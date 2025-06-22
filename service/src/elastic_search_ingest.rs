@@ -1,0 +1,1532 @@
+use std::error::Error;
+use std::fmt::Display;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+use std::{collections::HashMap, fs::File};
+use std::io::Write;
+
+use futures::FutureExt;
+use gotham::mime;
+use http::StatusCode;
+use idgenerator::*;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::sync::oneshot::error::RecvError;
+use tokio::sync::{mpsc, oneshot};
+use uuid_b64::UuidB64;
+
+use crate::elastic_search_commands::LookupById;
+use crate::elastic_search_common::{load_command_raw_result, CommandContext, ElasticSearchResponse};
+use crate::elastic_search_responses::{BulkResult, ErrorDetails, OperationResult, Shards, SingleDocCreateFaileResult};
+use crate::{data_access, distributed_cache};
+use crate::state_hosted_service::{CreateTable, SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription, API_SERVICE_CLIENT};
+use crate::util::log_err;
+
+
+
+#[derive(Debug)]
+pub(crate) struct IngestError {
+    pub message: String,
+}
+
+impl Display for IngestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _ = f.write_str(&self.message);
+        Ok(())
+    }
+}
+
+impl Error for IngestError {}
+
+
+fn default_as_false() -> bool {
+    false
+}
+
+#[derive(Clone)]
+pub(crate) struct WriteBuffer {
+    pub lines: Vec<String>,
+}
+
+
+impl Drop for WriteBuffer {
+    fn drop(&mut self) {
+        while let Some(_) = self.lines.pop() {}
+    }
+}
+
+impl WriteBuffer {
+    pub fn new() -> Self {
+        WriteBuffer {
+            lines: vec![],
+        }
+    }
+
+    fn write_to_file(&self, file_name: &String) -> Result<(), IngestError> {
+        let mut file_write = File::create(file_name).expect("Cannot create file");
+        for line in self.lines.iter() {
+            match writeln!(&mut file_write, "{}", line) {
+                Err(e) => return Err(IngestError { message: format!("{}", e).to_string() }),
+                _ => ()
+            }
+        }
+        Ok(())
+    }
+
+    fn concat(left: &WriteBuffer, right: &WriteBuffer) -> WriteBuffer {
+        WriteBuffer {
+            lines: [&left.lines[..], &right.lines[..]].concat(),
+        }
+    }
+
+    fn extend(&mut self, other: &WriteBuffer) {
+        self.lines.extend(other.lines.clone());
+    }
+
+    fn len(&self) -> usize {
+        self.lines.len()
+    }
+}
+
+
+struct CreateDoc {
+    raw: String,
+    parsed: Value,
+}
+
+
+#[derive(Deserialize)]
+struct IndexOrCreateBody {
+    #[serde(rename(deserialize = "_index"))]
+    index: Option<String>,
+    #[serde(rename(deserialize = "_id"))]
+    id: Option<String>,
+    #[serde(default = "default_as_false")]
+    list_executed_pipelines: bool,
+    #[serde(default = "default_as_false")]
+    require_alias: bool,
+    dynamic_templates: Option<HashMap<String, String>>,
+}
+
+
+#[derive(Deserialize)]
+struct UpdateOrDeleteBody {
+    #[serde(rename(deserialize = "_index"))]
+    index: Option<String>,
+    #[serde(rename(deserialize = "_id"))]
+    id: Option<String>,
+    #[serde(default = "default_as_false")]
+    require_alias: bool,
+}
+
+
+#[derive(Deserialize)]
+struct Create {
+    create: IndexOrCreateBody
+}
+
+
+#[derive(Deserialize)]
+struct Index {
+    index: IndexOrCreateBody
+}
+
+
+#[derive(Deserialize)]
+struct Delete {
+    delete: UpdateOrDeleteBody
+}
+
+
+#[derive(Deserialize)]
+struct Update {
+    update: UpdateOrDeleteBody
+}
+
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum IngestCommand {
+    Create(Create),
+    Index(Index),
+    Update(Update),
+}
+
+
+#[derive(Serialize, Deserialize, Clone)]
+struct CreateIndexSettings {
+    index: IndexSettings
+}
+
+
+#[derive(Serialize, Deserialize, Clone)]
+struct IndexMappingSettings {
+    total_fields: IndexMappingFieldSettings,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct IndexMappingFieldSettings {
+    limit: Option<u32>
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct IndexSettings {
+    number_of_shards: Option<u32>,
+    number_of_replicas: Option<u32>,
+    auto_expand_replicas: Option<String>,
+    refresh_interval: Option<String>,
+    priority: Option<u32>,
+    mapping: Option<IndexMappingSettings>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AliasInfo {
+    is_hidden: bool
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct MetaInfo {
+    #[serde(rename = "migrationMappingPropertyHashes")]
+    migration_mapping_property_hashes: HashMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+enum StringOrBool {
+    Bool(bool),
+    String(String),
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct PropertyInfo {
+    #[serde(rename = "type")]
+    type_name: Option<String>,
+    #[serde(default)]
+    enabled: bool,
+    dynamic: Option<StringOrBool>,
+    properties: Option<HashMap<String, PropertyInfo>>,
+    fields: Option<HashMap<String, PropertyInfo>>,
+    #[serde(default)]
+    ignore_above: u32,
+    scaling_factor: Option<u32>,
+}
+
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Mappings {
+    dynamic: String,
+    _meta: Option<MetaInfo>,
+    properties: HashMap<String, PropertyInfo>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct CreateIndexBody {
+    aliases: Option<HashMap<String, AliasInfo>>,
+    mappings: Option<Mappings>,
+    settings: Option<CreateIndexSettingsOption>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+enum CreateIndexSettingsOption {
+    Indirect(CreateIndexSettings),
+    Direct(IndexSettings),
+}
+
+
+#[derive(Serialize)]
+pub(crate) struct CreateIndexResult {
+    acknowledged: bool,
+    shards_acknowledged: bool,
+    index: String,
+}
+
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct CreateIndexTemplateBody {
+    #[serde(default)]
+    index_patterns: Vec<String>,
+    priority: Option<u32>,
+    version: Option<u32>,
+    template: CreateIndexBody,
+}
+
+
+pub(crate) async fn create_index(table: &String, body: &String) -> Result<CreateIndexResult, IngestError> {
+    let parsed_body: CreateIndexBody = match serde_json::from_str(body) {
+        Ok(pb) => pb,
+        Err(_e) => return log_err(IngestError{ message: "body parsing error".to_string() })
+    };
+    // TODO: fill in defaults
+
+    let serialized_body = match serde_json::to_string(&parsed_body) {
+        Ok(s) => s,
+        Err(_) => panic!("What happen?")
+    };
+
+    API_SERVICE_CLIENT.create_table(&CreateTable{ 
+        name: table.clone(),
+        tags: HashMap::from([("_es_original".to_string(), serialized_body)])
+    }).await;
+
+    match distributed_cache::create_table(table) {
+        Ok(_) => (),
+        Err(_) => panic!("What happen?")
+    }
+    Ok(CreateIndexResult { index: table.clone(), shards_acknowledged: true, acknowledged: true })
+}
+
+
+pub(crate) async fn create_index_template(table: &String, body: &String) -> Result<CreateIndexResult, IngestError> {
+    let parsed_body: CreateIndexTemplateBody = match serde_json::from_str(body) {
+        Ok(pb) => pb,
+        Err(_e) => return log_err(IngestError{ message: "body parsing error".to_string() })
+    };
+
+    API_SERVICE_CLIENT.create_table_template(&table, &parsed_body).await;
+
+    match distributed_cache::create_table(table) {
+        Ok(_) => (),
+        Err(_) => panic!("What happen?")
+    }
+    Ok(CreateIndexResult { index: table.clone(), shards_acknowledged: true, acknowledged: true })
+}
+
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Aliases {
+    actions: Vec<AliasAction>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+enum AliasAction {
+    Add(AliasAdd),
+    Remove(AliasRemove),
+    RemoveIndex(AliasRemoveIndex),
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AliasAdd {
+    add: AliasAddBody
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AliasAddBody {
+    // TODO: there are many more fields
+    index: String,
+    alias: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AliasRemove {
+    remove: AliasRemoveBody
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AliasRemoveBody {
+    // TODO: there are many more fields
+    index: String,
+    alias: String,    
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AliasRemoveIndex {
+    remove_index: AliasRemoveIndexBody,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AliasRemoveIndexBody {
+    index: String,
+}
+
+
+pub(crate) async fn update_aliases(body: &String) -> Result<(), IngestError> {
+    let parsed_body: Aliases = match serde_json::from_str(body) {
+        Ok(pb) => pb,
+        Err(_e) => return log_err(IngestError{ message: "body parsing error".to_string() })
+    };
+
+    // TODO: the actions should probably be pushed up in bulk
+    for action in parsed_body.actions {
+        match action {
+            AliasAction::Add(a) => {
+                API_SERVICE_CLIENT.add_alias(&a.add.index, &a.add.alias).await;
+            },
+            AliasAction::Remove(r) => {
+                API_SERVICE_CLIENT.remove_alias(&r.remove.index, &r.remove.alias).await;
+            },
+            AliasAction::RemoveIndex(_) => {
+                panic!("TODO: What does this mean?")
+            },
+        }
+    }
+    Ok(())
+}
+
+
+
+fn insert_into_doc(id: &String, version: u32, seq_no: i64, doc: &String) -> String {
+    match doc.find("{") {
+        Some(index) => format!("{}\"_id\": \"{}\", \"_version\": {}, \"_seq_no\": {}, {}", "{", id, version, seq_no, doc[index + 1..].to_string()),
+        None => panic!("Malformed JSON?")
+    }
+}
+
+
+pub(crate) fn ingest_create(
+    table_description: &TableDescription, 
+    create: &Create, 
+    doc: &CreateDoc,
+    version: u32, 
+    seq_no: i64, 
+    buffer: &mut WriteBuffer
+) -> OperationResult {
+    let id = match &create.create.id {
+        Some(id) => id.clone(),
+        None => UuidB64::new().to_string()
+    };
+    let doc_with_id = insert_into_doc(&id, version, seq_no, &doc.raw);
+    buffer.lines.push(doc_with_id);
+    OperationResult{
+        _index: table_description.name.clone(),
+        _id: id,
+        _version: 1,
+        result: "created".to_string(),
+        _shards: Shards {
+            total: 1,
+            successful: 1,
+            failed: 0,
+        },
+        status: 201,
+        _seq_no: seq_no,
+        _primary_term: 1,
+    }
+}
+
+
+pub(crate) struct IngestResult {
+    tables: HashMap<String, WriteBuffer>,
+    operations: Vec<OperationResult>,
+}
+
+impl IngestResult {
+    fn new() -> Self {
+        IngestResult { 
+            tables: HashMap::new(),
+            operations: vec!(),
+        }
+    }
+
+    fn get(&mut self, table: &String) -> &mut WriteBuffer {
+        match self.tables.get_mut(table) {
+            Some(_) => (),
+            None => {
+                self.tables.insert(table.clone(), WriteBuffer::new());
+
+            }
+        }
+        self.tables.get_mut(table).unwrap()
+    }
+}
+
+
+#[derive(Serialize)]
+struct CreateSingleSuccessResult {
+
+}
+
+#[derive(Serialize)]
+struct CreateSingleErrorResult {
+
+}
+
+
+pub(crate) async fn create_single(index: &String, doc_id: &String, payload: &String) -> Result<ElasticSearchResponse, IngestError> {
+    create_single_worker(index, doc_id, payload, true).await
+}
+
+pub(crate) async fn upsert_single(index: &String, doc_id: &String, payload: &String) -> Result<ElasticSearchResponse, IngestError> {
+    create_single_worker(index, doc_id, payload, false).await
+}
+
+pub(crate) async fn commit(buffer: &WriteBuffer, index: &String) -> Result<(), IngestError> {
+    commit_general(buffer, index, &"commit".to_string()).await
+}
+
+pub(crate) async fn commit_general(buffer: &WriteBuffer, index: &String, commit_type: &String) -> Result<(), IngestError> {
+    let _new_val = match distributed_cache::insert_operator(index, 1) {
+        Ok(v) => v,
+        Err(_) => panic!("oh no")
+    };
+
+    let new_id = format!("tests/data/ingest/{}-{}-{}.json", commit_type, index, IdInstance::next_id().to_string());
+    let write_to_file_result = buffer.write_to_file(&new_id);
+    tracing::info!("Ingest: table {} wrote {} records", index, buffer.len());
+
+    match write_to_file_result {
+        Ok(_) => (),
+        Err(_) => return Err(IngestError{ message: "File error".to_string() })
+    }
+
+    let commit_info = SpeedboatCommitTableInfo {
+        table_name: index.clone(),
+        files: vec!(new_id),
+        sizes: vec!(buffer.len() as u32),
+    };
+
+    match API_SERVICE_CLIENT.speedboat_commit(&SpeedboatCommit {
+        commit_type: commit_type.clone(),
+        type_files: vec!(commit_info),
+        compactions: vec!(),
+    }).await {
+        Ok(_) => Ok(()),
+        Err(_) => panic!("nope")
+    }  
+}
+
+async fn create_single_worker(index: &String, doc_id: &String, payload: &String, fail_on_exists: bool) -> Result<ElasticSearchResponse, IngestError> {
+    let table_description: TableDescription = match API_SERVICE_CLIENT.describe_table(&index).await {
+        Some(t) => t,
+        None => return Err(IngestError{ message: "Index does not exist".to_string() })
+    };
+    let seq_no: i64 = match distributed_cache::insert_operator(&table_description.name, 1) {
+        Ok(v) => v,
+        Err(_) => panic!("nope")
+    };
+    let doc: Result<Value, serde_json::Error>  = serde_json::from_str(payload);
+    match doc {
+        Ok(valid_doc) => {
+            let df_count = match load_command_raw_result(CommandContext{}, Arc::new(LookupById{ table: table_description.name.clone(), ids: vec!(doc_id.clone()) })).await {
+                Ok(lcrr) => match lcrr {
+                    Some(raw_table) => {
+                        let df = match data_access::execute_sql(&format!("SELECT * from {raw_table}")).await {
+                            Ok(df) => df,
+                            Err(_) => panic!("weird")
+                        };
+            
+                        match df.count().await {
+                            Ok(c) => c,
+                            Err(_) => panic!("weird")
+                        }
+                    },
+                    None => 0,
+                },
+                Err(_) => panic!("weird")
+            };
+
+            let version = if df_count != 0 {
+                // TODO: get version from existing doc
+                if fail_on_exists {
+                    let response = SingleDocCreateFaileResult {
+                        error: ErrorDetails::single_cause(
+                            &"version_conflict_engine_exception".to_string(),
+                            &format!("[{}]: version conflict, document already exists (current version [{}])", doc_id, 1),
+                            &"what is an index uuid?".to_string(),
+                            &"1".to_string(),
+                            &index.to_string(),
+                        ),
+                        status: 409,
+                    };
+                    return Ok(ElasticSearchResponse { status: StatusCode::CONFLICT, mime: mime::APPLICATION_JSON, body: serde_json::to_string(&response).unwrap() })
+                } else {
+                    // TODO: return real existing version + 1 here instead
+                    1 + 1
+                }
+            } else {
+                1
+            };
+
+            let mut buffer = WriteBuffer::new();
+            let _ = ingest_create(
+                &table_description,
+                &Create{ create: IndexOrCreateBody { index: None, id: Some(doc_id.clone()), list_executed_pipelines: false, require_alias: false, dynamic_templates: None }},
+                &CreateDoc{ raw: payload.replace("\n", ""), parsed: valid_doc },
+                version,
+                seq_no,
+                &mut buffer
+            );
+            
+            commit(&buffer, &table_description.name).await?;
+            Ok(ElasticSearchResponse { status: StatusCode::OK, mime: mime::APPLICATION_JSON, body: "inserted!".to_string() })
+        },
+        Err(_) => {
+            Ok(ElasticSearchResponse{ status: StatusCode::BAD_REQUEST, mime: mime::APPLICATION_JSON, body: "Bad request".to_string() })
+        }
+    }
+}
+
+
+fn create_delete(doc_id: &String, seq_no: i64) -> String {
+    format!("{{\"_id\": \"{}\", \"_seq_no\": {}}}", doc_id, seq_no)
+}
+
+pub(crate) async fn delete(index: &String, doc_id: &String) -> Result<ElasticSearchResponse, IngestError> {
+    let table_description: TableDescription = match API_SERVICE_CLIENT.describe_table(&index).await {
+        Some(t) => t,
+        None => return Err(IngestError{ message: "Index does not exist".to_string() })
+    };
+    let seq_no = match distributed_cache::delete_operator(&table_description.name, 1) {
+        Ok(v) => v,
+        Err(_) => panic!("Need to convert to an ingest error")
+    };
+    let mut buffer = WriteBuffer::new();
+    // TODO: need to include a version or timestamp in the delete
+    buffer.lines.push(create_delete(doc_id, seq_no));
+    commit_general(&buffer, &table_description.name, &"delete".to_string()).await?;
+    Ok(ElasticSearchResponse { status: StatusCode::OK, mime: mime::APPLICATION_JSON, body: "deleted!".to_string() })
+}
+
+
+pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) -> Result<IngestResult, IngestError> {
+    let payload_split = payload.lines();
+    let mut ingest_result = IngestResult::new();
+    let mut iterator = payload_split.into_iter().peekable();
+    while iterator.peek() != None {
+        let command_str = iterator.next().unwrap();
+        if command_str.len() == 0 {
+            continue;
+        }
+
+        let deser_command: Result<IngestCommand, serde_json::Error> = serde_json::from_str(command_str);
+        match deser_command {
+            Ok(command) => {
+                match command {
+                    IngestCommand::Create(c) => {
+                        let index = match &c.create.index {
+                            Some(i) => {
+                                match provided_index {
+                                    Some(pi) => if i != pi {
+                                        return Err(IngestError{ message: "Can not provide a index in create here".to_string() });
+                                    },
+                                    None => (),
+                                }
+                                i
+                            }
+                            None => {
+                                match provided_index {
+                                    Some(pi) => pi,
+                                    None => return Err(IngestError{ message: "Must provide index name".to_string() }),
+                                }
+                            }                               
+                        };
+                        let table_description = match API_SERVICE_CLIENT.describe_table(&index).await {
+                            Some(t) => t,
+                            None => return Err(IngestError{ message: "Index does not exist".to_string() })
+                        };
+                        let seq_no: i64 = match distributed_cache::insert_operator(&table_description.name, 1) {
+                            Ok(v) => v,
+                            Err(_) => panic!("nope")
+                        };
+                        let doc_str = match iterator.next() {
+                            Some(ds) => ds.trim(),
+                            None => panic!("How do I make my own error? This should return an error instead of panic")                            
+                        };
+                        let doc: Result<Value, serde_json::Error>  = serde_json::from_str(doc_str);
+                        match doc {
+                            Ok(valid_doc) => {
+                                let operation_result = ingest_create(
+                                    &table_description,
+                                    &c,
+                                    &CreateDoc{ raw: doc_str.to_string(), parsed: valid_doc },
+                                    1,
+                                    seq_no,
+                                    ingest_result.get(index)
+                                );
+                                ingest_result.operations.push(operation_result)
+                            },
+                            Err(_) => return Err(IngestError{ message: "Serde error".to_string() })
+                        }
+                    },
+                    _ => {
+                        panic!("Not implemented")
+                    },
+                }
+            },
+            Err(_) => return Err(IngestError{ message: "Serde error".to_string() })
+        }
+    }
+
+    Ok(ingest_result)
+}
+
+
+async fn ingest_and_write(payload: &String) -> Result<(Vec<SpeedboatCommitTableInfo>, BulkResult), IngestError> {
+    let buffer_items = match ingest(None, payload).await {
+        Ok(b) => b,
+        Err(e) => return Err(e)
+    };
+
+    let mut table_infos = vec!();
+    for table_buffer in buffer_items.tables {
+        let new_id = format!("tests/data/ingest/ingest-{}-{}.json", table_buffer.0, IdInstance::next_id().to_string());
+        let write_to_file_result = table_buffer.1.write_to_file(&new_id);
+        tracing::info!("Ingest: table {} wrote {} records", table_buffer.0, table_buffer.1.len());
+
+        match write_to_file_result {
+            Ok(_) => (),
+            Err(_) => return Err(IngestError{ message: "File error".to_string() })
+        }
+
+        table_infos.push(SpeedboatCommitTableInfo {
+            table_name: table_buffer.0.clone(),
+            files: vec!(new_id),
+            sizes: vec!(table_buffer.1.len() as u32),
+        });
+    }
+
+    Ok((table_infos, BulkResult::success(0, buffer_items.operations)))
+}
+
+
+pub(crate) async fn ingest_and_commit(payload: &String) -> Result<BulkResult, IngestError> {
+    match ingest_and_write(payload).await {
+        Ok(result) => {
+            match API_SERVICE_CLIENT.speedboat_commit(&SpeedboatCommit {
+                commit_type: "commit".to_string(),
+                type_files: result.0,
+                compactions: vec!(),
+            }).await {
+                Ok(_) => (),
+                Err(_) => panic!("nope")
+            }
+            Ok(result.1)
+        },
+        Err(e) => Err(e)
+    }
+}
+
+
+struct IngestRequest {
+    response: Vec<OperationResult>,
+    respond_to: Option<oneshot::Sender<Result<BulkResult, IngestError>>>,
+}
+
+struct IngestActor {
+    tables: HashMap<String, WriteBuffer>,
+    requests: Vec<IngestRequest>,
+    receiver: mpsc::Receiver<IngestActorMessage>,
+}
+
+enum IngestActorMessage {
+    IngestSingleTable {
+        table: String,
+        payload: String,
+        respond_to: oneshot::Sender<Result<BulkResult, IngestError>>,
+    },
+    Ingest {
+        payload: String,
+        respond_to: oneshot::Sender<Result<BulkResult, IngestError>>,
+    },
+    Commit {
+        respond_to: oneshot::Sender<()>,
+    }
+}
+
+impl IngestActor {
+    fn new(receiver: mpsc::Receiver<IngestActorMessage>) -> Self {
+        IngestActor {
+            tables: HashMap::new(),
+            requests: vec!(),
+            receiver: receiver,
+        }
+    }
+
+    fn merge_table_buffers(&mut self, tables: &HashMap<String, WriteBuffer>) -> () {
+        for table_entry in tables {
+            match self.tables.get_mut(table_entry.0) {
+                Some(buffer) => buffer.extend(table_entry.1),
+                None => {
+                    self.tables.insert(table_entry.0.clone(), table_entry.1.clone());
+                }
+            }
+        }
+    }
+
+    async fn do_ingest(&mut self, table: Option<&String>, payload: &String, respond_to: oneshot::Sender<Result<BulkResult, IngestError>>) -> () {
+        let buffer_items = ingest(table, &payload).await;
+        match buffer_items {
+            Ok(bi) => {
+                let request = IngestRequest { 
+                    response: bi.operations,
+                    respond_to: Some(respond_to)
+                };
+                self.requests.push(request);
+                self.merge_table_buffers(&bi.tables);
+            },
+            Err(e) => {
+                let _ = respond_to.send(Err(e));
+            }
+        };        
+    }
+
+    async fn handle_message(&mut self, msg: IngestActorMessage) -> () {
+        match msg {
+            IngestActorMessage::IngestSingleTable { table, payload, respond_to } => {
+                self.do_ingest(Some(&table), &payload, respond_to).await
+            },
+            IngestActorMessage::Ingest { payload, respond_to } => {
+                self.do_ingest(None, &payload, respond_to).await
+            },            
+            IngestActorMessage::Commit { respond_to } => {
+                let _ = self.commit().await;
+                let _ = respond_to.send(());
+            }
+        }
+    }
+
+    async fn commit(&mut self) -> Result<(), IngestError> {
+        if self.requests.len() == 0 {
+            return Ok(());
+        }
+
+        let mut commit_table_info = vec!();
+
+        for table_entry in &self.tables {
+            let new_id = format!("tests/data/ingest/ingest-{}-{}.json", table_entry.0, IdInstance::next_id().to_string());
+            let write_to_file_result = table_entry.1.write_to_file(&new_id);
+            tracing::info!("Ingest: table {} wrote {} records", table_entry.0, table_entry.1.len());
+            match write_to_file_result {
+                Ok(_) => (),
+                Err(_) => return Err(IngestError { message: "File error".to_string() }),
+            }
+            commit_table_info.push(
+                SpeedboatCommitTableInfo { 
+                    table_name: table_entry.0.clone(),
+                    files: vec!(new_id),
+                    sizes: vec!(table_entry.1.len().try_into().unwrap()),
+                }
+            );
+        }
+
+        match API_SERVICE_CLIENT.speedboat_commit(&SpeedboatCommit {
+            commit_type: "commit".to_string(),
+            type_files: commit_table_info,
+            compactions: vec!(),
+        }).await {
+            Ok(_) => (),
+            Err(_) => panic!("nope")
+        }
+
+        for request in self.requests.iter_mut() {
+            // TODO: track and report time correctly
+            let _ = request.respond_to.take().unwrap().send(Ok(BulkResult::success(0, request.response.clone())));
+        }
+
+        self.requests.clear();
+        self.tables.clear();
+
+        Ok(())
+    }
+
+
+}
+
+
+#[derive(Clone)]
+pub struct IngestHandle {
+    sender: mpsc::Sender<IngestActorMessage>,
+}
+
+
+async fn run_ingest_message_pump(mut actor: IngestActor) {
+    while let Some(msg) = actor.receiver.recv().await {
+        actor.handle_message(msg).await;
+    }
+}
+
+
+impl IngestHandle {
+    pub fn new() -> Self {
+        let (sender, receiver) = mpsc::channel(8);
+        let actor: IngestActor = IngestActor::new(receiver);
+        tokio::spawn(run_ingest_message_pump(actor));
+        Self { sender }
+    }
+
+    pub async fn send(&self, payload: &String) -> Result<BulkResult, IngestError> {
+        let (send, recv) = oneshot::channel();
+        let msg = IngestActorMessage::Ingest { 
+            payload: payload.clone(),
+            respond_to: send
+        };
+
+        let _ = self.sender.send(msg).await;
+        match recv.await {
+            Ok(r) => r,
+            Err(_) => panic!("RecvError")
+        }
+    }    
+
+    pub async fn send_single_table(&self, table: &String, payload: &String) -> Result<BulkResult, IngestError> {
+        let (send, recv) = oneshot::channel();
+        let msg = IngestActorMessage::IngestSingleTable { 
+            table: table.clone(), 
+            payload: payload.clone(),
+            respond_to: send
+        };
+
+        let _ = self.sender.send(msg).await;
+        match recv.await {
+            Ok(r) => r,
+            Err(_) => panic!("RecvError")
+        }
+    }
+
+    pub async fn commit(&self) -> Result<(), RecvError> {
+        let (send, recv) = oneshot::channel();
+        let msg = IngestActorMessage::Commit { 
+            respond_to: send
+        };
+
+        let _ = self.sender.send(msg).await;
+        recv.await
+    }    
+}
+
+
+fn commit_messages() -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = INGEST_HANDLE.commit().await;
+        }
+    }.boxed()
+}
+
+
+fn create_ingest() -> IngestHandle {
+    let handle = IngestHandle::new();
+    tokio::spawn(commit_messages());
+    handle
+}
+
+pub(crate) static INGEST_HANDLE: std::sync::LazyLock<IngestHandle> = std::sync::LazyLock::new(|| create_ingest());
+
+
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, fs};
+
+    use crate::{elastic_search_ingest::{ingest_and_write, IngestCommand, PropertyInfo}, state_hosted_service::{CreateTable, API_SERVICE_CLIENT}};
+
+    use super::{CreateIndexBody, CreateIndexTemplateBody};
+
+    #[test]
+    fn test_create_deser() {
+        let empty_deser: IngestCommand = serde_json::from_str("{\"create\": {} }").unwrap();
+        match empty_deser {
+            IngestCommand::Create(c) => {
+                assert_eq!(c.create.index, None);
+                assert_eq!(c.create.id, None);
+            },
+            _ => panic!("This should be a create"),
+        }
+
+
+        let index_deser: IngestCommand = serde_json::from_str("{\"create\": { \"_index\": \"test\" } }").unwrap();
+        match index_deser {
+            IngestCommand::Create(c) => {
+                assert_eq!(c.create.id, None);
+                match c.create.index {
+                    Some(cci) => assert_eq!(cci, "test".to_string()),
+                    _ => panic!("Should be index == test"),
+                }
+            },
+            _ => panic!("This should be a create"),
+        }        
+        
+    }
+
+    #[test]
+    fn test_index_deser() {
+        let empty_deser: IngestCommand = serde_json::from_str("{\"index\": {} }").unwrap();
+        match empty_deser {
+            IngestCommand::Index(i) => {
+                assert_eq!(i.index.index, None);
+                assert_eq!(i.index.id, None);
+            },
+            _ => panic!("This should be a create"),
+        }
+    }
+   
+    #[test]
+    fn test_create_index_deser() {
+        let mini_test_val = r#"{        "migrationVersion": {
+          "dynamic": "true",
+          "properties": {
+            "task": {
+              "type": "text",
+              "fields": {
+                "keyword": {
+                  "type": "keyword",
+                  "ignore_above": 256
+                }
+              }
+            }
+          }
+    }}"#;
+
+        let _mini_deser: HashMap<String, PropertyInfo> = match serde_json::from_str(mini_test_val) {
+            Ok(d) => d,
+            Err(e) => {
+                let error = format!("{}", e);
+                println!("{}", error);
+                panic!("nope");
+            }
+        };
+
+
+        let test_val = r#"{
+  ".kibana_task_manager_8.7.1_001": {
+    "aliases": {
+      ".kibana_task_manager": {
+        "is_hidden": true
+      },
+      ".kibana_task_manager_8.7.1": {
+        "is_hidden": true
+      }
+    },
+    "mappings": {
+      "dynamic": "strict",
+      "_meta": {
+        "migrationMappingPropertyHashes": {
+          "migrationVersion": "4a1746014a75ade3a714e1db5763276f",
+          "originId": "2f4316de49999235636386fe51dc06c1",
+          "task": "b3d0a471610ff17077e60653f422491d",
+          "updated_at": "00da57df13e94e9d98437d13ace4bfe0",
+          "references": "7997cf5a56cc02bdc9c93361bde732b0",
+          "namespace": "2f4316de49999235636386fe51dc06c1",
+          "created_at": "00da57df13e94e9d98437d13ace4bfe0",
+          "coreMigrationVersion": "2f4316de49999235636386fe51dc06c1",
+          "type": "2f4316de49999235636386fe51dc06c1",
+          "namespaces": "2f4316de49999235636386fe51dc06c1"
+        }
+      },
+      "properties": {
+        "coreMigrationVersion": {
+          "type": "keyword"
+        },
+        "created_at": {
+          "type": "date"
+        },
+        "migrationVersion": {
+          "dynamic": "true",
+          "properties": {
+            "task": {
+              "type": "text",
+              "fields": {
+                "keyword": {
+                  "type": "keyword",
+                  "ignore_above": 256
+                }
+              }
+            }
+          }
+        },
+        "namespace": {
+          "type": "keyword"
+        },
+        "namespaces": {
+          "type": "keyword"
+        },
+        "originId": {
+          "type": "keyword"
+        },
+        "references": {
+          "type": "nested",
+          "properties": {
+            "id": {
+              "type": "keyword"
+            },
+            "name": {
+              "type": "keyword"
+            },
+            "type": {
+              "type": "keyword"
+            }
+          }
+        },
+        "task": {
+          "properties": {
+            "attempts": {
+              "type": "integer"
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "ownerId": {
+              "type": "keyword"
+            },
+            "params": {
+              "type": "text"
+            },
+            "retryAt": {
+              "type": "date"
+            },
+            "runAt": {
+              "type": "date"
+            },
+            "schedule": {
+              "properties": {
+                "interval": {
+                  "type": "keyword"
+                }
+              }
+            },
+            "scheduledAt": {
+              "type": "date"
+            },
+            "scope": {
+              "type": "keyword"
+            },
+            "startedAt": {
+              "type": "date"
+            },
+            "state": {
+              "type": "text"
+            },
+            "status": {
+              "type": "keyword"
+            },
+            "taskType": {
+              "type": "keyword"
+            },
+            "traceparent": {
+              "type": "text"
+            },
+            "user": {
+              "type": "keyword"
+            }
+          }
+        },
+        "type": {
+          "type": "keyword"
+        },
+        "updated_at": {
+          "type": "date"
+        }
+      }
+    }
+  }
+}"#;
+        let deser: HashMap<String, CreateIndexBody> = match serde_json::from_str(test_val) {
+            Ok(d) => d,
+            Err(e) => {
+                let error = format!("{}", e);
+                println!("{}", error);
+                panic!("nope");
+            }
+        };
+        let index = deser.get(".kibana_task_manager_8.7.1_001").unwrap().clone();
+        assert_eq!(index.aliases.map_or_else(|| 0, |x| x.len()), 2);
+
+/* 
+        let file_content = match read_to_string("service/tests/data/example_create_index.json") {
+            Ok(f) => f,
+            Err(_) => panic!("Missing test file")
+        };
+        let deser_file: CreateIndexBody =  match serde_json::from_str(file_content.as_str()) {
+            Ok(d) => d,
+            Err(e) => {
+                let error = format!("{}", e);
+                println!("{}", error);
+                let _ = fs::write("service/output.txt", error);
+                panic!("nope");
+            }
+        };
+*/
+
+        let test_val = r#"{
+  "template": {
+    "settings": {
+      "number_of_shards": 1
+    },
+    "mappings": {
+      "dynamic": "strict",
+      "properties": {
+        "@timestamp": {
+          "type": "date"
+        },
+        "event": {
+          "properties": {
+            "action": {
+              "type": "keyword"
+            },
+            "kind": {
+              "type": "keyword"
+            }
+          }
+        },
+        "tags": {
+          "type": "keyword"
+        },
+        "kibana": {
+          "properties": {
+            "alert": {
+              "properties": {
+                "rule": {
+                  "properties": {
+                    "parameters": {
+                      "type": "flattened",
+                      "ignore_above": 4096
+                    },
+                    "rule_type_id": {
+                      "type": "keyword"
+                    },
+                    "consumer": {
+                      "type": "keyword"
+                    },
+                    "producer": {
+                      "type": "keyword"
+                    },
+                    "author": {
+                      "type": "keyword"
+                    },
+                    "category": {
+                      "type": "keyword"
+                    },
+                    "uuid": {
+                      "type": "keyword"
+                    },
+                    "created_at": {
+                      "type": "date"
+                    },
+                    "created_by": {
+                      "type": "keyword"
+                    },
+                    "description": {
+                      "type": "keyword"
+                    },
+                    "enabled": {
+                      "type": "keyword"
+                    },
+                    "execution": {
+                      "properties": {
+                        "uuid": {
+                          "type": "keyword"
+                        }
+                      }
+                    },
+                    "from": {
+                      "type": "keyword"
+                    },
+                    "interval": {
+                      "type": "keyword"
+                    },
+                    "license": {
+                      "type": "keyword"
+                    },
+                    "name": {
+                      "type": "keyword"
+                    },
+                    "note": {
+                      "type": "keyword"
+                    },
+                    "references": {
+                      "type": "keyword"
+                    },
+                    "rule_id": {
+                      "type": "keyword"
+                    },
+                    "rule_name_override": {
+                      "type": "keyword"
+                    },
+                    "tags": {
+                      "type": "keyword"
+                    },
+                    "to": {
+                      "type": "keyword"
+                    },
+                    "type": {
+                      "type": "keyword"
+                    },
+                    "updated_at": {
+                      "type": "date"
+                    },
+                    "updated_by": {
+                      "type": "keyword"
+                    },
+                    "version": {
+                      "type": "keyword"
+                    }
+                  }
+                },
+                "uuid": {
+                  "type": "keyword"
+                },
+                "instance": {
+                  "properties": {
+                    "id": {
+                      "type": "keyword"
+                    }
+                  }
+                },
+                "start": {
+                  "type": "date"
+                },
+                "time_range": {
+                  "type": "date_range",
+                  "format": "epoch_millis||strict_date_optional_time"
+                },
+                "end": {
+                  "type": "date"
+                },
+                "duration": {
+                  "properties": {
+                    "us": {
+                      "type": "long"
+                    }
+                  }
+                },
+                "severity": {
+                  "type": "keyword"
+                },
+                "status": {
+                  "type": "keyword"
+                },
+                "flapping": {
+                  "type": "boolean"
+                },
+                "risk_score": {
+                  "type": "float"
+                },
+                "workflow_status": {
+                  "type": "keyword"
+                },
+                "workflow_user": {
+                  "type": "keyword"
+                },
+                "workflow_reason": {
+                  "type": "keyword"
+                },
+                "system_status": {
+                  "type": "keyword"
+                },
+                "action_group": {
+                  "type": "keyword"
+                },
+                "reason": {
+                  "type": "keyword"
+                },
+                "case_ids": {
+                  "type": "keyword"
+                },
+                "suppression": {
+                  "properties": {
+                    "terms": {
+                      "properties": {
+                        "field": {
+                          "type": "keyword"
+                        },
+                        "value": {
+                          "type": "keyword"
+                        }
+                      }
+                    },
+                    "start": {
+                      "type": "date"
+                    },
+                    "end": {
+                      "type": "date"
+                    },
+                    "docs_count": {
+                      "type": "long"
+                    }
+                  }
+                },
+                "last_detected": {
+                  "type": "date"
+                }
+              }
+            },
+            "space_ids": {
+              "type": "keyword"
+            },
+            "version": {
+              "type": "version"
+            }
+          }
+        },
+        "ecs": {
+          "properties": {
+            "version": {
+              "type": "keyword"
+            }
+          }
+        }
+      }
+    }
+  }
+}"#;
+
+        let _deser: CreateIndexTemplateBody = match serde_json::from_str(test_val) {
+            Ok(d) => d,
+            Err(e) => {
+                let error = format!("{}", e);
+                println!("{}", error);
+                let _ = fs::write("service/output.txt", error);
+                panic!("nope");
+            }
+        };
+
+        let test_val = r#"{
+  "template": {
+    "settings": {},
+    "mappings": {
+      "dynamic": "strict",
+      "properties": {
+        "monitor": {
+          "properties": {
+            "id": {
+              "type": "keyword"
+            },
+            "name": {
+              "type": "keyword"
+            },
+            "type": {
+              "type": "keyword"
+            }
+          }
+        },
+        "url": {
+          "properties": {
+            "full": {
+              "type": "keyword"
+            }
+          }
+        },
+        "observer": {
+          "properties": {
+            "geo": {
+              "properties": {
+                "name": {
+                  "type": "keyword"
+                }
+              }
+            }
+          }
+        },
+        "error": {
+          "properties": {
+            "message": {
+              "type": "text"
+            }
+          }
+        },
+        "agent": {
+          "properties": {
+            "name": {
+              "type": "keyword"
+            }
+          }
+        },
+        "tls": {
+          "properties": {
+            "server": {
+              "properties": {
+                "x509": {
+                  "properties": {
+                    "issuer": {
+                      "properties": {
+                        "common_name": {
+                          "type": "keyword"
+                        }
+                      }
+                    },
+                    "subject": {
+                      "properties": {
+                        "common_name": {
+                          "type": "keyword"
+                        }
+                      }
+                    },
+                    "not_after": {
+                      "type": "date"
+                    },
+                    "not_before": {
+                      "type": "date"
+                    }
+                  }
+                },
+                "hash": {
+                  "properties": {
+                    "sha256": {
+                      "type": "keyword"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "anomaly": {
+          "properties": {
+            "start": {
+              "type": "date"
+            },
+            "bucket_span": {
+              "properties": {
+                "minutes": {
+                  "type": "keyword"
+                }
+              }
+            }
+          }
+        },
+        "kibana": {
+          "properties": {
+            "alert": {
+              "properties": {
+                "evaluation": {
+                  "properties": {
+                    "threshold": {
+                      "type": "scaled_float",
+                      "scaling_factor": 100
+                    },
+                    "value": {
+                      "type": "scaled_float",
+                      "scaling_factor": 100
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}"#;
+
+        let _deser: CreateIndexTemplateBody = match serde_json::from_str(test_val) {
+            Ok(d) => d,
+            Err(e) => {
+                let error = format!("{}", e);
+                println!("{}", error);
+                let _ = fs::write("service/output.txt", error);
+                panic!("nope");
+            }
+        };        
+
+    }
+
+    #[test]
+    fn test_create_index_template() {
+        let test_val = r#"{"version":1,"index_patterns":[".apm-source-map"],"template":{"settings":{"index":{"number_of_shards":1,"auto_expand_replicas":"0-2","hidden":true}},"mappings":{"dynamic":"strict","properties":{"fleet_id":{"type":"keyword"},"created":{"type":"date"},"content":{"type":"binary"},"content_sha256":{"type":"keyword"},"file.path":{"type":"keyword"},"service.name":{"type":"keyword"},"service.version":{"type":"keyword"}}}}}"#;
+
+        let _deser: CreateIndexTemplateBody = match serde_json::from_str(test_val) {
+            Ok(d) => d,
+            Err(e) => {
+                let error = format!("{}", e);
+                println!("{}", error);
+                panic!("nope");
+            }
+        };
+    }
+
+}

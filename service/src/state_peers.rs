@@ -1,0 +1,313 @@
+use std::{error::Error, fmt::Display};
+
+use async_trait::async_trait;
+use gotham::test::TestServer;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+
+use crate::{private_api::data_query, state_common::FileFilter, state_leader};
+
+
+#[derive(Serialize, Deserialize)]
+pub struct FieldFileFilterDescriptor {
+    pub field_name: String,
+    pub file_filter: FileFilter,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct FileFilterDescriptor {
+    pub able_name: String, // Field name to list of (operator, value)
+    pub filters: Vec<FieldFileFilterDescriptor>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct SnapshotDescriptor {
+    pub table_name: String,
+    pub snapshot_id: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct PrivateSqlInvocation {
+    pub sql: String,
+    pub required_extensions: Vec<String>,
+    pub file_filter: Vec<FileFilterDescriptor>,
+    pub snapshots: Vec<SnapshotDescriptor>,
+    pub index: u64,
+    pub num: u64,
+}
+
+
+// TODO: make all these Vecs into Arc<Vec>?
+impl PrivateSqlInvocation {
+    pub fn new(
+        sql: String,
+        required_extensions: Vec<String>,
+        file_filter: Vec<FileFilterDescriptor>,
+        snapshots: Vec<SnapshotDescriptor>,
+        index: u64,
+        num: u64,        
+    ) -> Self {
+        PrivateSqlInvocation {
+            sql: sql,
+            required_extensions: required_extensions,
+            file_filter: file_filter,
+            snapshots: snapshots,
+            index: index,
+            num: num,
+        }
+    }
+}
+
+
+#[derive(Serialize)]
+pub struct PrivateMetadataInvocation {
+    name: String,
+}
+
+
+#[derive(Debug)]
+pub(crate) struct PeerClientError {
+    pub message: String,
+}
+
+impl Display for PeerClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message);
+        Ok(())
+    }
+}
+
+impl Error for PeerClientError{}
+
+unsafe impl Send for PeerClientError {}
+unsafe impl Sync for PeerClientError {}
+
+#[async_trait]
+pub trait PeerClient: Send + Sync {
+    async fn private_sql(&self, invocation: &PrivateSqlInvocation) -> Result<String, PeerClientError>;
+}
+
+pub(crate) struct RemotePeer {
+    address: String,
+    client: Client,
+}
+
+
+impl RemotePeer {
+    pub fn new(address: String) -> Self {
+        RemotePeer {
+            address: address,
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+unsafe impl Send for RemotePeer {}
+unsafe impl Sync for RemotePeer {}
+
+
+#[async_trait]
+impl PeerClient for RemotePeer {
+    async fn private_sql(&self, invocation: &PrivateSqlInvocation) -> Result<String, PeerClientError> {
+        let address = &self.address;
+        let body = serde_json::to_string(invocation);
+        match body {
+            Ok(b) => {
+                let resp = self.client.post(format!("http://{address}/_private/v1/_sql"))
+                    .header("Content-Type", "application/json")
+                    .body(b)
+                    .send().await;
+                match resp {
+                    Ok(r) => {
+                        let text = r.text().await;
+                        match text {
+                            Ok(t) => Ok(t),
+                            Err(_) => Err(PeerClientError{ message: "Error".to_string() }),
+                        }
+                    },
+                    Err(_) => Err(PeerClientError{ message: "Error".to_string() })
+                }
+            },
+            Err(_) => {
+                panic!("Malformed request")
+            }
+        }
+    }
+/* 
+    async fn private_metadata(&self, invocation: &PrivateMetadataInvocation) -> Result<String, PeerClientError> {
+        let address = &self.address;
+        let body = serde_json::to_string(invocation);
+        match body {
+            Ok(b) => {
+                let resp = futures::executor::block_on(self.client.post(format!("{address}/_private/v1/_metadata"))
+                .header("Content-Type", "application/json")
+                .body(b)
+                .send());
+                match resp {
+                    Ok(r) => {
+                        let text = futures::executor::block_on(r.text());
+                        match text {
+                            Ok(t) => Ok(t),
+                            Err(e) => Err(PeerClientError{ message: "Error".to_string() }),
+                        }
+                    },
+                    Err(e) => Err(PeerClientError{ message: "Error".to_string() })
+                }
+            },
+            Err(e) => {
+                Err(PeerClientError{ message: "Error".to_string() })
+            }
+        }
+    } 
+    */   
+}
+
+
+pub struct SelfPeer {
+}
+
+impl SelfPeer {
+    pub fn new() -> Self {
+        SelfPeer {}
+    }
+}
+
+unsafe impl Send for SelfPeer {}
+unsafe impl Sync for SelfPeer {}
+
+
+#[async_trait]
+impl PeerClient for SelfPeer {
+    async fn private_sql(&self, invocation: &PrivateSqlInvocation) -> Result<String, PeerClientError> {
+        let query_result = data_query(invocation).await;
+        match query_result {
+            Ok(qr) => {
+                Ok(qr.result)
+            },
+            Err(e) => {
+                Err(PeerClientError { message: e.message })
+            }
+        }
+    }
+}
+
+
+pub(crate) trait PeerClientGenerator {
+    fn generate(&self) -> Vec<Box<dyn PeerClient>>;
+
+    fn test_server(&self) -> Option<&TestServer>;
+}
+
+
+struct RealPeerClientGenerator {}
+
+unsafe impl Send for RealPeerClientGenerator {}
+unsafe impl Sync for RealPeerClientGenerator {}
+
+impl RealPeerClientGenerator {
+    fn new() -> Self {
+        RealPeerClientGenerator{}
+    }
+}
+
+impl PeerClientGenerator for RealPeerClientGenerator {
+    fn generate(&self) -> Vec<Box<dyn PeerClient>> {
+        state_leader::get_leader().get_peers()
+    }
+
+    fn test_server(&self) -> Option<&TestServer> {
+        None
+    }
+}
+
+
+pub static mut PEER_CLIENT_GENERATOR: std::sync::LazyLock<Box<dyn PeerClientGenerator>> = 
+    std::sync::LazyLock::new(|| Box::new(RealPeerClientGenerator::new()));
+
+
+pub fn get_peer_clients() -> Vec<Box<dyn PeerClient>> {
+    unsafe {
+        (*PEER_CLIENT_GENERATOR).generate()
+    }
+}
+
+pub fn get_test_server() -> Option<&'static TestServer> {
+    unsafe {
+        (*PEER_CLIENT_GENERATOR).test_server()
+    }
+}
+
+
+#[cfg(test)]
+pub mod tests {
+    use std::str;
+
+    use async_trait::async_trait;
+    use gotham::{mime, test::TestServer};
+
+    use crate::router::router;
+
+    use super::{PeerClient, PeerClientError, PeerClientGenerator, PrivateSqlInvocation};
+
+    pub(crate) struct TestPeerClient {
+        server: TestServer,
+    }
+
+    impl TestPeerClient {
+        pub fn new(server: TestServer) -> Self {
+            TestPeerClient {
+                server: server
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PeerClient for TestPeerClient {
+        async fn private_sql(&self, invocation: &PrivateSqlInvocation) -> Result<String, PeerClientError> {
+            let body_obj = match serde_json::to_string(invocation) {
+                Ok(bo) => bo,
+                Err(_) => panic!("bad format")
+            };
+            let response = self.server.client().post(
+                "http://localhost/_private/v1/_sql",
+                body_obj,
+                mime::APPLICATION_JSON,
+            ).perform().unwrap();
+
+            if response.status() == 200 {
+                let body = response.read_body().unwrap();
+                let str_body = str::from_utf8(&body).unwrap();
+                Ok(str_body.to_string())
+            } else {
+                Err(PeerClientError { message: "Something go boom".to_string() })
+            }
+        }
+    }
+
+    pub struct TestPeerClientGenerator {
+        server: TestServer,
+    }
+
+    unsafe impl Send for TestPeerClientGenerator {}
+    unsafe impl Sync for TestPeerClientGenerator {}
+    
+    impl TestPeerClientGenerator {
+        pub fn new() -> Self {
+            TestPeerClientGenerator{
+                server: TestServer::new(router(true)).unwrap()
+            }
+        }
+    }
+    
+    impl PeerClientGenerator for TestPeerClientGenerator {
+        fn generate(&self) -> Vec<Box<dyn PeerClient>> {
+            vec!(Box::new(TestPeerClient{
+                server: self.server.clone()
+            }))
+        }
+
+        fn test_server(&self) -> Option<&TestServer> {
+            Some(&self.server)
+        }
+    }    
+}
