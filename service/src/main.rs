@@ -19,7 +19,6 @@ mod elastic_search_parser;
 mod elastic_search_pipeline;
 mod elastic_search_responses;
 mod expression_evaluator;
-mod json_loader;
 mod painless_parser;
 mod pipeline;
 mod private_api;
@@ -40,7 +39,7 @@ fn build_config() -> anyhow::Result<ServerConfig> {
     let certs = certs(&mut cert_file)
         .map(|result| result.map(|der| Certificate(der.to_vec())))
         .collect::<Result<_, _>>()?;
-    let mut keys: Vec<Result<PrivatePkcs1KeyDer, io::Error>> = rsa_private_keys(&mut key_file).collect();
+    let keys: Vec<Result<PrivatePkcs1KeyDer, io::Error>> = rsa_private_keys(&mut key_file).collect();
     let intermediate = keys.get(0).unwrap().as_ref().unwrap();
 
     let key = PrivateKey(intermediate.secret_pkcs1_der().to_vec());

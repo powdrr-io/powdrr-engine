@@ -11,11 +11,14 @@ use ttl_cache::TtlCache;
 pub(crate) trait LeaderClient {
     fn get_peers(&self) -> Vec<Box<dyn PeerClient>>;
 
+    #[allow(dead_code)]
     fn get_current_snapshot(&mut self, table_name: String, extensions: Option<String>) -> String;
 }
 
 struct RealLeader {
+    #[allow(dead_code)]
     cache: TtlCache<String, String>,
+    #[allow(dead_code)]
     ttl: Duration,
 }
 

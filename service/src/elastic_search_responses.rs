@@ -123,6 +123,7 @@ impl QueryResults {
         }
     }
 
+    #[allow(dead_code)]
     pub fn timed_out(took: u32, num_shards: u32) -> Self {
         QueryResults { 
             took: took, 
@@ -162,6 +163,7 @@ impl CommandResponse for QueryFailure {
 }
 
 #[derive(Serialize)]
+#[allow(dead_code)]
 pub(crate) struct SingleDocResult {
     _id: String,
     _index: String,

@@ -8,6 +8,7 @@ use datafusion::{
 
 
 // First, declare the actual implementation of the calculation
+#[allow(dead_code)]
 fn pow_udf(args: &[ColumnarValue]) -> Result<ColumnarValue, DataFusionError> {
     // in DataFusion, all `args` and output are dynamically-typed arrays, which means that we need to:
     // 1. cast the values to the type we want

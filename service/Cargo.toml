@@ -45,6 +45,3 @@ url = "2.5.4"
 use = "0.0.1-pre.0"
 uuid-b64 = "0.2.0"
 
-
-[profile.release]
-debug = 1

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, error::Error, hash::Hash};
+use std::{collections::HashMap, error::Error};
 
 use async_trait::async_trait;
 use idgenerator::IdInstance;
@@ -141,6 +141,7 @@ impl TableDescription {
 
 #[async_trait]
 pub(crate) trait ApiServiceClient : Send + Sync {
+    #[allow(dead_code)]
     async fn get_all_iceberg_tables(&mut self) -> Result<Vec<String>, Box<dyn Error>>;
 
     async fn create_table(&mut self, create_table: &CreateTable) -> Result<(), Box<dyn Error>>;
@@ -462,7 +463,7 @@ impl ApiServiceClient for RealApiServiceClient {
         todo!()
     }  
 
-    async fn create_table_template(&mut self, name: &String, template: &CreateIndexTemplateBody) -> Result<(), Box<dyn Error>> {
+    async fn create_table_template(&mut self, _name: &String, _template: &CreateIndexTemplateBody) -> Result<(), Box<dyn Error>> {
         todo!()
     }
 

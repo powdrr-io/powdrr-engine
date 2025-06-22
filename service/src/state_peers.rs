@@ -39,6 +39,7 @@ pub(crate) struct PrivateSqlInvocation {
 
 // TODO: make all these Vecs into Arc<Vec>?
 impl PrivateSqlInvocation {
+    #[allow(dead_code)]
     pub fn new(
         sql: String,
         required_extensions: Vec<String>,
@@ -72,7 +73,7 @@ pub(crate) struct PeerClientError {
 
 impl Display for PeerClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message);
+        f.write_str(&self.message)?;
         Ok(())
     }
 }
@@ -87,6 +88,7 @@ pub trait PeerClient: Send + Sync {
     async fn private_sql(&self, invocation: &PrivateSqlInvocation) -> Result<String, PeerClientError>;
 }
 
+#[allow(dead_code)]
 pub(crate) struct RemotePeer {
     address: String,
     client: Client,
@@ -94,6 +96,7 @@ pub(crate) struct RemotePeer {
 
 
 impl RemotePeer {
+    #[allow(dead_code)]
     pub fn new(address: String) -> Self {
         RemotePeer {
             address: address,
@@ -195,6 +198,7 @@ impl PeerClient for SelfPeer {
 pub(crate) trait PeerClientGenerator {
     fn generate(&self) -> Vec<Box<dyn PeerClient>>;
 
+    #[allow(dead_code)]
     fn test_server(&self) -> Option<&TestServer>;
 }
 
@@ -231,6 +235,7 @@ pub fn get_peer_clients() -> Vec<Box<dyn PeerClient>> {
     }
 }
 
+#[allow(dead_code)]
 pub fn get_test_server() -> Option<&'static TestServer> {
     unsafe {
         (*PEER_CLIENT_GENERATOR).test_server()
@@ -254,6 +259,7 @@ pub mod tests {
     }
 
     impl TestPeerClient {
+        #[allow(dead_code)]
         pub fn new(server: TestServer) -> Self {
             TestPeerClient {
                 server: server
@@ -292,6 +298,7 @@ pub mod tests {
     unsafe impl Sync for TestPeerClientGenerator {}
     
     impl TestPeerClientGenerator {
+        #[allow(dead_code)]
         pub fn new() -> Self {
             TestPeerClientGenerator{
                 server: TestServer::new(router(true)).unwrap()
