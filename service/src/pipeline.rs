@@ -2,7 +2,7 @@ use std::{collections::HashMap, error::Error, fmt::Display};
 
 use minijinja::context;
 use serde::{ser::SerializeMap, Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::expression_evaluator;
 
@@ -112,7 +112,7 @@ impl AppendProcessorBody {
         }
     }
 
-    fn apply(&self, value: &mut Value) -> Result<(), PipelineError> {
+    fn apply(&self, _value: &mut Value) -> Result<(), PipelineError> {
         todo!()
     }    
 }
@@ -139,7 +139,7 @@ impl RemoveProcessorBody {
         }
     }
 
-    fn apply(&self, value: &mut Value) -> Result<(), PipelineError> {
+    fn apply(&self, _value: &mut Value) -> Result<(), PipelineError> {
         todo!()
     }    
 }
@@ -166,7 +166,7 @@ impl PipelineProcessorBody {
         }
     }
 
-    fn apply(&self, value: &mut Value) -> Result<(), PipelineError> {
+    fn apply(&self, _value: &mut Value) -> Result<(), PipelineError> {
         todo!()
     }    
 }
@@ -195,7 +195,7 @@ impl RenameProcessorBody {
         }
     }
 
-    fn apply(&self, value: &mut Value) -> Result<(), PipelineError> {
+    fn apply(&self, _value: &mut Value) -> Result<(), PipelineError> {
         todo!()
     }    
 }
@@ -218,19 +218,19 @@ impl Serialize for ProcessorBodies {
         let mut map_serializer = serializer.serialize_map(None)?;
         match self {
             ProcessorBodies::Set(body) => {
-                map_serializer.serialize_entry("set", body);
+                map_serializer.serialize_entry("set", body)?;
             },
             ProcessorBodies::Pipeline(body) => {
-                map_serializer.serialize_entry("pipeline", body);
+                map_serializer.serialize_entry("pipeline", body)?;
             },
             ProcessorBodies::Remove(body) => {
-                map_serializer.serialize_entry("remove", body);
+                map_serializer.serialize_entry("remove", body)?;
             },
             ProcessorBodies::Rename(body) => {
-                map_serializer.serialize_entry("rename", body);
+                map_serializer.serialize_entry("rename", body)?;
             },  
             ProcessorBodies::Append(body) => {
-                map_serializer.serialize_entry("append", body);
+                map_serializer.serialize_entry("append", body)?;
             },                                                 
         }
         map_serializer.end()
@@ -315,6 +315,7 @@ pub(crate) struct PipelineDefinition {
 
 
 impl PipelineDefinition {
+    #[allow(dead_code)]
     pub fn new(description: &Option<String>, processors: &Vec<ProcessorBodies>, on_failure: &Vec<ProcessorBodies>) -> Self {
         PipelineDefinition { 
             description: description.clone(), 

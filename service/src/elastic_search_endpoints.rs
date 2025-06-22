@@ -268,7 +268,7 @@ pub fn es_update_with_id(mut state: State) -> Pin<Box<HandlerFuture>> {
     }.boxed()
 }
 
-pub fn es_get_with_id(mut state: State) -> Pin<Box<HandlerFuture>> {
+pub fn es_get_with_id(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_get_with_id"); 
     async {
         let path_extractor = NameIdPathExtractor::borrow_from(&state);
@@ -282,7 +282,7 @@ pub fn es_get_with_id(mut state: State) -> Pin<Box<HandlerFuture>> {
 }
 
 
-pub fn es_delete_with_id(mut state: State) -> Pin<Box<HandlerFuture>> {
+pub fn es_delete_with_id(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_get_with_id"); 
     async {
         let path_extractor = NameIdPathExtractor::borrow_from(&state);
@@ -432,13 +432,14 @@ pub fn es_create_index_template(mut state: State) -> Pin<Box<HandlerFuture>> {
 
 #[derive(Deserialize, StateData, StaticResponseExtender)]
 pub(crate) struct QueryStringAliases {
+    #[allow(dead_code)]
     timeout: Option<String>
 }
 
 pub fn es_update_aliases(mut state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_update_aliases"); 
     async {
-        let query_string = QueryStringAliases::take_from(&mut state);
+        let _query_string = QueryStringAliases::take_from(&mut state);
         let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
             Ok(vb) => vb,
             Err(_) => panic!("Oh no"),
@@ -461,8 +462,11 @@ pub fn es_update_aliases(mut state: State) -> Pin<Box<HandlerFuture>> {
 
 #[derive(Deserialize, StateData, StaticResponseExtender)]
 pub(crate) struct QueryStringSearch {
+    #[allow(dead_code)]
     allow_partial_search_results: Option<bool>,
+    #[allow(dead_code)]
     sort: Option<String>,
+    #[allow(dead_code)]
     rest_total_hits_as_int: Option<bool>,
 }
 
@@ -471,7 +475,7 @@ pub(crate) struct QueryStringSearch {
 pub fn es_search(mut state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_search");
     async {
-        let query_string = QueryStringSearch::take_from(&mut state);
+        let _query_string = QueryStringSearch::take_from(&mut state);
         let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
             Ok(vb) => vb,
             Err(_) => panic!("Oh no"),
@@ -540,10 +544,10 @@ pub fn es_search_table(mut state: State) -> Pin<Box<HandlerFuture>> {
 
 
 /// Handler function for `POST` requests directed to `/:table/_pit`
-pub fn es_index_pit(mut state: State) -> Pin<Box<HandlerFuture>> {
+pub fn es_index_pit(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_index_pit");
     async {
-        let path_extractor = NamePathExtractor::borrow_from(&state);
+        let _path_extractor = NamePathExtractor::borrow_from(&state);
         // TODO: really generate this. just needs to be an encoded checkpoint id for this table
         let response_data = HashMap::from(
             [("succeeded", json!(true)),
@@ -555,7 +559,7 @@ pub fn es_index_pit(mut state: State) -> Pin<Box<HandlerFuture>> {
 }
 
 /// Handler function for `DELETE` requests directed to `/_pit`
-pub fn es_delete_pit(mut state: State) -> Pin<Box<HandlerFuture>> {
+pub fn es_delete_pit(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_delete_pit");
     async {
         let response_data = HashMap::from([("id", "t8jsAwEeLmtpYmFuYV90YXNrX21hbmFnZXJfOC43LjFfMDAxFkNScFZFdlZZUzNHTTBZdzVmOVY1VHcAFk0yQkNZM0s0UldDQUlvZTBaTkRqNXcAAAAAAAAAAAEWUkxXRUxKbWhUWkt3LXRTWHdhb3loQQABFkNScFZFdlZZUzNHTTBZdzVmOVY1VHcAAA==")]);

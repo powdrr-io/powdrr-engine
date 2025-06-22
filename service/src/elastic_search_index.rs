@@ -6,6 +6,7 @@ use idgenerator::IdInstance;
 use crate::{data_access::{execute_sql, exists, load_json_file_as_table, load_parquet_file_as_table}, state_hosted_service::{ExtensionCommit, ExtensionFile, ExtensionFileMetadata, ExtensionMetadata, TableMetadataCheckpoint, API_SERVICE_CLIENT}, util::add_file_suffix};
 
 
+#[allow(dead_code)]
 pub(crate) struct IndexError {
     pub message: String,
 }

@@ -64,6 +64,8 @@ async fn to_hits(index: &String, data_frame: &DataFrame) -> Vec<QueryResultHit> 
     hits
 }
 
+#[allow(dead_code)]
+
 pub(crate) struct Match {
     pub table: String,
     pub field: String,
@@ -167,7 +169,7 @@ impl Command for Match {
     }    
 }
 
-
+#[allow(dead_code)]
 pub(crate) struct MatchBuilder {
     pub table: String,
     pub field: String,
@@ -180,10 +182,12 @@ unsafe impl Sync for MatchBuilder {}
 
 
 impl MatchBuilder {
+    #[allow(dead_code)]
     pub fn new(table: &String, field: &String) -> Self {
         MatchBuilder { table: table.clone(), field: field.clone(), query: None }
     }
 
+    #[allow(dead_code)]
     pub fn build(self) -> Result<Match, ParseError> {
         match self.query {
             None => return Err(ParseError { message: "Match must include query".to_string() }),
@@ -439,7 +443,7 @@ impl Command for UpdateByQueryCommand {
             final_result_values.iter().for_each(|f|buffer.lines.push(serde_json::to_string(f).unwrap()));
             match elastic_search_ingest::commit(&buffer, &table).await {
                 Ok(_) => (),
-                Err(e) => panic!("nope"),
+                Err(_) => panic!("nope"),
             };
             Ok(Arc::new(QueryFailure{ message: "I am trying!".to_string() }))
         }.boxed()

@@ -1,9 +1,4 @@
-use std::{any::Any, collections::HashMap, error::Error, fmt::Display, iter::zip};
-
-use datafusion::{common::utils::expr, functions::unicode::left};
-use serde_json::Value;
-use tracing::field;
-
+use std::{any::Any, error::Error, fmt::Display, iter::zip};
 
 #[derive(Clone, PartialEq, Debug)]
 enum TokenKind {
@@ -13,10 +8,12 @@ enum TokenKind {
 
 
 #[derive(Clone)]
-struct Token {
+pub(crate) struct Token {
     kind: TokenKind,
     value: String,
+    #[allow(dead_code)]
     line: usize,
+    #[allow(dead_code)]
     pos: usize,
 }
 
@@ -25,22 +22,16 @@ pub(crate) struct ParserContext {
     pub current_pos: usize,
 }
 
-
-fn is_string_literal_end(command_str: String, current_index: usize, end_string_literal: &str) -> bool {
-    if command_str.len() >= current_index + end_string_literal.len() - 1 {
-        false
-    } else {
-        &command_str[current_index..current_index + end_string_literal.len()] == end_string_literal
-    }
-}
-
 const KEYWORDS: [&str; 2] = ["if", "null"];
 const STRING_LITERAL_BEGINS: [&str; 1] = ["\""];
 const STRING_LITERAL_ENDS: [&str; 1] = ["\""];
 const DELIMITERS: [&str; 17] = [",", "(", ")", "=", ":", ";", "[", "]", "?", ".", "<", ">", "!", "|", "&", "[", "]"];
 const DELIMITER_CONTAINING_KEYWORDS: [&str; 7] = ["<=", ">=", "?.", "!=", "==", "||", "&&"];
+
+#[allow(dead_code)]
 const BOOLEAN_OPERATORS: [&str; 9] = ["<=", ">=", "?.", "!=", "==", "||", "&&", "<", ">"];
 const WHITESPACE: [&str; 2] = [" ", "\n"];
+#[allow(dead_code)]
 const EXPRESSION_ENDERS: [&str; 4] = [")", "=", "]", ";"];
 
 
@@ -346,7 +337,7 @@ impl Expression for VariableOrTypeReference {
         self
     }
 
-    fn translate(&self, context: TranslationContext) -> Result<String, TranslationError> {
+    fn translate(&self, _context: TranslationContext) -> Result<String, TranslationError> {
         if self.name == "ctx" || self.name == "params" {
             Ok(self.name.to_string())
         } else if self.name.starts_with("\"") {
@@ -365,7 +356,7 @@ impl Expression for NullReference {
         self
     }
 
-    fn translate(&self, context: TranslationContext) -> Result<String, TranslationError> {
+    fn translate(&self, _context: TranslationContext) -> Result<String, TranslationError> {
         Ok("none".to_string())
     }    
 }
@@ -482,7 +473,6 @@ impl Expression for Comparison {
    
     fn translate(&self, context: TranslationContext) -> Result<String, TranslationError> {
         // TODO: translate operator
-        let right = self.right_expression.translate(context.clone())?;
         let is_right_null = Comparison::is_null(&self.right_expression);
         if self.operator == "!=" && is_right_null {
             Ok(format!("{} is not none", self.left_expression.translate(context.clone())?))
@@ -770,7 +760,7 @@ fn parse_index(parser_context: &mut ParserContext, expression: Box<dyn Expressio
 }
 
 
-fn parse_variable_declaration(parser_context: &mut ParserContext, first_token: &Token) -> Result<Box<dyn Statement>, TranslationError> {
+fn parse_variable_declaration(_parser_context: &mut ParserContext, _first_token: &Token) -> Result<Box<dyn Statement>, TranslationError> {
     panic!("Not implemented")
 }
 

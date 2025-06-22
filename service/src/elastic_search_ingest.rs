@@ -76,6 +76,7 @@ impl WriteBuffer {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn concat(left: &WriteBuffer, right: &WriteBuffer) -> WriteBuffer {
         WriteBuffer {
             lines: [&left.lines[..], &right.lines[..]].concat(),
@@ -92,8 +93,9 @@ impl WriteBuffer {
 }
 
 
-struct CreateDoc {
+pub(crate) struct CreateDoc {
     raw: String,
+    #[allow(dead_code)]
     parsed: Value,
 }
 
@@ -105,9 +107,12 @@ struct IndexOrCreateBody {
     #[serde(rename(deserialize = "_id"))]
     id: Option<String>,
     #[serde(default = "default_as_false")]
+    #[allow(dead_code)]
     list_executed_pipelines: bool,
     #[serde(default = "default_as_false")]
+    #[allow(dead_code)]
     require_alias: bool,
+    #[allow(dead_code)]
     dynamic_templates: Option<HashMap<String, String>>,
 }
 
@@ -115,33 +120,39 @@ struct IndexOrCreateBody {
 #[derive(Deserialize)]
 struct UpdateOrDeleteBody {
     #[serde(rename(deserialize = "_index"))]
+    #[allow(dead_code)]
     index: Option<String>,
     #[serde(rename(deserialize = "_id"))]
+    #[allow(dead_code)]
     id: Option<String>,
     #[serde(default = "default_as_false")]
+    #[allow(dead_code)]
     require_alias: bool,
 }
 
 
 #[derive(Deserialize)]
-struct Create {
+pub(crate) struct Create {
     create: IndexOrCreateBody
 }
 
 
 #[derive(Deserialize)]
-struct Index {
+#[allow(dead_code)]
+pub(crate) struct Index {
     index: IndexOrCreateBody
 }
 
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct Delete {
     delete: UpdateOrDeleteBody
 }
 
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct Update {
     update: UpdateOrDeleteBody
 }
@@ -149,6 +160,7 @@ struct Update {
 
 #[derive(Deserialize)]
 #[serde(untagged)]
+#[allow(dead_code)]
 enum IngestCommand {
     Create(Create),
     Index(Index),
@@ -435,11 +447,13 @@ impl IngestResult {
 
 
 #[derive(Serialize)]
+#[allow(dead_code)]
 struct CreateSingleSuccessResult {
 
 }
 
 #[derive(Serialize)]
+#[allow(dead_code)]
 struct CreateSingleErrorResult {
 
 }
@@ -654,6 +668,8 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
 }
 
 
+//TODO this is called but the code analyzer isn't seeing it
+#[allow(dead_code)]
 async fn ingest_and_write(payload: &String) -> Result<(Vec<SpeedboatCommitTableInfo>, BulkResult), IngestError> {
     let buffer_items = match ingest(None, payload).await {
         Ok(b) => b,
@@ -682,6 +698,8 @@ async fn ingest_and_write(payload: &String) -> Result<(Vec<SpeedboatCommitTableI
 }
 
 
+// TODO: this is called but the code analyzer isn't seeing it
+#[allow(dead_code)]
 pub(crate) async fn ingest_and_commit(payload: &String) -> Result<BulkResult, IngestError> {
     match ingest_and_write(payload).await {
         Ok(result) => {
@@ -861,6 +879,7 @@ impl IngestHandle {
         }
     }    
 
+    #[allow(dead_code)]
     pub async fn send_single_table(&self, table: &String, payload: &String) -> Result<BulkResult, IngestError> {
         let (send, recv) = oneshot::channel();
         let msg = IngestActorMessage::IngestSingleTable { 
@@ -912,7 +931,7 @@ pub(crate) static INGEST_HANDLE: std::sync::LazyLock<IngestHandle> = std::sync::
 mod tests {
     use std::{collections::HashMap, fs};
 
-    use crate::{elastic_search_ingest::{ingest_and_write, IngestCommand, PropertyInfo}, state_hosted_service::{CreateTable, API_SERVICE_CLIENT}};
+    use crate::elastic_search_ingest::{IngestCommand, PropertyInfo};
 
     use super::{CreateIndexBody, CreateIndexTemplateBody};
 

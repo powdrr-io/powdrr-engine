@@ -1,8 +1,7 @@
-use std::{cell::Cell, collections::HashMap, fmt, sync::{Arc, Mutex, RwLock}, thread::current};
+use std::{collections::HashMap, fmt, sync::{Arc, Mutex}};
 
 use chrono::{DateTime, FixedOffset};
-use minijinja::{value::{Object, ValueKind}, Environment, Error, State, Template, Value};
-use serde::Serialize;
+use minijinja::{value::{Object, ValueKind}, Environment, Error, State, Value};
 
 
 #[derive(Debug)]
@@ -100,7 +99,7 @@ impl Object for ZonedDateTimeObject {
         self: &Arc<Self>,
         _state: &State,
         name: &str,
-        args: &[Value],
+        _args: &[Value],
     ) -> Result<Value, Error> {
         if name == "toInstant" {
             Ok(Value::from_object(Instant{ value: self.value.clone() }))
@@ -120,7 +119,7 @@ impl Object for Instant {
         self: &Arc<Self>,
         _state: &State,
         name: &str,
-        args: &[Value],
+        _args: &[Value],
     ) -> Result<Value, Error> {
         if name == "toEpochMilli" {
             // TODO: convert datetime str in 'value' to millis from the epoch
@@ -260,7 +259,7 @@ mod tests {
 
         let translated = translate(&test_val.to_string()).unwrap();
 
-        let (_, outputs) = eval_template(translated.as_str(), &source_val, HashMap::new(), Value::from_serialize(params_val));
+        let (_, _) = eval_template(translated.as_str(), &source_val, HashMap::new(), Value::from_serialize(params_val));
 
         let final_doc_str = serde_json::to_string(&source_val).unwrap();
         println!("{}", final_doc_str);

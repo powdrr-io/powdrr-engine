@@ -5,29 +5,9 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use phf::phf_map;
 
-use crate::elastic_search_commands::{MatchBuilder, SqlCommand, UpdateByQueryCommand};
+use crate::elastic_search_commands::{SqlCommand, UpdateByQueryCommand};
 use crate::elastic_search_common::{Command, ParseError};
-
-
-fn check_single_entry_dict(value: &Value) -> Result<(String, Value), ParseError> {
-    let val_keys: Vec<&String> = match value.as_object() {
-        Some(obj) => obj.keys().collect(),
-        None => return Err(ParseError{message: "Unexpected format".to_string()})
-    };
-
-    if val_keys.len() != 1 {
-        return Err(ParseError{message: "Only handling single val just now".to_string()})
-    }
-
-    let key = val_keys.get(0).unwrap(); 
-    let inner_value = &value[key];
-    Ok((key.to_string(), inner_value.clone()))
-}
-
-
-type CommandParserFnPtr = fn(&String, &Value) -> Result<Arc<dyn Command>, ParseError>;
 
 
 // Example:
@@ -40,67 +20,6 @@ type CommandParserFnPtr = fn(&String, &Value) -> Result<Arc<dyn Command>, ParseE
 //     }
 //   }
 // }
-fn match_command_parser(table: &String, value: &Value) ->  Result<Arc<dyn Command>, ParseError> {
-    let match_values = match check_single_entry_dict(&value) {
-        Ok(mv) => mv,
-        Err(e) => return Err(e),
-    };
-
-    let field = match_values.0;
-    let mut match_builder = MatchBuilder::new(table, &field);
-    match match_values.1.as_object() {
-        Some(v) => {
-            for entry in v.iter() {
-                if entry.0 == "query" {
-                    match entry.1.as_str() {
-                        Some(v) => match_builder.query = Some(v.to_string()),
-                        None => return Err(ParseError { message: "Expected string".to_string() }),
-                    };
-                } else {
-                    return Err(ParseError { message: "Need to add in more options".to_string() });
-                }
-            }
-        },
-        None => return Err(ParseError { message: "Expected values".to_string() }),
-    };
-    match match_builder.build() {
-        Ok(m) => Ok(Arc::new(m)),
-        Err(e) => Err(e)
-    }
-}
-
-
-static COMMANDS: phf::Map<&'static str, CommandParserFnPtr> = phf_map! {
-    "match" => match_command_parser,
-};
-
-
-pub fn old_parse(table: &String, val: &String) -> Result<Arc<dyn Command>, ParseError> {
-    let parsed_val: Value = match serde_json::from_str(val) {
-        Ok(v) => v,
-        Err(_) => return Err(ParseError{message: "Invalid JSON".to_string()})
-    };
-
-    let query_val = match parsed_val.get("query") {
-        Some(q) => q,
-        None => return Err(ParseError{message: "Query must contain 'query'".to_string()})
-    };
-
-    let query_val_keys: Vec<&String> = match query_val.as_object() {
-        Some(obj) => obj.keys().collect(),
-        None => return Err(ParseError{message: "Unexpected format".to_string()})
-    };
-
-    if query_val_keys.len() != 1 {
-        return Err(ParseError{message: "Only handling single val just now".to_string()})
-    }
-
-    let command_name = query_val_keys.get(0).unwrap();
-    match COMMANDS.get(&command_name) {
-        Some(cp) => cp(table, &query_val[command_name]),
-        None => Err(ParseError{message: "Unknown command".to_string()})
-    }
-}
 
 
 pub fn parse(table: Option<String>, val: &String) -> Result<Arc<dyn Command>, ParseError> {

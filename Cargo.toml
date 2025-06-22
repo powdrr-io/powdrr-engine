@@ -6,3 +6,6 @@ members = [ "iceberg_lib","service"]
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
+
+[profile.release]
+debug = 1

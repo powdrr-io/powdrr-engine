@@ -62,6 +62,7 @@ impl CommandResponse for ElasticSearchResponse {
     }
 }
 
+
 pub(crate) struct SqlBuilder {
     pub columns: Vec<String>,
     pub table: Option<String>,
@@ -71,6 +72,7 @@ pub(crate) struct SqlBuilder {
 
 
 impl SqlBuilder {
+    #[allow(dead_code)]
     fn new() -> Self {
         SqlBuilder {
             columns: Vec::new(),
@@ -80,25 +82,30 @@ impl SqlBuilder {
         }
     }
 
+    #[allow(dead_code)]
     fn get_table(&self) -> &Option<String> {
         &self.table
     }
 
+    #[allow(dead_code)]
     fn set_table(&mut self, val: String) -> &mut SqlBuilder {
         self.table = Some(val);
         self
     }
 
+    #[allow(dead_code)]
     fn add_column(&mut self, column: String) -> &mut SqlBuilder {
         self.columns.push(column);
         self
     }
 
+    #[allow(dead_code)]
     fn add_filter(&mut self, filter: String) -> &mut SqlBuilder {
         self.filters.push(filter);
         self
     }
 
+    #[allow(dead_code)]
     fn add_order_by(&mut self, order_by: String) -> &mut SqlBuilder {
         self.order_by.push(order_by);
         self
@@ -120,6 +127,7 @@ impl SqlBuilder {
         }
     }
 
+    #[allow(dead_code)]
     pub (crate) fn build(&self) -> String {
         let columns = self.columns.join(", ");
         let filters = self._format_filters();
@@ -131,8 +139,9 @@ impl SqlBuilder {
         
     }
 
+    #[allow(dead_code)]
     fn merge(_builders: Vec<&SqlBuilder>) -> SqlBuilder {
-        SqlBuilder::new()
+        todo!()
     }
 }
 
@@ -141,14 +150,17 @@ pub type ResultGeneratorFuture = dyn Future<Output = Result<Arc<dyn CommandRespo
 
 #[async_trait]
 pub(crate) trait Command: Send + Sync {
+    #[allow(dead_code)]
     fn get_name(&self) -> String;
 
+    #[allow(dead_code)]
     fn get_tables(&self) -> Vec<String>;
 
     fn result_generator(&self, result_table_name: Option<String>) -> Pin<Box<ResultGeneratorFuture>>;
 
     fn generate_sql(&self) -> String;
 
+    #[allow(dead_code)]
     fn generate_filters(&self) -> Vec<&FileFilter>;
 
     fn required_extensions(&self) -> Vec<String>;

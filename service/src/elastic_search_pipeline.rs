@@ -4,7 +4,7 @@ use chrono::prelude::*;
 use serde::{ser::SerializeMap, Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::{elastic_search_ingest, painless_parser, pipeline::{self, AppendProcessorBody, PipelineDefinition, PipelineError, PipelineProcessorBody, ProcessorBodies, RemoveProcessorBody, RenameProcessorBody, SetProcessorBody}, state_hosted_service::API_SERVICE_CLIENT};
+use crate::{painless_parser, pipeline::{self, AppendProcessorBody, PipelineDefinition, PipelineError, PipelineProcessorBody, ProcessorBodies, RemoveProcessorBody, RenameProcessorBody, SetProcessorBody}, state_hosted_service::API_SERVICE_CLIENT};
 
 
 fn is_false(b: &bool) -> bool { !b }
@@ -103,19 +103,19 @@ impl Serialize for ElasticSearchProcessorBodies {
         let mut map_serializer = serializer.serialize_map(None)?;
         match self {
             ElasticSearchProcessorBodies::Set(body) => {
-                map_serializer.serialize_entry("set", body);
+                map_serializer.serialize_entry("set", body)?;
             },
             ElasticSearchProcessorBodies::Pipeline(body) => {
-                map_serializer.serialize_entry("pipeline", body);
+                map_serializer.serialize_entry("pipeline", body)?;
             },
             ElasticSearchProcessorBodies::Remove(body) => {
-                map_serializer.serialize_entry("remove", body);
+                map_serializer.serialize_entry("remove", body)?;
             },
             ElasticSearchProcessorBodies::Append(body) => {
-                map_serializer.serialize_entry("append", body);
+                map_serializer.serialize_entry("append", body)?;
             },
             ElasticSearchProcessorBodies::Rename(body) => {
-                map_serializer.serialize_entry("rename", body);
+                map_serializer.serialize_entry("rename", body)?;
             },                                    
         }
         map_serializer.end()
@@ -164,7 +164,7 @@ impl ElasticSearchPipelineDefinition {
         match if_stmt {
             Some(if_str) => {
                 originals.insert(original_name.clone(), if_str.clone());
-                Ok(Some(painless_parser::translate(if_str).map_err(|x|PipelineError{})?))
+                Ok(Some(painless_parser::translate(if_str).map_err(|_|PipelineError{})?))
             },
             None => {
                 Ok(None)
@@ -172,6 +172,7 @@ impl ElasticSearchPipelineDefinition {
         }    
     }
 
+    #[allow(dead_code)]
     fn from_process_definition(definition: &PipelineDefinition) -> Self {
         let processors = definition.processors.iter().map(|x|Self::convert_from_processor(x)).collect();
         let on_failure = definition.on_failure.iter().map(|x|Self::convert_from_processor(x)).collect();
@@ -182,6 +183,7 @@ impl ElasticSearchPipelineDefinition {
         }
     }
 
+    #[allow(dead_code)]
     fn convert_from_processor(processor: &ProcessorBodies) -> ElasticSearchProcessorBodies {
         match processor {
             ProcessorBodies::Set(body) => {
@@ -236,7 +238,7 @@ impl ElasticSearchPipelineDefinition {
                     Some(cf) => {
                         originals.insert("original_copy_from".to_string(), cf.clone());
                         match &body.value {
-                            Some(v) => return Err(PipelineError {  }),
+                            Some(_) => return Err(PipelineError {  }),
                             None => {
                                 format!("{} _message.{} {}", "{{", cf, "}}")
                             }
@@ -320,6 +322,7 @@ impl ElasticSearchPipelineDefinition {
 }
 
 
+#[allow(dead_code)]
 pub(crate) fn parse_named_definition(value: &String) -> Result<(String, ElasticSearchPipelineDefinition), PipelineError> {
     let named_definition = serde_json::from_str::<HashMap<String, ElasticSearchPipelineDefinition>>(value).unwrap();
 
@@ -333,7 +336,7 @@ pub(crate) fn parse_named_definition(value: &String) -> Result<(String, ElasticS
 }
 
 pub(crate) async fn create_pipeline(name: &String, definition_str: &String) -> Result<CreatePipelineResult, ESPipelineError> {
-    let pipeline_definition = serde_json::from_str(definition_str).map_err(|x|ESPipelineError{ message: "dunno".to_string() })?;
+    let pipeline_definition = serde_json::from_str(definition_str).map_err(|_|ESPipelineError{ message: "dunno".to_string() })?;
 
     API_SERVICE_CLIENT.create_pipeline(name, &pipeline_definition).await;    
 
@@ -377,7 +380,7 @@ pub(crate) async fn simulate_pipeline(name: &Option<String>, definition_str: &St
     };
 
     let pipeline = match request.pipeline {
-        Some(pipeline) => pipeline.to_pipeline_definition().map_err(|x|ESPipelineError{ message: "dunno".to_string() })?,
+        Some(pipeline) => pipeline.to_pipeline_definition().map_err(|_|ESPipelineError{ message: "dunno".to_string() })?,
         None => {
             match name {
                 Some(name) => match API_SERVICE_CLIENT.describe_pipeline(name).await {
@@ -403,7 +406,7 @@ mod tests {
 
     fn double_roundtrip(original: &str) {
         let definition_pair = parse_named_definition(&original.to_string()).unwrap();
-        let name = definition_pair.0;
+        let _name = definition_pair.0;
         let definition = definition_pair.1;
 
         let es_serialized = serde_json::to_string(&definition).unwrap();

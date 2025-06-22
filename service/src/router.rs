@@ -1,5 +1,3 @@
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use futures::future;
 use futures::TryFutureExt;
 use futures_util::future::FutureExt;
@@ -116,29 +114,8 @@ impl Middleware for RouterMiddleware {
 struct PathExtractor {
     // This will be a Vec containing each path segment as a separate String, with no '/'s.
     #[serde(rename = "*")]
+    #[allow(dead_code)]
     parts: Vec<String>,
-}
-
-
-fn parts_handler(state: State) -> (State, String) {
-    let res = {
-        let path = PathExtractor::borrow_from(&state);
-
-        let mut response_string = format!(
-            "Got {} part{}:",
-            path.parts.len(),
-            if path.parts.len() == 1 { "" } else { "s" }
-        );
-
-        for part in path.parts.iter() {
-            response_string.push('\n');
-            response_string.push_str(part);
-        }
-
-        response_string
-    };
-
-    (state, res)
 }
 
 /// Create a `Router`
