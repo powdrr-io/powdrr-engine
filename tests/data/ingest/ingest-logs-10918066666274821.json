@@ -1,0 +1,2 @@
+{"@timestamp":"2099-03-08T11:06:07.000Z","_id":"2fd7MZtMQ5KHKHOSxh9M9A","_version":2,"dude":"bar","index_col":2,"message":"Login successful","score":0.6377141753642581,"user":{"id":"8a4f500d"}}
+{"@timestamp":"2099-03-08T11:04:05.000Z","_id":"O0A7HDGbQWiGW5z6PkZzQA","_version":2,"dude":"bar","index_col":1,"message":"Login attempt failed","score":0.5802048809927318,"user":{"id":"vlb44hny"}}
