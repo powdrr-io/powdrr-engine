@@ -41,6 +41,15 @@ pub fn parse_update_by_query(table: Option<String>, val: &String) -> Result<Arc<
     Ok(Arc::new(command))
 }
 
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+enum SortType {
+    Bare(String),
+    Parameterized(HashMap<String, SortBody>),
+}
+
+
 #[derive(Serialize, Deserialize, Clone)]
 struct SearchBody {
     pit: Option<PitInfo>,
@@ -48,7 +57,7 @@ struct SearchBody {
     from: Option<u32>,
     seq_no_primary_term: Option<bool>,
     query: Query,
-    sort: Option<Vec<HashMap<String, SortBody>>>
+    sort: Option<Vec<SortType>>
 }
 
 
@@ -67,6 +76,7 @@ pub(crate) enum Query {
     Term(Term),
     Exists(Exists),
     SimpleQueryString(SimpleQueryString),
+    Range(Range),
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -88,7 +98,6 @@ pub(crate) struct FieldMatchBody {
     query: String
 }
 
-
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct Bool {
     #[serde(rename = "bool")]
@@ -96,21 +105,45 @@ pub(crate) struct Bool {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+enum SingleOrVec {
+    Vec(Vec<Query>),
+    Single(Box<Query>),
+}
+
+impl SingleOrVec {
+    fn as_vec(&self) -> Vec<Query> {
+        match self {
+            SingleOrVec::Single(s) => {
+                vec!(*s.clone())
+            },
+            SingleOrVec::Vec(v) => {
+                v.clone()
+            }
+        }
+    }
+}
+
+fn default_single_or_vec() -> SingleOrVec {
+    SingleOrVec::Vec(vec!())
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct BoolBody {
-    #[serde(default)]
-    filter: Vec<Query>,
-    #[serde(default)]
-    should: Vec<Query>,
-    #[serde(default)]
-    must: Vec<Query>,
-    #[serde(default)]
-    must_not: Vec<Query>,
+    #[serde(default = "default_single_or_vec")]
+    filter: SingleOrVec,
+    #[serde(default = "default_single_or_vec")]
+    should: SingleOrVec,
+    #[serde(default = "default_single_or_vec")]
+    must: SingleOrVec,
+    #[serde(default = "default_single_or_vec")]
+    must_not: SingleOrVec,
     minimum_should_match: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct Term {
-    term: HashMap<String, String>,
+    term: HashMap<String, Value>,
 }
 
 
@@ -125,9 +158,29 @@ pub(crate) struct ExistsBody {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct RangeSpec {
+    gt: Option<String>,
+    gte: Option<String>,
+    lt: Option<String>,
+    lte: Option<String>,
+    format: Option<String>,
+    relation: Option<String>,
+    time_zone: Option<String>,
+    boost: Option<f64>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct Range {
+    range: HashMap<String, RangeSpec>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct SortBody {
-    order: String,
-    unmapped_type: String
+    #[serde(rename = "type")]
+    _type: Option<String>,
+    order: Option<String>,
+    unmapped_type: Option<String>,
+    script: Option<ScriptBlock>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -153,14 +206,14 @@ pub(crate) enum FilterExpression {
 pub(crate) struct UpdateByQueryBody {
     query: Query,
     script: ScriptBlock,
-    sort: Option<Vec<HashMap<String, SortBody>>>,
+    sort: Option<Vec<SortType>>,
     max_docs: Option<usize>,
     conflicts: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct ScriptBlock {
-    pub script: String,
+    pub source: String,
     pub lang: String,
     #[serde(default)]
     pub params: HashMap<String, Value>,
@@ -298,7 +351,7 @@ impl SqlBuilder {
     fn build(&mut self) -> String {
         let filter_str = self._filters();
         format!(
-            "select {} from {} t{}{}{}{}",
+            "select {} from {} {}{}{}{}",
             self._fields(),
             "{target_table} t",
             self._joins(),
@@ -355,6 +408,7 @@ fn to_command_worker(builder: &mut SqlBuilder, query: &Query) -> Result<(), Pars
         Query::Bool(b) => to_sql_bool(builder, &b),
         Query::Term(t) => to_sql_term(builder, &t),
         Query::Exists(e) => to_sql_exists(builder, &e),
+        Query::Range(r) => to_sql_range(builder, &r),
         Query::SimpleQueryString(s) => to_sql_simple_query(builder, s),
     }
 }
@@ -384,33 +438,33 @@ fn to_sql_match(builder: &mut SqlBuilder, match_obj: &Match) -> Result<(), Parse
 
 fn to_sql_bool(builder: &mut SqlBuilder, bool_obj: &Bool) -> Result<(), ParseError> {
     builder.push_filter_context();
-    if bool_obj._bool.must.len() > 0 {
+    if bool_obj._bool.must.as_vec().len() > 0 {
         builder.push_filter_context();
 
-        bool_obj._bool.must.iter().map(|x|to_command_worker(builder, x)).collect::<Result<Vec<()>, ParseError>>()?;
+        bool_obj._bool.must.as_vec().iter().map(|x|to_command_worker(builder, x)).collect::<Result<Vec<()>, ParseError>>()?;
 
         builder.pop_filter_context(true);
     }
-    if bool_obj._bool.should.len() > 0 {
+    if bool_obj._bool.should.as_vec().len() > 0 {
         builder.push_filter_context();
 
-        bool_obj._bool.should.iter().map(|x|to_command_worker(builder, x)).collect::<Result<Vec<()>, ParseError>>()?;
+        bool_obj._bool.should.as_vec().iter().map(|x|to_command_worker(builder, x)).collect::<Result<Vec<()>, ParseError>>()?;
 
         builder.pop_filter_context(false);        
     }
-    if bool_obj._bool.must_not.len() > 0 {
+    if bool_obj._bool.must_not.as_vec().len() > 0 {
         // Must not is an AND of NOTS which we rewrite into a NOT of ORS to simplify the codegen logic a bit here.
         builder.push_filter_context();
 
-        bool_obj._bool.must_not.iter().map(|x|to_command_worker(builder, x)).collect::<Result<Vec<()>, ParseError>>()?;
+        bool_obj._bool.must_not.as_vec().iter().map(|x|to_command_worker(builder, x)).collect::<Result<Vec<()>, ParseError>>()?;
 
         builder.pop_filter_context(false);        
         builder.not_last_filter();
     } 
-    if bool_obj._bool.filter.len() > 0 {
+    if bool_obj._bool.filter.as_vec().len() > 0 {
         builder.push_filter_context();
 
-        bool_obj._bool.filter.iter().map(|x|to_command_worker(builder, x)).collect::<Result<Vec<()>, ParseError>>()?;
+        bool_obj._bool.filter.as_vec().iter().map(|x|to_command_worker(builder, x)).collect::<Result<Vec<()>, ParseError>>()?;
 
         builder.pop_filter_context(true);
     }
@@ -427,6 +481,50 @@ fn to_sql_term(builder: &mut SqlBuilder, term_obj: &Term) -> Result<(), ParseErr
 
 fn to_sql_exists(builder: &mut SqlBuilder, exists_obj: &Exists) -> Result<(), ParseError> {
     builder.filter(format!("t.{} is not None", exists_obj.exists.field));
+    Ok(())
+}
+
+fn to_sql_range(builder: &mut SqlBuilder, range_obj: &Range) -> Result<(), ParseError> {
+    if range_obj.range.len() != 1 {
+        panic!("Not implemented")
+    }
+    
+    let pair = range_obj.range.iter().next().unwrap();
+    let field_name = pair.0;
+    let spec = pair.1;
+    
+    if spec.format.is_some() || spec.relation.is_some() || spec.time_zone.is_some() || spec.boost.is_some() {
+        panic!("Not implemented")
+    }
+    
+    match &spec.gt {
+        Some(val) => {
+            builder.filter(format!("{field_name} > {val}"));
+        },
+        None => ()
+    };
+
+    match &spec.gte {
+        Some(val) => {
+            builder.filter(format!("{field_name} >= {val}"));
+        },
+        None => ()
+    };
+
+    match &spec.lt {
+        Some(val) => {
+            builder.filter(format!("{field_name} < {val}"));
+        },
+        None => ()
+    };
+
+    match &spec.lte {
+        Some(val) => {
+            builder.filter(format!("{field_name} <= {val}"));
+        },
+        None => ()
+    };
+    
     Ok(())
 }
 
@@ -453,7 +551,7 @@ fn to_sql_simple_query(builder: &mut SqlBuilder, query_obj: &SimpleQueryString) 
 
 #[cfg(test)]
 mod tests {
-    use crate::elastic_search_parser::parse;
+    use crate::elastic_search_parser::{parse, UpdateByQueryBody};
 
     use super::{to_command, SearchBody};
 
@@ -508,7 +606,7 @@ mod tests {
         let command = to_command(Some("testtime".to_string()), &parse_result).unwrap();
 
         println!("{}", command.sql);
-    }    
+    }
 
     #[test]
     fn test_parse_bool() {
@@ -538,8 +636,10 @@ mod tests {
                       }
                     },
                     {
-                      "exists": {
-                        "field": "namespaces"
+                      "range": {
+                        "task.runAt": {
+                          "lte": "now"
+                        }
                       }
                     }
                   ]
@@ -704,6 +804,105 @@ mod tests {
 
         println!("{}", command.sql);
 
+        let test_val = r#"{
+  "size": 1000,
+  "seq_no_primary_term": true,
+  "from": 0,
+  "query": {
+    "bool": {
+      "filter": [
+        {
+          "bool": {
+            "should": [
+              {
+                "bool": {
+                  "must": [
+                    {
+                      "term": {
+                        "type": "space"
+                      }
+                    }
+                  ],
+                  "must_not": [
+                    {
+                      "exists": {
+                        "field": "namespace"
+                      }
+                    },
+                    {
+                      "exists": {
+                        "field": "namespaces"
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "minimum_should_match": 1
+          }
+        }
+      ]
+    }
+  },
+  "sort": [
+    {
+      "space.name.keyword": {
+        "unmapped_type": "keyword"
+      }
+    }
+  ]
+}"#;
+
+        let _parse_result: SearchBody = match serde_json::from_str(test_val) {
+            Ok(pr) => pr,
+            Err(e) => {
+                let error = format!("{}", e);
+                println!("{}", error);
+                panic!("ERROR");
+            }
+        };
+
+        let test_val = r#"{"size":1,"seq_no_primary_term":true,"from":0,"query":{"bool":{"filter":[{"bool":{"should":[{"bool":{"must":[{"term":{"type":"canvas-workpad-template"}}],"must_not":[{"exists":{"field":"namespace"}},{"exists":{"field":"namespaces"}}]}}],"minimum_should_match":1}}]}}}"#;
+
+        let parse_result: SearchBody = match serde_json::from_str(test_val) {
+            Ok(pr) => pr,
+            Err(e) => {
+                let error = format!("{}", e);
+                println!("{}", error);
+                panic!("ERROR");
+            }
+        };
+
+        let _command = to_command(Some("fake_name".to_string()), &parse_result);
+
+
+
     }
 
+    #[test]
+    fn test_parse_update_by_query() {
+        let test_val = include_str!("../tests/data/search_query_1.json");
+
+        let _parse_result: SearchBody = match serde_json::from_str(test_val) {
+            Ok(pr) => pr,
+            Err(e) => {
+                let error = format!("{}", e);
+                println!("{}", error);
+                panic!("ERROR");
+            }
+        };
+
+        let test_val = include_str!("../tests/data/update_by_query_1.json");
+
+        let _parse_result: UpdateByQueryBody = match serde_json::from_str(test_val) {
+            Ok(pr) => {
+                pr
+            },
+            Err(e) => {
+                let error = format!("{}", e);
+                println!("{}", error);
+                panic!("ERROR");
+            }
+        };
+    }
 }

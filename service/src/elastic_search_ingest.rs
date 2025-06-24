@@ -20,7 +20,7 @@ use uuid_b64::UuidB64;
 
 use crate::elastic_search_commands::LookupById;
 use crate::elastic_search_common::{load_command_raw_result, CommandContext, ElasticSearchResponse};
-use crate::elastic_search_responses::{BulkResult, ErrorDetails, OperationResult, Shards, SingleDocCreateFaileResult};
+use crate::elastic_search_responses::{BulkResult, ErrorDetails, OperationResult, Shards, SingleDocCreateFailedResult};
 use crate::{data_access, distributed_cache};
 use crate::state_hosted_service::{CreateTable, SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription, API_SERVICE_CLIENT};
 use crate::util::log_err;
@@ -229,7 +229,7 @@ struct PropertyInfo {
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Mappings {
-    dynamic: String,
+    dynamic: StringOrBool,
     _meta: Option<MetaInfo>,
     properties: HashMap<String, PropertyInfo>,
 }
@@ -239,6 +239,16 @@ struct CreateIndexBody {
     aliases: Option<HashMap<String, AliasInfo>>,
     mappings: Option<Mappings>,
     settings: Option<CreateIndexSettingsOption>,
+}
+
+impl CreateIndexBody {
+    fn parse(content: &String) -> Result<Self, serde_json::Error> {
+        if content.len() == 0 {
+            Ok(CreateIndexBody{ aliases: None, mappings: None, settings: None })
+        } else {
+            serde_json::from_str(content)
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -268,7 +278,7 @@ pub(crate) struct CreateIndexTemplateBody {
 
 
 pub(crate) async fn create_index(table: &String, body: &String) -> Result<CreateIndexResult, IngestError> {
-    let parsed_body: CreateIndexBody = match serde_json::from_str(body) {
+    let parsed_body = match CreateIndexBody::parse(body) {
         Ok(pb) => pb,
         Err(_e) => return log_err(IngestError{ message: "body parsing error".to_string() })
     };
@@ -283,11 +293,7 @@ pub(crate) async fn create_index(table: &String, body: &String) -> Result<Create
         name: table.clone(),
         tags: HashMap::from([("_es_original".to_string(), serialized_body)])
     }).await;
-
-    match distributed_cache::create_table(table) {
-        Ok(_) => (),
-        Err(_) => panic!("What happen?")
-    }
+    
     Ok(CreateIndexResult { index: table.clone(), shards_acknowledged: true, acknowledged: true })
 }
 
@@ -299,11 +305,7 @@ pub(crate) async fn create_index_template(table: &String, body: &String) -> Resu
     };
 
     API_SERVICE_CLIENT.create_table_template(&table, &parsed_body).await;
-
-    match distributed_cache::create_table(table) {
-        Ok(_) => (),
-        Err(_) => panic!("What happen?")
-    }
+    
     Ok(CreateIndexResult { index: table.clone(), shards_acknowledged: true, acknowledged: true })
 }
 
@@ -413,7 +415,7 @@ pub(crate) fn ingest_create(
             successful: 1,
             failed: 0,
         },
-        status: 201,
+        status: Some(201),
         _seq_no: seq_no,
         _primary_term: 1,
     }
@@ -502,6 +504,28 @@ pub(crate) async fn commit_general(buffer: &WriteBuffer, index: &String, commit_
     }  
 }
 
+
+async fn get_existing_doc_count(index: &String, doc_id: &String) -> Result<usize, IngestError> {
+    let df_count = match load_command_raw_result(CommandContext{}, Arc::new(LookupById{ table: index.clone(), ids: vec!(doc_id.clone()) })).await {
+        Ok(lcrr) => match lcrr {
+            Some(raw_table) => {
+                let df = match data_access::execute_sql(&format!("SELECT * from {raw_table}")).await {
+                    Ok(df) => df,
+                    Err(_) => panic!("weird")
+                };
+
+                match df.count().await {
+                    Ok(c) => c,
+                    Err(_) => panic!("weird")
+                }
+            },
+            None => 0,
+        },
+        Err(_) => panic!("weird")
+    };
+    Ok(df_count)
+}
+
 async fn create_single_worker(index: &String, doc_id: &String, payload: &String, fail_on_exists: bool) -> Result<ElasticSearchResponse, IngestError> {
     let table_description: TableDescription = match API_SERVICE_CLIENT.describe_table(&index).await {
         Some(t) => t,
@@ -511,37 +535,21 @@ async fn create_single_worker(index: &String, doc_id: &String, payload: &String,
         Ok(v) => v,
         Err(_) => panic!("nope")
     };
-    let doc: Result<Value, serde_json::Error>  = serde_json::from_str(payload);
+    let doc: Result<Value, serde_json::Error> = serde_json::from_str(payload);
     match doc {
         Ok(valid_doc) => {
-            let df_count = match load_command_raw_result(CommandContext{}, Arc::new(LookupById{ table: table_description.name.clone(), ids: vec!(doc_id.clone()) })).await {
-                Ok(lcrr) => match lcrr {
-                    Some(raw_table) => {
-                        let df = match data_access::execute_sql(&format!("SELECT * from {raw_table}")).await {
-                            Ok(df) => df,
-                            Err(_) => panic!("weird")
-                        };
-            
-                        match df.count().await {
-                            Ok(c) => c,
-                            Err(_) => panic!("weird")
-                        }
-                    },
-                    None => 0,
-                },
-                Err(_) => panic!("weird")
-            };
+            let df_count = get_existing_doc_count(index, doc_id).await?;
 
             let version = if df_count != 0 {
                 // TODO: get version from existing doc
                 if fail_on_exists {
-                    let response = SingleDocCreateFaileResult {
+                    let response = SingleDocCreateFailedResult {
                         error: ErrorDetails::single_cause(
                             &"version_conflict_engine_exception".to_string(),
                             &format!("[{}]: version conflict, document already exists (current version [{}])", doc_id, 1),
-                            &"what is an index uuid?".to_string(),
-                            &"1".to_string(),
-                            &index.to_string(),
+                            Some("what is an index uuid?".to_string()),
+                            Some("1".to_string()),
+                            Some(index.to_string()),
                         ),
                         status: 409,
                     };
@@ -555,7 +563,7 @@ async fn create_single_worker(index: &String, doc_id: &String, payload: &String,
             };
 
             let mut buffer = WriteBuffer::new();
-            let _ = ingest_create(
+            let result = ingest_create(
                 &table_description,
                 &Create{ create: IndexOrCreateBody { index: None, id: Some(doc_id.clone()), list_executed_pipelines: false, require_alias: false, dynamic_templates: None }},
                 &CreateDoc{ raw: payload.replace("\n", ""), parsed: valid_doc },
@@ -565,7 +573,8 @@ async fn create_single_worker(index: &String, doc_id: &String, payload: &String,
             );
             
             commit(&buffer, &table_description.name).await?;
-            Ok(ElasticSearchResponse { status: StatusCode::OK, mime: mime::APPLICATION_JSON, body: "inserted!".to_string() })
+
+            Ok(ElasticSearchResponse { status: StatusCode::CREATED, mime: mime::APPLICATION_JSON, body: serde_json::to_string(&result).unwrap() })
         },
         Err(_) => {
             Ok(ElasticSearchResponse{ status: StatusCode::BAD_REQUEST, mime: mime::APPLICATION_JSON, body: "Bad request".to_string() })
@@ -583,6 +592,25 @@ pub(crate) async fn delete(index: &String, doc_id: &String) -> Result<ElasticSea
         Some(t) => t,
         None => return Err(IngestError{ message: "Index does not exist".to_string() })
     };
+
+    let df_count = get_existing_doc_count(index, doc_id).await?;
+    if df_count == 0 {
+        let result = OperationResult {
+            _index: index.clone(),
+            _id: doc_id.clone(),
+            _version: 1,
+            result: "not_found".to_string(),
+            _shards: Shards {
+                total: 1,
+                successful: 1,
+                failed: 0,
+            },
+            _seq_no: 0,
+            _primary_term: 1,
+            status: None,
+        };
+        return Ok(ElasticSearchResponse { status: StatusCode::NOT_FOUND, mime: mime::APPLICATION_JSON, body: serde_json::to_string(&result).unwrap() })
+    }
     let seq_no = match distributed_cache::delete_operator(&table_description.name, 1) {
         Ok(v) => v,
         Err(_) => panic!("Need to convert to an ingest error")
@@ -1160,228 +1188,7 @@ mod tests {
         };
 */
 
-        let test_val = r#"{
-  "template": {
-    "settings": {
-      "number_of_shards": 1
-    },
-    "mappings": {
-      "dynamic": "strict",
-      "properties": {
-        "@timestamp": {
-          "type": "date"
-        },
-        "event": {
-          "properties": {
-            "action": {
-              "type": "keyword"
-            },
-            "kind": {
-              "type": "keyword"
-            }
-          }
-        },
-        "tags": {
-          "type": "keyword"
-        },
-        "kibana": {
-          "properties": {
-            "alert": {
-              "properties": {
-                "rule": {
-                  "properties": {
-                    "parameters": {
-                      "type": "flattened",
-                      "ignore_above": 4096
-                    },
-                    "rule_type_id": {
-                      "type": "keyword"
-                    },
-                    "consumer": {
-                      "type": "keyword"
-                    },
-                    "producer": {
-                      "type": "keyword"
-                    },
-                    "author": {
-                      "type": "keyword"
-                    },
-                    "category": {
-                      "type": "keyword"
-                    },
-                    "uuid": {
-                      "type": "keyword"
-                    },
-                    "created_at": {
-                      "type": "date"
-                    },
-                    "created_by": {
-                      "type": "keyword"
-                    },
-                    "description": {
-                      "type": "keyword"
-                    },
-                    "enabled": {
-                      "type": "keyword"
-                    },
-                    "execution": {
-                      "properties": {
-                        "uuid": {
-                          "type": "keyword"
-                        }
-                      }
-                    },
-                    "from": {
-                      "type": "keyword"
-                    },
-                    "interval": {
-                      "type": "keyword"
-                    },
-                    "license": {
-                      "type": "keyword"
-                    },
-                    "name": {
-                      "type": "keyword"
-                    },
-                    "note": {
-                      "type": "keyword"
-                    },
-                    "references": {
-                      "type": "keyword"
-                    },
-                    "rule_id": {
-                      "type": "keyword"
-                    },
-                    "rule_name_override": {
-                      "type": "keyword"
-                    },
-                    "tags": {
-                      "type": "keyword"
-                    },
-                    "to": {
-                      "type": "keyword"
-                    },
-                    "type": {
-                      "type": "keyword"
-                    },
-                    "updated_at": {
-                      "type": "date"
-                    },
-                    "updated_by": {
-                      "type": "keyword"
-                    },
-                    "version": {
-                      "type": "keyword"
-                    }
-                  }
-                },
-                "uuid": {
-                  "type": "keyword"
-                },
-                "instance": {
-                  "properties": {
-                    "id": {
-                      "type": "keyword"
-                    }
-                  }
-                },
-                "start": {
-                  "type": "date"
-                },
-                "time_range": {
-                  "type": "date_range",
-                  "format": "epoch_millis||strict_date_optional_time"
-                },
-                "end": {
-                  "type": "date"
-                },
-                "duration": {
-                  "properties": {
-                    "us": {
-                      "type": "long"
-                    }
-                  }
-                },
-                "severity": {
-                  "type": "keyword"
-                },
-                "status": {
-                  "type": "keyword"
-                },
-                "flapping": {
-                  "type": "boolean"
-                },
-                "risk_score": {
-                  "type": "float"
-                },
-                "workflow_status": {
-                  "type": "keyword"
-                },
-                "workflow_user": {
-                  "type": "keyword"
-                },
-                "workflow_reason": {
-                  "type": "keyword"
-                },
-                "system_status": {
-                  "type": "keyword"
-                },
-                "action_group": {
-                  "type": "keyword"
-                },
-                "reason": {
-                  "type": "keyword"
-                },
-                "case_ids": {
-                  "type": "keyword"
-                },
-                "suppression": {
-                  "properties": {
-                    "terms": {
-                      "properties": {
-                        "field": {
-                          "type": "keyword"
-                        },
-                        "value": {
-                          "type": "keyword"
-                        }
-                      }
-                    },
-                    "start": {
-                      "type": "date"
-                    },
-                    "end": {
-                      "type": "date"
-                    },
-                    "docs_count": {
-                      "type": "long"
-                    }
-                  }
-                },
-                "last_detected": {
-                  "type": "date"
-                }
-              }
-            },
-            "space_ids": {
-              "type": "keyword"
-            },
-            "version": {
-              "type": "version"
-            }
-          }
-        },
-        "ecs": {
-          "properties": {
-            "version": {
-              "type": "keyword"
-            }
-          }
-        }
-      }
-    }
-  }
-}"#;
+        let test_val = include_str!("../tests/data/component_template_2.json");
 
         let _deser: CreateIndexTemplateBody = match serde_json::from_str(test_val) {
             Ok(d) => d,
@@ -1532,6 +1339,827 @@ mod tests {
             }
         };        
 
+        let test_val = r#"{
+  "template": {
+    "settings": {},
+    "mappings": {
+      "dynamic": false,
+      "properties": {
+        "@timestamp": {
+          "type": "date"
+        },
+        "event": {
+          "properties": {
+            "action": {
+              "type": "keyword"
+            },
+            "kind": {
+              "type": "keyword"
+            }
+          }
+        },
+        "tags": {
+          "type": "keyword"
+        },
+        "kibana": {
+          "properties": {
+            "alert": {
+              "properties": {
+                "rule": {
+                  "properties": {
+                    "parameters": {
+                      "type": "flattened",
+                      "ignore_above": 4096
+                    },
+                    "rule_type_id": {
+                      "type": "keyword"
+                    },
+                    "consumer": {
+                      "type": "keyword"
+                    },
+                    "producer": {
+                      "type": "keyword"
+                    },
+                    "author": {
+                      "type": "keyword"
+                    },
+                    "category": {
+                      "type": "keyword"
+                    },
+                    "uuid": {
+                      "type": "keyword"
+                    },
+                    "created_at": {
+                      "type": "date"
+                    },
+                    "created_by": {
+                      "type": "keyword"
+                    },
+                    "description": {
+                      "type": "keyword"
+                    },
+                    "enabled": {
+                      "type": "keyword"
+                    },
+                    "execution": {
+                      "properties": {
+                        "uuid": {
+                          "type": "keyword"
+                        }
+                      }
+                    },
+                    "from": {
+                      "type": "keyword"
+                    },
+                    "interval": {
+                      "type": "keyword"
+                    },
+                    "license": {
+                      "type": "keyword"
+                    },
+                    "name": {
+                      "type": "keyword"
+                    },
+                    "note": {
+                      "type": "keyword"
+                    },
+                    "references": {
+                      "type": "keyword"
+                    },
+                    "rule_id": {
+                      "type": "keyword"
+                    },
+                    "rule_name_override": {
+                      "type": "keyword"
+                    },
+                    "tags": {
+                      "type": "keyword"
+                    },
+                    "to": {
+                      "type": "keyword"
+                    },
+                    "type": {
+                      "type": "keyword"
+                    },
+                    "updated_at": {
+                      "type": "date"
+                    },
+                    "updated_by": {
+                      "type": "keyword"
+                    },
+                    "version": {
+                      "type": "keyword"
+                    },
+                    "building_block_type": {
+                      "type": "keyword"
+                    },
+                    "exceptions_list": {
+                      "type": "object"
+                    },
+                    "false_positives": {
+                      "type": "keyword"
+                    },
+                    "immutable": {
+                      "type": "keyword"
+                    },
+                    "max_signals": {
+                      "type": "long"
+                    },
+                    "threat": {
+                      "properties": {
+                        "framework": {
+                          "type": "keyword"
+                        },
+                        "tactic": {
+                          "properties": {
+                            "id": {
+                              "type": "keyword"
+                            },
+                            "name": {
+                              "type": "keyword"
+                            },
+                            "reference": {
+                              "type": "keyword"
+                            }
+                          }
+                        },
+                        "technique": {
+                          "properties": {
+                            "id": {
+                              "type": "keyword"
+                            },
+                            "name": {
+                              "type": "keyword"
+                            },
+                            "reference": {
+                              "type": "keyword"
+                            },
+                            "subtechnique": {
+                              "properties": {
+                                "id": {
+                                  "type": "keyword"
+                                },
+                                "name": {
+                                  "type": "keyword"
+                                },
+                                "reference": {
+                                  "type": "keyword"
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "timeline_id": {
+                      "type": "keyword"
+                    },
+                    "timeline_title": {
+                      "type": "keyword"
+                    },
+                    "timestamp_override": {
+                      "type": "keyword"
+                    }
+                  }
+                },
+                "uuid": {
+                  "type": "keyword"
+                },
+                "instance": {
+                  "properties": {
+                    "id": {
+                      "type": "keyword"
+                    }
+                  }
+                },
+                "start": {
+                  "type": "date"
+                },
+                "time_range": {
+                  "type": "date_range",
+                  "format": "epoch_millis||strict_date_optional_time"
+                },
+                "end": {
+                  "type": "date"
+                },
+                "duration": {
+                  "properties": {
+                    "us": {
+                      "type": "long"
+                    }
+                  }
+                },
+                "severity": {
+                  "type": "keyword"
+                },
+                "status": {
+                  "type": "keyword"
+                },
+                "flapping": {
+                  "type": "boolean"
+                },
+                "risk_score": {
+                  "type": "float"
+                },
+                "workflow_status": {
+                  "type": "keyword"
+                },
+                "workflow_user": {
+                  "type": "keyword"
+                },
+                "workflow_reason": {
+                  "type": "keyword"
+                },
+                "system_status": {
+                  "type": "keyword"
+                },
+                "action_group": {
+                  "type": "keyword"
+                },
+                "reason": {
+                  "type": "keyword"
+                },
+                "case_ids": {
+                  "type": "keyword"
+                },
+                "suppression": {
+                  "properties": {
+                    "terms": {
+                      "properties": {
+                        "field": {
+                          "type": "keyword"
+                        },
+                        "value": {
+                          "type": "keyword"
+                        }
+                      }
+                    },
+                    "start": {
+                      "type": "date"
+                    },
+                    "end": {
+                      "type": "date"
+                    },
+                    "docs_count": {
+                      "type": "long"
+                    }
+                  }
+                },
+                "last_detected": {
+                  "type": "date"
+                },
+                "ancestors": {
+                  "type": "object",
+                  "properties": {
+                    "depth": {
+                      "type": "long"
+                    },
+                    "id": {
+                      "type": "keyword"
+                    },
+                    "index": {
+                      "type": "keyword"
+                    },
+                    "rule": {
+                      "type": "keyword"
+                    },
+                    "type": {
+                      "type": "keyword"
+                    }
+                  }
+                },
+                "building_block_type": {
+                  "type": "keyword"
+                },
+                "depth": {
+                  "type": "long"
+                },
+                "group": {
+                  "properties": {
+                    "id": {
+                      "type": "keyword"
+                    },
+                    "index": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "original_event": {
+                  "properties": {
+                    "action": {
+                      "type": "keyword"
+                    },
+                    "agent_id_status": {
+                      "type": "keyword"
+                    },
+                    "category": {
+                      "type": "keyword"
+                    },
+                    "code": {
+                      "type": "keyword"
+                    },
+                    "created": {
+                      "type": "date"
+                    },
+                    "dataset": {
+                      "type": "keyword"
+                    },
+                    "duration": {
+                      "type": "keyword"
+                    },
+                    "end": {
+                      "type": "date"
+                    },
+                    "hash": {
+                      "type": "keyword"
+                    },
+                    "id": {
+                      "type": "keyword"
+                    },
+                    "ingested": {
+                      "type": "date"
+                    },
+                    "kind": {
+                      "type": "keyword"
+                    },
+                    "module": {
+                      "type": "keyword"
+                    },
+                    "original": {
+                      "type": "keyword"
+                    },
+                    "outcome": {
+                      "type": "keyword"
+                    },
+                    "provider": {
+                      "type": "keyword"
+                    },
+                    "reason": {
+                      "type": "keyword"
+                    },
+                    "reference": {
+                      "type": "keyword"
+                    },
+                    "risk_score": {
+                      "type": "float"
+                    },
+                    "risk_score_norm": {
+                      "type": "float"
+                    },
+                    "sequence": {
+                      "type": "long"
+                    },
+                    "severity": {
+                      "type": "long"
+                    },
+                    "start": {
+                      "type": "date"
+                    },
+                    "timezone": {
+                      "type": "keyword"
+                    },
+                    "type": {
+                      "type": "keyword"
+                    },
+                    "url": {
+                      "type": "keyword"
+                    }
+                  }
+                },
+                "original_time": {
+                  "type": "date"
+                },
+                "threshold_result": {
+                  "properties": {
+                    "cardinality": {
+                      "type": "object",
+                      "properties": {
+                        "field": {
+                          "type": "keyword"
+                        },
+                        "value": {
+                          "type": "long"
+                        }
+                      }
+                    },
+                    "count": {
+                      "type": "long"
+                    },
+                    "from": {
+                      "type": "date"
+                    },
+                    "terms": {
+                      "type": "object",
+                      "properties": {
+                        "field": {
+                          "type": "keyword"
+                        },
+                        "value": {
+                          "type": "keyword"
+                        }
+                      }
+                    }
+                  }
+                },
+                "new_terms": {
+                  "type": "keyword"
+                }
+              }
+            },
+            "space_ids": {
+              "type": "keyword"
+            },
+            "version": {
+              "type": "version"
+            }
+          }
+        },
+        "ecs": {
+          "properties": {
+            "version": {
+              "type": "keyword"
+            }
+          }
+        },
+        "signal": {
+          "properties": {
+            "ancestors": {
+              "properties": {
+                "depth": {
+                  "type": "alias",
+                  "path": "kibana.alert.ancestors.depth"
+                },
+                "id": {
+                  "type": "alias",
+                  "path": "kibana.alert.ancestors.id"
+                },
+                "index": {
+                  "type": "alias",
+                  "path": "kibana.alert.ancestors.index"
+                },
+                "type": {
+                  "type": "alias",
+                  "path": "kibana.alert.ancestors.type"
+                }
+              }
+            },
+            "depth": {
+              "type": "alias",
+              "path": "kibana.alert.depth"
+            },
+            "group": {
+              "properties": {
+                "id": {
+                  "type": "alias",
+                  "path": "kibana.alert.group.id"
+                },
+                "index": {
+                  "type": "alias",
+                  "path": "kibana.alert.group.index"
+                }
+              }
+            },
+            "original_event": {
+              "properties": {
+                "action": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.action"
+                },
+                "category": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.category"
+                },
+                "code": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.code"
+                },
+                "created": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.created"
+                },
+                "dataset": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.dataset"
+                },
+                "duration": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.duration"
+                },
+                "end": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.end"
+                },
+                "hash": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.hash"
+                },
+                "id": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.id"
+                },
+                "kind": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.kind"
+                },
+                "module": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.module"
+                },
+                "outcome": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.outcome"
+                },
+                "provider": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.provider"
+                },
+                "reason": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.reason"
+                },
+                "risk_score": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.risk_score"
+                },
+                "risk_score_norm": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.risk_score_norm"
+                },
+                "sequence": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.sequence"
+                },
+                "severity": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.severity"
+                },
+                "start": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.start"
+                },
+                "timezone": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.timezone"
+                },
+                "type": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.type"
+                }
+              }
+            },
+            "original_time": {
+              "type": "alias",
+              "path": "kibana.alert.original_time"
+            },
+            "reason": {
+              "type": "alias",
+              "path": "kibana.alert.reason"
+            },
+            "rule": {
+              "properties": {
+                "author": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.author"
+                },
+                "building_block_type": {
+                  "type": "alias",
+                  "path": "kibana.alert.building_block_type"
+                },
+                "created_at": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.created_at"
+                },
+                "created_by": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.created_by"
+                },
+                "description": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.description"
+                },
+                "enabled": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.enabled"
+                },
+                "false_positives": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.false_positives"
+                },
+                "from": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.from"
+                },
+                "id": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.uuid"
+                },
+                "immutable": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.immutable"
+                },
+                "interval": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.interval"
+                },
+                "license": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.license"
+                },
+                "max_signals": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.max_signals"
+                },
+                "name": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.name"
+                },
+                "note": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.note"
+                },
+                "references": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.references"
+                },
+                "risk_score": {
+                  "type": "alias",
+                  "path": "kibana.alert.risk_score"
+                },
+                "rule_id": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.rule_id"
+                },
+                "rule_name_override": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.rule_name_override"
+                },
+                "severity": {
+                  "type": "alias",
+                  "path": "kibana.alert.severity"
+                },
+                "tags": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.tags"
+                },
+                "threat": {
+                  "properties": {
+                    "framework": {
+                      "type": "alias",
+                      "path": "kibana.alert.rule.threat.framework"
+                    },
+                    "tactic": {
+                      "properties": {
+                        "id": {
+                          "type": "alias",
+                          "path": "kibana.alert.rule.threat.tactic.id"
+                        },
+                        "name": {
+                          "type": "alias",
+                          "path": "kibana.alert.rule.threat.tactic.name"
+                        },
+                        "reference": {
+                          "type": "alias",
+                          "path": "kibana.alert.rule.threat.tactic.reference"
+                        }
+                      }
+                    },
+                    "technique": {
+                      "properties": {
+                        "id": {
+                          "type": "alias",
+                          "path": "kibana.alert.rule.threat.technique.id"
+                        },
+                        "name": {
+                          "type": "alias",
+                          "path": "kibana.alert.rule.threat.technique.name"
+                        },
+                        "reference": {
+                          "type": "alias",
+                          "path": "kibana.alert.rule.threat.technique.reference"
+                        },
+                        "subtechnique": {
+                          "properties": {
+                            "id": {
+                              "type": "alias",
+                              "path": "kibana.alert.rule.threat.technique.subtechnique.id"
+                            },
+                            "name": {
+                              "type": "alias",
+                              "path": "kibana.alert.rule.threat.technique.subtechnique.name"
+                            },
+                            "reference": {
+                              "type": "alias",
+                              "path": "kibana.alert.rule.threat.technique.subtechnique.reference"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "timeline_id": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.timeline_id"
+                },
+                "timeline_title": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.timeline_title"
+                },
+                "timestamp_override": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.timestamp_override"
+                },
+                "to": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.to"
+                },
+                "type": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.type"
+                },
+                "updated_at": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.updated_at"
+                },
+                "updated_by": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.updated_by"
+                },
+                "version": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.version"
+                }
+              }
+            },
+            "status": {
+              "type": "alias",
+              "path": "kibana.alert.workflow_status"
+            },
+            "threshold_result": {
+              "properties": {
+                "from": {
+                  "type": "alias",
+                  "path": "kibana.alert.threshold_result.from"
+                },
+                "terms": {
+                  "properties": {
+                    "field": {
+                      "type": "alias",
+                      "path": "kibana.alert.threshold_result.terms.field"
+                    },
+                    "value": {
+                      "type": "alias",
+                      "path": "kibana.alert.threshold_result.terms.value"
+                    }
+                  }
+                },
+                "cardinality": {
+                  "properties": {
+                    "field": {
+                      "type": "alias",
+                      "path": "kibana.alert.threshold_result.cardinality.field"
+                    },
+                    "value": {
+                      "type": "alias",
+                      "path": "kibana.alert.threshold_result.cardinality.value"
+                    }
+                  }
+                },
+                "count": {
+                  "type": "alias",
+                  "path": "kibana.alert.threshold_result.count"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+        let _deser: CreateIndexTemplateBody = match serde_json::from_str(test_val) {
+            Ok(d) => d,
+            Err(e) => {
+                let error = format!("{}", e);
+                let error_str = error.as_str();
+                println!("{}", error_str);
+                let _ = fs::write("/Users/gregory/code/powdrr-engine/service/output.txt", error);
+                panic!("nope");
+            }
+        };
+
+        let test_val = include_str!("../tests/data/component_template_1.json");
+
+        let _deser: CreateIndexTemplateBody = match serde_json::from_str(test_val) {
+            Ok(d) => d,
+            Err(e) => {
+                let error = format!("{}", e);
+                println!("{}", error);
+                let _ = fs::write("service/output.txt", error);
+                panic!("nope");
+            }
+        };
     }
 
     #[test]

@@ -1,0 +1,119 @@
+{
+  "query": {
+    "bool": {
+      "must": [
+        {
+          "term": {
+            "type": "task"
+          }
+        },
+        {
+          "bool": {
+            "must": [
+              {
+                "bool": {
+                  "must": [
+                    {
+                      "term": {
+                        "task.enabled": true
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "bool": {
+                  "should": [
+                    {
+                      "bool": {
+                        "must": [
+                          {
+                            "term": {
+                              "task.status": "idle"
+                            }
+                          },
+                          {
+                            "range": {
+                              "task.runAt": {
+                                "lte": "now"
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "bool": {
+                        "must": [
+                          {
+                            "bool": {
+                              "should": [
+                                {
+                                  "term": {
+                                    "task.status": "running"
+                                  }
+                                },
+                                {
+                                  "term": {
+                                    "task.status": "claiming"
+                                  }
+                                }
+                              ]
+                            }
+                          },
+                          {
+                            "range": {
+                              "task.retryAt": {
+                                "lte": "now"
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "filter": [
+              {
+                "bool": {
+                  "must_not": [
+                    {
+                      "bool": {
+                        "should": [
+                          {
+                            "term": {
+                              "task.status": "running"
+                            }
+                          },
+                          {
+                            "term": {
+                              "task.status": "claiming"
+                            }
+                          }
+                        ],
+                        "must": {
+                          "range": {
+                            "task.retryAt": {
+                              "gt": "now"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}
+
+
+
+
+

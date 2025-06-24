@@ -25,7 +25,7 @@ pub(crate) struct OperationResult {
     pub _shards: Shards,
     pub _seq_no: i64,
     pub _primary_term: u32,
-    pub status: u32,
+    pub status: Option<u32>,
 }
 
 
@@ -88,6 +88,19 @@ pub(crate) struct QueryResults {
     hits: QueryResultHits,
 }
 
+
+#[derive(Serialize, Clone)]
+pub(crate) struct QueryResultsNotFound {
+    pub _index: String,
+    pub _id: String,
+    pub found: bool,
+}
+
+impl CommandResponse for QueryResultsNotFound {
+    fn generate_response(&self, state: &State) -> gotham::hyper::Response<gotham::hyper::Body> {
+        create_response(state, StatusCode::NOT_FOUND, mime::APPLICATION_JSON, serde_json::to_string(self).unwrap())
+    }
+}
 
 impl QueryResultHit {
     pub fn new(index: &String, id: &String, version: i64, seq_no: i64, score: f64, source: Value) -> Self {
@@ -184,7 +197,7 @@ impl CommandResponse for SingleDocResult {
 
 
 #[derive(Serialize)]
-pub(crate) struct SingleDocCreateFaileResult {
+pub(crate) struct SingleDocCreateFailedResult {
     pub error: ErrorDetails,
     pub status: u32
 }
@@ -196,14 +209,14 @@ pub(crate) struct ErrorDetails {
     #[serde(rename="type")]
     _type: String,
     reason: String,
-    index_uuid: String,
-    shard: String,
-    index: String,
+    index_uuid: Option<String>,
+    shard: Option<String>,
+    index: Option<String>,
 }
 
 
 impl ErrorDetails {
-    pub(crate) fn single_cause(_type: &String, reason: &String, index_uuid: &String, shard: &String, index: &String) -> Self {
+    pub(crate) fn single_cause(_type: &String, reason: &String, index_uuid: Option<String>, shard: Option<String>, index: Option<String>) -> Self {
         ErrorDetails { 
             root_cause: Some(vec!(ErrorDetails{ 
                 root_cause: None, 
