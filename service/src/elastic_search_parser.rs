@@ -351,7 +351,7 @@ impl SqlBuilder {
     fn build(&mut self) -> String {
         let filter_str = self._filters();
         format!(
-            "select {} from {} t{}{}{}{}",
+            "select {} from {} {}{}{}{}",
             self._fields(),
             "{target_table} t",
             self._joins(),

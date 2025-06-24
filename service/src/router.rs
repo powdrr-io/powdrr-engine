@@ -281,7 +281,7 @@ pub(crate) fn router(include_test_apis: bool) -> Router {
 
 #[cfg(test)]
 mod tests {
-    use std::str;
+    use std::{env, str};
     use std::sync::LazyLock;
 
     use gotham::mime;
@@ -367,14 +367,14 @@ mod tests {
             mime::TEXT_PLAIN
         ).perform().unwrap();
 
-        
+        let file_path = format!("file://{}/tests/data/flights.parquet", env::current_dir().unwrap().to_str().unwrap());
         
         let checkpoint = TableMetadataCheckpoint {
             table_name: "flights".to_string(),
             checkpoint_id: "fake_id".to_string(),
             iceberg_metadata: Some(IcebergMetadata {
                 snapshot_id: "fake_iceberg_snapshot".to_string(),
-                files: vec!("file:///Users/greg.fee/code/monolith-rust-workspace/service/tests/data/flights.parquet".to_string()),
+                files: vec!(file_path),
                 column_names: vec!(),
                 column_stats: vec!(),
             }),
