@@ -7,7 +7,7 @@ use futures::FutureExt;
 use serde_json::{json, Value};
 
 use crate::{data_access::{self, execute_sql}, distributed_cache, elastic_search_common::{Command, CommandResponse, ParseError, ResultGeneratorFuture, SqlBuilder}, elastic_search_ingest::{self, WriteBuffer}, elastic_search_parser::ScriptBlock, elastic_search_responses::{QueryFailure, QueryResultHit, QueryResults}, expression_evaluator, painless_parser, state_hosted_service::API_SERVICE_CLIENT, state_peers::SnapshotDescriptor};
-
+use crate::elastic_search_responses::QueryResultsNotFound;
 
 fn empty_result() -> Arc<dyn CommandResponse> {
     // TODO: need to record and feed through the requested number of shards from index creation
@@ -246,14 +246,20 @@ impl Command for LookupById {
 
     fn result_generator(&self, result_table_name: Option<String>) -> Pin<Box<ResultGeneratorFuture>> {
         let table = self.table.clone();
+        let ids = self.ids.clone();
         async move {
             let result = match LookupById::to_dataframe(result_table_name).await {
                 Some(df) => {
                     let hits = to_hits(&table, &df).await;
-                    Arc::new(QueryResults::success(10, 2, hits.len(), 1.0, hits))
+                    let inner_result: Arc<dyn CommandResponse> = if hits.len() == 0 {
+                        Arc::new(QueryResultsNotFound { _index: table, _id: ids.get(0).unwrap().clone(), found: false })
+                    } else {
+                        Arc::new(QueryResults::success(10, 2, hits.len(), 1.0, hits))
+                    };
+                    inner_result
                 },
                 None => {
-                    empty_result()
+                    Arc::new(QueryResultsNotFound { _index: table, _id: ids.get(0).unwrap().clone(), found: false })
                 }
             };
             Ok(result)
@@ -397,7 +403,7 @@ pub(crate) struct UpdateByQueryCommand {
 impl UpdateByQueryCommand {
     fn evaluate(script: &ScriptBlock, value: &Value) -> Value {
         // TODO: run script
-        let translated_script = match painless_parser::translate(&script.script) {
+        let translated_script = match painless_parser::translate(&script.source) {
             Ok(t) => t,
             Err(_) => panic!("Need to make an error path")
         };

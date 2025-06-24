@@ -15,6 +15,7 @@ mod elastic_search_common;
 mod elastic_search_endpoints;
 mod elastic_search_index;
 mod elastic_search_ingest;
+mod elastic_search_lifetime_policy;
 mod elastic_search_parser;
 mod elastic_search_pipeline;
 mod elastic_search_responses;

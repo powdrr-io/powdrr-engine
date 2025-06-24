@@ -239,11 +239,12 @@ pub(crate) async fn create_index(table_metadata: &TableMetadataCheckpoint) -> Re
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use crate::elastic_search_index::{create_index_jsonl, create_index_parquet};
 
     #[tokio::test]
     async fn test_simple_create_index_parquet() {
-        match create_index_parquet(&"file:///Users/greg.fee/code/monolith-rust/tests/data/flights.parquet".to_string(), &"index_col".to_string()).await {
+        match create_index_parquet(&format!("file://{}/tests/data/flights.parquet", env::current_dir().unwrap().to_str().unwrap()), &"index_col".to_string()).await {
             Err(_) => panic!("failed"),
             Ok(_) => ()
         }
@@ -251,7 +252,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_simple_create_index_json() {
-        match create_index_jsonl(&"file:///Users/greg.fee/code/monolith-rust/tests/data/logs.json".to_string(), &"index_col".to_string()).await {
+        match create_index_jsonl(&format!("file://{}/tests/data/logs.json", env::current_dir().unwrap().to_str().unwrap()), &"index_col".to_string()).await {
             Err(_) => panic!("failed"),
             Ok(_) => ()
         }

@@ -2,6 +2,7 @@ use std::{collections::HashMap, env, pin::Pin, sync::Arc};
 
 use futures::FutureExt;
 use gotham::{handler::HandlerFuture, helpers::http::response::create_response, hyper::{body, Body}, mime, prelude::StaticResponseExtender, state::{FromState, State, StateData}};
+use gotham::helpers::http::response::create_empty_response;
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -10,10 +11,9 @@ use uuid_b64::UuidB64;
 use crate::{elastic_search_cluster_info, elastic_search_commands::LookupById, elastic_search_common::{execute_command, CommandContext, CommandResponse}, elastic_search_ingest, elastic_search_parser, elastic_search_pipeline, state_hosted_service::API_SERVICE_CLIENT};
 
 
-
 #[derive(Deserialize, StateData, StaticResponseExtender)]
 pub struct NamePathExtractor {
-    name: String,
+    pub(crate) name: String,
 }
 
 #[derive(Deserialize, StateData, StaticResponseExtender)]
@@ -111,14 +111,6 @@ pub fn es_root(state: State) -> Pin<Box<HandlerFuture>> {
     }.boxed()
 }
 
-pub fn es_empty_ok(state: State) -> Pin<Box<HandlerFuture>> {
-    tracing::info!("es_empty_ok"); 
-    async {
-        let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, "");
-        Ok((state, res))
-    }.boxed()
-}
-
 pub fn es_nodes(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_nodes"); 
     async {
@@ -146,6 +138,14 @@ pub fn es_license(state: State) -> Pin<Box<HandlerFuture>> {
         let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, serde_json::to_string(&License::new()).unwrap());
         Ok((state, res))
     }.boxed()    
+}
+
+pub fn es_xpack(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_xpack");
+    async {
+        let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, serde_json::to_string(&License::new()).unwrap());
+        Ok((state, res))
+    }.boxed()
 }
 
 #[derive(Deserialize, StateData, StaticResponseExtender)]
@@ -196,6 +196,54 @@ pub fn es_get_index(state: State) -> Pin<Box<HandlerFuture>> {
     }.boxed()       
 }
 
+pub fn es_head_index(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_get_index");
+    async {
+        let path_extractor = NamePathExtractor::borrow_from(&state);
+
+        for table_name in path_extractor.name.to_string().split(",") {
+            let table_desc = API_SERVICE_CLIENT.describe_table(&table_name.to_string()).await;
+            let res = if table_desc.is_none() {
+                create_empty_response(&state, StatusCode::NOT_FOUND)
+            } else {
+                let response = table_desc.map_or_else(
+                    || "{}".to_string(),
+                    |x| x.tags.get("_es_original").map_or_else(|| "{}".to_string(), |x| x.clone())
+                );
+
+                create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, response)
+            };
+            return Ok((state, res))
+        }
+        let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, "{}");
+        Ok((state, res))
+
+    }.boxed()
+}
+
+
+pub fn es_get_index_aliases(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_get_index_aliases");
+    async {
+        let _path_extractor = NamePathExtractor::borrow_from(&state);
+        // TODO: make this actually work
+        let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, "{}");
+        Ok((state, res))
+
+    }.boxed()
+}
+
+pub fn es_get_index_settings(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_get_index_aliases");
+    async {
+        let _path_extractor = NamePathExtractor::borrow_from(&state);
+        // TODO: make this actually work
+        let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, "{}");
+        Ok((state, res))
+
+    }.boxed()
+}
+
 pub fn es_get_index_template(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_get_index_template"); 
     async {
@@ -213,9 +261,6 @@ pub fn es_get_index_template(state: State) -> Pin<Box<HandlerFuture>> {
         Ok((state, res))
     }.boxed()       
 }
-
-
-
 
 
 pub fn es_create_with_id(mut state: State) -> Pin<Box<HandlerFuture>> {
@@ -394,16 +439,6 @@ pub fn es_create_index(mut state: State) -> Pin<Box<HandlerFuture>> {
     }.boxed()
 }
 
-pub fn es_post_ilm_policy(state: State) -> Pin<Box<HandlerFuture>> {
-    tracing::info!("es_post_ilm_policy"); 
-    // TODO: figure out what to do with ILM policy
-    async {
-        let response = HashMap::from([("acknowledged", true)]);
-        let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, serde_json::to_string(&response).unwrap());
-        Ok((state, res))
-    }.boxed()
-}
-
 
 pub fn es_create_index_template(mut state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_create_index_template"); 
@@ -425,6 +460,47 @@ pub fn es_create_index_template(mut state: State) -> Pin<Box<HandlerFuture>> {
                 let res = create_response(&state, StatusCode::ALREADY_REPORTED, mime::TEXT_PLAIN, e.message);
                 Ok((state, res))
             }
+        }
+    }.boxed()
+}
+
+
+pub fn es_head_template(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_head_template");
+    async {
+        let path_extractor = NamePathExtractor::borrow_from(&state);
+        let table = path_extractor.name.to_string();
+
+        match API_SERVICE_CLIENT.describe_table_template(&table).await {
+            Some(_) => {
+                let res = create_empty_response(&state, StatusCode::OK);
+                Ok((state, res))
+            },
+            None => {
+                let res = create_empty_response(&state, StatusCode::NOT_FOUND);
+                Ok((state, res))
+            }
+
+        }
+    }.boxed()
+}
+
+pub fn es_get_template(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_get_template");
+    async {
+        let path_extractor = NamePathExtractor::borrow_from(&state);
+        let table = path_extractor.name.to_string();
+
+        match API_SERVICE_CLIENT.describe_table_template(&table).await {
+            Some(t) => {
+                let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, serde_json::to_string(&t).unwrap());
+                Ok((state, res))
+            },
+            None => {
+                let res = create_empty_response(&state, StatusCode::NOT_FOUND);
+                Ok((state, res))
+            }
+
         }
     }.boxed()
 }

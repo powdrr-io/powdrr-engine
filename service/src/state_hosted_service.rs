@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot::{self, error::RecvError}};
 
 use crate::{distributed_cache, elastic_search_ingest::CreateIndexTemplateBody, pipeline::PipelineDefinition, state_peers::SnapshotDescriptor};
-
+use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct SpeedboatCSpeedInfo {
@@ -160,6 +160,10 @@ pub(crate) trait ApiServiceClient : Send + Sync {
 
     async fn describe_pipeline(&mut self, name: &String) -> Result<Option<PipelineDefinition>, Box<dyn Error>>;
 
+    async fn create_lifetime_policy(&mut self, name: &String, policy: &ILMPolicyDefinition) -> Result<(), Box<dyn Error>>;
+
+    async fn describe_lifetime_policy(&mut self, name: &String) -> Result<Option<ILMPolicyDefinition>, Box<dyn Error>>;
+    
     async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), Box<dyn Error>>;
 
     async fn iceberg_commit(&mut self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), Box<dyn Error>>;
@@ -195,7 +199,16 @@ enum ApiServiceClientActorMessage {
     DescribePipeline {
         respond_to: oneshot::Sender<Option<PipelineDefinition>>,
         name: String,
-    },    
+    },
+    CreateLifetimePolicy {
+        respond_to: oneshot::Sender<()>,
+        name: String,
+        policy: ILMPolicyDefinition,
+    },
+    DescribeLifetimePolicy {
+        respond_to: oneshot::Sender<Option<ILMPolicyDefinition>>,
+        name: String,
+    },
     CreateTable {
         respond_to: oneshot::Sender<()>,
         create_table: CreateTable,
@@ -294,7 +307,21 @@ impl ApiServiceClientActor {
                 } else {
                     let _ = respond_to.send(self.real.describe_pipeline(&name).await.expect("nope"));
                 }                
-            },                        
+            },
+            ApiServiceClientActorMessage::CreateLifetimePolicy { respond_to, name, policy } => {
+                if self.test_mode {
+                    let _ = respond_to.send(self.test.create_lifetime_policy(&name, &policy).await.expect("nope"));
+                } else {
+                    let _ = respond_to.send(self.real.create_lifetime_policy(&name, &policy).await.expect("nope"));
+                }
+            },
+            ApiServiceClientActorMessage::DescribeLifetimePolicy { respond_to, name } => {
+                if self.test_mode {
+                    let _ = respond_to.send(self.test.describe_lifetime_policy(&name).await.expect("nope"));
+                } else {
+                    let _ = respond_to.send(self.real.describe_lifetime_policy(&name).await.expect("nope"));
+                }
+            },
             ApiServiceClientActorMessage::CreateTable { respond_to, create_table } => {
                 if self.test_mode {
                     let _ = respond_to.send(self.test.create_table(&create_table).await.expect("nope"));
@@ -446,6 +473,14 @@ impl ApiServiceClient for RealApiServiceClient {
     async fn describe_pipeline(&mut self, _name: &String) -> Result<Option<PipelineDefinition>, Box<dyn Error>> {
         todo!()
     }
+
+    async fn create_lifetime_policy(&mut self, _name: &String, _pipeline: &ILMPolicyDefinition) -> Result<(), Box<dyn Error>> {
+        todo!()
+    }
+
+    async fn describe_lifetime_policy(&mut self, _name: &String) -> Result<Option<ILMPolicyDefinition>, Box<dyn Error>> {
+        todo!()
+    }    
 
     async fn add_alias(&mut self, _table_name: &String, _alias: &String) -> Result<(), Box<dyn Error>> {
         todo!()
@@ -627,6 +662,7 @@ struct TestApiServiceClient {
     table_aliases: HashMap<String, String>,
     table_templates: HashMap<String, CreateIndexTemplateBody>,
     pipelines: HashMap<String, PipelineDefinition>,
+    lifetime_policies: HashMap<String, ILMPolicyDefinition>,
     latest_checkpoint_id: HashMap<String, String>,
     index_work_items: Vec<TableMetadataCheckpoint>,
     compact_work_items: Vec<TableMetadataCheckpoint>,
@@ -641,6 +677,7 @@ impl TestApiServiceClient {
             table_aliases: HashMap::new(),
             table_templates: HashMap::new(),
             pipelines: HashMap::new(),
+            lifetime_policies: HashMap::new(),
             latest_checkpoint_id: HashMap::new(),
             index_work_items: vec!(),
             compact_work_items: vec!(),
@@ -655,12 +692,12 @@ impl TestApiServiceClient {
         self.table_aliases.clear();
         self.table_templates.clear();
         self.pipelines.clear();
+        self.lifetime_policies.clear();
         self.latest_checkpoint_id.clear();
         self.index_work_items.clear();
         self.compact_work_items.clear();
         self.compactions.clear();
         self.checkpoints.clear();
-
     }    
 
     fn add_checkpoint(&mut self, metadata: &TableMetadataCheckpoint) -> () {
@@ -849,20 +886,40 @@ impl ApiServiceClient for TestApiServiceClient {
             Some(p) => Ok(Some(p.clone())),
             None => Ok(None)
         }      
-    }    
+    }
+
+    async fn create_lifetime_policy(&mut self, name: &String, policy: &ILMPolicyDefinition) -> Result<(), Box<dyn Error>> {
+        match self.lifetime_policies.get(name) {
+            Some(_) => panic!("Need to do a real error path now"),
+            None => {
+                self.lifetime_policies.insert(name.clone(), policy.clone());
+                Ok(())
+            }
+        }
+    }
+
+    async fn describe_lifetime_policy(&mut self, name: &String) -> Result<Option<ILMPolicyDefinition>, Box<dyn Error>> {
+        match self.lifetime_policies.get(name) {
+            Some(p) => Ok(Some(p.clone())),
+            None => Ok(None)
+        }
+    }
 
     async fn create_table(&mut self, create_table: &CreateTable) -> Result<(), Box<dyn Error>> {
+        match distributed_cache::create_table(&create_table.name) {
+            Ok(_) => (),
+            Err(e) => panic!("Unable to create table = {}", e),
+        };
         match self.tables.get(&create_table.name) {
             Some(_) => {
                 self.tables.remove(&create_table.name);
                 self.tables.insert(create_table.name.clone(), TableDescription::from_create_table(create_table));
-                Ok(())
             }
             None => {
-                self.tables.insert(create_table.name.clone(), TableDescription::from_create_table(create_table));
-                Ok(())
+                self.tables.insert(create_table.name.clone(), TableDescription::from_create_table(create_table)); 
             }
         }
+        Ok(())
     } 
 
     async fn describe_table(&mut self, name: &String) -> Result<Option<TableDescription>, Box<dyn Error>> {
@@ -1064,7 +1121,32 @@ impl ApiServiceClientHandle {
         let _ = self.sender.send(msg).await;
         // TODO: deal with errors
         recv.await.expect("Actor task has been killed")          
-    }      
+    }
+
+    pub async fn create_lifetime_policy(&self, name: &String, pipeline: &ILMPolicyDefinition) -> () {
+        let (send, recv) = oneshot::channel();
+        let msg = ApiServiceClientActorMessage::CreateLifetimePolicy {
+            respond_to: send,
+            name: name.clone(),
+            policy: pipeline.clone(),
+        };
+
+        let _ = self.sender.send(msg).await;
+        // TODO: deal with errors
+        recv.await.expect("Actor task has been killed")
+    }
+
+    pub async fn describe_lifetime_policy(&self, name: &String) -> Option<ILMPolicyDefinition> {
+        let (send, recv) = oneshot::channel();
+        let msg = ApiServiceClientActorMessage::DescribeLifetimePolicy {
+            respond_to: send,
+            name: name.clone()
+        };
+
+        let _ = self.sender.send(msg).await;
+        // TODO: deal with errors
+        recv.await.expect("Actor task has been killed")
+    }
 
     pub async fn create_table(&self, create_table: &CreateTable) -> () {
         let (send, recv) = oneshot::channel();
