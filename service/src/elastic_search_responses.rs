@@ -79,6 +79,19 @@ pub(crate) struct QueryResultHits {
     hits: Vec<QueryResultHit>
 }
 
+#[derive(Serialize, Clone)]
+pub(crate) struct AggregationBucket {
+    key: String,
+    doc_count: u64,
+}
+
+#[derive(Serialize, Clone)]
+pub(crate) struct AggregationResult {
+    pub doc_count_error_upper_bound: u64,
+    pub sum_other_doc_count: u64,
+    pub buckets: Vec<AggregationBucket>
+}
+
 
 #[derive(Serialize, Clone)]
 pub(crate) struct QueryResults {
@@ -86,6 +99,7 @@ pub(crate) struct QueryResults {
     timed_out: bool,
     _shards: QueryResultShards,
     hits: QueryResultHits,
+    aggregations: Option<HashMap<String, AggregationResult>>,
 }
 
 
@@ -132,7 +146,8 @@ impl QueryResults {
             took: took, 
             timed_out: false, 
             _shards: QueryResultShards { total: num_shards, successful: num_shards, skipped: 0, failed: 0 }, 
-            hits: QueryResultHits { total: QueryResultTotal::new(0), max_score: 0.0, hits: vec!() }
+            hits: QueryResultHits { total: QueryResultTotal::new(0), max_score: 0.0, hits: vec!() },
+            aggregations: None,
         }
     }
 
@@ -142,16 +157,18 @@ impl QueryResults {
             took: took, 
             timed_out: true, 
             _shards: QueryResultShards { total: num_shards, successful: num_shards, skipped: 0, failed: 0 }, 
-            hits: QueryResultHits { total: QueryResultTotal::new(0), max_score: 0.0, hits: vec!() }
+            hits: QueryResultHits { total: QueryResultTotal::new(0), max_score: 0.0, hits: vec!() },
+            aggregations: None,
         }        
     }
 
-    pub fn success(took: u32, num_shards: u32, total_hits: usize, max_score: f64, hits: Vec<QueryResultHit>) -> Self {
+    pub fn success(took: u32, num_shards: u32, total_hits: usize, max_score: f64, hits: Vec<QueryResultHit>, aggregations: Option<HashMap<String, AggregationResult>>) -> Self {
         QueryResults { 
             took: took, 
             timed_out: false, 
             _shards: QueryResultShards { total: num_shards, successful: num_shards, skipped: 0, failed: 0 }, 
-            hits: QueryResultHits { total: QueryResultTotal::new(total_hits), max_score: max_score, hits: hits }
+            hits: QueryResultHits { total: QueryResultTotal::new(total_hits), max_score: max_score, hits: hits },
+            aggregations: aggregations,
         }  
     }
 }

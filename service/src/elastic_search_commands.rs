@@ -7,7 +7,8 @@ use futures::FutureExt;
 use serde_json::{json, Value};
 
 use crate::{data_access::{self, execute_sql}, distributed_cache, elastic_search_common::{Command, CommandResponse, ParseError, ResultGeneratorFuture, SqlBuilder}, elastic_search_ingest::{self, WriteBuffer}, elastic_search_parser::ScriptBlock, elastic_search_responses::{QueryFailure, QueryResultHit, QueryResults}, expression_evaluator, painless_parser, state_hosted_service::API_SERVICE_CLIENT, state_peers::SnapshotDescriptor};
-use crate::elastic_search_responses::QueryResultsNotFound;
+use crate::elastic_search_parser::AggSpec;
+use crate::elastic_search_responses::{AggregationBucket, AggregationResult, QueryResultsNotFound};
 
 fn empty_result() -> Arc<dyn CommandResponse> {
     // TODO: need to record and feed through the requested number of shards from index creation
@@ -146,6 +147,7 @@ impl Command for Match {
                 num_records_with_term,
                 hits.get(0).unwrap().score(),
                 hits,
+                None,
             );    
 
             Ok(Arc::new(final_result))
@@ -254,7 +256,7 @@ impl Command for LookupById {
                     let inner_result: Arc<dyn CommandResponse> = if hits.len() == 0 {
                         Arc::new(QueryResultsNotFound { _index: table, _id: ids.get(0).unwrap().clone(), found: false })
                     } else {
-                        Arc::new(QueryResults::success(10, 2, hits.len(), 1.0, hits))
+                        Arc::new(QueryResults::success(10, 2, hits.len(), 1.0, hits, None))
                     };
                     inner_result
                 },
@@ -288,12 +290,13 @@ pub(crate) struct SqlCommand {
     pub sql: String,
     pub table: String,
     pub calculate_score: bool,
+    pub aggs: Option<HashMap<String, AggSpec>>,
 }
 
 impl SqlCommand {
-    async fn get_final_dataframe(public_table_name: &String, temp_table_name: &String, calculate_score: bool) -> DataFrame {
+    async fn get_final_table_name(public_table_name: &String, temp_table_name: &String, calculate_score: bool) -> String {
         if calculate_score {
-            let initial_data_frame = match execute_sql(&format!("select 1 from {temp_table_name}")).await {
+            let initial_data_frame = match execute_sql(&format!("select * from {temp_table_name}")).await {
                 Ok(df) => df,
                 Err(_) => panic!("nope")
             };
@@ -301,8 +304,9 @@ impl SqlCommand {
             let num_records_with_term = match initial_data_frame.clone().count().await {
                 Ok(tr) => tr,
                 Err(_) => panic!("nope"),
-            };            
+            };
 
+            let column_names = initial_data_frame.schema().columns().iter().map(|c|format!("[{}]", c.name())).collect::<Vec<String>>().join(", ");
             // TODO: need to get more of the metadata tracking system working to get total_records and avgdl for real
             let total_records: f64 = match distributed_cache::get_approx_num_records(public_table_name) {
                 Ok(t) => t as f64,
@@ -313,22 +317,41 @@ impl SqlCommand {
             let constant_b = 0.75;
             let avgdl = 5.6;
 
-            let bm25_sql = format!("SELECT *, ln(({total_records} - {records_with_term} + 0.5)/({records_with_term} + 0.5) + 1) * (term_cnt * ({constant_k} + 1)) / (term_cnt + {constant_k} * (1 - {constant_b} + ({constant_b} * word_cnt / {avgdl}))) as score FROM {temp_table_name} order by score desc");
-            let sql_data_frame = match execute_sql(&bm25_sql).await {
+            let final_table_name = format!("{temp_table_name}_final");
+            let bm25_sql = format!("CREATE TABLE {final_table_name} AS SELECT {column_names}, ln(({total_records} - {records_with_term} + 0.5)/({records_with_term} + 0.5) + 1) * (term_cnt * ({constant_k} + 1)) / (term_cnt + {constant_k} * (1 - {constant_b} + ({constant_b} * word_cnt / {avgdl}))) as score FROM {temp_table_name} order by score desc");
+            let _sql_data_frame = match execute_sql(&bm25_sql).await {
                 Ok(df) => df,
                 Err(_) => panic!("nope"),
             };
-            match sql_data_frame.drop_columns(&["term_cnt", "word_cnt", "field_term", "field_name", "doc_id"]) {
-                Ok(df) => df,
-                Err(_) => panic!("nope"),
-            }
+            final_table_name.clone()
         } else {
-            match execute_sql(&format!("select * from {temp_table_name}")).await {
-                Ok(df) => df,
-                Err(_) => panic!("nope"),
-            }               
+            temp_table_name.clone()
         }
-    }    
+    }
+
+    async fn to_buckets(_data_frame: DataFrame, _spec: &AggSpec) -> Vec<AggregationBucket> {
+        vec!()
+    }
+    
+    async fn generate_aggregations(data_frame: DataFrame, aggs: Option<HashMap<String, AggSpec>>) -> Option<HashMap<String, AggregationResult>> {
+        if aggs.is_none() {
+            return None
+        }
+        
+        let mut results = HashMap::new();
+        for (name, spec) in aggs.unwrap().iter() {
+            let buckets = SqlCommand::to_buckets(data_frame.clone(), spec).await;
+            results.insert(
+                name.clone(),
+                AggregationResult {
+                    doc_count_error_upper_bound: 0,
+                    sum_other_doc_count: 0,
+                    buckets: buckets,
+                }
+            );
+        }
+        Some(results)
+    }
 }
 
 
@@ -349,12 +372,17 @@ impl Command for SqlCommand {
     fn result_generator(&self, result_table_name: Option<String>) -> Pin<Box<ResultGeneratorFuture>> {
         let table = self.table.clone();
         let calculate_score = self.calculate_score;
+        let aggs = self.aggs.clone();
         async move {
             let table_name = match result_table_name {
                 Some(t) => t,
                 None => return Ok(empty_result())
             };
-            let data_frame = SqlCommand::get_final_dataframe(&table, &table_name, calculate_score).await;
+            let final_table_name = SqlCommand::get_final_table_name(&table, &table_name, calculate_score).await;
+            let data_frame = match execute_sql(&format!("select * from {final_table_name}")).await {
+                Ok(df) => df,
+                Err(_) => panic!("nope")
+            };
             let num_records = match data_frame.clone().count().await {
                 Ok(tr) => tr,
                 Err(_) => panic!("nope"),
@@ -366,12 +394,15 @@ impl Command for SqlCommand {
             };      
                   
             let hits = to_hits(&table, &first_10_rows).await;
+            
+            let aggregations = SqlCommand::generate_aggregations(data_frame.clone(), aggs).await;
             let final_result = QueryResults::success(
                 10,
                 2,
                 num_records,
                 hits.get(0).unwrap().score(),
                 hits,
+                aggregations,
             );    
 
             Ok(Arc::new(final_result))
@@ -439,7 +470,11 @@ impl Command for UpdateByQueryCommand {
                 Some(t) => t,
                 None => return Ok(empty_result())
             };
-            let data_frame = SqlCommand::get_final_dataframe(&table, &table_name, calculate_score).await;
+            let final_table_name = SqlCommand::get_final_table_name(&table, &table_name, calculate_score).await;
+            let data_frame = match execute_sql(&format!("select * from {final_table_name}")).await {
+                Ok(df) => df,
+                Err(_) => panic!("nope")    
+            };
 
             let result_values = to_serde_value(&data_frame).await;
 

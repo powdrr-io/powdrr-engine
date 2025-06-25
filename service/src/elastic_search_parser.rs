@@ -49,6 +49,24 @@ enum SortType {
     Parameterized(HashMap<String, SortBody>),
 }
 
+fn default_as_true() -> bool {
+    true
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct AggTerms {
+    field: String,
+    size: Option<u32>,
+    #[serde(default = "default_as_true")]
+    show_term_doc_count_error: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct AggSpec {
+    terms: Option<AggTerms>,
+    aggs: Option<Box<AggSpec>>,
+}
+
 
 #[derive(Serialize, Deserialize, Clone)]
 struct SearchBody {
@@ -57,6 +75,7 @@ struct SearchBody {
     from: Option<u32>,
     seq_no_primary_term: Option<bool>,
     query: Query,
+    aggs: Option<HashMap<String, AggSpec>>,
     sort: Option<Vec<SortType>>
 }
 
@@ -383,7 +402,7 @@ fn to_command(table: Option<String>, body: &SearchBody) -> Result<SqlCommand, Pa
         }
     };
 
-    Ok(SqlCommand{ sql: builder.build(), table: table_name, calculate_score: builder.score() })
+    Ok(SqlCommand{ sql: builder.build(), table: table_name, calculate_score: builder.score(), aggs: body.aggs.clone() })
 }
 
 fn to_command_update_by_query(table: Option<String>, body: &UpdateByQueryBody) -> Result<UpdateByQueryCommand, ParseError> {
@@ -397,7 +416,7 @@ fn to_command_update_by_query(table: Option<String>, body: &UpdateByQueryBody) -
     };
 
     Ok(UpdateByQueryCommand{ 
-        query_command: SqlCommand{ sql: builder.build(), table: table_name, calculate_score: builder.score() },
+        query_command: SqlCommand{ sql: builder.build(), table: table_name, calculate_score: builder.score(), aggs: None },
         script_block: body.script.clone(),
     })
 }
@@ -904,5 +923,157 @@ mod tests {
                 panic!("ERROR");
             }
         };
+    }
+
+    #[test]
+    fn test_parse_query_aggs() {
+        let test_val = r#"{
+  "query": {
+    "bool": {
+      "filter": [
+        {
+          "term": {
+            "type": "task"
+          }
+        }
+      ]
+    }
+  },
+  "aggs": {
+    "taskType": {
+      "terms": {
+        "size": 100,
+        "field": "task.taskType"
+      },
+      "aggs": {
+        "status": {
+          "terms": {
+            "field": "task.status"
+          }
+        }
+      }
+    },
+    "schedule": {
+      "terms": {
+        "field": "task.schedule.interval",
+        "size": 100
+      }
+    },
+    "nonRecurringTasks": {
+      "missing": {
+        "field": "task.schedule"
+      }
+    },
+    "ownerIds": {
+      "filter": {
+        "range": {
+          "task.startedAt": {
+            "gte": "now-1w/w"
+          }
+        }
+      },
+      "aggs": {
+        "ownerIds": {
+          "cardinality": {
+            "field": "task.ownerId"
+          }
+        }
+      }
+    },
+    "idleTasks": {
+      "filter": {
+        "term": {
+          "task.status": "idle"
+        }
+      },
+      "aggs": {
+        "scheduleDensity": {
+          "range": {
+            "field": "task.runAt",
+            "ranges": [
+              {
+                "from": "now",
+                "to": "now+2m"
+              }
+            ]
+          },
+          "aggs": {
+            "histogram": {
+              "date_histogram": {
+                "field": "task.runAt",
+                "fixed_interval": "3s"
+              },
+              "aggs": {
+                "interval": {
+                  "terms": {
+                    "field": "task.schedule.interval"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "overdue": {
+          "filter": {
+            "range": {
+              "task.runAt": {
+                "lt": "now"
+              }
+            }
+          },
+          "aggs": {
+            "nonRecurring": {
+              "missing": {
+                "field": "task.schedule"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "size": 0,
+  "track_total_hits": true
+}"#;
+
+        let parse_result: SearchBody = match serde_json::from_str(test_val) {
+            Ok(pr) => pr,
+            Err(e) => {
+                let error = format!("{}", e);
+                println!("{}", error);
+                panic!("ERROR");
+            }
+        };
+
+        let _command = to_command(Some("foobar".to_string()), &parse_result);
+
+        let test_val  = r#"
+        {
+           "query": {
+             "match": {
+               "message": {
+                 "query": "Login"
+               }
+             }
+           },
+           "aggs": {
+             "messageType": {
+               "terms": {
+                 "field": "message"
+               }          
+            }
+           }
+        }"#;
+
+        let parse_result: SearchBody = match serde_json::from_str(test_val) {
+            Ok(pr) => pr,
+            Err(e) => {
+                let error = format!("{}", e);
+                println!("{}", error);
+                panic!("ERROR");
+            }
+        };
+
+        let _command = to_command(Some("foobar".to_string()), &parse_result);        
     }
 }
