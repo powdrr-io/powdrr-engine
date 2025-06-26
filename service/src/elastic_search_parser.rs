@@ -1,24 +1,151 @@
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
-use crate::elastic_search_commands::{SqlCommand, UpdateByQueryCommand};
+use crate::data_access::execute_sql;
+use crate::elastic_search_commands::{to_serde_value, SqlCommand, UpdateByQueryCommand};
 use crate::elastic_search_common::{Command, ParseError};
+use crate::elastic_search_responses::{AggregationResult, AverageAggregationResult, FilterAggregationResult, TermAggregationBucket, TermAggregationResult};
 
 
-// Example:
-// {
-//   "query": {
-//     "match": {
-//       "message": {
-//         "query": "this is a test"
-//       }
-//     }
-//   }
-// }
+
+#[derive(Clone)]
+pub(crate) struct TermAggProcessor {
+    sql: String,
+}
+
+impl TermAggProcessor {
+    fn create_aggregation_bucket(value: &Value) -> TermAggregationBucket {
+        let value_map = value.as_object().unwrap();
+        let mut value_map_iter = value_map.iter();
+        let first_pair = value_map_iter.next().unwrap();
+        let second_pair = value_map_iter.next().unwrap();
+
+        TermAggregationBucket {
+            key: second_pair.1.to_string(),
+            doc_count: first_pair.1.as_u64().unwrap()
+        }
+    }
+
+    async fn create_buckets(table_name: &String, query: &String) -> Vec<TermAggregationBucket> {
+        let final_sql = query.replace("{target_table}", table_name);
+        let data_frame = match execute_sql(&final_sql).await {
+            Ok(df) => df,
+            Err(_) => panic!("nope")
+        };
+
+        assert_eq!(data_frame.schema().columns().len(), 2);
+
+        let serde_values = to_serde_value(&data_frame).await;
+
+        serde_values.iter().map(|v| TermAggProcessor::create_aggregation_bucket(v)).collect::<Vec<TermAggregationBucket>>()
+    }
+
+    async fn process(&self, table_name: &String, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
+        let child_aggs = process_aggregations(subaggregations, table_name).await;
+
+        AggregationResult::Terms(TermAggregationResult{
+            doc_count_error_upper_bound: 0,
+            sum_other_doc_count: 0,
+            buckets: TermAggProcessor::create_buckets(table_name, &self.sql).await,
+            aggs: child_aggs
+        })
+    }
+}
+
+
+#[derive(Clone)]
+pub(crate) struct AverageAggProcessor {
+    sql: String,
+}
+
+impl AverageAggProcessor {
+    async fn calculate_average(table_name: &String, query: &String) -> f64 {
+        let final_sql = query.replace("{target_table}", table_name);
+        let data_frame = match execute_sql(&final_sql).await {
+            Ok(df) => df,
+            Err(_) => panic!("nope")
+        };
+
+        assert_eq!(data_frame.schema().columns().len(), 1);
+
+        let serde_values = to_serde_value(&data_frame).await;
+
+        serde_values.get(0).unwrap().as_object().unwrap().get("avg").unwrap().as_f64().unwrap()
+    }
+
+    async fn process(&self, table_name: &String, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
+        let child_aggs = process_aggregations(subaggregations, table_name).await;
+
+        AggregationResult::Average(AverageAggregationResult{
+            value: AverageAggProcessor::calculate_average(table_name, &self.sql).await,
+            aggs: child_aggs,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct FilterAggProcessor {
+    sql: String,
+}
+
+
+impl FilterAggProcessor {
+    async fn process(&self, table_name: &String, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
+        let final_sql = self.sql.replace("{target_table}", table_name);
+        let data_frame = execute_sql(&final_sql).await.unwrap();
+        assert_eq!(data_frame.schema().columns().len(), 1);
+        let serde_values = to_serde_value(&data_frame).await;
+        let cnt = serde_values.get(0).unwrap().as_object().unwrap().get("cnt").unwrap().as_u64().unwrap();
+
+        let child_aggs = process_aggregations(subaggregations, table_name).await;
+
+        AggregationResult::Filter(FilterAggregationResult {
+            doc_count: cnt,
+            aggs: child_aggs
+        })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum AggProcessor {
+    Term(TermAggProcessor),
+    Average(AverageAggProcessor),
+    Filter(FilterAggProcessor),
+}
+
+#[derive(Clone)]
+pub(crate) struct Aggregation {
+    pub name: String,
+    pub processor: AggProcessor,
+    pub subaggregations: Option<Vec<Aggregation>>
+}
+
+pub(crate) async fn process_aggregation(aggregation: &Aggregation, table_name: &String) -> AggregationResult {
+    match &aggregation.processor {
+        AggProcessor::Term(term) => {
+            term.process(table_name, aggregation.subaggregations.clone()).await
+        },
+        AggProcessor::Average(average) => {
+            average.process(table_name, aggregation.subaggregations.clone()).await
+        },
+        AggProcessor::Filter(filter) => {
+            filter.process(table_name, aggregation.subaggregations.clone()).await
+        }
+    }
+}
+
+pub(crate) async fn process_aggregations(aggregations: Option<Vec<Aggregation>>, table_name: &String) -> HashMap<String, AggregationResult> {
+    let mut results = HashMap::new();
+    if aggregations.is_some() {
+        for aggregation in aggregations.unwrap() {
+            results.insert(aggregation.name.clone(), Box::pin(process_aggregation(&aggregation, table_name)).await);
+        }
+    }
+    results
+}
 
 
 pub fn parse(table: Option<String>, val: &String) -> Result<Arc<dyn Command>, ParseError> {
@@ -158,6 +285,17 @@ pub(crate) struct AggSpecRange {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct AggSpecAverageBody {
+    field: String
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct AggSpecAverage {
+    avg: AggSpecAverageBody,
+    aggs: Option<HashMap<String, AggSpec>>
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(untagged)]
 pub(crate) enum AggSpec {
     Terms(AggSpecTerms),
@@ -166,6 +304,7 @@ pub(crate) enum AggSpec {
     DateHistogram(AggSpecDateHistogram),
     Cardinality(AggSpecCardinality),
     Range(AggSpecRange),
+    Average(AggSpecAverage),
 }
 
 
@@ -175,7 +314,7 @@ struct SearchBody {
     size: Option<u32>,
     from: Option<u32>,
     seq_no_primary_term: Option<bool>,
-    query: Query,
+    query: Option<Query>,
     aggs: Option<HashMap<String, AggSpec>>,
     sort: Option<Vec<SortType>>
 }
@@ -315,6 +454,7 @@ pub(crate) struct SimpleQueryStringBody {
     default_operator: String,
 }
 
+#[derive(Clone)]
 pub(crate) enum FilterExpression {
     And(Vec<FilterExpression>),
     Or(Vec<FilterExpression>),
@@ -339,24 +479,42 @@ pub(crate) struct ScriptBlock {
     pub params: HashMap<String, Value>,
 }
 
+#[derive(Clone)]
 struct SqlBuilder {
     fields: Vec<String>,
     joins: Vec<String>,
-    filter_stack: Cell<Vec<Vec<FilterExpression>>>,
+    filter_stack: RefCell<Vec<Vec<FilterExpression>>>,
     limit: Option<u64>,
     calculate_score: bool,
     order_by: Vec<String>,
+    group_by: Vec<String>,
+    top_level: bool,
 }
 
 impl SqlBuilder {
-    fn new() -> Self {
+    fn for_query() -> Self {
         SqlBuilder { 
             fields: vec!(), 
             joins: vec!(), 
-            filter_stack: Cell::new(vec!(vec!())),
+            filter_stack: RefCell::new(vec!(vec!())),
             limit: None, 
             calculate_score: false,
             order_by: vec!(),
+            group_by: vec!(),
+            top_level: true,
+        }
+    }
+
+    fn for_agg() -> Self {
+        SqlBuilder {
+            fields: vec!(),
+            joins: vec!(),
+            filter_stack: RefCell::new(vec!(vec!())),
+            limit: None,
+            calculate_score: false,
+            order_by: vec!(),
+            group_by: vec!(),
+            top_level: false,
         }
     }
 
@@ -402,22 +560,42 @@ impl SqlBuilder {
         }
     }
 
-    fn _joins(&self) -> String {
-        if self.joins.len() == 0 {
-            " LEFT JOIN {deletes_table} dt on t._id = dt._id".to_string()
+    fn _deletes(&self) -> String {
+        if self.top_level {
+            " LEFT JOIN {deletes_table} dt ON dt._id = t._id".to_string()
         } else {
-            format!(" {} LEFT JOIN {{deletes_table}} dt on t._id = dt._id", self.joins.join(" "))
+            "".to_string()
         }
     }
 
-    fn _filters(&mut self) -> String {
-        let local_filter_stack = self.filter_stack.get_mut();
-        assert!(local_filter_stack.len() == 1);
-        let top = local_filter_stack.pop().unwrap();
-        if top.len() == 0 {
-            " WHERE (dt._seq_no is null or t._seq_no > dt._seq_no)".to_string()
+    fn _joins(&self) -> String {
+        if self.joins.len() == 0 {
+            self._deletes()
         } else {
-            format!(" WHERE (dt._seq_no is null or t._seq_no > dt._seq_no) AND {}", SqlBuilder::format_filter(&FilterExpression::And(top)))
+            format!(" {}{}", self.joins.join(" "), self._deletes())
+        }
+    }
+
+    fn _latest(&self) -> String {
+        if self.top_level {
+            "(dt._seq_no is null or t._seq_no > dt._seq_no)".to_string()
+        } else {
+            "".to_string()
+        }
+    }
+
+    fn _filters(&self) -> String {
+        let mut local_filter_stack = self.filter_stack.borrow().clone();
+        assert_eq!(local_filter_stack.len(), 1);
+        let top = local_filter_stack.pop().unwrap();
+        if top.len() == 0 && !self.top_level {
+            "".to_string()
+        } else if top.len() == 0 {
+            format!(" WHERE {}", self._latest())
+        } else if self.top_level{
+            format!(" WHERE {} AND {}", self._latest(), SqlBuilder::format_filter(&FilterExpression::And(top)))
+        } else {
+            format!(" WHERE {}", SqlBuilder::format_filter(&FilterExpression::And(top)))
         }
     }
 
@@ -459,8 +637,15 @@ impl SqlBuilder {
         if self.order_by.len() == 0 {
             "".to_string()
         } else {
-            // TODO
+            format!(" ORDER BY {}", self.group_by.join(", "))
+        }
+    }
+
+    fn _group_by(&self) -> String {
+        if self.group_by.len() == 0 {
             "".to_string()
+        } else {
+            format!(" GROUP BY {}", self.group_by.join(", "))
         }
     }
 
@@ -468,28 +653,56 @@ impl SqlBuilder {
         self.calculate_score
     }
 
-    fn build(&mut self) -> String {
+    fn build(&self) -> String {
         let filter_str = self._filters();
         format!(
-            "select {} from {} {}{}{}{}",
+            "select {} from {} {}{}{}{}{}",
             self._fields(),
             "{target_table} t",
             self._joins(),
             filter_str,
             self._order_by(),
+            self._group_by(),
             self._limit()
         )
     }
 }
 
-fn agg_to_sql(spec: &AggSpec) -> String {
+fn create_aggregation_filter(filter: &AggSpecFilterBody) -> String {
+    match filter {
+        AggSpecFilterBody::Term(term) => {
+            assert_eq!(term.term.len(), 1);
+            let (name, value) = term.term.iter().next().unwrap();
+            format!("{name} = '{value}'")
+        },
+        AggSpecFilterBody::Range(_range) => {
+            todo!()
+        }
+    }
+}
+
+fn create_aggregation_processor(input_builder: &SqlBuilder, spec: &AggSpec) -> (AggProcessor, Option<Vec<Aggregation>>) {
     match spec {
         AggSpec::Terms(terms) => {
             let field_name = terms.terms.field.clone();
-            format!("select {field_name}, count(1) from {{target_table}} t group by {field_name}")
+            let mut builder = input_builder.clone();
+            builder.fields.push(format!("{field_name} as field_name"));
+            builder.fields.push("count(1) as cnt".to_string());
+            builder.group_by.push(format!("{field_name}"));
+            let sql = builder.build();
+            let processor = AggProcessor::Term(TermAggProcessor{ sql: sql });
+            let aggregations = aggs_to_sql(Some(builder), terms.aggs.clone());
+            (processor, aggregations)
         },
-        AggSpec::Filter(_filter) => {
-            todo!()
+        AggSpec::Filter(filter) => {
+            let mut builder = input_builder.clone();
+            builder.filter(create_aggregation_filter(&filter.filter));
+            let mut query_builder = builder.clone();
+            query_builder.fields.push("count(1) as cnt".to_string());
+            let sql = query_builder.build();
+            let processor = AggProcessor::Filter(FilterAggProcessor{ sql: sql });
+            let aggregations = aggs_to_sql(Some(builder), filter.aggs.clone());
+            (processor, aggregations)
         },
         AggSpec::Missing(_missing) => {
             todo!()
@@ -503,19 +716,38 @@ fn agg_to_sql(spec: &AggSpec) -> String {
         AggSpec::Range(_range) => {
             todo!()
         }
+        AggSpec::Average(average) => {
+            let mut builder = input_builder.clone();
+            let field_name = average.avg.field.clone();
+            builder.fields.push(format!("avg({field_name}) as avg"));
+            let sql = builder.build();
+            let processor = AggProcessor::Average(AverageAggProcessor{ sql: sql });
+            let aggregations = aggs_to_sql(Some(builder), average.aggs.clone());
+            (processor, aggregations)
+        }
     }
 }
 
-fn aggs_to_sql(aggs: Option<HashMap<String, AggSpec>>) -> Option<HashMap<String, String>> {
+fn create_aggregation(input_builder: Option<SqlBuilder>, name: &String, spec: &AggSpec) -> Aggregation {
+    let builder = input_builder.unwrap_or_else(|| SqlBuilder::for_agg());
+    let (processor, subaggregations) = create_aggregation_processor(&builder, spec);
+    Aggregation {
+        name: name.clone(),
+        processor: processor,
+        subaggregations: subaggregations,
+    }
+}
+
+fn aggs_to_sql(input_builder: Option<SqlBuilder>, aggs: Option<HashMap<String, AggSpec>>) -> Option<Vec<Aggregation>> {
     if aggs.is_none() {
         return None;
     }
 
-    Some(aggs.unwrap().iter().map(|x| (x.0.clone(), agg_to_sql(x.1))).collect())
+    Some(aggs.unwrap().iter().map(|x| create_aggregation(input_builder.clone(), x.0, x.1)).collect())
 }
 
 fn to_command(table: Option<String>, body: &SearchBody) -> Result<SqlCommand, ParseError> {
-    let mut builder = SqlBuilder::new();
+    let mut builder = SqlBuilder::for_query();
 
     if body.from.is_some() {
         if body.from.unwrap() != 0 {
@@ -523,7 +755,11 @@ fn to_command(table: Option<String>, body: &SearchBody) -> Result<SqlCommand, Pa
         }
     }
 
-    to_command_worker(&mut builder, &body.query)?;
+    if body.query.is_some() {
+        to_command_worker(&mut builder, &body.query.clone().unwrap())?;
+    } else {
+        builder.fields.push("*".to_string());
+    }
 
     let table_name = match table {
         Some(t) => t,
@@ -534,13 +770,13 @@ fn to_command(table: Option<String>, body: &SearchBody) -> Result<SqlCommand, Pa
         }
     };
 
-    let aggs = aggs_to_sql(body.aggs.clone());
+    let aggs = aggs_to_sql(None, body.aggs.clone());
 
     Ok(SqlCommand{ sql: builder.build(), table: table_name, calculate_score: builder.score(), aggs: aggs })
 }
 
 fn to_command_update_by_query(table: Option<String>, body: &UpdateByQueryBody) -> Result<UpdateByQueryCommand, ParseError> {
-    let mut builder = SqlBuilder::new();
+    let mut builder = SqlBuilder::for_query();
 
     to_command_worker(&mut builder, &body.query)?;
 
@@ -562,7 +798,7 @@ fn to_command_worker(builder: &mut SqlBuilder, query: &Query) -> Result<(), Pars
         Query::Term(t) => to_sql_term(builder, &t),
         Query::Exists(e) => to_sql_exists(builder, &e),
         Query::Range(r) => to_sql_range(builder, &r),
-        Query::SimpleQueryString(s) => to_sql_simple_query(builder, s),
+        Query::SimpleQueryString(s) => to_sql_simple_query(builder, &s),
     }
 }
 

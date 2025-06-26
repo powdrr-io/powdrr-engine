@@ -714,7 +714,92 @@ mod tests {
         }
 
     }
-    
+
+    #[test]
+    fn test_es_ingest_then_search_table_sub_agg() {
+        let test_server = &*TEST_SERVER;
+
+        test_server.client().put(
+            "http://localhost/_test/v1/_testing_mode",
+            "",
+            mime::TEXT_PLAIN
+        ).perform().unwrap();
+
+        let body_create_index = r#"{
+            "settings" : {
+                "index": {
+                "number_of_shards" : 2,
+                "number_of_replicas" : 1
+            } } }"#;
+
+        let response_create_index = test_server.client().put(
+            "http://localhost/logs",
+            body_create_index,
+            mime::APPLICATION_JSON,
+        ).perform().unwrap();
+
+        assert_eq!(response_create_index.status(), 200);
+
+        let body = r#"{"create":{ "_index": "logs" }}
+{ "@timestamp": "2099-03-08T11:04:05.000Z", "index_col": 1, "user": { "id": "vlb44hny" }, "type": "t-shirt", "price": 100.00 }
+{"create":{ "_index": "logs" }}
+{ "@timestamp": "2099-03-08T11:06:07.000Z", "index_col": 2, "user": { "id": "8a4f500d" }, "type": "t-shirt", "price": 80.00 }
+{"create":{ "_index": "logs" }}
+{ "@timestamp": "2099-03-09T11:07:08.000Z", "index_col": 3, "user": { "id": "l7gk7f82" }, "type": "button down", "price": 120.00 }
+{"create":{ "_index": "logs" }}
+{ "@timestamp": "2099-03-10T11:08:07.000Z", "index_col": 4, "user": { "id": "8a2f500d" }, "type": "button down", "price": 140.00 }"#;
+
+        let response = test_server.client().post(
+            "http://localhost/_bulk",
+            body,
+            mime::APPLICATION_JSON,
+        ).perform().unwrap();
+
+        assert_eq!(response.status(), 200);
+
+        let process_work_response = test_server.client().put(
+            "http://localhost/_test/v1/_process_work",
+            "",
+            mime::TEXT_PLAIN,
+        ).perform().unwrap();
+
+        assert_eq!(process_work_response.status(), 200);
+
+        let body_obj  = r#"
+        {
+          "aggs": {
+            "avg_price": { "avg": { "field": "price" } },
+            "t_shirts": {
+              "filter": { "term": { "type": "t-shirt" } },
+              "aggs": {
+                "avg_price": { "avg": { "field": "price" } }
+              }
+            }
+          }
+        }"#;
+
+        let response_result = test_server.client().post(
+            "http://localhost/logs/_search",
+            body_obj,
+            mime::APPLICATION_JSON,
+        ).perform();
+
+        match response_result {
+            Ok(response) => {
+                assert_eq!(response.status(), 200);
+                let body = response.read_body().unwrap();
+                let str_body = str::from_utf8(&body).unwrap();
+                print!("{}", str_body);
+                assert!(str_body.contains("aggregations"));
+            },
+            Err(e) => {
+                panic!("Failed {}", e)
+            }
+        }
+
+    }
+
+
     
     #[test]
     fn test_es_ingest_search_ingest_compact_then_search_table() {
