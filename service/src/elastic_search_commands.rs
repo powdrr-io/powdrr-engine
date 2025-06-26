@@ -1,13 +1,12 @@
 
 use std::{collections::HashMap, pin::Pin, sync::Arc};
-
+use std::sync::LazyLock;
 use async_trait::async_trait;
 use datafusion::{arrow::array::RecordBatch, prelude::DataFrame};
 use futures::FutureExt;
 use serde_json::{json, Value};
 
 use crate::{data_access::{self, execute_sql}, distributed_cache, elastic_search_common::{Command, CommandResponse, ParseError, ResultGeneratorFuture, SqlBuilder}, elastic_search_ingest::{self, WriteBuffer}, elastic_search_parser::ScriptBlock, elastic_search_responses::{QueryFailure, QueryResultHit, QueryResults}, expression_evaluator, painless_parser, state_hosted_service::API_SERVICE_CLIENT, state_peers::SnapshotDescriptor};
-use crate::elastic_search_parser::AggSpec;
 use crate::elastic_search_responses::{AggregationBucket, AggregationResult, QueryResultsNotFound};
 
 fn empty_result() -> Arc<dyn CommandResponse> {
@@ -36,7 +35,7 @@ fn to_hit(index: &String, value: &Value) -> QueryResultHit {
     )
 }
 
-async fn to_serde_value(data_frame: &DataFrame) -> Vec<Value> {
+pub(crate) async fn to_serde_value(data_frame: &DataFrame) -> Vec<Value> {
     let record_batches: Vec<RecordBatch> = match data_frame.clone().collect().await {
         Ok(b) => b,
         Err(_e) => panic!("nope")
@@ -290,8 +289,17 @@ pub(crate) struct SqlCommand {
     pub sql: String,
     pub table: String,
     pub calculate_score: bool,
-    pub aggs: Option<HashMap<String, AggSpec>>,
+    pub aggs: Option<HashMap<String, String>>,
 }
+
+static SEARCH_COLUMNS: LazyLock<Vec<String>> = LazyLock::new(|| vec!(
+    "\"term_cnt\"".to_string(),
+    "\"word_cnt\"".to_string(),
+    "\"field_term\"".to_string(),
+    "\"field_name\"".to_string(),
+    "\"@timestamp\"".to_string(),
+    //"\"user\"".to_string(),
+));
 
 impl SqlCommand {
     async fn get_final_table_name(public_table_name: &String, temp_table_name: &String, calculate_score: bool) -> String {
@@ -306,7 +314,10 @@ impl SqlCommand {
                 Err(_) => panic!("nope"),
             };
 
-            let column_names = initial_data_frame.schema().columns().iter().map(|c|format!("[{}]", c.name())).collect::<Vec<String>>().join(", ");
+            let mut column_names = initial_data_frame.schema().columns().iter().map(|c|format!("\"{}\"", c.name()).to_string()).collect::<Vec<String>>();
+            column_names.retain(|c| !SEARCH_COLUMNS.contains(c));
+            let column_names_joined = column_names.join(", ");
+
             // TODO: need to get more of the metadata tracking system working to get total_records and avgdl for real
             let total_records: f64 = match distributed_cache::get_approx_num_records(public_table_name) {
                 Ok(t) => t as f64,
@@ -318,7 +329,7 @@ impl SqlCommand {
             let avgdl = 5.6;
 
             let final_table_name = format!("{temp_table_name}_final");
-            let bm25_sql = format!("CREATE TABLE {final_table_name} AS SELECT {column_names}, ln(({total_records} - {records_with_term} + 0.5)/({records_with_term} + 0.5) + 1) * (term_cnt * ({constant_k} + 1)) / (term_cnt + {constant_k} * (1 - {constant_b} + ({constant_b} * word_cnt / {avgdl}))) as score FROM {temp_table_name} order by score desc");
+            let bm25_sql = format!("CREATE TABLE {final_table_name} AS SELECT {column_names_joined}, ln(({total_records} - {records_with_term} + 0.5)/({records_with_term} + 0.5) + 1) * (term_cnt * ({constant_k} + 1)) / (term_cnt + {constant_k} * (1 - {constant_b} + ({constant_b} * word_cnt / {avgdl}))) as score FROM {temp_table_name} order by score desc");
             let _sql_data_frame = match execute_sql(&bm25_sql).await {
                 Ok(df) => df,
                 Err(_) => panic!("nope"),
@@ -328,19 +339,41 @@ impl SqlCommand {
             temp_table_name.clone()
         }
     }
+    
+    fn to_aggregation_bucket(value: &Value) -> AggregationBucket {
+        let value_map = value.as_object().unwrap();
+        let mut value_map_iter = value_map.iter();
+        let first_pair = value_map_iter.next().unwrap();
+        let second_pair = value_map_iter.next().unwrap();
+        
+        AggregationBucket {
+            key: second_pair.1.to_string(),
+            doc_count: first_pair.1.as_u64().unwrap()
+        }
+    }
 
-    async fn to_buckets(_data_frame: DataFrame, _spec: &AggSpec) -> Vec<AggregationBucket> {
-        vec!()
+    async fn to_buckets(table_name: &String, query: &String) -> Vec<AggregationBucket> {
+        let final_sql = query.replace("{target_table}", table_name);
+        let data_frame = match execute_sql(&final_sql).await {
+            Ok(df) => df,
+            Err(_) => panic!("nope")
+        };
+        
+        assert_eq!(data_frame.schema().columns().len(), 2);
+        
+        let serde_values = to_serde_value(&data_frame).await;
+        
+        serde_values.iter().map(|v| SqlCommand::to_aggregation_bucket(v)).collect::<Vec<AggregationBucket>>()
     }
     
-    async fn generate_aggregations(data_frame: DataFrame, aggs: Option<HashMap<String, AggSpec>>) -> Option<HashMap<String, AggregationResult>> {
+    async fn generate_aggregations(table_name: &String, aggs: Option<HashMap<String, String>>) -> Option<HashMap<String, AggregationResult>> {
         if aggs.is_none() {
             return None
         }
         
         let mut results = HashMap::new();
-        for (name, spec) in aggs.unwrap().iter() {
-            let buckets = SqlCommand::to_buckets(data_frame.clone(), spec).await;
+        for (name, query) in aggs.unwrap().iter() {
+            let buckets = SqlCommand::to_buckets(table_name, query).await;
             results.insert(
                 name.clone(),
                 AggregationResult {
@@ -391,11 +424,11 @@ impl Command for SqlCommand {
             let first_10_rows = match data_frame.clone().limit(0, Some(10)) {
                 Ok(ftr) => ftr,
                 Err(_) => panic!("nope"),
-            };      
-                  
+            };
+
             let hits = to_hits(&table, &first_10_rows).await;
             
-            let aggregations = SqlCommand::generate_aggregations(data_frame.clone(), aggs).await;
+            let aggregations = SqlCommand::generate_aggregations(&final_table_name, aggs).await;
             let final_result = QueryResults::success(
                 10,
                 2,
@@ -473,7 +506,7 @@ impl Command for UpdateByQueryCommand {
             let final_table_name = SqlCommand::get_final_table_name(&table, &table_name, calculate_score).await;
             let data_frame = match execute_sql(&format!("select * from {final_table_name}")).await {
                 Ok(df) => df,
-                Err(_) => panic!("nope")    
+                Err(_) => panic!("nope")
             };
 
             let result_values = to_serde_value(&data_frame).await;

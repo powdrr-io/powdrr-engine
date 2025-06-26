@@ -9,7 +9,6 @@ mod compaction;
 mod data_access;
 mod data_fusion_functions;
 mod distributed_cache;
-mod elastic_search_aggregation_processor;
 mod elastic_search_cluster_info;
 mod elastic_search_commands;
 mod elastic_search_common;

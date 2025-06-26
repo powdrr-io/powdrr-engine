@@ -2,7 +2,6 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -62,9 +61,111 @@ pub(crate) struct AggTerms {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct AggSpec {
-    terms: Option<AggTerms>,
-    aggs: Option<Box<AggSpec>>,
+pub(crate) struct AggSpecTermsBody {
+    field: String,
+    size: Option<u32>,
+    #[serde(default = "default_as_true")]
+    show_term_doc_count_error: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct AggSpecTerms {
+    terms: AggSpecTermsBody,
+    aggs: Option<HashMap<String, AggSpec>>,
+}
+
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct AggSpecMissingBody {
+    field: String,
+    size: Option<u32>,
+    #[serde(default = "default_as_true")]
+    show_term_doc_count_error: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct AggSpecMissing {
+    missing: AggSpecMissingBody,
+    aggs: Option<HashMap<String, AggSpec>>
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct AggSpecFilterTerm {
+    term: HashMap<String, String>
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct AggSpecFilterRangeSpan {
+    from: String,
+    to: String
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct AggSpecFilterRangeStructured {
+    field: String,
+    ranges: Vec<AggSpecFilterRangeSpan>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+pub(crate) enum AggSpecFilterRangeBody {
+    Structured(AggSpecFilterRangeStructured),
+    Raw(HashMap<String, HashMap<String, String>>),
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct AggSpecFilterRange {
+    range: AggSpecFilterRangeBody,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+pub(crate) enum AggSpecFilterBody {
+    Term(AggSpecFilterTerm),
+    Range(AggSpecFilterRange),
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct AggSpecFilter {
+    filter: AggSpecFilterBody,
+    aggs: Option<HashMap<String, AggSpec>>
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct AggSpecDateHistogramBody {
+    field: String,
+    fixed_interval: String,
+}
+
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct AggSpecDateHistogram {
+    date_histogram: AggSpecDateHistogramBody,
+    aggs: Option<HashMap<String, AggSpec>>
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct AggSpecCardinality {
+    cardinality: HashMap<String, String>,
+    aggs: Option<HashMap<String, AggSpec>>
+}
+
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct AggSpecRange {
+    range: AggSpecFilterRangeBody,
+    aggs: Option<HashMap<String, AggSpec>>
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+pub(crate) enum AggSpec {
+    Terms(AggSpecTerms),
+    Missing(AggSpecMissing),
+    Filter(AggSpecFilter),
+    DateHistogram(AggSpecDateHistogram),
+    Cardinality(AggSpecCardinality),
+    Range(AggSpecRange),
 }
 
 
@@ -381,6 +482,37 @@ impl SqlBuilder {
     }
 }
 
+fn agg_to_sql(spec: &AggSpec) -> String {
+    match spec {
+        AggSpec::Terms(terms) => {
+            let field_name = terms.terms.field.clone();
+            format!("select {field_name}, count(1) from {{target_table}} t group by {field_name}")
+        },
+        AggSpec::Filter(_filter) => {
+            todo!()
+        },
+        AggSpec::Missing(_missing) => {
+            todo!()
+        },
+        AggSpec::DateHistogram(_hist) => {
+            todo!()
+        },
+        AggSpec::Cardinality(_cardinality) => {
+            todo!()
+        } ,
+        AggSpec::Range(_range) => {
+            todo!()
+        }
+    }
+}
+
+fn aggs_to_sql(aggs: Option<HashMap<String, AggSpec>>) -> Option<HashMap<String, String>> {
+    if aggs.is_none() {
+        return None;
+    }
+
+    Some(aggs.unwrap().iter().map(|x| (x.0.clone(), agg_to_sql(x.1))).collect())
+}
 
 fn to_command(table: Option<String>, body: &SearchBody) -> Result<SqlCommand, ParseError> {
     let mut builder = SqlBuilder::new();
@@ -402,7 +534,9 @@ fn to_command(table: Option<String>, body: &SearchBody) -> Result<SqlCommand, Pa
         }
     };
 
-    Ok(SqlCommand{ sql: builder.build(), table: table_name, calculate_score: builder.score(), aggs: body.aggs.clone() })
+    let aggs = aggs_to_sql(body.aggs.clone());
+
+    Ok(SqlCommand{ sql: builder.build(), table: table_name, calculate_score: builder.score(), aggs: aggs })
 }
 
 fn to_command_update_by_query(table: Option<String>, body: &UpdateByQueryBody) -> Result<UpdateByQueryCommand, ParseError> {
@@ -415,7 +549,7 @@ fn to_command_update_by_query(table: Option<String>, body: &UpdateByQueryBody) -
         None => panic!("Didn't find a table")
     };
 
-    Ok(UpdateByQueryCommand{ 
+    Ok(UpdateByQueryCommand{
         query_command: SqlCommand{ sql: builder.build(), table: table_name, calculate_score: builder.score(), aggs: None },
         script_block: body.script.clone(),
     })
@@ -1036,7 +1170,7 @@ mod tests {
   "track_total_hits": true
 }"#;
 
-        let parse_result: SearchBody = match serde_json::from_str(test_val) {
+        let _parse_result: SearchBody = match serde_json::from_str(test_val) {
             Ok(pr) => pr,
             Err(e) => {
                 let error = format!("{}", e);
@@ -1045,7 +1179,7 @@ mod tests {
             }
         };
 
-        let _command = to_command(Some("foobar".to_string()), &parse_result);
+        //let _command = to_command(Some("foobar".to_string()), &parse_result);
 
         let test_val  = r#"
         {

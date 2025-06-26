@@ -81,8 +81,8 @@ pub(crate) struct QueryResultHits {
 
 #[derive(Serialize, Clone)]
 pub(crate) struct AggregationBucket {
-    key: String,
-    doc_count: u64,
+    pub key: String,
+    pub doc_count: u64,
 }
 
 #[derive(Serialize, Clone)]
