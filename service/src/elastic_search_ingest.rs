@@ -276,7 +276,6 @@ pub(crate) struct CreateIndexTemplateBody {
     template: CreateIndexBody,
 }
 
-
 pub(crate) async fn create_index(table: &String, body: &String) -> Result<CreateIndexResult, IngestError> {
     let parsed_body = match CreateIndexBody::parse(body) {
         Ok(pb) => pb,
@@ -293,7 +292,13 @@ pub(crate) async fn create_index(table: &String, body: &String) -> Result<Create
         name: table.clone(),
         tags: HashMap::from([("_es_original".to_string(), serialized_body)])
     }).await;
-    
+
+    if parsed_body.aliases.is_some() {
+        for (name, _) in parsed_body.aliases.unwrap() {
+            API_SERVICE_CLIENT.add_alias(table, &name).await;
+        }
+    }
+
     Ok(CreateIndexResult { index: table.clone(), shards_acknowledged: true, acknowledged: true })
 }
 
