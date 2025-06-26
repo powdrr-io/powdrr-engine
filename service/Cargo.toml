@@ -1,7 +1,7 @@
 
 [package]
-name = "tranquil-io-monolith"
-description = "Tranquil.io Monolith"
+name = "powdrr-io-engine"
+description = "Powdrr.io Monolith"
 keywords = ["arrow", "query", "sql"]
 publish = false
 readme = "README.md"

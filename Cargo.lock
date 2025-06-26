@@ -3863,6 +3863,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "powdrr-io-engine"
+version = "0.0.1"
+dependencies = [
+ "arrow-json",
+ "arrow-select",
+ "async-trait",
+ "aws-smithy-http",
+ "aws-types",
+ "chrono",
+ "datafusion",
+ "flamegraph",
+ "flate2",
+ "futures",
+ "futures-util",
+ "gotham",
+ "gotham_restful",
+ "http 0.2.12",
+ "iceberg_lib",
+ "idgenerator",
+ "lazy_static",
+ "minijinja",
+ "object_store",
+ "phf",
+ "rand 0.9.1",
+ "redis",
+ "reqwest 0.12.20",
+ "rustls-pemfile 2.2.0",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "ttl_cache",
+ "url",
+ "use",
+ "uuid-b64",
+]
+
+[[package]]
 name = "powerfmt"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5656,46 +5696,6 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
-]
-
-[[package]]
-name = "tranquil-io-monolith"
-version = "0.0.1"
-dependencies = [
- "arrow-json",
- "arrow-select",
- "async-trait",
- "aws-smithy-http",
- "aws-types",
- "chrono",
- "datafusion",
- "flamegraph",
- "flate2",
- "futures",
- "futures-util",
- "gotham",
- "gotham_restful",
- "http 0.2.12",
- "iceberg_lib",
- "idgenerator",
- "lazy_static",
- "minijinja",
- "object_store",
- "phf",
- "rand 0.9.1",
- "redis",
- "reqwest 0.12.20",
- "rustls-pemfile 2.2.0",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "ttl_cache",
- "url",
- "use",
- "uuid-b64",
 ]
 
 [[package]]
