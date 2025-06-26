@@ -7,7 +7,8 @@ use futures::FutureExt;
 use serde_json::{json, Value};
 
 use crate::{data_access::{self, execute_sql}, distributed_cache, elastic_search_common::{Command, CommandResponse, ParseError, ResultGeneratorFuture, SqlBuilder}, elastic_search_ingest::{self, WriteBuffer}, elastic_search_parser::ScriptBlock, elastic_search_responses::{QueryFailure, QueryResultHit, QueryResults}, expression_evaluator, painless_parser, state_hosted_service::API_SERVICE_CLIENT, state_peers::SnapshotDescriptor};
-use crate::elastic_search_responses::{AggregationBucket, AggregationResult, QueryResultsNotFound};
+use crate::elastic_search_parser::{process_aggregations, Aggregation};
+use crate::elastic_search_responses::{AggregationResult, QueryResultsNotFound};
 
 fn empty_result() -> Arc<dyn CommandResponse> {
     // TODO: need to record and feed through the requested number of shards from index creation
@@ -289,7 +290,7 @@ pub(crate) struct SqlCommand {
     pub sql: String,
     pub table: String,
     pub calculate_score: bool,
-    pub aggs: Option<HashMap<String, String>>,
+    pub aggs: Option<Vec<Aggregation>>,
 }
 
 static SEARCH_COLUMNS: LazyLock<Vec<String>> = LazyLock::new(|| vec!(
@@ -297,8 +298,8 @@ static SEARCH_COLUMNS: LazyLock<Vec<String>> = LazyLock::new(|| vec!(
     "\"word_cnt\"".to_string(),
     "\"field_term\"".to_string(),
     "\"field_name\"".to_string(),
+    // TODO: figure out how to get @ character into SQL properly
     "\"@timestamp\"".to_string(),
-    //"\"user\"".to_string(),
 ));
 
 impl SqlCommand {
@@ -340,50 +341,12 @@ impl SqlCommand {
         }
     }
     
-    fn to_aggregation_bucket(value: &Value) -> AggregationBucket {
-        let value_map = value.as_object().unwrap();
-        let mut value_map_iter = value_map.iter();
-        let first_pair = value_map_iter.next().unwrap();
-        let second_pair = value_map_iter.next().unwrap();
-        
-        AggregationBucket {
-            key: second_pair.1.to_string(),
-            doc_count: first_pair.1.as_u64().unwrap()
-        }
-    }
-
-    async fn to_buckets(table_name: &String, query: &String) -> Vec<AggregationBucket> {
-        let final_sql = query.replace("{target_table}", table_name);
-        let data_frame = match execute_sql(&final_sql).await {
-            Ok(df) => df,
-            Err(_) => panic!("nope")
-        };
-        
-        assert_eq!(data_frame.schema().columns().len(), 2);
-        
-        let serde_values = to_serde_value(&data_frame).await;
-        
-        serde_values.iter().map(|v| SqlCommand::to_aggregation_bucket(v)).collect::<Vec<AggregationBucket>>()
-    }
-    
-    async fn generate_aggregations(table_name: &String, aggs: Option<HashMap<String, String>>) -> Option<HashMap<String, AggregationResult>> {
+    async fn generate_aggregations(table_name: &String, aggs: Option<Vec<Aggregation>>) -> Option<HashMap<String, AggregationResult>> {
         if aggs.is_none() {
             return None
         }
         
-        let mut results = HashMap::new();
-        for (name, query) in aggs.unwrap().iter() {
-            let buckets = SqlCommand::to_buckets(table_name, query).await;
-            results.insert(
-                name.clone(),
-                AggregationResult {
-                    doc_count_error_upper_bound: 0,
-                    sum_other_doc_count: 0,
-                    buckets: buckets,
-                }
-            );
-        }
-        Some(results)
+        Some(process_aggregations(aggs, table_name).await)
     }
 }
 

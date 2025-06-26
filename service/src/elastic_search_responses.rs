@@ -80,18 +80,41 @@ pub(crate) struct QueryResultHits {
 }
 
 #[derive(Serialize, Clone)]
-pub(crate) struct AggregationBucket {
+pub(crate) struct TermAggregationBucket {
     pub key: String,
     pub doc_count: u64,
 }
 
 #[derive(Serialize, Clone)]
-pub(crate) struct AggregationResult {
+pub(crate) struct TermAggregationResult {
     pub doc_count_error_upper_bound: u64,
     pub sum_other_doc_count: u64,
-    pub buckets: Vec<AggregationBucket>
+    pub buckets: Vec<TermAggregationBucket>,
+    #[serde(flatten)]
+    pub aggs: HashMap<String, AggregationResult>,
 }
 
+#[derive(Serialize, Clone)]
+pub(crate) struct AverageAggregationResult {
+    pub value: f64,
+    #[serde(flatten)]
+    pub aggs: HashMap<String, AggregationResult>,
+}
+
+#[derive(Serialize, Clone)]
+pub(crate) struct FilterAggregationResult {
+    pub doc_count: u64,
+    #[serde(flatten)]
+    pub aggs: HashMap<String, AggregationResult>
+}
+
+#[derive(Serialize, Clone)]
+#[serde(untagged)]
+pub(crate) enum AggregationResult {
+    Terms(TermAggregationResult),
+    Average(AverageAggregationResult),
+    Filter(FilterAggregationResult),
+}
 
 #[derive(Serialize, Clone)]
 pub(crate) struct QueryResults {
