@@ -109,11 +109,19 @@ pub(crate) struct FilterAggregationResult {
 }
 
 #[derive(Serialize, Clone)]
+pub(crate) struct CardinalityAggregationResult {
+    pub type_count: u64,
+    #[serde(flatten)]
+    pub aggs: HashMap<String, AggregationResult>
+}
+
+#[derive(Serialize, Clone)]
 #[serde(untagged)]
 pub(crate) enum AggregationResult {
     Terms(TermAggregationResult),
     Average(AverageAggregationResult),
     Filter(FilterAggregationResult),
+    Cardinality(CardinalityAggregationResult),
 }
 
 #[derive(Serialize, Clone)]

@@ -319,10 +319,19 @@ pub fn es_get_with_id(state: State) -> Pin<Box<HandlerFuture>> {
         let path_extractor = NameIdPathExtractor::borrow_from(&state);
         let index_name = path_extractor.name.to_string();
         let doc_id = path_extractor.id.to_string();
-        let command = LookupById{ table: index_name, ids: vec!(doc_id) };
-        let response = execute_command(CommandContext{}, Arc::new(command)).await;
-        let res = response.generate_response(&state);
-        Ok((state, res))
+        let table_desc = API_SERVICE_CLIENT.describe_table(&index_name).await;
+        match table_desc {
+            Some(td) => {
+                let command = LookupById{ table: td.name, ids: vec!(doc_id) };
+                let response = execute_command(CommandContext{}, Arc::new(command)).await;
+                let res = response.generate_response(&state);
+                Ok((state, res))                
+            },
+            None => {
+                panic!("Table not found");
+            }
+        }
+
     }.boxed()
 }
 

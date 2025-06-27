@@ -923,10 +923,10 @@ impl ApiServiceClient for TestApiServiceClient {
     } 
 
     async fn describe_table(&mut self, name: &String) -> Result<Option<TableDescription>, Box<dyn Error>> {
-        let final_name = match self.table_aliases.get(name) {
-            Some(t) => t,
-            None => name
-        };
+        if name.starts_with(".kibana_8.7.1") {
+            println!("Returning None for kibana table");
+        }
+        let final_name = self.table_aliases.get(name).unwrap_or_else(|| name);
         match self.tables.get(final_name) {
             Some(d) => Ok(Some(d.clone())),
             None => Ok(None)

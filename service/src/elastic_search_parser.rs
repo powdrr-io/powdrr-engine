@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::data_access::execute_sql;
 use crate::elastic_search_commands::{to_serde_value, SqlCommand, UpdateByQueryCommand};
 use crate::elastic_search_common::{Command, ParseError};
-use crate::elastic_search_responses::{AggregationResult, AverageAggregationResult, FilterAggregationResult, TermAggregationBucket, TermAggregationResult};
+use crate::elastic_search_responses::{AggregationResult, AverageAggregationResult, CardinalityAggregationResult, FilterAggregationResult, TermAggregationBucket, TermAggregationResult};
 
 
 
@@ -87,10 +87,81 @@ impl AverageAggProcessor {
 }
 
 #[derive(Clone)]
-pub(crate) struct FilterAggProcessor {
+pub(crate) struct CardinalityAggProcessor {
     sql: String,
 }
 
+impl CardinalityAggProcessor {
+    async fn calculate_cardinality(table_name: &String, query: &String) -> u64 {
+        let final_sql = query.replace("{target_table}", table_name);
+        let data_frame = match execute_sql(&final_sql).await {
+            Ok(df) => df,
+            Err(_) => panic!("nope")
+        };
+
+        assert_eq!(data_frame.schema().columns().len(), 1);
+
+        let serde_values = to_serde_value(&data_frame).await;
+
+        serde_values.get(0).unwrap().as_object().unwrap().get("type_count").unwrap().as_u64().unwrap()
+    }
+
+    async fn process(&self, table_name: &String, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
+        let child_aggs = process_aggregations(subaggregations, table_name).await;
+
+        AggregationResult::Cardinality(CardinalityAggregationResult{
+            type_count: CardinalityAggProcessor::calculate_cardinality(table_name, &self.sql).await,
+            aggs: child_aggs,
+        })
+    }
+}
+
+
+#[derive(Clone)]
+pub(crate) struct DateHistogramAggProcessor {
+    sql: String,
+}
+
+impl DateHistogramAggProcessor {
+    fn create_aggregation_bucket(value: &Value) -> TermAggregationBucket {
+        let value_map = value.as_object().unwrap();
+
+        TermAggregationBucket {
+            key: value_map.get("field_value").unwrap().as_str().unwrap().to_string(),
+            doc_count: value_map.get("doc_count").unwrap().as_u64().unwrap(),
+        }
+    }
+
+    async fn create_buckets(table_name: &String, query: &String) -> Vec<TermAggregationBucket> {
+        let final_sql = query.replace("{target_table}", table_name);
+        let data_frame = match execute_sql(&final_sql).await {
+            Ok(df) => df,
+            Err(_) => panic!("nope")
+        };
+
+        assert_eq!(data_frame.schema().columns().len(), 2);
+
+        let serde_values = to_serde_value(&data_frame).await;
+
+        serde_values.iter().map(|v| DateHistogramAggProcessor::create_aggregation_bucket(v)).collect::<Vec<TermAggregationBucket>>()
+    }
+
+    async fn process(&self, table_name: &String, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
+        let child_aggs = process_aggregations(subaggregations, table_name).await;
+
+        AggregationResult::Terms(TermAggregationResult{
+            doc_count_error_upper_bound: 0,
+            sum_other_doc_count: 0,
+            buckets: DateHistogramAggProcessor::create_buckets(table_name, &self.sql).await,
+            aggs: child_aggs
+        })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct FilterAggProcessor {
+    sql: String,
+}
 
 impl FilterAggProcessor {
     async fn process(&self, table_name: &String, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
@@ -110,10 +181,30 @@ impl FilterAggProcessor {
 }
 
 #[derive(Clone)]
+pub(crate) struct MissingAggProcessor {
+}
+
+impl MissingAggProcessor {
+    async fn process(&self, table_name: &String, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
+        let child_aggs = process_aggregations(subaggregations, table_name).await;
+
+        // TODO: we need to find doc that are actually missing values
+        AggregationResult::Filter(FilterAggregationResult {
+            doc_count: 0,
+            aggs: child_aggs
+        })
+    }
+}
+
+
+#[derive(Clone)]
 pub(crate) enum AggProcessor {
-    Term(TermAggProcessor),
     Average(AverageAggProcessor),
+    Cardinality(CardinalityAggProcessor),
+    DateHistogram(DateHistogramAggProcessor),
     Filter(FilterAggProcessor),
+    Missing(MissingAggProcessor),
+    Term(TermAggProcessor),
 }
 
 #[derive(Clone)]
@@ -133,6 +224,15 @@ pub(crate) async fn process_aggregation(aggregation: &Aggregation, table_name: &
         },
         AggProcessor::Filter(filter) => {
             filter.process(table_name, aggregation.subaggregations.clone()).await
+        },
+        AggProcessor::DateHistogram(date_histogram) => {
+            date_histogram.process(table_name, aggregation.subaggregations.clone()).await
+        },
+        AggProcessor::Missing(missing) => {
+            missing.process(table_name, aggregation.subaggregations.clone()).await
+        },
+        AggProcessor::Cardinality(cardinality) => {
+            cardinality.process(table_name, aggregation.subaggregations.clone()).await
         }
     }
 }
@@ -272,8 +372,13 @@ pub(crate) struct AggSpecDateHistogram {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct AggSpecCardinalityBody {
+    field: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct AggSpecCardinality {
-    cardinality: HashMap<String, String>,
+    cardinality: AggSpecCardinalityBody,
     aggs: Option<HashMap<String, AggSpec>>
 }
 
@@ -668,15 +773,43 @@ impl SqlBuilder {
     }
 }
 
-fn create_aggregation_filter(filter: &AggSpecFilterBody) -> String {
+fn create_aggregation_filters(filter: &AggSpecFilterBody) -> Vec<String> {
     match filter {
         AggSpecFilterBody::Term(term) => {
             assert_eq!(term.term.len(), 1);
             let (name, value) = term.term.iter().next().unwrap();
-            format!("{name} = '{value}'")
+            vec!(format!("{name} = '{value}'"))
         },
-        AggSpecFilterBody::Range(_range) => {
-            todo!()
+        AggSpecFilterBody::Range(range) => {
+            create_aggregation_range_filters(&range.range)
+        }
+    }
+}
+
+fn create_aggregation_range_filters(range: &AggSpecFilterRangeBody) -> Vec<String> {
+    match range {
+        AggSpecFilterRangeBody::Raw(raw) => {
+            assert_eq!(raw.len(), 1);
+            let (name, value_and_op) = raw.iter().next().unwrap();
+            assert_eq!(value_and_op.len(), 1);
+            let (op, value) = value_and_op.iter().next().unwrap();
+            // TODO: need to convert the op to the appropriate SQL operator
+            // TODO: need to convert the value to the appropriate SQL type
+            let converted_op = op;
+            let converted_value = value;
+            vec!(format!("{name} {converted_op} {converted_value}"))
+        },
+        AggSpecFilterRangeBody::Structured(structured) => {
+            let mut retval = vec!();
+            let name = &structured.field;
+            for range in structured.ranges.iter() {
+                // TODO: need to convert both these values
+                let converted_from_value = &range.from;
+                let converted_to_value = &range.to;
+                retval.push(format!("{name} >= {converted_from_value}"));
+                retval.push(format!("{name} < {converted_to_value}"));
+            }
+            retval
         }
     }
 }
@@ -696,7 +829,9 @@ fn create_aggregation_processor(input_builder: &SqlBuilder, spec: &AggSpec) -> (
         },
         AggSpec::Filter(filter) => {
             let mut builder = input_builder.clone();
-            builder.filter(create_aggregation_filter(&filter.filter));
+            for filter in create_aggregation_filters(&filter.filter) {
+                builder.filter(filter);
+            }
             let mut query_builder = builder.clone();
             query_builder.fields.push("count(1) as cnt".to_string());
             let sql = query_builder.build();
@@ -704,25 +839,54 @@ fn create_aggregation_processor(input_builder: &SqlBuilder, spec: &AggSpec) -> (
             let aggregations = aggs_to_sql(Some(builder), filter.aggs.clone());
             (processor, aggregations)
         },
-        AggSpec::Missing(_missing) => {
-            todo!()
+        AggSpec::Missing(missing) => {
+            let processor = AggProcessor::Missing(MissingAggProcessor{ });
+            let aggregations = aggs_to_sql(Some(input_builder.clone()), missing.aggs.clone());
+            (processor, aggregations)
         },
-        AggSpec::DateHistogram(_hist) => {
-            todo!()
+        AggSpec::DateHistogram(hist) => {
+            let mut builder = input_builder.clone();
+            let field_name = hist.date_histogram.field.clone();
+            builder.fields.push(format!("{field_name} as field_value"));
+            builder.fields.push("count(1) as doc_count".to_string());
+            // TODO: get offset and interval from the spec
+            // TODO: convert the field as necessary (aka datetime to millis since epoch)
+            let offset = 0;
+            let interval = 5;
+            builder.group_by.push(format!("floor(({field_name} - {offset}) / {interval}) * {interval} + {offset}"));
+            let sql = builder.build();
+            let processor = AggProcessor::DateHistogram(DateHistogramAggProcessor{ sql: sql });
+            let aggregations = aggs_to_sql(Some(input_builder.clone()), hist.aggs.clone());
+            (processor, aggregations)
         },
-        AggSpec::Cardinality(_cardinality) => {
-            todo!()
+        AggSpec::Cardinality(cardinality) => {
+            let mut builder = input_builder.clone();
+            let field_name = &cardinality.cardinality.field;
+            builder.fields.push(format!("count(distinct {field_name}) as type_count"));
+            let sql = builder.build();
+            let processor = AggProcessor::Cardinality(CardinalityAggProcessor{ sql: sql });
+            let aggregations = aggs_to_sql(Some(input_builder.clone()), cardinality.aggs.clone());
+            (processor, aggregations)
         } ,
-        AggSpec::Range(_range) => {
-            todo!()
+        AggSpec::Range(range) => {
+            let mut builder = input_builder.clone();
+            for filter in create_aggregation_range_filters(&range.range) {
+                builder.filter(filter);
+            }
+            let mut query_builder = builder.clone();
+            query_builder.fields.push("count(1) as cnt".to_string());
+            let sql = query_builder.build();
+            let processor = AggProcessor::Filter(FilterAggProcessor{ sql: sql });
+            let aggregations = aggs_to_sql(Some(builder), range.aggs.clone());
+            (processor, aggregations)
         }
         AggSpec::Average(average) => {
             let mut builder = input_builder.clone();
-            let field_name = average.avg.field.clone();
+            let field_name = &average.avg.field;
             builder.fields.push(format!("avg({field_name}) as avg"));
             let sql = builder.build();
             let processor = AggProcessor::Average(AverageAggProcessor{ sql: sql });
-            let aggregations = aggs_to_sql(Some(builder), average.aggs.clone());
+            let aggregations = aggs_to_sql(Some(input_builder.clone()), average.aggs.clone());
             (processor, aggregations)
         }
     }

@@ -277,11 +277,15 @@ pub(crate) struct CreateIndexTemplateBody {
 }
 
 pub(crate) async fn create_index(table: &String, body: &String) -> Result<CreateIndexResult, IngestError> {
-    let parsed_body = match CreateIndexBody::parse(body) {
-        Ok(pb) => pb,
-        Err(_e) => return log_err(IngestError{ message: "body parsing error".to_string() })
+    let parsed_body = if body.len() == 0 {
+        CreateIndexBody{ aliases: None, mappings: None, settings: None }
+    } else {
+        match CreateIndexBody::parse(body) {
+            Ok(pb) => pb,
+            Err(_e) => return log_err(IngestError { message: "body parsing error".to_string() })
+        }
+        // TODO: fill in defaults
     };
-    // TODO: fill in defaults
 
     let serialized_body = match serde_json::to_string(&parsed_body) {
         Ok(s) => s,
@@ -532,6 +536,9 @@ async fn get_existing_doc_count(index: &String, doc_id: &String) -> Result<usize
 }
 
 async fn create_single_worker(index: &String, doc_id: &String, payload: &String, fail_on_exists: bool) -> Result<ElasticSearchResponse, IngestError> {
+    if index.contains(".kibana") && doc_id.contains("config") {
+        println!("thing");
+    }
     let table_description: TableDescription = match API_SERVICE_CLIENT.describe_table(&index).await {
         Some(t) => t,
         None => return Err(IngestError{ message: "Index does not exist".to_string() })
