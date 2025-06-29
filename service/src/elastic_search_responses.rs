@@ -32,14 +32,6 @@ pub(crate) struct OperationResult {
 }
 
 #[derive(Serialize)]
-pub(crate) struct UpdateResult {
-    pub errors: bool,
-    pub took: u32,
-    pub items: Vec<HashMap<String, OperationResult>>
-}
-
-
-#[derive(Serialize)]
 pub(crate) struct BulkResult {
     pub errors: bool,
     pub took: u32,
@@ -81,17 +73,18 @@ pub(crate) enum QueryResultTotal {
 #[derive(Serialize, Clone)]
 pub(crate) struct QueryResultHit {
     #[serde(skip_serializing_if = "Option::is_none")]
-    _index: Option<String>,
+    pub _index: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    _id: Option<String>,
-    _version: i64,
-    _seq_no: i64,
+    pub _id: Option<String>,
+    pub _version: i64,
+    pub _seq_no: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    _score: Option<f64>,
+    pub _score: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    _primary_term: Option<i64>,
-    found: bool,
-    _source: Value,
+    pub _primary_term: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub found: Option<bool>,
+    pub _source: Value,
 }
 
 
@@ -229,24 +222,6 @@ pub(crate) struct QueryResultsNotFound {
 impl CommandResponse for QueryResultsNotFound {
     fn generate_response(&self, state: &State) -> gotham::hyper::Response<gotham::hyper::Body> {
         create_response(state, StatusCode::NOT_FOUND, mime::APPLICATION_JSON, serde_json::to_string(self).unwrap())
-    }
-}
-
-impl QueryResultHit {
-    pub fn new(index: &String, id: &String, version: i64, seq_no: i64, score: f64, found: bool, source: Value) -> Self {
-        QueryResultHit {
-            _index: index.clone(),
-            _id: id.clone(),
-            _version: version,
-            _seq_no: seq_no,
-            _score: score,
-            found: found,
-            _source: source.clone()
-        }
-    }
-
-    pub fn score(&self) -> f64 {
-        self._score
     }
 }
 

@@ -31,15 +31,16 @@ fn to_hit(index: &String, value: &Value) -> QueryResultHit {
     value_map.remove("_id");
     value_map.remove("_version");
     value_map.remove("_seq_no");
-    QueryResultHit::new(
-        index,
-        &id,
-        version,
-        seq_no,
-        score,
-        true,
-        json!(value_map)
-    )
+    QueryResultHit {
+        _index: Some(index.clone()),
+        _id: Some(id),
+        _version: version,
+        _seq_no: seq_no,
+        _score: Some(score),
+        _primary_term: None,
+        found: None,
+        _source: json!(value_map)
+    }
 }
 
 pub(crate) async fn to_serde_value(data_frame: &DataFrame) -> Vec<Value> {
@@ -147,11 +148,13 @@ impl Command for Match {
             };      
                   
             let hits = to_hits(&table, &first_10_rows).await;
+            // TODO: need to calculate the actual max score here
+            let max_score = hits.get(0).unwrap()._score.unwrap();
             let final_result = QueryResults::success(
                 50,
                 1,
                 num_records_with_term,
-                hits.get(0).unwrap().score(),
+                max_score,
                 hits,
                 None,
                 true,
@@ -408,11 +411,13 @@ impl Command for SqlCommand {
             let hits = to_hits(&table, &first_10_rows).await;
             
             let aggregations = SqlCommand::generate_aggregations(Some(final_table_name), aggs).await;
+            // TODO: need to calculate the actual max score here
+            let max_score = hits.get(0).unwrap()._score.unwrap();
             let final_result = QueryResults::success(
                 50,
                 1,
                 num_records,
-                hits.get(0).unwrap().score(),
+                max_score,
                 hits,
                 aggregations,
                 !query_params.rest_total_hits_as_int.unwrap_or_else(|| false),

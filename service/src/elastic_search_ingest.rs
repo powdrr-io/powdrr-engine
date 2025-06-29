@@ -21,7 +21,7 @@ use uuid_b64::UuidB64;
 
 use crate::elastic_search_commands::LookupById;
 use crate::elastic_search_common::{load_command_raw_result, CommandContext, ElasticSearchResponse, MIME_ES_JSON};
-use crate::elastic_search_responses::{BulkResult, ErrorDetails, OperationResult, Shards, SingleDocCreateFailedResult};
+use crate::elastic_search_responses::{BulkResult, ErrorDetails, OperationResult, QueryResultHit, Shards, SingleDocCreateFailedResult};
 use crate::{data_access, distributed_cache};
 use crate::elastic_search_parser::UpdateBody;
 use crate::state_hosted_service::{CreateTable, SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription, API_SERVICE_CLIENT};
@@ -430,6 +430,7 @@ pub(crate) fn ingest_create(
         status: status,
         _seq_no: seq_no,
         _primary_term: 1,
+        get: None,
     }
 }
 
@@ -628,7 +629,7 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
         let mut buffer = WriteBuffer::new();
         let upsert_doc = update_request.upsert.unwrap();
         let raw_doc = serde_json::to_string(&upsert_doc).unwrap().replace("\n", "");
-        let result = ingest_create(
+        let mut result = ingest_create(
             &table_description,
             &Create { create: IndexOrCreateBody { index: None, id: Some(doc_id.clone()), list_executed_pipelines: false, require_alias: false, dynamic_templates: None } },
             &CreateDoc { raw: raw_doc, parsed: upsert_doc.clone() },
@@ -638,8 +639,17 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
             &mut buffer
         );
         
-        let update_result = UpdateResult
-
+        result.get = Some(QueryResultHit{
+            _index: None,
+            _id: None,
+            _version: 1,
+            _seq_no: seq_no,
+            _score: None,
+            _primary_term: Some(1),
+            found: Some(true),
+            _source: upsert_doc.clone()
+        });
+        
         commit(&buffer, &table_description.name).await?;
         let headers = vec!((LOCATION, format!("/{}/_doc/{}", table_description.name, url_escape::encode_userinfo(doc_id))));
         Ok(ElasticSearchResponse {
@@ -678,6 +688,7 @@ pub(crate) async fn delete(index: &String, doc_id: &String) -> Result<ElasticSea
             _seq_no: 0,
             _primary_term: 1,
             status: None,
+            get: None,
         };
         return Ok(ElasticSearchResponse { status: StatusCode::NOT_FOUND, mime: mime::APPLICATION_JSON, body: serde_json::to_string(&result).unwrap(), headers: vec!() })
     }
