@@ -9,7 +9,7 @@ use serde_json::json;
 use uuid_b64::UuidB64;
 
 use crate::{elastic_search_cluster_info, elastic_search_commands::LookupById, elastic_search_common::{execute_command, CommandContext, CommandResponse}, elastic_search_ingest, elastic_search_parser, elastic_search_pipeline, state_hosted_service::API_SERVICE_CLIENT};
-
+use crate::elastic_search_common::MIME_ES_JSON;
 
 #[derive(Deserialize, StateData, StaticResponseExtender)]
 pub struct NamePathExtractor {
@@ -97,6 +97,10 @@ impl License {
             start_date_in_millis: -1,
         })])
     }
+
+    fn xpack() -> String {
+        include_str!("xpack_response.json").to_string()
+    }
 }
 
 static SERVER_INFO: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| serde_json::to_string_pretty(&ServerInfo::new()).unwrap());
@@ -143,7 +147,7 @@ pub fn es_license(state: State) -> Pin<Box<HandlerFuture>> {
 pub fn es_xpack(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_xpack");
     async {
-        let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, serde_json::to_string(&License::new()).unwrap());
+        let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, License::xpack());
         Ok((state, res))
     }.boxed()
 }
@@ -277,7 +281,7 @@ pub fn es_create_with_id(mut state: State) -> Pin<Box<HandlerFuture>> {
         let create_single_result = elastic_search_ingest::create_single(&index_name, &doc_id, &body_content).await;
         match create_single_result {
             Ok(success) => {
-                let res = create_response(&state, success.status, success.mime, success.body);
+                let res = success.generate_response(&state);
                 Ok((state, res))
             }
             Err(e) => {
@@ -301,8 +305,8 @@ pub fn es_update_with_id(mut state: State) -> Pin<Box<HandlerFuture>> {
         let body_content = String::from_utf8(valid_body.to_vec()).unwrap();    
         let create_single_result = elastic_search_ingest::upsert_single(&index_name, &doc_id, &body_content).await;
         match create_single_result {
-            Ok(success) => {
-                let res = create_response(&state, success.status, success.mime, success.body);
+            Ok(success_response) => {
+                let res = success_response.generate_response(&state);
                 Ok((state, res))
             }
             Err(e) => {
@@ -319,10 +323,19 @@ pub fn es_get_with_id(state: State) -> Pin<Box<HandlerFuture>> {
         let path_extractor = NameIdPathExtractor::borrow_from(&state);
         let index_name = path_extractor.name.to_string();
         let doc_id = path_extractor.id.to_string();
-        let command = LookupById{ table: index_name, ids: vec!(doc_id) };
-        let response = execute_command(CommandContext{}, Arc::new(command)).await;
-        let res = response.generate_response(&state);
-        Ok((state, res))
+        let table_desc = API_SERVICE_CLIENT.describe_table(&index_name).await;
+        match table_desc {
+            Some(td) => {
+                let command = LookupById{ table: td.name, ids: vec!(doc_id) };
+                let response = execute_command(CommandContext{}, Arc::new(command)).await;
+                let res = response.generate_response(&state);
+                Ok((state, res))
+            },
+            None => {
+                panic!("Table not found");
+            }
+        }
+
     }.boxed()
 }
 
@@ -428,7 +441,7 @@ pub fn es_create_index(mut state: State) -> Pin<Box<HandlerFuture>> {
         let create_index_result = elastic_search_ingest::create_index(&table, &body_content).await;
         match create_index_result {
             Ok(success) => {
-                let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, serde_json::to_string(&success).unwrap());
+                let res = create_response(&state, StatusCode::OK, MIME_ES_JSON.clone(), serde_json::to_string(&success).unwrap());
                 Ok((state, res))
             }
             Err(e) => {
@@ -453,7 +466,7 @@ pub fn es_create_index_template(mut state: State) -> Pin<Box<HandlerFuture>> {
         let create_index_result = elastic_search_ingest::create_index_template(&table, &body_content).await;
         match create_index_result {
             Ok(success) => {
-                let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, serde_json::to_string(&success).unwrap());
+                let res = create_response(&state, StatusCode::OK, MIME_ES_JSON.clone(), serde_json::to_string(&success).unwrap());
                 Ok((state, res))
             }
             Err(e) => {
@@ -525,7 +538,7 @@ pub fn es_update_aliases(mut state: State) -> Pin<Box<HandlerFuture>> {
         match create_index_result {
             Ok(_) => {
                 let response = HashMap::from([("acknowledged", true)]);
-                let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, serde_json::to_string(&response).unwrap());
+                let res = create_response(&state, StatusCode::OK, MIME_ES_JSON.clone(), serde_json::to_string(&response).unwrap());
                 Ok((state, res))
             }
             Err(e) => {
@@ -536,14 +549,20 @@ pub fn es_update_aliases(mut state: State) -> Pin<Box<HandlerFuture>> {
     }.boxed()
 }
 
-#[derive(Deserialize, StateData, StaticResponseExtender)]
+#[derive(Deserialize, StateData, StaticResponseExtender, Clone)]
 pub(crate) struct QueryStringSearch {
     #[allow(dead_code)]
-    allow_partial_search_results: Option<bool>,
+    pub allow_partial_search_results: Option<bool>,
     #[allow(dead_code)]
-    sort: Option<String>,
+    pub sort: Option<String>,
+    pub rest_total_hits_as_int: Option<bool>,
+}
+
+impl QueryStringSearch {
     #[allow(dead_code)]
-    rest_total_hits_as_int: Option<bool>,
+    pub(crate) fn new() -> Self {
+        QueryStringSearch{ allow_partial_search_results: None, sort: None, rest_total_hits_as_int: None }
+    }
 }
 
 
@@ -551,13 +570,13 @@ pub(crate) struct QueryStringSearch {
 pub fn es_search(mut state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_search");
     async {
-        let _query_string = QueryStringSearch::take_from(&mut state);
+        let query_string = QueryStringSearch::take_from(&mut state);
         let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
             Ok(vb) => vb,
             Err(_) => panic!("Oh no"),
         };
         let body_content = String::from_utf8(valid_body.to_vec()).unwrap();    
-        let command = match elastic_search_parser::parse(None, &body_content) {
+        let command = match elastic_search_parser::parse(None, &body_content, &query_string) {
             Ok(c) => c,
             Err(_) => {
                 let res = create_response(&state, StatusCode::BAD_REQUEST, mime::TEXT_PLAIN, "Bad request".to_string());
@@ -598,14 +617,19 @@ pub fn es_update_by_query(mut state: State) -> Pin<Box<HandlerFuture>> {
 pub fn es_search_table(mut state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_search_table");
     async {
-        let path_extractor = NamePathExtractor::borrow_from(&state);
+        let path_extractor = NamePathExtractor::take_from(&mut state);
+        let query_extractor = QueryStringSearch::take_from(&mut state);
         let table = path_extractor.name.to_string();
+        let table_desc = match API_SERVICE_CLIENT.describe_table(&table).await {
+            Some(td) => td,
+            None => panic!("Oh no"),
+        };
         let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
             Ok(vb) => vb,
             Err(_) => panic!("Oh no"),
         };
         let body_content = String::from_utf8(valid_body.to_vec()).unwrap();    
-        let command = match elastic_search_parser::parse(Some(table), &body_content) {
+        let command = match elastic_search_parser::parse(Some(table_desc.name), &body_content, &query_extractor) {
             Ok(c) => c,
             Err(_) => {
                 let res = create_response(&state, StatusCode::BAD_REQUEST, mime::TEXT_PLAIN, "Bad request".to_string());
@@ -658,7 +682,7 @@ pub fn es_bulk_ingest(mut state: State) -> Pin<Box<HandlerFuture>> {
         let ingest_result = elastic_search_ingest::INGEST_HANDLE.send(&body_content).await;
         match ingest_result {
             Ok(success) => {
-                let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, serde_json::to_string(&success).unwrap());
+                let res = create_response(&state, StatusCode::OK, MIME_ES_JSON.clone(), serde_json::to_string(&success).unwrap());
                 Ok((state, res))
             }
             Err(e) => {

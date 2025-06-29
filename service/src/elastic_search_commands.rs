@@ -4,15 +4,20 @@ use std::sync::LazyLock;
 use async_trait::async_trait;
 use datafusion::{arrow::array::RecordBatch, prelude::DataFrame};
 use futures::FutureExt;
+use gotham::mime;
+use http::StatusCode;
 use serde_json::{json, Value};
 
-use crate::{data_access::{self, execute_sql}, distributed_cache, elastic_search_common::{Command, CommandResponse, ParseError, ResultGeneratorFuture, SqlBuilder}, elastic_search_ingest::{self, WriteBuffer}, elastic_search_parser::ScriptBlock, elastic_search_responses::{QueryFailure, QueryResultHit, QueryResults}, expression_evaluator, painless_parser, state_hosted_service::API_SERVICE_CLIENT, state_peers::SnapshotDescriptor};
+use crate::{data_access::{self, execute_sql}, distributed_cache, elastic_search_common::{Command, CommandResponse, ParseError, ResultGeneratorFuture, SqlBuilder}, elastic_search_ingest::{self, WriteBuffer}, elastic_search_parser::ScriptBlock, elastic_search_responses::{QueryResultHit, QueryResults}, expression_evaluator, painless_parser, state_hosted_service::API_SERVICE_CLIENT, state_peers::SnapshotDescriptor};
+use crate::elastic_search_common::ElasticSearchResponse;
+use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::elastic_search_parser::{process_aggregations, Aggregation};
-use crate::elastic_search_responses::{AggregationResult, QueryResultsNotFound};
+use crate::elastic_search_responses::{AggregationResult, QueryResultsNotFound, UpdateByQueryResults, UpdateByQueryResultsRetries, UpdateByQuerySuccess};
 
-fn empty_result() -> Arc<dyn CommandResponse> {
+async fn empty_result(aggs: Option<Vec<Aggregation>>, total_hits_complex: bool) -> Arc<dyn CommandResponse> {
     // TODO: need to record and feed through the requested number of shards from index creation
-    Arc::new(QueryResults::empty(0, 2))
+    let aggregation_results = SqlCommand::generate_aggregations(None, aggs).await;
+    Arc::new(QueryResults::empty(0, 2, aggregation_results, total_hits_complex))
 }
 
 
@@ -26,14 +31,16 @@ fn to_hit(index: &String, value: &Value) -> QueryResultHit {
     value_map.remove("_id");
     value_map.remove("_version");
     value_map.remove("_seq_no");
-    QueryResultHit::new(
-        index,
-        &id,
-        version,
-        seq_no,
-        score,
-        json!(value_map)
-    )
+    QueryResultHit {
+        _index: Some(index.clone()),
+        _id: Some(id),
+        _version: version,
+        _seq_no: seq_no,
+        _score: Some(score),
+        _primary_term: None,
+        found: None,
+        _source: json!(value_map)
+    }
 }
 
 pub(crate) async fn to_serde_value(data_frame: &DataFrame) -> Vec<Value> {
@@ -83,7 +90,7 @@ impl Command for Match {
         let query = &self.query;
         SqlBuilder {
             columns: vec!("*".to_string()),
-            table: Some("{target_table}_search_index si inner join {target_table} t on si.doc_id = t.index_col".to_string()),
+            table: Some("{target_table}_search_index si INNER JOIN {target_table} t ON si.doc_id = t.index_col".to_string()),
             filters: vec!(format!("field_name = '{field}'").to_string(), format!("field_term = '{query}'").to_string()),
             order_by: vec!(),
         }.build()
@@ -102,7 +109,7 @@ impl Command for Match {
         async move {
             let table_name = match result_table_name {
                 Some(t) => t,
-                None => return Ok(empty_result())
+                None => return Ok(empty_result(None, true).await)
             };
 
             let initial_data_frame = match execute_sql(&format!("select 1 from {table_name}")).await {
@@ -141,13 +148,16 @@ impl Command for Match {
             };      
                   
             let hits = to_hits(&table, &first_10_rows).await;
+            // TODO: need to calculate the actual max score here
+            let max_score = hits.get(0).unwrap()._score.unwrap();
             let final_result = QueryResults::success(
-                10,
-                2,
+                50,
+                1,
                 num_records_with_term,
-                hits.get(0).unwrap().score(),
+                max_score,
                 hits,
                 None,
+                true,
             );    
 
             Ok(Arc::new(final_result))
@@ -256,7 +266,14 @@ impl Command for LookupById {
                     let inner_result: Arc<dyn CommandResponse> = if hits.len() == 0 {
                         Arc::new(QueryResultsNotFound { _index: table, _id: ids.get(0).unwrap().clone(), found: false })
                     } else {
-                        Arc::new(QueryResults::success(10, 2, hits.len(), 1.0, hits, None))
+                        assert_eq!(hits.len(), 1);
+                        let response = ElasticSearchResponse {
+                            status: StatusCode::OK,
+                            mime: mime::APPLICATION_JSON,
+                            body: serde_json::to_string(hits.get(0).unwrap()).unwrap(),
+                            headers: vec![],
+                        };
+                        Arc::new(response)
                     };
                     inner_result
                 },
@@ -291,6 +308,7 @@ pub(crate) struct SqlCommand {
     pub table: String,
     pub calculate_score: bool,
     pub aggs: Option<Vec<Aggregation>>,
+    pub query_params: QueryStringSearch,
 }
 
 static SEARCH_COLUMNS: LazyLock<Vec<String>> = LazyLock::new(|| vec!(
@@ -341,7 +359,7 @@ impl SqlCommand {
         }
     }
     
-    async fn generate_aggregations(table_name: &String, aggs: Option<Vec<Aggregation>>) -> Option<HashMap<String, AggregationResult>> {
+    async fn generate_aggregations(table_name: Option<String>, aggs: Option<Vec<Aggregation>>) -> Option<HashMap<String, AggregationResult>> {
         if aggs.is_none() {
             return None
         }
@@ -369,10 +387,11 @@ impl Command for SqlCommand {
         let table = self.table.clone();
         let calculate_score = self.calculate_score;
         let aggs = self.aggs.clone();
+        let query_params = self.query_params.clone();
         async move {
             let table_name = match result_table_name {
                 Some(t) => t,
-                None => return Ok(empty_result())
+                None => return Ok(empty_result(aggs, !query_params.rest_total_hits_as_int.unwrap_or_else(|| false)).await)
             };
             let final_table_name = SqlCommand::get_final_table_name(&table, &table_name, calculate_score).await;
             let data_frame = match execute_sql(&format!("select * from {final_table_name}")).await {
@@ -391,14 +410,17 @@ impl Command for SqlCommand {
 
             let hits = to_hits(&table, &first_10_rows).await;
             
-            let aggregations = SqlCommand::generate_aggregations(&final_table_name, aggs).await;
+            let aggregations = SqlCommand::generate_aggregations(Some(final_table_name), aggs).await;
+            // TODO: need to calculate the actual max score here
+            let max_score = hits.get(0).unwrap()._score.unwrap();
             let final_result = QueryResults::success(
-                10,
-                2,
+                50,
+                1,
                 num_records,
-                hits.get(0).unwrap().score(),
+                max_score,
                 hits,
                 aggregations,
+                !query_params.rest_total_hits_as_int.unwrap_or_else(|| false),
             );    
 
             Ok(Arc::new(final_result))
@@ -442,6 +464,29 @@ impl UpdateByQueryCommand {
     }
 }
 
+impl UpdateByQueryCommand {
+    fn empty_result() -> Arc<dyn CommandResponse> {
+        Arc::new(UpdateByQuerySuccess{ result: UpdateByQueryResults{
+            took: 0,
+            timed_out: false,
+            total: 0,
+            updated: 0,
+            deleted: 0,
+            batches: 0,
+            version_conflicts: 0,
+            noops: 0,
+            retries: UpdateByQueryResultsRetries {
+                bulk: 0,
+                search: 0,
+            },
+            throttled_millis: 0,
+            requests_per_second: 0,
+            throttled_until_millis: 0,
+            failures: vec![],
+        }})
+    }
+}
+
 
 #[async_trait]
 impl Command for UpdateByQueryCommand {
@@ -464,7 +509,7 @@ impl Command for UpdateByQueryCommand {
         async move {
             let table_name = match result_table_name {
                 Some(t) => t,
-                None => return Ok(empty_result())
+                None => return Ok(UpdateByQueryCommand::empty_result())
             };
             let final_table_name = SqlCommand::get_final_table_name(&table, &table_name, calculate_score).await;
             let data_frame = match execute_sql(&format!("select * from {final_table_name}")).await {
@@ -482,7 +527,7 @@ impl Command for UpdateByQueryCommand {
                 Ok(_) => (),
                 Err(_) => panic!("nope"),
             };
-            Ok(Arc::new(QueryFailure{ message: "I am trying!".to_string() }))
+            Ok(UpdateByQueryCommand::empty_result())
         }.boxed()
     }
 

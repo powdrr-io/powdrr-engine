@@ -2,8 +2,9 @@
 
 https://www.elastic.co/blog/getting-started-with-the-elastic-stack-and-docker-compose
 
-curl -X PUT http://localhost:9200/_test/v1/_testing_mode
-
+```
+curl -X PUT http://localhost:9200/_test/v1/_testing_and_processing_mode
+```
 
 Some of the tests use shared data state so they must be run single threaded.
 

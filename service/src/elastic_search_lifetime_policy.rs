@@ -9,6 +9,7 @@ use gotham::prelude::FromState;
 use gotham::state::State;
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
+use crate::elastic_search_common::MIME_ES_JSON;
 use crate::elastic_search_endpoints::NamePathExtractor;
 use crate::elastic_search_responses::{ErrorDetails, SingleDocCreateFailedResult};
 use crate::state_hosted_service::API_SERVICE_CLIENT;
@@ -122,10 +123,26 @@ pub fn es_post_ilm_policy(mut state: State) -> Pin<Box<HandlerFuture>> {
 
         let response = HashMap::from([("acknowledged", true)]);
 
-        let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, serde_json::to_string(&response).unwrap());
+        let res = create_response(&state, StatusCode::OK, MIME_ES_JSON.clone(), serde_json::to_string(&response).unwrap());
         Ok((state, res))
     }.boxed()
 }
+
+pub fn es_post_monitoring_bulk(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_post_monitoring_bulk");
+    // TODO: figure out what this really means
+    async {
+        let response_str = r#"{
+  "took": 0,
+  "ignored": true,
+  "errors": false
+}"#;
+
+        let res = create_response(&state, StatusCode::OK, MIME_ES_JSON.clone(), response_str);
+        Ok((state, res))
+    }.boxed()
+}
+
 
 
 #[cfg(test)]

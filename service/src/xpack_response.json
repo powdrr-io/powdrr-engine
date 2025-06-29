@@ -1,0 +1,107 @@
+{
+  "build": {
+    "hash": "f229ed3f893a515d590d0f39b05f68913e2d9b53",
+    "date": "2023-04-27T04:33:42.127815583Z"
+  },
+  "license": {
+    "uid": "98f6bcc7-ae8f-4f75-a9b7-e6e909416eaa",
+    "type": "basic",
+    "mode": "basic",
+    "status": "active"
+  },
+  "features": {
+    "aggregate_metric": {
+      "available": true,
+      "enabled": true
+    },
+    "analytics": {
+      "available": true,
+      "enabled": true
+    },
+    "archive": {
+      "available": false,
+      "enabled": true
+    },
+    "ccr": {
+      "available": false,
+      "enabled": true
+    },
+    "data_streams": {
+      "available": true,
+      "enabled": true
+    },
+    "data_tiers": {
+      "available": true,
+      "enabled": true
+    },
+    "enrich": {
+      "available": true,
+      "enabled": true
+    },
+    "eql": {
+      "available": true,
+      "enabled": true
+    },
+    "frozen_indices": {
+      "available": true,
+      "enabled": true
+    },
+    "graph": {
+      "available": false,
+      "enabled": true
+    },
+    "ilm": {
+      "available": true,
+      "enabled": true
+    },
+    "logstash": {
+      "available": false,
+      "enabled": true
+    },
+    "ml": {
+      "available": false,
+      "enabled": true
+    },
+    "monitoring": {
+      "available": true,
+      "enabled": true
+    },
+    "rollup": {
+      "available": true,
+      "enabled": true
+    },
+    "searchable_snapshots": {
+      "available": false,
+      "enabled": true
+    },
+    "security": {
+      "available": true,
+      "enabled": false
+    },
+    "slm": {
+      "available": true,
+      "enabled": true
+    },
+    "spatial": {
+      "available": true,
+      "enabled": true
+    },
+    "sql": {
+      "available": true,
+      "enabled": true
+    },
+    "transform": {
+      "available": true,
+      "enabled": true
+    },
+    "voting_only": {
+      "available": true,
+      "enabled": true
+    },
+    "watcher": {
+      "available": false,
+      "enabled": true
+    }
+  },
+  "tagline": "You know, for X"
+}

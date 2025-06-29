@@ -9,6 +9,7 @@ use std::io::Write;
 
 use futures::FutureExt;
 use gotham::mime;
+use http::header::LOCATION;
 use http::StatusCode;
 use idgenerator::*;
 
@@ -19,9 +20,10 @@ use tokio::sync::{mpsc, oneshot};
 use uuid_b64::UuidB64;
 
 use crate::elastic_search_commands::LookupById;
-use crate::elastic_search_common::{load_command_raw_result, CommandContext, ElasticSearchResponse};
-use crate::elastic_search_responses::{BulkResult, ErrorDetails, OperationResult, Shards, SingleDocCreateFailedResult};
+use crate::elastic_search_common::{load_command_raw_result, CommandContext, ElasticSearchResponse, MIME_ES_JSON};
+use crate::elastic_search_responses::{BulkResult, ErrorDetails, OperationResult, QueryResultHit, Shards, SingleDocCreateFailedResult};
 use crate::{data_access, distributed_cache};
+use crate::elastic_search_parser::UpdateBody;
 use crate::state_hosted_service::{CreateTable, SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription, API_SERVICE_CLIENT};
 use crate::util::log_err;
 
@@ -277,11 +279,15 @@ pub(crate) struct CreateIndexTemplateBody {
 }
 
 pub(crate) async fn create_index(table: &String, body: &String) -> Result<CreateIndexResult, IngestError> {
-    let parsed_body = match CreateIndexBody::parse(body) {
-        Ok(pb) => pb,
-        Err(_e) => return log_err(IngestError{ message: "body parsing error".to_string() })
+    let parsed_body = if body.len() == 0 {
+        CreateIndexBody{ aliases: None, mappings: None, settings: None }
+    } else {
+        match CreateIndexBody::parse(body) {
+            Ok(pb) => pb,
+            Err(_e) => return log_err(IngestError { message: "body parsing error".to_string() })
+        }
+        // TODO: fill in defaults
     };
-    // TODO: fill in defaults
 
     let serialized_body = match serde_json::to_string(&parsed_body) {
         Ok(s) => s,
@@ -401,7 +407,8 @@ pub(crate) fn ingest_create(
     create: &Create, 
     doc: &CreateDoc,
     version: u32, 
-    seq_no: i64, 
+    seq_no: i64,
+    status: Option<u32>,
     buffer: &mut WriteBuffer
 ) -> OperationResult {
     let id = match &create.create.id {
@@ -420,9 +427,10 @@ pub(crate) fn ingest_create(
             successful: 1,
             failed: 0,
         },
-        status: Some(201),
+        status: status,
         _seq_no: seq_no,
         _primary_term: 1,
+        get: None,
     }
 }
 
@@ -467,11 +475,11 @@ struct CreateSingleErrorResult {
 
 
 pub(crate) async fn create_single(index: &String, doc_id: &String, payload: &String) -> Result<ElasticSearchResponse, IngestError> {
-    create_single_worker(index, doc_id, payload, true).await
+    create_single_worker(index, doc_id, payload).await
 }
 
 pub(crate) async fn upsert_single(index: &String, doc_id: &String, payload: &String) -> Result<ElasticSearchResponse, IngestError> {
-    create_single_worker(index, doc_id, payload, false).await
+    update_single_worker(index, doc_id, payload).await
 }
 
 pub(crate) async fn commit(buffer: &WriteBuffer, index: &String) -> Result<(), IngestError> {
@@ -504,9 +512,11 @@ pub(crate) async fn commit_general(buffer: &WriteBuffer, index: &String, commit_
         type_files: vec!(commit_info),
         compactions: vec!(),
     }).await {
-        Ok(_) => Ok(()),
+        Ok(_) => (),
         Err(_) => panic!("nope")
-    }  
+    }
+
+    Ok(())
 }
 
 
@@ -531,61 +541,126 @@ async fn get_existing_doc_count(index: &String, doc_id: &String) -> Result<usize
     Ok(df_count)
 }
 
-async fn create_single_worker(index: &String, doc_id: &String, payload: &String, fail_on_exists: bool) -> Result<ElasticSearchResponse, IngestError> {
+async fn create_single_worker(index: &String, doc_id: &String, payload: &String) -> Result<ElasticSearchResponse, IngestError> {
     let table_description: TableDescription = match API_SERVICE_CLIENT.describe_table(&index).await {
         Some(t) => t,
         None => return Err(IngestError{ message: "Index does not exist".to_string() })
-    };
-    let seq_no: i64 = match distributed_cache::insert_operator(&table_description.name, 1) {
-        Ok(v) => v,
-        Err(_) => panic!("nope")
     };
     let doc: Result<Value, serde_json::Error> = serde_json::from_str(payload);
     match doc {
         Ok(valid_doc) => {
             let df_count = get_existing_doc_count(index, doc_id).await?;
-
-            let version = if df_count != 0 {
+            
+            if df_count != 0 {
                 // TODO: get version from existing doc
-                if fail_on_exists {
-                    let response = SingleDocCreateFailedResult {
-                        error: ErrorDetails::single_cause(
-                            &"version_conflict_engine_exception".to_string(),
-                            &format!("[{}]: version conflict, document already exists (current version [{}])", doc_id, 1),
-                            Some("what is an index uuid?".to_string()),
-                            Some("1".to_string()),
-                            Some(index.to_string()),
-                        ),
-                        status: 409,
-                    };
-                    return Ok(ElasticSearchResponse { status: StatusCode::CONFLICT, mime: mime::APPLICATION_JSON, body: serde_json::to_string(&response).unwrap() })
-                } else {
-                    // TODO: return real existing version + 1 here instead
-                    1 + 1
-                }
-            } else {
-                1
+                let response = SingleDocCreateFailedResult {
+                    error: ErrorDetails::single_cause(
+                        &"version_conflict_engine_exception".to_string(),
+                        &format!("[{}]: version conflict, document already exists (current version [{}])", doc_id, 1),
+                        Some("what is an index uuid?".to_string()),
+                        Some("1".to_string()),
+                        Some(index.to_string()),
+                    ),
+                    status: 409,
+                };
+                return Ok(ElasticSearchResponse { status: StatusCode::CONFLICT, mime: mime::APPLICATION_JSON, body: serde_json::to_string(&response).unwrap(), headers: vec!() })
             };
 
+            let seq_no: i64 = match distributed_cache::insert_operator(&table_description.name, 1) {
+                Ok(v) => v,
+                Err(_) => panic!("nope")
+            };
+            
             let mut buffer = WriteBuffer::new();
             let result = ingest_create(
                 &table_description,
                 &Create{ create: IndexOrCreateBody { index: None, id: Some(doc_id.clone()), list_executed_pipelines: false, require_alias: false, dynamic_templates: None }},
                 &CreateDoc{ raw: payload.replace("\n", ""), parsed: valid_doc },
-                version,
+                1,
                 seq_no,
+                None,
                 &mut buffer
             );
             
             commit(&buffer, &table_description.name).await?;
-
-            Ok(ElasticSearchResponse { status: StatusCode::CREATED, mime: mime::APPLICATION_JSON, body: serde_json::to_string(&result).unwrap() })
+            let headers = vec!((LOCATION, format!("/{}/_doc/{}", table_description.name, url_escape::encode_userinfo(doc_id))));
+            Ok(ElasticSearchResponse {
+                status: StatusCode::CREATED,
+                mime: MIME_ES_JSON.clone(),
+                body: serde_json::to_string(&result).unwrap(),
+                headers: headers
+            })
         },
         Err(_) => {
-            Ok(ElasticSearchResponse{ status: StatusCode::BAD_REQUEST, mime: mime::APPLICATION_JSON, body: "Bad request".to_string() })
+            Ok(ElasticSearchResponse{ status: StatusCode::BAD_REQUEST, mime: mime::APPLICATION_JSON, body: "Bad request".to_string(), headers: vec!() })
         }
     }
 }
+
+
+async fn update_single_worker(index: &String, doc_id: &String, payload: &String) -> Result<ElasticSearchResponse, IngestError> {
+    let table_description: TableDescription = match API_SERVICE_CLIENT.describe_table(&index).await {
+        Some(t) => t,
+        None => return Err(IngestError{ message: "Index does not exist".to_string() })
+    };
+
+    let update_request: UpdateBody = match serde_json::from_str(payload) {
+        Ok(body) => body,
+        Err(_) => {
+            return Ok(ElasticSearchResponse{ status: StatusCode::BAD_REQUEST, mime: mime::APPLICATION_JSON, body: "Bad request".to_string(), headers: vec!() })
+        }
+    };
+
+    let df_count = get_existing_doc_count(index, doc_id).await?;
+
+    if df_count != 0 {
+        todo!("Need to implement actual update")
+    } else {
+        if update_request.upsert.is_none() {
+            // TODO: this is the doc_as_upsert path too to figure out
+            return Ok(ElasticSearchResponse{ status: StatusCode::BAD_REQUEST, mime: mime::APPLICATION_JSON, body: "Document does not exist".to_string(), headers: vec!() })
+        }
+        
+        let seq_no: i64 = match distributed_cache::insert_operator(&table_description.name, 1) {
+            Ok(v) => v,
+            Err(_) => panic!("nope")
+        };
+
+        let mut buffer = WriteBuffer::new();
+        let upsert_doc = update_request.upsert.unwrap();
+        let raw_doc = serde_json::to_string(&upsert_doc).unwrap().replace("\n", "");
+        let mut result = ingest_create(
+            &table_description,
+            &Create { create: IndexOrCreateBody { index: None, id: Some(doc_id.clone()), list_executed_pipelines: false, require_alias: false, dynamic_templates: None } },
+            &CreateDoc { raw: raw_doc, parsed: upsert_doc.clone() },
+            1,
+            seq_no,
+            None,
+            &mut buffer
+        );
+        
+        result.get = Some(QueryResultHit{
+            _index: None,
+            _id: None,
+            _version: 1,
+            _seq_no: seq_no,
+            _score: None,
+            _primary_term: Some(1),
+            found: Some(true),
+            _source: upsert_doc.clone()
+        });
+        
+        commit(&buffer, &table_description.name).await?;
+        let headers = vec!((LOCATION, format!("/{}/_doc/{}", table_description.name, url_escape::encode_userinfo(doc_id))));
+        Ok(ElasticSearchResponse {
+            status: StatusCode::CREATED,
+            mime: MIME_ES_JSON.clone(),
+            body: serde_json::to_string(&result).unwrap(),
+            headers: headers
+        })
+    }
+}
+
 
 
 fn create_delete(doc_id: &String, seq_no: i64) -> String {
@@ -613,8 +688,9 @@ pub(crate) async fn delete(index: &String, doc_id: &String) -> Result<ElasticSea
             _seq_no: 0,
             _primary_term: 1,
             status: None,
+            get: None,
         };
-        return Ok(ElasticSearchResponse { status: StatusCode::NOT_FOUND, mime: mime::APPLICATION_JSON, body: serde_json::to_string(&result).unwrap() })
+        return Ok(ElasticSearchResponse { status: StatusCode::NOT_FOUND, mime: mime::APPLICATION_JSON, body: serde_json::to_string(&result).unwrap(), headers: vec!() })
     }
     let seq_no = match distributed_cache::delete_operator(&table_description.name, 1) {
         Ok(v) => v,
@@ -624,7 +700,7 @@ pub(crate) async fn delete(index: &String, doc_id: &String) -> Result<ElasticSea
     // TODO: need to include a version or timestamp in the delete
     buffer.lines.push(create_delete(doc_id, seq_no));
     commit_general(&buffer, &table_description.name, &"delete".to_string()).await?;
-    Ok(ElasticSearchResponse { status: StatusCode::OK, mime: mime::APPLICATION_JSON, body: "deleted!".to_string() })
+    Ok(ElasticSearchResponse { status: StatusCode::OK, mime: mime::APPLICATION_JSON, body: "deleted!".to_string(), headers: vec!() })
 }
 
 
@@ -681,6 +757,7 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
                                     &CreateDoc{ raw: doc_str.to_string(), parsed: valid_doc },
                                     1,
                                     seq_no,
+                                    Some(201),
                                     ingest_result.get(index)
                                 );
                                 ingest_result.operations.push(operation_result)
