@@ -274,7 +274,10 @@ pub(crate) fn router(include_test_apis: bool) -> Router {
         route.put("/_ilm/policy/:name")
             .with_path_extractor::<NamePathExtractor>()
             .to(elastic_search_lifetime_policy::es_post_ilm_policy);
-
+        route.put("/_monitoring/bulk")
+            .to(elastic_search_lifetime_policy::es_post_monitoring_bulk);
+        route.post("/_monitoring/bulk")
+            .to(elastic_search_lifetime_policy::es_post_monitoring_bulk);
     })
 }
 

@@ -34,7 +34,11 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
         |field_name| format!("SELECT {doc_id_field_name_local} as doc_id, '{field_name}' as field_name, {new_local_name}.\"{field_name}\" as field_value from {new_local_name}")
     ).collect();
 
-    // TODO: join string and create table
+    if field_normalization_queries.len() == 0 {
+        // There are no string fields so there is nothing to index
+        return Ok(())
+    }
+    
     let field_normalization_queries_union = field_normalization_queries.join(" UNION ");
 
     match execute_sql(&format!("CREATE TABLE {new_local_name}_fields AS {field_normalization_queries_union}")).await {
@@ -173,14 +177,35 @@ pub(crate) async fn create_index_parquet(file_path: &String, doc_id_field_name: 
 
 
 pub(crate) async fn create_index(table_metadata: &TableMetadataCheckpoint) -> Result<(), Box<dyn Error>> {
+    let files = create_index_inner(table_metadata).await?;
+    if files.len() > 0 {
+        match API_SERVICE_CLIENT.extension_commit(
+            &table_metadata.table_name,
+            &ExtensionCommit {
+                extension: "es".to_string(),
+                checkpoint_id: table_metadata.checkpoint_id.clone(),
+                partial_metadata: ExtensionMetadata {
+                    files: files,
+                },
+            }
+        ).await {
+            Ok(_) => (),
+            Err(e) => return Err(Box::new(e)),
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn create_index_inner(table_metadata: &TableMetadataCheckpoint) -> Result<Vec<ExtensionFileMetadata>, Box<dyn Error>> {  
     let mut files: Vec<ExtensionFileMetadata> = vec!();
 
-    // TODO: need some additional stable metadata for things like doc id column name.
+    // TODO: does just "_id" work for everything?
 
     match &table_metadata.iceberg_metadata {
         Some(im) => {
             for file_path in im.files.iter() {
-                match create_index_parquet(file_path, &"index_col".to_string()).await {
+                match create_index_parquet(file_path, &"_id".to_string()).await {
                     Ok(output) => match output {
                         Some(extension_file_path) => files.push(ExtensionFileMetadata {
                             data_file_location: file_path.clone(),
@@ -202,7 +227,7 @@ pub(crate) async fn create_index(table_metadata: &TableMetadataCheckpoint) -> Re
     match &table_metadata.speedboat_metadata {
         Some(im) => {
             for file_path in im.files.iter() {
-                match create_index_jsonl(file_path, &"index_col".to_string()).await {
+                match create_index_jsonl(file_path, &"_id".to_string()).await {
                     Ok(output) => match output {
                         Some(extension_file_path) => files.push(ExtensionFileMetadata {
                             data_file_location: file_path.clone(),
@@ -215,27 +240,9 @@ pub(crate) async fn create_index(table_metadata: &TableMetadataCheckpoint) -> Re
             }
         },
         None => (),
-    }; 
-
-    if files.len() > 0 {
-        match API_SERVICE_CLIENT.extension_commit(
-            &table_metadata.table_name,
-            &ExtensionCommit {
-                extension: "es".to_string(),
-                checkpoint_id: table_metadata.checkpoint_id.clone(),
-                partial_metadata: ExtensionMetadata {
-                    files: files,
-                },
-            }
-        ).await {
-            Ok(_) => (),
-            Err(e) => return Err(Box::new(e)),
-        }
-    }   
-
-    Ok(())
+    };
+    Ok(files)
 }
-
 
 #[cfg(test)]
 mod tests {

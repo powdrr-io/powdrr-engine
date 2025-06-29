@@ -65,7 +65,7 @@ pub fn test_v1_set_testing_mode(state: State) -> Pin<Box<HandlerFuture>> {
 
 
 #[allow(warnings)]
-async fn do_all_available_work() -> () {
+pub(crate) async fn do_all_available_work() -> () {
     loop {
         let mut work_done = false;
         let mut last_snapshot_id: i64 = 0;

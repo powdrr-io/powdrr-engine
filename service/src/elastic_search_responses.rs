@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use gotham::{hyper::StatusCode, mime, state::State};
 use gotham::helpers::http::response::create_response;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::elastic_search_common::CommandResponse;
@@ -25,7 +25,17 @@ pub(crate) struct OperationResult {
     pub _shards: Shards,
     pub _seq_no: i64,
     pub _primary_term: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub get: Option<QueryResultHit>
+}
+
+#[derive(Serialize)]
+pub(crate) struct UpdateResult {
+    pub errors: bool,
+    pub took: u32,
+    pub items: Vec<HashMap<String, OperationResult>>
 }
 
 
@@ -56,18 +66,31 @@ pub(crate) struct QueryResultShards {
 }
 
 #[derive(Serialize, Clone)]
-pub(crate) struct QueryResultTotal {
+pub(crate) struct QueryResultTotalComplex {
     value: u64,
     relation: String,
 }
 
 #[derive(Serialize, Clone)]
+#[serde(untagged)]
+pub(crate) enum QueryResultTotal {
+    Simple(u64),
+    Complex(QueryResultTotalComplex),
+}
+
+#[derive(Serialize, Clone)]
 pub(crate) struct QueryResultHit {
-    _index: String,
-    _id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    _index: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    _id: Option<String>,
     _version: i64,
     _seq_no: i64,
-    _score: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    _score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    _primary_term: Option<i64>,
+    found: bool,
     _source: Value,
 }
 
@@ -75,7 +98,7 @@ pub(crate) struct QueryResultHit {
 #[derive(Serialize, Clone)]
 pub(crate) struct QueryResultHits {
     total: QueryResultTotal,
-    max_score: f64,
+    max_score: Option<f64>,
     hits: Vec<QueryResultHit>
 }
 
@@ -116,12 +139,51 @@ pub(crate) struct CardinalityAggregationResult {
 }
 
 #[derive(Serialize, Clone)]
+pub(crate) struct RangeAggregationBucket {
+    pub key: String,
+    pub from: u64,
+    pub from_as_string: String,
+    pub to: u64,
+    pub to_as_string: String,
+    pub doc_count: u64,
+    #[serde(flatten)]
+    pub aggs: HashMap<String, AggregationResult>
+}
+
+#[derive(Serialize, Clone)]
+pub(crate) struct HistogramAggregationBucket {
+    // TODO: this may not be correct
+    pub key: String,
+    pub from: u64,
+    pub from_as_string: String,
+    pub to: u64,
+    pub to_as_string: String,
+    pub doc_count: u64,
+    #[serde(flatten)]
+    pub aggs: HashMap<String, AggregationResult>
+}
+
+#[derive(Serialize, Clone)]
+pub(crate) struct HistogramAggregationResult {
+    pub(crate) buckets: Vec<HistogramAggregationBucket>,
+
+}
+
+
+#[derive(Serialize, Clone)]
+pub(crate) struct RangeAggregationResult {
+    pub buckets: Vec<RangeAggregationBucket>,
+}
+
+#[derive(Serialize, Clone)]
 #[serde(untagged)]
 pub(crate) enum AggregationResult {
-    Terms(TermAggregationResult),
     Average(AverageAggregationResult),
-    Filter(FilterAggregationResult),
     Cardinality(CardinalityAggregationResult),
+    Filter(FilterAggregationResult),
+    Histogram(HistogramAggregationResult),
+    Range(RangeAggregationResult),
+    Terms(TermAggregationResult),
 }
 
 #[derive(Serialize, Clone)]
@@ -130,9 +192,32 @@ pub(crate) struct QueryResults {
     timed_out: bool,
     _shards: QueryResultShards,
     hits: QueryResultHits,
+    #[serde(skip_serializing_if = "Option::is_none")]
     aggregations: Option<HashMap<String, AggregationResult>>,
 }
 
+#[derive(Serialize, Deserialize)]
+pub(crate) struct UpdateByQueryResultsRetries {
+    pub bulk: i64,
+    pub search: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct UpdateByQueryResults {
+    pub took: i64,
+    pub timed_out: bool,
+    pub total: i64,
+    pub updated: i64,
+    pub deleted: i64,
+    pub batches: i64,
+    pub version_conflicts: i64,
+    pub noops: i64,
+    pub retries: UpdateByQueryResultsRetries,
+    pub throttled_millis: i64,
+    pub requests_per_second: i64,
+    pub throttled_until_millis: i64,
+    pub failures: Vec<String>,
+}
 
 #[derive(Serialize, Clone)]
 pub(crate) struct QueryResultsNotFound {
@@ -148,13 +233,14 @@ impl CommandResponse for QueryResultsNotFound {
 }
 
 impl QueryResultHit {
-    pub fn new(index: &String, id: &String, version: i64, seq_no: i64, score: f64, source: Value) -> Self {
+    pub fn new(index: &String, id: &String, version: i64, seq_no: i64, score: f64, found: bool, source: Value) -> Self {
         QueryResultHit {
             _index: index.clone(),
             _id: id.clone(),
             _version: version,
             _seq_no: seq_no,
             _score: score,
+            found: found,
             _source: source.clone()
         }
     }
@@ -164,41 +250,54 @@ impl QueryResultHit {
     }
 }
 
-impl QueryResultTotal {
+impl QueryResultTotalComplex {
     fn new(num: usize) -> Self {
-        QueryResultTotal { value: num as u64, relation: "eq".to_string() }
+        QueryResultTotalComplex { value: num as u64, relation: "eq".to_string() }
     }
 }
 
 
 impl QueryResults {
-    pub fn empty(took: u32, num_shards: u32) -> Self {
+    pub fn empty(took: u32, num_shards: u32, aggregations: Option<HashMap<String, AggregationResult>>, total_hits_complex: bool) -> Self {
+        let total_hits = match total_hits_complex {
+            true => QueryResultTotal::Complex(QueryResultTotalComplex::new(0)),
+            false => QueryResultTotal::Simple(0)
+        };
         QueryResults { 
             took: took, 
             timed_out: false, 
             _shards: QueryResultShards { total: num_shards, successful: num_shards, skipped: 0, failed: 0 }, 
-            hits: QueryResultHits { total: QueryResultTotal::new(0), max_score: 0.0, hits: vec!() },
-            aggregations: None,
+            hits: QueryResultHits { total: total_hits, max_score: None, hits: vec!() },
+            aggregations: aggregations,
         }
     }
 
     #[allow(dead_code)]
-    pub fn timed_out(took: u32, num_shards: u32) -> Self {
+    pub fn timed_out(took: u32, num_shards: u32, total_hits_complex: bool) -> Self {
+        let total_hits = match total_hits_complex {
+            true => QueryResultTotal::Complex(QueryResultTotalComplex::new(0)),
+            false => QueryResultTotal::Simple(0),
+        };
         QueryResults { 
             took: took, 
             timed_out: true, 
             _shards: QueryResultShards { total: num_shards, successful: num_shards, skipped: 0, failed: 0 }, 
-            hits: QueryResultHits { total: QueryResultTotal::new(0), max_score: 0.0, hits: vec!() },
+            hits: QueryResultHits { total: total_hits, max_score: None, hits: vec!() },
             aggregations: None,
         }        
     }
 
-    pub fn success(took: u32, num_shards: u32, total_hits: usize, max_score: f64, hits: Vec<QueryResultHit>, aggregations: Option<HashMap<String, AggregationResult>>) -> Self {
+    pub fn success(took: u32, num_shards: u32, total_hits: usize, max_score: f64, hits: Vec<QueryResultHit>, aggregations: Option<HashMap<String, AggregationResult>>, total_hits_complex: bool) -> Self {
+        let total_hits = match total_hits_complex {
+            true => QueryResultTotal::Complex(QueryResultTotalComplex::new(total_hits)),
+            false => QueryResultTotal::Simple(total_hits as u64)
+        };
+
         QueryResults { 
             took: took, 
             timed_out: false, 
             _shards: QueryResultShards { total: num_shards, successful: num_shards, skipped: 0, failed: 0 }, 
-            hits: QueryResultHits { total: QueryResultTotal::new(total_hits), max_score: max_score, hits: hits },
+            hits: QueryResultHits { total: total_hits, max_score: Some(max_score), hits: hits },
             aggregations: aggregations,
         }  
     }
@@ -220,6 +319,16 @@ pub(crate) struct QueryFailure {
 impl CommandResponse for QueryFailure {
     fn generate_response(&self, state: &State) -> gotham::hyper::Response<gotham::hyper::Body> {
         create_response(state, StatusCode::BAD_REQUEST, mime::TEXT_PLAIN, self.message.clone())
+    }
+}
+
+pub(crate) struct UpdateByQuerySuccess {
+    pub result: UpdateByQueryResults
+}
+
+impl CommandResponse for UpdateByQuerySuccess {
+    fn generate_response(&self, state: &State) -> gotham::hyper::Response<gotham::hyper::Body> {
+        create_response(state, StatusCode::OK, mime::APPLICATION_JSON, serde_json::to_string(&self.result).unwrap())
     }
 }
 

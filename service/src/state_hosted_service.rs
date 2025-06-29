@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot::{self, error::RecvError}};
 
 use crate::{distributed_cache, elastic_search_ingest::CreateIndexTemplateBody, pipeline::PipelineDefinition, state_peers::SnapshotDescriptor};
+use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -791,8 +792,10 @@ impl TestApiServiceClient {
             };
 
             self.checkpoints.insert(format!("{}_{}", &table_info.table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
-            self.index_work_items.push(new_latest_checkpoint.clone());
+            //self.index_work_items.push(new_latest_checkpoint.clone());
+            self.create_index(&new_latest_checkpoint).await?;
             self.set_latest_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
+            
             if new_speedboat_metadata.files.len() >= 2 {
                 self.compact_work_items.push(new_latest_checkpoint.clone());
             }
@@ -859,7 +862,19 @@ impl TestApiServiceClient {
         Ok(())
     }    
 
-
+    async fn create_index(&mut self, new_latest_checkpoint: &TableMetadataCheckpoint) -> Result<(), Box<dyn Error>> {
+        let files = create_index_inner(new_latest_checkpoint).await?;
+        self.extension_commit(
+            &new_latest_checkpoint.table_name,
+            &ExtensionCommit {
+                extension: "es".to_string(),
+                checkpoint_id: new_latest_checkpoint.checkpoint_id.clone(),
+                partial_metadata: ExtensionMetadata {
+                    files: files,
+                },
+            }
+        ).await
+    }
 }
 
 unsafe impl Sync for TestApiServiceClient {}
@@ -923,9 +938,6 @@ impl ApiServiceClient for TestApiServiceClient {
     } 
 
     async fn describe_table(&mut self, name: &String) -> Result<Option<TableDescription>, Box<dyn Error>> {
-        if name.starts_with(".kibana_8.7.1") {
-            println!("Returning None for kibana table");
-        }
         let final_name = self.table_aliases.get(name).unwrap_or_else(|| name);
         match self.tables.get(final_name) {
             Some(d) => Ok(Some(d.clone())),

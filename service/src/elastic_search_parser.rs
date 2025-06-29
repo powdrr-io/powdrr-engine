@@ -7,7 +7,8 @@ use serde_json::Value;
 use crate::data_access::execute_sql;
 use crate::elastic_search_commands::{to_serde_value, SqlCommand, UpdateByQueryCommand};
 use crate::elastic_search_common::{Command, ParseError};
-use crate::elastic_search_responses::{AggregationResult, AverageAggregationResult, CardinalityAggregationResult, FilterAggregationResult, TermAggregationBucket, TermAggregationResult};
+use crate::elastic_search_endpoints::QueryStringSearch;
+use crate::elastic_search_responses::{AggregationResult, AverageAggregationResult, CardinalityAggregationResult, FilterAggregationResult, HistogramAggregationResult, RangeAggregationBucket, RangeAggregationResult, TermAggregationBucket, TermAggregationResult};
 
 
 
@@ -43,17 +44,92 @@ impl TermAggProcessor {
         serde_values.iter().map(|v| TermAggProcessor::create_aggregation_bucket(v)).collect::<Vec<TermAggregationBucket>>()
     }
 
-    async fn process(&self, table_name: &String, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
-        let child_aggs = process_aggregations(subaggregations, table_name).await;
+    async fn process(&self, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
+        let child_aggs = process_aggregations(subaggregations, table_name.clone()).await;
+
+        let buckets = match &table_name {
+            Some(t) => TermAggProcessor::create_buckets(t, &self.sql).await,
+            None => vec!()
+        };
 
         AggregationResult::Terms(TermAggregationResult{
             doc_count_error_upper_bound: 0,
             sum_other_doc_count: 0,
-            buckets: TermAggProcessor::create_buckets(table_name, &self.sql).await,
+            buckets: buckets,
             aggs: child_aggs
         })
     }
 }
+
+#[derive(Clone)]
+pub(crate) struct RangeAggBucket {
+    sql: String,
+    key: String,
+    from: u64,
+    from_as_string: String,
+    to: u64,
+    to_as_string: String,
+    subaggregations: Option<Vec<Aggregation>>
+}
+
+#[derive(Clone)]
+pub(crate) struct RangeAggProcessor {
+    buckets: Vec<RangeAggBucket>
+}
+
+impl RangeAggProcessor {
+    async fn create_aggregation_bucket(bucket_spec: &RangeAggBucket, table_name: Option<String>) -> RangeAggregationBucket {
+        let child_aggs = process_aggregations(bucket_spec.subaggregations.clone(), table_name.clone()).await;
+
+        let doc_count = match &table_name {
+            Some(t) => {
+                let final_sql = bucket_spec.sql.replace("{target_table}", t);
+                let data_frame = match execute_sql(&final_sql).await {
+                    Ok(df) => df,
+                    Err(_) => panic!("nope")
+                };
+
+                assert_eq!(data_frame.schema().columns().len(), 1);
+
+                let serde_values = to_serde_value(&data_frame).await;
+
+                serde_values.get(0).unwrap().as_object().unwrap().get("cnt").unwrap().as_u64().unwrap()
+            },
+            None => 0
+        };
+
+        RangeAggregationBucket {
+            key: bucket_spec.key.clone(),
+            from: bucket_spec.from,
+            from_as_string: bucket_spec.from_as_string.clone(),
+            to: bucket_spec.to,
+            to_as_string: bucket_spec.to_as_string.clone(),
+            doc_count: doc_count,
+            aggs: child_aggs,
+        }
+    }
+
+    async fn create_buckets(&self, table_name: Option<String>) -> Vec<RangeAggregationBucket> {
+        let mut buckets = vec!();
+        for bucket_spec in self.buckets.iter() {
+            buckets.push(RangeAggProcessor::create_aggregation_bucket(&bucket_spec, table_name.clone()).await)
+        }
+        buckets
+    }
+
+    async fn process(&self, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
+        // The subaggregations should get passed into each bucket
+        assert!(subaggregations.is_none());
+
+        let buckets = self.create_buckets(table_name).await;
+
+        AggregationResult::Range(RangeAggregationResult{
+            buckets: buckets,
+        })
+    }
+}
+
+
 
 
 #[derive(Clone)]
@@ -76,11 +152,16 @@ impl AverageAggProcessor {
         serde_values.get(0).unwrap().as_object().unwrap().get("avg").unwrap().as_f64().unwrap()
     }
 
-    async fn process(&self, table_name: &String, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
-        let child_aggs = process_aggregations(subaggregations, table_name).await;
+    async fn process(&self, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
+        let child_aggs = process_aggregations(subaggregations, table_name.clone()).await;
+
+        let avg = match &table_name {
+            Some(t) => AverageAggProcessor::calculate_average(t, &self.sql).await,
+            None => 0.0
+        };
 
         AggregationResult::Average(AverageAggregationResult{
-            value: AverageAggProcessor::calculate_average(table_name, &self.sql).await,
+            value: avg,
             aggs: child_aggs,
         })
     }
@@ -106,54 +187,37 @@ impl CardinalityAggProcessor {
         serde_values.get(0).unwrap().as_object().unwrap().get("type_count").unwrap().as_u64().unwrap()
     }
 
-    async fn process(&self, table_name: &String, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
-        let child_aggs = process_aggregations(subaggregations, table_name).await;
+    async fn process(&self, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
+        let child_aggs = process_aggregations(subaggregations, table_name.clone()).await;
 
+        let type_count = match &table_name {
+            Some(t) => CardinalityAggProcessor::calculate_cardinality(t, &self.sql).await,
+            None => 0
+        };
         AggregationResult::Cardinality(CardinalityAggregationResult{
-            type_count: CardinalityAggProcessor::calculate_cardinality(table_name, &self.sql).await,
+            type_count: type_count,
             aggs: child_aggs,
         })
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct DateHistogramAggBucket {
+    #[allow(dead_code)]
+    subaggregations: Option<Vec<Aggregation>>
+}
 
 #[derive(Clone)]
 pub(crate) struct DateHistogramAggProcessor {
-    sql: String,
+    #[allow(dead_code)]
+    buckets: Vec<DateHistogramAggBucket>
 }
 
 impl DateHistogramAggProcessor {
-    fn create_aggregation_bucket(value: &Value) -> TermAggregationBucket {
-        let value_map = value.as_object().unwrap();
-
-        TermAggregationBucket {
-            key: value_map.get("field_value").unwrap().as_str().unwrap().to_string(),
-            doc_count: value_map.get("doc_count").unwrap().as_u64().unwrap(),
-        }
-    }
-
-    async fn create_buckets(table_name: &String, query: &String) -> Vec<TermAggregationBucket> {
-        let final_sql = query.replace("{target_table}", table_name);
-        let data_frame = match execute_sql(&final_sql).await {
-            Ok(df) => df,
-            Err(_) => panic!("nope")
-        };
-
-        assert_eq!(data_frame.schema().columns().len(), 2);
-
-        let serde_values = to_serde_value(&data_frame).await;
-
-        serde_values.iter().map(|v| DateHistogramAggProcessor::create_aggregation_bucket(v)).collect::<Vec<TermAggregationBucket>>()
-    }
-
-    async fn process(&self, table_name: &String, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
-        let child_aggs = process_aggregations(subaggregations, table_name).await;
-
-        AggregationResult::Terms(TermAggregationResult{
-            doc_count_error_upper_bound: 0,
-            sum_other_doc_count: 0,
-            buckets: DateHistogramAggProcessor::create_buckets(table_name, &self.sql).await,
-            aggs: child_aggs
+    async fn process(&self, _table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
+        assert!(subaggregations.is_none());
+        AggregationResult::Histogram(HistogramAggregationResult{
+            buckets: vec!()
         })
     }
 }
@@ -164,17 +228,21 @@ pub(crate) struct FilterAggProcessor {
 }
 
 impl FilterAggProcessor {
-    async fn process(&self, table_name: &String, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
-        let final_sql = self.sql.replace("{target_table}", table_name);
-        let data_frame = execute_sql(&final_sql).await.unwrap();
-        assert_eq!(data_frame.schema().columns().len(), 1);
-        let serde_values = to_serde_value(&data_frame).await;
-        let cnt = serde_values.get(0).unwrap().as_object().unwrap().get("cnt").unwrap().as_u64().unwrap();
-
-        let child_aggs = process_aggregations(subaggregations, table_name).await;
+    async fn process(&self, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
+        let doc_count = match &table_name {
+            Some(t) => {
+                let final_sql = self.sql.replace("{target_table}", t);
+                let data_frame = execute_sql(&final_sql).await.unwrap();
+                assert_eq!(data_frame.schema().columns().len(), 1);
+                let serde_values = to_serde_value(&data_frame).await;
+                serde_values.get(0).unwrap().as_object().unwrap().get("cnt").unwrap().as_u64().unwrap()
+            },
+            None => 0
+        };
+        let child_aggs = process_aggregations(subaggregations, table_name.clone()).await;
 
         AggregationResult::Filter(FilterAggregationResult {
-            doc_count: cnt,
+            doc_count: doc_count,
             aggs: child_aggs
         })
     }
@@ -185,7 +253,7 @@ pub(crate) struct MissingAggProcessor {
 }
 
 impl MissingAggProcessor {
-    async fn process(&self, table_name: &String, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
+    async fn process(&self, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
         let child_aggs = process_aggregations(subaggregations, table_name).await;
 
         // TODO: we need to find doc that are actually missing values
@@ -204,6 +272,7 @@ pub(crate) enum AggProcessor {
     DateHistogram(DateHistogramAggProcessor),
     Filter(FilterAggProcessor),
     Missing(MissingAggProcessor),
+    Range(RangeAggProcessor),
     Term(TermAggProcessor),
 }
 
@@ -214,43 +283,46 @@ pub(crate) struct Aggregation {
     pub subaggregations: Option<Vec<Aggregation>>
 }
 
-pub(crate) async fn process_aggregation(aggregation: &Aggregation, table_name: &String) -> AggregationResult {
+pub(crate) async fn process_aggregation(aggregation: &Aggregation, table_name: Option<String>) -> AggregationResult {
     match &aggregation.processor {
-        AggProcessor::Term(term) => {
-            term.process(table_name, aggregation.subaggregations.clone()).await
-        },
         AggProcessor::Average(average) => {
             average.process(table_name, aggregation.subaggregations.clone()).await
         },
-        AggProcessor::Filter(filter) => {
-            filter.process(table_name, aggregation.subaggregations.clone()).await
+        AggProcessor::Cardinality(cardinality) => {
+            cardinality.process(table_name, aggregation.subaggregations.clone()).await
         },
         AggProcessor::DateHistogram(date_histogram) => {
             date_histogram.process(table_name, aggregation.subaggregations.clone()).await
         },
+        AggProcessor::Filter(filter) => {
+            filter.process(table_name, aggregation.subaggregations.clone()).await
+        },
         AggProcessor::Missing(missing) => {
             missing.process(table_name, aggregation.subaggregations.clone()).await
         },
-        AggProcessor::Cardinality(cardinality) => {
-            cardinality.process(table_name, aggregation.subaggregations.clone()).await
-        }
+        AggProcessor::Range(range) => {
+            range.process(table_name, aggregation.subaggregations.clone()).await
+        },
+        AggProcessor::Term(term) => {
+            term.process(table_name, aggregation.subaggregations.clone()).await
+        },
     }
 }
 
-pub(crate) async fn process_aggregations(aggregations: Option<Vec<Aggregation>>, table_name: &String) -> HashMap<String, AggregationResult> {
+pub(crate) async fn process_aggregations(aggregations: Option<Vec<Aggregation>>, table_name: Option<String>) -> HashMap<String, AggregationResult> {
     let mut results = HashMap::new();
     if aggregations.is_some() {
         for aggregation in aggregations.unwrap() {
-            results.insert(aggregation.name.clone(), Box::pin(process_aggregation(&aggregation, table_name)).await);
+            results.insert(aggregation.name.clone(), Box::pin(process_aggregation(&aggregation, table_name.clone())).await);
         }
     }
     results
 }
 
 
-pub fn parse(table: Option<String>, val: &String) -> Result<Arc<dyn Command>, ParseError> {
+pub fn parse(table: Option<String>, val: &String, query: &QueryStringSearch) -> Result<Arc<dyn Command>, ParseError> {
     let body: SearchBody = serde_json::from_str(val.as_str()).map_err(|e|ParseError{ message: format!("{}", e)})?;
-    let command = to_command(table, &body)?;
+    let command = to_command(table, &body, query)?;
     Ok(Arc::new(command))
 }
 
@@ -567,6 +639,28 @@ pub(crate) enum FilterExpression {
     Expr(String),
 }
 
+impl FilterExpression {
+    pub fn and(exprs: Vec<FilterExpression>) -> Option<Self> {
+        if exprs.len() == 0 {
+            None
+        } else if exprs.len() == 1 {
+            Some(exprs.get(0).unwrap().clone())
+        } else {
+            Some(FilterExpression::And(exprs))
+        }
+    }
+
+    pub fn or(exprs: Vec<FilterExpression>) -> Option<Self> {
+        if exprs.len() == 0 {
+            None
+        } else if exprs.len() == 1 {
+            Some(exprs.get(0).unwrap().clone())
+        } else {
+            Some(FilterExpression::Or(exprs))
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct UpdateByQueryBody {
     query: Query,
@@ -574,6 +668,15 @@ pub(crate) struct UpdateByQueryBody {
     sort: Option<Vec<SortType>>,
     max_docs: Option<usize>,
     conflicts: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct UpdateBody {
+    pub scripted_upsert: Option<bool>,
+    pub script: Option<ScriptBlock>,
+    pub doc: Option<Value>,
+    pub upsert: Option<Value>,
+    pub doc_as_upsert: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -629,31 +732,36 @@ impl SqlBuilder {
     }
 
     fn pop_filter_context(&mut self, is_and: bool) -> &mut Self {
+        self.pop_and_maybe_not_filter_context(is_and, false)
+    }
+
+    fn pop_and_not_filter_context(&mut self, is_and: bool) -> &mut Self {
+        self.pop_and_maybe_not_filter_context(is_and, true)
+    }
+
+    fn pop_and_maybe_not_filter_context(&mut self, is_and: bool, is_not: bool) -> &mut Self {
         let local_filter_stack = self.filter_stack.get_mut();
         assert!(local_filter_stack.len() > 0);
 
         let filter = match is_and {
-            true => FilterExpression::And(local_filter_stack.pop().unwrap()),
-            false => FilterExpression::Or(local_filter_stack.pop().unwrap()),
+            true => FilterExpression::and(local_filter_stack.pop().unwrap()),
+            false => FilterExpression::or(local_filter_stack.pop().unwrap()),
         };
 
-        let local_last = local_filter_stack.last_mut().unwrap();
-        local_last.push(filter);
+        if filter.is_some() {
+            let local_last = local_filter_stack.last_mut().unwrap();
+            if is_not {
+                local_last.push(FilterExpression::Not(Box::new(filter.unwrap())));
+            } else {
+                local_last.push(filter.unwrap());
+            }
+        }
         self
     }
 
     fn filter(&mut self, filter: String) -> &mut Self {
         let local_filter_stack = self.filter_stack.get_mut();
         local_filter_stack.last_mut().unwrap().push(FilterExpression::Expr(filter));
-        self
-    }
-
-    fn not_last_filter(&mut self) -> &mut Self {
-        let local_filter_stack = self.filter_stack.get_mut();
-        let local_last = local_filter_stack.last_mut().unwrap();
-        assert!(local_last.len() > 0);
-        let not_filter = FilterExpression::Not(Box::new(local_last.pop().unwrap()));
-        local_last.push(not_filter);
         self
     }
 
@@ -845,6 +953,7 @@ fn create_aggregation_processor(input_builder: &SqlBuilder, spec: &AggSpec) -> (
             (processor, aggregations)
         },
         AggSpec::DateHistogram(hist) => {
+            // TODO: this is a mess. Need to figure out how histograms work
             let mut builder = input_builder.clone();
             let field_name = hist.date_histogram.field.clone();
             builder.fields.push(format!("{field_name} as field_value"));
@@ -854,10 +963,9 @@ fn create_aggregation_processor(input_builder: &SqlBuilder, spec: &AggSpec) -> (
             let offset = 0;
             let interval = 5;
             builder.group_by.push(format!("floor(({field_name} - {offset}) / {interval}) * {interval} + {offset}"));
-            let sql = builder.build();
-            let processor = AggProcessor::DateHistogram(DateHistogramAggProcessor{ sql: sql });
-            let aggregations = aggs_to_sql(Some(input_builder.clone()), hist.aggs.clone());
-            (processor, aggregations)
+            let _sql = builder.build();
+            let processor = AggProcessor::DateHistogram(DateHistogramAggProcessor{ buckets: vec!() });
+            (processor, None)
         },
         AggSpec::Cardinality(cardinality) => {
             let mut builder = input_builder.clone();
@@ -869,6 +977,8 @@ fn create_aggregation_processor(input_builder: &SqlBuilder, spec: &AggSpec) -> (
             (processor, aggregations)
         } ,
         AggSpec::Range(range) => {
+            // TODO: this is a mess. Need to figure out the full range of options here
+            // and figure out how to target the multibucket range case
             let mut builder = input_builder.clone();
             for filter in create_aggregation_range_filters(&range.range) {
                 builder.filter(filter);
@@ -876,9 +986,22 @@ fn create_aggregation_processor(input_builder: &SqlBuilder, spec: &AggSpec) -> (
             let mut query_builder = builder.clone();
             query_builder.fields.push("count(1) as cnt".to_string());
             let sql = query_builder.build();
-            let processor = AggProcessor::Filter(FilterAggProcessor{ sql: sql });
             let aggregations = aggs_to_sql(Some(builder), range.aggs.clone());
-            (processor, aggregations)
+            let processor = AggProcessor::Range(RangeAggProcessor {
+                buckets: vec!(
+                    RangeAggBucket {
+                        sql,
+                        key: "2025-06-27T20:18:59.356Z-2025-06-27T20:20:59.356Z".to_string(),
+                        from: 1751055539356,
+                        from_as_string: "2025-06-27T20:18:59.356Z".to_string(),
+                        to: 1751055659356,
+                        to_as_string: "2025-06-27T20:20:59.356Z".to_string(),
+                        subaggregations: aggregations,
+                    }
+                )
+            });
+
+            (processor, None)
         }
         AggSpec::Average(average) => {
             let mut builder = input_builder.clone();
@@ -910,7 +1033,7 @@ fn aggs_to_sql(input_builder: Option<SqlBuilder>, aggs: Option<HashMap<String, A
     Some(aggs.unwrap().iter().map(|x| create_aggregation(input_builder.clone(), x.0, x.1)).collect())
 }
 
-fn to_command(table: Option<String>, body: &SearchBody) -> Result<SqlCommand, ParseError> {
+fn to_command(table: Option<String>, body: &SearchBody, query: &QueryStringSearch) -> Result<SqlCommand, ParseError> {
     let mut builder = SqlBuilder::for_query();
 
     if body.from.is_some() {
@@ -936,7 +1059,13 @@ fn to_command(table: Option<String>, body: &SearchBody) -> Result<SqlCommand, Pa
 
     let aggs = aggs_to_sql(None, body.aggs.clone());
 
-    Ok(SqlCommand{ sql: builder.build(), table: table_name, calculate_score: builder.score(), aggs: aggs })
+    Ok(SqlCommand{
+        sql: builder.build(),
+        table: table_name,
+        calculate_score: builder.score(),
+        aggs: aggs,
+        query_params: query.clone()
+    })
 }
 
 fn to_command_update_by_query(table: Option<String>, body: &UpdateByQueryBody) -> Result<UpdateByQueryCommand, ParseError> {
@@ -950,7 +1079,17 @@ fn to_command_update_by_query(table: Option<String>, body: &UpdateByQueryBody) -
     };
 
     Ok(UpdateByQueryCommand{
-        query_command: SqlCommand{ sql: builder.build(), table: table_name, calculate_score: builder.score(), aggs: None },
+        query_command: SqlCommand{
+            sql: builder.build(),
+            table: table_name,
+            calculate_score: builder.score(),
+            aggs: None,
+            query_params: QueryStringSearch {
+                allow_partial_search_results: None,
+                sort: None,
+                rest_total_hits_as_int: None,
+            }
+        },
         script_block: body.script.clone(),
     })
 }
@@ -980,7 +1119,7 @@ fn to_sql_match(builder: &mut SqlBuilder, match_obj: &Match) -> Result<(), Parse
 
     builder.calculate_score = true;
     if builder.joins.len() == 0 {
-        builder.joins.push("inner join {target_table}_search_index si on si.doc_id = t.index_col".to_string());
+        builder.joins.push("INNER JOIN {target_table}_search_index si on si.doc_id = t.index_col".to_string());
     }
 
     for pair in match_obj._match.iter() {
@@ -1011,8 +1150,7 @@ fn to_sql_bool(builder: &mut SqlBuilder, bool_obj: &Bool) -> Result<(), ParseErr
 
         bool_obj._bool.must_not.as_vec().iter().map(|x|to_command_worker(builder, x)).collect::<Result<Vec<()>, ParseError>>()?;
 
-        builder.pop_filter_context(false);        
-        builder.not_last_filter();
+        builder.pop_and_not_filter_context(false);
     } 
     if bool_obj._bool.filter.as_vec().len() > 0 {
         builder.push_filter_context();
@@ -1032,8 +1170,9 @@ fn to_sql_term(builder: &mut SqlBuilder, term_obj: &Term) -> Result<(), ParseErr
     Ok(())
 }
 
-fn to_sql_exists(builder: &mut SqlBuilder, exists_obj: &Exists) -> Result<(), ParseError> {
-    builder.filter(format!("t.{} is not None", exists_obj.exists.field));
+fn to_sql_exists(_builder: &mut SqlBuilder, _exists_obj: &Exists) -> Result<(), ParseError> {
+    // TODO: need to figure out how to query the schema
+    // builder.filter(format!("t.{} is not null", exists_obj.exists.field));
     Ok(())
 }
 
@@ -1088,7 +1227,7 @@ fn to_sql_simple_query(builder: &mut SqlBuilder, query_obj: &SimpleQueryString) 
 
     builder.calculate_score = true;
     if builder.joins.len() == 0 {
-        builder.joins.push("inner join {target_table}_search_index si on si.doc_id = t.index_col".to_string());
+        builder.joins.push("INNER JOIN {target_table}_search_index si on si.doc_id = t.index_col".to_string());
     }
 
     // TODO: need to really parse the query string
@@ -1104,6 +1243,7 @@ fn to_sql_simple_query(builder: &mut SqlBuilder, query_obj: &SimpleQueryString) 
 
 #[cfg(test)]
 mod tests {
+    use crate::elastic_search_endpoints::QueryStringSearch;
     use crate::elastic_search_parser::{parse, UpdateByQueryBody};
 
     use super::{to_command, SearchBody};
@@ -1121,7 +1261,8 @@ mod tests {
        }
      }
    }
-}"#.to_string()
+}"#.to_string(),
+            &QueryStringSearch::new(),
         );
 
         match parse_result {
@@ -1156,7 +1297,7 @@ mod tests {
             }
         };
 
-        let command = to_command(Some("testtime".to_string()), &parse_result).unwrap();
+        let command = to_command(Some("testtime".to_string()), &parse_result, &QueryStringSearch::new()).unwrap();
 
         println!("{}", command.sql);
     }
@@ -1216,7 +1357,7 @@ mod tests {
             }
         };
 
-        let command = to_command(Some("testtime".to_string()), &parse_result).unwrap();
+        let command = to_command(Some("testtime".to_string()), &parse_result, &QueryStringSearch::new()).unwrap();
 
         println!("{}", command.sql);
 
@@ -1353,7 +1494,7 @@ mod tests {
             }
         };
 
-        let command = to_command(Some("testtime".to_string()), &parse_result).unwrap();
+        let command = to_command(Some("testtime".to_string()), &parse_result, &QueryStringSearch::new()).unwrap();
 
         println!("{}", command.sql);
 
@@ -1426,7 +1567,7 @@ mod tests {
             }
         };
 
-        let _command = to_command(Some("fake_name".to_string()), &parse_result);
+        let _command = to_command(Some("fake_name".to_string()), &parse_result, &QueryStringSearch::new());
 
 
 
@@ -1608,6 +1749,6 @@ mod tests {
             }
         };
 
-        let _command = to_command(Some("foobar".to_string()), &parse_result);        
+        let _command = to_command(Some("foobar".to_string()), &parse_result, &QueryStringSearch::new());
     }
 }

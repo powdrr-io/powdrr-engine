@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fmt::Display;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use arrow_json::reader::infer_json_schema;
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
@@ -13,13 +13,16 @@ use gotham::helpers::http::response::create_response;
 use gotham::hyper::{Body, Response};
 use gotham::mime::Mime;
 use gotham::state::State;
-use http::StatusCode;
+use http::{HeaderName, StatusCode};
 
 use crate::data_access::{execute_sql, load_memtable};
 use crate::elastic_search_responses::QueryFailure;
 use crate::state_peers::{self, PeerClient, PeerClientError, PrivateSqlInvocation, SnapshotDescriptor};
 use crate::state_common::FileFilter;
 use crate::util::log_err;
+
+
+pub(crate) const MIME_ES_JSON: LazyLock<Mime> = LazyLock::new(|| "application/vnd.elasticsearch+json;compatible-with=8".parse().unwrap());
 
 
 pub(crate) struct CommandContext {
@@ -50,6 +53,7 @@ pub(crate) struct ElasticSearchResponse {
     pub status: StatusCode, 
     pub mime: Mime, 
     pub body: String,
+    pub headers: Vec<(HeaderName, String)>,
 }
 
 unsafe impl Send for ElasticSearchResponse {}
@@ -58,7 +62,14 @@ unsafe impl Sync for ElasticSearchResponse {}
 
 impl CommandResponse for ElasticSearchResponse {
     fn generate_response(&self, state: &State) -> gotham::hyper::Response<gotham::hyper::Body> {
-        create_response(state, self.status.clone(), self.mime.clone(), self.body.clone())
+        let mut response = create_response(state, self.status.clone(), self.mime.clone(), self.body.clone());
+        if self.headers.len() != 0 {
+            let response_headers = response.headers_mut();
+            for (k, v) in self.headers.iter() {
+                response_headers.insert(k, v.parse().unwrap());
+            }
+        }
+        response
     }
 }
 
