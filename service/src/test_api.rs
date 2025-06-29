@@ -57,7 +57,7 @@ pub fn test_v1_add_checkpoint(mut state: State) -> Pin<Box<HandlerFuture>> {
 
 pub fn test_v1_set_testing_mode(state: State) -> Pin<Box<HandlerFuture>> {
     async {
-        API_SERVICE_CLIENT.set_testing_mode().await;
+        API_SERVICE_CLIENT.set_testing_mode(false).await;
         let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "Ok");
         Ok((state, res))        
     }.boxed()
@@ -112,7 +112,7 @@ fn do_work_for_forever(wait_time_ms: u64) -> impl Future<Output = ()> {
 
 pub fn test_v1_set_testing_processing_mode(state: State) -> Pin<Box<HandlerFuture>> {
     async {
-        API_SERVICE_CLIENT.set_testing_mode().await;
+        API_SERVICE_CLIENT.set_testing_mode(true).await;
         tokio::spawn(do_work_for_forever(1000));
         let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "Ok");
         Ok((state, res))        

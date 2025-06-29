@@ -165,7 +165,7 @@ pub(crate) trait ApiServiceClient : Send + Sync {
 
     async fn describe_lifetime_policy(&mut self, name: &String) -> Result<Option<ILMPolicyDefinition>, Box<dyn Error>>;
     
-    async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), Box<dyn Error>>;
+    async fn speedboat_commit(&mut self, commit: &SpeedboatCommit, sync_index: bool) -> Result<(), Box<dyn Error>>;
 
     async fn iceberg_commit(&mut self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), Box<dyn Error>>;
 
@@ -185,12 +185,14 @@ struct ApiServiceClientActor {
     real: RealApiServiceClient,
     test: TestApiServiceClient,
     test_mode: bool,
+    sync_index: bool,
     receiver: mpsc::Receiver<ApiServiceClientActorMessage>,
 }
 
 enum ApiServiceClientActorMessage {
     Testing {
         respond_to: oneshot::Sender<()>,
+        sync_index: bool,
     },
     CreatePipeline {
         respond_to: oneshot::Sender<()>,
@@ -284,14 +286,16 @@ impl ApiServiceClientActor {
             real: RealApiServiceClient::new(base_address),
             test: TestApiServiceClient::new(),
             test_mode: false,
+            sync_index: false,           
             receiver: receiver,
         }
     }
 
     async fn handle_message(&mut self, msg: ApiServiceClientActorMessage) {
         match msg {
-            ApiServiceClientActorMessage::Testing { respond_to } => {
+            ApiServiceClientActorMessage::Testing { respond_to, sync_index } => {
                 self.test_mode = true;
+                self.sync_index = sync_index;
                 self.test.clear();
                 let _ = respond_to.send(());
             },
@@ -378,9 +382,9 @@ impl ApiServiceClientActor {
             },            
             ApiServiceClientActorMessage::SpeedboatCommit { respond_to, speedboat_commit } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.speedboat_commit(&speedboat_commit).await.expect("nope"));
+                    let _ = respond_to.send(self.test.speedboat_commit(&speedboat_commit, self.sync_index).await.expect("nope"));
                 } else {
-                    let _ = respond_to.send(self.real.speedboat_commit(&speedboat_commit).await.expect("nope"));
+                    let _ = respond_to.send(self.real.speedboat_commit(&speedboat_commit, self.sync_index).await.expect("nope"));
                 }                
             },
             ApiServiceClientActorMessage::ExtensionCommit { respond_to, table_name, extension_commit } => {
@@ -507,7 +511,7 @@ impl ApiServiceClient for RealApiServiceClient {
         todo!()
     }          
 
-    async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), Box<dyn Error>> {
+    async fn speedboat_commit(&mut self, commit: &SpeedboatCommit, _sync_index: bool) -> Result<(), Box<dyn Error>> {
         let base_address = &self.base_address;
         let body = serde_json::to_string(commit);
         match body {
@@ -702,6 +706,13 @@ impl TestApiServiceClient {
     }    
 
     fn add_checkpoint(&mut self, metadata: &TableMetadataCheckpoint) -> () {
+        // To make testing a little easier, we'll just magic up a table as necessary
+        if !self.tables.contains_key(&metadata.table_name) {
+            self.tables.insert(
+                metadata.table_name.clone(), 
+                TableDescription{ name: metadata.table_name.clone(), tags: Default::default() }
+            );
+        }
         let key = format!("{}_{}", &metadata.table_name, &metadata.checkpoint_id);
         if !self.latest_checkpoint_id.contains_key(&metadata.table_name) {
             self.latest_checkpoint_id.insert(metadata.table_name.clone(), metadata.checkpoint_id.clone());            
@@ -734,7 +745,7 @@ impl TestApiServiceClient {
         self.latest_checkpoint_id.insert(key.clone(), checkpoint_id.clone());        
     }
 
-    async fn speedboat_commit_type_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), Box<dyn std::error::Error>> {
+    async fn speedboat_commit_type_commit(&mut self, commit: &SpeedboatCommit, sync_index: bool) -> Result<(), Box<dyn std::error::Error>> {
         for table_info in commit.type_files.iter() {
             let latest_checkpoint = match self.get_latest_checkpoint_sync(&table_info.table_name, None) {
                 Some(checkpoint_id) => {
@@ -792,10 +803,14 @@ impl TestApiServiceClient {
             };
 
             self.checkpoints.insert(format!("{}_{}", &table_info.table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
-            //self.index_work_items.push(new_latest_checkpoint.clone());
-            self.create_index(&new_latest_checkpoint).await?;
+
+            if sync_index {
+                self.create_index(&new_latest_checkpoint).await?;
+            } else {
+                self.index_work_items.push(new_latest_checkpoint.clone());
+            }
             self.set_latest_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
-            
+
             if new_speedboat_metadata.files.len() >= 2 {
                 self.compact_work_items.push(new_latest_checkpoint.clone());
             }
@@ -979,9 +994,9 @@ impl ApiServiceClient for TestApiServiceClient {
     }
 
 
-    async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), Box<dyn std::error::Error>> {
+    async fn speedboat_commit(&mut self, commit: &SpeedboatCommit, sync_index: bool) -> Result<(), Box<dyn std::error::Error>> {
         if commit.commit_type == "commit" {
-            self.speedboat_commit_type_commit(commit).await
+            self.speedboat_commit_type_commit(commit, sync_index).await
         } else if commit.commit_type == "delete" {
             self.speedboat_commit_type_delete(commit).await
         } else {
@@ -1099,10 +1114,11 @@ impl ApiServiceClientHandle {
         Self { sender }
     }
 
-    pub async fn set_testing_mode(&self) -> () {
+    pub async fn set_testing_mode(&self, sync_index: bool) -> () {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::Testing { 
             respond_to: send,
+            sync_index: sync_index,
         };
 
         let _ = self.sender.send(msg).await;

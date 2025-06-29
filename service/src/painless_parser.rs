@@ -475,9 +475,9 @@ impl Expression for Comparison {
         // TODO: translate operator
         let is_right_null = Comparison::is_null(&self.right_expression);
         if self.operator == "!=" && is_right_null {
-            Ok(format!("{} is not null", self.left_expression.translate(context.clone())?))
+            Ok(format!("{} is not none", self.left_expression.translate(context.clone())?))
         } else if self.operator == "==" && is_right_null {
-            Ok(format!("{} is null", self.left_expression.translate(context.clone())?))
+            Ok(format!("{} is none", self.left_expression.translate(context.clone())?))
         } else {
             Ok(format!(
                 "{} {} {}",

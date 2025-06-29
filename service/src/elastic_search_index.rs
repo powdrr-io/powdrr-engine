@@ -38,7 +38,7 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
         // There are no string fields so there is nothing to index
         return Ok(())
     }
-    
+
     let field_normalization_queries_union = field_normalization_queries.join(" UNION ");
 
     match execute_sql(&format!("CREATE TABLE {new_local_name}_fields AS {field_normalization_queries_union}")).await {
@@ -197,7 +197,7 @@ pub(crate) async fn create_index(table_metadata: &TableMetadataCheckpoint) -> Re
     Ok(())
 }
 
-pub(crate) async fn create_index_inner(table_metadata: &TableMetadataCheckpoint) -> Result<Vec<ExtensionFileMetadata>, Box<dyn Error>> {  
+pub(crate) async fn create_index_inner(table_metadata: &TableMetadataCheckpoint) -> Result<Vec<ExtensionFileMetadata>, Box<dyn Error>> {
     let mut files: Vec<ExtensionFileMetadata> = vec!();
 
     // TODO: does just "_id" work for everything?
