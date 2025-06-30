@@ -895,8 +895,6 @@ fn create_aggregation_filters(filter: &AggSpecFilterBody) -> Vec<String> {
 }
 
 fn create_aggregation_range_filters(range: &AggSpecFilterRangeBody) -> Vec<String> {
-    vec!()
-    /*
     match range {
         AggSpecFilterRangeBody::Raw(raw) => {
             assert_eq!(raw.len(), 1);
@@ -922,7 +920,6 @@ fn create_aggregation_range_filters(range: &AggSpecFilterRangeBody) -> Vec<Strin
             retval
         }
     }
-     */
 }
 
 fn create_aggregation_processor(input_builder: &SqlBuilder, spec: &AggSpec) -> (AggProcessor, Option<Vec<Aggregation>>) {
@@ -1199,36 +1196,28 @@ fn to_sql_range(builder: &mut SqlBuilder, range_obj: &Range) -> Result<(), Parse
     
     match &spec.gt {
         Some(val) => {
-            if !val.contains("now") {
-                builder.filter(format!("{field_name} > {val}"));
-            }
+            builder.filter(format!("{field_name} > {val}"));
         },
         None => ()
     };
 
     match &spec.gte {
         Some(val) => {
-            if !val.contains("now") {
-                builder.filter(format!("{field_name} >= {val}"));
-            }
+            builder.filter(format!("{field_name} >= {val}"));
         },
         None => ()
     };
 
     match &spec.lt {
         Some(val) => {
-            if !val.contains("now") {
-                builder.filter(format!("{field_name} < {val}"));
-            }
+            builder.filter(format!("{field_name} < {val}"));
         },
         None => ()
     };
 
     match &spec.lte {
         Some(val) => {
-            if !val.contains("now") {
-                builder.filter(format!("{field_name} <= {val}"));
-            }
+            builder.filter(format!("{field_name} <= {val}"));
         },
         None => ()
     };
