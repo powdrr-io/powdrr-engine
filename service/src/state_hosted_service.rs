@@ -811,9 +811,10 @@ impl TestApiServiceClient {
             }
             self.set_latest_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
 
-            if new_speedboat_metadata.files.len() >= 2 {
-                self.compact_work_items.push(new_latest_checkpoint.clone());
-            }
+            // TODO: Re-enable compaction
+            //if new_speedboat_metadata.files.len() >= 2 {
+            //    self.compact_work_items.push(new_latest_checkpoint.clone());
+            //}
         }
         Ok(())
     }    
