@@ -927,12 +927,12 @@ fn create_aggregation_processor(input_builder: &SqlBuilder, spec: &AggSpec) -> (
         AggSpec::Terms(terms) => {
             let field_name = terms.terms.field.clone();
             let mut builder = input_builder.clone();
+            builder.group_by.push(format!("{field_name}"));
+            let aggregations = aggs_to_sql(Some(builder.clone()), terms.aggs.clone());
             builder.fields.push(format!("{field_name} as field_name"));
             builder.fields.push("count(1) as cnt".to_string());
-            builder.group_by.push(format!("{field_name}"));
             let sql = builder.build();
             let processor = AggProcessor::Term(TermAggProcessor{ sql: sql });
-            let aggregations = aggs_to_sql(Some(builder), terms.aggs.clone());
             (processor, aggregations)
         },
         AggSpec::Filter(filter) => {
@@ -1057,10 +1057,11 @@ fn to_command(table: Option<String>, body: &SearchBody, query: &QueryStringSearc
         }
     };
 
+    let sql = builder.build();
     let aggs = aggs_to_sql(None, body.aggs.clone());
 
     Ok(SqlCommand{
-        sql: builder.build(),
+        sql: sql,
         table: table_name,
         calculate_score: builder.score(),
         aggs: aggs,
@@ -1119,7 +1120,7 @@ fn to_sql_match(builder: &mut SqlBuilder, match_obj: &Match) -> Result<(), Parse
 
     builder.calculate_score = true;
     if builder.joins.len() == 0 {
-        builder.joins.push("INNER JOIN {target_table}_search_index si on si.doc_id = t.index_col".to_string());
+        builder.joins.push("INNER JOIN {target_table}_search_index si on si.doc_id = t._id".to_string());
     }
 
     for pair in match_obj._match.iter() {
@@ -1165,7 +1166,11 @@ fn to_sql_bool(builder: &mut SqlBuilder, bool_obj: &Bool) -> Result<(), ParseErr
 
 fn to_sql_term(builder: &mut SqlBuilder, term_obj: &Term) -> Result<(), ParseError> {
     for pair in term_obj.term.iter() {
-        builder.filter(format!("t.{} = '{}'", pair.0, pair.1));
+        if pair.1.is_string() {
+            builder.filter(format!("t.{} = '{}'", pair.0, pair.1.as_str().unwrap()));
+        } else {
+            builder.filter(format!("t.{} = {}", pair.0, pair.1));
+        }
     }
     Ok(())
 }
@@ -1227,7 +1232,7 @@ fn to_sql_simple_query(builder: &mut SqlBuilder, query_obj: &SimpleQueryString) 
 
     builder.calculate_score = true;
     if builder.joins.len() == 0 {
-        builder.joins.push("INNER JOIN {target_table}_search_index si on si.doc_id = t.index_col".to_string());
+        builder.joins.push("INNER JOIN {target_table}_search_index si on si.doc_id = t._id".to_string());
     }
 
     // TODO: need to really parse the query string

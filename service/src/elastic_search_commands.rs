@@ -17,7 +17,7 @@ use crate::elastic_search_responses::{AggregationResult, QueryResultsNotFound, U
 async fn empty_result(aggs: Option<Vec<Aggregation>>, total_hits_complex: bool) -> Arc<dyn CommandResponse> {
     // TODO: need to record and feed through the requested number of shards from index creation
     let aggregation_results = SqlCommand::generate_aggregations(None, aggs).await;
-    Arc::new(QueryResults::empty(0, 2, aggregation_results, total_hits_complex))
+    Arc::new(QueryResults::empty(50, 1, aggregation_results, total_hits_complex))
 }
 
 
@@ -90,7 +90,7 @@ impl Command for Match {
         let query = &self.query;
         SqlBuilder {
             columns: vec!("*".to_string()),
-            table: Some("{target_table}_search_index si INNER JOIN {target_table} t ON si.doc_id = t.index_col".to_string()),
+            table: Some("{target_table}_search_index si INNER JOIN {target_table} t ON si.doc_id = t._id".to_string()),
             filters: vec!(format!("field_name = '{field}'").to_string(), format!("field_term = '{query}'").to_string()),
             order_by: vec!(),
         }.build()

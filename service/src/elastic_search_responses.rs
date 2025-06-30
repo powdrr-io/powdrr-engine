@@ -49,28 +49,28 @@ impl BulkResult {
     }
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct QueryResultShards {
-    total: u32,
-    successful: u32,
-    skipped: u32,
-    failed: u32,
+    pub total: u32,
+    pub successful: u32,
+    pub skipped: u32,
+    pub failed: u32,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct QueryResultTotalComplex {
-    value: u64,
-    relation: String,
+    pub value: u64,
+    pub relation: String,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 #[serde(untagged)]
 pub(crate) enum QueryResultTotal {
     Simple(u64),
     Complex(QueryResultTotalComplex),
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct QueryResultHit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub _index: Option<String>,
@@ -88,20 +88,20 @@ pub(crate) struct QueryResultHit {
 }
 
 
-#[derive(Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct QueryResultHits {
-    total: QueryResultTotal,
-    max_score: Option<f64>,
-    hits: Vec<QueryResultHit>
+    pub total: QueryResultTotal,
+    pub max_score: Option<f64>,
+    pub hits: Vec<QueryResultHit>
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct TermAggregationBucket {
     pub key: String,
     pub doc_count: u64,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct TermAggregationResult {
     pub doc_count_error_upper_bound: u64,
     pub sum_other_doc_count: u64,
@@ -110,28 +110,28 @@ pub(crate) struct TermAggregationResult {
     pub aggs: HashMap<String, AggregationResult>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct AverageAggregationResult {
     pub value: f64,
     #[serde(flatten)]
     pub aggs: HashMap<String, AggregationResult>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct FilterAggregationResult {
     pub doc_count: u64,
     #[serde(flatten)]
     pub aggs: HashMap<String, AggregationResult>
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct CardinalityAggregationResult {
     pub type_count: u64,
     #[serde(flatten)]
     pub aggs: HashMap<String, AggregationResult>
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct RangeAggregationBucket {
     pub key: String,
     pub from: u64,
@@ -143,7 +143,7 @@ pub(crate) struct RangeAggregationBucket {
     pub aggs: HashMap<String, AggregationResult>
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct HistogramAggregationBucket {
     // TODO: this may not be correct
     pub key: String,
@@ -156,19 +156,19 @@ pub(crate) struct HistogramAggregationBucket {
     pub aggs: HashMap<String, AggregationResult>
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct HistogramAggregationResult {
     pub(crate) buckets: Vec<HistogramAggregationBucket>,
 
 }
 
 
-#[derive(Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct RangeAggregationResult {
     pub buckets: Vec<RangeAggregationBucket>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 #[serde(untagged)]
 pub(crate) enum AggregationResult {
     Average(AverageAggregationResult),
@@ -179,14 +179,14 @@ pub(crate) enum AggregationResult {
     Terms(TermAggregationResult),
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct QueryResults {
-    took: u32,
-    timed_out: bool,
-    _shards: QueryResultShards,
-    hits: QueryResultHits,
+    pub took: u32,
+    pub timed_out: bool,
+    pub _shards: QueryResultShards,
+    pub hits: QueryResultHits,
     #[serde(skip_serializing_if = "Option::is_none")]
-    aggregations: Option<HashMap<String, AggregationResult>>,
+    pub aggregations: Option<HashMap<String, AggregationResult>>,
 }
 
 #[derive(Serialize, Deserialize)]

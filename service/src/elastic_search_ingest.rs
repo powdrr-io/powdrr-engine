@@ -591,7 +591,9 @@ async fn create_single_worker(index: &String, doc_id: &String, payload: &String)
                 headers: headers
             })
         },
-        Err(_) => {
+        Err(e) => {
+            let error = format!("{}", e);
+            println!("{}", error);
             Ok(ElasticSearchResponse{ status: StatusCode::BAD_REQUEST, mime: mime::APPLICATION_JSON, body: "Bad request".to_string(), headers: vec!() })
         }
     }

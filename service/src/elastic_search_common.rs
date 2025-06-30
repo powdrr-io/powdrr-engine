@@ -295,9 +295,9 @@ mod tests {
     fn sql_builder_test1() {
         let mut sql_builder = SqlBuilder::new();
         sql_builder.set_table("foo_bar".to_string());
-        sql_builder.add_column("index_col".to_string()).add_column("*".to_string());
+        sql_builder.add_column("_id".to_string()).add_column("*".to_string());
         sql_builder.add_filter("baz > 0".to_string()).add_filter("quux = 'what up'".to_string());
         sql_builder.add_order_by("dudical".to_string()).add_order_by("my_man".to_string());
-        assert_eq!(sql_builder.build(), "SELECT index_col, * FROM foo_bar WHERE baz > 0 AND quux = 'what up' ORDER BY dudical, my_man");
+        assert_eq!(sql_builder.build(), "SELECT _id, * FROM foo_bar WHERE baz > 0 AND quux = 'what up' ORDER BY dudical, my_man");
     }
 }
