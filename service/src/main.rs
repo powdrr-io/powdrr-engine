@@ -30,6 +30,7 @@ mod state_leader;
 mod state_peers;
 mod test_api;
 mod util;
+mod elastic_search_datetime_parser;
 
 /// Start a server and call the `Handler` we've defined above for each `Request` we receive.
 // #[tokio::main]
@@ -56,7 +57,7 @@ fn run_server() -> () {
     tracing_subscriber::fmt().init();
     let addr = "0.0.0.0:9200";
     println!("Listening for requests at http://{}", addr);
-    gotham::start(addr, router::router(true)).unwrap()    
+    gotham::start_with_num_threads(addr, router::router(true), 16).unwrap()    
 }
 
 

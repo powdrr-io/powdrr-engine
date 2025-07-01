@@ -24,3 +24,4 @@ service/tests/data/flights_search_index.parquet
 .idea/
 
 .DS_Store
+.history

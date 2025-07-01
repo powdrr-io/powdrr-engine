@@ -2,11 +2,13 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use crate::data_access::execute_sql;
 use crate::elastic_search_commands::{to_serde_value, SqlCommand, UpdateByQueryCommand};
 use crate::elastic_search_common::{Command, ParseError};
+use crate::elastic_search_datetime_parser;
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::elastic_search_responses::{AggregationResult, AverageAggregationResult, CardinalityAggregationResult, FilterAggregationResult, HistogramAggregationResult, RangeAggregationBucket, RangeAggregationResult, TermAggregationBucket, TermAggregationResult};
 
@@ -409,7 +411,7 @@ pub(crate) struct AggSpecFilterRangeStructured {
 #[serde(untagged)]
 pub(crate) enum AggSpecFilterRangeBody {
     Structured(AggSpecFilterRangeStructured),
-    Raw(HashMap<String, HashMap<String, String>>),
+    Raw(HashMap<String, RangeSpecOperator>),
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -593,12 +595,67 @@ pub(crate) struct ExistsBody {
     field: String
 }
 
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct RangeSpecGt {
+    gt: Value
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct RangeSpecGte {
+    gte: Value
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct RangeSpecLt {
+    lt: Value
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct RangeSpecLte {
+    lte: Value
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+pub(crate) enum RangeSpecOperator {
+    GT(RangeSpecGt),
+    GTE(RangeSpecGte),
+    LT(RangeSpecLt),
+    LTE(RangeSpecLte),
+}
+
+impl RangeSpecOperator {
+    fn convert_to_sql(&self) -> (String, String) {
+        let (op, val) = match self {
+            RangeSpecOperator::GT(op) => {
+                (">", op.gt.clone())
+            },
+            RangeSpecOperator::GTE(op) => {
+                (">=", op.gte.clone())
+            },
+            RangeSpecOperator::LT(op) => {
+                ("<", op.lt.clone())
+            },
+            RangeSpecOperator::LTE(op) => {
+                ("<=", op.lte.clone())
+            },
+        };
+
+        let final_val = if val.is_string() {
+            convert_datetime_if_necessary(val.as_str().unwrap())
+        } else {
+            val.to_string()
+        };
+
+        (op.to_string(), final_val)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct RangeSpec {
-    gt: Option<String>,
-    gte: Option<String>,
-    lt: Option<String>,
-    lte: Option<String>,
+    #[serde(flatten)]
+    op: RangeSpecOperator,
     format: Option<String>,
     relation: Option<String>,
     time_zone: Option<String>,
@@ -899,12 +956,8 @@ fn create_aggregation_range_filters(range: &AggSpecFilterRangeBody) -> Vec<Strin
         AggSpecFilterRangeBody::Raw(raw) => {
             assert_eq!(raw.len(), 1);
             let (name, value_and_op) = raw.iter().next().unwrap();
-            assert_eq!(value_and_op.len(), 1);
-            let (op, value) = value_and_op.iter().next().unwrap();
-            // TODO: need to convert the op to the appropriate SQL operator
-            // TODO: need to convert the value to the appropriate SQL type
-            let converted_op = op;
-            let converted_value = value;
+
+            let (converted_op, converted_value) = value_and_op.convert_to_sql();
             vec!(format!("{name} {converted_op} {converted_value}"))
         },
         AggSpecFilterRangeBody::Structured(structured) => {
@@ -1181,47 +1234,29 @@ fn to_sql_exists(_builder: &mut SqlBuilder, _exists_obj: &Exists) -> Result<(), 
     Ok(())
 }
 
+fn convert_datetime_if_necessary(value: &str) -> String {
+    if value.contains("now") {
+        // TODO: need to handle errors
+        elastic_search_datetime_parser::evaluate(&value.to_string(), &Utc::now()).unwrap()
+    } else {
+        value.to_string()
+    }
+}
+
 fn to_sql_range(builder: &mut SqlBuilder, range_obj: &Range) -> Result<(), ParseError> {
     if range_obj.range.len() != 1 {
         panic!("Not implemented")
     }
     
-    let pair = range_obj.range.iter().next().unwrap();
-    let field_name = pair.0;
-    let spec = pair.1;
-    
+    let (field_name, spec) = range_obj.range.iter().next().unwrap();
+
     if spec.format.is_some() || spec.relation.is_some() || spec.time_zone.is_some() || spec.boost.is_some() {
         panic!("Not implemented")
     }
-    
-    match &spec.gt {
-        Some(val) => {
-            builder.filter(format!("{field_name} > {val}"));
-        },
-        None => ()
-    };
 
-    match &spec.gte {
-        Some(val) => {
-            builder.filter(format!("{field_name} >= {val}"));
-        },
-        None => ()
-    };
+    let (op, final_val) = spec.op.convert_to_sql();
+    builder.filter(format!("t.{} {} {}", field_name, op, final_val));
 
-    match &spec.lt {
-        Some(val) => {
-            builder.filter(format!("{field_name} < {val}"));
-        },
-        None => ()
-    };
-
-    match &spec.lte {
-        Some(val) => {
-            builder.filter(format!("{field_name} <= {val}"));
-        },
-        None => ()
-    };
-    
     Ok(())
 }
 

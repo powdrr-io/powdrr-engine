@@ -122,10 +122,10 @@ pub fn es_nodes(state: State) -> Pin<Box<HandlerFuture>> {
         let nodes_cfg = r#"{
   "nodes": {
     "M2BCY3K4RWCAIoe0ZNDj5w": {
-      "ip": "172.24.0.4",
+      "ip": "host.docker.internal",
       "version": "8.7.1",
       "http": {
-        "publish_address": "172.24.0.4:9200"
+        "publish_address": "host.docker.internal:9200"
       }
     }
   }
@@ -631,7 +631,9 @@ pub fn es_search_table(mut state: State) -> Pin<Box<HandlerFuture>> {
         let body_content = String::from_utf8(valid_body.to_vec()).unwrap();    
         let command = match elastic_search_parser::parse(Some(table_desc.name), &body_content, &query_extractor) {
             Ok(c) => c,
-            Err(_) => {
+            Err(e) => {
+                let error = format!("{}", e);
+                println!("Error: {}", error);
                 let res = create_response(&state, StatusCode::BAD_REQUEST, mime::TEXT_PLAIN, "Bad request".to_string());
                 return Ok((state, res))
             }
