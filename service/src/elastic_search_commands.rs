@@ -37,7 +37,7 @@ fn to_hit(index: &String, value: &Value) -> QueryResultHit {
         _version: version,
         _seq_no: seq_no,
         _score: Some(score),
-        _primary_term: None,
+        _primary_term: Some(1),
         found: None,
         _source: json!(value_map)
     }

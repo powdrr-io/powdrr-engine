@@ -1419,7 +1419,7 @@ mod tests {
                   "must": [
                     {
                       "term": {
-                        "space.name": "Default"
+                        "space._reserved": true
                       }
                     }
                   ]
@@ -1459,5 +1459,152 @@ mod tests {
                 panic!("Failed {}", e)
             }
         }        
+    }
+    
+    #[test]
+    fn test_es_date_comparison() {
+        let test_server = &*TEST_SERVER;
+
+        test_server.client().put(
+            "http://localhost/_test/v1/_testing_mode",
+            "",
+            mime::TEXT_PLAIN
+        ).perform().unwrap();
+
+        let body_create_index = r#"{
+            "settings" : {
+                "index": {
+                "number_of_shards" : 1,
+                "number_of_replicas" : 1
+            } } }"#;
+
+        let response_create_index = test_server.client().put(
+            "http://localhost/.kibana_8.7.1",
+            body_create_index,
+            mime::APPLICATION_JSON,
+        ).perform().unwrap();
+
+        assert_eq!(response_create_index.status(), 200);
+
+        let doc_val = r#"{
+  "space": {
+    "name": "Default",
+    "description": "This is your default space!",
+    "color": "\\#00bfb3",
+    "disabledFeatures": [],
+    "_reserved": true
+  },
+  "type": "space",
+  "references": [],
+  "migrationVersion": {
+    "space": "6.6.0"
+  },
+  "coreMigrationVersion": "8.7.1",
+  "updated_at": "2025-06-29T19:26:43.469Z",
+  "created_at": "2025-06-29T19:26:43.469Z"
+}"#;
+
+        let create_response = test_server.client().post(
+            "http://localhost/.kibana_8.7.1/_create/space%3Adefault",
+            doc_val,
+            mime::APPLICATION_JSON,
+        ).perform();
+
+        match create_response {
+            Ok(response) => {
+                assert_eq!(response.status(), 201);
+            },
+            Err(e) => {
+                panic!("Failed {}", e)
+            }
+        }
+
+        let process_work_response = test_server.client().put(
+            "http://localhost/_test/v1/_process_work",
+            "",
+            mime::TEXT_PLAIN,
+        ).perform().unwrap();
+
+        assert_eq!(process_work_response.status(), 200);
+
+        let query_val = r#"{
+  "size": 1000,
+  "seq_no_primary_term": true,
+  "from": 0,
+  "query": {
+    "bool": {
+      "filter": [
+        {
+          "bool": {
+            "should": [
+              {
+                "bool": {
+                  "must": [
+                    {
+                      "term": {
+                        "type": "space"
+                      },
+                      "range": {
+                        "updated_at": {
+                          "lte": "now"
+                        }
+                      }
+                    }
+                  ],
+                  "must_not": [
+                    {
+                      "exists": {
+                        "field": "namespace"
+                      }
+                    },
+                    {
+                      "exists": {
+                        "field": "namespaces"
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "minimum_should_match": 1
+          }
+        }
+      ]
+    }
+  },
+  "sort": [
+    {
+      "space.name.keyword": {
+        "unmapped_type": "keyword"
+      }
+    }
+  ]
+}"#;
+
+        let query_response = test_server.client().post(
+            "http://localhost/.kibana_8.7.1/_search",
+            query_val,
+            mime::APPLICATION_JSON,
+        ).perform();
+
+        match query_response {
+            Ok(response) => {
+                assert_eq!(response.status(), 200);
+                let body = response.read_body().unwrap();
+                let str_body = str::from_utf8(&body).unwrap();
+                let obj_body = serde_json::from_str::<QueryResults>(str_body).unwrap();
+                match obj_body.hits.total {
+                    QueryResultTotal::Complex(complex) => {
+                        assert_eq!(complex.value, 1);
+                    },
+                    _ => {
+                        panic!("Failed to get total")
+                    }
+                }
+            },
+            Err(e) => {
+                panic!("Failed {}", e)
+            }
+        }
     }
 }
