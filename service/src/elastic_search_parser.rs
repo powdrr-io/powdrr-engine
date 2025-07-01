@@ -2,12 +2,13 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use chrono::{SecondsFormat, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use crate::data_access::execute_sql;
 use crate::elastic_search_commands::{to_serde_value, SqlCommand, UpdateByQueryCommand};
 use crate::elastic_search_common::{Command, ParseError};
+use crate::elastic_search_datetime_parser;
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::elastic_search_responses::{AggregationResult, AverageAggregationResult, CardinalityAggregationResult, FilterAggregationResult, HistogramAggregationResult, RangeAggregationBucket, RangeAggregationResult, TermAggregationBucket, TermAggregationResult};
 
@@ -1235,11 +1236,8 @@ fn to_sql_exists(_builder: &mut SqlBuilder, _exists_obj: &Exists) -> Result<(), 
 
 fn convert_datetime_if_necessary(value: &str) -> String {
     if value.contains("now") {
-        if value == "now" {
-            Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
-        } else {
-            todo!("There is so much weird date math to do")
-        }
+        // TODO: need to handle errors
+        elastic_search_datetime_parser::evaluate(&value.to_string(), &Utc::now()).unwrap()
     } else {
         value.to_string()
     }
