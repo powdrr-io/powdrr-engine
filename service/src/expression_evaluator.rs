@@ -145,7 +145,7 @@ pub(crate) fn eval_template(expr_str: &str, source: &serde_json::Value, other_co
     env.add_global("__private_impl", Value::from_object(outputs_ctx));
     env.add_global("__types", Value::from_object(Types::new()));
     let mut full_context = other_context.clone();
-    // Note: Value::from_serialize() is a hack to get around the fact that serde_json::Value doesn't implement Serialize
+    // Note: Value::from_serialize() converts a serde_json::Value to a minijinja::Value
     full_context.insert("_source".to_string(), Value::from_serialize(source));
     env.add_global("ctx", full_context);
     env.add_global("params", params);    
