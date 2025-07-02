@@ -148,17 +148,7 @@ async fn ensure_loaded(invocation: &PrivateSqlInvocation, file_path: &String, pa
                 Err(e) => return Err(e),
                 Ok(nln) => nln,
             };
-
-            // TESTING CODE
-            let batches = execute_sql(&format!("select * from {new_local_name}"), &"".to_string(), &"".to_string()).await?;
-            for field in batches.get(0).unwrap().schema().fields.iter() {
-                let field_info = format!("{}", field);
-                println!("{}", field_info);
-            }
-            //let batches = execute_sql(&format!("select t.task.runAt from {new_local_name}"), &"".to_string(), &"".to_string()).await?;
-
-            // END
-
+            
             let extension_files = get_extension_files(invocation, file_path);
             for extension_file in extension_files {
                 let extension_local_name = format!("{}_{}", new_local_name, extension_file.suffix);

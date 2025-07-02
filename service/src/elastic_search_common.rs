@@ -73,91 +73,6 @@ impl CommandResponse for ElasticSearchResponse {
     }
 }
 
-/*
-pub(crate) struct SqlBuilder {
-    pub columns: Vec<String>,
-    pub table: Option<String>,
-    pub filters: Vec<String>,
-    pub order_by: Vec<String>,
-    pub group_by: Vec<String>,
-}
-
-
-impl SqlBuilder {
-    #[allow(dead_code)]
-    fn new() -> Self {
-        SqlBuilder {
-            columns: Vec::new(),
-            table: None,
-            filters: Vec::new(),
-            order_by: Vec::new(),
-            group_by: Vec::new(),
-        }
-    }
-
-    #[allow(dead_code)]
-    fn get_table(&self) -> &Option<String> {
-        &self.table
-    }
-
-    #[allow(dead_code)]
-    fn set_table(&mut self, val: String) -> &mut SqlBuilder {
-        self.table = Some(val);
-        self
-    }
-
-    #[allow(dead_code)]
-    fn add_column(&mut self, column: String) -> &mut SqlBuilder {
-        self.columns.push(column);
-        self
-    }
-
-    #[allow(dead_code)]
-    fn add_filter(&mut self, filter: String) -> &mut SqlBuilder {
-        self.filters.push(filter);
-        self
-    }
-
-    #[allow(dead_code)]
-    fn add_order_by(&mut self, order_by: String) -> &mut SqlBuilder {
-        self.order_by.push(order_by);
-        self
-    }
-
-    fn _format_filters(&self) -> String {
-        if self.filters.len() == 0 {
-            "".to_string()
-        } else {
-            format!(" WHERE {}", self.filters.join(" AND "))
-        }
-    }
-
-    fn _format_order_by(&self) -> String {
-        if self.order_by.len() == 0 {
-            "".to_string()
-        } else {
-            format!(" ORDER BY {}", self.order_by.join(", "))
-        }
-    }
-
-    #[allow(dead_code)]
-    pub (crate) fn build(&self) -> String {
-        let columns = self.columns.join(", ");
-        let filters = self._format_filters();
-        let order_by: String = self._format_order_by();
-        match &self.table {
-            Some(t) => format!("SELECT {columns} FROM {t}{filters}{order_by}"),
-            None => panic!()
-        }
-        
-    }
-
-    #[allow(dead_code)]
-    fn merge(_builders: Vec<&SqlBuilder>) -> SqlBuilder {
-        todo!()
-    }
-}
-*/
 
 pub type ResultGeneratorFuture = dyn Future<Output = Result<Arc<dyn CommandResponse>, String>> + Send;
 
@@ -272,7 +187,6 @@ pub async fn load_command_raw_result(_context: CommandContext, command: Arc<dyn 
     let target_snapshots = command._current_target_snapshots().await;
     let target_sql = command.generate_sql();
     let required_extensions = command.required_extensions();
-    //tracing::info!("Executing command, snapshot id = {}: {}", target_snapshots.get(0).unwrap().snapshot_id, target_sql);
     call_peers_and_load_results(&required_extensions, &target_snapshots, &target_sql).await
 }
 
