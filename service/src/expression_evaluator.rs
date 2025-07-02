@@ -131,13 +131,21 @@ impl Object for Instant {
 }
 
 
-pub(crate) fn eval_template(expr_str: &str, source: &serde_json::Value, other_context: HashMap<String, Value>, params: Value) -> (String, serde_json::Value) {
+pub(crate) struct EvalOutput {
+    pub result: String,
+    pub source: serde_json::Value,
+    pub other_context: HashMap<String, Value>,
+}
+
+
+pub(crate) fn eval_template(expr_str: &str, source: &serde_json::Value, other_context: HashMap<String, Value>, params: Value) -> EvalOutput {
     let mut env = Environment::new();
     env.add_template("foo", expr_str).unwrap();
     let (outputs_ctx, outputs_map) = Outputs::new();
     env.add_global("__private_impl", Value::from_object(outputs_ctx));
     env.add_global("__types", Value::from_object(Types::new()));
     let mut full_context = other_context.clone();
+    // Note: Value::from_serialize() converts a serde_json::Value to a minijinja::Value
     full_context.insert("_source".to_string(), Value::from_serialize(source));
     env.add_global("ctx", full_context);
     env.add_global("params", params);    
@@ -152,13 +160,16 @@ pub(crate) fn eval_template(expr_str: &str, source: &serde_json::Value, other_co
     };
     let output_map_final = outputs_map.lock().unwrap();
     let mut output_value = source.clone();
-    apply(&mut output_value, &output_map_final);
-    (template_output, output_value)
+    let other_context_output = apply(&other_context, &mut output_value, &output_map_final);
+    EvalOutput {
+        result: template_output,
+        source: output_value,
+        other_context: other_context_output
+    }
 }
 
 
-fn get_container<'a>(document: &'a mut serde_json::Value, path: &String) -> (&'a mut serde_json::Map<String, serde_json::Value>, String) {
-    let path_split: Vec<&str> = path.split(".").collect();
+fn get_container<'a>(document: &'a mut serde_json::Value, path_split: Vec<&str>) -> (&'a mut serde_json::Map<String, serde_json::Value>, String) {
     if path_split.len() <= 2 {
         panic!("Should always we ctx._source.<stuff>")
     }
@@ -194,11 +205,25 @@ fn convert(value: &Value) -> serde_json::Value {
     }
 }
 
-pub(crate) fn apply(document: &mut serde_json::Value, updates: &HashMap<String, Value>) -> () {
-    for pair in updates {
-        let (container, key) = get_container(document, pair.0);
-        container.insert(key, convert(&pair.1));
+pub(crate) fn apply(
+        other_context: &HashMap<String, Value>, 
+        document: &mut serde_json::Value,
+        updates: &HashMap<String, Value>
+) -> HashMap<String, Value> {
+    let mut retval = other_context.clone();
+    for (path, value) in updates {
+        let path_split: Vec<&str> = path.split(".").collect();
+        if path_split.len() == 2 {
+            retval.insert(path_split[1].to_string(), value.clone());
+        } else if path_split.len() > 2 {
+            assert_eq!(path_split.get(1).unwrap().to_string(), "_source".to_string());
+            let (container, key) = get_container(document, path_split);
+            container.insert(key, convert(&value));
+        } else {
+            panic!("Path length of 1 is not supported: {}", path)
+        };
     }
+    retval
 }
 
 
@@ -212,25 +237,6 @@ mod tests {
 
     #[test]
     fn test_assignment_script() {
-        /*
-        let test_val = r#"
-    if (params.claimableTaskTypes.contains(ctx._source.task.taskType)) {
-      if (ctx._source.task.schedule != null || ctx._source.task.attempts < params.taskMaxAttempts[ctx._source.task.taskType]) {
-        if(ctx._source.task.retryAt != null && ZonedDateTime.parse(ctx._source.task.retryAt).toInstant().toEpochMilli() < params.now) {
-          ctx._source.task.scheduledAt=ctx._source.task.retryAt;
-        } else {
-          ctx._source.task.scheduledAt=ctx._source.task.runAt;
-        }
-        ctx._source.task.status = "claiming"; ctx._source.task.ownerId=params.fieldUpdates.ownerId; ctx._source.task.retryAt=params.fieldUpdates.retryAt;
-      } else {
-        ctx._source.task.status = "failed";
-      }
-    } else if (params.unusedTaskTypes.contains(ctx._source.task.taskType)) {
-      ctx._source.task.status = "unrecognized";
-    } else {
-      ctx.op = "noop";
-    }"#;
-        */
         let test_val = r#"
         if (params.claimableTaskTypes.contains(ctx._source.task.taskType)) {
             ctx._source.task.scheduledAt=ctx._source.task.retryAt;
@@ -259,21 +265,20 @@ mod tests {
 
         let translated = translate(&test_val.to_string()).unwrap();
 
-        let (_, _) = eval_template(translated.as_str(), &source_val, HashMap::new(), Value::from_serialize(params_val));
+        let eval_result = eval_template(translated.as_str(), &source_val, HashMap::new(), Value::from_serialize(params_val));
 
-        let final_doc_str = serde_json::to_string(&source_val).unwrap();
-        println!("{}", final_doc_str);
-
-
+        let final_doc_str = serde_json::to_string(&eval_result.source).unwrap();
+        assert!(final_doc_str.contains("\"scheduledAt\":\"2025-05-25T00:00:00Z\""));
     }
-
+        
     #[test]
     fn test_translate_and_execute_datetime_method() {
         let test_val = "ZonedDateTime.parse(\"2025-05-31T12:34:56Z\").toInstant().toEpochMilli()";
         let translated = translate(&test_val.to_string()).unwrap();
 
-        let (retval, _) = eval_template(translated.as_str(), &serde_json::from_str("{}").unwrap(), HashMap::new(), Value::from_safe_string("nope".to_string()));
+        let eval_result = eval_template(translated.as_str(), &serde_json::from_str("{}").unwrap(), HashMap::new(), Value::from_safe_string("nope".to_string()));
 
-        println!("{}", retval)
+        // TODO: actually verify the result here       
+        println!("{}", eval_result.result)
     }    
 }

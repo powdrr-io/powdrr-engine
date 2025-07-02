@@ -658,10 +658,12 @@ fn parse_expression_booleans(parser_context: &mut ParserContext) -> Result<Box<d
     while parser_context.has_more() {
         match parser_context.peek().value.as_str() {
             "&&" => {
-                expression = Box::new(Comparison::new(expression, parser_context.pop().value,parse_expression_comparisons(parser_context)?));
+                parser_context.pop_validate("&&");
+                expression = Box::new(Comparison::new(expression, "and".to_string(),parse_expression_comparisons(parser_context)?));
             },
             "||" => {
-                expression = Box::new(Comparison::new(expression, parser_context.pop().value,parse_expression_comparisons(parser_context)?));
+                parser_context.pop_validate("||");
+                expression = Box::new(Comparison::new(expression, "or".to_string(),parse_expression_comparisons(parser_context)?));
             },
             _ => break,                           
         }

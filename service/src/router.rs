@@ -101,7 +101,6 @@ impl Middleware for RouterMiddleware {
                 headers.insert("X-elastic-product", "Elasticsearch".parse().unwrap());
                 headers.insert("X-Opaque-Id", "unknownId".parse().unwrap());
                 headers.remove("x-request-id");
-                headers.iter().for_each(|x|println!("response {} = {:?}", x.0, x.1));
                 future::ok((state, response))
             });
     
@@ -1606,5 +1605,347 @@ mod tests {
                 panic!("Failed {}", e)
             }
         }
+    }
+    
+    #[test]
+    fn test_es_update_by_query_kibana() {
+        let test_server = &*TEST_SERVER;
+
+
+        test_server.client().put(
+            "http://localhost/_test/v1/_testing_mode",
+            "",
+            mime::TEXT_PLAIN
+        ).perform().unwrap();
+
+        let body_create_index = r#"{
+            "settings" : {
+                "index": {
+                "number_of_shards" : 1,
+                "number_of_replicas" : 1
+            } } }"#;
+
+        let response_create_index = test_server.client().put(
+            "http://localhost/.kibana_task_manager_8.7.1",
+            body_create_index,
+            mime::APPLICATION_JSON,
+        ).perform().unwrap();
+
+        assert_eq!(response_create_index.status(), 200);
+        
+        let doc_val = r#"{
+  "task": {
+    "taskType": "actions_telemetry",
+    "state": "{}",
+    "params": "{}",
+    "traceparent": "00-81cce91b9d1dc316f8f32fc5e88a2f4a-0b838b32cd59e25d-00",
+    "enabled": true,
+    "attempts": 0,
+    "scheduledAt": "2025-07-01T22:07:24.901Z",
+    "startedAt": null,
+    "retryAt": null,
+    "runAt": "2025-07-01T22:07:24.901Z",
+    "status": "idle"
+  },
+  "type": "task",
+  "references": [],
+  "migrationVersion": {
+    "task": "8.5.0"
+  },
+  "coreMigrationVersion": "8.7.1",
+  "updated_at": "2025-07-01T22:07:24.901Z",
+  "created_at": "2025-07-01T22:07:24.901Z"
+}"#;
+
+        let create_response = test_server.client().post(
+            "http://localhost/.kibana_task_manager_8.7.1/_create/task%3Asecurity%3Atelemetry-timelines%3A1.0.0?refresh=false&require_alias=true",
+            doc_val,
+            mime::APPLICATION_JSON,
+        ).perform();
+
+        match create_response {
+            Ok(response) => {
+                assert_eq!(response.status(), 201);
+            },
+            Err(e) => {
+                panic!("Failed {}", e)
+            }
+        }
+
+        let process_work_response = test_server.client().put(
+            "http://localhost/_test/v1/_process_work",
+            "",
+            mime::TEXT_PLAIN,
+        ).perform().unwrap();
+
+        assert_eq!(process_work_response.status(), 200);        
+        
+        let query_val = r#"{
+  "query": {
+    "bool": {
+      "must": [
+        {
+          "term": {
+            "type": "task"
+          }
+        },
+        {
+          "bool": {
+            "must": [
+              {
+                "bool": {
+                  "must": [
+                    {
+                      "term": {
+                        "task.enabled": true
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "bool": {
+                  "should": [
+                    {
+                      "bool": {
+                        "must": [
+                          {
+                            "term": {
+                              "task.status": "idle"
+                            }
+                          },
+                          {
+                            "range": {
+                              "task.runAt": {
+                                "lte": "now"
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "bool": {
+                        "must": [
+                          {
+                            "bool": {
+                              "should": [
+                                {
+                                  "term": {
+                                    "task.status": "running"
+                                  }
+                                },
+                                {
+                                  "term": {
+                                    "task.status": "claiming"
+                                  }
+                                }
+                              ]
+                            }
+                          },
+                          {
+                            "range": {
+                              "task.retryAt": {
+                                "lte": "now"
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "filter": [
+              {
+                "bool": {
+                  "must_not": [
+                    {
+                      "bool": {
+                        "should": [
+                          {
+                            "term": {
+                              "task.status": "running"
+                            }
+                          },
+                          {
+                            "term": {
+                              "task.status": "claiming"
+                            }
+                          }
+                        ],
+                        "must": {
+                          "range": {
+                            "task.retryAt": {
+                              "gt": "now"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "script": {
+    "source": "\n    if (params.claimableTaskTypes.contains(ctx._source.task.taskType)) {\n      if (ctx._source.task.schedule != null || ctx._source.task.attempts < params.taskMaxAttempts[ctx._source.task.taskType]) {\n        if(ctx._source.task.retryAt != null && ZonedDateTime.parse(ctx._source.task.retryAt).toInstant().toEpochMilli() < params.now) {\n    ctx._source.task.scheduledAt=ctx._source.task.retryAt;\n  } else {\n    ctx._source.task.scheduledAt=ctx._source.task.runAt;\n  }\n    ctx._source.task.status = \"claiming\"; ctx._source.task.ownerId=params.fieldUpdates.ownerId; ctx._source.task.retryAt=params.fieldUpdates.retryAt;\n      } else {\n        ctx._source.task.status = \"failed\";\n      }\n    } else if (params.unusedTaskTypes.contains(ctx._source.task.taskType)) {\n      ctx._source.task.status = \"unrecognized\";\n    } else {\n      ctx.op = \"noop\";\n    }",
+    "lang": "painless",
+    "params": {
+      "now": 1751407079698,
+      "fieldUpdates": {
+        "ownerId": "kibana:9f414dbe-805e-4f6d-8b06-b84cc2d2b9a6",
+        "retryAt": "2025-07-01T21:58:29.646Z"
+      },
+      "claimableTaskTypes": [
+        "apm-source-map-migration-task"
+      ],
+      "skippedTaskTypes": [
+        "session_cleanup",
+        "actions_telemetry",
+        "cleanup_failed_action_executions",
+        "alerting_telemetry",
+        "alerts_invalidate_api_keys",
+        "alerting_health_check",
+        "report:execute",
+        "reports:monitor",
+        "alerting:transform_health",
+        "actions:.email",
+        "actions:.index",
+        "actions:.pagerduty",
+        "actions:.swimlane",
+        "actions:.server-log",
+        "actions:.slack",
+        "actions:.webhook",
+        "actions:.cases-webhook",
+        "actions:.xmatters",
+        "actions:.servicenow",
+        "actions:.servicenow-sir",
+        "actions:.servicenow-itom",
+        "actions:.jira",
+        "actions:.resilient",
+        "actions:.teams",
+        "actions:.torq",
+        "actions:.opsgenie",
+        "actions:.tines",
+        "alerting:.index-threshold",
+        "alerting:.geo-containment",
+        "alerting:.es-query",
+        "dashboard_telemetry",
+        "cases-telemetry-task",
+        "Fleet-Usage-Sender",
+        "Fleet-Usage-Logger",
+        "fleet:reassign_action:retry",
+        "fleet:unenroll_action:retry",
+        "fleet:upgrade_action:retry",
+        "fleet:update_agent_tags:retry",
+        "fleet:request_diagnostics:retry",
+        "fleet:check-deleted-files-task",
+        "osquery:telemetry-packs",
+        "osquery:telemetry-saved-queries",
+        "osquery:telemetry-configs",
+        "cloud_security_posture-stats_task",
+        "ML:saved-objects-sync",
+        "alerting:xpack.ml.anomaly_detection_alert",
+        "alerting:xpack.ml.anomaly_detection_jobs_health",
+        "UPTIME:SyntheticsService:Sync-Saved-Monitor-Objects",
+        "alerting:xpack.uptime.alerts.monitorStatus",
+        "alerting:xpack.uptime.alerts.tlsCertificate",
+        "alerting:xpack.uptime.alerts.durationAnomaly",
+        "alerting:xpack.uptime.alerts.tls",
+        "alerting:xpack.synthetics.alerts.monitorStatus",
+        "alerting:siem.eqlRule",
+        "alerting:siem.savedQueryRule",
+        "alerting:siem.indicatorRule",
+        "alerting:siem.mlRule",
+        "alerting:siem.queryRule",
+        "alerting:siem.thresholdRule",
+        "alerting:siem.newTermsRule",
+        "alerting:siem.notifications",
+        "endpoint:user-artifact-packager",
+        "security:endpoint-diagnostics",
+        "security:endpoint-meta-telemetry",
+        "security:telemetry-lists",
+        "security:telemetry-detection-rules",
+        "security:telemetry-prebuilt-rule-alerts",
+        "security:telemetry-timelines",
+        "security:telemetry-configuration",
+        "security:telemetry-filterlist-artifact",
+        "endpoint:metadata-check-transforms-task",
+        "alerting:metrics.alert.anomaly",
+        "alerting:logs.alert.document.count",
+        "alerting:metrics.alert.inventory.threshold",
+        "alerting:metrics.alert.threshold",
+        "alerting:monitoring_alert_cluster_health",
+        "alerting:monitoring_alert_license_expiration",
+        "alerting:monitoring_alert_cpu_usage",
+        "alerting:monitoring_alert_missing_monitoring_data",
+        "alerting:monitoring_alert_disk_usage",
+        "alerting:monitoring_alert_thread_pool_search_rejections",
+        "alerting:monitoring_alert_thread_pool_write_rejections",
+        "alerting:monitoring_alert_jvm_memory_usage",
+        "alerting:monitoring_alert_nodes_changed",
+        "alerting:monitoring_alert_logstash_version_mismatch",
+        "alerting:monitoring_alert_kibana_version_mismatch",
+        "alerting:monitoring_alert_elasticsearch_version_mismatch",
+        "alerting:monitoring_ccr_read_exceptions",
+        "alerting:monitoring_shard_size",
+        "apm-telemetry-task",
+        "alerting:apm.transaction_duration",
+        "alerting:apm.anomaly",
+        "alerting:apm.error_rate",
+        "alerting:apm.transaction_error_rate"
+      ],
+      "unusedTaskTypes": [
+        "sampleTaskRemovedType",
+        "alerting:siem.signals",
+        "search_sessions_monitor",
+        "search_sessions_cleanup",
+        "search_sessions_expire"
+      ],
+      "taskMaxAttempts": {
+        "apm-source-map-migration-task": 5
+      }
+    }
+  },
+  "sort": [
+    {
+      "_script": {
+        "type": "number",
+        "order": "asc",
+        "script": {
+          "lang": "painless",
+          "source": "\nif (doc['task.retryAt'].size()!=0) {\n  return doc['task.retryAt'].value.toInstant().toEpochMilli();\n}\nif (doc['task.runAt'].size()!=0) {\n  return doc['task.runAt'].value.toInstant().toEpochMilli();\n}\n    "
+        }
+      }
+    }
+  ],
+  "max_docs": 1,
+  "conflicts": "proceed"
+}"#;
+
+        let update_response_result = test_server.client().post(
+            "http://localhost/.kibana_task_manager_8.7.1/_update_by_query",
+            query_val,
+            mime::APPLICATION_JSON,
+        ).perform();
+
+        match update_response_result {
+            Ok(response) => {
+                //assert_eq!(response.status(), 200);
+                let body = response.read_body().unwrap();
+                let str_body = str::from_utf8(&body).unwrap();
+                print!("{}", str_body);
+            },
+            Err(e) => {
+                panic!("Failed {}", e)
+            }
+        }
+        
     }
 }

@@ -74,89 +74,6 @@ impl CommandResponse for ElasticSearchResponse {
 }
 
 
-pub(crate) struct SqlBuilder {
-    pub columns: Vec<String>,
-    pub table: Option<String>,
-    pub filters: Vec<String>,
-    pub order_by: Vec<String>,
-}
-
-
-impl SqlBuilder {
-    #[allow(dead_code)]
-    fn new() -> Self {
-        SqlBuilder {
-            columns: Vec::new(),
-            table: None,
-            filters: Vec::new(),
-            order_by: Vec::new(),
-        }
-    }
-
-    #[allow(dead_code)]
-    fn get_table(&self) -> &Option<String> {
-        &self.table
-    }
-
-    #[allow(dead_code)]
-    fn set_table(&mut self, val: String) -> &mut SqlBuilder {
-        self.table = Some(val);
-        self
-    }
-
-    #[allow(dead_code)]
-    fn add_column(&mut self, column: String) -> &mut SqlBuilder {
-        self.columns.push(column);
-        self
-    }
-
-    #[allow(dead_code)]
-    fn add_filter(&mut self, filter: String) -> &mut SqlBuilder {
-        self.filters.push(filter);
-        self
-    }
-
-    #[allow(dead_code)]
-    fn add_order_by(&mut self, order_by: String) -> &mut SqlBuilder {
-        self.order_by.push(order_by);
-        self
-    }
-
-    fn _format_filters(&self) -> String {
-        if self.filters.len() == 0 {
-            "".to_string()
-        } else {
-            format!(" WHERE {}", self.filters.join(" AND "))
-        }
-    }
-
-    fn _format_order_by(&self) -> String {
-        if self.order_by.len() == 0 {
-            "".to_string()
-        } else {
-            format!(" ORDER BY {}", self.order_by.join(", "))
-        }
-    }
-
-    #[allow(dead_code)]
-    pub (crate) fn build(&self) -> String {
-        let columns = self.columns.join(", ");
-        let filters = self._format_filters();
-        let order_by: String = self._format_order_by();
-        match &self.table {
-            Some(t) => format!("SELECT {columns} FROM {t}{filters}{order_by}"),
-            None => panic!()
-        }
-        
-    }
-
-    #[allow(dead_code)]
-    fn merge(_builders: Vec<&SqlBuilder>) -> SqlBuilder {
-        todo!()
-    }
-}
-
-
 pub type ResultGeneratorFuture = dyn Future<Output = Result<Arc<dyn CommandResponse>, String>> + Send;
 
 #[async_trait]
@@ -286,18 +203,3 @@ pub async fn execute_command(_context: CommandContext, command: Arc<dyn Command>
     response
 }
 
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sql_builder_test1() {
-        let mut sql_builder = SqlBuilder::new();
-        sql_builder.set_table("foo_bar".to_string());
-        sql_builder.add_column("_id".to_string()).add_column("*".to_string());
-        sql_builder.add_filter("baz > 0".to_string()).add_filter("quux = 'what up'".to_string());
-        sql_builder.add_order_by("dudical".to_string()).add_order_by("my_man".to_string());
-        assert_eq!(sql_builder.build(), "SELECT _id, * FROM foo_bar WHERE baz > 0 AND quux = 'what up' ORDER BY dudical, my_man");
-    }
-}

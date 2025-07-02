@@ -788,7 +788,7 @@ impl TestApiServiceClient {
             };
 
             let total_records: u32 = new_speedboat_metadata.sizes.iter().sum();
-            tracing::info!("Speedboat commit has {} files with {} records", new_speedboat_metadata.files.len(), total_records);
+            tracing::info!("Speedboat commit {} has {} files with {} records", new_checkpoint_id, new_speedboat_metadata.files.len(), total_records);
             for file in &new_speedboat_metadata.files {
                 tracing::info!("Speedboat file {}", file)
             }
@@ -1315,12 +1315,12 @@ impl ApiServiceClientHandle {
         recv.await
     }    
 
-    pub async fn get_latest_checkpoint(&self, table_name: &String, extension: Option<&String>) -> Result<Option<String>, RecvError> {
+    pub async fn get_latest_checkpoint(&self, table_name: &String, extension: Option<String>) -> Result<Option<String>, RecvError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::GetLatestCheckpoint { 
             respond_to: send,
             table_name: table_name.clone(),
-            extensions: extension.cloned(),
+            extensions: extension.clone(),
         };
 
         let _ = self.sender.send(msg).await;

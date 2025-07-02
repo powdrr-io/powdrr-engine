@@ -96,9 +96,32 @@ impl WriteBuffer {
 
 
 pub(crate) struct CreateDoc {
-    raw: String,
-    #[allow(dead_code)]
     parsed: Value,
+}
+
+impl CreateDoc {
+    fn create_normalized_value(value: &Value) -> Value {
+        match value {
+            Value::Object(obj) => {
+                let mut new_map = serde_json::Map::new();
+                for (map_key, map_value) in obj.iter() {
+                    new_map.insert(map_key.to_lowercase(), CreateDoc::create_normalized_value(map_value));
+                }
+                Value::from(new_map)
+            },
+            _ => value.clone()
+        }
+    }
+    fn normalized_value(&self) -> Value {
+        CreateDoc::create_normalized_value(&self.parsed)
+    }
+
+    fn normalized_raw(&self) -> String {
+        match serde_json::to_string(&self.normalized_value()) {
+            Ok(s) => s.replace("\n", ""),
+            Err(_) => panic!("What happen?")
+        }
+    }
 }
 
 
@@ -415,7 +438,7 @@ pub(crate) fn ingest_create(
         Some(id) => id.clone(),
         None => UuidB64::new().to_string()
     };
-    let doc_with_id = insert_into_doc(&id, version, seq_no, &doc.raw);
+    let doc_with_id = insert_into_doc(&id, version, seq_no, &doc.normalized_raw());
     buffer.lines.push(doc_with_id);
     OperationResult{
         _index: table_description.name.clone(),
@@ -487,11 +510,6 @@ pub(crate) async fn commit(buffer: &WriteBuffer, index: &String) -> Result<(), I
 }
 
 pub(crate) async fn commit_general(buffer: &WriteBuffer, index: &String, commit_type: &String) -> Result<(), IngestError> {
-    let _new_val = match distributed_cache::insert_operator(index, 1) {
-        Ok(v) => v,
-        Err(_) => panic!("oh no")
-    };
-
     let new_id = format!("tests/data/ingest/{}-{}-{}.json", commit_type, index, IdInstance::next_id().to_string());
     let write_to_file_result = buffer.write_to_file(&new_id);
     tracing::info!("Ingest: table {} wrote {} records", index, buffer.len());
@@ -520,8 +538,8 @@ pub(crate) async fn commit_general(buffer: &WriteBuffer, index: &String, commit_
 }
 
 
-async fn get_existing_doc_count(index: &String, doc_id: &String) -> Result<usize, IngestError> {
-    let df_count = match load_command_raw_result(CommandContext{}, Arc::new(LookupById{ table: index.clone(), ids: vec!(doc_id.clone()) })).await {
+async fn get_existing_doc_count(index: &String, doc_ids: &Vec<String>) -> Result<usize, IngestError> {
+    let df_count = match load_command_raw_result(CommandContext{}, Arc::new(LookupById{ table: index.clone(), ids: doc_ids.clone() })).await {
         Ok(lcrr) => match lcrr {
             Some(raw_table) => {
                 let df = match data_access::execute_sql(&format!("SELECT * from {raw_table}")).await {
@@ -549,7 +567,7 @@ async fn create_single_worker(index: &String, doc_id: &String, payload: &String)
     let doc: Result<Value, serde_json::Error> = serde_json::from_str(payload);
     match doc {
         Ok(valid_doc) => {
-            let df_count = get_existing_doc_count(index, doc_id).await?;
+            let df_count = get_existing_doc_count(index, &vec!(doc_id.to_string())).await?;
             
             if df_count != 0 {
                 // TODO: get version from existing doc
@@ -575,7 +593,7 @@ async fn create_single_worker(index: &String, doc_id: &String, payload: &String)
             let result = ingest_create(
                 &table_description,
                 &Create{ create: IndexOrCreateBody { index: None, id: Some(doc_id.clone()), list_executed_pipelines: false, require_alias: false, dynamic_templates: None }},
-                &CreateDoc{ raw: payload.replace("\n", ""), parsed: valid_doc },
+                &CreateDoc{ parsed: valid_doc },
                 1,
                 seq_no,
                 None,
@@ -613,7 +631,7 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
         }
     };
 
-    let df_count = get_existing_doc_count(index, doc_id).await?;
+    let df_count = get_existing_doc_count(index, &vec!(doc_id.to_string())).await?;
 
     if df_count != 0 {
         todo!("Need to implement actual update")
@@ -630,11 +648,10 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
 
         let mut buffer = WriteBuffer::new();
         let upsert_doc = update_request.upsert.unwrap();
-        let raw_doc = serde_json::to_string(&upsert_doc).unwrap().replace("\n", "");
         let mut result = ingest_create(
             &table_description,
             &Create { create: IndexOrCreateBody { index: None, id: Some(doc_id.clone()), list_executed_pipelines: false, require_alias: false, dynamic_templates: None } },
-            &CreateDoc { raw: raw_doc, parsed: upsert_doc.clone() },
+            &CreateDoc { parsed: upsert_doc.clone() },
             1,
             seq_no,
             None,
@@ -665,7 +682,7 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
 
 
 
-fn create_delete(doc_id: &String, seq_no: i64) -> String {
+pub(crate) fn create_delete(doc_id: &String, seq_no: u64) -> String {
     format!("{{\"_id\": \"{}\", \"_seq_no\": {}}}", doc_id, seq_no)
 }
 
@@ -675,7 +692,7 @@ pub(crate) async fn delete(index: &String, doc_id: &String) -> Result<ElasticSea
         None => return Err(IngestError{ message: "Index does not exist".to_string() })
     };
 
-    let df_count = get_existing_doc_count(index, doc_id).await?;
+    let df_count = get_existing_doc_count(index, &vec!(doc_id.clone())).await?;
     if df_count == 0 {
         let result = OperationResult {
             _index: index.clone(),
@@ -756,7 +773,7 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
                                 let operation_result = ingest_create(
                                     &table_description,
                                     &c,
-                                    &CreateDoc{ raw: doc_str.to_string(), parsed: valid_doc },
+                                    &CreateDoc{ parsed: valid_doc },
                                     1,
                                     seq_no,
                                     Some(201),

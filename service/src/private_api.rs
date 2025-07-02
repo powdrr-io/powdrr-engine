@@ -148,7 +148,7 @@ async fn ensure_loaded(invocation: &PrivateSqlInvocation, file_path: &String, pa
                 Err(e) => return Err(e),
                 Ok(nln) => nln,
             };
-
+            
             let extension_files = get_extension_files(invocation, file_path);
             for extension_file in extension_files {
                 let extension_local_name = format!("{}_{}", new_local_name, extension_file.suffix);
