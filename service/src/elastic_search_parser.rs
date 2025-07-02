@@ -22,13 +22,12 @@ pub(crate) struct TermAggProcessor {
 impl TermAggProcessor {
     fn create_aggregation_bucket(value: &Value) -> TermAggregationBucket {
         let value_map = value.as_object().unwrap();
-        let mut value_map_iter = value_map.iter();
-        let first_pair = value_map_iter.next().unwrap();
-        let second_pair = value_map_iter.next().unwrap();
+        let key = value_map.get("field_name").unwrap().as_str().unwrap();
+        let doc_count = value_map.get("cnt").unwrap().as_u64().unwrap();
 
         TermAggregationBucket {
-            key: second_pair.1.to_string(),
-            doc_count: first_pair.1.as_u64().unwrap()
+            key: key.to_string(),
+            doc_count: doc_count
         }
     }
 
@@ -745,19 +744,19 @@ pub(crate) struct ScriptBlock {
 }
 
 #[derive(Clone)]
-struct SqlBuilder {
-    fields: Vec<String>,
-    joins: Vec<String>,
+pub(crate) struct SqlBuilder {
+    pub(crate) fields: Vec<String>,
+    pub(crate) joins: Vec<String>,
     filter_stack: RefCell<Vec<Vec<FilterExpression>>>,
-    limit: Option<u64>,
-    calculate_score: bool,
-    order_by: Vec<String>,
-    group_by: Vec<String>,
+    pub(crate) limit: Option<u64>,
+    pub(crate) calculate_score: bool,
+    pub(crate) order_by: Vec<String>,
+    pub(crate) group_by: Vec<String>,
     top_level: bool,
 }
 
 impl SqlBuilder {
-    fn for_query() -> Self {
+    pub(crate) fn for_query() -> Self {
         SqlBuilder { 
             fields: vec!(), 
             joins: vec!(), 
@@ -770,7 +769,7 @@ impl SqlBuilder {
         }
     }
 
-    fn for_agg() -> Self {
+    pub(crate) fn for_agg() -> Self {
         SqlBuilder {
             fields: vec!(),
             joins: vec!(),
@@ -783,20 +782,20 @@ impl SqlBuilder {
         }
     }
 
-    fn push_filter_context(&mut self) -> &mut Self {
+    pub(crate) fn push_filter_context(&mut self) -> &mut Self {
         self.filter_stack.get_mut().push(vec!());
         self
     }
 
-    fn pop_filter_context(&mut self, is_and: bool) -> &mut Self {
+    pub(crate) fn pop_filter_context(&mut self, is_and: bool) -> &mut Self {
         self.pop_and_maybe_not_filter_context(is_and, false)
     }
 
-    fn pop_and_not_filter_context(&mut self, is_and: bool) -> &mut Self {
+    pub(crate) fn pop_and_not_filter_context(&mut self, is_and: bool) -> &mut Self {
         self.pop_and_maybe_not_filter_context(is_and, true)
     }
 
-    fn pop_and_maybe_not_filter_context(&mut self, is_and: bool, is_not: bool) -> &mut Self {
+    pub(crate) fn pop_and_maybe_not_filter_context(&mut self, is_and: bool, is_not: bool) -> &mut Self {
         let local_filter_stack = self.filter_stack.get_mut();
         assert!(local_filter_stack.len() > 0);
 
@@ -816,7 +815,7 @@ impl SqlBuilder {
         self
     }
 
-    fn filter(&mut self, filter: String) -> &mut Self {
+    pub(crate) fn filter(&mut self, filter: String) -> &mut Self {
         let local_filter_stack = self.filter_stack.get_mut();
         local_filter_stack.last_mut().unwrap().push(FilterExpression::Expr(filter));
         self
@@ -919,11 +918,11 @@ impl SqlBuilder {
         }
     }
 
-    fn score(&self) -> bool {
+    pub(crate) fn score(&self) -> bool {
         self.calculate_score
     }
 
-    fn build(&self) -> String {
+    pub(crate) fn build(&self) -> String {
         let filter_str = self._filters();
         format!(
             "select {} from {} {}{}{}{}{}",
@@ -1235,12 +1234,14 @@ fn to_sql_exists(_builder: &mut SqlBuilder, _exists_obj: &Exists) -> Result<(), 
 }
 
 fn convert_datetime_if_necessary(value: &str) -> String {
-    if value.contains("now") {
+    let converted_value = if value.contains("now") {
         // TODO: need to handle errors
         elastic_search_datetime_parser::evaluate(&value.to_string(), &Utc::now()).unwrap()
     } else {
         value.to_string()
-    }
+    };
+
+    format!("'{}'", converted_value)
 }
 
 fn to_sql_range(builder: &mut SqlBuilder, range_obj: &Range) -> Result<(), ParseError> {
@@ -1255,7 +1256,7 @@ fn to_sql_range(builder: &mut SqlBuilder, range_obj: &Range) -> Result<(), Parse
     }
 
     let (op, final_val) = spec.op.convert_to_sql();
-    builder.filter(format!("t.{} {} {}", field_name, op, final_val));
+    builder.filter(format!("(t.{field_name} {op} {final_val} OR t.{field_name} is null)"));
 
     Ok(())
 }

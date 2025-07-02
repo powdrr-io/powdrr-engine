@@ -197,18 +197,18 @@ pub(crate) struct UpdateByQueryResultsRetries {
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct UpdateByQueryResults {
-    pub took: i64,
+    pub took: u64,
     pub timed_out: bool,
-    pub total: i64,
-    pub updated: i64,
-    pub deleted: i64,
-    pub batches: i64,
-    pub version_conflicts: i64,
-    pub noops: i64,
+    pub total: u64,
+    pub updated: u64,
+    pub deleted: u64,
+    pub batches: u64,
+    pub version_conflicts: u64,
+    pub noops: u64,
     pub retries: UpdateByQueryResultsRetries,
-    pub throttled_millis: i64,
+    pub throttled_millis: u64,
     pub requests_per_second: i64,
-    pub throttled_until_millis: i64,
+    pub throttled_until_millis: u64,
     pub failures: Vec<String>,
 }
 

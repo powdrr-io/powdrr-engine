@@ -73,12 +73,13 @@ impl CommandResponse for ElasticSearchResponse {
     }
 }
 
-
+/*
 pub(crate) struct SqlBuilder {
     pub columns: Vec<String>,
     pub table: Option<String>,
     pub filters: Vec<String>,
     pub order_by: Vec<String>,
+    pub group_by: Vec<String>,
 }
 
 
@@ -90,6 +91,7 @@ impl SqlBuilder {
             table: None,
             filters: Vec::new(),
             order_by: Vec::new(),
+            group_by: Vec::new(),
         }
     }
 
@@ -155,7 +157,7 @@ impl SqlBuilder {
         todo!()
     }
 }
-
+*/
 
 pub type ResultGeneratorFuture = dyn Future<Output = Result<Arc<dyn CommandResponse>, String>> + Send;
 
@@ -270,6 +272,7 @@ pub async fn load_command_raw_result(_context: CommandContext, command: Arc<dyn 
     let target_snapshots = command._current_target_snapshots().await;
     let target_sql = command.generate_sql();
     let required_extensions = command.required_extensions();
+    //tracing::info!("Executing command, snapshot id = {}: {}", target_snapshots.get(0).unwrap().snapshot_id, target_sql);
     call_peers_and_load_results(&required_extensions, &target_snapshots, &target_sql).await
 }
 
@@ -286,18 +289,3 @@ pub async fn execute_command(_context: CommandContext, command: Arc<dyn Command>
     response
 }
 
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sql_builder_test1() {
-        let mut sql_builder = SqlBuilder::new();
-        sql_builder.set_table("foo_bar".to_string());
-        sql_builder.add_column("_id".to_string()).add_column("*".to_string());
-        sql_builder.add_filter("baz > 0".to_string()).add_filter("quux = 'what up'".to_string());
-        sql_builder.add_order_by("dudical".to_string()).add_order_by("my_man".to_string());
-        assert_eq!(sql_builder.build(), "SELECT _id, * FROM foo_bar WHERE baz > 0 AND quux = 'what up' ORDER BY dudical, my_man");
-    }
-}

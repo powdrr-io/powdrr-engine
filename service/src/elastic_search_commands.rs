@@ -8,10 +8,10 @@ use gotham::mime;
 use http::StatusCode;
 use serde_json::{json, Value};
 
-use crate::{data_access::{self, execute_sql}, distributed_cache, elastic_search_common::{Command, CommandResponse, ParseError, ResultGeneratorFuture, SqlBuilder}, elastic_search_ingest::{self, WriteBuffer}, elastic_search_parser::ScriptBlock, elastic_search_responses::{QueryResultHit, QueryResults}, expression_evaluator, painless_parser, state_hosted_service::API_SERVICE_CLIENT, state_peers::SnapshotDescriptor};
+use crate::{data_access::{self, execute_sql}, distributed_cache, elastic_search_common::{Command, CommandResponse, ResultGeneratorFuture}, elastic_search_ingest::{self, WriteBuffer}, elastic_search_parser::ScriptBlock, elastic_search_responses::{QueryResultHit, QueryResults}, expression_evaluator, painless_parser, state_hosted_service::API_SERVICE_CLIENT, state_peers::SnapshotDescriptor};
 use crate::elastic_search_common::ElasticSearchResponse;
 use crate::elastic_search_endpoints::QueryStringSearch;
-use crate::elastic_search_parser::{process_aggregations, Aggregation};
+use crate::elastic_search_parser::{process_aggregations, Aggregation, SqlBuilder};
 use crate::elastic_search_responses::{AggregationResult, QueryResultsNotFound, UpdateByQueryResults, UpdateByQueryResultsRetries, UpdateByQuerySuccess};
 
 async fn empty_result(aggs: Option<Vec<Aggregation>>, total_hits_complex: bool) -> Arc<dyn CommandResponse> {
@@ -72,8 +72,8 @@ async fn to_hits(index: &String, data_frame: &DataFrame) -> Vec<QueryResultHit> 
     hits
 }
 
+/*
 #[allow(dead_code)]
-
 pub(crate) struct Match {
     pub table: String,
     pub field: String,
@@ -173,7 +173,7 @@ impl Command for Match {
     }
 
     async fn _current_target_snapshots(&self) -> Vec<SnapshotDescriptor> {
-        let checkpoint_id = API_SERVICE_CLIENT.get_latest_checkpoint(&self.table, Some(&"es".to_string())).await.unwrap();
+        let checkpoint_id = API_SERVICE_CLIENT.get_latest_checkpoint(&self.table, Some("es".to_string())).await.unwrap();
         match checkpoint_id {
             Some(c) => vec!(SnapshotDescriptor{ table_name: self.table.clone(), snapshot_id: c }),
             None => vec!(),
@@ -214,7 +214,7 @@ impl MatchBuilder {
         })
     }
 }
-
+*/
 
 pub(crate) struct LookupById {
     pub table: String,
@@ -238,16 +238,6 @@ impl LookupById {
 
 #[async_trait]
 impl Command for LookupById {
-    fn generate_sql(&self) -> String {
-        let id_list = self.ids.iter().map(|id|format!("'{}'", id)).collect::<Vec<String>>().join(",");
-        SqlBuilder {
-            columns: vec!("*".to_string()),
-            table: Some("{target_table} t left join {deletes_table} dt on t._id = dt._id".to_string()),
-            filters: vec!(format!("t._id in ({id_list})"), "(dt._seq_no is null or t._seq_no > dt._seq_no)".to_string()),
-            order_by: vec!(),
-        }.build()
-    }   
-
     fn get_name(&self) -> String {
         "LookupById".to_string()
     }
@@ -283,6 +273,15 @@ impl Command for LookupById {
             };
             Ok(result)
         }.boxed()
+    }
+
+    fn generate_sql(&self) -> String {
+        let id_list = self.ids.iter().map(|id|format!("'{}'", id)).collect::<Vec<String>>().join(",");
+        let mut sql_builder = SqlBuilder::for_query();
+        sql_builder.fields.push("*".to_string());
+        sql_builder.fields.push("count(1) as cnt".to_string());
+        sql_builder.filter(format!("t._id IN ({id_list})"));
+        sql_builder.build()
     }
 
     fn generate_filters(&self) -> Vec<&crate::state_common::FileFilter> {
@@ -436,7 +435,11 @@ impl Command for SqlCommand {
     }    
 
     async fn _current_target_snapshots(&self) -> Vec<SnapshotDescriptor> {
-        let checkpoint_id = API_SERVICE_CLIENT.get_latest_checkpoint(&self.table, Some(&"es".to_string())).await.unwrap();
+        let extension = match self.calculate_score {
+            true => Some("es".to_string()),
+            false => None
+        };
+        let checkpoint_id = API_SERVICE_CLIENT.get_latest_checkpoint(&self.table, extension).await.unwrap();
         match checkpoint_id {
             Some(c) => vec!(SnapshotDescriptor{ table_name: self.table.clone(), snapshot_id: c }),
             None => vec!(),
@@ -449,41 +452,144 @@ pub(crate) struct UpdateByQueryCommand {
     pub script_block: ScriptBlock,
 }
 
+
+enum EvalResult {
+    Update(Value),
+    Noop,
+    #[allow(dead_code)]
+    Delete((String, u64)),
+}
+
+struct UpdateByQueryResult {
+    table: String,
+    update_buffer: WriteBuffer,
+    #[allow(dead_code)]
+    delete_buffer: WriteBuffer,
+    update_count: u64,
+    delete_count: u64,
+    noop_count: u64,
+}
+
+impl UpdateByQueryResult {
+    fn total_count(&self) -> u64 {
+        self.update_count + self.delete_count + self.noop_count
+    }
+
+    async fn commit(&self) -> Result<Arc<dyn CommandResponse>, String> {
+        // TODO: ideally this would write all the files once and do a single commit to the service.
+        match elastic_search_ingest::commit_general(&self.update_buffer, &self.table, &"commit".to_string()).await {
+            Ok(_) => (),
+            Err(_) => panic!("nope"),
+        };
+        match elastic_search_ingest::commit_general(&self.update_buffer, &self.table, &"delete".to_string()).await {
+            Ok(_) => (),
+            Err(_) => panic!("nope"),
+        };
+        Ok(UpdateByQueryCommand::success(
+            self.total_count(),
+            self.update_count,
+            self.delete_count,
+            self.noop_count,
+            1
+        ))
+    }
+}
+
+
 impl UpdateByQueryCommand {
-    fn evaluate(script: &ScriptBlock, value: &Value) -> Value {
+    fn evaluate(script: &ScriptBlock, value: &Value) -> EvalResult {
         // TODO: run script
         let translated_script = match painless_parser::translate(&script.source) {
             Ok(t) => t,
             Err(_) => panic!("Need to make an error path")
         };
-        let (_, mut output_val) = expression_evaluator::eval_template(&translated_script, value, HashMap::new(), minijinja::Value::from_serialize(script.params.clone()));
-        let value_map = output_val.as_object_mut().unwrap();
-        let version = value_map.get("_version").unwrap().as_number().unwrap();
-        value_map.insert("_version".to_string(), Value::from(version.as_u64().unwrap() + 1));
-        output_val
-    }
-}
+        let mut output = expression_evaluator::eval_template(
+            &translated_script,
+            value,
+            HashMap::from([
+                ("op".to_string(), minijinja::Value::from("update"))
+            ]),
+            minijinja::Value::from_serialize(script.params.clone())
+        );
 
-impl UpdateByQueryCommand {
+        let op = output.other_context.get("op").map_or_else(|| "noop", |v|v.as_str().unwrap());
+
+        match op {
+            "update" => {
+                let value_map = output.source.as_object_mut().unwrap();
+                let version = value_map.get("_version").unwrap().as_number().unwrap();
+                value_map.insert("_version".to_string(), Value::from(version.as_u64().unwrap() + 1));
+                EvalResult::Update(output.source)
+            },
+            "noop" => {
+                EvalResult::Noop
+            },
+            "delete" => {
+                todo!("Need to implement delete")
+            },
+            _ => {
+                panic!("Unknown operation")
+            }
+        }
+    }
+
     fn empty_result() -> Arc<dyn CommandResponse> {
+        UpdateByQueryCommand::success(0, 0, 0, 0, 0)
+    }
+
+    fn success(total: u64, updated: u64, deleted: u64, noops: u64, batches: u64) -> Arc<dyn CommandResponse> {
         Arc::new(UpdateByQuerySuccess{ result: UpdateByQueryResults{
             took: 0,
             timed_out: false,
-            total: 0,
-            updated: 0,
-            deleted: 0,
-            batches: 0,
+            total: total,
+            updated: updated,
+            deleted: deleted,
+            batches: batches,
             version_conflicts: 0,
-            noops: 0,
+            noops: noops,
             retries: UpdateByQueryResultsRetries {
                 bulk: 0,
                 search: 0,
             },
             throttled_millis: 0,
-            requests_per_second: 0,
+            requests_per_second: -1,
             throttled_until_millis: 0,
             failures: vec![],
         }})
+    }
+
+    async fn create_final_result(table: &String, final_values: Vec<EvalResult>) -> UpdateByQueryResult {
+        let mut update_buffer = WriteBuffer::new();
+        let mut delete_buffer = WriteBuffer::new();
+        
+        let mut update_count: u64 = 0;
+        let mut delete_count: u64 = 0;
+        let mut noop_count: u64 = 0;
+        
+        for result in final_values {
+            match result {
+                EvalResult::Noop => {
+                    noop_count += 1;
+                },
+                EvalResult::Delete((doc_id, seq_no)) => {
+                    delete_buffer.lines.push(crate::elastic_search_ingest::create_delete(&doc_id, seq_no));
+                    delete_count += 1;
+                },
+                EvalResult::Update(value) => {
+                    update_buffer.lines.push(serde_json::to_string(&value).unwrap());
+                    update_count += 1;
+                }
+            }
+        }
+        
+        UpdateByQueryResult {
+            table: table.clone(),
+            update_buffer: update_buffer,
+            delete_buffer: delete_buffer,
+            update_count: update_count,
+            delete_count: delete_count,
+            noop_count: noop_count,
+        }
     }
 }
 
@@ -519,15 +625,10 @@ impl Command for UpdateByQueryCommand {
 
             let result_values = to_serde_value(&data_frame).await;
 
-            let final_result_values: Vec<Value> = result_values.iter().map(|x|UpdateByQueryCommand::evaluate(&script_block, x)).collect();
+            let final_result_values: Vec<EvalResult> = result_values.iter().map(|x|UpdateByQueryCommand::evaluate(&script_block, x)).collect();
 
-            let mut buffer = WriteBuffer::new();
-            final_result_values.iter().for_each(|f|buffer.lines.push(serde_json::to_string(f).unwrap()));
-            match elastic_search_ingest::commit(&buffer, &table).await {
-                Ok(_) => (),
-                Err(_) => panic!("nope"),
-            };
-            Ok(UpdateByQueryCommand::empty_result())
+            let result_info = UpdateByQueryCommand::create_final_result(&table, final_result_values).await;
+            result_info.commit().await
         }.boxed()
     }
 
@@ -540,7 +641,11 @@ impl Command for UpdateByQueryCommand {
     }    
 
     async fn _current_target_snapshots(&self) -> Vec<SnapshotDescriptor> {
-        let checkpoint_id = API_SERVICE_CLIENT.get_latest_checkpoint(&self.query_command.table, Some(&"es".to_string())).await.unwrap();
+        let extension = match self.query_command.calculate_score {
+            true => Some("es".to_string()),
+            false => None
+        };
+        let checkpoint_id = API_SERVICE_CLIENT.get_latest_checkpoint(&self.query_command.table, extension).await.unwrap();
         match checkpoint_id {
             Some(c) => vec!(SnapshotDescriptor{ table_name: self.query_command.table.clone(), snapshot_id: c }),
             None => vec!(),

@@ -54,23 +54,25 @@ impl SetProcessorBody {
     fn apply(&self, value: &mut Value) -> Result<(), PipelineError> {
         match &self._if {
             Some(if_val) => {
+                // TODO: need to revisit this, what is that context?
                 let if_result = expression_evaluator::eval_template(if_val, value, HashMap::new(), context!{ a => "a" });
-                if if_result.0.as_str() != "true" {
+                // TODO: does Painless have a "true-ish" semantic like Python?
+                if if_result.result.to_string() != "true" {
                     return Ok(())
                 }
             },
             None => ()
         };
 
-        let (value_result, _outputs) = expression_evaluator::eval_template(&self.value_formula, value, HashMap::new(), context!{ a => "a" });
+        // TODO: need to revisit this, context is weird, what about fields not in the root of the source?
+        let eval_result = expression_evaluator::eval_template(&self.value_formula, value, HashMap::new(), context!{ a => "a" });
         match value {
-            // TODO: need to revisit this
             Value::Object(inner_val) => {
                 match inner_val.get_mut("_source") {
                     Some(source_val) => {
                         match source_val {
                             Value::Object(source_map) => {
-                                source_map.insert(self.field.clone(), Value::String(value_result));
+                                source_map.insert(self.field.clone(), Value::String(eval_result.result.as_str().to_string()));
                             },
                             _ => return Err(PipelineError {  })
                         }
