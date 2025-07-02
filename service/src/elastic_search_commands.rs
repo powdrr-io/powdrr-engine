@@ -136,7 +136,6 @@ impl Command for LookupById {
         let id_list = self.ids.iter().map(|id|format!("'{}'", id)).collect::<Vec<String>>().join(",");
         let mut sql_builder = SqlBuilder::for_query();
         sql_builder.fields.push("*".to_string());
-        sql_builder.fields.push("count(1) as cnt".to_string());
         sql_builder.filter(format!("t._id IN ({id_list})"));
         sql_builder.build()
     }
