@@ -1,6 +1,6 @@
 use std::{error::Error, fmt::Display, iter::zip};
 use std::ops::Add;
-use chrono::{DateTime, Datelike, DurationRound, SecondsFormat, Utc};
+use chrono::{DateTime, DurationRound, SecondsFormat, Utc};
 
 #[derive(Clone, PartialEq, Debug)]
 enum TokenKind {
@@ -236,8 +236,8 @@ impl Expression for NowExpression {
 
 enum DateUnit {
     Day,
-    Month,
     Hour,
+    Minute,
     Week,
 }
 
@@ -252,10 +252,8 @@ impl Expression for FloorExpression {
         let final_val = match self.unit {
             DateUnit::Day => left_val.add(chrono::Duration::hours(-12)).duration_round(chrono::Duration::days(1)),
             DateUnit::Hour => left_val.add(chrono::Duration::minutes(-30)).duration_round(chrono::Duration::hours(1)),
+            DateUnit::Minute => left_val.add(chrono::Duration::seconds(-30)).duration_round(chrono::Duration::minutes(1)),
             DateUnit::Week => left_val.add(chrono::Duration::hours(-84)).duration_round(chrono::Duration::weeks(1)),
-            DateUnit::Month => {
-                Ok(DateTime::parse_from_rfc3339(format!("{}-{number:0>2}-01T00:00:00.000Z", left_val.year(), number=left_val.month()).as_str()).unwrap().to_utc())
-            },
         };
 
         match final_val {
@@ -302,9 +300,9 @@ impl IntervalExpression {
     fn to_duration(&self) -> chrono::Duration {
         match self.unit {
             DateUnit::Day => chrono::Duration::days(self.quantity),
+            DateUnit::Minute => chrono::Duration::minutes(self.quantity),
             DateUnit::Hour => chrono::Duration::hours(self.quantity),
             DateUnit::Week => chrono::Duration::days(7 * self.quantity),
-            DateUnit::Month => todo!("How does this actually work")
         }
     }
 }
@@ -351,7 +349,7 @@ fn parse_top_level_expression(parser_context: &mut ParserContext) -> Result<Box<
 fn parse_date_unit(value: &str) -> DateUnit {
     match value {
         "d" => DateUnit::Day,
-        "m" => DateUnit::Month,
+        "m" => DateUnit::Minute,
         "h" => DateUnit::Hour,
         "w" => DateUnit::Week,
         _ => {
@@ -418,12 +416,13 @@ mod tests {
         assert_eq!(evaluate(&"now".to_string(), &now).unwrap(), "2025-06-29T13:42:46.228Z");
         assert_eq!(evaluate(&"now/d".to_string(), &now).unwrap(), "2025-06-29T00:00:00.000Z");
         assert_eq!(evaluate(&"now/h".to_string(), &now).unwrap(), "2025-06-29T13:00:00.000Z");
-        assert_eq!(evaluate(&"now/m".to_string(), &now).unwrap(), "2025-06-01T00:00:00.000Z");
+        assert_eq!(evaluate(&"now/m".to_string(), &now).unwrap(), "2025-06-29T13:42:00.000Z");
         assert_eq!(evaluate(&"now/w".to_string(), &now).unwrap(), "2025-06-26T00:00:00.000Z");
         assert_eq!(evaluate(&"now-1d".to_string(), &now).unwrap(), "2025-06-28T13:42:46.228Z");
         assert_eq!(evaluate(&"now+1d".to_string(), &now).unwrap(), "2025-06-30T13:42:46.228Z");
         assert_eq!(evaluate(&"now+2d".to_string(), &now).unwrap(), "2025-07-01T13:42:46.228Z");
         assert_eq!(evaluate(&"now+2h".to_string(), &now).unwrap(), "2025-06-29T15:42:46.228Z");
         assert_eq!(evaluate(&"now-1w".to_string(), &now).unwrap(), "2025-06-22T13:42:46.228Z");
+        assert_eq!(evaluate(&"now+5m".to_string(), &now).unwrap(), "2025-06-29T13:47:46.228Z");
     }
 }

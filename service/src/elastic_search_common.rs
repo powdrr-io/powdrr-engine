@@ -14,7 +14,7 @@ use gotham::hyper::{Body, Response};
 use gotham::mime::Mime;
 use gotham::state::State;
 use http::{HeaderName, StatusCode};
-
+use serde_json::Value;
 use crate::data_access::{execute_sql, load_memtable};
 use crate::elastic_search_responses::QueryFailure;
 use crate::state_peers::{self, PeerClient, PeerClientError, PrivateSqlInvocation, SnapshotDescriptor};
@@ -203,3 +203,50 @@ pub async fn execute_command(_context: CommandContext, command: Arc<dyn Command>
     response
 }
 
+// TODO: this is a method to workaround a bug in datafusion
+pub fn create_normalized_value(value: &Value) -> Value {
+    match value {
+        Value::Object(obj) => {
+            let mut new_map = serde_json::Map::new();
+            for (map_key, map_value) in obj.iter() {
+                new_map.insert(create_normalized_name(map_key), create_normalized_value(map_value));
+            }
+            Value::from(new_map)
+        },
+        Value::Array(arr) => {
+            let mut new_array = Vec::new();
+            for array_value in arr.iter() {
+                new_array.push(create_normalized_value(array_value));
+            }
+            Value::from(new_array)            
+        }
+        _ => value.clone()
+    }
+}
+
+
+// TODO: this is a method to workaround a bug in datafusion
+pub fn create_normalized_name(value: &String) -> String {
+    value.to_lowercase()
+}
+
+
+#[cfg(test)]
+mod tests {
+    use crate::elastic_search_common::create_normalized_value;
+
+    #[test]
+    fn test_normalized() {
+        let test_val = r#"{"A":{"B":null,"C":"not null"}}"#;
+
+        let parsed_val = serde_json::from_str::<serde_json::Value>(test_val).unwrap();
+
+        let test_val_again = serde_json::to_string(&parsed_val).unwrap();
+        assert_eq!(test_val, test_val_again);
+        let normalized_val = create_normalized_value(&parsed_val);
+
+        let normalized_val_str = serde_json::to_string(&normalized_val).unwrap();
+
+        println!("{:?}", normalized_val_str);
+    }
+}

@@ -740,7 +740,7 @@ pub(crate) struct ScriptBlock {
     pub source: String,
     pub lang: String,
     #[serde(default)]
-    pub params: HashMap<String, Value>,
+    pub params: Value,
 }
 
 #[derive(Clone)]
@@ -963,9 +963,8 @@ fn create_aggregation_range_filters(range: &AggSpecFilterRangeBody) -> Vec<Strin
             let mut retval = vec!();
             let name = &structured.field;
             for range in structured.ranges.iter() {
-                // TODO: need to convert both these values
-                let converted_from_value = &range.from;
-                let converted_to_value = &range.to;
+                let converted_from_value = convert_datetime_if_necessary(&range.from);
+                let converted_to_value = convert_datetime_if_necessary(&range.to);
                 retval.push(format!("{name} >= {converted_from_value}"));
                 retval.push(format!("{name} < {converted_to_value}"));
             }

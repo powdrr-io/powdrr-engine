@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 use uuid_b64::UuidB64;
 
 use crate::elastic_search_commands::LookupById;
-use crate::elastic_search_common::{load_command_raw_result, CommandContext, ElasticSearchResponse, MIME_ES_JSON};
+use crate::elastic_search_common::{create_normalized_value, load_command_raw_result, CommandContext, ElasticSearchResponse, MIME_ES_JSON};
 use crate::elastic_search_responses::{BulkResult, ErrorDetails, OperationResult, QueryResultHit, Shards, SingleDocCreateFailedResult};
 use crate::{data_access, distributed_cache};
 use crate::elastic_search_parser::UpdateBody;
@@ -100,20 +100,8 @@ pub(crate) struct CreateDoc {
 }
 
 impl CreateDoc {
-    fn create_normalized_value(value: &Value) -> Value {
-        match value {
-            Value::Object(obj) => {
-                let mut new_map = serde_json::Map::new();
-                for (map_key, map_value) in obj.iter() {
-                    new_map.insert(map_key.to_lowercase(), CreateDoc::create_normalized_value(map_value));
-                }
-                Value::from(new_map)
-            },
-            _ => value.clone()
-        }
-    }
     fn normalized_value(&self) -> Value {
-        CreateDoc::create_normalized_value(&self.parsed)
+        create_normalized_value(&self.parsed)
     }
 
     fn normalized_raw(&self) -> String {
