@@ -143,12 +143,6 @@ pub(crate) struct EvalOutput {
 
 
 pub(crate) fn eval_template(expr_str: &str, source: &serde_json::Value, other_context: HashMap<String, Value>, params: Value) -> EvalOutput {
-    // TESTING CODE
-    let source_str = serde_json::to_string(&source).unwrap();
-    println!("{}", source_str);
-    let params_str = serde_json::to_string(&params).unwrap();
-    println!("{}", params_str);   
-    // END
     let mut env = Environment::new();
     env.add_template("foo", expr_str).unwrap();
     let (outputs_ctx, outputs_map) = Outputs::new();

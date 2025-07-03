@@ -22,12 +22,6 @@ pub(crate) struct TermAggProcessor {
 impl TermAggProcessor {
     fn create_aggregation_bucket(value: &Value) -> TermAggregationBucket {
         let value_map = value.as_object().unwrap();
-        // TESTING CODE
-        for (k, v) in value_map.iter() {
-            let line = format!("{}: {}", k, v);
-            println!("{}", line);
-        }
-        // END
         let key = value_map.get("field_name").unwrap().as_str().unwrap();
         let doc_count = value_map.get("cnt").unwrap().as_u64().unwrap();
 
