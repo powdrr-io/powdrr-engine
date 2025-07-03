@@ -279,7 +279,7 @@ mod tests {
         let eval_result = eval_template(translated.as_str(), &source_val, HashMap::new(), Value::from_serialize(params_val));
 
         let final_doc_str = serde_json::to_string(&eval_result.source).unwrap();
-        assert!(final_doc_str.contains("\"scheduledAt\":\"2025-05-26T12:12:12Z\""));
+        assert!(final_doc_str.contains("\"scheduledat\":\"2025-05-26T12:12:12Z\""));
     }
         
     #[test]

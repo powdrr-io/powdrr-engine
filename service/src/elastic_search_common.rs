@@ -209,10 +209,17 @@ pub fn create_normalized_value(value: &Value) -> Value {
         Value::Object(obj) => {
             let mut new_map = serde_json::Map::new();
             for (map_key, map_value) in obj.iter() {
-                new_map.insert(map_key.to_lowercase(), create_normalized_value(map_value));
+                new_map.insert(create_normalized_name(map_key), create_normalized_value(map_value));
             }
             Value::from(new_map)
         },
+        Value::Array(arr) => {
+            let mut new_array = Vec::new();
+            for array_value in arr.iter() {
+                new_array.push(create_normalized_value(array_value));
+            }
+            Value::from(new_array)            
+        }
         _ => value.clone()
     }
 }
