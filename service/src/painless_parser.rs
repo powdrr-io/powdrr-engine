@@ -1,4 +1,5 @@
 use std::{any::Any, error::Error, fmt::Display, iter::zip};
+use crate::elastic_search_common::create_normalized_name;
 
 #[derive(Clone, PartialEq, Debug)]
 enum TokenKind {
@@ -307,7 +308,7 @@ impl Statement for AssignmentStatement {
         loop {
             match current_left.as_any().downcast_ref::<FieldAccess>() {
                 Some(l) => {
-                    left_side_raw.push(l.field_name.clone());
+                    left_side_raw.push(create_normalized_name(&l.field_name));
                     current_left = &l.expression;
                 },
                 None => break
@@ -315,7 +316,7 @@ impl Statement for AssignmentStatement {
         }
         match current_left.as_any().downcast_ref::<VariableOrTypeReference>() {
             Some(l) => {
-                left_side_raw.push(l.name.clone());
+                left_side_raw.push(create_normalized_name(&l.name));
             },
             None => panic!("Don't know how to translate this type of assignment")
         }
@@ -389,7 +390,7 @@ impl Expression for FieldAccess {
     }
         
     fn translate(&self, context: TranslationContext) -> Result<String, TranslationError> {
-        Ok(format!("{}.{}", self.expression.translate(context)?, self.field_name))
+        Ok(format!("{}.{}", self.expression.translate(context)?, create_normalized_name(&self.field_name)))
     }
 }
 
@@ -474,14 +475,14 @@ impl Expression for Comparison {
     fn translate(&self, context: TranslationContext) -> Result<String, TranslationError> {
         // TODO: translate operator
         let is_right_null = Comparison::is_null(&self.right_expression);
+        let left_expression_str = self.left_expression.translate(context.clone())?;
         if self.operator == "!=" && is_right_null {
-            Ok(format!("{} is not none", self.left_expression.translate(context.clone())?))
+            Ok(format!("({left_expression_str} is defined and {left_expression_str} is not none)"))
         } else if self.operator == "==" && is_right_null {
-            Ok(format!("{} is none", self.left_expression.translate(context.clone())?))
+            Ok(format!("({left_expression_str} is not defined or {left_expression_str} is none)"))
         } else {
             Ok(format!(
-                "{} {} {}",
-                self.left_expression.translate(context.clone())?,
+                "{left_expression_str} {} {}",
                 self.operator,
                 self.right_expression.translate(context.clone())?,
             ))

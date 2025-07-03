@@ -1,6 +1,8 @@
 
 use std::{collections::HashMap, pin::Pin, sync::Arc};
 use std::sync::LazyLock;
+use arrow_json::writer::LineDelimited;
+use arrow_json::WriterBuilder;
 use async_trait::async_trait;
 use datafusion::{arrow::array::RecordBatch, prelude::DataFrame};
 use futures::FutureExt;
@@ -9,7 +11,7 @@ use http::StatusCode;
 use serde_json::{json, Value};
 
 use crate::{data_access::{self, execute_sql}, distributed_cache, elastic_search_common::{Command, CommandResponse, ResultGeneratorFuture}, elastic_search_ingest::{self, WriteBuffer}, elastic_search_parser::ScriptBlock, elastic_search_responses::{QueryResultHit, QueryResults}, expression_evaluator, painless_parser, state_hosted_service::API_SERVICE_CLIENT, state_peers::SnapshotDescriptor};
-use crate::elastic_search_common::ElasticSearchResponse;
+use crate::elastic_search_common::{create_normalized_value, ElasticSearchResponse};
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::elastic_search_parser::{process_aggregations, Aggregation, SqlBuilder};
 use crate::elastic_search_responses::{AggregationResult, QueryResultsNotFound, UpdateByQueryResults, UpdateByQueryResultsRetries, UpdateByQuerySuccess};
@@ -46,13 +48,19 @@ fn to_hit(index: &String, value: &Value) -> QueryResultHit {
 pub(crate) async fn to_serde_value(data_frame: &DataFrame) -> Vec<Value> {
     let record_batches: Vec<RecordBatch> = match data_frame.clone().collect().await {
         Ok(b) => b,
-        Err(_e) => panic!("nope")
+        Err(e) => {
+            let error = format!("{:?}", e);
+            println!("{}", error);
+            panic!("nope");
+        }
     };        
     
     let record_batch_references: Vec<&RecordBatch> = record_batches.iter().map(|r| r).collect();
 
     let buf = Vec::new();
-    let mut writer = arrow_json::LineDelimitedWriter::new(buf);
+    let builder = WriterBuilder::new().with_explicit_nulls(true);
+    let mut writer = builder.build::<_, LineDelimited>(buf);
+    //let mut writer = arrow_json::LineDelimitedWriter::new(buf);
     writer.write_batches(record_batch_references.as_slice()).unwrap();
     writer.finish().unwrap();
     
@@ -287,8 +295,12 @@ impl Command for SqlCommand {
     }
 
     fn required_extensions(&self) -> Vec<String> {
-        vec!("es".to_string())
-    }    
+        if self.calculate_score {
+            vec!("es".to_string())
+        } else {
+            vec!()
+        }
+    }
 
     async fn _current_target_snapshots(&self) -> Vec<SnapshotDescriptor> {
         let extension = match self.calculate_score {
@@ -337,7 +349,7 @@ impl UpdateByQueryResult {
             Ok(_) => (),
             Err(_) => panic!("nope"),
         };
-        match elastic_search_ingest::commit_general(&self.update_buffer, &self.table, &"delete".to_string()).await {
+        match elastic_search_ingest::commit_general(&self.delete_buffer, &self.table, &"delete".to_string()).await {
             Ok(_) => (),
             Err(_) => panic!("nope"),
         };
@@ -365,7 +377,7 @@ impl UpdateByQueryCommand {
             HashMap::from([
                 ("op".to_string(), minijinja::Value::from("update"))
             ]),
-            minijinja::Value::from_serialize(script.params.clone())
+            minijinja::Value::from_serialize(create_normalized_value(&script.params))
         );
 
         let op = output.other_context.get("op").map_or_else(|| "noop", |v|v.as_str().unwrap());
@@ -452,10 +464,6 @@ impl UpdateByQueryCommand {
 
 #[async_trait]
 impl Command for UpdateByQueryCommand {
-    fn generate_sql(&self) -> String {
-        self.query_command.sql.clone()
-    }  
-
     fn get_name(&self) -> String {
         "UpdateByQueryCommand".to_string()
     }
@@ -488,12 +496,20 @@ impl Command for UpdateByQueryCommand {
         }.boxed()
     }
 
+    fn generate_sql(&self) -> String {
+        self.query_command.sql.clone()
+    }
+
     fn generate_filters(&self) -> Vec<&crate::state_common::FileFilter> {
         vec!()
     }
 
     fn required_extensions(&self) -> Vec<String> {
-        vec!("es".to_string())
+        if self.query_command.calculate_score {
+            vec!("es".to_string())
+        } else {
+            vec!()
+        }
     }    
 
     async fn _current_target_snapshots(&self) -> Vec<SnapshotDescriptor> {

@@ -1610,8 +1610,7 @@ mod tests {
     #[test]
     fn test_es_update_by_query_kibana() {
         let test_server = &*TEST_SERVER;
-
-
+        
         test_server.client().put(
             "http://localhost/_test/v1/_testing_mode",
             "",
@@ -1635,16 +1634,19 @@ mod tests {
         
         let doc_val = r#"{
   "task": {
-    "taskType": "actions_telemetry",
+    "taskType": "alerts_invalidate_api_keys",
     "state": "{}",
     "params": "{}",
-    "traceparent": "00-81cce91b9d1dc316f8f32fc5e88a2f4a-0b838b32cd59e25d-00",
+    "schedule": {
+      "interval": "5m"
+    },
+    "traceparent": "00-0ab09373b4693b7c9a409be5be19845e-8eb1a3c13b4ca47a-00",
     "enabled": true,
     "attempts": 0,
-    "scheduledAt": "2025-07-01T22:07:24.901Z",
+    "scheduledAt": "2025-07-03T02:51:23.055Z",
     "startedAt": null,
     "retryAt": null,
-    "runAt": "2025-07-01T22:07:24.901Z",
+    "runAt": "2025-07-03T02:51:23.055Z",
     "status": "idle"
   },
   "type": "task",
@@ -1653,12 +1655,12 @@ mod tests {
     "task": "8.5.0"
   },
   "coreMigrationVersion": "8.7.1",
-  "updated_at": "2025-07-01T22:07:24.901Z",
-  "created_at": "2025-07-01T22:07:24.901Z"
+  "updated_at": "2025-07-03T02:51:23.055Z",
+  "created_at": "2025-07-03T02:51:23.055Z"
 }"#;
 
         let create_response = test_server.client().post(
-            "http://localhost/.kibana_task_manager_8.7.1/_create/task%3Asecurity%3Atelemetry-timelines%3A1.0.0?refresh=false&require_alias=true",
+            "http://localhost/.kibana_task_manager_8.7.1/_create/task%3AAlerts-alerts_invalidate_api_keys?refresh=false&require_alias=true".to_string(),
             doc_val,
             mime::APPLICATION_JSON,
         ).perform();
@@ -1803,14 +1805,14 @@ mod tests {
         "retryAt": "2025-07-01T21:58:29.646Z"
       },
       "claimableTaskTypes": [
-        "apm-source-map-migration-task"
+        "osquery:telemetry-saved-queries",
+        "alerts_invalidate_api_keys"
       ],
       "skippedTaskTypes": [
         "session_cleanup",
         "actions_telemetry",
         "cleanup_failed_action_executions",
         "alerting_telemetry",
-        "alerts_invalidate_api_keys",
         "alerting_health_check",
         "report:execute",
         "reports:monitor",
@@ -1847,7 +1849,7 @@ mod tests {
         "fleet:request_diagnostics:retry",
         "fleet:check-deleted-files-task",
         "osquery:telemetry-packs",
-        "osquery:telemetry-saved-queries",
+        "apm-source-map-migration-task",
         "osquery:telemetry-configs",
         "cloud_security_posture-stats_task",
         "ML:saved-objects-sync",

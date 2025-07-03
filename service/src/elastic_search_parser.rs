@@ -22,6 +22,12 @@ pub(crate) struct TermAggProcessor {
 impl TermAggProcessor {
     fn create_aggregation_bucket(value: &Value) -> TermAggregationBucket {
         let value_map = value.as_object().unwrap();
+        // TESTING CODE
+        for (k, v) in value_map.iter() {
+            let line = format!("{}: {}", k, v);
+            println!("{}", line);
+        }
+        // END
         let key = value_map.get("field_name").unwrap().as_str().unwrap();
         let doc_count = value_map.get("cnt").unwrap().as_u64().unwrap();
 
@@ -740,7 +746,7 @@ pub(crate) struct ScriptBlock {
     pub source: String,
     pub lang: String,
     #[serde(default)]
-    pub params: HashMap<String, Value>,
+    pub params: Value,
 }
 
 #[derive(Clone)]
@@ -963,9 +969,8 @@ fn create_aggregation_range_filters(range: &AggSpecFilterRangeBody) -> Vec<Strin
             let mut retval = vec!();
             let name = &structured.field;
             for range in structured.ranges.iter() {
-                // TODO: need to convert both these values
-                let converted_from_value = &range.from;
-                let converted_to_value = &range.to;
+                let converted_from_value = convert_datetime_if_necessary(&range.from);
+                let converted_to_value = convert_datetime_if_necessary(&range.to);
                 retval.push(format!("{name} >= {converted_from_value}"));
                 retval.push(format!("{name} < {converted_to_value}"));
             }

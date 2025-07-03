@@ -2,7 +2,7 @@ use std::{collections::HashMap, fmt, sync::{Arc, Mutex}};
 
 use chrono::{DateTime, FixedOffset};
 use minijinja::{value::{Object, ValueKind}, Environment, Error, State, Value};
-
+use crate::elastic_search_common::create_normalized_name;
 
 #[derive(Debug)]
 struct Outputs {
@@ -81,8 +81,12 @@ impl Object for ZonedDateTimeClass {
         args: &[Value],
     ) -> Result<Value, Error> {
         if name == "parse" {
-            let arg_str = args[0].as_str().unwrap().to_string();
-            Ok(Value::from_object(ZonedDateTimeObject{ value: DateTime::parse_from_rfc3339(&arg_str).unwrap() }))
+            if args[0].is_undefined() {
+                Ok(Value::from_object(ZonedDateTimeObject{ value: DateTime::from_timestamp_millis(0).unwrap().fixed_offset() }))
+            } else {
+                let arg_str = args[0].as_str().unwrap().to_string();
+                Ok(Value::from_object(ZonedDateTimeObject{ value: DateTime::parse_from_rfc3339(&arg_str).unwrap() }))
+            }
         } else {
             panic!("Method does not exist in Outputs")
         }
@@ -101,7 +105,7 @@ impl Object for ZonedDateTimeObject {
         name: &str,
         _args: &[Value],
     ) -> Result<Value, Error> {
-        if name == "toInstant" {
+        if name == create_normalized_name(&"toInstant".to_string()) {
             Ok(Value::from_object(Instant{ value: self.value.clone() }))
         } else {
             panic!("Method does not exist in Outputs")
@@ -121,7 +125,7 @@ impl Object for Instant {
         name: &str,
         _args: &[Value],
     ) -> Result<Value, Error> {
-        if name == "toEpochMilli" {
+        if name == create_normalized_name(&"toEpochMilli".to_string()) {
             // TODO: convert datetime str in 'value' to millis from the epoch
             Ok(Value::from(self.value.timestamp_millis()))
         } else {
@@ -139,6 +143,12 @@ pub(crate) struct EvalOutput {
 
 
 pub(crate) fn eval_template(expr_str: &str, source: &serde_json::Value, other_context: HashMap<String, Value>, params: Value) -> EvalOutput {
+    // TESTING CODE
+    let source_str = serde_json::to_string(&source).unwrap();
+    println!("{}", source_str);
+    let params_str = serde_json::to_string(&params).unwrap();
+    println!("{}", params_str);   
+    // END
     let mut env = Environment::new();
     env.add_template("foo", expr_str).unwrap();
     let (outputs_ctx, outputs_map) = Outputs::new();
@@ -234,11 +244,12 @@ mod tests {
     use minijinja::Value;
 
     use crate::{expression_evaluator::eval_template, painless_parser::translate};
+    use crate::elastic_search_common::create_normalized_value;
 
     #[test]
     fn test_assignment_script() {
         let test_val = r#"
-        if (params.claimableTaskTypes.contains(ctx._source.task.taskType)) {
+        if(ctx._source.task.retryAt != null) {
             ctx._source.task.scheduledAt=ctx._source.task.retryAt;
         } else {
             ctx._source.task.scheduledAt=ctx._source.task.runAt;
@@ -247,28 +258,28 @@ mod tests {
         let source = r#"{
                 "task": {
                     "attempts": 1,
-                    "retryAt": "2025-05-25T00:00:00Z",
+                    "retryAt": null,
                     "runAt": "2025-05-26T12:12:12Z",
                     "taskType": "foobar"
                 }
         }"#;
-        let source_val: serde_json::Value = serde_json::from_str(&source).unwrap();
+        let source_val: serde_json::Value = create_normalized_value(&serde_json::from_str(&source).unwrap());
 
         let params = r#"{
             "claimableTaskTypes": ["foobar"],
             "taskMaxAttempts": {
                 "foobar": 1
             },
-            "now": 999999999999
+            "now": 99999999999999999999
         }"#;
-        let params_val: serde_json::Value = serde_json::from_str(&params).unwrap();
+        let params_val: serde_json::Value = create_normalized_value(&serde_json::from_str(&params).unwrap());
 
         let translated = translate(&test_val.to_string()).unwrap();
 
         let eval_result = eval_template(translated.as_str(), &source_val, HashMap::new(), Value::from_serialize(params_val));
 
         let final_doc_str = serde_json::to_string(&eval_result.source).unwrap();
-        assert!(final_doc_str.contains("\"scheduledAt\":\"2025-05-25T00:00:00Z\""));
+        assert!(final_doc_str.contains("\"scheduledAt\":\"2025-05-26T12:12:12Z\""));
     }
         
     #[test]

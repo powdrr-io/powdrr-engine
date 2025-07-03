@@ -236,8 +236,9 @@ impl Expression for NowExpression {
 
 enum DateUnit {
     Day,
-    Month,
     Hour,
+    Minute,
+    Month,
     Week,
 }
 
@@ -252,6 +253,7 @@ impl Expression for FloorExpression {
         let final_val = match self.unit {
             DateUnit::Day => left_val.add(chrono::Duration::hours(-12)).duration_round(chrono::Duration::days(1)),
             DateUnit::Hour => left_val.add(chrono::Duration::minutes(-30)).duration_round(chrono::Duration::hours(1)),
+            DateUnit::Minute => left_val.add(chrono::Duration::seconds(-30)).duration_round(chrono::Duration::minutes(1)),
             DateUnit::Week => left_val.add(chrono::Duration::hours(-84)).duration_round(chrono::Duration::weeks(1)),
             DateUnit::Month => {
                 Ok(DateTime::parse_from_rfc3339(format!("{}-{number:0>2}-01T00:00:00.000Z", left_val.year(), number=left_val.month()).as_str()).unwrap().to_utc())
@@ -302,6 +304,7 @@ impl IntervalExpression {
     fn to_duration(&self) -> chrono::Duration {
         match self.unit {
             DateUnit::Day => chrono::Duration::days(self.quantity),
+            DateUnit::Minute => chrono::Duration::minutes(self.quantity),
             DateUnit::Hour => chrono::Duration::hours(self.quantity),
             DateUnit::Week => chrono::Duration::days(7 * self.quantity),
             DateUnit::Month => todo!("How does this actually work")
@@ -351,7 +354,7 @@ fn parse_top_level_expression(parser_context: &mut ParserContext) -> Result<Box<
 fn parse_date_unit(value: &str) -> DateUnit {
     match value {
         "d" => DateUnit::Day,
-        "m" => DateUnit::Month,
+        "m" => DateUnit::Minute,
         "h" => DateUnit::Hour,
         "w" => DateUnit::Week,
         _ => {
