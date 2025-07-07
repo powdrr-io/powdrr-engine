@@ -99,10 +99,6 @@ impl WriteBuffer {
     }
 }
 
-
-// Source will always be what the user gave us albeit without formatting guarantees.
-
-
 pub(crate) struct CreateDoc {
     parsed: Value,
 }
