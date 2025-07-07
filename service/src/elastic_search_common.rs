@@ -17,8 +17,10 @@ use http::{HeaderName, StatusCode};
 use serde_json::Value;
 use crate::data_access::{execute_sql, load_memtable};
 use crate::elastic_search_responses::QueryFailure;
+use crate::schema_massager::SqlQuery;
 use crate::state_peers::{self, PeerClient, PeerClientError, PrivateSqlInvocation, SnapshotDescriptor};
 use crate::state_common::FileFilter;
+use crate::state_hosted_service::TableMetadataCheckpoint;
 use crate::util::log_err;
 
 
@@ -75,6 +77,7 @@ impl CommandResponse for ElasticSearchResponse {
 
 
 pub type ResultGeneratorFuture = dyn Future<Output = Result<Arc<dyn CommandResponse>, String>> + Send;
+pub type SnapshotGeneratorFuture = dyn Future<Output = Result<Vec<SnapshotDescriptor>, String>> + Send;
 
 #[async_trait]
 pub(crate) trait Command: Send + Sync {
@@ -86,19 +89,19 @@ pub(crate) trait Command: Send + Sync {
 
     fn result_generator(&self, result_table_name: Option<String>) -> Pin<Box<ResultGeneratorFuture>>;
 
-    fn generate_sql(&self) -> String;
+    fn generate_sql(&self) -> SqlQuery;
 
     #[allow(dead_code)]
     fn generate_filters(&self) -> Vec<&FileFilter>;
 
     fn required_extensions(&self) -> Vec<String>;
 
-    async fn _current_target_snapshots(&self) -> Vec<SnapshotDescriptor>;
+    async fn current_target_snapshots(&self) -> Vec<SnapshotDescriptor>;
 }
 
 pub(crate) async fn call_private_sql(
     peer_client: &dyn PeerClient,
-    target_sql: &String, 
+    target_sql: &SqlQuery,
     required_extensions: &Vec<String>,
     target_snapshots: &Vec<SnapshotDescriptor>,
     index: u64,
@@ -119,7 +122,7 @@ pub(crate) async fn call_private_sql(
 
 pub(crate) async fn call_private_sql_and_load(
     peer_client: &dyn PeerClient,
-    target_sql: &String, 
+    target_sql: &SqlQuery,
     required_extensions: &Vec<String>,
     target_snapshots: &Vec<SnapshotDescriptor>,
     index: u64,
@@ -147,7 +150,7 @@ pub(crate) async fn call_private_sql_and_load(
 async fn call_peers_and_load_results(
     required_extensions: &Vec<String>,
     target_snapshots: &Vec<SnapshotDescriptor>, 
-    sql: &String
+    sql: &SqlQuery
 ) -> Result<Option<String>, PeerClientError> {
     if target_snapshots.len() == 0 {
         return Ok(None)
@@ -184,7 +187,7 @@ async fn call_peers_and_load_results(
 
 
 pub async fn load_command_raw_result(_context: CommandContext, command: Arc<dyn Command>) -> Result<Option<String>, PeerClientError> {
-    let target_snapshots = command._current_target_snapshots().await;
+    let target_snapshots = command.current_target_snapshots().await;
     let target_sql = command.generate_sql();
     let required_extensions = command.required_extensions();
     call_peers_and_load_results(&required_extensions, &target_snapshots, &target_sql).await

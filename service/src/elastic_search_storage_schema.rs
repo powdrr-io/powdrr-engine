@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use crate::elastic_search_common::create_normalized_value;
 use crate::elastic_search_ingest::WriteBuffer;
 use crate::schema_massager::{extract_powdrr_schema_option, PowdrrSchema};
 
@@ -7,35 +7,28 @@ use crate::schema_massager::{extract_powdrr_schema_option, PowdrrSchema};
 pub(crate) struct RecordInput {
     pub _id: String,
     pub _seq_no: i64,
-    pub _version: i64,
+    pub _version: u64,
     pub existing_normalized: Option<Value>,
     pub source: Value
 }
 
 impl RecordInput {
-    fn ensure_normalized_value(&mut self) -> () {
+    pub fn ensure_normalized_value(&mut self) -> () {
         if self.existing_normalized.is_none() {
             let mut values = serde_json::Map::new();
             values.insert("_id".to_string(), Value::String(self._id.clone()));
             values.insert("_seq_no".to_string(), Value::Number(self._seq_no.into()));
             values.insert("_version".to_string(), Value::Number(self._version.into()));
-            values.insert("source".to_string(), self.source.clone());
-            self.existing_normalized = Some(Value::Object(values));
+            values.insert("source".to_string(), Value::String(serde_json::to_string(&self.source).unwrap()));
+            let normalized_value = create_normalized_value(&Value::Object(values));
+            self.existing_normalized = Some(normalized_value);
         }
     }
 
-    fn to_record(&self) -> Record {
-        Record {
-            normalized: self.existing_normalized.as_ref().unwrap().clone(),
-            source: self.source.clone()
-        }
+    pub fn to_record(&self) -> Value {
+        assert!(self.existing_normalized.is_some(), "You forgot to call ensure_normalized_value() on the record before calling to_record()");
+        self.existing_normalized.as_ref().unwrap().clone()
     }
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct Record {
-    pub normalized: Value,
-    pub source: Value
 }
 
 
@@ -55,7 +48,7 @@ impl WriteBufferBuilder {
 
         self.records.iter_mut().for_each(|r| merged_schema.coerce_value_option(&mut r.existing_normalized));
 
-        let final_records = self.records.iter().map(|r| r.to_record()).collect::<Vec<Record>>();
+        let final_records = self.records.iter().map(|r| r.to_record()).collect::<Vec<Value>>();
         WriteBuffer::from(merged_schema, final_records.iter().map(|r|serde_json::to_string(&r).unwrap()).collect())
     }
 }
@@ -63,9 +56,8 @@ impl WriteBufferBuilder {
 
 #[cfg(test)]
 mod tests {
-    use arrow_json::reader::infer_json_schema;
     use crate::elastic_search_storage_schema::{RecordInput, WriteBufferBuilder};
-    use crate::schema_massager::{extract_powdrr_schema, to_powdrr_schema, PowdrrDataType, PowdrrSchema, SqlBuilder};
+    use crate::schema_massager::PowdrrDataType;
 
     #[test]
     fn test_builder_basic() {

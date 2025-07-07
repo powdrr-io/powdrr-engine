@@ -6,7 +6,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::{private_api::data_query, state_common::FileFilter, state_leader};
-
+use crate::schema_massager::SqlQuery;
 
 #[derive(Serialize, Deserialize)]
 pub struct FieldFileFilterDescriptor {
@@ -28,7 +28,7 @@ pub(crate) struct SnapshotDescriptor {
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct PrivateSqlInvocation {
-    pub sql: String,
+    pub sql: SqlQuery,
     pub required_extensions: Vec<String>,
     pub file_filter: Vec<FileFilterDescriptor>,
     pub snapshots: Vec<SnapshotDescriptor>,
@@ -41,7 +41,7 @@ pub(crate) struct PrivateSqlInvocation {
 impl PrivateSqlInvocation {
     #[allow(dead_code)]
     pub fn new(
-        sql: String,
+        sql: SqlQuery,
         required_extensions: Vec<String>,
         file_filter: Vec<FileFilterDescriptor>,
         snapshots: Vec<SnapshotDescriptor>,

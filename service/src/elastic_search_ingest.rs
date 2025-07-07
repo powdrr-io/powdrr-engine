@@ -14,16 +14,17 @@ use http::StatusCode;
 use idgenerator::*;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::{mpsc, oneshot};
 use uuid_b64::UuidB64;
 
 use crate::elastic_search_commands::LookupById;
-use crate::elastic_search_common::{create_normalized_value, load_command_raw_result, CommandContext, ElasticSearchResponse, MIME_ES_JSON};
+use crate::elastic_search_common::{load_command_raw_result, CommandContext, ElasticSearchResponse, MIME_ES_JSON};
 use crate::elastic_search_responses::{BulkResult, ErrorDetails, OperationResult, QueryResultHit, Shards, SingleDocCreateFailedResult};
 use crate::{data_access, distributed_cache};
 use crate::elastic_search_parser::UpdateBody;
+use crate::elastic_search_storage_schema::RecordInput;
 use crate::schema_massager::PowdrrSchema;
 use crate::state_hosted_service::{CreateTable, SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription, API_SERVICE_CLIENT};
 use crate::util::log_err;
@@ -98,24 +99,6 @@ impl WriteBuffer {
         self.lines.len()
     }
 }
-
-pub(crate) struct CreateDoc {
-    parsed: Value,
-}
-
-impl CreateDoc {
-    fn normalized_value(&self) -> Value {
-        create_normalized_value(&self.parsed)
-    }
-
-    fn normalized_raw(&self) -> String {
-        match serde_json::to_string(&self.normalized_value()) {
-            Ok(s) => s.replace("\n", ""),
-            Err(_) => panic!("What happen?")
-        }
-    }
-}
-
 
 #[derive(Deserialize)]
 struct IndexOrCreateBody {
@@ -408,22 +391,11 @@ pub(crate) async fn update_aliases(body: &String) -> Result<(), IngestError> {
 }
 
 
-
-fn insert_into_doc(id: &String, version: u32, seq_no: i64, doc: &Value) -> Value {
-    let mut final_doc = doc.clone();
-    let final_doc_map = final_doc.as_object_mut().unwrap();
-    final_doc_map.insert("_id".to_string(), Value::String(id.clone()));
-    final_doc_map.insert("_version".to_string(), json!(version));
-    final_doc_map.insert("_seq_no".to_string(), json!(seq_no));
-    final_doc
-}
-
-
 pub(crate) fn ingest_create(
     table_description: &TableDescription, 
     create: &Create, 
-    doc: &CreateDoc,
-    version: u32, 
+    doc: &Value,
+    version: u64,
     seq_no: i64,
     status: Option<u32>,
     buffer: &mut WriteBuffer
@@ -432,8 +404,15 @@ pub(crate) fn ingest_create(
         Some(id) => id.clone(),
         None => UuidB64::new().to_string()
     };
-    let doc_with_id = insert_into_doc(&id, version, seq_no, &doc.normalized_value());
-    buffer.lines.push(serde_json::to_string(&doc_with_id).unwrap());
+    let mut doc_with_id = RecordInput {
+        _id: id.clone(),
+        _seq_no: seq_no,
+        _version: version,
+        existing_normalized: None,
+        source: doc.clone(),
+    };
+    doc_with_id.ensure_normalized_value();
+    buffer.lines.push(serde_json::to_string(&doc_with_id.to_record()).unwrap());
     OperationResult{
         _index: table_description.name.clone(),
         _id: id,
@@ -532,7 +511,7 @@ pub(crate) async fn commit_general(buffer: &WriteBuffer, index: &String, commit_
 
 
 async fn get_existing_doc_count(index: &String, doc_ids: &Vec<String>) -> Result<usize, IngestError> {
-    let df_count = match load_command_raw_result(CommandContext{}, Arc::new(LookupById{ table: index.clone(), ids: doc_ids.clone() })).await {
+    let df_count = match load_command_raw_result(CommandContext{}, Arc::new(LookupById::new(&PowdrrSchema::empty(), &index, &doc_ids))).await {
         Ok(lcrr) => match lcrr {
             Some(raw_table) => {
                 let df = match data_access::execute_sql(&format!("SELECT * from {raw_table}")).await {
@@ -586,7 +565,7 @@ async fn create_single_worker(index: &String, doc_id: &String, payload: &String)
             let result = ingest_create(
                 &table_description,
                 &Create{ create: IndexOrCreateBody { index: None, id: Some(doc_id.clone()), list_executed_pipelines: false, require_alias: false, dynamic_templates: None }},
-                &CreateDoc{ parsed: valid_doc },
+                &valid_doc,
                 1,
                 seq_no,
                 None,
@@ -644,7 +623,7 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
         let mut result = ingest_create(
             &table_description,
             &Create { create: IndexOrCreateBody { index: None, id: Some(doc_id.clone()), list_executed_pipelines: false, require_alias: false, dynamic_templates: None } },
-            &CreateDoc { parsed: upsert_doc.clone() },
+            &upsert_doc,
             1,
             seq_no,
             None,
@@ -766,7 +745,7 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
                                 let operation_result = ingest_create(
                                     &table_description,
                                     &c,
-                                    &CreateDoc{ parsed: valid_doc },
+                                    &valid_doc,
                                     1,
                                     seq_no,
                                     Some(201),

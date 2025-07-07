@@ -43,6 +43,8 @@ pub(crate) struct IcebergMetadata {
     // per file, per column lower and upper bounds
     // TODO: this needs to be generalized to support bloom filters
     pub column_stats: Vec<(String, String)>,
+    pub schemas: Vec<PowdrrSchema>,
+    pub file_schemas: Vec<u64>,    
 }
 
 

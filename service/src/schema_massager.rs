@@ -7,8 +7,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(untagged)]
+#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
 pub(crate) enum PowdrrDataType {
     String,
     Integer,
@@ -35,13 +34,13 @@ impl PowdrrDataType {
 }
 
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
 pub(crate) struct PowdrrField {
     pub name: String,
     pub data_type: PowdrrDataType
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
 pub(crate) struct PowdrrSchema {
     pub fields: Vec<PowdrrField>
 }
@@ -52,6 +51,19 @@ pub(crate) struct SchematizedValue {
 }
 
 impl PowdrrSchema {
+    pub fn empty() -> Self {
+        // TODO: this is a placeholder until all the scaffolding is in place
+        PowdrrSchema{
+            fields: vec!()
+        }
+    }
+
+    pub fn from(fields: &Vec<PowdrrField>) -> Self {
+        PowdrrSchema{
+            fields: fields.clone()
+        }
+    }
+
     fn to_map(&self) -> HashMap<String, PowdrrField> {
         self.fields.iter().map(|x| (x.name.clone(), x.clone())).collect::<HashMap<String, PowdrrField>>()
     }
@@ -150,17 +162,24 @@ pub(crate) struct NamedStructEntry {
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) enum SqlExpression {
     And(Vec<SqlExpression>),
+    Arithmetic(Box<SqlExpression>, String, Box<SqlExpression>),
+    Average(Box<SqlExpression>),
     Comparison(Box<SqlExpression>, String, Box<SqlExpression>),
     Count,
+    CountDistinct(Box<SqlExpression>),
     FieldRef(String, String),
     In(Box<SqlExpression>, Vec<SqlExpression>),
     IsNull(Box<SqlExpression>),
+    Like(Box<SqlExpression>, Box<SqlExpression>),
     LiteralNonString(String),
     LiteralString(String),
     NamedStruct(Vec<NamedStructEntry>),
     Not(Box<SqlExpression>),
     Or(Vec<SqlExpression>),
 }
+
+unsafe impl Send for SqlExpression {}
+unsafe impl Sync for SqlExpression {}
 
 impl SqlExpression {
     fn lookup_field(schema: &HashMap<String, PowdrrField>, path: &String) -> Option<PowdrrField> {
@@ -193,6 +212,18 @@ impl SqlExpression {
             SqlExpression::And(exprs) => {
                 SqlExpression::And(exprs.iter().map(|x| x.finalize(original_schema, target_schema)).collect())
             },
+            SqlExpression::Arithmetic(left, op, right) => {
+                SqlExpression::Arithmetic(
+                    Box::new(left.finalize(original_schema, target_schema)),
+                    op.clone(),
+                    Box::new(right.finalize(original_schema, target_schema))
+                )
+            },
+            SqlExpression::Average(value) => {
+                SqlExpression::Average(
+                    Box::new(value.finalize(original_schema, target_schema))
+                )
+            },
             SqlExpression::Comparison(left, op, right) => {
                 SqlExpression::Comparison(
                     Box::new(left.finalize(original_schema, target_schema)),
@@ -201,6 +232,11 @@ impl SqlExpression {
                 )
             },
             SqlExpression::Count => self.clone(),
+            SqlExpression::CountDistinct(value) => {
+                SqlExpression::CountDistinct(
+                    Box::new(value.finalize(original_schema, target_schema)),
+                )
+            }
             SqlExpression::FieldRef(table, name) => {
                 let original_schema_field = Self::lookup_field(original_schema, name).unwrap();
                 let target_schema_field = Self::lookup_field(target_schema, name);
@@ -219,6 +255,12 @@ impl SqlExpression {
             SqlExpression::IsNull(value) => {
                 SqlExpression::IsNull(
                     Box::new(value.finalize(original_schema, target_schema)),
+                )
+            },
+            SqlExpression::Like(left, right) => {
+                SqlExpression::Like(
+                    Box::new(left.finalize(original_schema, target_schema)),
+                    Box::new(right.finalize(original_schema, target_schema))
                 )
             },
             SqlExpression::LiteralNonString(_) => self.clone(),
@@ -291,20 +333,32 @@ impl SqlExpression {
                 let exprs_str = exprs.iter().map(|x| x.stringize()).collect::<Vec<String>>();
                 format!("({})", exprs_str.join(" AND "))
             },
+            SqlExpression::Arithmetic(left, op, right) => {
+                format!("({} {} {})", left.stringize(), op, right.stringize())
+            },
+            SqlExpression::Average(value) => {
+                format!("AVG({})", value.stringize())
+            },
             SqlExpression::Comparison(left, op, right) => {
-                format!("{} {} {}", left.stringize(), op, right.stringize())
+                format!("({} {} {})", left.stringize(), op, right.stringize())
             },
             SqlExpression::Count => {
                 "count(1)".to_string()
             },
+            SqlExpression::CountDistinct(value) => {
+                format!("count(distinct {})", value.stringize())
+            },
             SqlExpression::FieldRef(table, field) => {
-                format!("{}.{}", table, field)
+                format!("{}.\"{}\"", table, field)
             },
             SqlExpression::In(left, right) => {
                 format!("{} IN ({})", left.stringize(), right.iter().map(|x| x.stringize()).collect::<Vec<String>>().join(", "))
             },
             SqlExpression::IsNull(value) => {
                 format!("{} IS NULL", value.stringize())
+            },
+            SqlExpression::Like(left, right) => {
+                format!("{} LIKE {}", left.stringize(), right.stringize())
             },
             SqlExpression::LiteralNonString(value) => {
                 value.clone()
@@ -381,7 +435,8 @@ pub(crate) struct SqlBuilder {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct SqlQuery {
-    original_schema: PowdrrSchema,
+    original_schema: Option<PowdrrSchema>,
+    all_fields: bool,
     fields: Vec<FieldExpression>,
     joins: String,
     filters: Option<SqlExpression>,
@@ -393,7 +448,7 @@ pub(crate) struct SqlQuery {
 impl SqlBuilder {
     pub(crate) fn for_query(all_fields: bool) -> Self {
         SqlBuilder {
-            all_fields: all_fields,
+            all_fields,
             fields: vec!(),
             joins: vec!(),
             filter_stack: RefCell::new(vec!(vec!())),
@@ -417,6 +472,10 @@ impl SqlBuilder {
             group_by: vec!(),
             top_level: false,
         }
+    }
+
+    pub fn set_all_fields_testing_only(&mut self) -> () {
+        self.all_fields = true;
     }
 
     pub(crate) fn push_filter_context(&mut self) -> &mut Self {
@@ -458,16 +517,17 @@ impl SqlBuilder {
         self
     }
 
-    fn _fields(&self, powdrr_schema: &PowdrrSchema) -> Vec<FieldExpression> {
+    fn _fields(&self) -> Vec<FieldExpression> {
         let mut fields_copy = self.fields.clone();
         if self.all_fields {
-            for field in powdrr_schema.fields.iter() {
+            for field in self.schema.fields.iter() {
                 fields_copy.push(FieldExpression{
                     name: field.name.clone(),
                     expression: SqlExpression::FieldRef("t".to_string(), field.name.clone())
                 });
             }
         }
+        assert!(fields_copy.len() > 0);
         fields_copy
     }
 
@@ -500,10 +560,11 @@ impl SqlBuilder {
         SqlExpression::and(top_copy)
     }
 
-    pub(crate) fn build(&self, powdrr_schema: &PowdrrSchema) -> SqlQuery {
+    pub(crate) fn build(&self) -> SqlQuery {
         SqlQuery {
-            original_schema: powdrr_schema.clone(),
-            fields: self._fields(powdrr_schema),
+            original_schema: None,
+            all_fields: self.all_fields,
+            fields: self._fields.clone(),
             joins: self._joins().join(" "),
             filters: self._filters(),
             limit: self.limit.clone(),
@@ -542,6 +603,11 @@ impl SqlQuery {
             Some(limit) => format!("LIMIT {}", limit),
             None => "".to_string()
         }
+    }
+
+    pub(crate) fn build_same(&self) -> String {
+        // TODO: this can be made faster since we know the original and target schema are the same
+        self.build(&self.original_schema)
     }
 
     pub(crate) fn build(&self, target_schema: &PowdrrSchema) -> String {
@@ -617,8 +683,8 @@ mod tests {
         let (schema, _) = infer_json_schema(test_val_file.as_bytes(), None).unwrap();
         let powdrr_schema_file = to_powdrr_schema(&schema);
 
-        let sql_builder = SqlBuilder::for_query(true);
-        let sql_query = sql_builder.build(&powdrr_schema_table);
+        let sql_builder = SqlBuilder::for_query(&powdrr_schema_table, true);
+        let sql_query = sql_builder.build();
         let sql = sql_query.build(&powdrr_schema_file);
         assert!(sql.contains("as b,"));
     }
