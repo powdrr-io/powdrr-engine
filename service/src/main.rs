@@ -12,6 +12,7 @@ mod distributed_cache;
 mod elastic_search_cluster_info;
 mod elastic_search_commands;
 mod elastic_search_common;
+mod elastic_search_datetime_parser;
 mod elastic_search_endpoints;
 mod elastic_search_index;
 mod elastic_search_ingest;
@@ -19,18 +20,20 @@ mod elastic_search_lifetime_policy;
 mod elastic_search_parser;
 mod elastic_search_pipeline;
 mod elastic_search_responses;
+mod elastic_search_storage_schema;
 mod expression_evaluator;
 mod painless_parser;
 mod pipeline;
 mod private_api;
 mod router;
+mod schema_massager;
 mod state_common;
 mod state_hosted_service;
 mod state_leader;
 mod state_peers;
 mod test_api;
 mod util;
-mod elastic_search_datetime_parser;
+
 
 /// Start a server and call the `Handler` we've defined above for each `Request` we receive.
 // #[tokio::main]

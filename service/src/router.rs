@@ -291,6 +291,7 @@ mod tests {
     use serde_json::Value;
     use crate::elastic_search_responses::{QueryResultTotal, QueryResults};
     use crate::router::router;
+    use crate::schema_massager::PowdrrSchema;
     use crate::state_hosted_service::{IcebergMetadata, SpeedboatMetadata, TableMetadataCheckpoint};
     use crate::state_peers::{PrivateSqlInvocation, SnapshotDescriptor};
 
@@ -313,9 +314,12 @@ mod tests {
             speedboat_metadata: Some(SpeedboatMetadata{ 
                 files: vec!("file:///Users/greg.fee/code/monolith-rust-workspace/service/tests/data/logs.json".to_string()),
                 sizes: vec!(6),
+                schemas: vec!(),
+                file_schemas: vec!(),
             }),
             deletes_metadata: None,
             extension_metadata: None,
+            schema: PowdrrSchema{ fields: vec!() },
         };
 
         let checkpoint_response = test_server.client().post(
@@ -384,6 +388,7 @@ mod tests {
             speedboat_metadata: None,
             deletes_metadata: None,
             extension_metadata: None,
+            schema: PowdrrSchema{ fields: vec!() },
         };
 
         let checkpoint_response = test_server.client().post(
@@ -441,6 +446,7 @@ mod tests {
             speedboat_metadata: None,
             deletes_metadata: None,
             extension_metadata: None,
+            schema: PowdrrSchema{ fields: vec!() },
         };
 
         let checkpoint_response = test_server.client().post(
@@ -502,9 +508,12 @@ mod tests {
             speedboat_metadata: Some(SpeedboatMetadata{ 
                 files: vec!("file:///Users/greg.fee/code/monolith-rust-workspace/service/tests/data/logs.json".to_string()),
                 sizes: vec!(6),
+                schemas: vec!(),
+                file_schemas: vec!()
             }),
             deletes_metadata: None,
             extension_metadata: None,
+            schema: PowdrrSchema{ fields: vec!() },
         };
 
         let checkpoint_response = test_server.client().post(
