@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashMap, fs::File};
 use std::io::Write;
-
+use std::str::FromStr;
 use futures::FutureExt;
 use gotham::mime;
 use http::header::LOCATION;
@@ -14,7 +14,7 @@ use http::StatusCode;
 use idgenerator::*;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::{mpsc, oneshot};
 use uuid_b64::UuidB64;
@@ -24,6 +24,7 @@ use crate::elastic_search_common::{create_normalized_value, load_command_raw_res
 use crate::elastic_search_responses::{BulkResult, ErrorDetails, OperationResult, QueryResultHit, Shards, SingleDocCreateFailedResult};
 use crate::{data_access, distributed_cache};
 use crate::elastic_search_parser::UpdateBody;
+use crate::schema_massager::PowdrrSchema;
 use crate::state_hosted_service::{CreateTable, SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription, API_SERVICE_CLIENT};
 use crate::util::log_err;
 
@@ -48,11 +49,14 @@ fn default_as_false() -> bool {
     false
 }
 
+
+
+
 #[derive(Clone)]
 pub(crate) struct WriteBuffer {
     pub lines: Vec<String>,
+    pub schema: Option<PowdrrSchema>
 }
-
 
 impl Drop for WriteBuffer {
     fn drop(&mut self) {
@@ -64,6 +68,14 @@ impl WriteBuffer {
     pub fn new() -> Self {
         WriteBuffer {
             lines: vec![],
+            schema: None,
+        }
+    }
+
+    pub fn from(schema: PowdrrSchema, lines: Vec<String>) -> Self {
+        WriteBuffer {
+            lines,
+            schema: Some(schema)
         }
     }
 
@@ -78,13 +90,6 @@ impl WriteBuffer {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    fn concat(left: &WriteBuffer, right: &WriteBuffer) -> WriteBuffer {
-        WriteBuffer {
-            lines: [&left.lines[..], &right.lines[..]].concat(),
-        }
-    }
-
     fn extend(&mut self, other: &WriteBuffer) {
         self.lines.extend(other.lines.clone());
     }
@@ -93,6 +98,9 @@ impl WriteBuffer {
         self.lines.len()
     }
 }
+
+
+// Source will always be what the user gave us albeit without formatting guarantees.
 
 
 pub(crate) struct CreateDoc {
@@ -405,11 +413,13 @@ pub(crate) async fn update_aliases(body: &String) -> Result<(), IngestError> {
 
 
 
-fn insert_into_doc(id: &String, version: u32, seq_no: i64, doc: &String) -> String {
-    match doc.find("{") {
-        Some(index) => format!("{}\"_id\": \"{}\", \"_version\": {}, \"_seq_no\": {}, {}", "{", id, version, seq_no, doc[index + 1..].to_string()),
-        None => panic!("Malformed JSON?")
-    }
+fn insert_into_doc(id: &String, version: u32, seq_no: i64, doc: &Value) -> Value {
+    let mut final_doc = doc.clone();
+    let final_doc_map = final_doc.as_object_mut().unwrap();
+    final_doc_map.insert("_id".to_string(), Value::String(id.clone()));
+    final_doc_map.insert("_version".to_string(), json!(version));
+    final_doc_map.insert("_seq_no".to_string(), json!(seq_no));
+    final_doc
 }
 
 
@@ -426,8 +436,8 @@ pub(crate) fn ingest_create(
         Some(id) => id.clone(),
         None => UuidB64::new().to_string()
     };
-    let doc_with_id = insert_into_doc(&id, version, seq_no, &doc.normalized_raw());
-    buffer.lines.push(doc_with_id);
+    let doc_with_id = insert_into_doc(&id, version, seq_no, &doc.normalized_value());
+    buffer.lines.push(serde_json::to_string(&doc_with_id).unwrap());
     OperationResult{
         _index: table_description.name.clone(),
         _id: id,
@@ -444,7 +454,6 @@ pub(crate) fn ingest_create(
         get: None,
     }
 }
-
 
 pub(crate) struct IngestResult {
     tables: HashMap<String, WriteBuffer>,
@@ -464,7 +473,6 @@ impl IngestResult {
             Some(_) => (),
             None => {
                 self.tables.insert(table.clone(), WriteBuffer::new());
-
             }
         }
         self.tables.get_mut(table).unwrap()
@@ -511,6 +519,7 @@ pub(crate) async fn commit_general(buffer: &WriteBuffer, index: &String, commit_
         table_name: index.clone(),
         files: vec!(new_id),
         sizes: vec!(buffer.len() as u32),
+        schema: buffer.schema.clone(),
     };
 
     match API_SERVICE_CLIENT.speedboat_commit(&SpeedboatCommit {
@@ -670,8 +679,8 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
 
 
 
-pub(crate) fn create_delete(doc_id: &String, seq_no: u64) -> String {
-    format!("{{\"_id\": \"{}\", \"_seq_no\": {}}}", doc_id, seq_no)
+pub(crate) fn create_delete(doc_id: &String, seq_no: u64) -> Value {
+    serde_json::Value::from_str(&format!("{{\"_id\": \"{}\", \"_seq_no\": {}}}", doc_id, seq_no)).unwrap()
 }
 
 pub(crate) async fn delete(index: &String, doc_id: &String) -> Result<ElasticSearchResponse, IngestError> {
@@ -705,7 +714,7 @@ pub(crate) async fn delete(index: &String, doc_id: &String) -> Result<ElasticSea
     };
     let mut buffer = WriteBuffer::new();
     // TODO: need to include a version or timestamp in the delete
-    buffer.lines.push(create_delete(doc_id, seq_no));
+    buffer.lines.push(serde_json::to_string(&create_delete(doc_id, seq_no)).unwrap());
     commit_general(&buffer, &table_description.name, &"delete".to_string()).await?;
     Ok(ElasticSearchResponse { status: StatusCode::OK, mime: mime::APPLICATION_JSON, body: "deleted!".to_string(), headers: vec!() })
 }
@@ -785,19 +794,24 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
 }
 
 
+struct IngestAndWriteResult {
+    table_infos: Vec<SpeedboatCommitTableInfo>,
+    result: BulkResult
+}
+
 //TODO this is called but the code analyzer isn't seeing it
 #[allow(dead_code)]
-async fn ingest_and_write(payload: &String) -> Result<(Vec<SpeedboatCommitTableInfo>, BulkResult), IngestError> {
+async fn ingest_and_write(payload: &String) -> Result<IngestAndWriteResult, IngestError> {
     let buffer_items = match ingest(None, payload).await {
         Ok(b) => b,
         Err(e) => return Err(e)
     };
 
     let mut table_infos = vec!();
-    for table_buffer in buffer_items.tables {
-        let new_id = format!("tests/data/ingest/ingest-{}-{}.json", table_buffer.0, IdInstance::next_id().to_string());
-        let write_to_file_result = table_buffer.1.write_to_file(&new_id);
-        tracing::info!("Ingest: table {} wrote {} records", table_buffer.0, table_buffer.1.len());
+    for (name, buffer) in buffer_items.tables {
+        let new_id = format!("tests/data/ingest/ingest-{}-{}.json", name, IdInstance::next_id().to_string());
+        let write_to_file_result = buffer.write_to_file(&new_id);
+        tracing::info!("Ingest: table {} wrote {} records", name, buffer.len());
 
         match write_to_file_result {
             Ok(_) => (),
@@ -805,13 +819,14 @@ async fn ingest_and_write(payload: &String) -> Result<(Vec<SpeedboatCommitTableI
         }
 
         table_infos.push(SpeedboatCommitTableInfo {
-            table_name: table_buffer.0.clone(),
+            table_name: name.clone(),
             files: vec!(new_id),
-            sizes: vec!(table_buffer.1.len() as u32),
+            sizes: vec!(buffer.len() as u32),
+            schema: buffer.schema.clone()
         });
     }
 
-    Ok((table_infos, BulkResult::success(0, buffer_items.operations)))
+    Ok(IngestAndWriteResult{ table_infos, result: BulkResult::success(0, buffer_items.operations)})
 }
 
 
@@ -822,13 +837,13 @@ pub(crate) async fn ingest_and_commit(payload: &String) -> Result<BulkResult, In
         Ok(result) => {
             match API_SERVICE_CLIENT.speedboat_commit(&SpeedboatCommit {
                 commit_type: "commit".to_string(),
-                type_files: result.0,
+                type_files: result.table_infos,
                 compactions: vec!(),
             }).await {
                 Ok(_) => (),
                 Err(_) => panic!("nope")
             }
-            Ok(result.1)
+            Ok(result.result)
         },
         Err(e) => Err(e)
     }
@@ -920,19 +935,20 @@ impl IngestActor {
 
         let mut commit_table_info = vec!();
 
-        for table_entry in &self.tables {
-            let new_id = format!("tests/data/ingest/ingest-{}-{}.json", table_entry.0, IdInstance::next_id().to_string());
-            let write_to_file_result = table_entry.1.write_to_file(&new_id);
-            tracing::info!("Ingest: table {} wrote {} records", table_entry.0, table_entry.1.len());
+        for (name, buffer) in &self.tables {
+            let new_id = format!("tests/data/ingest/ingest-{}-{}.json", name, IdInstance::next_id().to_string());
+            let write_to_file_result = buffer.write_to_file(&new_id);
+            tracing::info!("Ingest: table {} wrote {} records", name, buffer.len());
             match write_to_file_result {
                 Ok(_) => (),
                 Err(_) => return Err(IngestError { message: "File error".to_string() }),
             }
             commit_table_info.push(
                 SpeedboatCommitTableInfo { 
-                    table_name: table_entry.0.clone(),
+                    table_name: name.clone(),
                     files: vec!(new_id),
-                    sizes: vec!(table_entry.1.len().try_into().unwrap()),
+                    sizes: vec!(buffer.len().try_into().unwrap()),
+                    schema: buffer.schema.clone()
                 }
             );
         }

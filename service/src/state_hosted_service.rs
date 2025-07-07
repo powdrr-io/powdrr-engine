@@ -9,6 +9,7 @@ use tokio::sync::{mpsc, oneshot::{self, error::RecvError}};
 use crate::{distributed_cache, elastic_search_ingest::CreateIndexTemplateBody, pipeline::PipelineDefinition, state_peers::SnapshotDescriptor};
 use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
+use crate::schema_massager::PowdrrSchema;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct SpeedboatCSpeedInfo {
@@ -22,6 +23,7 @@ pub(crate) struct SpeedboatCommitTableInfo {
     pub table_name: String,
     pub files: Vec<String>,
     pub sizes: Vec<u32>,
+    pub schema: Option<PowdrrSchema>,
 }
 
 
@@ -54,6 +56,8 @@ pub(crate) struct IcebergCommit {
 pub(crate) struct SpeedboatMetadata {
     pub files: Vec<String>,
     pub sizes: Vec<u32>,
+    pub schemas: Vec<PowdrrSchema>,
+    pub file_schemas: Vec<u64>,
 }
 
 
@@ -106,6 +110,7 @@ pub(crate) struct TableMetadataCheckpoint {
     pub speedboat_metadata: Option<SpeedboatMetadata>,
     pub deletes_metadata: Option<DeletesMetadata>,
     pub extension_metadata: Option<Vec<(String, ExtensionMetadata)>>,
+    pub schema: PowdrrSchema,
 }
 
 
@@ -763,6 +768,7 @@ impl TestApiServiceClient {
                         speedboat_metadata: None,
                         deletes_metadata: None,
                         extension_metadata: None,
+                        schema: PowdrrSchema{ fields: vec!() },
                     }
                 },
             };
@@ -772,6 +778,8 @@ impl TestApiServiceClient {
                 None => SpeedboatMetadata {
                     files: table_info.files.clone(),
                     sizes: table_info.sizes.clone(),
+                    schemas: vec!(),
+                    file_schemas: vec!(),
                 },
                 Some(existing) => {
                     let mut files = existing.files.clone();
@@ -783,6 +791,8 @@ impl TestApiServiceClient {
                     SpeedboatMetadata {
                         files: files,
                         sizes: sizes,
+                        schemas: vec!(),
+                        file_schemas: vec!(),
                     }
                 },
             };
@@ -799,7 +809,8 @@ impl TestApiServiceClient {
                 iceberg_metadata: latest_checkpoint.iceberg_metadata.clone(),
                 speedboat_metadata: Some(new_speedboat_metadata.clone()),
                 deletes_metadata: latest_checkpoint.deletes_metadata.clone(),
-                extension_metadata: latest_checkpoint.extension_metadata.clone(),                
+                extension_metadata: latest_checkpoint.extension_metadata.clone(),   
+                schema: latest_checkpoint.schema.clone(),
             };
 
             self.checkpoints.insert(format!("{}_{}", &table_info.table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
@@ -837,6 +848,7 @@ impl TestApiServiceClient {
                         speedboat_metadata: None,
                         deletes_metadata: None,
                         extension_metadata: None,
+                        schema: PowdrrSchema{ fields: vec!() },
                     }
                 },
             };
@@ -866,7 +878,8 @@ impl TestApiServiceClient {
                 iceberg_metadata: latest_checkpoint.iceberg_metadata.clone(),
                 speedboat_metadata: latest_checkpoint.speedboat_metadata.clone(),
                 deletes_metadata: Some(new_deletes_metadata),
-                extension_metadata: latest_checkpoint.extension_metadata.clone(),                
+                extension_metadata: latest_checkpoint.extension_metadata.clone(),  
+                schema: latest_checkpoint.schema.clone(),
             };
 
             self.checkpoints.insert(format!("{}_{}", &table_info.table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
@@ -1022,6 +1035,7 @@ impl ApiServiceClient for TestApiServiceClient {
                     speedboat_metadata: None,
                     deletes_metadata: None,
                     extension_metadata: None,
+                    schema: PowdrrSchema{ fields: vec!() },
                 }
             },
         };
@@ -1037,6 +1051,8 @@ impl ApiServiceClient for TestApiServiceClient {
                 Some(SpeedboatMetadata {
                     files: files,
                     sizes: sizes,
+                    schemas: vec!(),
+                    file_schemas: vec!(),
                 })
             },
         };     
@@ -1047,7 +1063,8 @@ impl ApiServiceClient for TestApiServiceClient {
             iceberg_metadata: Some(iceberg_commit.metadata.clone()),
             speedboat_metadata: new_speedboat_metadata,
             deletes_metadata: latest_checkpoint.deletes_metadata.clone(),
-            extension_metadata: latest_checkpoint.extension_metadata.clone(),                
+            extension_metadata: latest_checkpoint.extension_metadata.clone(), 
+            schema: latest_checkpoint.schema.clone(),
         };
 
         self.checkpoints.insert(format!("{}_{}", &table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
