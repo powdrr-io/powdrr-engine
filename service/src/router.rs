@@ -683,6 +683,105 @@ mod tests {
     }
 
     #[test]
+    fn test_es_ingest_then_search_table_for_nonexistent() {
+        let test_server = &*TEST_SERVER;
+
+        test_server.client().put(
+            "http://localhost/_test/v1/_testing_mode",
+            "",
+            mime::TEXT_PLAIN
+        ).perform().unwrap();
+
+        let body_create_index = r#"{
+            "settings" : {
+                "index": {
+                "number_of_shards" : 2,
+                "number_of_replicas" : 1
+            } } }"#;
+
+        let response_create_index = test_server.client().put(
+            "http://localhost/logs",
+            body_create_index,
+            mime::APPLICATION_JSON,
+        ).perform().unwrap();
+
+        assert_eq!(response_create_index.status(), 200);
+
+        let body = r#"{"create":{ "_index": "logs" }}
+{ "@timestamp": "2099-03-08T11:04:05.000Z", "index_col": 1, "user": { "id": "vlb44hny" }, "message": "Login attempt failed" }
+{"create":{ "_index": "logs" }}
+{ "@timestamp": "2099-03-08T11:06:07.000Z", "index_col": 2, "user": { "id": "8a4f500d" }, "message": "Login successful" }
+{"create":{ "_index": "logs" }}
+{ "@timestamp": "2099-03-09T11:07:08.000Z", "index_col": 3, "user": { "id": "l7gk7f82" }, "message": "Logout successful" }"#;
+
+        let response = test_server.client().post(
+            "http://localhost/_bulk",
+            body,
+            mime::APPLICATION_JSON,
+        ).perform().unwrap();
+
+        assert_eq!(response.status(), 200);
+
+        let process_work_response = test_server.client().put(
+            "http://localhost/_test/v1/_process_work",
+            "",
+            mime::TEXT_PLAIN,
+        ).perform().unwrap();
+
+        assert_eq!(process_work_response.status(), 200);
+
+        let body_obj  = r#"
+        {
+           "query": {
+    "bool": {
+      "filter": [
+        {
+          "bool": {
+            "should": [
+              {
+                "bool": {
+                  "must": [
+                    {
+                      "term": {
+                        "type": "space"
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "minimum_should_match": 1
+          }
+        }
+      ]
+    }
+  }
+}"#;
+
+        let response_result = test_server.client().post(
+            "http://localhost/logs/_search",
+            body_obj,
+            mime::APPLICATION_JSON,
+        ).perform();
+
+        match response_result {
+            Ok(response) => {
+                assert_eq!(response.status(), 200);
+                let body = response.read_body().unwrap();
+                let str_body = str::from_utf8(&body).unwrap();
+                let json_body: serde_json::Value = serde_json::from_str(&str_body).unwrap();
+                let hits = json_body["hits"]["hits"].as_array().unwrap();
+                assert_eq!(hits.len(), 0);
+            },
+            Err(e) => {
+                panic!("Failed {}", e)
+            }
+        }
+
+    }
+
+
+    #[test]
     fn test_es_ingest_then_search_table_agg() {
         let test_server = &*TEST_SERVER;
 
@@ -1258,7 +1357,7 @@ mod tests {
              }
            },
            "script": {
-              "script": "ctx._source.dude = params.foo",
+              "source": "ctx._source.dude = params.foo",
               "lang": "painless",
               "params" : {
                 "foo": "bar"
