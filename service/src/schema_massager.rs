@@ -195,6 +195,85 @@ impl SqlExpression {
         }
     }
 
+    fn explode_ref(&self, table: &String, name: &String, original_schema: &HashMap<String, PowdrrField>, target_schema: &HashMap<String, PowdrrField>) -> HashMap<String, Self> {
+        assert_eq!(table, "t");
+        let denormalized_name = name.replace(".", "_");
+        let original_schema_field = Self::lookup_field(original_schema, &denormalized_name);
+        let target_schema_field = Self::lookup_field(target_schema, &denormalized_name);
+        if original_schema_field.is_none() {
+            HashMap::from([("".to_string(), self.clone())])
+        } else if target_schema_field.is_some() {
+            self.explode_partial_ref(&"".to_string(), &original_schema_field.unwrap(), &target_schema_field.unwrap())
+            //self.populate_field(&denormalized_name, &original_schema_field.unwrap(), &target_schema_field.unwrap())
+        } else {
+            self.explode_full_ref(&"".to_string(), &original_schema_field.unwrap())
+        }
+    }
+
+    fn explode_partial_ref(&self, prefix: &String, original_field: &PowdrrField, target_field: &PowdrrField) -> HashMap<String, Self> {
+        let original_inner_fields = match &original_field.data_type {
+            PowdrrDataType::Object(schema) => {
+                schema.fields.clone()
+            },
+            _ => {
+                return HashMap::from([(
+                    prefix.clone(),
+                    self.make_exploded_ref(prefix)
+                )]);
+            }
+        };
+
+        let target_inner_fields_map = match &target_field.data_type {
+            PowdrrDataType::Object(schema) => {
+                schema.to_map()
+            },
+            _ => {
+                return HashMap::from([(
+                    prefix.clone(),
+                    self.make_exploded_ref(prefix)
+                )]);
+            }
+        };
+
+        let mut result = HashMap::new();
+        for field in original_inner_fields.iter() {
+            let target_field = target_inner_fields_map.get(&field.name);
+            match target_field {
+                Some(tf) => {
+                    result.extend(self.explode_partial_ref(&format!("{}_{}", prefix, field.name), &field, &tf));
+                },
+                None => {
+                    result.extend(self.explode_full_ref(&format!("{}_{}", prefix, field.name), &field));
+                }
+            }
+        }
+        result
+    }
+
+    fn explode_full_ref(&self, prefix: &String, field: &PowdrrField) -> HashMap<String, Self> {
+        match &field.data_type {
+            PowdrrDataType::Object(schema) => {
+                let mut result = HashMap::new();
+                for field in schema.fields.iter() {
+                    result.extend(self.explode_full_ref(&format!("{}_{}", prefix, field.name), &field));
+                }
+                result
+            },
+            _ => {
+                HashMap::from([(prefix.clone(), Self::literal_default(field))])
+            }
+        }
+    }
+
+    fn make_exploded_ref(&self, prefix: &String) -> Self {
+        match self {
+            SqlExpression::FieldRef(table, name) => {
+                SqlExpression::FieldRef(table.clone(), format!("{}{}", name, prefix))
+            },
+            _ => panic!("Expected a field ref")
+        }
+    }
+
     fn finalize(&self, original_schema: &HashMap<String, PowdrrField>, target_schema: &HashMap<String, PowdrrField>) -> Self {
         match self {
             SqlExpression::And(exprs) => {
@@ -230,8 +309,8 @@ impl SqlExpression {
                 let original_schema_field = Self::lookup_field(original_schema, &denormalized_name);
                 let target_schema_field = Self::lookup_field(target_schema, &denormalized_name);
                 if original_schema_field.is_none() {
-                    self.clone()
-                }else if target_schema_field.is_some() {
+                    SqlExpression::LiteralNonString("null".to_string())
+                } else if target_schema_field.is_some() {
                     self.populate_field(&denormalized_name, &original_schema_field.unwrap(), &target_schema_field.unwrap())
                 } else {
                     Self::literal_default(&original_schema_field.unwrap())
@@ -273,7 +352,6 @@ impl SqlExpression {
             },
             SqlExpression::Or(exprs) => {
                 SqlExpression::Or(exprs.iter().map(|x| x.finalize(original_schema, target_schema)).collect())
-
             }
         }
     }
@@ -407,10 +485,21 @@ pub(crate) struct FieldExpression {
 }
 
 impl FieldExpression {
-    fn finalize(&self, original_schema: &HashMap<String, PowdrrField>, target_schema: &HashMap<String, PowdrrField>) -> Self {
-        FieldExpression {
-            name: self.name.clone(),
-            expression: self.expression.finalize(original_schema, target_schema)
+    fn finalize(&self, original_schema: &HashMap<String, PowdrrField>, target_schema: &HashMap<String, PowdrrField>) -> Vec<Self> {
+        match &self.expression {
+            SqlExpression::FieldRef(table, name) if table == "t" => {
+                let exploded_ref = self.expression.explode_ref(table, name, original_schema, target_schema);
+                exploded_ref.iter().map(|(name_suffix, expression)|FieldExpression{
+                    name: format!("{}{}", self.name, name_suffix),
+                    expression: expression.clone(),
+                }).collect()
+            },
+            _ => {
+                vec!(FieldExpression {
+                    name: self.name.clone(),
+                    expression: self.expression.finalize(original_schema, target_schema)
+                })
+            }
         }
     }
 
@@ -473,6 +562,7 @@ impl SqlBuilder {
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_all_fields_testing_only(&mut self) -> () {
         self.all_fields = true;
     }
@@ -592,7 +682,7 @@ impl SqlQuery {
             }
         }
         for field in fields_copy.iter() {
-            final_fields.push(field.finalize(original_schema, target_schema).stringize());
+            final_fields.extend(field.finalize(original_schema, target_schema).iter().map(|f|f.stringize()));
         }
         final_fields.join(", ")
     }
@@ -704,7 +794,7 @@ mod tests {
 
     #[test]
     fn test_default_missing_fields_schema() {
-        let test_val_table = r#"{"_seq_no": 1, "a": 1, "b": "2", "c": 3.3, "d":{"e": 4, "f": 5}, "g": [1, 2, 3]}"#;
+        let test_val_table = r#"{"_seq_no": 1, "a": 1, "b": "2", "c": 3.3, "d":{"e": 4, "f": 5}, "g": [1, 2, 3], "h": {"i": 1, "j": 2}}"#;
         let test_val_file = r#"{"_seq_no": 1, "a": 1, "c": 3.3, "d":{"e": 4}, "g": [1, 2, 3]}"#;
         let (schema, _) = infer_json_schema(test_val_table.as_bytes(), None).unwrap();
         let powdrr_schema_table = to_powdrr_schema(&schema);
@@ -715,7 +805,7 @@ mod tests {
         let sql_query = sql_builder.build();
         let sql = sql_query.build(&powdrr_schema_table, &powdrr_schema_file);
         assert!(sql.contains("null as b"));
-        assert!(sql.contains("'f', null"));
+        assert!(sql.contains("null as d_f"));
     }
 
     #[test]

@@ -16,11 +16,11 @@ use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::elastic_search_parser::{process_aggregations, Aggregation};
 use crate::elastic_search_responses::{AggregationResult, QueryResultsNotFound, UpdateByQueryResults, UpdateByQueryResultsRetries, UpdateByQuerySuccess};
 use crate::elastic_search_storage_schema::{RecordInput, WriteBufferBuilder};
-use crate::schema_massager::{SqlBuilder, SqlExpression, SqlQuery};
+use crate::schema_massager::{to_powdrr_schema, PowdrrSchema, SqlBuilder, SqlExpression, SqlQuery};
 
 async fn empty_result(aggs: Option<Vec<Aggregation>>, total_hits_complex: bool) -> Arc<dyn CommandResponse> {
     // TODO: need to record and feed through the requested number of shards from index creation
-    let aggregation_results = SqlCommand::generate_aggregations(None, aggs).await;
+    let aggregation_results = SqlCommand::generate_aggregations(None, aggs, None).await;
     Arc::new(QueryResults::empty(50, 1, aggregation_results, total_hits_complex))
 }
 
@@ -48,7 +48,7 @@ fn to_hit(index: &String, value: &Value) -> QueryResultHit {
     }
 }
 
-pub(crate) async fn to_serde_value(data_frame: &DataFrame) -> Vec<Value> {
+pub(crate) async fn to_serde_value(data_frame: &DataFrame) -> (Vec<Value>, Option<PowdrrSchema>) {
     let record_batches: Vec<RecordBatch> = match data_frame.clone().collect().await {
         Ok(b) => b,
         Err(e) => {
@@ -56,7 +56,12 @@ pub(crate) async fn to_serde_value(data_frame: &DataFrame) -> Vec<Value> {
             println!("{}", error);
             panic!("nope");
         }
-    };        
+    };
+
+    let schema = match record_batches.len() {
+        0 => None,
+        _ => Some(to_powdrr_schema(&record_batches.get(0).unwrap().schema())),
+    };
     
     let record_batch_references: Vec<&RecordBatch> = record_batches.iter().map(|r| r).collect();
 
@@ -73,14 +78,14 @@ pub(crate) async fn to_serde_value(data_frame: &DataFrame) -> Vec<Value> {
 
     let parsed_json: Vec<Value> = reader.lines().map(|x|serde_json::from_str(x).unwrap()).collect();
 
-    parsed_json    
+    (parsed_json, schema)
 }
 
-async fn to_hits(index: &String, data_frame: &DataFrame) -> Vec<QueryResultHit> {
-    let parsed_json = to_serde_value(data_frame).await;
+async fn to_hits(index: &String, data_frame: &DataFrame) -> (Vec<QueryResultHit>, Option<PowdrrSchema>) {
+    let (parsed_json, schema) = to_serde_value(data_frame).await;
 
     let hits = parsed_json.iter().map(|x|to_hit(index, &x)).collect();
-    hits
+    (hits, schema)
 }
 
 
@@ -132,7 +137,7 @@ impl Command for LookupById {
         async move {
             let result = match LookupById::to_dataframe(result_table_name).await {
                 Some(df) => {
-                    let hits = to_hits(&table, &df).await;
+                    let (hits, _) = to_hits(&table, &df).await;
                     let inner_result: Arc<dyn CommandResponse> = if hits.len() == 0 {
                         Arc::new(QueryResultsNotFound { _index: table, _id: ids.get(0).unwrap().clone(), found: false })
                     } else {
@@ -233,12 +238,12 @@ impl SqlCommand {
         }
     }
     
-    async fn generate_aggregations(table_name: Option<String>, aggs: Option<Vec<Aggregation>>) -> Option<HashMap<String, AggregationResult>> {
+    async fn generate_aggregations(schema: Option<PowdrrSchema>, aggs: Option<Vec<Aggregation>>, table_name: Option<String>) -> Option<HashMap<String, AggregationResult>> {
         if aggs.is_none() {
             return None
         }
         
-        Some(process_aggregations(aggs, table_name).await)
+        Some(process_aggregations(schema, aggs, table_name).await)
     }
 }
 
@@ -278,9 +283,9 @@ impl Command for SqlCommand {
                 Err(_) => panic!("nope"),
             };
 
-            let hits = to_hits(&table, &first_10_rows).await;
+            let (hits, schema) = to_hits(&table, &first_10_rows).await;
 
-            let aggregations = SqlCommand::generate_aggregations(Some(final_table_name), aggs).await;
+            let aggregations = SqlCommand::generate_aggregations(schema, aggs, Some(final_table_name)).await;
             // TODO: need to calculate the actual max score here
             let max_score = hits.get(0).unwrap()._score.unwrap();
             let final_result = QueryResults::success(
@@ -501,7 +506,7 @@ impl Command for UpdateByQueryCommand {
                 Err(_) => panic!("nope")
             };
 
-            let result_values = to_hits(&table, &data_frame).await;
+            let (result_values, _) = to_hits(&table, &data_frame).await;
 
             let final_result_values: Vec<EvalResult> = result_values.iter().map(|x|UpdateByQueryCommand::evaluate(&script_block, x)).collect();
 
