@@ -9,8 +9,6 @@ use gotham::pipeline::single_pipeline;
 use gotham::prelude::NewMiddleware;
 use gotham::prelude::StaticResponseExtender;
 use gotham::state::StateData;
-use http::HeaderMap;
-use http::Uri;
 use serde::Deserialize;
 use std::pin::Pin;
 
@@ -78,11 +76,12 @@ impl Middleware for RouterMiddleware {
     where
         Chain: FnOnce(State) -> Pin<Box<HandlerFuture>> + Send + 'static,
         Self: Sized {
+            /* Uncomment to dump all request headers
             let uri = state.borrow::<Uri>();
             println!("Uri = {}", uri);
             let headers = state.borrow::<HeaderMap>();
             headers.iter().for_each(|x|println!("{} = {:?}", x.0, x.1));
-
+            */ 
             // We're finished working on the Request, so allow other components to continue processing
             // the Request.
             //
@@ -411,7 +410,7 @@ mod tests {
         };
 
 
-        let mut builder = SqlBuilder::for_agg(&schema);
+        let mut builder = SqlBuilder::for_agg();
         builder.set_all_fields_testing_only();
         builder.filter(SqlExpression::Like(
             Box::new(SqlExpression::FieldRef("t".to_string(), "snippet".to_string())),
@@ -435,8 +434,9 @@ mod tests {
 
         assert_eq!(response.status(), 200);
         let body = response.read_body().unwrap();
-        let str_body = str::from_utf8(&body).unwrap();
-        print!("{}", str_body);
+        let _str_body = str::from_utf8(&body).unwrap();
+
+        // TODO: add some validation
         
     }    
 
@@ -593,7 +593,6 @@ mod tests {
         
     }
 
-
     #[test]
     fn test_es_ingest_then_search_table() {
         let test_server = &*TEST_SERVER;
@@ -664,7 +663,17 @@ mod tests {
                 assert_eq!(response.status(), 200);
                 let body = response.read_body().unwrap();
                 let str_body = str::from_utf8(&body).unwrap();
-                print!("{}", str_body);
+                let json_body: serde_json::Value = serde_json::from_str(&str_body).unwrap();
+                let hits = json_body["hits"]["hits"].as_array().unwrap();
+                assert_eq!(hits.len(), 2);
+                let first_hit = hits[0].as_object().unwrap();
+                let first_hit_message = first_hit["_source"]["message"].as_str().unwrap();
+                let second_hit = hits[1].as_object().unwrap();
+                let second_hit_message = second_hit["_source"]["message"].as_str().unwrap();
+                // Annoying because order is not guaranteed.
+                assert!(second_hit_message.contains("Login successful") || second_hit_message.contains("Login attempt failed"));
+                assert!(first_hit_message.contains("Login successful") || first_hit_message.contains("Login attempt failed"));
+                assert_ne!(first_hit_message, second_hit_message);
             },
             Err(e) => {
                 panic!("Failed {}", e)

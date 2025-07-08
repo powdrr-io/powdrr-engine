@@ -66,6 +66,7 @@ struct FileDescriptor {
 }
 
 struct RequiredFiles {
+    table_schema: PowdrrSchema,
     iceberg_files: Vec<FileDescriptor>,
     speedboat_files: Vec<FileDescriptor>,
     delete_files: Vec<String>,
@@ -109,7 +110,12 @@ fn filter_iceberg<'a>(invocation: &'a PrivateSqlInvocation, iceberg_metadata: &'
 
 fn filter_speedboat<'a>(_invocation: &'a PrivateSqlInvocation, speedboat_metadata: &'a Option<SpeedboatMetadata>) -> Vec<FileDescriptor> {
     match speedboat_metadata {
-        Some(sm) => sm.files.iter().map(|f|FileDescriptor{ file_path: f.clone(), schema: PowdrrSchema::empty() }).collect(),
+        Some(sm) => {
+            sm.files.iter().enumerate().map(|(index, file_path)|FileDescriptor{
+                file_path: file_path.clone(),
+                schema: sm.schemas.get(*sm.file_schemas.get(index).unwrap() as usize).unwrap().clone(),
+            }).collect()
+        },
         None => vec!()
     }
 }
@@ -129,6 +135,7 @@ async fn determine_required_files(invocation: &PrivateSqlInvocation) -> Result<R
     let filtered_iceberg_files = filter_iceberg(invocation, &table_metadata.iceberg_metadata);
     let filtered_speedboat_files = filter_speedboat(invocation, &table_metadata.speedboat_metadata);
     Ok(RequiredFiles {
+        table_schema: table_metadata.schema.clone(),
         iceberg_files: filtered_iceberg_files.to_vec(),
         speedboat_files: filtered_speedboat_files.to_vec(),
         delete_files: table_metadata.deletes_metadata.map_or_else(|| vec!(), |d|d.files.clone()),
@@ -231,7 +238,7 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation) -> Result<Data
             Ok(ln) => ln,
             Err(e) => return Err(PrivateApiError::from(e)),
         };
-        let local_results = match execute_sql(&invocation.sql.build(&iceberg_file.schema), &local_name, &all_deletes_local_name).await {
+        let local_results = match execute_sql(&invocation.sql.build(&required_files.table_schema, &iceberg_file.schema), &local_name, &all_deletes_local_name).await {
             Ok(vrb) => vrb,
             Err(e) => return log_err(PrivateApiError::from(e)),
         };
@@ -242,7 +249,7 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation) -> Result<Data
             Ok(ln) => ln,
             Err(e) => return log_err(PrivateApiError::from(e)),
         };
-        let local_results = match execute_sql(&invocation.sql.build(&speedboat_file.schema), &local_name, &all_deletes_local_name).await {
+        let local_results = match execute_sql(&invocation.sql.build(&required_files.table_schema, &speedboat_file.schema), &local_name, &all_deletes_local_name).await {
             Ok(vrb) => vrb,
             Err(e) => return log_err(PrivateApiError::from(e)),
         };

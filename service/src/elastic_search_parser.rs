@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::string::ToString;
+use std::sync::{Arc, LazyLock};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -9,7 +10,33 @@ use crate::elastic_search_common::{Command, ParseError};
 use crate::elastic_search_datetime_parser;
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::elastic_search_responses::{AggregationResult, AverageAggregationResult, CardinalityAggregationResult, FilterAggregationResult, HistogramAggregationResult, RangeAggregationBucket, RangeAggregationResult, TermAggregationBucket, TermAggregationResult};
-use crate::schema_massager::{FieldExpression, PowdrrSchema, SqlBuilder, SqlExpression, SqlQuery};
+use crate::schema_massager::{FieldExpression, PowdrrDataType, PowdrrField, PowdrrSchema, SqlBuilder, SqlExpression, SqlQuery};
+
+
+static TERM_AGG_SCHEMA: LazyLock<PowdrrSchema> = LazyLock::new(|| PowdrrSchema::from(&vec!(
+    PowdrrField{ name: "field_name".to_string(), data_type: PowdrrDataType::String},
+    PowdrrField{ name: "cnt".to_string(), data_type: PowdrrDataType::String},
+)));
+
+static RANGE_AGG_SCHEMA: LazyLock<PowdrrSchema> = LazyLock::new(|| PowdrrSchema::from(&vec!(
+    PowdrrField{ name: "field_name".to_string(), data_type: PowdrrDataType::String},
+    PowdrrField{ name: "cnt".to_string(), data_type: PowdrrDataType::String},
+)));
+
+static AVERAGE_AGG_SCHEMA: LazyLock<PowdrrSchema> = LazyLock::new(|| PowdrrSchema::from(&vec!(
+    PowdrrField{ name: "field_name".to_string(), data_type: PowdrrDataType::String},
+    PowdrrField{ name: "cnt".to_string(), data_type: PowdrrDataType::String},
+)));
+
+static CARDINALITY_AGG_SCHEMA: LazyLock<PowdrrSchema> = LazyLock::new(|| PowdrrSchema::from(&vec!(
+    PowdrrField{ name: "field_name".to_string(), data_type: PowdrrDataType::String},
+    PowdrrField{ name: "cnt".to_string(), data_type: PowdrrDataType::String},
+)));
+
+static FILTER_AGG_SCHEMA: LazyLock<PowdrrSchema> = LazyLock::new(|| PowdrrSchema::from(&vec!(
+    PowdrrField{ name: "field_name".to_string(), data_type: PowdrrDataType::String},
+    PowdrrField{ name: "cnt".to_string(), data_type: PowdrrDataType::String},
+)));
 
 #[derive(Clone)]
 pub(crate) struct TermAggProcessor {
@@ -29,7 +56,7 @@ impl TermAggProcessor {
     }
 
     async fn create_buckets(table_name: &String, query: &SqlQuery) -> Vec<TermAggregationBucket> {
-        let final_sql = query.build_same().replace("{target_table}", table_name);
+        let final_sql = query.build_same(&TERM_AGG_SCHEMA).replace("{target_table}", table_name);
         let data_frame = match execute_sql(&final_sql).await {
             Ok(df) => df,
             Err(_) => panic!("nope")
@@ -81,7 +108,7 @@ impl RangeAggProcessor {
 
         let doc_count = match &table_name {
             Some(t) => {
-                let final_sql = bucket_spec.sql.build_same().replace("{target_table}", t);
+                let final_sql = bucket_spec.sql.build_same(&RANGE_AGG_SCHEMA).replace("{target_table}", t);
                 let data_frame = match execute_sql(&final_sql).await {
                     Ok(df) => df,
                     Err(_) => panic!("nope")
@@ -154,7 +181,7 @@ impl AverageAggProcessor {
         let child_aggs = process_aggregations(subaggregations, table_name.clone()).await;
 
         let avg = match &table_name {
-            Some(t) => AverageAggProcessor::calculate_average(t, &self.sql.build_same()).await,
+            Some(t) => AverageAggProcessor::calculate_average(t, &self.sql.build_same(&AVERAGE_AGG_SCHEMA)).await,
             None => 0.0
         };
 
@@ -189,7 +216,7 @@ impl CardinalityAggProcessor {
         let child_aggs = process_aggregations(subaggregations, table_name.clone()).await;
 
         let type_count = match &table_name {
-            Some(t) => CardinalityAggProcessor::calculate_cardinality(t, &self.sql.build_same()).await,
+            Some(t) => CardinalityAggProcessor::calculate_cardinality(t, &self.sql.build_same(&CARDINALITY_AGG_SCHEMA)).await,
             None => 0
         };
         AggregationResult::Cardinality(CardinalityAggregationResult{
@@ -229,7 +256,7 @@ impl FilterAggProcessor {
     async fn process(&self, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
         let doc_count = match &table_name {
             Some(t) => {
-                let final_sql = self.sql.build_same().replace("{target_table}", t);
+                let final_sql = self.sql.build_same(&FILTER_AGG_SCHEMA).replace("{target_table}", t);
                 let data_frame = execute_sql(&final_sql).await.unwrap();
                 assert_eq!(data_frame.schema().columns().len(), 1);
                 let serde_values = to_serde_value(&data_frame).await;
@@ -682,36 +709,6 @@ pub(crate) struct SimpleQueryStringBody {
     query: String,
     fields: Vec<String>,
     default_operator: String,
-}
-
-#[derive(Clone)]
-pub(crate) enum FilterExpression {
-    And(Vec<FilterExpression>),
-    Or(Vec<FilterExpression>),
-    Not(Box<FilterExpression>),
-    Expr(String),
-}
-
-impl FilterExpression {
-    pub fn and(exprs: Vec<FilterExpression>) -> Option<Self> {
-        if exprs.len() == 0 {
-            None
-        } else if exprs.len() == 1 {
-            Some(exprs.get(0).unwrap().clone())
-        } else {
-            Some(FilterExpression::And(exprs))
-        }
-    }
-
-    pub fn or(exprs: Vec<FilterExpression>) -> Option<Self> {
-        if exprs.len() == 0 {
-            None
-        } else if exprs.len() == 1 {
-            Some(exprs.get(0).unwrap().clone())
-        } else {
-            Some(FilterExpression::Or(exprs))
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1223,9 +1220,6 @@ fn to_sql_match(builder: &mut SqlBuilder, match_obj: &Match) -> Result<(), Parse
     }
 
     builder.calculate_score = true;
-    if builder.joins.len() == 0 {
-        builder.joins.push("INNER JOIN {target_table}_search_index si on si.doc_id = t._id".to_string());
-    }
 
     builder.push_filter_context();
     for pair in match_obj._match.iter() {
@@ -1312,7 +1306,7 @@ fn convert_datetime_if_necessary(value: &str) -> String {
         value.to_string()
     };
 
-    format!("'{}'", converted_value)
+    converted_value
 }
 
 fn to_sql_range(builder: &mut SqlBuilder, range_obj: &Range) -> Result<(), ParseError> {
@@ -1377,7 +1371,7 @@ fn to_sql_simple_query(builder: &mut SqlBuilder, query_obj: &SimpleQueryString) 
 mod tests {
     use crate::elastic_search_endpoints::QueryStringSearch;
     use crate::elastic_search_parser::{parse, UpdateByQueryBody};
-
+    use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
     use super::{to_command, SearchBody};
 
     #[test]
@@ -1431,7 +1425,15 @@ mod tests {
 
         let command = to_command(Some("testtime".to_string()), &parse_result, &QueryStringSearch::new()).unwrap();
 
-        println!("{}", command.sql.build_same());
+        let schema = PowdrrSchema::from(&vec!(
+            PowdrrField{ name: "message".to_string(), data_type: PowdrrDataType::String},
+            PowdrrField{ name: "_seq_no".to_string(), data_type: PowdrrDataType::Integer},
+        ));
+
+        let sql = command.sql.build_same(&schema);
+
+        assert!(sql.contains("t.\"message\""));
+        assert!(sql.contains("si.\"field_name\" = 'message'"));
     }
 
     #[test]
@@ -1491,7 +1493,14 @@ mod tests {
 
         let command = to_command(Some("testtime".to_string()), &parse_result, &QueryStringSearch::new()).unwrap();
 
-        println!("{}", command.sql.build_same());
+        let schema = PowdrrSchema::from(&vec!(
+            PowdrrField{ name: "type".to_string(), data_type: PowdrrDataType::String},
+            PowdrrField{ name: "ingest-package-policies_package_name".to_string(), data_type: PowdrrDataType::String},
+            PowdrrField{ name: "task_runAt".to_string(), data_type: PowdrrDataType::String},
+            PowdrrField{ name: "_seq_no".to_string(), data_type: PowdrrDataType::Integer},
+        ));
+
+        println!("{}", command.sql.build_same(&schema));
 
         let test_val = r#"{
   "size": 20,
@@ -1628,7 +1637,13 @@ mod tests {
 
         let command = to_command(Some("testtime".to_string()), &parse_result, &QueryStringSearch::new()).unwrap();
 
-        println!("{}", command.sql.build_same());
+        let schema = PowdrrSchema::from(&vec!(
+            PowdrrField{ name: "type".to_string(), data_type: PowdrrDataType::String},
+            PowdrrField{ name: "ingest-package-policies_package_name".to_string(), data_type: PowdrrDataType::String},
+            PowdrrField{ name: "_seq_no".to_string(), data_type: PowdrrDataType::Integer},
+        ));
+
+        println!("{}", command.sql.build_same(&schema));
 
         let test_val = r#"{
   "size": 1000,

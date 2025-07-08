@@ -1,5 +1,5 @@
 use serde_json::Value;
-use crate::elastic_search_common::create_normalized_value;
+use crate::elastic_search_common::create_denormalized_value;
 use crate::elastic_search_ingest::WriteBuffer;
 use crate::schema_massager::{extract_powdrr_schema_option, PowdrrSchema};
 
@@ -16,12 +16,13 @@ impl RecordInput {
     pub fn ensure_normalized_value(&mut self) -> () {
         if self.existing_normalized.is_none() {
             let mut values = serde_json::Map::new();
+            let denormalized_value = create_denormalized_value(&self.source);
             values.insert("_id".to_string(), Value::String(self._id.clone()));
             values.insert("_seq_no".to_string(), Value::Number(self._seq_no.into()));
             values.insert("_version".to_string(), Value::Number(self._version.into()));
-            values.insert("source".to_string(), Value::String(serde_json::to_string(&self.source).unwrap()));
-            let normalized_value = create_normalized_value(&Value::Object(values));
-            self.existing_normalized = Some(normalized_value);
+            values.insert("_source".to_string(), Value::String(serde_json::to_string(&self.source).unwrap()));
+            values.extend(denormalized_value.as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())));
+            self.existing_normalized = Some(Value::Object(values));
         }
     }
 
@@ -31,7 +32,7 @@ impl RecordInput {
     }
 }
 
-
+#[derive(Clone)]
 pub(crate) struct WriteBufferBuilder {
     pub records: Vec<RecordInput>
 }
@@ -39,6 +40,10 @@ pub(crate) struct WriteBufferBuilder {
 impl WriteBufferBuilder {
     pub fn new() -> Self {
         WriteBufferBuilder{ records: vec!() }
+    }
+
+    pub fn extend(&mut self, builder: &WriteBufferBuilder) {
+        self.records.extend(builder.records.iter().map(|r| r.clone()));
     }
 
     pub fn build(&mut self) -> WriteBuffer {
@@ -81,14 +86,11 @@ mod tests {
         assert_eq!(buffer.lines.len(), 2);
         assert!(buffer.schema.is_some());
         let schema = buffer.schema.as_ref().unwrap();
-        assert_eq!(schema.fields.len(), 4);
-        let source_field = schema.fields.get(3).unwrap();
-        assert_eq!(source_field.name, "source");
-        match &source_field.data_type {
-            PowdrrDataType::Object(source_schema) => {
-                assert_eq!(source_schema.fields.len(), 5);
-            },
-            _ => panic!("unexpected schema")
-        };
+        assert_eq!(schema.fields.len(), 10);
+        let schema_map = schema.to_map();
+        let source_field = schema_map.get("_source").unwrap();
+        assert_eq!(source_field.data_type, PowdrrDataType::String);
+        assert!(schema_map.contains_key("d_e"));
+        assert!(schema_map.contains_key("d_f"));
     }
 }

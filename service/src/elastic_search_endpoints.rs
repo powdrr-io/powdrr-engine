@@ -10,7 +10,6 @@ use uuid_b64::UuidB64;
 
 use crate::{elastic_search_cluster_info, elastic_search_commands::LookupById, elastic_search_common::{execute_command, CommandContext, CommandResponse}, elastic_search_ingest, elastic_search_parser, elastic_search_pipeline, state_hosted_service::API_SERVICE_CLIENT};
 use crate::elastic_search_common::MIME_ES_JSON;
-use crate::schema_massager::PowdrrSchema;
 
 #[derive(Deserialize, StateData, StaticResponseExtender)]
 pub struct NamePathExtractor {
@@ -327,7 +326,7 @@ pub fn es_get_with_id(state: State) -> Pin<Box<HandlerFuture>> {
         let table_desc = API_SERVICE_CLIENT.describe_table(&index_name).await;
         match table_desc {
             Some(td) => {
-                let command = LookupById::new(&PowdrrSchema::empty(), &td.name, &vec!(doc_id));
+                let command = LookupById::new(&td.name, &vec!(doc_id));
                 let response = execute_command(CommandContext{}, Arc::new(command)).await;
                 let res = response.generate_response(&state);
                 Ok((state, res))

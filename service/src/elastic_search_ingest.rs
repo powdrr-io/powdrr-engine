@@ -24,7 +24,7 @@ use crate::elastic_search_common::{load_command_raw_result, CommandContext, Elas
 use crate::elastic_search_responses::{BulkResult, ErrorDetails, OperationResult, QueryResultHit, Shards, SingleDocCreateFailedResult};
 use crate::{data_access, distributed_cache};
 use crate::elastic_search_parser::UpdateBody;
-use crate::elastic_search_storage_schema::RecordInput;
+use crate::elastic_search_storage_schema::{RecordInput, WriteBufferBuilder};
 use crate::schema_massager::PowdrrSchema;
 use crate::state_hosted_service::{CreateTable, SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription, API_SERVICE_CLIENT};
 use crate::util::log_err;
@@ -89,10 +89,6 @@ impl WriteBuffer {
             }
         }
         Ok(())
-    }
-
-    fn extend(&mut self, other: &WriteBuffer) {
-        self.lines.extend(other.lines.clone());
     }
 
     fn len(&self) -> usize {
@@ -398,21 +394,20 @@ pub(crate) fn ingest_create(
     version: u64,
     seq_no: i64,
     status: Option<u32>,
-    buffer: &mut WriteBuffer
+    buffer: &mut WriteBufferBuilder
 ) -> OperationResult {
     let id = match &create.create.id {
         Some(id) => id.clone(),
         None => UuidB64::new().to_string()
     };
-    let mut doc_with_id = RecordInput {
+    let doc_with_id = RecordInput {
         _id: id.clone(),
         _seq_no: seq_no,
         _version: version,
         existing_normalized: None,
         source: doc.clone(),
     };
-    doc_with_id.ensure_normalized_value();
-    buffer.lines.push(serde_json::to_string(&doc_with_id.to_record()).unwrap());
+    buffer.records.push(doc_with_id);
     OperationResult{
         _index: table_description.name.clone(),
         _id: id,
@@ -431,7 +426,7 @@ pub(crate) fn ingest_create(
 }
 
 pub(crate) struct IngestResult {
-    tables: HashMap<String, WriteBuffer>,
+    tables: HashMap<String, WriteBufferBuilder>,
     operations: Vec<OperationResult>,
 }
 
@@ -443,11 +438,11 @@ impl IngestResult {
         }
     }
 
-    fn get(&mut self, table: &String) -> &mut WriteBuffer {
+    fn get(&mut self, table: &String) -> &mut WriteBufferBuilder {
         match self.tables.get_mut(table) {
             Some(_) => (),
             None => {
-                self.tables.insert(table.clone(), WriteBuffer::new());
+                self.tables.insert(table.clone(), WriteBufferBuilder::new());
             }
         }
         self.tables.get_mut(table).unwrap()
@@ -511,7 +506,7 @@ pub(crate) async fn commit_general(buffer: &WriteBuffer, index: &String, commit_
 
 
 async fn get_existing_doc_count(index: &String, doc_ids: &Vec<String>) -> Result<usize, IngestError> {
-    let df_count = match load_command_raw_result(CommandContext{}, Arc::new(LookupById::new(&PowdrrSchema::empty(), &index, &doc_ids))).await {
+    let df_count = match load_command_raw_result(CommandContext{}, Arc::new(LookupById::new(&index, &doc_ids))).await {
         Ok(lcrr) => match lcrr {
             Some(raw_table) => {
                 let df = match data_access::execute_sql(&format!("SELECT * from {raw_table}")).await {
@@ -561,7 +556,7 @@ async fn create_single_worker(index: &String, doc_id: &String, payload: &String)
                 Err(_) => panic!("nope")
             };
             
-            let mut buffer = WriteBuffer::new();
+            let mut buffer = WriteBufferBuilder::new();
             let result = ingest_create(
                 &table_description,
                 &Create{ create: IndexOrCreateBody { index: None, id: Some(doc_id.clone()), list_executed_pipelines: false, require_alias: false, dynamic_templates: None }},
@@ -572,7 +567,7 @@ async fn create_single_worker(index: &String, doc_id: &String, payload: &String)
                 &mut buffer
             );
             
-            commit(&buffer, &table_description.name).await?;
+            commit(&buffer.build(), &table_description.name).await?;
             let headers = vec!((LOCATION, format!("/{}/_doc/{}", table_description.name, url_escape::encode_userinfo(doc_id))));
             Ok(ElasticSearchResponse {
                 status: StatusCode::CREATED,
@@ -618,7 +613,7 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
             Err(_) => panic!("nope")
         };
 
-        let mut buffer = WriteBuffer::new();
+        let mut buffer = WriteBufferBuilder::new();
         let upsert_doc = update_request.upsert.unwrap();
         let mut result = ingest_create(
             &table_description,
@@ -641,7 +636,7 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
             _source: upsert_doc.clone()
         });
         
-        commit(&buffer, &table_description.name).await?;
+        commit(&buffer.build(), &table_description.name).await?;
         let headers = vec!((LOCATION, format!("/{}/_doc/{}", table_description.name, url_escape::encode_userinfo(doc_id))));
         Ok(ElasticSearchResponse {
             status: StatusCode::CREATED,
@@ -777,13 +772,14 @@ struct IngestAndWriteResult {
 //TODO this is called but the code analyzer isn't seeing it
 #[allow(dead_code)]
 async fn ingest_and_write(payload: &String) -> Result<IngestAndWriteResult, IngestError> {
-    let buffer_items = match ingest(None, payload).await {
+    let mut buffer_items = match ingest(None, payload).await {
         Ok(b) => b,
         Err(e) => return Err(e)
     };
 
     let mut table_infos = vec!();
-    for (name, buffer) in buffer_items.tables {
+    for (name, buffer_builder) in buffer_items.tables.iter_mut() {
+        let buffer = buffer_builder.build();
         let new_id = format!("tests/data/ingest/ingest-{}-{}.json", name, IdInstance::next_id().to_string());
         let write_to_file_result = buffer.write_to_file(&new_id);
         tracing::info!("Ingest: table {} wrote {} records", name, buffer.len());
@@ -831,7 +827,7 @@ struct IngestRequest {
 }
 
 struct IngestActor {
-    tables: HashMap<String, WriteBuffer>,
+    tables: HashMap<String, WriteBufferBuilder>,
     requests: Vec<IngestRequest>,
     receiver: mpsc::Receiver<IngestActorMessage>,
 }
@@ -860,12 +856,12 @@ impl IngestActor {
         }
     }
 
-    fn merge_table_buffers(&mut self, tables: &HashMap<String, WriteBuffer>) -> () {
-        for table_entry in tables {
-            match self.tables.get_mut(table_entry.0) {
-                Some(buffer) => buffer.extend(table_entry.1),
+    fn merge_table_buffers(&mut self, tables: &HashMap<String, WriteBufferBuilder>) -> () {
+        for (table, buffer_builder) in tables {
+            match self.tables.get_mut(table) {
+                Some(buffer) => buffer.extend(buffer_builder),
                 None => {
-                    self.tables.insert(table_entry.0.clone(), table_entry.1.clone());
+                    self.tables.insert(table.clone(), buffer_builder.clone());
                 }
             }
         }
@@ -910,7 +906,8 @@ impl IngestActor {
 
         let mut commit_table_info = vec!();
 
-        for (name, buffer) in &self.tables {
+        for (name, buffer_builder) in self.tables.iter_mut() {
+            let buffer = buffer_builder.build();
             let new_id = format!("tests/data/ingest/ingest-{}-{}.json", name, IdInstance::next_id().to_string());
             let write_to_file_result = buffer.write_to_file(&new_id);
             tracing::info!("Ingest: table {} wrote {} records", name, buffer.len());

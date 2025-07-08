@@ -1,5 +1,4 @@
 use std::{any::Any, error::Error, fmt::Display, iter::zip};
-use crate::elastic_search_common::create_normalized_name;
 
 #[derive(Clone, PartialEq, Debug)]
 enum TokenKind {
@@ -308,7 +307,7 @@ impl Statement for AssignmentStatement {
         loop {
             match current_left.as_any().downcast_ref::<FieldAccess>() {
                 Some(l) => {
-                    left_side_raw.push(create_normalized_name(&l.field_name));
+                    left_side_raw.push(l.field_name.clone());
                     current_left = &l.expression;
                 },
                 None => break
@@ -316,7 +315,7 @@ impl Statement for AssignmentStatement {
         }
         match current_left.as_any().downcast_ref::<VariableOrTypeReference>() {
             Some(l) => {
-                left_side_raw.push(create_normalized_name(&l.name));
+                left_side_raw.push(l.name.clone());
             },
             None => panic!("Don't know how to translate this type of assignment")
         }
@@ -390,7 +389,7 @@ impl Expression for FieldAccess {
     }
         
     fn translate(&self, context: TranslationContext) -> Result<String, TranslationError> {
-        Ok(format!("{}.{}", self.expression.translate(context)?, create_normalized_name(&self.field_name)))
+        Ok(format!("{}.{}", self.expression.translate(context)?, self.field_name))
     }
 }
 
@@ -506,7 +505,7 @@ struct NullTestFieldAccess {
 }
 
 fn create_field_access(field_chain: &Vec<String>) -> String {
-    field_chain.iter().rev().map(|x|format!("[\"{}\"]", create_normalized_name(x))).collect::<Vec<String>>().join("")    
+    field_chain.iter().rev().map(|x|format!("[\"{}\"]", x)).collect::<Vec<String>>().join("")
 }
 
 fn create_field_chains(nested_field_chain: &Vec<String>) -> Vec<Vec<String>> {
@@ -819,7 +818,7 @@ mod tests {
     fn test_translate() {     
         let translated = translate(&"ctx?.kibana?.log?.meta?.res?.responseTime != null".to_string()).unwrap();
 
-        assert_eq!(translated, r#"{{ (ctx["kibana"]["log"]["meta"]["res"]["responsetime"] if ctx is defined and ctx is mapping and ctx["kibana"] is defined and ctx["kibana"] is mapping and ctx["kibana"]["log"] is defined and ctx["kibana"]["log"] is mapping and ctx["kibana"]["log"]["meta"] is defined and ctx["kibana"]["log"]["meta"] is mapping and ctx["kibana"]["log"]["meta"]["res"] is defined and ctx["kibana"]["log"]["meta"]["res"] is mapping else none) is not none }}"#);
+        assert_eq!(translated, r#"{{ (ctx["kibana"]["log"]["meta"]["res"]["responseTime"] if ctx is defined and ctx is mapping and ctx["kibana"] is defined and ctx["kibana"] is mapping and ctx["kibana"]["log"] is defined and ctx["kibana"]["log"] is mapping and ctx["kibana"]["log"]["meta"] is defined and ctx["kibana"]["log"]["meta"] is mapping and ctx["kibana"]["log"]["meta"]["res"] is defined and ctx["kibana"]["log"]["meta"]["res"] is mapping else none) is not none }}"#);
     }  
 
     #[test]
@@ -827,7 +826,7 @@ mod tests {
         let test_val = "ZonedDateTime.parse(\"2025-05-31T12:34:56\").toInstant().toEpochMilli()";
         let translated = translate(&test_val.to_string()).unwrap();
 
-        assert_eq!(translated, r#"{{ __types.ZonedDateTime.parse("2025-05-31T12:34:56").toinstant().toepochmilli() }}"#);
+        assert_eq!(translated, r#"{{ __types.ZonedDateTime.parse("2025-05-31T12:34:56").toInstant().toEpochMilli() }}"#);
     }
 
     #[test]
@@ -853,5 +852,7 @@ mod tests {
         let translated = translate(&test_val.to_string()).unwrap();
 
         println!("{}", translated);
+
+        // TODO - add validation
     }  
 }

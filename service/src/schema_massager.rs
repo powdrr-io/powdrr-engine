@@ -45,26 +45,14 @@ pub(crate) struct PowdrrSchema {
     pub fields: Vec<PowdrrField>
 }
 
-pub(crate) struct SchematizedValue {
-    value: Value,
-    schema: PowdrrSchema,
-}
-
 impl PowdrrSchema {
-    pub fn empty() -> Self {
-        // TODO: this is a placeholder until all the scaffolding is in place
-        PowdrrSchema{
-            fields: vec!()
-        }
-    }
-
     pub fn from(fields: &Vec<PowdrrField>) -> Self {
         PowdrrSchema{
             fields: fields.clone()
         }
     }
 
-    fn to_map(&self) -> HashMap<String, PowdrrField> {
+    pub fn to_map(&self) -> HashMap<String, PowdrrField> {
         self.fields.iter().map(|x| (x.name.clone(), x.clone())).collect::<HashMap<String, PowdrrField>>()
     }
 
@@ -237,14 +225,22 @@ impl SqlExpression {
                     Box::new(value.finalize(original_schema, target_schema)),
                 )
             }
-            SqlExpression::FieldRef(table, name) => {
-                let original_schema_field = Self::lookup_field(original_schema, name).unwrap();
-                let target_schema_field = Self::lookup_field(target_schema, name);
-                if table != "t" || target_schema_field.is_some() {
-                    self.populate_field(name, &original_schema_field, &target_schema_field.unwrap())
+            SqlExpression::FieldRef(table, name) if table == "t" => {
+                let denormalized_name = name.replace(".", "_");
+                let original_schema_field = Self::lookup_field(original_schema, &denormalized_name);
+                let target_schema_field = Self::lookup_field(target_schema, &denormalized_name);
+                if original_schema_field.is_none() {
+                    self.clone()
+                }else if target_schema_field.is_some() {
+                    self.populate_field(&denormalized_name, &original_schema_field.unwrap(), &target_schema_field.unwrap())
                 } else {
-                    Self::literal_default(&original_schema_field)
+                    Self::literal_default(&original_schema_field.unwrap())
                 }
+            },
+            SqlExpression::FieldRef(table, _name) => {
+                // We don't do any rewriting for field refs that are not against the user defined data.
+                assert_ne!(table, "t");
+                self.clone()
             },
             SqlExpression::In(left, right) => {
                 SqlExpression::In(
@@ -316,13 +312,12 @@ impl SqlExpression {
             });
         }
         SqlExpression::NamedStruct(entries)
-
     }
 
     fn literal_default(field: &PowdrrField) -> SqlExpression {
         match &field.data_type {
             PowdrrDataType::Array(_element_type) => todo!(),
-            PowdrrDataType::Object(schema) => todo!(),
+            PowdrrDataType::Object(_schema) => todo!(),
             _ => SqlExpression::LiteralNonString("null".to_string())
         }
     }
@@ -348,7 +343,12 @@ impl SqlExpression {
             SqlExpression::CountDistinct(value) => {
                 format!("count(distinct {})", value.stringize())
             },
+            SqlExpression::FieldRef(table, field) if table == "t" => {
+                format!("{}.\"{}\"", table, field.replace(".", "_"))
+            },
             SqlExpression::FieldRef(table, field) => {
+                assert_ne!(table, "t");
+                assert!(!field.contains("."), "Need to handle this case now");
                 format!("{}.\"{}\"", table, field)
             },
             SqlExpression::In(left, right) => {
@@ -435,7 +435,6 @@ pub(crate) struct SqlBuilder {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct SqlQuery {
-    original_schema: Option<PowdrrSchema>,
     all_fields: bool,
     fields: Vec<FieldExpression>,
     joins: String,
@@ -517,22 +516,11 @@ impl SqlBuilder {
         self
     }
 
-    fn _fields(&self) -> Vec<FieldExpression> {
-        let mut fields_copy = self.fields.clone();
-        if self.all_fields {
-            for field in self.schema.fields.iter() {
-                fields_copy.push(FieldExpression{
-                    name: field.name.clone(),
-                    expression: SqlExpression::FieldRef("t".to_string(), field.name.clone())
-                });
-            }
-        }
-        assert!(fields_copy.len() > 0);
-        fields_copy
-    }
-
     fn _joins(&self) -> Vec<String> {
         let mut joins_copy = self.joins.clone();
+        if self.calculate_score {
+            joins_copy.push("INNER JOIN {target_table}_search_index si on si.doc_id = t._id".to_string())
+        }
         if self.top_level {
             joins_copy.push("LEFT JOIN {deletes_table} dt ON dt._id = t._id".to_string())
         }
@@ -560,11 +548,25 @@ impl SqlBuilder {
         SqlExpression::and(top_copy)
     }
 
+    fn _fields(&self) -> Vec<FieldExpression> {
+        let mut fields_copy = self.fields.clone();
+        if self.calculate_score {
+            fields_copy.push(FieldExpression{
+                name: "term_cnt".to_string(),
+                expression: SqlExpression::FieldRef("si".to_string(), "term_cnt".to_string())
+            });
+            fields_copy.push(FieldExpression{
+                name: "word_cnt".to_string(),
+                expression: SqlExpression::FieldRef("si".to_string(), "word_cnt".to_string())
+            });
+        }
+        fields_copy
+    }
+
     pub(crate) fn build(&self) -> SqlQuery {
         SqlQuery {
-            original_schema: None,
             all_fields: self.all_fields,
-            fields: self._fields.clone(),
+            fields: self._fields(),
             joins: self._joins().join(" "),
             filters: self._filters(),
             limit: self.limit.clone(),
@@ -580,38 +582,59 @@ impl SqlQuery {
         // Magic up missing fields as nulls
         // TODO: figure out when fields have changed types and do something
         let mut final_fields = vec!();
-        for field in self.fields.iter() {
+        let mut fields_copy = self.fields.clone();
+        if self.all_fields {
+            for (_, field) in original_schema.iter() {
+                fields_copy.push(FieldExpression {
+                    name: field.name.clone(),
+                    expression: SqlExpression::FieldRef("t".to_string(), field.name.clone())
+                });
+            }
+        }
+        for field in fields_copy.iter() {
             final_fields.push(field.finalize(original_schema, target_schema).stringize());
         }
         final_fields.join(", ")
     }
 
     fn filters(&self, original_schema: &HashMap<String, PowdrrField>, target_schema: &HashMap<String, PowdrrField>) -> String {
-        "".to_string()
-    }
-
-    fn order_by(&self, original_schema: &HashMap<String, PowdrrField>, target_schema: &HashMap<String, PowdrrField>) -> String {
-        "".to_string()
-    }
-
-    fn group_by(&self, original_schema: &HashMap<String, PowdrrField>, target_schema: &HashMap<String, PowdrrField>) -> String {
-        "".to_string()
-    }
-
-    fn limit(&self) -> String {
-        match self.limit {
-            Some(limit) => format!("LIMIT {}", limit),
+        // "Pre-process" filters where any missing field is considered a null value.
+        // TODO: we could detect cases where the filter can't possibly match to terminate early
+        match &self.filters {
+            Some(filter) => {
+                format!(" WHERE {}", filter.finalize(original_schema, target_schema).stringize())
+            },
             None => "".to_string()
         }
     }
 
-    pub(crate) fn build_same(&self) -> String {
-        // TODO: this can be made faster since we know the original and target schema are the same
-        self.build(&self.original_schema)
+    fn order_by(&self, original_schema: &HashMap<String, PowdrrField>, target_schema: &HashMap<String, PowdrrField>) -> String {
+        match self.order_by.len() {
+            0 => "".to_string(),
+            _ => format!(" ORDER BY {}", self.order_by.iter().map(|x| x.finalize(original_schema, target_schema).stringize()).collect::<Vec<String>>().join(", "))
+        }
     }
 
-    pub(crate) fn build(&self, target_schema: &PowdrrSchema) -> String {
-        let original_schema_map = self.original_schema.to_map();
+    fn group_by(&self, original_schema: &HashMap<String, PowdrrField>, target_schema: &HashMap<String, PowdrrField>) -> String {
+        match self.group_by.len() {
+            0 => "".to_string(),
+            _ => format!(" GROUP BY {}", self.group_by.iter().map(|x| x.finalize(original_schema, target_schema).stringize()).collect::<Vec<String>>().join(", "))
+        }
+    }
+
+    fn limit(&self) -> String {
+        match self.limit {
+            Some(limit) => format!(" LIMIT {}", limit),
+            None => "".to_string()
+        }
+    }
+
+    pub(crate) fn build_same(&self, schema: &PowdrrSchema) -> String {
+        self.build(schema, schema)
+    }
+
+     pub(crate) fn build(&self, original_schema: &PowdrrSchema, target_schema: &PowdrrSchema) -> String {
+        let original_schema_map = original_schema.to_map();
         let target_schema_map = target_schema.to_map();
         let fields = self.fields(&original_schema_map, &target_schema_map);
         let joins = &self.joins;
@@ -620,13 +643,18 @@ impl SqlQuery {
         let group_by = self.group_by(&original_schema_map, &target_schema_map);
         let limit = self.limit();
 
-        format!("SELECT {fields} FROM {{target_table}} t {joins}{filters}{group_by}{order_by}{limit}",)
+        format!("SELECT {fields} FROM {{target_table}} t {joins}{filters}{group_by}{order_by}{limit}")
     }
 }
 
 
 fn to_powdrr_data_type(data_type: &DataType) -> PowdrrDataType {
     match data_type {
+        DataType::Null => {
+            // Null is a wacky type. We could probably do anything here but we'll say
+            // it is a String for now.
+            PowdrrDataType::String
+        },
         DataType::Int64 => PowdrrDataType::Integer,
         DataType::Boolean => PowdrrDataType::Boolean,
         DataType::Utf8 => PowdrrDataType::String,
@@ -683,10 +711,11 @@ mod tests {
         let (schema, _) = infer_json_schema(test_val_file.as_bytes(), None).unwrap();
         let powdrr_schema_file = to_powdrr_schema(&schema);
 
-        let sql_builder = SqlBuilder::for_query(&powdrr_schema_table, true);
+        let sql_builder = SqlBuilder::for_query(true);
         let sql_query = sql_builder.build();
-        let sql = sql_query.build(&powdrr_schema_file);
-        assert!(sql.contains("as b,"));
+        let sql = sql_query.build(&powdrr_schema_table, &powdrr_schema_file);
+        assert!(sql.contains("null as b"));
+        assert!(sql.contains("'f', null"));
     }
 
     #[test]

@@ -14,13 +14,12 @@ use gotham::hyper::{Body, Response};
 use gotham::mime::Mime;
 use gotham::state::State;
 use http::{HeaderName, StatusCode};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use crate::data_access::{execute_sql, load_memtable};
 use crate::elastic_search_responses::QueryFailure;
 use crate::schema_massager::SqlQuery;
 use crate::state_peers::{self, PeerClient, PeerClientError, PrivateSqlInvocation, SnapshotDescriptor};
 use crate::state_common::FileFilter;
-use crate::state_hosted_service::TableMetadataCheckpoint;
 use crate::util::log_err;
 
 
@@ -77,7 +76,6 @@ impl CommandResponse for ElasticSearchResponse {
 
 
 pub type ResultGeneratorFuture = dyn Future<Output = Result<Arc<dyn CommandResponse>, String>> + Send;
-pub type SnapshotGeneratorFuture = dyn Future<Output = Result<Vec<SnapshotDescriptor>, String>> + Send;
 
 #[async_trait]
 pub(crate) trait Command: Send + Sync {
@@ -159,7 +157,7 @@ async fn call_peers_and_load_results(
     let peer_clients: Vec<Box<dyn PeerClient>> = state_peers::get_peer_clients();
 
     let all_calls = peer_clients.iter().enumerate().map(
-        |tuple| call_private_sql_and_load(tuple.1.as_ref(), sql, required_extensions, target_snapshots, tuple.0 as u64, peer_clients.len() as u64));
+        |(index, client)| call_private_sql_and_load(client.as_ref(), sql, required_extensions, target_snapshots, index as u64, peer_clients.len() as u64));
     let all_records: Vec<RecordBatch> = match try_join_all(all_calls).await {
         Ok(ar) => ar.iter().filter(|x| x.is_some()).map(|x| x.clone().unwrap()).flatten().collect(),
         Err(e) => {
@@ -188,8 +186,8 @@ async fn call_peers_and_load_results(
 
 pub async fn load_command_raw_result(_context: CommandContext, command: Arc<dyn Command>) -> Result<Option<String>, PeerClientError> {
     let target_snapshots = command.current_target_snapshots().await;
-    let target_sql = command.generate_sql();
     let required_extensions = command.required_extensions();
+    let target_sql = command.generate_sql();
     call_peers_and_load_results(&required_extensions, &target_snapshots, &target_sql).await
 }
 
@@ -206,20 +204,61 @@ pub async fn execute_command(_context: CommandContext, command: Arc<dyn Command>
     response
 }
 
+
+// We are using a columnar format. Structs are not as efficient in columnar formats.
+// Therefore we "denormalize" the data from structs into individual fields. For example:
+//
+// {
+//     "A": {
+//         "B": null,
+//         "C": "not null"
+//     }
+// }
+//
+// becomes
+//
+// {
+//     "A_B": null,
+//     "A_C": "not null"
+// }
+//
+fn create_denormalized_value_worker(target_map: &mut Map<String, Value>, prefix: &String, value: &Value) -> () {
+    assert!(value.is_object());
+    for (map_key, map_value) in value.as_object().unwrap().iter() {
+        match map_value {
+            Value::Object(_) => {
+                create_denormalized_value_worker(target_map, &format!("{}{}_", prefix, map_key), &map_value);
+            },
+            _ => {
+                target_map.insert(format!("{}{}", prefix, map_key), map_value.clone());
+            }
+        }
+    }
+}
+
+pub fn create_denormalized_value(value: &Value) -> Value {
+    let mut new_map = serde_json::Map::new();
+
+    create_denormalized_value_worker(&mut new_map, &"".to_string(), value);
+
+    Value::from(new_map)
+}
+
+/*
 // TODO: this is a method to workaround a bug in datafusion
-pub fn create_normalized_value(value: &Value) -> Value {
+pub fn create_datafusion_safe_value(value: &Value) -> Value {
     match value {
         Value::Object(obj) => {
             let mut new_map = serde_json::Map::new();
             for (map_key, map_value) in obj.iter() {
-                new_map.insert(create_normalized_name(map_key), create_normalized_value(map_value));
+                new_map.insert(create_datafusion_safe_name(map_key), create_datafusion_safe_value(map_value));
             }
             Value::from(new_map)
         },
         Value::Array(arr) => {
             let mut new_array = Vec::new();
             for array_value in arr.iter() {
-                new_array.push(create_normalized_value(array_value));
+                new_array.push(create_datafusion_safe_value(array_value));
             }
             Value::from(new_array)            
         }
@@ -229,27 +268,30 @@ pub fn create_normalized_value(value: &Value) -> Value {
 
 
 // TODO: this is a method to workaround a bug in datafusion
-pub fn create_normalized_name(value: &String) -> String {
-    value.to_lowercase()
+pub fn create_datafusion_safe_name(value: &String) -> String {
+    value.clone()
 }
-
+*/
 
 #[cfg(test)]
 mod tests {
-    use crate::elastic_search_common::create_normalized_value;
+    use crate::elastic_search_common::create_denormalized_value;
 
     #[test]
-    fn test_normalized() {
-        let test_val = r#"{"A":{"B":null,"C":"not null"}}"#;
+    fn test_denormalized() {
+        let test_val = r#"{"A":{"B":null,"C":"NOT NULL"}}"#;
 
         let parsed_val = serde_json::from_str::<serde_json::Value>(test_val).unwrap();
 
         let test_val_again = serde_json::to_string(&parsed_val).unwrap();
         assert_eq!(test_val, test_val_again);
-        let normalized_val = create_normalized_value(&parsed_val);
 
-        let normalized_val_str = serde_json::to_string(&normalized_val).unwrap();
-
-        println!("{:?}", normalized_val_str);
+        let denormalized_val = create_denormalized_value(&parsed_val);
+        assert_eq!(denormalized_val.as_object().unwrap().len(), 2);
+        assert_eq!(denormalized_val.as_object().unwrap().get("A_B").unwrap(), &serde_json::Value::Null);
+        assert_eq!(denormalized_val.as_object().unwrap().get("A_C").unwrap(), &serde_json::Value::String("NOT NULL".to_string()));
+        let denormalized_val_str = serde_json::to_string(&denormalized_val).unwrap();
+        assert!(denormalized_val_str.contains("A_B"));
+        assert!(denormalized_val_str.contains("A_C"));
     }
 }
