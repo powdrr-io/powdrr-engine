@@ -2,7 +2,6 @@ use std::{collections::HashMap, fmt, sync::{Arc, Mutex}};
 
 use chrono::{DateTime, FixedOffset};
 use minijinja::{value::{Object, ValueKind}, Environment, Error, State, Value};
-use crate::elastic_search_common::create_normalized_name;
 
 #[derive(Debug)]
 struct Outputs {
@@ -105,7 +104,7 @@ impl Object for ZonedDateTimeObject {
         name: &str,
         _args: &[Value],
     ) -> Result<Value, Error> {
-        if name == create_normalized_name(&"toInstant".to_string()) {
+        if name == "toInstant" {
             Ok(Value::from_object(Instant{ value: self.value.clone() }))
         } else {
             panic!("Method does not exist in Outputs")
@@ -125,7 +124,7 @@ impl Object for Instant {
         name: &str,
         _args: &[Value],
     ) -> Result<Value, Error> {
-        if name == create_normalized_name(&"toEpochMilli".to_string()) {
+        if name == "toEpochMilli" {
             // TODO: convert datetime str in 'value' to millis from the epoch
             Ok(Value::from(self.value.timestamp_millis()))
         } else {
@@ -238,7 +237,6 @@ mod tests {
     use minijinja::Value;
 
     use crate::{expression_evaluator::eval_template, painless_parser::translate};
-    use crate::elastic_search_common::create_normalized_value;
 
     #[test]
     fn test_assignment_script() {
@@ -257,7 +255,7 @@ mod tests {
                     "taskType": "foobar"
                 }
         }"#;
-        let source_val: serde_json::Value = create_normalized_value(&serde_json::from_str(&source).unwrap());
+        let source_val: serde_json::Value = serde_json::from_str(&source).unwrap();
 
         let params = r#"{
             "claimableTaskTypes": ["foobar"],
@@ -266,14 +264,14 @@ mod tests {
             },
             "now": 99999999999999999999
         }"#;
-        let params_val: serde_json::Value = create_normalized_value(&serde_json::from_str(&params).unwrap());
+        let params_val: serde_json::Value = serde_json::from_str(&params).unwrap();
 
         let translated = translate(&test_val.to_string()).unwrap();
 
         let eval_result = eval_template(translated.as_str(), &source_val, HashMap::new(), Value::from_serialize(params_val));
 
         let final_doc_str = serde_json::to_string(&eval_result.source).unwrap();
-        assert!(final_doc_str.contains("\"scheduledat\":\"2025-05-26T12:12:12Z\""));
+        assert!(final_doc_str.contains("\"scheduledAt\":\"2025-05-26T12:12:12Z\""));
     }
         
     #[test]

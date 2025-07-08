@@ -69,6 +69,8 @@ async fn do_iceberg_commit(table_name: &String, last_snapshot_id: i64) -> Result
                 files: lib_metadata.files,
                 column_names: lib_metadata.column_names,
                 column_stats: lib_metadata.column_stats,
+                schemas: vec!(),
+                file_schemas: vec!(),
             },
             compactions: lib_metadata.compactions,
         }

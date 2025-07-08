@@ -76,7 +76,7 @@ pub(crate) struct QueryResultHit {
     pub _index: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub _id: Option<String>,
-    pub _version: i64,
+    pub _version: u64,
     pub _seq_no: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub _score: Option<f64>,

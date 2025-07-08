@@ -8,14 +8,15 @@ use datafusion::{arrow::array::RecordBatch, prelude::DataFrame};
 use futures::FutureExt;
 use gotham::mime;
 use http::StatusCode;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::{data_access::{self, execute_sql}, distributed_cache, elastic_search_common::{Command, CommandResponse, ResultGeneratorFuture}, elastic_search_ingest::{self, WriteBuffer}, elastic_search_parser::ScriptBlock, elastic_search_responses::{QueryResultHit, QueryResults}, expression_evaluator, painless_parser, state_hosted_service::API_SERVICE_CLIENT, state_peers::SnapshotDescriptor};
-use crate::elastic_search_common::{create_normalized_value, ElasticSearchResponse};
+use crate::elastic_search_common::ElasticSearchResponse;
 use crate::elastic_search_endpoints::QueryStringSearch;
-use crate::elastic_search_parser::{process_aggregations, Aggregation, SqlBuilder};
+use crate::elastic_search_parser::{process_aggregations, Aggregation};
 use crate::elastic_search_responses::{AggregationResult, QueryResultsNotFound, UpdateByQueryResults, UpdateByQueryResultsRetries, UpdateByQuerySuccess};
 use crate::elastic_search_storage_schema::{RecordInput, WriteBufferBuilder};
+use crate::schema_massager::{SqlBuilder, SqlExpression, SqlQuery};
 
 async fn empty_result(aggs: Option<Vec<Aggregation>>, total_hits_complex: bool) -> Arc<dyn CommandResponse> {
     // TODO: need to record and feed through the requested number of shards from index creation
@@ -25,15 +26,16 @@ async fn empty_result(aggs: Option<Vec<Aggregation>>, total_hits_complex: bool) 
 
 
 fn to_hit(index: &String, value: &Value) -> QueryResultHit {
-    let mut value_map = value.as_object().unwrap().clone();
+    let value_map = value.as_object().unwrap().clone();
     let score = value_map.get("score").map_or_else(|| 0.0, |f|f.as_f64().unwrap());
     let id = value_map.get("_id").unwrap().as_str().unwrap().to_string();
-    let version = value_map.get("_version").unwrap().as_i64().unwrap();
+    let version = value_map.get("_version").unwrap().as_u64().unwrap();
     let seq_no = value_map.get("_seq_no").unwrap().as_i64().unwrap();
-    value_map.remove("score");
-    value_map.remove("_id");
-    value_map.remove("_version");
-    value_map.remove("_seq_no");
+    let source = value_map.get("_source").unwrap().as_str().unwrap();
+    // TODO: we are parsing the string into a value just to put it an object
+    // that will get serialized out again. That is lame. If we can get the serializer
+    // to look at a string but put it in like it is a Value, that would be better.
+    let source_value = serde_json::from_str(source).unwrap();
     QueryResultHit {
         _index: Some(index.clone()),
         _id: Some(id),
@@ -42,7 +44,7 @@ fn to_hit(index: &String, value: &Value) -> QueryResultHit {
         _score: Some(score),
         _primary_term: Some(1),
         found: None,
-        _source: json!(value_map)
+        _source: source_value,
     }
 }
 
@@ -83,11 +85,24 @@ async fn to_hits(index: &String, data_frame: &DataFrame) -> Vec<QueryResultHit> 
 
 
 pub(crate) struct LookupById {
-    pub table: String,
-    pub ids: Vec<String>,
+    table: String,
+    ids: Vec<String>,
+    sql: SqlQuery,
 }
 
 impl LookupById {
+    pub fn new(table: &String, ids: &Vec<String>) -> Self {
+        let mut sql_builder = SqlBuilder::for_query(true);
+        sql_builder.filter(SqlExpression::In(
+            Box::new(SqlExpression::FieldRef("t".to_string(), "_id".to_string())),
+            ids.iter().map(|i|SqlExpression::LiteralString(i.clone())).collect()
+        ));
+        LookupById {
+            table: table.clone(),
+            ids: ids.clone(),
+            sql: sql_builder.build(),
+        }
+    }
     async fn to_dataframe(result_table_name: Option<String>) -> Option<DataFrame> {
         match result_table_name {
             Some(rtn) => {
@@ -100,7 +115,6 @@ impl LookupById {
         }
     }
 }
-
 
 #[async_trait]
 impl Command for LookupById {
@@ -141,12 +155,8 @@ impl Command for LookupById {
         }.boxed()
     }
 
-    fn generate_sql(&self) -> String {
-        let id_list = self.ids.iter().map(|id|format!("'{}'", id)).collect::<Vec<String>>().join(",");
-        let mut sql_builder = SqlBuilder::for_query();
-        sql_builder.fields.push("*".to_string());
-        sql_builder.filter(format!("t._id IN ({id_list})"));
-        sql_builder.build()
+    fn generate_sql(&self) -> SqlQuery {
+        self.sql.clone()
     }
 
     fn generate_filters(&self) -> Vec<&crate::state_common::FileFilter> {
@@ -157,7 +167,7 @@ impl Command for LookupById {
         vec!()
     }
 
-    async fn _current_target_snapshots(&self) -> Vec<SnapshotDescriptor> {
+    async fn current_target_snapshots(&self) -> Vec<SnapshotDescriptor> {
         let checkpoint_id = API_SERVICE_CLIENT.get_latest_checkpoint(&self.table, None).await.unwrap();
         match checkpoint_id {
             Some(c) => vec!(SnapshotDescriptor{ table_name: self.table.clone(), snapshot_id: c }),
@@ -168,11 +178,11 @@ impl Command for LookupById {
 
 
 pub(crate) struct SqlCommand {
-    pub sql: String,
+    pub sql: SqlQuery,
     pub table: String,
-    pub calculate_score: bool,
     pub aggs: Option<Vec<Aggregation>>,
     pub query_params: QueryStringSearch,
+    pub calculate_score: bool,
 }
 
 static SEARCH_COLUMNS: LazyLock<Vec<String>> = LazyLock::new(|| vec!(
@@ -235,10 +245,6 @@ impl SqlCommand {
 
 #[async_trait]
 impl Command for SqlCommand {
-    fn generate_sql(&self) -> String {
-        self.sql.clone()
-    }  
-
     fn get_name(&self) -> String {
         "SqlCommand".to_string()
     }
@@ -265,7 +271,7 @@ impl Command for SqlCommand {
             let num_records = match data_frame.clone().count().await {
                 Ok(tr) => tr,
                 Err(_) => panic!("nope"),
-            };            
+            };
 
             let first_10_rows = match data_frame.clone().limit(0, Some(10)) {
                 Ok(ftr) => ftr,
@@ -273,7 +279,7 @@ impl Command for SqlCommand {
             };
 
             let hits = to_hits(&table, &first_10_rows).await;
-            
+
             let aggregations = SqlCommand::generate_aggregations(Some(final_table_name), aggs).await;
             // TODO: need to calculate the actual max score here
             let max_score = hits.get(0).unwrap()._score.unwrap();
@@ -285,10 +291,14 @@ impl Command for SqlCommand {
                 hits,
                 aggregations,
                 !query_params.rest_total_hits_as_int.unwrap_or_else(|| false),
-            );    
+            );
 
             Ok(Arc::new(final_result))
         }.boxed()
+    }
+
+    fn generate_sql(&self) -> SqlQuery {
+        self.sql.clone()
     }
 
     fn generate_filters(&self) -> Vec<&crate::state_common::FileFilter> {
@@ -303,7 +313,7 @@ impl Command for SqlCommand {
         }
     }
 
-    async fn _current_target_snapshots(&self) -> Vec<SnapshotDescriptor> {
+    async fn current_target_snapshots(&self) -> Vec<SnapshotDescriptor> {
         let extension = match self.calculate_score {
             true => Some("es".to_string()),
             false => None
@@ -372,26 +382,23 @@ impl UpdateByQueryCommand {
             Ok(t) => t,
             Err(_) => panic!("Need to make an error path")
         };
-        let mut output = expression_evaluator::eval_template(
+        let output = expression_evaluator::eval_template(
             &translated_script,
             &value._source,
             HashMap::from([
                 ("op".to_string(), minijinja::Value::from("update"))
             ]),
-            minijinja::Value::from_serialize(create_normalized_value(&script.params))
+            minijinja::Value::from_serialize(&script.params)
         );
 
         let op = output.other_context.get("op").map_or_else(|| "noop", |v|v.as_str().unwrap());
         
         match op {
             "update" => {
-                let value_map = output.source.as_object_mut().unwrap();
-                let version = value_map.get("_version").unwrap().as_number().unwrap();
-                value_map.insert("_version".to_string(), Value::from(version.as_u64().unwrap() + 1));
                 EvalResult::Update(RecordInput {
                     _id: value._id.as_ref().unwrap().clone(),
                     _seq_no: value._seq_no,
-                    _version: value._version,
+                    _version: value._version + 1,
                     existing_normalized: None,
                     source: output.source,
                 })
@@ -503,32 +510,20 @@ impl Command for UpdateByQueryCommand {
         }.boxed()
     }
 
-    fn generate_sql(&self) -> String {
-        self.query_command.sql.clone()
+    fn generate_sql(&self) -> SqlQuery {
+        self.query_command.generate_sql()
     }
 
     fn generate_filters(&self) -> Vec<&crate::state_common::FileFilter> {
-        vec!()
+        self.query_command.generate_filters()
     }
 
     fn required_extensions(&self) -> Vec<String> {
-        if self.query_command.calculate_score {
-            vec!("es".to_string())
-        } else {
-            vec!()
-        }
+        self.query_command.required_extensions()
     }    
 
-    async fn _current_target_snapshots(&self) -> Vec<SnapshotDescriptor> {
-        let extension = match self.query_command.calculate_score {
-            true => Some("es".to_string()),
-            false => None
-        };
-        let checkpoint_id = API_SERVICE_CLIENT.get_latest_checkpoint(&self.query_command.table, extension).await.unwrap();
-        match checkpoint_id {
-            Some(c) => vec!(SnapshotDescriptor{ table_name: self.query_command.table.clone(), snapshot_id: c }),
-            None => vec!(),
-        }
+    async fn current_target_snapshots(&self) -> Vec<SnapshotDescriptor> {
+        self.query_command.current_target_snapshots().await
     }    
 }
 

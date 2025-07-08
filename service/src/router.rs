@@ -9,8 +9,6 @@ use gotham::pipeline::single_pipeline;
 use gotham::prelude::NewMiddleware;
 use gotham::prelude::StaticResponseExtender;
 use gotham::state::StateData;
-use http::HeaderMap;
-use http::Uri;
 use serde::Deserialize;
 use std::pin::Pin;
 
@@ -78,11 +76,12 @@ impl Middleware for RouterMiddleware {
     where
         Chain: FnOnce(State) -> Pin<Box<HandlerFuture>> + Send + 'static,
         Self: Sized {
+            /* Uncomment to dump all request headers
             let uri = state.borrow::<Uri>();
             println!("Uri = {}", uri);
             let headers = state.borrow::<HeaderMap>();
             headers.iter().for_each(|x|println!("{} = {:?}", x.0, x.1));
-
+            */ 
             // We're finished working on the Request, so allow other components to continue processing
             // the Request.
             //
@@ -291,7 +290,7 @@ mod tests {
     use serde_json::Value;
     use crate::elastic_search_responses::{QueryResultTotal, QueryResults};
     use crate::router::router;
-    use crate::schema_massager::PowdrrSchema;
+    use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema, SqlBuilder, SqlExpression};
     use crate::state_hosted_service::{IcebergMetadata, SpeedboatMetadata, TableMetadataCheckpoint};
     use crate::state_peers::{PrivateSqlInvocation, SnapshotDescriptor};
 
@@ -375,7 +374,13 @@ mod tests {
         ).perform().unwrap();
 
         let file_path = format!("file://{}/tests/data/flights.parquet", env::current_dir().unwrap().to_str().unwrap());
-        
+
+        let schema = PowdrrSchema::from(&vec!(
+            PowdrrField{ name: "snippet".to_string(), data_type: PowdrrDataType::String },
+            PowdrrField{ name: "searchTerms".to_string(), data_type: PowdrrDataType::String },
+            PowdrrField{ name: "title".to_string(), data_type: PowdrrDataType::String },
+        ));
+
         let checkpoint = TableMetadataCheckpoint {
             table_name: "flights".to_string(),
             checkpoint_id: "fake_id".to_string(),
@@ -384,11 +389,13 @@ mod tests {
                 files: vec!(file_path),
                 column_names: vec!(),
                 column_stats: vec!(),
+                schemas: vec!(schema.clone()),
+                file_schemas: vec!(0),
             }),
             speedboat_metadata: None,
             deletes_metadata: None,
             extension_metadata: None,
-            schema: PowdrrSchema{ fields: vec!() },
+            schema: schema.clone(),
         };
 
         let checkpoint_response = test_server.client().post(
@@ -401,10 +408,18 @@ mod tests {
             Err(_) => panic!("test setup failed"),
             Ok(_) => ()
         };
+
+
+        let mut builder = SqlBuilder::for_agg();
+        builder.set_all_fields_testing_only();
+        builder.filter(SqlExpression::Like(
+            Box::new(SqlExpression::FieldRef("t".to_string(), "snippet".to_string())),
+            Box::new(SqlExpression::LiteralString("%Looking%".to_string())),
+        ));
         
         let body_obj = PrivateSqlInvocation::new(
-            "select * from {target_table} where snippet like '%Looking%'".to_string(),
-            vec!["search".to_string()],
+            builder.build(),
+            vec!["es".to_string()],
             vec![],
             vec!(SnapshotDescriptor { table_name: "flights".to_string(), snapshot_id: "fake_id".to_string()}),
             0,
@@ -419,8 +434,9 @@ mod tests {
 
         assert_eq!(response.status(), 200);
         let body = response.read_body().unwrap();
-        let str_body = str::from_utf8(&body).unwrap();
-        print!("{}", str_body);
+        let _str_body = str::from_utf8(&body).unwrap();
+
+        // TODO: add some validation
         
     }    
 
@@ -434,6 +450,12 @@ mod tests {
             mime::TEXT_PLAIN
         ).perform().unwrap();
 
+        let schema = PowdrrSchema::from(&vec!(
+            PowdrrField{ name: "snippet".to_string(), data_type: PowdrrDataType::String },
+            PowdrrField{ name: "searchTerms".to_string(), data_type: PowdrrDataType::String },
+            PowdrrField{ name: "title".to_string(), data_type: PowdrrDataType::String },
+        ));
+
         let checkpoint = TableMetadataCheckpoint {
             table_name: "flights".to_string(),
             checkpoint_id: "fake_id".to_string(),
@@ -442,11 +464,13 @@ mod tests {
                 files: vec!("file:///Users/greg.fee/code/monolith-rust-workspace/service/tests/data/flights.parquet".to_string()),
                 column_names: vec!(),
                 column_stats: vec!(),
+                schemas: vec!(schema.clone()),
+                file_schemas: vec!(0),
             }),
             speedboat_metadata: None,
             deletes_metadata: None,
             extension_metadata: None,
-            schema: PowdrrSchema{ fields: vec!() },
+            schema: schema.clone(),
         };
 
         let checkpoint_response = test_server.client().post(
@@ -501,6 +525,17 @@ mod tests {
             mime::TEXT_PLAIN
         ).perform().unwrap();
 
+        let schema = PowdrrSchema::from(&vec!(
+            PowdrrField{ name: "@timestamp".to_string(), data_type: PowdrrDataType::String },
+            PowdrrField{ name: "message".to_string(), data_type: PowdrrDataType::String },
+            PowdrrField{ name: "index_col".to_string(), data_type: PowdrrDataType::Integer },
+            PowdrrField{ name: "user".to_string(), data_type: PowdrrDataType::Object(
+                Box::new(PowdrrSchema::from(&vec!(
+                    PowdrrField{ name: "id".to_string(), data_type: PowdrrDataType::String },
+                )))
+            )}
+        ));
+
         let checkpoint = TableMetadataCheckpoint {
             table_name: "logs".to_string(),
             checkpoint_id: "fake_id".to_string(),
@@ -508,12 +543,12 @@ mod tests {
             speedboat_metadata: Some(SpeedboatMetadata{ 
                 files: vec!("file:///Users/greg.fee/code/monolith-rust-workspace/service/tests/data/logs.json".to_string()),
                 sizes: vec!(6),
-                schemas: vec!(),
-                file_schemas: vec!()
+                schemas: vec!(schema.clone()),
+                file_schemas: vec!(0),
             }),
             deletes_metadata: None,
             extension_metadata: None,
-            schema: PowdrrSchema{ fields: vec!() },
+            schema: schema.clone(),
         };
 
         let checkpoint_response = test_server.client().post(
@@ -557,7 +592,6 @@ mod tests {
         }
         
     }
-
 
     #[test]
     fn test_es_ingest_then_search_table() {
@@ -629,7 +663,17 @@ mod tests {
                 assert_eq!(response.status(), 200);
                 let body = response.read_body().unwrap();
                 let str_body = str::from_utf8(&body).unwrap();
-                print!("{}", str_body);
+                let json_body: serde_json::Value = serde_json::from_str(&str_body).unwrap();
+                let hits = json_body["hits"]["hits"].as_array().unwrap();
+                assert_eq!(hits.len(), 2);
+                let first_hit = hits[0].as_object().unwrap();
+                let first_hit_message = first_hit["_source"]["message"].as_str().unwrap();
+                let second_hit = hits[1].as_object().unwrap();
+                let second_hit_message = second_hit["_source"]["message"].as_str().unwrap();
+                // Annoying because order is not guaranteed.
+                assert!(second_hit_message.contains("Login successful") || second_hit_message.contains("Login attempt failed"));
+                assert!(first_hit_message.contains("Login successful") || first_hit_message.contains("Login attempt failed"));
+                assert_ne!(first_hit_message, second_hit_message);
             },
             Err(e) => {
                 panic!("Failed {}", e)

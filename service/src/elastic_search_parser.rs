@@ -1,7 +1,6 @@
-
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::string::ToString;
+use std::sync::{Arc, LazyLock};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,12 +10,37 @@ use crate::elastic_search_common::{Command, ParseError};
 use crate::elastic_search_datetime_parser;
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::elastic_search_responses::{AggregationResult, AverageAggregationResult, CardinalityAggregationResult, FilterAggregationResult, HistogramAggregationResult, RangeAggregationBucket, RangeAggregationResult, TermAggregationBucket, TermAggregationResult};
+use crate::schema_massager::{FieldExpression, PowdrrDataType, PowdrrField, PowdrrSchema, SqlBuilder, SqlExpression, SqlQuery};
 
 
+static TERM_AGG_SCHEMA: LazyLock<PowdrrSchema> = LazyLock::new(|| PowdrrSchema::from(&vec!(
+    PowdrrField{ name: "field_name".to_string(), data_type: PowdrrDataType::String},
+    PowdrrField{ name: "cnt".to_string(), data_type: PowdrrDataType::String},
+)));
+
+static RANGE_AGG_SCHEMA: LazyLock<PowdrrSchema> = LazyLock::new(|| PowdrrSchema::from(&vec!(
+    PowdrrField{ name: "field_name".to_string(), data_type: PowdrrDataType::String},
+    PowdrrField{ name: "cnt".to_string(), data_type: PowdrrDataType::String},
+)));
+
+static AVERAGE_AGG_SCHEMA: LazyLock<PowdrrSchema> = LazyLock::new(|| PowdrrSchema::from(&vec!(
+    PowdrrField{ name: "field_name".to_string(), data_type: PowdrrDataType::String},
+    PowdrrField{ name: "cnt".to_string(), data_type: PowdrrDataType::String},
+)));
+
+static CARDINALITY_AGG_SCHEMA: LazyLock<PowdrrSchema> = LazyLock::new(|| PowdrrSchema::from(&vec!(
+    PowdrrField{ name: "field_name".to_string(), data_type: PowdrrDataType::String},
+    PowdrrField{ name: "cnt".to_string(), data_type: PowdrrDataType::String},
+)));
+
+static FILTER_AGG_SCHEMA: LazyLock<PowdrrSchema> = LazyLock::new(|| PowdrrSchema::from(&vec!(
+    PowdrrField{ name: "field_name".to_string(), data_type: PowdrrDataType::String},
+    PowdrrField{ name: "cnt".to_string(), data_type: PowdrrDataType::String},
+)));
 
 #[derive(Clone)]
 pub(crate) struct TermAggProcessor {
-    sql: String,
+    sql: SqlQuery,
 }
 
 impl TermAggProcessor {
@@ -27,12 +51,12 @@ impl TermAggProcessor {
 
         TermAggregationBucket {
             key: key.to_string(),
-            doc_count: doc_count
+            doc_count
         }
     }
 
-    async fn create_buckets(table_name: &String, query: &String) -> Vec<TermAggregationBucket> {
-        let final_sql = query.replace("{target_table}", table_name);
+    async fn create_buckets(table_name: &String, query: &SqlQuery) -> Vec<TermAggregationBucket> {
+        let final_sql = query.build_same(&TERM_AGG_SCHEMA).replace("{target_table}", table_name);
         let data_frame = match execute_sql(&final_sql).await {
             Ok(df) => df,
             Err(_) => panic!("nope")
@@ -64,7 +88,7 @@ impl TermAggProcessor {
 
 #[derive(Clone)]
 pub(crate) struct RangeAggBucket {
-    sql: String,
+    sql: SqlQuery,
     key: String,
     from: u64,
     from_as_string: String,
@@ -84,7 +108,7 @@ impl RangeAggProcessor {
 
         let doc_count = match &table_name {
             Some(t) => {
-                let final_sql = bucket_spec.sql.replace("{target_table}", t);
+                let final_sql = bucket_spec.sql.build_same(&RANGE_AGG_SCHEMA).replace("{target_table}", t);
                 let data_frame = match execute_sql(&final_sql).await {
                     Ok(df) => df,
                     Err(_) => panic!("nope")
@@ -135,7 +159,7 @@ impl RangeAggProcessor {
 
 #[derive(Clone)]
 pub(crate) struct AverageAggProcessor {
-    sql: String,
+    sql: SqlQuery,
 }
 
 impl AverageAggProcessor {
@@ -157,7 +181,7 @@ impl AverageAggProcessor {
         let child_aggs = process_aggregations(subaggregations, table_name.clone()).await;
 
         let avg = match &table_name {
-            Some(t) => AverageAggProcessor::calculate_average(t, &self.sql).await,
+            Some(t) => AverageAggProcessor::calculate_average(t, &self.sql.build_same(&AVERAGE_AGG_SCHEMA)).await,
             None => 0.0
         };
 
@@ -170,7 +194,7 @@ impl AverageAggProcessor {
 
 #[derive(Clone)]
 pub(crate) struct CardinalityAggProcessor {
-    sql: String,
+    sql: SqlQuery,
 }
 
 impl CardinalityAggProcessor {
@@ -192,7 +216,7 @@ impl CardinalityAggProcessor {
         let child_aggs = process_aggregations(subaggregations, table_name.clone()).await;
 
         let type_count = match &table_name {
-            Some(t) => CardinalityAggProcessor::calculate_cardinality(t, &self.sql).await,
+            Some(t) => CardinalityAggProcessor::calculate_cardinality(t, &self.sql.build_same(&CARDINALITY_AGG_SCHEMA)).await,
             None => 0
         };
         AggregationResult::Cardinality(CardinalityAggregationResult{
@@ -225,14 +249,14 @@ impl DateHistogramAggProcessor {
 
 #[derive(Clone)]
 pub(crate) struct FilterAggProcessor {
-    sql: String,
+    sql: SqlQuery,
 }
 
 impl FilterAggProcessor {
     async fn process(&self, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
         let doc_count = match &table_name {
             Some(t) => {
-                let final_sql = self.sql.replace("{target_table}", t);
+                let final_sql = self.sql.build_same(&FILTER_AGG_SCHEMA).replace("{target_table}", t);
                 let data_frame = execute_sql(&final_sql).await.unwrap();
                 assert_eq!(data_frame.schema().columns().len(), 1);
                 let serde_values = to_serde_value(&data_frame).await;
@@ -625,7 +649,7 @@ pub(crate) enum RangeSpecOperator {
 }
 
 impl RangeSpecOperator {
-    fn convert_to_sql(&self) -> (String, String) {
+    fn convert_to_sql(&self) -> (String, SqlExpression) {
         let (op, val) = match self {
             RangeSpecOperator::GT(op) => {
                 (">", op.gt.clone())
@@ -642,9 +666,9 @@ impl RangeSpecOperator {
         };
 
         let final_val = if val.is_string() {
-            convert_datetime_if_necessary(val.as_str().unwrap())
+            SqlExpression::LiteralString(convert_datetime_if_necessary(val.as_str().unwrap()))
         } else {
-            val.to_string()
+            SqlExpression::LiteralNonString(val.to_string())
         };
 
         (op.to_string(), final_val)
@@ -687,36 +711,6 @@ pub(crate) struct SimpleQueryStringBody {
     default_operator: String,
 }
 
-#[derive(Clone)]
-pub(crate) enum FilterExpression {
-    And(Vec<FilterExpression>),
-    Or(Vec<FilterExpression>),
-    Not(Box<FilterExpression>),
-    Expr(String),
-}
-
-impl FilterExpression {
-    pub fn and(exprs: Vec<FilterExpression>) -> Option<Self> {
-        if exprs.len() == 0 {
-            None
-        } else if exprs.len() == 1 {
-            Some(exprs.get(0).unwrap().clone())
-        } else {
-            Some(FilterExpression::And(exprs))
-        }
-    }
-
-    pub fn or(exprs: Vec<FilterExpression>) -> Option<Self> {
-        if exprs.len() == 0 {
-            None
-        } else if exprs.len() == 1 {
-            Some(exprs.get(0).unwrap().clone())
-        } else {
-            Some(FilterExpression::Or(exprs))
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct UpdateByQueryBody {
     query: Query,
@@ -743,206 +737,17 @@ pub(crate) struct ScriptBlock {
     pub params: Value,
 }
 
-#[derive(Clone)]
-pub(crate) struct SqlBuilder {
-    pub(crate) fields: Vec<String>,
-    pub(crate) joins: Vec<String>,
-    filter_stack: RefCell<Vec<Vec<FilterExpression>>>,
-    pub(crate) limit: Option<u64>,
-    pub(crate) calculate_score: bool,
-    pub(crate) order_by: Vec<String>,
-    pub(crate) group_by: Vec<String>,
-    top_level: bool,
-}
 
-impl SqlBuilder {
-    pub(crate) fn for_query() -> Self {
-        SqlBuilder { 
-            fields: vec!(), 
-            joins: vec!(), 
-            filter_stack: RefCell::new(vec!(vec!())),
-            limit: None, 
-            calculate_score: false,
-            order_by: vec!(),
-            group_by: vec!(),
-            top_level: true,
-        }
-    }
-
-    pub(crate) fn for_agg() -> Self {
-        SqlBuilder {
-            fields: vec!(),
-            joins: vec!(),
-            filter_stack: RefCell::new(vec!(vec!())),
-            limit: None,
-            calculate_score: false,
-            order_by: vec!(),
-            group_by: vec!(),
-            top_level: false,
-        }
-    }
-
-    pub(crate) fn push_filter_context(&mut self) -> &mut Self {
-        self.filter_stack.get_mut().push(vec!());
-        self
-    }
-
-    pub(crate) fn pop_filter_context(&mut self, is_and: bool) -> &mut Self {
-        self.pop_and_maybe_not_filter_context(is_and, false)
-    }
-
-    pub(crate) fn pop_and_not_filter_context(&mut self, is_and: bool) -> &mut Self {
-        self.pop_and_maybe_not_filter_context(is_and, true)
-    }
-
-    pub(crate) fn pop_and_maybe_not_filter_context(&mut self, is_and: bool, is_not: bool) -> &mut Self {
-        let local_filter_stack = self.filter_stack.get_mut();
-        assert!(local_filter_stack.len() > 0);
-
-        let filter = match is_and {
-            true => FilterExpression::and(local_filter_stack.pop().unwrap()),
-            false => FilterExpression::or(local_filter_stack.pop().unwrap()),
-        };
-
-        if filter.is_some() {
-            let local_last = local_filter_stack.last_mut().unwrap();
-            if is_not {
-                local_last.push(FilterExpression::Not(Box::new(filter.unwrap())));
-            } else {
-                local_last.push(filter.unwrap());
-            }
-        }
-        self
-    }
-
-    pub(crate) fn filter(&mut self, filter: String) -> &mut Self {
-        let local_filter_stack = self.filter_stack.get_mut();
-        local_filter_stack.last_mut().unwrap().push(FilterExpression::Expr(filter));
-        self
-    }
-
-    fn _fields(&self) -> String {
-        if self.fields.len() == 0 {
-            "*".to_string()
-        } else {
-            self.fields.join(", ")
-        }
-    }
-
-    fn _deletes(&self) -> String {
-        if self.top_level {
-            " LEFT JOIN {deletes_table} dt ON dt._id = t._id".to_string()
-        } else {
-            "".to_string()
-        }
-    }
-
-    fn _joins(&self) -> String {
-        if self.joins.len() == 0 {
-            self._deletes()
-        } else {
-            format!(" {}{}", self.joins.join(" "), self._deletes())
-        }
-    }
-
-    fn _latest(&self) -> String {
-        if self.top_level {
-            "(dt._seq_no is null or t._seq_no > dt._seq_no)".to_string()
-        } else {
-            "".to_string()
-        }
-    }
-
-    fn _filters(&self) -> String {
-        let mut local_filter_stack = self.filter_stack.borrow().clone();
-        assert_eq!(local_filter_stack.len(), 1);
-        let top = local_filter_stack.pop().unwrap();
-        if top.len() == 0 && !self.top_level {
-            "".to_string()
-        } else if top.len() == 0 {
-            format!(" WHERE {}", self._latest())
-        } else if self.top_level{
-            format!(" WHERE {} AND {}", self._latest(), SqlBuilder::format_filter(&FilterExpression::And(top)))
-        } else {
-            format!(" WHERE {}", SqlBuilder::format_filter(&FilterExpression::And(top)))
-        }
-    }
-
-    fn format_filter(expr: &FilterExpression) -> String {
-        match expr {
-            FilterExpression::And(exprs) => {
-                assert!(exprs.len() > 0);
-                if exprs.len() == 1 {
-                    return SqlBuilder::format_filter(exprs.get(0).unwrap());
-                } else {
-                    format!("({})", exprs.iter().map(|x|SqlBuilder::format_filter(x)).collect::<Vec<String>>().join(" AND "))
-                }
-            },
-            FilterExpression::Or(exprs) => {
-                if exprs.len() == 1 {
-                    return SqlBuilder::format_filter(exprs.get(0).unwrap());
-                } else {
-                    format!("({})", exprs.iter().map(|x|SqlBuilder::format_filter(x)).collect::<Vec<String>>().join(" OR "))
-                }                
-            },
-            FilterExpression::Not(inner_expr) => {
-                format!("NOT({})", SqlBuilder::format_filter(&inner_expr))
-            },
-            FilterExpression::Expr(val) => {
-                val.clone()
-            }
-        }
-    }
-
-    fn _limit(&self) -> String {
-        if self.limit.is_none() {
-            "".to_string()
-        } else {
-            format!(" LIMIT {}", self.limit.unwrap())
-        }
-    }
-
-    fn _order_by(&self) -> String {
-        if self.order_by.len() == 0 {
-            "".to_string()
-        } else {
-            format!(" ORDER BY {}", self.group_by.join(", "))
-        }
-    }
-
-    fn _group_by(&self) -> String {
-        if self.group_by.len() == 0 {
-            "".to_string()
-        } else {
-            format!(" GROUP BY {}", self.group_by.join(", "))
-        }
-    }
-
-    pub(crate) fn score(&self) -> bool {
-        self.calculate_score
-    }
-
-    pub(crate) fn build(&self) -> String {
-        let filter_str = self._filters();
-        format!(
-            "select {} from {} {}{}{}{}{}",
-            self._fields(),
-            "{target_table} t",
-            self._joins(),
-            filter_str,
-            self._order_by(),
-            self._group_by(),
-            self._limit()
-        )
-    }
-}
-
-fn create_aggregation_filters(filter: &AggSpecFilterBody) -> Vec<String> {
+fn create_aggregation_filters(filter: &AggSpecFilterBody) -> Vec<SqlExpression> {
     match filter {
         AggSpecFilterBody::Term(term) => {
             assert_eq!(term.term.len(), 1);
             let (name, value) = term.term.iter().next().unwrap();
-            vec!(format!("{name} = '{value}'"))
+            vec!(SqlExpression::Comparison(
+                Box::new(SqlExpression::FieldRef("t".to_string(), name.clone())),
+                "=".to_string(),
+                Box::new(SqlExpression::LiteralString(value.clone())),
+            ))
         },
         AggSpecFilterBody::Range(range) => {
             create_aggregation_range_filters(&range.range)
@@ -950,14 +755,18 @@ fn create_aggregation_filters(filter: &AggSpecFilterBody) -> Vec<String> {
     }
 }
 
-fn create_aggregation_range_filters(range: &AggSpecFilterRangeBody) -> Vec<String> {
+fn create_aggregation_range_filters(range: &AggSpecFilterRangeBody) -> Vec<SqlExpression> {
     match range {
         AggSpecFilterRangeBody::Raw(raw) => {
             assert_eq!(raw.len(), 1);
             let (name, value_and_op) = raw.iter().next().unwrap();
 
             let (converted_op, converted_value) = value_and_op.convert_to_sql();
-            vec!(format!("{name} {converted_op} {converted_value}"))
+            vec!(SqlExpression::Comparison(
+                Box::new(SqlExpression::FieldRef("t".to_string(), name.clone())),
+                converted_op.clone(),
+                Box::new(converted_value),
+            ))
         },
         AggSpecFilterRangeBody::Structured(structured) => {
             let mut retval = vec!();
@@ -965,8 +774,16 @@ fn create_aggregation_range_filters(range: &AggSpecFilterRangeBody) -> Vec<Strin
             for range in structured.ranges.iter() {
                 let converted_from_value = convert_datetime_if_necessary(&range.from);
                 let converted_to_value = convert_datetime_if_necessary(&range.to);
-                retval.push(format!("{name} >= {converted_from_value}"));
-                retval.push(format!("{name} < {converted_to_value}"));
+                retval.push(SqlExpression::Comparison(
+                    Box::new(SqlExpression::FieldRef("t".to_string(), name.clone())),
+                    ">=".to_string(),
+                    Box::new(SqlExpression::LiteralString(converted_from_value.clone())),
+                ));
+                retval.push(SqlExpression::Comparison(
+                    Box::new(SqlExpression::FieldRef("t".to_string(), name.clone())),
+                    "<".to_string(),
+                    Box::new(SqlExpression::LiteralString(converted_to_value.clone())),
+                ));
             }
             retval
         }
@@ -978,10 +795,17 @@ fn create_aggregation_processor(input_builder: &SqlBuilder, spec: &AggSpec) -> (
         AggSpec::Terms(terms) => {
             let field_name = terms.terms.field.clone();
             let mut builder = input_builder.clone();
-            builder.group_by.push(format!("{field_name}"));
+            let field_ref_expr = SqlExpression::FieldRef("t".to_string(), field_name.clone());
+            builder.group_by.push(field_ref_expr.clone());
             let aggregations = aggs_to_sql(Some(builder.clone()), terms.aggs.clone());
-            builder.fields.push(format!("{field_name} as field_name"));
-            builder.fields.push("count(1) as cnt".to_string());
+            builder.fields.push(FieldExpression {
+                name: "field_name".to_string(),
+                expression: field_ref_expr.clone()
+            });
+            builder.fields.push(FieldExpression {
+                name: "cnt".to_string(),
+                expression: SqlExpression::Count,
+            });
             let sql = builder.build();
             let processor = AggProcessor::Term(TermAggProcessor{ sql: sql });
             (processor, aggregations)
@@ -992,9 +816,12 @@ fn create_aggregation_processor(input_builder: &SqlBuilder, spec: &AggSpec) -> (
                 builder.filter(filter);
             }
             let mut query_builder = builder.clone();
-            query_builder.fields.push("count(1) as cnt".to_string());
+            query_builder.fields.push(FieldExpression {
+                name: "cnt".to_string(),
+                expression: SqlExpression::Count,
+            });
             let sql = query_builder.build();
-            let processor = AggProcessor::Filter(FilterAggProcessor{ sql: sql });
+            let processor = AggProcessor::Filter(FilterAggProcessor{ sql });
             let aggregations = aggs_to_sql(Some(builder), filter.aggs.clone());
             (processor, aggregations)
         },
@@ -1007,13 +834,31 @@ fn create_aggregation_processor(input_builder: &SqlBuilder, spec: &AggSpec) -> (
             // TODO: this is a mess. Need to figure out how histograms work
             let mut builder = input_builder.clone();
             let field_name = hist.date_histogram.field.clone();
-            builder.fields.push(format!("{field_name} as field_value"));
-            builder.fields.push("count(1) as doc_count".to_string());
+            builder.fields.push(FieldExpression{
+                name: "field_value".to_string(),
+                expression: SqlExpression::FieldRef("t".to_string(), field_name.clone())
+            });
+            builder.fields.push(FieldExpression{
+                name: "doc_count".to_string(),
+                expression: SqlExpression::Count,
+            });
             // TODO: get offset and interval from the spec
             // TODO: convert the field as necessary (aka datetime to millis since epoch)
             let offset = 0;
             let interval = 5;
-            builder.group_by.push(format!("floor(({field_name} - {offset}) / {interval}) * {interval} + {offset}"));
+            builder.group_by.push(SqlExpression::Arithmetic(
+                Box::new(SqlExpression::Arithmetic(
+                    Box::new(SqlExpression::Arithmetic(
+                        Box::new(SqlExpression::FieldRef("t".to_string(), field_name.clone())),
+                        "-".to_string(),
+                        Box::new(SqlExpression::LiteralNonString(offset.to_string()))
+                    )),
+                    "/".to_string(),
+                    Box::new(SqlExpression::LiteralNonString(interval.to_string())),
+                )),
+                "+".to_string(),
+                Box::new(SqlExpression::LiteralNonString(offset.to_string()))
+            ));
             let _sql = builder.build();
             let processor = AggProcessor::DateHistogram(DateHistogramAggProcessor{ buckets: vec!() });
             (processor, None)
@@ -1021,7 +866,12 @@ fn create_aggregation_processor(input_builder: &SqlBuilder, spec: &AggSpec) -> (
         AggSpec::Cardinality(cardinality) => {
             let mut builder = input_builder.clone();
             let field_name = &cardinality.cardinality.field;
-            builder.fields.push(format!("count(distinct {field_name}) as type_count"));
+            builder.fields.push(FieldExpression{
+                name: "type_count".to_string(),
+                expression: SqlExpression::CountDistinct(
+                    Box::new(SqlExpression::FieldRef("t".to_string(), field_name.clone()))
+                )
+            });
             let sql = builder.build();
             let processor = AggProcessor::Cardinality(CardinalityAggProcessor{ sql: sql });
             let aggregations = aggs_to_sql(Some(input_builder.clone()), cardinality.aggs.clone());
@@ -1035,7 +885,10 @@ fn create_aggregation_processor(input_builder: &SqlBuilder, spec: &AggSpec) -> (
                 builder.filter(filter);
             }
             let mut query_builder = builder.clone();
-            query_builder.fields.push("count(1) as cnt".to_string());
+            query_builder.fields.push(FieldExpression {
+                name: "cnt".to_string(),
+                expression: SqlExpression::Count,
+            });
             let sql = query_builder.build();
             let aggregations = aggs_to_sql(Some(builder), range.aggs.clone());
             let processor = AggProcessor::Range(RangeAggProcessor {
@@ -1057,7 +910,12 @@ fn create_aggregation_processor(input_builder: &SqlBuilder, spec: &AggSpec) -> (
         AggSpec::Average(average) => {
             let mut builder = input_builder.clone();
             let field_name = &average.avg.field;
-            builder.fields.push(format!("avg({field_name}) as avg"));
+            builder.fields.push(FieldExpression{
+                name: "avg".to_string(),
+                expression: SqlExpression::Average(
+                    Box::new(SqlExpression::FieldRef("t".to_string(), field_name.clone()))
+                )
+            });
             let sql = builder.build();
             let processor = AggProcessor::Average(AverageAggProcessor{ sql: sql });
             let aggregations = aggs_to_sql(Some(input_builder.clone()), average.aggs.clone());
@@ -1085,7 +943,7 @@ fn aggs_to_sql(input_builder: Option<SqlBuilder>, aggs: Option<HashMap<String, A
 }
 
 fn to_command(table: Option<String>, body: &SearchBody, query: &QueryStringSearch) -> Result<SqlCommand, ParseError> {
-    let mut builder = SqlBuilder::for_query();
+    let mut builder = SqlBuilder::for_query(true);
 
     if body.from.is_some() {
         if body.from.unwrap() != 0 {
@@ -1095,8 +953,6 @@ fn to_command(table: Option<String>, body: &SearchBody, query: &QueryStringSearc
 
     if body.query.is_some() {
         to_command_worker(&mut builder, &body.query.clone().unwrap())?;
-    } else {
-        builder.fields.push("*".to_string());
     }
 
     let table_name = match table {
@@ -1108,20 +964,19 @@ fn to_command(table: Option<String>, body: &SearchBody, query: &QueryStringSearc
         }
     };
 
-    let sql = builder.build();
     let aggs = aggs_to_sql(None, body.aggs.clone());
 
     Ok(SqlCommand{
-        sql: sql,
+        sql: builder.build(),
         table: table_name,
-        calculate_score: builder.score(),
+        calculate_score: builder.calculate_score,
         aggs: aggs,
         query_params: query.clone()
     })
 }
 
 fn to_command_update_by_query(table: Option<String>, body: &UpdateByQueryBody) -> Result<UpdateByQueryCommand, ParseError> {
-    let mut builder = SqlBuilder::for_query();
+    let mut builder = SqlBuilder::for_query(true);
 
     to_command_worker(&mut builder, &body.query)?;
 
@@ -1134,7 +989,7 @@ fn to_command_update_by_query(table: Option<String>, body: &UpdateByQueryBody) -
         query_command: SqlCommand{
             sql: builder.build(),
             table: table_name,
-            calculate_score: builder.score(),
+            calculate_score: builder.calculate_score,
             aggs: None,
             query_params: QueryStringSearch {
                 allow_partial_search_results: None,
@@ -1170,13 +1025,21 @@ fn to_sql_match(builder: &mut SqlBuilder, match_obj: &Match) -> Result<(), Parse
     }
 
     builder.calculate_score = true;
-    if builder.joins.len() == 0 {
-        builder.joins.push("INNER JOIN {target_table}_search_index si on si.doc_id = t._id".to_string());
-    }
 
+    builder.push_filter_context();
     for pair in match_obj._match.iter() {
-        builder.filter(format!("(si.field_name = '{}' AND si.field_term = '{}')", pair.0, to_field_term(pair.1)));
+        builder.filter(SqlExpression::Comparison(
+            Box::new(SqlExpression::FieldRef("si".to_string(), "field_name".to_string())),
+            "=".to_string(),
+            Box::new(SqlExpression::LiteralString(pair.0.clone()))
+        ));
+        builder.filter(SqlExpression::Comparison(
+            Box::new(SqlExpression::FieldRef("si".to_string(), "field_term".to_string())),
+            "=".to_string(),
+            Box::new(SqlExpression::LiteralString(to_field_term(pair.1)))
+        ));
     }
+    builder.pop_filter_context(true);
     Ok(())
 }
 
@@ -1216,11 +1079,19 @@ fn to_sql_bool(builder: &mut SqlBuilder, bool_obj: &Bool) -> Result<(), ParseErr
 }
 
 fn to_sql_term(builder: &mut SqlBuilder, term_obj: &Term) -> Result<(), ParseError> {
-    for pair in term_obj.term.iter() {
-        if pair.1.is_string() {
-            builder.filter(format!("t.{} = '{}'", pair.0, pair.1.as_str().unwrap()));
+    for (name, value) in term_obj.term.iter() {
+        if value.is_string() {
+            builder.filter(SqlExpression::Comparison(
+                Box::new(SqlExpression::FieldRef("t".to_string(), name.clone())),
+                "=".to_string(),
+                Box::new(SqlExpression::LiteralString(value.as_str().unwrap().to_string()))
+            ));
         } else {
-            builder.filter(format!("t.{} = {}", pair.0, pair.1));
+            builder.filter(SqlExpression::Comparison(
+                Box::new(SqlExpression::FieldRef("t".to_string(), name.clone())),
+                "=".to_string(),
+                Box::new(SqlExpression::LiteralNonString(value.to_string()))
+            ));
         }
     }
     Ok(())
@@ -1240,7 +1111,7 @@ fn convert_datetime_if_necessary(value: &str) -> String {
         value.to_string()
     };
 
-    format!("'{}'", converted_value)
+    converted_value
 }
 
 fn to_sql_range(builder: &mut SqlBuilder, range_obj: &Range) -> Result<(), ParseError> {
@@ -1255,7 +1126,16 @@ fn to_sql_range(builder: &mut SqlBuilder, range_obj: &Range) -> Result<(), Parse
     }
 
     let (op, final_val) = spec.op.convert_to_sql();
-    builder.filter(format!("(t.{field_name} {op} {final_val} OR t.{field_name} is null)"));
+    builder.push_filter_context();
+    builder.filter(SqlExpression::Comparison(
+        Box::new(SqlExpression::FieldRef("t".to_string(), field_name.clone())),
+        op.clone(),
+        Box::new(final_val)
+    ));
+    builder.filter(SqlExpression::IsNull(
+        Box::new(SqlExpression::FieldRef("t".to_string(), field_name.clone()))
+    ));
+    builder.pop_filter_context(false);
 
     Ok(())
 }
@@ -1272,11 +1152,22 @@ fn to_sql_simple_query(builder: &mut SqlBuilder, query_obj: &SimpleQueryString) 
 
     // TODO: need to really parse the query string
     let split_query = query_obj.simple_query_string.query.split(" ");
+    builder.push_filter_context();
     for field_term in split_query {
         for field_name in query_obj.simple_query_string.fields.iter() {
-            builder.filter(format!("(si.field_name = '{}' AND si.field_term = '{}')", field_name, field_term));
+            builder.filter(SqlExpression::Comparison(
+                Box::new(SqlExpression::FieldRef("si".to_string(), "field_name".to_string())),
+                "=".to_string(),
+                Box::new(SqlExpression::LiteralString(field_name.clone()))
+            ));
+            builder.filter(SqlExpression::Comparison(
+                Box::new(SqlExpression::FieldRef("si".to_string(), "field_term".to_string())),
+                "=".to_string(),
+                Box::new(SqlExpression::LiteralString(field_term.to_string()))
+            ));
         }
     }
+    builder.pop_filter_context(true);
     Ok(())    
 }
 
@@ -1285,7 +1176,7 @@ fn to_sql_simple_query(builder: &mut SqlBuilder, query_obj: &SimpleQueryString) 
 mod tests {
     use crate::elastic_search_endpoints::QueryStringSearch;
     use crate::elastic_search_parser::{parse, UpdateByQueryBody};
-
+    use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
     use super::{to_command, SearchBody};
 
     #[test]
@@ -1339,7 +1230,15 @@ mod tests {
 
         let command = to_command(Some("testtime".to_string()), &parse_result, &QueryStringSearch::new()).unwrap();
 
-        println!("{}", command.sql);
+        let schema = PowdrrSchema::from(&vec!(
+            PowdrrField{ name: "message".to_string(), data_type: PowdrrDataType::String},
+            PowdrrField{ name: "_seq_no".to_string(), data_type: PowdrrDataType::Integer},
+        ));
+
+        let sql = command.sql.build_same(&schema);
+
+        assert!(sql.contains("t.\"message\""));
+        assert!(sql.contains("si.\"field_name\" = 'message'"));
     }
 
     #[test]
@@ -1399,7 +1298,14 @@ mod tests {
 
         let command = to_command(Some("testtime".to_string()), &parse_result, &QueryStringSearch::new()).unwrap();
 
-        println!("{}", command.sql);
+        let schema = PowdrrSchema::from(&vec!(
+            PowdrrField{ name: "type".to_string(), data_type: PowdrrDataType::String},
+            PowdrrField{ name: "ingest-package-policies_package_name".to_string(), data_type: PowdrrDataType::String},
+            PowdrrField{ name: "task_runAt".to_string(), data_type: PowdrrDataType::String},
+            PowdrrField{ name: "_seq_no".to_string(), data_type: PowdrrDataType::Integer},
+        ));
+
+        println!("{}", command.sql.build_same(&schema));
 
         let test_val = r#"{
   "size": 20,
@@ -1536,7 +1442,13 @@ mod tests {
 
         let command = to_command(Some("testtime".to_string()), &parse_result, &QueryStringSearch::new()).unwrap();
 
-        println!("{}", command.sql);
+        let schema = PowdrrSchema::from(&vec!(
+            PowdrrField{ name: "type".to_string(), data_type: PowdrrDataType::String},
+            PowdrrField{ name: "ingest-package-policies_package_name".to_string(), data_type: PowdrrDataType::String},
+            PowdrrField{ name: "_seq_no".to_string(), data_type: PowdrrDataType::Integer},
+        ));
+
+        println!("{}", command.sql.build_same(&schema));
 
         let test_val = r#"{
   "size": 1000,

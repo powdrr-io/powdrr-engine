@@ -43,6 +43,8 @@ pub(crate) struct IcebergMetadata {
     // per file, per column lower and upper bounds
     // TODO: this needs to be generalized to support bloom filters
     pub column_stats: Vec<(String, String)>,
+    pub schemas: Vec<PowdrrSchema>,
+    pub file_schemas: Vec<u64>,
 }
 
 
@@ -768,7 +770,7 @@ impl TestApiServiceClient {
                         speedboat_metadata: None,
                         deletes_metadata: None,
                         extension_metadata: None,
-                        schema: PowdrrSchema{ fields: vec!() },
+                        schema: table_info.schema.as_ref().unwrap().clone()
                     }
                 },
             };
@@ -778,21 +780,26 @@ impl TestApiServiceClient {
                 None => SpeedboatMetadata {
                     files: table_info.files.clone(),
                     sizes: table_info.sizes.clone(),
-                    schemas: vec!(),
-                    file_schemas: vec!(),
+                    schemas: vec!(table_info.schema.as_ref().unwrap().clone()),
+                    file_schemas: vec!(0),
                 },
                 Some(existing) => {
                     let mut files = existing.files.clone();
                     let mut sizes = existing.sizes.clone();
+                    let mut schemas = existing.schemas.clone();
+                    let mut file_schemas = existing.file_schemas.clone();
                     let all_removed_files = self.get_removed_files(&commit.compactions);
                     do_remove(&all_removed_files, &mut files, &mut sizes);
                     files.extend(table_info.files.clone());
                     sizes.extend(table_info.sizes.clone());
+                    // TODO: look for existing schemas that match and reuse
+                    file_schemas.push(schemas.len() as u64);
+                    schemas.push(table_info.schema.as_ref().unwrap().clone());
                     SpeedboatMetadata {
-                        files: files,
-                        sizes: sizes,
-                        schemas: vec!(),
-                        file_schemas: vec!(),
+                        files,
+                        sizes,
+                        schemas,
+                        file_schemas,
                     }
                 },
             };

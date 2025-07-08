@@ -326,7 +326,7 @@ pub fn es_get_with_id(state: State) -> Pin<Box<HandlerFuture>> {
         let table_desc = API_SERVICE_CLIENT.describe_table(&index_name).await;
         match table_desc {
             Some(td) => {
-                let command = LookupById{ table: td.name, ids: vec!(doc_id) };
+                let command = LookupById::new(&td.name, &vec!(doc_id));
                 let response = execute_command(CommandContext{}, Arc::new(command)).await;
                 let res = response.generate_response(&state);
                 Ok((state, res))
