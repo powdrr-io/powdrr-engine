@@ -244,34 +244,6 @@ pub fn create_denormalized_value(value: &Value) -> Value {
     Value::from(new_map)
 }
 
-/*
-// TODO: this is a method to workaround a bug in datafusion
-pub fn create_datafusion_safe_value(value: &Value) -> Value {
-    match value {
-        Value::Object(obj) => {
-            let mut new_map = serde_json::Map::new();
-            for (map_key, map_value) in obj.iter() {
-                new_map.insert(create_datafusion_safe_name(map_key), create_datafusion_safe_value(map_value));
-            }
-            Value::from(new_map)
-        },
-        Value::Array(arr) => {
-            let mut new_array = Vec::new();
-            for array_value in arr.iter() {
-                new_array.push(create_datafusion_safe_value(array_value));
-            }
-            Value::from(new_array)            
-        }
-        _ => value.clone()
-    }
-}
-
-
-// TODO: this is a method to workaround a bug in datafusion
-pub fn create_datafusion_safe_name(value: &String) -> String {
-    value.clone()
-}
-*/
 
 #[cfg(test)]
 mod tests {

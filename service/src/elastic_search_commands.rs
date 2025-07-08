@@ -32,6 +32,9 @@ fn to_hit(index: &String, value: &Value) -> QueryResultHit {
     let version = value_map.get("_version").unwrap().as_u64().unwrap();
     let seq_no = value_map.get("_seq_no").unwrap().as_i64().unwrap();
     let source = value_map.get("_source").unwrap().as_str().unwrap();
+    // TODO: we are parsing the string into a value just to put it an object
+    // that will get serialized out again. That is lame. If we can get the serializer
+    // to look at a string but put it in like it is a Value, that would be better.
     let source_value = serde_json::from_str(source).unwrap();
     QueryResultHit {
         _index: Some(index.clone()),
@@ -317,7 +320,7 @@ impl Command for SqlCommand {
         };
         let checkpoint_id = API_SERVICE_CLIENT.get_latest_checkpoint(&self.table, extension).await.unwrap();
         match checkpoint_id {
-            Some(c) => vec!(SnapshotDescriptor { table_name: self.table.clone(), snapshot_id: c }),
+            Some(c) => vec!(SnapshotDescriptor{ table_name: self.table.clone(), snapshot_id: c }),
             None => vec!(),
         }
     }    
