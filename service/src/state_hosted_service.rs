@@ -733,11 +733,11 @@ impl TestApiServiceClient {
     } 
 
     fn get_latest_checkpoint_sync(&mut self, table_name: &String, extensions: Option<String>) -> Option<String> {
+        let real_table_name = self.table_aliases.get(table_name).unwrap_or(table_name);
         let key = match extensions {
-            Some(e) => &format!("{}_{}", table_name, e).to_string(),
+            Some(e) => &format!("{}_{}", real_table_name, e).to_string(),
             None => table_name,
         };
-
         match self.latest_checkpoint_id.get(key) {
             Some(c) => Some(c.to_string()),
             None => None
@@ -745,8 +745,9 @@ impl TestApiServiceClient {
     }     
 
     fn set_latest_checkpoint(&mut self, table_name: &String, extensions: Option<&String>, checkpoint_id: &String) {
+        let real_table_name = self.table_aliases.get(table_name).unwrap_or(table_name);
         let key = match extensions {
-            Some(e) => &format!("{}_{}", table_name, e).to_string(),
+            Some(e) => &format!("{}_{}", real_table_name, e).to_string(),
             None => table_name,
         };        
         self.latest_checkpoint_id.insert(key.clone(), checkpoint_id.clone());        

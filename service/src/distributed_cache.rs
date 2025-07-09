@@ -102,12 +102,16 @@ pub(crate) fn insert_operator(table: &String, num_records: i64) -> Result<i64, C
     increment(&table_seq_no_key(table), 1)
 }
 
-pub(crate) fn delete_operator(table: &String, num_records: i64) -> Result<u64, CacheError> {
+pub(crate) fn delete_operator(table: &String, num_records: i64) -> Result<i64, CacheError> {
     // Decrease the number of records
     increment(&approx_num_records_key(table), -num_records)?;
-    // ...and dump the seq no
-    Ok(increment(&table_seq_no_key(table), 1)?.try_into().unwrap())
-}  
+    // ...and up the seq no
+    increment(&table_seq_no_key(table), 1)
+}
+
+pub(crate) fn update_operator(table: &String) -> Result<i64, CacheError> {
+    increment(&table_seq_no_key(table), 1)
+}
 
 pub(crate) fn clear(tables: &Vec<String>) -> Result<(), CacheError> {
     for table in tables.into_iter() {

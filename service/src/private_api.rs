@@ -188,6 +188,7 @@ async fn ensure_loaded(invocation: &PrivateSqlInvocation, file_path: &String, pa
 async fn execute_sql(sql_template: &String, local_name: &String, deletes_local_name: &String) -> Result<Vec<RecordBatch>, DataFusionError> {
     // create a plan to run a SQL query
     let final_sql = sql_template.replace("{target_table}", local_name).replace("{deletes_table}", deletes_local_name);
+    println!("{}", final_sql);
     let results = match data_access::execute_sql(&final_sql).await {
         Ok(df) => df,
         Err(e) => return log_err(e),

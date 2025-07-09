@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashMap, fs::File};
 use std::io::Write;
-use std::str::FromStr;
 use futures::FutureExt;
 use gotham::mime;
 use http::header::LOCATION;
@@ -14,12 +13,12 @@ use http::StatusCode;
 use idgenerator::*;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::{mpsc, oneshot};
 use uuid_b64::UuidB64;
 
-use crate::elastic_search_commands::LookupById;
+use crate::elastic_search_commands::{to_serde_value, LookupById};
 use crate::elastic_search_common::{load_command_raw_result, CommandContext, ElasticSearchResponse, MIME_ES_JSON};
 use crate::elastic_search_responses::{BulkResult, ErrorDetails, OperationResult, QueryResultHit, Shards, SingleDocCreateFailedResult};
 use crate::{data_access, distributed_cache};
@@ -81,6 +80,7 @@ impl WriteBuffer {
     }
 
     fn write_to_file(&self, file_name: &String) -> Result<(), IngestError> {
+        assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
         let mut file_write = File::create(file_name).expect("Cannot create file");
         for line in self.lines.iter() {
             match writeln!(&mut file_write, "{}", line) {
@@ -400,13 +400,12 @@ pub(crate) fn ingest_create(
         Some(id) => id.clone(),
         None => UuidB64::new().to_string()
     };
-    let doc_with_id = RecordInput {
-        _id: id.clone(),
-        _seq_no: seq_no,
-        _version: version,
-        existing_normalized: None,
-        source: doc.clone(),
-    };
+    let doc_with_id = RecordInput::new(
+        id.clone(),
+        seq_no,
+        version,
+        &doc,
+    );
     buffer.records.push(doc_with_id);
     OperationResult{
         _index: table_description.name.clone(),
@@ -476,9 +475,13 @@ pub(crate) async fn commit(buffer: &WriteBuffer, index: &String) -> Result<(), I
 }
 
 pub(crate) async fn commit_general(buffer: &WriteBuffer, index: &String, commit_type: &String) -> Result<(), IngestError> {
+    if buffer.lines.len() == 0 {
+        return Ok(())
+    }
+
     let new_id = format!("tests/data/ingest/{}-{}-{}.json", commit_type, index, IdInstance::next_id().to_string());
     let write_to_file_result = buffer.write_to_file(&new_id);
-    tracing::info!("Ingest: table {} wrote {} records", index, buffer.len());
+    tracing::info!("Ingest: op {} on table {} wrote {} records", commit_type, index, buffer.len());
 
     match write_to_file_result {
         Ok(_) => (),
@@ -504,9 +507,15 @@ pub(crate) async fn commit_general(buffer: &WriteBuffer, index: &String, commit_
     Ok(())
 }
 
+struct ExistingDocs {
+    docs: Vec<Value>,
+    #[allow(dead_code)]
+    schema: Option<PowdrrSchema>
+}
 
-async fn get_existing_doc_count(index: &String, doc_ids: &Vec<String>) -> Result<usize, IngestError> {
-    let df_count = match load_command_raw_result(CommandContext{}, Arc::new(LookupById::new(&index, &doc_ids))).await {
+
+async fn get_existing_docs(index: &String, doc_ids: &Vec<String>) -> Result<ExistingDocs, IngestError> {
+    let docs = match load_command_raw_result(CommandContext{}, Arc::new(LookupById::new(&index, &doc_ids))).await {
         Ok(lcrr) => match lcrr {
             Some(raw_table) => {
                 let df = match data_access::execute_sql(&format!("SELECT * from {raw_table}")).await {
@@ -514,16 +523,14 @@ async fn get_existing_doc_count(index: &String, doc_ids: &Vec<String>) -> Result
                     Err(_) => panic!("weird")
                 };
 
-                match df.count().await {
-                    Ok(c) => c,
-                    Err(_) => panic!("weird")
-                }
+                let (docs, schema) = to_serde_value(&df).await;
+                ExistingDocs{ docs, schema }
             },
-            None => 0,
+            None => ExistingDocs{ docs: vec!(), schema: None }
         },
         Err(_) => panic!("weird")
     };
-    Ok(df_count)
+    Ok(docs)
 }
 
 async fn create_single_worker(index: &String, doc_id: &String, payload: &String) -> Result<ElasticSearchResponse, IngestError> {
@@ -534,9 +541,9 @@ async fn create_single_worker(index: &String, doc_id: &String, payload: &String)
     let doc: Result<Value, serde_json::Error> = serde_json::from_str(payload);
     match doc {
         Ok(valid_doc) => {
-            let df_count = get_existing_doc_count(index, &vec!(doc_id.to_string())).await?;
+            let docs = get_existing_docs(&table_description.name, &vec!(doc_id.to_string())).await?;
             
-            if df_count != 0 {
+            if docs.docs.len() != 0 {
                 // TODO: get version from existing doc
                 let response = SingleDocCreateFailedResult {
                     error: ErrorDetails::single_cause(
@@ -585,6 +592,20 @@ async fn create_single_worker(index: &String, doc_id: &String, payload: &String)
 }
 
 
+fn merge_source(existing_doc: &Value, new_doc: &Value) -> Value {
+    // TODO: this is a hack where whole keys are replace where it should
+    // be only leaf node keys where there is overlap.
+    let mut map = serde_json::Map::new();
+    for (k, v) in existing_doc.as_object().unwrap().iter() {
+        map.insert(k.clone(), v.clone());
+    }
+    for (k, v) in new_doc.as_object().unwrap().iter() {
+        map.insert(k.clone(), v.clone());
+    }
+    Value::Object(map)
+}
+
+
 async fn update_single_worker(index: &String, doc_id: &String, payload: &String) -> Result<ElasticSearchResponse, IngestError> {
     let table_description: TableDescription = match API_SERVICE_CLIENT.describe_table(&index).await {
         Some(t) => t,
@@ -598,22 +619,65 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
         }
     };
 
-    let df_count = get_existing_doc_count(index, &vec!(doc_id.to_string())).await?;
+    let docs = get_existing_docs(&table_description.name, &vec!(doc_id.to_string())).await?;
 
-    if df_count != 0 {
-        todo!("Need to implement actual update")
+    let mut buffer = WriteBufferBuilder::new();
+    let result = if docs.docs.len() != 0 {
+        assert_eq!(docs.docs.len(), 1);
+        if update_request.doc.is_none() {
+            todo!("What do we do here?")
+        }
+        let mut existing_doc = RecordInput::from_record(&docs.docs[0]);
+        existing_doc.ensure_source();
+        let seq_no: i64 = match distributed_cache::update_operator(&table_description.name) {
+            Ok(v) => v,
+            Err(_) => panic!("nope")
+        };
+
+        let mut updated_doc = RecordInput::new(
+            existing_doc.id().clone(),
+            seq_no,
+            existing_doc.version() + 1,
+            &merge_source(existing_doc.source().unwrap(), update_request.doc.as_ref().unwrap()),
+        );
+        updated_doc.ensure_source();
+        updated_doc.ensure_normalized_value();
+        buffer.records.push(updated_doc.clone());
+        OperationResult{
+            _index: table_description.name.clone(),
+            _id: existing_doc.id().clone(),
+            _version: 1,
+            result: "updated".to_string(),
+            _shards: Shards {
+                total: 1,
+                successful: 1,
+                failed: 0,
+            },
+            status: None,
+            _seq_no: seq_no,
+            _primary_term: 1,
+            get: Some(QueryResultHit {
+                _index: None,
+                _id: None,
+                _version: 1,
+                _seq_no: seq_no,
+                _score: None,
+                _primary_term: Some(1),
+                found: None,
+                _source: updated_doc.source().cloned().unwrap()
+            })
+        }
     } else {
         if update_request.upsert.is_none() {
-            // TODO: this is the doc_as_upsert path too to figure out
-            return Ok(ElasticSearchResponse{ status: StatusCode::BAD_REQUEST, mime: mime::APPLICATION_JSON, body: "Document does not exist".to_string(), headers: vec!() })
+            // TODO: this is the doc_as_upsert path to figure out
+            todo!("Need to implement upsert")
         }
-        
+
         let seq_no: i64 = match distributed_cache::insert_operator(&table_description.name, 1) {
             Ok(v) => v,
             Err(_) => panic!("nope")
         };
 
-        let mut buffer = WriteBufferBuilder::new();
         let upsert_doc = update_request.upsert.unwrap();
         let mut result = ingest_create(
             &table_description,
@@ -624,33 +688,39 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
             None,
             &mut buffer
         );
-        
-        result.get = Some(QueryResultHit{
+
+        result.get = Some(QueryResultHit {
             _index: None,
             _id: None,
             _version: 1,
             _seq_no: seq_no,
             _score: None,
             _primary_term: Some(1),
-            found: Some(true),
+            found: None,
             _source: upsert_doc.clone()
         });
-        
-        commit(&buffer.build(), &table_description.name).await?;
-        let headers = vec!((LOCATION, format!("/{}/_doc/{}", table_description.name, url_escape::encode_userinfo(doc_id))));
-        Ok(ElasticSearchResponse {
-            status: StatusCode::CREATED,
-            mime: MIME_ES_JSON.clone(),
-            body: serde_json::to_string(&result).unwrap(),
-            headers: headers
-        })
-    }
+
+        result
+    };
+
+    commit(&buffer.build(), &table_description.name).await?;
+    let headers = vec!((LOCATION, format!("/{}/_doc/{}", table_description.name, url_escape::encode_userinfo(doc_id))));
+    Ok(ElasticSearchResponse {
+        status: StatusCode::CREATED,
+        mime: MIME_ES_JSON.clone(),
+        body: serde_json::to_string(&result).unwrap(),
+        headers: headers
+    })
+
 }
 
 
 
-pub(crate) fn create_delete(doc_id: &String, seq_no: u64) -> Value {
-    serde_json::Value::from_str(&format!("{{\"_id\": \"{}\", \"_seq_no\": {}}}", doc_id, seq_no)).unwrap()
+pub(crate) fn create_delete(doc_id: &String, seq_no: i64) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert("_id".to_string(), json!(doc_id));
+    map.insert("_seq_no".to_string(), json!(seq_no));
+    Value::Object(map)
 }
 
 pub(crate) async fn delete(index: &String, doc_id: &String) -> Result<ElasticSearchResponse, IngestError> {
@@ -659,8 +729,8 @@ pub(crate) async fn delete(index: &String, doc_id: &String) -> Result<ElasticSea
         None => return Err(IngestError{ message: "Index does not exist".to_string() })
     };
 
-    let df_count = get_existing_doc_count(index, &vec!(doc_id.clone())).await?;
-    if df_count == 0 {
+    let docs = get_existing_docs(&table_description.name, &vec!(doc_id.clone())).await?;
+    if docs.docs.len() == 0 {
         let result = OperationResult {
             _index: index.clone(),
             _id: doc_id.clone(),

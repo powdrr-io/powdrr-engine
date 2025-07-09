@@ -25,7 +25,6 @@ pub fn test_v1_create_index(mut state: State) -> Pin<Box<HandlerFuture>> {
             Ok(io) => io,
             Err(_) => panic!("This should not happen"),
         };
-        println!("Body: {}", body_content);
         match elastic_search_index::create_index_parquet(&invocation_obj.file_path, &invocation_obj.doc_id_field_name).await {
             Err(_) => panic!("Let's just panic for now"),
             Ok(_) => ()
@@ -47,7 +46,6 @@ pub fn test_v1_add_checkpoint(mut state: State) -> Pin<Box<HandlerFuture>> {
             Ok(io) => io,
             Err(_) => panic!("This should not happen"),
         };
-        println!("Body: {}", body_content);
 
         API_SERVICE_CLIENT.add_checkpoint(&invocation_obj).await;
         let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "Ok");

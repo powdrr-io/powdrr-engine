@@ -110,9 +110,18 @@
         }
       ]
     }
+  },
+  "sort": {
+    "_script": {
+      "type": "number",
+      "order": "asc",
+      "script": {
+        "lang": "painless",
+        "source": "\nif (doc['task.retryAt'].size()!=0) {\n  return doc['task.retryAt'].value.toInstant().toEpochMilli();\n}\nif (doc['task.runAt'].size()!=0) {\n  return doc['task.runAt'].value.toInstant().toEpochMilli();\n}\n"
+      }
+    }
   }
 }
-
 
 
 

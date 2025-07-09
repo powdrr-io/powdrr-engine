@@ -25,29 +25,6 @@ async fn empty_result(aggs: Option<Vec<Aggregation>>, total_hits_complex: bool) 
 }
 
 
-fn to_hit(index: &String, value: &Value) -> QueryResultHit {
-    let value_map = value.as_object().unwrap().clone();
-    let score = value_map.get("score").map_or_else(|| 0.0, |f|f.as_f64().unwrap());
-    let id = value_map.get("_id").unwrap().as_str().unwrap().to_string();
-    let version = value_map.get("_version").unwrap().as_u64().unwrap();
-    let seq_no = value_map.get("_seq_no").unwrap().as_i64().unwrap();
-    let source = value_map.get("_source").unwrap().as_str().unwrap();
-    // TODO: we are parsing the string into a value just to put it an object
-    // that will get serialized out again. That is lame. If we can get the serializer
-    // to look at a string but put it in like it is a Value, that would be better.
-    let source_value = serde_json::from_str(source).unwrap();
-    QueryResultHit {
-        _index: Some(index.clone()),
-        _id: Some(id),
-        _version: version,
-        _seq_no: seq_no,
-        _score: Some(score),
-        _primary_term: Some(1),
-        found: None,
-        _source: source_value,
-    }
-}
-
 pub(crate) async fn to_serde_value(data_frame: &DataFrame) -> (Vec<Value>, Option<PowdrrSchema>) {
     let record_batches: Vec<RecordBatch> = match data_frame.clone().collect().await {
         Ok(b) => b,
@@ -81,10 +58,17 @@ pub(crate) async fn to_serde_value(data_frame: &DataFrame) -> (Vec<Value>, Optio
     (parsed_json, schema)
 }
 
-async fn to_hits(index: &String, data_frame: &DataFrame) -> (Vec<QueryResultHit>, Option<PowdrrSchema>) {
+async fn to_record_inputs(data_frame: &DataFrame) -> (Vec<RecordInput>, Option<PowdrrSchema>) {
     let (parsed_json, schema) = to_serde_value(data_frame).await;
 
-    let hits = parsed_json.iter().map(|x|to_hit(index, &x)).collect();
+    let record_inputs = parsed_json.iter().map(|x| RecordInput::from_record(&x)).collect();
+    (record_inputs, schema)
+}
+
+async fn to_hits(index: &String, data_frame: &DataFrame, found: Option<bool>) -> (Vec<QueryResultHit>, Option<PowdrrSchema>) {
+    let (parsed_json, schema) = to_serde_value(data_frame).await;
+
+    let hits = parsed_json.iter().map(|x|QueryResultHit::from_record(&Some(index.clone()), &x, found)).collect();
     (hits, schema)
 }
 
@@ -137,7 +121,7 @@ impl Command for LookupById {
         async move {
             let result = match LookupById::to_dataframe(result_table_name).await {
                 Some(df) => {
-                    let (hits, _) = to_hits(&table, &df).await;
+                    let (hits, _) = to_hits(&table, &df, Some(true)).await;
                     let inner_result: Arc<dyn CommandResponse> = if hits.len() == 0 {
                         Arc::new(QueryResultsNotFound { _index: table, _id: ids.get(0).unwrap().clone(), found: false })
                     } else {
@@ -278,16 +262,18 @@ impl Command for SqlCommand {
                 Err(_) => panic!("nope"),
             };
 
-            let first_10_rows = match data_frame.clone().limit(0, Some(10)) {
+            // TODO: figure out the real size to return. There is default and then size can
+            // be passed in.
+            let first_n_rows = match data_frame.clone().limit(0, Some(100)) {
                 Ok(ftr) => ftr,
                 Err(_) => panic!("nope"),
             };
 
-            let (hits, schema) = to_hits(&table, &first_10_rows).await;
+            let (hits, schema) = to_hits(&table, &first_n_rows, None).await;
 
             let aggregations = SqlCommand::generate_aggregations(schema, aggs, Some(final_table_name)).await;
             // TODO: need to calculate the actual max score here
-            let max_score = hits.get(0).unwrap()._score.unwrap();
+            let max_score = hits.get(0).unwrap()._score;
             let final_result = QueryResults::success(
                 50,
                 1,
@@ -341,7 +327,7 @@ enum EvalResult {
     Update(RecordInput),
     Noop,
     #[allow(dead_code)]
-    Delete((String, u64)),
+    Delete((String, i64)),
 }
 
 struct UpdateByQueryResult {
@@ -361,10 +347,12 @@ impl UpdateByQueryResult {
     
     async fn commit(&mut self) -> Result<Arc<dyn CommandResponse>, String> {
         // TODO: ideally this would write all the files once and do a single commit to the service.
-        match elastic_search_ingest::commit_general(&self.update_buffer.build(), &self.table, &"commit".to_string()).await {
-            Ok(_) => (),
-            Err(_) => panic!("nope"),
-        };
+        if self.update_buffer.records.len() != 0 {
+            match elastic_search_ingest::commit_general(&self.update_buffer.build(), &self.table, &"commit".to_string()).await {
+                Ok(_) => (),
+                Err(_) => panic!("nope"),
+            };
+        }
         match elastic_search_ingest::commit_general(&self.delete_buffer, &self.table, &"delete".to_string()).await {
             Ok(_) => (),
             Err(_) => panic!("nope"),
@@ -381,15 +369,14 @@ impl UpdateByQueryResult {
 
 
 impl UpdateByQueryCommand {
-    fn evaluate(script: &ScriptBlock, value: &QueryResultHit) -> EvalResult {
-        // TODO: run script
+    fn evaluate(table_name: &String, script: &ScriptBlock, value: &RecordInput) -> EvalResult {
         let translated_script = match painless_parser::translate(&script.source) {
             Ok(t) => t,
             Err(_) => panic!("Need to make an error path")
         };
         let output = expression_evaluator::eval_template(
             &translated_script,
-            &value._source,
+            &value.source().unwrap(),
             HashMap::from([
                 ("op".to_string(), minijinja::Value::from("update"))
             ]),
@@ -397,16 +384,20 @@ impl UpdateByQueryCommand {
         );
 
         let op = output.other_context.get("op").map_or_else(|| "noop", |v|v.as_str().unwrap());
-        
+
         match op {
             "update" => {
-                EvalResult::Update(RecordInput {
-                    _id: value._id.as_ref().unwrap().clone(),
-                    _seq_no: value._seq_no,
-                    _version: value._version + 1,
-                    existing_normalized: None,
-                    source: output.source,
-                })
+                let seq_no: i64 = match distributed_cache::update_operator(&table_name) {
+                    Ok(t) => t,
+                    Err(_) => panic!("nope"),
+                };
+
+                EvalResult::Update(RecordInput::new(
+                    value.id().clone(),
+                    seq_no,
+                    value.version() + 1,
+                    &output.source,
+                ))
             },
             "noop" => {
                 EvalResult::Noop
@@ -506,9 +497,9 @@ impl Command for UpdateByQueryCommand {
                 Err(_) => panic!("nope")
             };
 
-            let (result_values, _) = to_hits(&table, &data_frame).await;
-
-            let final_result_values: Vec<EvalResult> = result_values.iter().map(|x|UpdateByQueryCommand::evaluate(&script_block, x)).collect();
+            let (mut result_values, _) = to_record_inputs(&data_frame).await;
+            result_values.iter_mut().for_each(|x|x.ensure_source());
+            let final_result_values: Vec<EvalResult> = result_values.iter().map(|x|UpdateByQueryCommand::evaluate(&table, &script_block, x)).collect();
 
             let mut result_info = UpdateByQueryCommand::create_final_result(&table, final_result_values).await;
             result_info.commit().await
