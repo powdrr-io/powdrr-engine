@@ -394,8 +394,8 @@ impl SqlExpression {
 
     fn literal_default(field: &PowdrrField) -> SqlExpression {
         match &field.data_type {
-            PowdrrDataType::Array(_element_type) => todo!(),
-            PowdrrDataType::Object(_schema) => todo!(),
+            PowdrrDataType::Array(_element_type) => SqlExpression::LiteralNonString("null".to_string()),
+            PowdrrDataType::Object(_schema) => SqlExpression::LiteralNonString("null".to_string()),
             _ => SqlExpression::LiteralNonString("null".to_string())
         }
     }
@@ -504,7 +504,7 @@ impl FieldExpression {
     }
 
     fn stringize(&self) -> String {
-        format!("{} as {}", self.expression.stringize(), self.name)
+        format!("{} as \"{}\"", self.expression.stringize(), self.name)
     }
 }
 
@@ -734,6 +734,16 @@ impl SqlQuery {
         let limit = self.limit();
 
         format!("SELECT {fields} FROM {{target_table}} t {joins}{filters}{group_by}{order_by}{limit}")
+    }
+    
+    pub(crate) fn build_debug(&self) -> String {
+        let fields = self.fields.iter().map(|x|x.stringize()).collect::<Vec<String>>().join(", ");
+        let joins = self.joins.clone();
+        let filters = self.filters.clone().map(|x|x.stringize()).unwrap_or("".to_string());
+        let order_by = self.order_by.iter().map(|x|x.stringize()).collect::<Vec<String>>().join(", ");
+        let group_by = self.group_by.iter().map(|x|x.stringize()).collect::<Vec<String>>().join(", ");
+        let limit = self.limit();
+        format!("SELECT {fields} FROM {{target_table}} t {joins} WHERE {filters} GROUP BY {group_by} ORDER BY {order_by} {limit}")
     }
 }
 

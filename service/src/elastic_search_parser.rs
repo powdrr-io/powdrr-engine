@@ -46,7 +46,22 @@ pub(crate) struct TermAggProcessor {
 impl TermAggProcessor {
     fn create_aggregation_bucket(value: &Value) -> TermAggregationBucket {
         let value_map = value.as_object().unwrap();
-        let key = value_map.get("field_name").unwrap().as_str().unwrap();
+        let key = match value_map.get("field_name") {
+            Some(v) => {
+                if v.is_string() {
+                    v.as_str().unwrap()
+                } else if v.is_null() {
+                    "null"
+                } else {
+                    panic!("nope")
+                }
+            },
+            None => {
+                let value_str = serde_json::to_string(&value).unwrap();
+                println!("value_str: {}", value_str);
+                panic!("nope")
+            }
+        };
         let doc_count = value_map.get("cnt").unwrap().as_u64().unwrap();
 
         TermAggregationBucket {
@@ -364,6 +379,13 @@ pub fn parse_update_by_query(table: Option<String>, val: &String) -> Result<Arc<
     Ok(Arc::new(command))
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+enum SortSection {
+    Single(SortType),
+    Multiple(Vec<SortType>),
+}
+
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(untagged)]
@@ -518,7 +540,7 @@ struct SearchBody {
     seq_no_primary_term: Option<bool>,
     query: Option<Query>,
     aggs: Option<HashMap<String, AggSpec>>,
-    sort: Option<Vec<SortType>>
+    sort: Option<SortSection>
 }
 
 
@@ -1146,9 +1168,6 @@ fn to_sql_simple_query(builder: &mut SqlBuilder, query_obj: &SimpleQueryString) 
     }
 
     builder.calculate_score = true;
-    if builder.joins.len() == 0 {
-        builder.joins.push("INNER JOIN {target_table}_search_index si on si.doc_id = t._id".to_string());
-    }
 
     // TODO: need to really parse the query string
     let split_query = query_obj.simple_query_string.query.split(" ");
@@ -1520,9 +1539,6 @@ mod tests {
         };
 
         let _command = to_command(Some("fake_name".to_string()), &parse_result, &QueryStringSearch::new());
-
-
-
     }
 
     #[test]

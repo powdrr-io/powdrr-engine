@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashMap, fs::File};
 use std::io::Write;
-use std::str::FromStr;
 use futures::FutureExt;
 use gotham::mime;
 use http::header::LOCATION;
@@ -14,7 +13,7 @@ use http::StatusCode;
 use idgenerator::*;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::{mpsc, oneshot};
 use uuid_b64::UuidB64;
@@ -81,6 +80,7 @@ impl WriteBuffer {
     }
 
     fn write_to_file(&self, file_name: &String) -> Result<(), IngestError> {
+        assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
         let mut file_write = File::create(file_name).expect("Cannot create file");
         for line in self.lines.iter() {
             match writeln!(&mut file_write, "{}", line) {
@@ -476,9 +476,13 @@ pub(crate) async fn commit(buffer: &WriteBuffer, index: &String) -> Result<(), I
 }
 
 pub(crate) async fn commit_general(buffer: &WriteBuffer, index: &String, commit_type: &String) -> Result<(), IngestError> {
+    if buffer.lines.len() == 0 {
+        return Ok(())
+    }
+    
     let new_id = format!("tests/data/ingest/{}-{}-{}.json", commit_type, index, IdInstance::next_id().to_string());
     let write_to_file_result = buffer.write_to_file(&new_id);
-    tracing::info!("Ingest: table {} wrote {} records", index, buffer.len());
+    tracing::info!("Ingest: op {} on table {} wrote {} records", commit_type, index, buffer.len());
 
     match write_to_file_result {
         Ok(_) => (),
@@ -534,7 +538,7 @@ async fn create_single_worker(index: &String, doc_id: &String, payload: &String)
     let doc: Result<Value, serde_json::Error> = serde_json::from_str(payload);
     match doc {
         Ok(valid_doc) => {
-            let df_count = get_existing_doc_count(index, &vec!(doc_id.to_string())).await?;
+            let df_count = get_existing_doc_count(&table_description.name, &vec!(doc_id.to_string())).await?;
             
             if df_count != 0 {
                 // TODO: get version from existing doc
@@ -598,7 +602,7 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
         }
     };
 
-    let df_count = get_existing_doc_count(index, &vec!(doc_id.to_string())).await?;
+    let df_count = get_existing_doc_count(&table_description.name, &vec!(doc_id.to_string())).await?;
 
     if df_count != 0 {
         todo!("Need to implement actual update")
@@ -650,7 +654,10 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
 
 
 pub(crate) fn create_delete(doc_id: &String, seq_no: u64) -> Value {
-    serde_json::Value::from_str(&format!("{{\"_id\": \"{}\", \"_seq_no\": {}}}", doc_id, seq_no)).unwrap()
+    let mut map = serde_json::Map::new();
+    map.insert("_id".to_string(), json!(doc_id));
+    map.insert("_seq_no".to_string(), json!(seq_no));
+    Value::Object(map)
 }
 
 pub(crate) async fn delete(index: &String, doc_id: &String) -> Result<ElasticSearchResponse, IngestError> {
@@ -659,7 +666,7 @@ pub(crate) async fn delete(index: &String, doc_id: &String) -> Result<ElasticSea
         None => return Err(IngestError{ message: "Index does not exist".to_string() })
     };
 
-    let df_count = get_existing_doc_count(index, &vec!(doc_id.clone())).await?;
+    let df_count = get_existing_doc_count(&table_description.name, &vec!(doc_id.clone())).await?;
     if df_count == 0 {
         let result = OperationResult {
             _index: index.clone(),

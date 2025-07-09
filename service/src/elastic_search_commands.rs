@@ -27,7 +27,7 @@ async fn empty_result(aggs: Option<Vec<Aggregation>>, total_hits_complex: bool) 
 
 fn to_hit(index: &String, value: &Value) -> QueryResultHit {
     let value_map = value.as_object().unwrap().clone();
-    let score = value_map.get("score").map_or_else(|| 0.0, |f|f.as_f64().unwrap());
+    let score = value_map.get("score").map_or_else(|| None, |f|f.as_f64());
     let id = value_map.get("_id").unwrap().as_str().unwrap().to_string();
     let version = value_map.get("_version").unwrap().as_u64().unwrap();
     let seq_no = value_map.get("_seq_no").unwrap().as_i64().unwrap();
@@ -41,9 +41,9 @@ fn to_hit(index: &String, value: &Value) -> QueryResultHit {
         _id: Some(id),
         _version: version,
         _seq_no: seq_no,
-        _score: Some(score),
+        _score: score,
         _primary_term: Some(1),
-        found: None,
+        found: Some(true),
         _source: source_value,
     }
 }
@@ -278,12 +278,12 @@ impl Command for SqlCommand {
                 Err(_) => panic!("nope"),
             };
 
-            let first_10_rows = match data_frame.clone().limit(0, Some(10)) {
+            let first_100_rows = match data_frame.clone().limit(0, Some(100)) {
                 Ok(ftr) => ftr,
                 Err(_) => panic!("nope"),
             };
 
-            let (hits, schema) = to_hits(&table, &first_10_rows).await;
+            let (hits, schema) = to_hits(&table, &first_100_rows).await;
 
             let aggregations = SqlCommand::generate_aggregations(schema, aggs, Some(final_table_name)).await;
             // TODO: need to calculate the actual max score here
@@ -361,10 +361,12 @@ impl UpdateByQueryResult {
     
     async fn commit(&mut self) -> Result<Arc<dyn CommandResponse>, String> {
         // TODO: ideally this would write all the files once and do a single commit to the service.
-        match elastic_search_ingest::commit_general(&self.update_buffer.build(), &self.table, &"commit".to_string()).await {
-            Ok(_) => (),
-            Err(_) => panic!("nope"),
-        };
+        if self.update_buffer.records.len() != 0 {
+            match elastic_search_ingest::commit_general(&self.update_buffer.build(), &self.table, &"commit".to_string()).await {
+                Ok(_) => (),
+                Err(_) => panic!("nope"),
+            };
+        }
         match elastic_search_ingest::commit_general(&self.delete_buffer, &self.table, &"delete".to_string()).await {
             Ok(_) => (),
             Err(_) => panic!("nope"),
@@ -397,12 +399,15 @@ impl UpdateByQueryCommand {
         );
 
         let op = output.other_context.get("op").map_or_else(|| "noop", |v|v.as_str().unwrap());
-        
+
+        // TODO: need to track sequence number. Current way of doing that is just counting records
+        // but we really need to count operations.
+
         match op {
             "update" => {
                 EvalResult::Update(RecordInput {
                     _id: value._id.as_ref().unwrap().clone(),
-                    _seq_no: value._seq_no,
+                    _seq_no: value._seq_no + 100,
                     _version: value._version + 1,
                     existing_normalized: None,
                     source: output.source,
@@ -516,6 +521,7 @@ impl Command for UpdateByQueryCommand {
     }
 
     fn generate_sql(&self) -> SqlQuery {
+        println!("UPDATE BY QUERY = {}", self.query_command.generate_sql().build_debug());
         self.query_command.generate_sql()
     }
 

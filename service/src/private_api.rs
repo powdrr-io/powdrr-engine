@@ -188,6 +188,7 @@ async fn ensure_loaded(invocation: &PrivateSqlInvocation, file_path: &String, pa
 async fn execute_sql(sql_template: &String, local_name: &String, deletes_local_name: &String) -> Result<Vec<RecordBatch>, DataFusionError> {
     // create a plan to run a SQL query
     let final_sql = sql_template.replace("{target_table}", local_name).replace("{deletes_table}", deletes_local_name);
+    println!("{}", final_sql);
     let results = match data_access::execute_sql(&final_sql).await {
         Ok(df) => df,
         Err(e) => return log_err(e),
@@ -216,6 +217,7 @@ async fn create_all_deletes_table(local_names: &Vec<String>) -> Result<String, P
 
 
 pub(crate) async fn data_query(invocation: &PrivateSqlInvocation) -> Result<DataQueryResult, PrivateApiError> {
+    println!("Data query = {}", invocation.sql.build_debug());
     let required_files = match determine_required_files(invocation).await {
         Ok(rf) => rf,
         Err(e) => return log_err(e),

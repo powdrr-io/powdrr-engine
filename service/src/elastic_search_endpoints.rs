@@ -598,8 +598,16 @@ pub fn es_update_by_query(mut state: State) -> Pin<Box<HandlerFuture>> {
             Ok(vb) => vb,
             Err(_) => panic!("Oh no"),
         };
-        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();    
-        let command = match elastic_search_parser::parse_update_by_query(Some(table), &body_content) {
+        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+        let table_description = match API_SERVICE_CLIENT.describe_table(&table).await {
+            Some(td) => td,
+            None =>  {
+                let res = create_response(&state, StatusCode::BAD_REQUEST, mime::TEXT_PLAIN, "Index does not exist".to_string());
+                return Ok((state, res))
+            }
+        };
+        
+        let command = match elastic_search_parser::parse_update_by_query(Some(table_description.name), &body_content) {
             Ok(c) => c,
             Err(_) => {
                 let res = create_response(&state, StatusCode::BAD_REQUEST, mime::TEXT_PLAIN, "Bad request".to_string());

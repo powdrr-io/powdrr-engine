@@ -19,8 +19,8 @@ use gotham::router::builder::*;
 use gotham::state::State;
 use gotham::state::FromState;
 use gotham::hyper::{body, Body};
-
-
+use http::header::HOST;
+use http::HeaderMap;
 use crate::{elastic_search_endpoints, elastic_search_lifetime_policy};
 use crate::elastic_search_endpoints::NameIdPathExtractor;
 use crate::elastic_search_endpoints::NamePathExtractor;
@@ -76,12 +76,8 @@ impl Middleware for RouterMiddleware {
     where
         Chain: FnOnce(State) -> Pin<Box<HandlerFuture>> + Send + 'static,
         Self: Sized {
-            /* Uncomment to dump all request headers
-            let uri = state.borrow::<Uri>();
-            println!("Uri = {}", uri);
-            let headers = state.borrow::<HeaderMap>();
-            headers.iter().for_each(|x|println!("{} = {:?}", x.0, x.1));
-            */ 
+            let request_headers = state.borrow::<HeaderMap>();
+
             // We're finished working on the Request, so allow other components to continue processing
             // the Request.
             //
@@ -98,8 +94,13 @@ impl Middleware for RouterMiddleware {
             let f = result.and_then(move |(state, mut response)| {
                 let headers = response.headers_mut();
                 headers.insert("X-elastic-product", "Elasticsearch".parse().unwrap());
-                headers.insert("X-Opaque-Id", "unknownId".parse().unwrap());
+                if request_headers.contains_key("X-Opaque-Id") {
+                    headers.insert("X-Opaque-Id", request_headers.get("X-Opaque-Id").unwrap().clone());
+                } else {
+                    headers.insert("X-Opaque-Id", "unknownId".parse().unwrap());
+                }
                 headers.remove("x-request-id");
+                headers.remove("date");
                 future::ok((state, response))
             });
     
@@ -2095,11 +2096,62 @@ mod tests {
                 let body = response.read_body().unwrap();
                 let str_body = str::from_utf8(&body).unwrap();
                 print!("{}", str_body);
+                // TODO: Check the response
             },
             Err(e) => {
                 panic!("Failed {}", e)
             }
         }
-        
+
+        let get_response_result = test_server.client().get(
+            "http://localhost/.kibana_task_manager_8.7.1/_doc/task%3AAlerts-alerts_invalidate_api_keys",
+        ).perform();
+
+        match get_response_result {
+            Ok(response) => {
+                //assert_eq!(response.status(), 200);
+                let body = response.read_body().unwrap();
+                let str_body = str::from_utf8(&body).unwrap();
+                print!("{}", str_body);
+                // TODO: Check the response
+            },
+            Err(e) => {
+                panic!("Failed {}", e)
+            }
+        }
+
+        let query_val = r#"{
+  "query": {
+    "bool": {
+      "must": [
+        {
+          "term": {
+            "type": "task"
+          }
+        }
+      ]
+    }
+  }
+}"#;
+
+        let query_response = test_server.client().post(
+            "http://localhost/.kibana_task_manager_8.7.1/_search",
+            query_val,
+            mime::APPLICATION_JSON,
+        ).perform();
+
+        match query_response {
+            Ok(response) => {
+                //assert_eq!(response.status(), 200);
+                let body = response.read_body().unwrap();
+                let str_body = str::from_utf8(&body).unwrap();
+                print!("{}", str_body);
+                // TODO: Check the response
+            },
+            Err(e) => {
+                panic!("Failed {}", e)
+            }
+        }
+
     }
 }
