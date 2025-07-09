@@ -87,6 +87,31 @@ pub(crate) struct QueryResultHit {
     pub _source: Value,
 }
 
+impl QueryResultHit {
+    pub fn from_record(index: &Option<String>, value: &Value, found: Option<bool>) -> Self {
+        let value_map = value.as_object().unwrap().clone();
+        let score = value_map.get("score").map_or_else(|| None, |f|f.as_f64());
+        let id = value_map.get("_id").unwrap().as_str().unwrap().to_string();
+        let version = value_map.get("_version").unwrap().as_u64().unwrap();
+        let seq_no = value_map.get("_seq_no").unwrap().as_i64().unwrap();
+        let source = value_map.get("_source").unwrap().as_str().unwrap();
+        // TODO: we are parsing the string into a value just to put it an object
+        // that will get serialized out again. That is lame. If we can get the serializer
+        // to look at a string but put it in like it is a Value, that would be better.
+        let source_value = serde_json::from_str(source).unwrap();
+        QueryResultHit {
+            _index: index.clone(),
+            _id: Some(id),
+            _version: version,
+            _seq_no: seq_no,
+            _score: score,
+            _primary_term: Some(1),
+            found: found,
+            _source: source_value,
+        }
+    }
+}
+
 
 #[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct QueryResultHits {

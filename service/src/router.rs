@@ -19,7 +19,6 @@ use gotham::router::builder::*;
 use gotham::state::State;
 use gotham::state::FromState;
 use gotham::hyper::{body, Body};
-use http::header::HOST;
 use http::HeaderMap;
 use crate::{elastic_search_endpoints, elastic_search_lifetime_policy};
 use crate::elastic_search_endpoints::NameIdPathExtractor;
@@ -76,7 +75,6 @@ impl Middleware for RouterMiddleware {
     where
         Chain: FnOnce(State) -> Pin<Box<HandlerFuture>> + Send + 'static,
         Self: Sized {
-            let request_headers = state.borrow::<HeaderMap>();
 
             // We're finished working on the Request, so allow other components to continue processing
             // the Request.
@@ -92,12 +90,13 @@ impl Middleware for RouterMiddleware {
             // operates, you may not have encountered this before. For more details you can read about
             // the Tokio project at https://tokio.rs/docs/getting-started/hello-world/
             let f = result.and_then(move |(state, mut response)| {
+                let request_headers = state.borrow::<HeaderMap>();
+                let request_opaque_id = request_headers.get("X-Opaque-Id").clone();
+
                 let headers = response.headers_mut();
                 headers.insert("X-elastic-product", "Elasticsearch".parse().unwrap());
-                if request_headers.contains_key("X-Opaque-Id") {
-                    headers.insert("X-Opaque-Id", request_headers.get("X-Opaque-Id").unwrap().clone());
-                } else {
-                    headers.insert("X-Opaque-Id", "unknownId".parse().unwrap());
+                if request_opaque_id.is_some() {
+                    headers.insert("X-Opaque-Id", request_opaque_id.unwrap().clone());
                 }
                 headers.remove("x-request-id");
                 headers.remove("date");
