@@ -140,20 +140,18 @@ mod tests {
     #[test]
     fn test_builder_basic() {
         let mut builder = WriteBufferBuilder::new();
-        builder.records.push(RecordInput {
-            _id: "abc".to_string(),
-            _seq_no: 1,
-            _version: 1,
-            existing_normalized: None,
-            source: serde_json::from_str(r#"{"a": 1, "b": "2", "c": 3.3, "d":{"e": 4, "f": 5}, "g": [1, 2, 3]}"#).unwrap(),
-        });
-        builder.records.push(RecordInput {
-            _id: "def".to_string(),
-            _seq_no: 1,
-            _version: 1,
-            existing_normalized: None,
-            source: serde_json::from_str(r#"{"a": 2, "c": 4.3, "d":{"e": 8}, "g": [4, 5, 6]}"#).unwrap(),
-        });
+        builder.records.push(RecordInput::new(
+            "abc".to_string(),
+            1,
+            1,
+            &serde_json::from_str(r#"{"a": 1, "b": "2", "c": 3.3, "d":{"e": 4, "f": 5}, "g": [1, 2, 3]}"#).unwrap()
+        ));
+        builder.records.push(RecordInput::new(
+            "def".to_string(),
+            1,
+            1,
+            &serde_json::from_str(r#"{"a": 2, "c": 4.3, "d":{"e": 8}, "g": [4, 5, 6]}"#).unwrap(),
+        ));
 
         let buffer = builder.build();
         assert_eq!(buffer.lines.len(), 2);

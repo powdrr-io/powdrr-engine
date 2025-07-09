@@ -262,16 +262,18 @@ impl Command for SqlCommand {
                 Err(_) => panic!("nope"),
             };
 
-            let first_100_rows = match data_frame.clone().limit(0, Some(100)) {
+            // TODO: figure out the real size to return. There is default and then size can
+            // be passed in.
+            let first_n_rows = match data_frame.clone().limit(0, Some(100)) {
                 Ok(ftr) => ftr,
                 Err(_) => panic!("nope"),
             };
 
-            let (hits, schema) = to_hits(&table, &first_100_rows, None).await;
+            let (hits, schema) = to_hits(&table, &first_n_rows, None).await;
 
             let aggregations = SqlCommand::generate_aggregations(schema, aggs, Some(final_table_name)).await;
             // TODO: need to calculate the actual max score here
-            let max_score = hits.get(0).unwrap()._score.unwrap();
+            let max_score = hits.get(0).unwrap()._score;
             let final_result = QueryResults::success(
                 50,
                 1,
@@ -389,7 +391,7 @@ impl UpdateByQueryCommand {
                     Ok(t) => t,
                     Err(_) => panic!("nope"),
                 };
-                
+
                 EvalResult::Update(RecordInput::new(
                     value.id().clone(),
                     seq_no,
@@ -495,8 +497,8 @@ impl Command for UpdateByQueryCommand {
                 Err(_) => panic!("nope")
             };
 
-            let (result_values, _) = to_record_inputs(&data_frame).await;
-
+            let (mut result_values, _) = to_record_inputs(&data_frame).await;
+            result_values.iter_mut().for_each(|x|x.ensure_source());
             let final_result_values: Vec<EvalResult> = result_values.iter().map(|x|UpdateByQueryCommand::evaluate(&table, &script_block, x)).collect();
 
             let mut result_info = UpdateByQueryCommand::create_final_result(&table, final_result_values).await;
@@ -505,7 +507,6 @@ impl Command for UpdateByQueryCommand {
     }
 
     fn generate_sql(&self) -> SqlQuery {
-        println!("UPDATE BY QUERY = {}", self.query_command.generate_sql().build_debug());
         self.query_command.generate_sql()
     }
 

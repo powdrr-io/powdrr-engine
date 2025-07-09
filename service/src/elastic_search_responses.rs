@@ -287,7 +287,7 @@ impl QueryResults {
         }        
     }
 
-    pub fn success(took: u32, num_shards: u32, total_hits: usize, max_score: f64, hits: Vec<QueryResultHit>, aggregations: Option<HashMap<String, AggregationResult>>, total_hits_complex: bool) -> Self {
+    pub fn success(took: u32, num_shards: u32, total_hits: usize, max_score: Option<f64>, hits: Vec<QueryResultHit>, aggregations: Option<HashMap<String, AggregationResult>>, total_hits_complex: bool) -> Self {
         let total_hits = match total_hits_complex {
             true => QueryResultTotal::Complex(QueryResultTotalComplex::new(total_hits)),
             false => QueryResultTotal::Simple(total_hits as u64)
@@ -297,7 +297,7 @@ impl QueryResults {
             took: took, 
             timed_out: false, 
             _shards: QueryResultShards { total: num_shards, successful: num_shards, skipped: 0, failed: 0 }, 
-            hits: QueryResultHits { total: total_hits, max_score: Some(max_score), hits: hits },
+            hits: QueryResultHits { total: total_hits, max_score: max_score, hits: hits },
             aggregations: aggregations,
         }  
     }

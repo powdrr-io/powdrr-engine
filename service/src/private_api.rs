@@ -217,7 +217,6 @@ async fn create_all_deletes_table(local_names: &Vec<String>) -> Result<String, P
 
 
 pub(crate) async fn data_query(invocation: &PrivateSqlInvocation) -> Result<DataQueryResult, PrivateApiError> {
-    println!("Data query = {}", invocation.sql.build_debug());
     let required_files = match determine_required_files(invocation).await {
         Ok(rf) => rf,
         Err(e) => return log_err(e),

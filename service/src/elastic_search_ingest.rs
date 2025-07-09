@@ -593,6 +593,8 @@ async fn create_single_worker(index: &String, doc_id: &String, payload: &String)
 
 
 fn merge_source(existing_doc: &Value, new_doc: &Value) -> Value {
+    // TODO: this is a hack where whole keys are replace where it should
+    // be only leaf node keys where there is overlap.
     let mut map = serde_json::Map::new();
     for (k, v) in existing_doc.as_object().unwrap().iter() {
         map.insert(k.clone(), v.clone());

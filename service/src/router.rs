@@ -47,7 +47,6 @@ pub fn private_v1_sql(mut state: State) -> Pin<Box<HandlerFuture>> {
             Ok(io) => io,
             Err(_) => panic!("This should not happen"),
         };
-        println!("Body: {}", body_content);
         let query_result = private_api::data_query(&invocation_obj).await;
         match query_result {
             Ok(success) => {

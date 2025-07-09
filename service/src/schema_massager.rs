@@ -735,7 +735,7 @@ impl SqlQuery {
 
         format!("SELECT {fields} FROM {{target_table}} t {joins}{filters}{group_by}{order_by}{limit}")
     }
-    
+
     pub(crate) fn build_debug(&self) -> String {
         let fields = self.fields.iter().map(|x|x.stringize()).collect::<Vec<String>>().join(", ");
         let joins = self.joins.clone();
@@ -814,8 +814,8 @@ mod tests {
         let sql_builder = SqlBuilder::for_query(true);
         let sql_query = sql_builder.build();
         let sql = sql_query.build(&powdrr_schema_table, &powdrr_schema_file);
-        assert!(sql.contains("null as b"));
-        assert!(sql.contains("null as d_f"));
+        assert!(sql.contains("null as \"b\""));
+        assert!(sql.contains("null as \"d_f\""));
     }
 
     #[test]
