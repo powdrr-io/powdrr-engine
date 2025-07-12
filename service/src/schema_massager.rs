@@ -68,7 +68,7 @@ impl PowdrrSchema {
         merged_schema
     }
 
-    fn merge_from(&mut self, other: &PowdrrSchema) -> () {
+    pub fn merge_from(&mut self, other: &PowdrrSchema) -> () {
         let self_map = self.to_map();
 
         for other_field in other.fields.iter() {
@@ -736,6 +736,7 @@ impl SqlQuery {
         format!("SELECT {fields} FROM {{target_table}} t {joins}{filters}{group_by}{order_by}{limit}")
     }
 
+    #[allow(dead_code)]
     pub(crate) fn build_debug(&self) -> String {
         let fields = self.fields.iter().map(|x|x.stringize()).collect::<Vec<String>>().join(", ");
         let joins = self.joins.clone();
@@ -786,6 +787,13 @@ pub(crate) fn extract_powdrr_schema(value: &Value) -> PowdrrSchema {
     let serialized_val = serde_json::to_string(value).unwrap();
     let (schema, _) = infer_json_schema(serialized_val.as_bytes(), None).unwrap();
     to_powdrr_schema(&schema)
+}
+
+pub(crate) fn extract_powdrr_schema_str(value: &str) -> PowdrrSchema {
+    let value_split = value.split("\n").filter(|x|x.len() > 0).collect::<Vec<&str>>();
+    let serde_values = value_split.iter().map(|x|serde_json::from_str(x).unwrap()).collect::<Vec<Value>>();
+    assert!(serde_values.len() > 0);
+    extract_powdrr_schema(&serde_values[0])
 }
 
 pub(crate) fn extract_powdrr_schema_option(value: &Option<Value>) -> PowdrrSchema {

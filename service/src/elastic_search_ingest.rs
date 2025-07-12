@@ -11,7 +11,6 @@ use gotham::mime;
 use http::header::LOCATION;
 use http::StatusCode;
 use idgenerator::*;
-
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::oneshot::error::RecvError;
@@ -592,17 +591,27 @@ async fn create_single_worker(index: &String, doc_id: &String, payload: &String)
 }
 
 
-fn merge_source(existing_doc: &Value, new_doc: &Value) -> Value {
-    // TODO: this is a hack where whole keys are replace where it should
-    // be only leaf node keys where there is overlap.
-    let mut map = serde_json::Map::new();
-    for (k, v) in existing_doc.as_object().unwrap().iter() {
-        map.insert(k.clone(), v.clone());
+fn merge_source(existing_doc: &Value, update_doc: &Value) -> Value {
+    assert!(existing_doc.is_object());
+    assert!(update_doc.is_object());
+
+    let mut new_doc = existing_doc.clone();
+    let new_doc_map = new_doc.as_object_mut().unwrap();
+    for (key, value) in update_doc.as_object().unwrap().iter() {
+        match new_doc_map.get(key) {
+            Some(new_doc_value) => {
+                if new_doc_value.is_object() && value.is_object() {
+                    new_doc_map.insert(key.clone(), merge_source(new_doc_value, value));
+                } else {
+                    new_doc_map.insert(key.clone(), value.clone());
+                }
+            },
+            None => {
+                new_doc_map.insert(key.clone(), value.clone());
+            }
+        }
     }
-    for (k, v) in new_doc.as_object().unwrap().iter() {
-        map.insert(k.clone(), v.clone());
-    }
-    Value::Object(map)
+    new_doc
 }
 
 
@@ -646,7 +655,7 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
         OperationResult{
             _index: table_description.name.clone(),
             _id: existing_doc.id().clone(),
-            _version: 1,
+            _version: updated_doc.version(),
             result: "updated".to_string(),
             _shards: Shards {
                 total: 1,
@@ -663,7 +672,7 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
                 _seq_no: seq_no,
                 _score: None,
                 _primary_term: Some(1),
-                found: None,
+                found: Some(true),
                 _source: updated_doc.source().cloned().unwrap()
             })
         }
@@ -772,6 +781,7 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
 
         let deser_command: Result<IngestCommand, serde_json::Error> = serde_json::from_str(command_str);
         match deser_command {
+            // TODO: we could bulkify the fetching of the docs to be updated
             Ok(command) => {
                 match command {
                     IngestCommand::Create(c) => {
@@ -821,6 +831,82 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
                             Err(_) => return Err(IngestError{ message: "Serde error".to_string() })
                         }
                     },
+                    IngestCommand::Update(u) => {
+                        let index = match &u.update.index {
+                            Some(i) => {
+                                match provided_index {
+                                    Some(pi) => if i != pi {
+                                        return Err(IngestError{ message: "Can not provide a index in create here".to_string() });
+                                    },
+                                    None => (),
+                                }
+                                i
+                            }
+                            None => {
+                                match provided_index {
+                                    Some(pi) => pi,
+                                    None => return Err(IngestError{ message: "Must provide index name".to_string() }),
+                                }
+                            }
+                        };
+                        let table_description = match API_SERVICE_CLIENT.describe_table(&index).await {
+                            Some(t) => t,
+                            None => return Err(IngestError{ message: "Index does not exist".to_string() })
+                        };
+                        let existing_docs = get_existing_docs(&table_description.name, &vec!(u.update.id.unwrap())).await?;
+                        if existing_docs.docs.len() == 0 {
+                            let _seq_no: i64 = match distributed_cache::insert_operator(&table_description.name, 1) {
+                                Ok(v) => v,
+                                Err(_) => panic!("nope")
+                            };
+                            todo!("Need to handle this case")
+                        }
+                        let doc_str = match iterator.next() {
+                            Some(ds) => ds.trim(),
+                            None => panic!("How do I make my own error? This should return an error instead of panic")
+                        };
+                        let doc: Result<UpdateBody, serde_json::Error>  = serde_json::from_str(doc_str);
+                        match doc {
+                            Ok(update_request) => {
+                                if update_request.doc.is_none() {
+                                    todo!("What do we do here?")
+                                }
+                                let mut existing_doc = RecordInput::from_record(&existing_docs.docs[0]);
+                                existing_doc.ensure_source();
+                                let seq_no: i64 = match distributed_cache::update_operator(&table_description.name) {
+                                    Ok(v) => v,
+                                    Err(_) => panic!("nope")
+                                };
+
+                                let mut updated_doc = RecordInput::new(
+                                    existing_doc.id().clone(),
+                                    seq_no,
+                                    existing_doc.version() + 1,
+                                    &merge_source(existing_doc.source().unwrap(), update_request.doc.as_ref().unwrap()),
+                                );
+                                updated_doc.ensure_source();
+                                updated_doc.ensure_normalized_value();
+                                let operation_result = OperationResult{
+                                    _index: table_description.name.clone(),
+                                    _id: existing_doc.id().clone(),
+                                    _version: updated_doc.version(),
+                                    result: "updated".to_string(),
+                                    _shards: Shards {
+                                        total: 1,
+                                        successful: 1,
+                                        failed: 0,
+                                    },
+                                    status: Some(201),
+                                    _seq_no: seq_no,
+                                    _primary_term: 1,
+                                    get: None,
+                                };
+                                ingest_result.get(index).records.push(updated_doc.clone());
+                                ingest_result.operations.push(operation_result);
+                            },
+                            Err(_) => return Err(IngestError{ message: "Serde error".to_string() })
+                        }
+                    }
                     _ => {
                         panic!("Not implemented")
                     },

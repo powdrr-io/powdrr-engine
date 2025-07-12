@@ -6,7 +6,6 @@ use gotham::helpers::http::response::create_empty_response;
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use uuid_b64::UuidB64;
 
 use crate::{elastic_search_cluster_info, elastic_search_commands::LookupById, elastic_search_common::{execute_command, CommandContext, CommandResponse}, elastic_search_ingest, elastic_search_parser, elastic_search_pipeline, state_hosted_service::API_SERVICE_CLIENT};
 use crate::elastic_search_common::MIME_ES_JSON;
@@ -86,10 +85,10 @@ impl License {
     fn new() -> HashMap<String, Self> {
         HashMap::from([("license".to_string(), License {
             status: "active".to_string(),
-            uid: UuidB64::new().to_string(),
+            uid: "98f6bcc7-ae8f-4f75-a9b7-e6e909416eaa".to_string(),
             _type: "basic".to_string(),
-            issue_date: "2025-05-08T06:36:21.277Z".to_string(),
-            issue_data_in_millis: 1746686181277,
+            issue_date: "2025-07-08T22:10:56.204Z".to_string(),
+            issue_data_in_millis: 1752012656204,
             max_nodes: 1000,
             max_resource_units: None,
             issued_to: "docker-cluster".to_string(),
@@ -636,7 +635,7 @@ pub fn es_search_table(mut state: State) -> Pin<Box<HandlerFuture>> {
             Ok(vb) => vb,
             Err(_) => panic!("Oh no"),
         };
-        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();    
+        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
         let command = match elastic_search_parser::parse(Some(table_desc.name), &body_content, &query_extractor) {
             Ok(c) => c,
             Err(e) => {

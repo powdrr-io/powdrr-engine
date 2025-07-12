@@ -188,7 +188,6 @@ async fn ensure_loaded(invocation: &PrivateSqlInvocation, file_path: &String, pa
 async fn execute_sql(sql_template: &String, local_name: &String, deletes_local_name: &String) -> Result<Vec<RecordBatch>, DataFusionError> {
     // create a plan to run a SQL query
     let final_sql = sql_template.replace("{target_table}", local_name).replace("{deletes_table}", deletes_local_name);
-    println!("{}", final_sql);
     let results = match data_access::execute_sql(&final_sql).await {
         Ok(df) => df,
         Err(e) => return log_err(e),
@@ -234,7 +233,7 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation) -> Result<Data
     let all_deletes_local_name = create_all_deletes_table(&delete_local_names).await?;     
 
     let mut all_results: Vec<RecordBatch> = vec!();
-    for iceberg_file in required_files.iceberg_files {
+    for iceberg_file in required_files.iceberg_files.iter() {
         let local_name = match ensure_loaded(invocation, &iceberg_file.file_path, true).await {
             Ok(ln) => ln,
             Err(e) => return Err(PrivateApiError::from(e)),
@@ -245,7 +244,7 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation) -> Result<Data
         };
         all_results.extend(local_results);
     }
-    for speedboat_file in required_files.speedboat_files {
+    for speedboat_file in required_files.speedboat_files.iter() {
         let local_name = match ensure_loaded(invocation, &speedboat_file.file_path, false).await {
             Ok(ln) => ln,
             Err(e) => return log_err(PrivateApiError::from(e)),
