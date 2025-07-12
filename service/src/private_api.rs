@@ -188,7 +188,6 @@ async fn ensure_loaded(invocation: &PrivateSqlInvocation, file_path: &String, pa
 async fn execute_sql(sql_template: &String, local_name: &String, deletes_local_name: &String) -> Result<Vec<RecordBatch>, DataFusionError> {
     // create a plan to run a SQL query
     let final_sql = sql_template.replace("{target_table}", local_name).replace("{deletes_table}", deletes_local_name);
-    println!("FINAL_SQL = {}, {}", local_name, final_sql);
     let results = match data_access::execute_sql(&final_sql).await {
         Ok(df) => df,
         Err(e) => return log_err(e),
@@ -264,19 +263,6 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation) -> Result<Data
         _ => all_results.iter().map(|v| v.num_rows()).reduce(|l, r| l + r).unwrap()
     };
     // TODO: need to convert this whole thing into arrow flight
-    // TODO: testing code
-    let sql = invocation.sql.build_debug();
-    if sql.contains("'alerting_health_check'") {
-        for speedboat_file in required_files.speedboat_files.iter() {
-            println!("{}", &speedboat_file.file_path);
-            if speedboat_file.file_path.len() == 0 {
-                println!("Skipping empty speedboat file");
-            }
-        }
-
-        println!("{}", sql);
-    }
-    // END TESTING CODE
     let buf = Vec::new();
     let mut writer = arrow_json::LineDelimitedWriter::new(buf);
     writer.write_batches(all_results_refs.as_slice()).unwrap();

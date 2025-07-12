@@ -636,9 +636,6 @@ pub fn es_search_table(mut state: State) -> Pin<Box<HandlerFuture>> {
             Err(_) => panic!("Oh no"),
         };
         let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
-        if table == ".kibana_task_manager" && body_content.contains("\"task.ownerId\"") {
-            println!("Time for debug")
-        }
         let command = match elastic_search_parser::parse(Some(table_desc.name), &body_content, &query_extractor) {
             Ok(c) => c,
             Err(e) => {

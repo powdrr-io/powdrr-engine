@@ -188,10 +188,6 @@ pub async fn load_command_raw_result(_context: CommandContext, command: Arc<dyn 
     let target_snapshots = command.current_target_snapshots().await;
     let required_extensions = command.required_extensions();
     let target_sql = command.generate_sql();
-    // TODO: TESTING CODE
-    let debug_sql = target_sql.build_debug();
-    println!("{}", debug_sql);
-    // END TESTING CODE
     call_peers_and_load_results(&required_extensions, &target_snapshots, &target_sql).await
 }
 

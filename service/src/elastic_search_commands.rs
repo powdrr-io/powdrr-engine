@@ -470,8 +470,8 @@ impl UpdateByQueryCommand {
             update_count: update_count,
             delete_count: delete_count,
             noop_count: noop_count,
-            // TODO: remove when debugging is done
-            debug: Some(update_buffer.records.iter().map(|x|x.source().unwrap().clone()).collect()),
+            // UNCOMMENT FOR DEBUGGING: debug: Some(update_buffer.records.iter().map(|x|x.source().unwrap().clone()).collect()),
+            debug: None,
         }
     }
 }
