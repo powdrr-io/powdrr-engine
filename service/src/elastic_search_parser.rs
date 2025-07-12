@@ -230,12 +230,12 @@ impl CardinalityAggProcessor {
     async fn process(&self, schema: Option<PowdrrSchema>, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
         let child_aggs = process_aggregations(schema.clone(), subaggregations, table_name.clone()).await;
 
-        let type_count = match &table_name {
+        let value = match &table_name {
             Some(t) => CardinalityAggProcessor::calculate_cardinality(t, &self.sql.build_same(&schema.unwrap_or_else(||CARDINALITY_AGG_SCHEMA.clone()))).await,
             None => 0
         };
         AggregationResult::Cardinality(CardinalityAggregationResult{
-            type_count: type_count,
+            value: value,
             aggs: child_aggs,
         })
     }
