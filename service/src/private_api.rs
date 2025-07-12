@@ -249,7 +249,6 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation) -> Result<Data
             Ok(ln) => ln,
             Err(e) => return log_err(PrivateApiError::from(e)),
         };
-        println!("Naming = {}, {}", &local_name, &speedboat_file.file_path);
         let local_results = match execute_sql(&invocation.sql.build(&required_files.table_schema, &speedboat_file.schema), &local_name, &all_deletes_local_name).await {
             Ok(vrb) => vrb,
             Err(e) => return log_err(PrivateApiError::from(e)),
