@@ -806,6 +806,9 @@ impl TestApiServiceClient {
                     }
                 },
             };
+            
+            assert_eq!(new_speedboat_metadata.files.len(), new_speedboat_metadata.sizes.len());
+            assert_eq!(new_speedboat_metadata.files.len(), new_speedboat_metadata.file_schemas.len());
 
             let total_records: u32 = new_speedboat_metadata.sizes.iter().sum();
             tracing::info!("Speedboat commit {} has {} files with {} records", new_checkpoint_id, new_speedboat_metadata.files.len(), total_records);

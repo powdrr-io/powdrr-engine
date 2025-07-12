@@ -289,7 +289,7 @@ mod tests {
     use serde_json::Value;
     use crate::elastic_search_responses::{QueryResultTotal, QueryResults};
     use crate::router::router;
-    use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema, SqlBuilder, SqlExpression};
+    use crate::schema_massager::{extract_powdrr_schema_str, PowdrrDataType, PowdrrField, PowdrrSchema, SqlBuilder, SqlExpression};
     use crate::state_hosted_service::{IcebergMetadata, SpeedboatMetadata, TableMetadataCheckpoint};
     use crate::state_peers::{PrivateSqlInvocation, SnapshotDescriptor};
 
@@ -305,15 +305,16 @@ mod tests {
             mime::TEXT_PLAIN
         ).perform().unwrap();
 
+        
         let checkpoint = TableMetadataCheckpoint {
             table_name: "logs".to_string(),
             checkpoint_id: "fake_id".to_string(),
             iceberg_metadata: None,
             speedboat_metadata: Some(SpeedboatMetadata{ 
-                files: vec!("file:///Users/greg.fee/code/monolith-rust-workspace/service/tests/data/logs.json".to_string()),
+                files: vec!(format!("file://{}/tests/data/logs.json", env::current_dir().unwrap().to_str().unwrap())),
                 sizes: vec!(6),
-                schemas: vec!(),
-                file_schemas: vec!(),
+                schemas: vec!(extract_powdrr_schema_str(include_str!("../tests/data/logs.json"))),
+                file_schemas: vec!(0),
             }),
             deletes_metadata: None,
             extension_metadata: None,
