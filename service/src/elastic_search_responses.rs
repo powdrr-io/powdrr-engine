@@ -20,7 +20,7 @@ pub(crate) struct Shards {
 pub(crate) struct OperationResult {
     pub _index: String,
     pub _id: String,
-    pub _version: u32,
+    pub _version: u64,
     pub result: String,
     pub _shards: Shards,
     pub _seq_no: i64,
@@ -151,7 +151,7 @@ pub(crate) struct FilterAggregationResult {
 
 #[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct CardinalityAggregationResult {
-    pub type_count: u64,
+    pub value: u64,
     #[serde(flatten)]
     pub aggs: HashMap<String, AggregationResult>
 }
@@ -235,6 +235,8 @@ pub(crate) struct UpdateByQueryResults {
     pub requests_per_second: i64,
     pub throttled_until_millis: u64,
     pub failures: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug: Option<Vec<Value>>,
 }
 
 #[derive(Serialize, Clone)]

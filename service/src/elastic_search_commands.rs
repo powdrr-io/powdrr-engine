@@ -338,6 +338,7 @@ struct UpdateByQueryResult {
     update_count: u64,
     delete_count: u64,
     noop_count: u64,
+    debug: Option<Vec<Value>>,
 }
 
 impl UpdateByQueryResult {
@@ -362,7 +363,8 @@ impl UpdateByQueryResult {
             self.update_count,
             self.delete_count,
             self.noop_count,
-            1
+            1,
+            self.debug.clone()
         ))
     }
 }
@@ -412,10 +414,10 @@ impl UpdateByQueryCommand {
     }
 
     fn empty_result() -> Arc<dyn CommandResponse> {
-        UpdateByQueryCommand::success(0, 0, 0, 0, 0)
+        UpdateByQueryCommand::success(0, 0, 0, 0, 0, None)
     }
 
-    fn success(total: u64, updated: u64, deleted: u64, noops: u64, batches: u64) -> Arc<dyn CommandResponse> {
+    fn success(total: u64, updated: u64, deleted: u64, noops: u64, batches: u64, debug_data: Option<Vec<Value>>) -> Arc<dyn CommandResponse> {
         Arc::new(UpdateByQuerySuccess{ result: UpdateByQueryResults{
             took: 0,
             timed_out: false,
@@ -433,6 +435,7 @@ impl UpdateByQueryCommand {
             requests_per_second: -1,
             throttled_until_millis: 0,
             failures: vec![],
+            debug: debug_data,
         }})
     }
 
@@ -462,11 +465,13 @@ impl UpdateByQueryCommand {
         
         UpdateByQueryResult {
             table: table.clone(),
-            update_buffer: update_buffer,
+            update_buffer: update_buffer.clone(),
             delete_buffer: delete_buffer,
             update_count: update_count,
             delete_count: delete_count,
             noop_count: noop_count,
+            // TODO: remove when debugging is done
+            debug: Some(update_buffer.records.iter().map(|x|x.source().unwrap().clone()).collect()),
         }
     }
 }

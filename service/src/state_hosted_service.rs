@@ -654,13 +654,15 @@ impl ApiServiceClient for RealApiServiceClient {
 }
 
 
-fn do_remove(removed_files: &Vec<String>, files: &mut Vec<String>, sizes: &mut Vec<u32>) -> () {
-    assert!(files.len() == sizes.len());
+fn do_remove(removed_files: &Vec<String>, files: &mut Vec<String>, sizes: &mut Vec<u32>, file_schema: &mut Vec<u64>) -> () {
+    assert_eq!(files.len(), sizes.len());
+    assert_eq!(files.len(), file_schema.len());
     let mut i = 0;
     while i < files.len() {
         if removed_files.contains(files.get(i).unwrap()) {
             files.remove(i);
             sizes.remove(i);
+            file_schema.remove(i);
         } else {
             i += 1;
         }
@@ -782,7 +784,7 @@ impl TestApiServiceClient {
                     files: table_info.files.clone(),
                     sizes: table_info.sizes.clone(),
                     schemas: vec!(table_info.schema.as_ref().unwrap().clone()),
-                    file_schemas: vec!(0),
+                    file_schemas: table_info.files.iter().map(|_|0).collect(),
                 },
                 Some(existing) => {
                     let mut files = existing.files.clone();
@@ -790,11 +792,11 @@ impl TestApiServiceClient {
                     let mut schemas = existing.schemas.clone();
                     let mut file_schemas = existing.file_schemas.clone();
                     let all_removed_files = self.get_removed_files(&commit.compactions);
-                    do_remove(&all_removed_files, &mut files, &mut sizes);
+                    do_remove(&all_removed_files, &mut files, &mut sizes, &mut file_schemas);
                     files.extend(table_info.files.clone());
                     sizes.extend(table_info.sizes.clone());
                     // TODO: look for existing schemas that match and reuse
-                    file_schemas.push(schemas.len() as u64);
+                    file_schemas.extend(table_info.files.iter().map(|_|schemas.len() as u64));
                     schemas.push(table_info.schema.as_ref().unwrap().clone());
                     SpeedboatMetadata {
                         files,
@@ -811,6 +813,11 @@ impl TestApiServiceClient {
                 tracing::info!("Speedboat file {}", file)
             }
 
+            let mut merged_schema = latest_checkpoint.schema.clone();
+            if table_info.schema.is_some() {
+                merged_schema.merge_from(table_info.schema.as_ref().unwrap());
+            }
+
             let new_latest_checkpoint = TableMetadataCheckpoint {
                 table_name: table_info.table_name.clone(),
                 checkpoint_id: new_checkpoint_id.clone(),
@@ -818,7 +825,7 @@ impl TestApiServiceClient {
                 speedboat_metadata: Some(new_speedboat_metadata.clone()),
                 deletes_metadata: latest_checkpoint.deletes_metadata.clone(),
                 extension_metadata: latest_checkpoint.extension_metadata.clone(),   
-                schema: latest_checkpoint.schema.clone(),
+                schema: merged_schema,
             };
 
             self.checkpoints.insert(format!("{}_{}", &table_info.table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
@@ -1051,17 +1058,21 @@ impl ApiServiceClient for TestApiServiceClient {
         let new_checkpoint_id = IdInstance::next_id().to_string();
         let new_speedboat_metadata = match &latest_checkpoint.speedboat_metadata {
             None => None,
-            Some(existing) => {
+            Some(_existing) => {
+                todo!("This needs fixing for powdrrschema stuff");
+                /*
                 let mut files = existing.files.clone();
                 let mut sizes = existing.sizes.clone();
                 let all_removed_files = self.get_removed_files(&iceberg_commit.compactions);
-                do_remove(&all_removed_files, &mut files, &mut sizes);
+                do_remove(&all_removed_files, &mut files, &mut sizes, );
                 Some(SpeedboatMetadata {
                     files: files,
                     sizes: sizes,
                     schemas: vec!(),
                     file_schemas: vec!(),
                 })
+
+                 */
             },
         };     
 

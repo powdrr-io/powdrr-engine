@@ -68,7 +68,7 @@ impl PowdrrSchema {
         merged_schema
     }
 
-    fn merge_from(&mut self, other: &PowdrrSchema) -> () {
+    pub fn merge_from(&mut self, other: &PowdrrSchema) -> () {
         let self_map = self.to_map();
 
         for other_field in other.fields.iter() {
@@ -736,6 +736,7 @@ impl SqlQuery {
         format!("SELECT {fields} FROM {{target_table}} t {joins}{filters}{group_by}{order_by}{limit}")
     }
 
+    #[allow(dead_code)]
     pub(crate) fn build_debug(&self) -> String {
         let fields = self.fields.iter().map(|x|x.stringize()).collect::<Vec<String>>().join(", ");
         let joins = self.joins.clone();
