@@ -2187,7 +2187,13 @@ mod tests {
                 panic!("Failed {}", e)
             }
         }
+    }
 
+    fn make_create_bulk_body(index: String, values: Vec<String>) -> String {
+        let removed_newlines = values.iter().map(|v| format!("{}\n", v.replace("\n", ""))).collect::<Vec<String>>();
+        let create_lines = values.iter().map(|_| format!("{{\"create\":{{\"_index\":\"{}\"}}}}\n", index)).collect::<Vec<String>>();
+        let together = create_lines.iter().zip(removed_newlines.iter()).map(|(v, c)| format!("{}{}", v, c)).collect::<Vec<String>>();
+        together.join("")
     }
 
     #[test]
@@ -2200,57 +2206,64 @@ mod tests {
             mime::TEXT_PLAIN
         ).perform().unwrap();
 
-        let schema = PowdrrSchema::from(&vec!(
-            PowdrrField{ name: "@timestamp".to_string(), data_type: PowdrrDataType::String },
-            PowdrrField{ name: "message".to_string(), data_type: PowdrrDataType::String },
-            PowdrrField{ name: "index_col".to_string(), data_type: PowdrrDataType::Integer },
-            PowdrrField{ name: "user".to_string(), data_type: PowdrrDataType::Object(
-                Box::new(PowdrrSchema::from(&vec!(
-                    PowdrrField{ name: "id".to_string(), data_type: PowdrrDataType::String },
-                )))
-            )}
-        ));
+        let body_create_index = r#"{
+            "settings" : {
+                "index": {
+                "number_of_shards" : 2,
+                "number_of_replicas" : 1
+            } } }"#;
 
-        let checkpoint = TableMetadataCheckpoint {
-            table_name: "logs".to_string(),
-            checkpoint_id: "fake_id".to_string(),
-            iceberg_metadata: None,
-            speedboat_metadata: Some(SpeedboatMetadata{
-                files: vec!("file:///Users/greg.fee/code/monolith-rust-workspace/service/tests/data/logs.json".to_string()),
-                sizes: vec!(6),
-                schemas: vec!(schema.clone()),
-                file_schemas: vec!(0),
-            }),
-            deletes_metadata: None,
-            extension_metadata: None,
-            schema: schema.clone(),
-        };
-
-        let checkpoint_response = test_server.client().post(
-            "http://localhost/_test/v1/_add_checkpoint",
-            serde_json::to_string(&checkpoint).unwrap(),
+        let response_create_index = test_server.client().put(
+            "http://localhost/okta_system_log",
+            body_create_index,
             mime::APPLICATION_JSON,
-        ).perform();
+        ).perform().unwrap();
 
-        match checkpoint_response {
-            Err(_) => panic!("test setup failed"),
-            Ok(_) => ()
-        };
+        assert_eq!(response_create_index.status(), 200);
 
-        let body_obj  = r#"
+        let body = make_create_bulk_body(
+            "okta_system_log".to_string(),
+            vec!(
+                include_str!("../tests/data/okta_system_log_1.json").to_string(),
+                include_str!("../tests/data/okta_system_log_2.json").to_string(),
+                include_str!("../tests/data/okta_system_log_3.json").to_string(),
+                include_str!("../tests/data/okta_system_log_4.json").to_string(),
+            )
+        );
+
+        let response = test_server.client().post(
+            "http://localhost/_bulk",
+            body,
+            mime::APPLICATION_JSON,
+        ).perform().unwrap();
+
+        assert_eq!(response.status(), 200);
+
+        let process_work_response = test_server.client().put(
+            "http://localhost/_test/v1/_process_work",
+            "",
+            mime::TEXT_PLAIN,
+        ).perform().unwrap();
+
+        assert_eq!(process_work_response.status(), 200);
+
+        let query_val = r#"{
+  "query": {
+    "bool": {
+      "must": [
         {
-           "query": {
-             "match": {
-               "message": {
-                 "query": "Login"
-               }
-             }
-           }
-        }"#;
+          "term": {
+            "debugContext.debugData.isUserSuspicious": false
+          }
+        }
+      ]
+    }
+  }
+}"#;
 
         let response_result = test_server.client().post(
-            "http://localhost/logs/_search",
-            body_obj,
+            "http://localhost/okta_system_log/_search",
+            query_val,
             mime::APPLICATION_JSON,
         ).perform();
 
@@ -2258,7 +2271,12 @@ mod tests {
             Ok(response) => {
                 assert_eq!(response.status(), 200);
                 let body = response.read_body().unwrap();
-                let _str_body = str::from_utf8(&body).unwrap();
+                let str_body = str::from_utf8(&body).unwrap();
+                println!("{}", str_body);
+                let json_body = serde_json::from_str::<Value>(str_body).unwrap();
+                let hits = json_body["hits"]["hits"].as_array().unwrap();
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0]["_source"]["debugContext"]["debugData"]["isUserSuspicious"].as_bool().unwrap(), false);
             },
             Err(e) => {
                 panic!("Failed {}", e)
