@@ -1,6 +1,6 @@
-{ "@timestamp": "2099-03-08T11:04:05.000Z", "index_col": 1, "user": { "id": "vlb44hny" }, "message": "Login attempt failed" }
-{ "@timestamp": "2099-03-08T11:06:07.000Z", "index_col": 2, "user": { "id": "8a4f500d" }, "message": "Login successful" }
-{ "@timestamp": "2099-03-09T11:07:08.000Z", "index_col": 3, "user": { "id": "l7gk7f82" }, "message": "Logout successful" }
-{ "@timestamp": "2099-03-08T11:04:06.000Z", "index_col": 4, "user": { "id": "vlb44hny" }, "message": "Login attempt also failed" }
-{ "@timestamp": "2099-03-08T11:06:08.000Z", "index_col": 5, "user": { "id": "8a4f500d" }, "message": "Login also successful" }
-{ "@timestamp": "2099-03-09T11:07:09.000Z", "index_col": 6, "user": { "id": "l7gk7f82" }, "message": "Logout also successful" }
+{ "@timestamp": "2099-03-08T11:04:05.000Z", "_id": "1", "_version": 1, "_seq_no": 1, "index_col": 1, "_source": "{\"message\": \"Login attempt failed\"}", "message": "Login attempt failed" }
+{ "@timestamp": "2099-03-08T11:06:07.000Z", "_id": "2", "_version": 1, "_seq_no": 1, "index_col": 2, "_source": "{\"message\": \"Login successful\"}", "message": "Login successful" }
+{ "@timestamp": "2099-03-09T11:07:08.000Z", "_id": "3", "_version": 1, "_seq_no": 1, "index_col": 3, "_source": "{\"message\": \"Logout successful\"}", "message": "Logout successful" }
+{ "@timestamp": "2099-03-08T11:04:06.000Z", "_id": "4", "_version": 1, "_seq_no": 1, "index_col": 4, "_source": "{\"message\": \"Login attempt also failed\"}", "message": "Login attempt also failed" }
+{ "@timestamp": "2099-03-08T11:06:08.000Z", "_id": "5", "_version": 1, "_seq_no": 1, "index_col": 5, "_source": "{\"message\": \"Login also successful\"}", "message": "Login also successful" }
+{ "@timestamp": "2099-03-09T11:07:09.000Z", "_id": "6", "_version": 1, "_seq_no": 1, "index_col": 6, "_source": "{\"message\": \"Logout also successful\"}", "message": "Logout also successful" }
