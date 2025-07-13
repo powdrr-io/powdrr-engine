@@ -1,0 +1,142 @@
+{
+  "uuid": "evt_0oa10a1o0o0o0o0o010",
+  "published": "2025-07-12T20:50:10.000Z",
+  "eventType": "user.factor.enroll",
+  "version": "1.0",
+  "displayMessage": "User enrolled factor Okta Verify",
+  "severity": "INFO",
+  "client": {
+    "id": null,
+    "ipAddress": "198.51.100.25",
+    "device": "Mobile",
+    "os": "iOS",
+    "userAgent": {
+      "rawUserAgent": "OktaVerify/7.0.0 (iPhone; iOS 17.5.1; Scale/3.00)",
+      "os": "iOS",
+      "browser": "OktaVerify",
+      "version": "7.0.0"
+    },
+    "zone": {
+      "id": "zone_0oaz9b2b9b2b9b2b9",
+      "name": "Trusted IP Zone"
+    },
+    "geographicalContext": {
+      "city": "San Francisco",
+      "state": "California",
+      "country": "United States",
+      "postalCode": "94105",
+      "geolocation": {
+        "lat": 37.7749,
+        "lon": -122.4194
+      }
+    }
+  },
+  "outcome": {
+    "result": "SUCCESS",
+    "reason": null
+  },
+  "actor": {
+    "id": "00u1e1e1e1e1e1e1e1e1",
+    "type": "User",
+    "alternateId": "emily.white@example.com",
+    "displayName": "Emily White",
+    "credentialProvider": "OKTA",
+    "credentialType": "PASSWORD",
+    "detail": null
+  },
+  "authenticationContext": {
+    "authenticationStep": 1,
+    "externalSessionId": "pqrs5678901234",
+    "credentialProvider": "OKTA",
+    "credentialType": "PASSWORD",
+    "issuer": {
+      "id": "0oa1a1a1a1a1a1a1a1a1",
+      "type": "Org",
+      "alternateId": "example.okta.com",
+      "displayName": "Example Okta Org",
+      "detail": null
+    },
+    "interface": null,
+    "authenticationSources": [],
+    "contextProperty": {}
+  },
+  "target": [
+    {
+      "id": "fct0e0e0e0e0e0e0e0e0",
+      "type": "Factor",
+      "alternateId": "Okta Verify",
+      "displayName": "Okta Verify",
+      "detail": {
+        "factorType": "OKTA_VERIFY",
+        "factorProfileId": "fpf0e0e0e0e0e0e0e0e0",
+        "platform": "iOS",
+        "deviceModel": "iPhone14,3"
+      }
+    },
+    {
+      "id": "00u1e1e1e1e1e1e1e1e1",
+      "type": "User",
+      "alternateId": "emily.white@example.com",
+      "displayName": "Emily White",
+      "detail": {
+        "firstName": "Emily",
+        "lastName": "White"
+      }
+    }
+  ],
+  "transaction": {
+    "id": "txn_0oaz9b2b9b2b9b2c2",
+    "type": "WEB",
+    "detail": null
+  },
+  "request": {
+    "ipChain": [
+      {
+        "ip": "198.51.100.25",
+        "geographicalContext": {
+          "city": "San Francisco",
+          "state": "California",
+          "country": "United States",
+          "postalCode": "94105",
+          "geolocation": {
+            "lat": 37.7749,
+            "lon": -122.4194
+          }
+        },
+        "version": "HTTP/1.1",
+        "header": {
+          "User-Agent": [
+            "OktaVerify/7.0.0 (iPhone; iOS 17.5.1; Scale/3.00)"
+          ],
+          "Accept-Language": [
+            "en-US,en;q=0.9"
+          ]
+        }
+      }
+    ]
+  },
+  "debugContext": {
+    "debugData": {
+      "requestUri": "/api/v1/users/00u1e1e1e1e1e1e1e1e1/factors",
+      "factorId": "fct0e0e0e0e0e0e0e0e0",
+      "factorType": "OKTA_VERIFY",
+      "oktaRequestId": "okta_req_id_qrst4567890123",
+      "policyId": "policy_id_enrollment123",
+      "policyRuleId": "policy_rule_id_enrollment456",
+      "policyResult": "ALLOW"
+    }
+  },
+  "securityContext": {
+    "asNumber": 64515,
+    "asOrg": "Mobile ISP Co.",
+    "isp": "Mobile ISP Co.",
+    "domain": "example.org",
+    "isProxy": false,
+    "isTor": false,
+    "threatEvent": {
+      "threatClassification": null,
+      "threatConfidence": null
+    }
+  },
+  "legacyEventType": "user.factor.provision"
+}

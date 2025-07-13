@@ -290,7 +290,7 @@ mod tests {
     use crate::elastic_search_responses::{QueryResultTotal, QueryResults};
     use crate::router::router;
     use crate::schema_massager::{extract_powdrr_schema_str, PowdrrDataType, PowdrrField, PowdrrSchema, SqlBuilder, SqlExpression};
-    use crate::state_hosted_service::{IcebergMetadata, SpeedboatMetadata, TableMetadataCheckpoint};
+    use crate::state_hosted_service::{ExtensionFile, ExtensionFileMetadata, ExtensionMetadata, IcebergMetadata, SpeedboatMetadata, TableMetadataCheckpoint};
     use crate::state_peers::{PrivateSqlInvocation, SnapshotDescriptor};
 
     pub(crate) static TEST_SERVER: LazyLock<TestServer> = LazyLock::new(|| TestServer::with_timeout(router(true), 1000).unwrap());
@@ -434,10 +434,10 @@ mod tests {
 
         assert_eq!(response.status(), 200);
         let body = response.read_body().unwrap();
-        let _str_body = str::from_utf8(&body).unwrap();
-
-        // TODO: add some validation
-        
+        let str_body = str::from_utf8(&body).unwrap();
+        let json_body: serde_json::Value = serde_json::from_str(&str_body).unwrap();
+        let num = json_body["num"].as_u64().unwrap();
+        assert_eq!(num, 505);
     }    
 
     #[test]
@@ -456,12 +456,14 @@ mod tests {
             PowdrrField{ name: "title".to_string(), data_type: PowdrrDataType::String },
         ));
 
+        let file_path = format!("file://{}/tests/data/flights.parquet", env::current_dir().unwrap().to_str().unwrap());
+
         let checkpoint = TableMetadataCheckpoint {
             table_name: "flights".to_string(),
             checkpoint_id: "fake_id".to_string(),
             iceberg_metadata: Some(IcebergMetadata {
                 snapshot_id: "fake_iceberg_snapshot".to_string(),
-                files: vec!("file:///Users/greg.fee/code/monolith-rust-workspace/service/tests/data/flights.parquet".to_string()),
+                files: vec!(file_path),
                 column_names: vec!(),
                 column_stats: vec!(),
                 schemas: vec!(schema.clone()),
@@ -527,27 +529,39 @@ mod tests {
 
         let schema = PowdrrSchema::from(&vec!(
             PowdrrField{ name: "@timestamp".to_string(), data_type: PowdrrDataType::String },
+            PowdrrField{ name: "_id".to_string(), data_type: PowdrrDataType::String },
+            PowdrrField{ name: "_version".to_string(), data_type: PowdrrDataType::Integer },
+            PowdrrField{ name: "_seq_no".to_string(), data_type: PowdrrDataType::Integer },
             PowdrrField{ name: "message".to_string(), data_type: PowdrrDataType::String },
+            PowdrrField{ name: "_source".to_string(), data_type: PowdrrDataType::String },
             PowdrrField{ name: "index_col".to_string(), data_type: PowdrrDataType::Integer },
-            PowdrrField{ name: "user".to_string(), data_type: PowdrrDataType::Object(
-                Box::new(PowdrrSchema::from(&vec!(
-                    PowdrrField{ name: "id".to_string(), data_type: PowdrrDataType::String },
-                )))
-            )}
         ));
+
+        let data_file_path = format!("file://{}/tests/data/logs.json", env::current_dir().unwrap().to_str().unwrap());
+        let index_file_path = format!("file://{}/tests/data/logs_search_index.parquet", env::current_dir().unwrap().to_str().unwrap());
 
         let checkpoint = TableMetadataCheckpoint {
             table_name: "logs".to_string(),
             checkpoint_id: "fake_id".to_string(),
             iceberg_metadata: None,
             speedboat_metadata: Some(SpeedboatMetadata{ 
-                files: vec!("file:///Users/greg.fee/code/monolith-rust-workspace/service/tests/data/logs.json".to_string()),
+                files: vec!(data_file_path.clone()),
                 sizes: vec!(6),
                 schemas: vec!(schema.clone()),
                 file_schemas: vec!(0),
             }),
             deletes_metadata: None,
-            extension_metadata: None,
+            extension_metadata: Some(
+                vec!((
+                    "es".to_string(),
+                    ExtensionMetadata {
+                        files: vec!(ExtensionFileMetadata {
+                            data_file_location: data_file_path.clone(),
+                            extension_file_locations: vec!(ExtensionFile { suffix: "search_index".to_string(), location: index_file_path }),
+                        })
+                    }
+                ))
+            ),
             schema: schema.clone(),
         };
 
@@ -584,9 +598,12 @@ mod tests {
                 assert_eq!(response.status(), 200);
                 let body = response.read_body().unwrap();
                 let str_body = str::from_utf8(&body).unwrap();
-                print!("{}", str_body);
+                let json_body: serde_json::Value = serde_json::from_str(&str_body).unwrap();
+                let hits = json_body["hits"]["hits"].as_array().unwrap();
+                assert_eq!(hits.len(), 4);
             },
-            Err(e) => {
+            Err(e,
+            ) => {
                 panic!("Failed {}", e)
             }
         }
@@ -777,9 +794,7 @@ mod tests {
                 panic!("Failed {}", e)
             }
         }
-
     }
-
 
     #[test]
     fn test_es_ingest_then_search_table_agg() {
@@ -860,8 +875,11 @@ mod tests {
                 assert_eq!(response.status(), 200);
                 let body = response.read_body().unwrap();
                 let str_body = str::from_utf8(&body).unwrap();
-                print!("{}", str_body);
-                assert!(str_body.contains("aggregations"));
+                let json_body: serde_json::Value = serde_json::from_str(&str_body).unwrap();
+                let hits = json_body["hits"]["hits"].as_array().unwrap();
+                assert_eq!(hits.len(), 3);
+                let buckets = json_body["aggregations"]["messageType"]["buckets"].as_array().unwrap();
+                assert_eq!(buckets.len(), 2);
             },
             Err(e) => {
                 panic!("Failed {}", e)
@@ -944,18 +962,18 @@ mod tests {
                 assert_eq!(response.status(), 200);
                 let body = response.read_body().unwrap();
                 let str_body = str::from_utf8(&body).unwrap();
-                print!("{}", str_body);
-                assert!(str_body.contains("aggregations"));
+                let json_body: serde_json::Value = serde_json::from_str(&str_body).unwrap();
+                let aggregations = json_body["aggregations"].as_object().unwrap();
+                assert_eq!(aggregations.len(), 2);
+                assert_eq!(110.0, aggregations["avg_price"]["value"].as_f64().unwrap());
+                assert_eq!(aggregations["t_shirts"]["avg_price"]["value"].as_f64().unwrap(), 90.0);
             },
             Err(e) => {
                 panic!("Failed {}", e)
             }
         }
-
     }
 
-
-    
     #[test]
     fn test_es_ingest_search_ingest_compact_then_search_table() {
         let test_server = &*TEST_SERVER;
@@ -1026,7 +1044,9 @@ mod tests {
                 assert_eq!(response.status(), 200);
                 let body = response.read_body().unwrap();
                 let str_body = str::from_utf8(&body).unwrap();
-                print!("{}", str_body);
+                let json_body: serde_json::Value = serde_json::from_str(&str_body).unwrap();
+                let hits = json_body["hits"]["hits"].as_array().unwrap();
+                assert_eq!(hits.len(), 2);
             },
             Err(e) => {
                 panic!("Failed {}", e)
@@ -1067,7 +1087,9 @@ mod tests {
                 assert_eq!(response.status(), 200);
                 let body = response.read_body().unwrap();
                 let str_body = str::from_utf8(&body).unwrap();
-                print!("{}", str_body);
+                let json_body: serde_json::Value = serde_json::from_str(&str_body).unwrap();
+                let hits = json_body["hits"]["hits"].as_array().unwrap();
+                assert_eq!(hits.len(), 4);
             },
             Err(e) => {
                 panic!("Failed {}", e)
@@ -1383,12 +1405,20 @@ mod tests {
             }
         }
 
-        let body_obj  = r#"
+       let process_work_response = test_server.client().put(
+           "http://localhost/_test/v1/_process_work",
+           "",
+           mime::TEXT_PLAIN,
+       ).perform().unwrap();
+
+       assert_eq!(process_work_response.status(), 200);
+
+       let body_obj  = r#"
         {
            "query": {
              "match": {
-               "message": {
-                 "query": "Login"
+               "dude": {
+                 "query": "bar"
                }
              }
            }
@@ -1405,7 +1435,9 @@ mod tests {
                 assert_eq!(response.status(), 200);
                 let body = response.read_body().unwrap();
                 let str_body = str::from_utf8(&body).unwrap();
-                print!("{}", str_body);
+                let json_body: serde_json::Value = serde_json::from_str(&str_body).unwrap();
+                let hits = json_body["hits"]["hits"].as_array().unwrap();
+                assert_eq!(hits.len(), 2);
             },
             Err(e) => {
                 panic!("Failed {}", e)
@@ -2094,8 +2126,8 @@ mod tests {
                 //assert_eq!(response.status(), 200);
                 let body = response.read_body().unwrap();
                 let str_body = str::from_utf8(&body).unwrap();
-                print!("{}", str_body);
-                // TODO: Check the response
+                let json_body = serde_json::from_str::<Value>(str_body).unwrap();
+                assert_eq!(json_body["updated"].as_u64().unwrap(), 1);
             },
             Err(e) => {
                 panic!("Failed {}", e)
@@ -2112,6 +2144,8 @@ mod tests {
                 let body = response.read_body().unwrap();
                 let str_body = str::from_utf8(&body).unwrap();
                 print!("{}", str_body);
+                let json_body = serde_json::from_str::<Value>(str_body).unwrap();
+                assert_eq!(json_body["_source"]["task"]["status"].as_str().unwrap(), "claiming");
                 // TODO: Check the response
             },
             Err(e) => {
@@ -2144,8 +2178,10 @@ mod tests {
                 //assert_eq!(response.status(), 200);
                 let body = response.read_body().unwrap();
                 let str_body = str::from_utf8(&body).unwrap();
-                print!("{}", str_body);
-                // TODO: Check the response
+                let json_body = serde_json::from_str::<Value>(str_body).unwrap();
+                let hits = json_body["hits"]["hits"].as_array().unwrap();
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0]["_source"]["task"]["ownerId"].as_str().unwrap(), "kibana:9f414dbe-805e-4f6d-8b06-b84cc2d2b9a6");
             },
             Err(e) => {
                 panic!("Failed {}", e)
@@ -2153,4 +2189,82 @@ mod tests {
         }
 
     }
+
+    #[test]
+    fn test_es_search_table_json_okta_system_log() {
+        let test_server = &*TEST_SERVER;
+
+        test_server.client().put(
+            "http://localhost/_test/v1/_testing_mode",
+            "",
+            mime::TEXT_PLAIN
+        ).perform().unwrap();
+
+        let schema = PowdrrSchema::from(&vec!(
+            PowdrrField{ name: "@timestamp".to_string(), data_type: PowdrrDataType::String },
+            PowdrrField{ name: "message".to_string(), data_type: PowdrrDataType::String },
+            PowdrrField{ name: "index_col".to_string(), data_type: PowdrrDataType::Integer },
+            PowdrrField{ name: "user".to_string(), data_type: PowdrrDataType::Object(
+                Box::new(PowdrrSchema::from(&vec!(
+                    PowdrrField{ name: "id".to_string(), data_type: PowdrrDataType::String },
+                )))
+            )}
+        ));
+
+        let checkpoint = TableMetadataCheckpoint {
+            table_name: "logs".to_string(),
+            checkpoint_id: "fake_id".to_string(),
+            iceberg_metadata: None,
+            speedboat_metadata: Some(SpeedboatMetadata{
+                files: vec!("file:///Users/greg.fee/code/monolith-rust-workspace/service/tests/data/logs.json".to_string()),
+                sizes: vec!(6),
+                schemas: vec!(schema.clone()),
+                file_schemas: vec!(0),
+            }),
+            deletes_metadata: None,
+            extension_metadata: None,
+            schema: schema.clone(),
+        };
+
+        let checkpoint_response = test_server.client().post(
+            "http://localhost/_test/v1/_add_checkpoint",
+            serde_json::to_string(&checkpoint).unwrap(),
+            mime::APPLICATION_JSON,
+        ).perform();
+
+        match checkpoint_response {
+            Err(_) => panic!("test setup failed"),
+            Ok(_) => ()
+        };
+
+        let body_obj  = r#"
+        {
+           "query": {
+             "match": {
+               "message": {
+                 "query": "Login"
+               }
+             }
+           }
+        }"#;
+
+        let response_result = test_server.client().post(
+            "http://localhost/logs/_search",
+            body_obj,
+            mime::APPLICATION_JSON,
+        ).perform();
+
+        match response_result {
+            Ok(response) => {
+                assert_eq!(response.status(), 200);
+                let body = response.read_body().unwrap();
+                let _str_body = str::from_utf8(&body).unwrap();
+            },
+            Err(e) => {
+                panic!("Failed {}", e)
+            }
+        }
+
+    }
+
 }

@@ -1,0 +1,131 @@
+{
+  "uuid": "evt_0oa10a1o0o0o0o0o008",
+  "published": "2024-07-12T21:58:15.000Z",
+  "eventType": "user.lifecycle.deactivate",
+  "version": "1.0",
+  "displayMessage": "User deactivated by administrator",
+  "severity": "INFO",
+  "client": {
+    "id": null,
+    "ipAddress": "192.0.2.10",
+    "device": "Computer",
+    "os": "Windows",
+    "userAgent": {
+      "rawUserAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "os": "Windows",
+      "browser": "Chrome",
+      "version": "120.0.0.0"
+    },
+    "zone": {
+      "id": "zone_0oaz9b2b9b2b9b2b9",
+      "name": "Trusted IP Zone"
+    },
+    "geographicalContext": {
+      "city": "Dallas",
+      "state": "Texas",
+      "country": "United States",
+      "postalCode": "75201",
+      "geolocation": {
+        "lat": 32.7767,
+        "lon": -96.7970
+      }
+    }
+  },
+  "outcome": {
+    "result": "SUCCESS",
+    "reason": null
+  },
+  "actor": {
+    "id": "00u2b2b2b2b2b2b2b2b2",
+    "type": "User",
+    "alternateId": "admin.user@example.com",
+    "displayName": "Admin User",
+    "credentialProvider": "OKTA",
+    "credentialType": "PASSWORD",
+    "detail": null
+  },
+  "authenticationContext": {
+    "authenticationStep": 1,
+    "externalSessionId": "hijk9876543210",
+    "credentialProvider": "OKTA",
+    "credentialType": "PASSWORD",
+    "issuer": {
+      "id": "0oa1a1a1a1a1a1a1a1a1",
+      "type": "Org",
+      "alternateId": "example.okta.com",
+      "displayName": "Example Okta Org",
+      "detail": null
+    },
+    "interface": null,
+    "authenticationSources": [],
+    "contextProperty": {}
+  },
+  "target": [
+    {
+      "id": "00u1c1c1c1c1c1c1c1c1",
+      "type": "User",
+      "alternateId": "jane.doe@example.com",
+      "displayName": "Jane Doe",
+      "detail": {
+        "firstName": "Jane",
+        "lastName": "Doe"
+      }
+    }
+  ],
+  "transaction": {
+    "id": "txn_0oaz9b2b9b2b9b2c0",
+    "type": "ADMIN_UI",
+    "detail": null
+  },
+  "request": {
+    "ipChain": [
+      {
+        "ip": "192.0.2.10",
+        "geographicalContext": {
+          "city": "Dallas",
+          "state": "Texas",
+          "country": "United States",
+          "postalCode": "75201",
+          "geolocation": {
+            "lat": 32.7767,
+            "lon": -96.7970
+          }
+        },
+        "version": "HTTP/1.1",
+        "header": {
+          "User-Agent": [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          ],
+          "Accept-Language": [
+            "en-US,en;q=0.9"
+          ]
+        }
+      }
+    ]
+  },
+  "debugContext": {
+    "debugData": {
+      "requestUri": "/api/v1/users/00u1c1c1c1c1c1c1c1c1/lifecycle/deactivate",
+      "adminUserId": "00u2b2b2b2b2b2b2b2b2",
+      "targetUserId": "00u1c1c1c1c1c1c1c1c1",
+      "oktaRequestId": "okta_req_id_ghijkl789012",
+      "policyId": null,
+      "policyRuleId": null,
+      "policyResult": null,
+      "reason": "Deactivated by administrator request"
+    }
+  },
+  "securityContext": {
+    "asNumber": 64513,
+    "asOrg": "Another Example ISP",
+    "isp": "Another Example ISP",
+    "domain": "example.net",
+    "isProxy": false,
+    "isTor": false,
+    "threatEvent": {
+      "threatClassification": null,
+      "threatConfidence": null
+    }
+  },
+  "legacyEventType": "core.user.deactivate"
+}

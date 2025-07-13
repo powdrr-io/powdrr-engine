@@ -723,10 +723,20 @@ impl TestApiServiceClient {
             );
         }
         let key = format!("{}_{}", &metadata.table_name, &metadata.checkpoint_id);
+        if !self.checkpoints.contains_key(&key) {
+            self.checkpoints.insert(key, metadata.clone());
+        }
         if !self.latest_checkpoint_id.contains_key(&metadata.table_name) {
             self.latest_checkpoint_id.insert(metadata.table_name.clone(), metadata.checkpoint_id.clone());            
         }
-        self.checkpoints.insert(key, metadata.clone());
+        if metadata.extension_metadata.is_some() {
+            for (extension, _) in metadata.extension_metadata.as_ref().unwrap().iter() {
+                let key = format!("{}_{}", &metadata.table_name, extension);
+                if !self.latest_checkpoint_id.contains_key(&key) {
+                    self.latest_checkpoint_id.insert(key, metadata.checkpoint_id.clone());
+                }
+            }
+        }
     }
 
     fn get_removed_files(&self, compactions: &Vec<String>) -> Vec<String> {

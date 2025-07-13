@@ -1,0 +1,144 @@
+{
+  "uuid": "evt_0oa10a1o0o0o0o0o007",
+  "published": "2024-07-12T21:55:00.000Z",
+  "eventType": "user.session.start",
+  "version": "1.0",
+  "displayMessage": "User login to Okta",
+  "severity": "INFO",
+  "client": {
+    "id": null,
+    "ipAddress": "203.0.113.45",
+    "device": "Computer",
+    "os": "Mac OS X",
+    "userAgent": {
+      "rawUserAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/500.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/500.36",
+      "os": "Mac OS X",
+      "browser": "Chrome",
+      "version": "120.0.0.0"
+    },
+    "zone": {
+      "id": "zone_0oaz9b2b9b2b9b2b9",
+      "name": "Trusted IP Zone"
+    },
+    "geographicalContext": {
+      "city": "New York",
+      "state": "New York",
+      "country": "United States",
+      "postalCode": "10001",
+      "geolocation": {
+        "lat": 40.7128,
+        "lon": -74.0060
+      }
+    }
+  },
+  "outcome": {
+    "result": "SUCCESS",
+    "reason": null
+  },
+  "actor": {
+    "id": "00u1a1a1a1a1a1a1a1a1",
+    "type": "User",
+    "alternateId": "john.doe@example.com",
+    "displayName": "John Doe",
+    "credentialProvider": "OKTA",
+    "credentialType": "OTP",
+    "detail": null
+  },
+  "authenticationContext": {
+    "authenticationStep": 1,
+    "externalSessionId": "defg1234567890",
+    "credentialProvider": "OKTA",
+    "credentialType": "OTP",
+    "issuer": {
+      "id": "0oa1a1a1a1a1a1a1a1a1",
+      "type": "Org",
+      "alternateId": "example.okta.com",
+      "displayName": "Example Okta Org",
+      "detail": null
+    },
+    "interface": null,
+    "authenticationSources": [
+      {
+        "id": "0pr1a1a1a1a1a1a1a1a1",
+        "type": "MFA_FACTOR",
+        "name": "Google Authenticator",
+        "detail": {
+          "securityMethod": "PUSH"
+        }
+      }
+    ],
+    "contextProperty": {
+      "ip_evaluation_status": "ALLOWED",
+      "risk_score": 0,
+      "risk_level": "LOW"
+    }
+  },
+  "target": [
+    {
+      "id": "0oa1a1a1a1a1a1a1a1a1",
+      "type": "AppInstance",
+      "alternateId": "Okta Dashboard",
+      "displayName": "Okta Dashboard",
+      "detail": null
+    }
+  ],
+  "transaction": {
+    "id": "txn_0oaz9b2b9b2b9b2b9",
+    "type": "WEB",
+    "detail": null
+  },
+  "request": {
+    "ipChain": [
+      {
+        "ip": "203.0.113.45",
+        "geographicalContext": {
+          "city": "New York",
+          "state": "New York",
+          "country": "United States",
+          "postalCode": "10001",
+          "geolocation": {
+            "lat": 40.7128,
+            "lon": -74.0060
+          }
+        },
+        "version": "HTTP/1.1",
+        "header": {
+          "User-Agent": [
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/500.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/500.36"
+          ],
+          "X-Forwarded-For": [
+            "192.168.1.100"
+          ],
+          "Accept-Language": [
+            "en-US,en;q=0.9"
+          ]
+        }
+      }
+    ]
+  },
+  "debugContext": {
+    "debugData": {
+      "requestUri": "/oauth2/v1/authorize?client_id=client_id_value&response_type=code&scope=openid%20profile%20email&redirect_uri=https%3A%2F%2Fapp.example.com%2Fcallback&state=state_value",
+      "authnProvider": "OKTA",
+      "authenticationContext": "WEB",
+      "oktaRequestId": "okta_req_id_abcdef123456",
+      "policyId": "policy_id_abcdef123456",
+      "policyRuleId": "policy_rule_id_abcdef123456",
+      "policyResult": "ALLOW",
+      "isUserSuspicious": false
+    }
+  },
+  "securityContext": {
+    "asNumber": 64512,
+    "asOrg": "Example ISP",
+    "isp": "Example ISP",
+    "domain": "example.com",
+    "isProxy": false,
+    "isTor": false,
+    "threatEvent": {
+      "threatClassification": null,
+      "threatConfidence": null
+    }
+  },
+  "legacyEventType": "core.user_auth.login_success"
+}
