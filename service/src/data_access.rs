@@ -1,8 +1,11 @@
 use std::{path::Path, sync::Arc};
-
+use std::num::NonZero;
 use datafusion::{arrow::array::RecordBatch, error::DataFusionError, prelude::{DataFrame, NdJsonReadOptions, ParquetReadOptions, SessionContext}};
+use datafusion::common::HashMap;
 use idgenerator::IdInstance;
+use lru::LruCache;
 use object_store::{aws::{AmazonS3, AmazonS3Builder}, ObjectStore};
+use tokio::sync::{mpsc, oneshot};
 use url::Url;
 
 use crate::util::log_err;
@@ -41,10 +44,126 @@ fn create_session() -> SessionContext {
 }
 
 
+#[derive(Debug, Clone)]
+struct LRUCachePutResponse {
+    exists: bool,
+    to_remove: Vec<String>,
+}
+
+
+enum LRUCacheHandleActorMessage {
+    Put {
+        respond_to: oneshot::Sender<LRUCachePutResponse>,
+        file_location: String,
+        size: u64,
+        upstream_file_location: Option<String>
+    },
+}
+
+
+struct LRUCacheHandleActor {
+    receiver: mpsc::Receiver<LRUCacheHandleActorMessage>,
+    lru_cache: LruCache<String, u64>,
+    related: HashMap<String, Vec<String>>
+}
+
+impl LRUCacheHandleActor {
+    pub fn new(receiver: mpsc::Receiver<LRUCacheHandleActorMessage>) -> Self {
+        Self {
+            receiver,
+            lru_cache: LruCache::new(NonZero::new(1000).unwrap()),
+            related: HashMap::new(),
+        }
+    }
+
+    fn handle_message(&mut self, msg: LRUCacheHandleActorMessage) {
+        match msg {
+            LRUCacheHandleActorMessage::Put { respond_to, file_location, size, upstream_file_location } => {
+                match upstream_file_location {
+                    Some(ufl) => {
+                        if !self.related.contains_key(&ufl) {
+                            self.related.insert(ufl.clone(), vec!());
+                        }
+                        self.related.get_mut(&ufl).unwrap().push(file_location.clone());
+                    },
+                    None => ()
+                }
+                let retval = match self.lru_cache.push(file_location.clone(), size) {
+                    Some((existing_key, _)) => {
+                        if existing_key == file_location {
+                            LRUCachePutResponse{
+                                exists: true,
+                                to_remove: vec!()
+                            }
+                        } else {
+                            let mut to_remove = vec!(existing_key.clone());
+                            match self.related.get(&existing_key) {
+                                Some(related_files) => {
+                                    to_remove.extend(related_files.clone());
+                                    self.related.remove(&existing_key);
+                                },
+                                None => ()
+                            };
+                            LRUCachePutResponse{
+                                exists: false,
+                                to_remove
+                            }
+                        }
+                    },
+                    None => {
+                        LRUCachePutResponse{
+                            exists: false,
+                            to_remove: vec!()
+                        }
+                    }
+                };
+                let _ = respond_to.send(retval);
+            },
+        }
+    }
+}
+
+
+#[derive(Clone)]
+pub struct LRUCacheHandle {
+    sender: mpsc::Sender<LRUCacheHandleActorMessage>,
+}
+
+async fn run_lru_cache_actor_message_pump(mut actor: LRUCacheHandleActor) {
+    while let Some(msg) = actor.receiver.recv().await {
+        actor.handle_message(msg);
+    }
+}
+
+impl LRUCacheHandle {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::channel(1);
+        let actor = LRUCacheHandleActor::new(receiver);
+        tokio::spawn(run_lru_cache_actor_message_pump(actor));
+        Self { sender }
+    }
+
+    async fn put(&self, file_location: &String, size: u64, upstream_file_location: Option<String>) -> LRUCachePutResponse {
+        let (send, recv) = oneshot::channel();
+        let msg = LRUCacheHandleActorMessage::Put {
+            respond_to: send,
+            file_location: file_location.clone(),
+            size: size,
+            upstream_file_location: upstream_file_location.clone(),
+        };
+
+        let _ = self.sender.send(msg).await;
+        // TODO: deal with errors
+        recv.await.expect("Actor task has been killed")
+    }
+}
+
+
 static DATA_FUSION_CONTEXT: std::sync::LazyLock<SessionContext> = std::sync::LazyLock::new(|| create_session());
+static LRU_CACHE_HANDLE: std::sync::LazyLock<LRUCacheHandle> = std::sync::LazyLock::new(|| LRUCacheHandle::new());
 
 
-pub(crate) async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> Result<(), DataFusionError> {
+async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> Result<(), DataFusionError> {
     match DATA_FUSION_CONTEXT.table_exist(local_name) {
         Ok(exists) => match exists {
             true => return Ok(()),
@@ -83,7 +202,7 @@ pub(crate) async fn load_parquet_file_as_table(file_path: &String, local_name: &
 }
 
 
-pub(crate) async fn load_json_file_as_table(file_path: &String, local_name: &String) -> Result<(), DataFusionError> {
+async fn load_json_file_as_table(file_path: &String, local_name: &String) -> Result<(), DataFusionError> {
     match DATA_FUSION_CONTEXT.table_exist(local_name) {
         Ok(exists) => match exists {
             true => return Ok(()),
@@ -113,17 +232,28 @@ fn path_to_table_name(file_path: &String) -> String {
     format!("table_{}", safe_name)   
 }
 
-pub(crate) async fn load_file_as_table(file_path: &String, parquet: bool) -> Result<String, DataFusionError> {
+pub(crate) async fn load_file_as_table(file_path: &String, size: u64, upstream_table_name: Option<String>, parquet: bool) -> Result<String, DataFusionError> {
     let new_local_name = path_to_table_name(file_path);
-    if parquet {
-        match load_parquet_file_as_table(&file_path, &new_local_name).await {
-            Err(e) => return log_err(e),
-            _ => ()
-        }
-    } else {
-        match load_json_file_as_table(file_path, &new_local_name).await {
-            Err(e) => return log_err(e),
-            _ => ()                    
+    load_file_as_table_with_name(&new_local_name, file_path, size, upstream_table_name, parquet).await
+}
+
+pub(crate) async fn load_file_as_table_with_name(new_local_name: &String, file_path: &String, size: u64, upstream_table_name: Option<String>, parquet: bool) -> Result<String, DataFusionError> {
+    let retval = LRU_CACHE_HANDLE.put(new_local_name, size, upstream_table_name).await;
+    for to_remove_name in retval.to_remove.iter() {
+        let _ = DATA_FUSION_CONTEXT.sql(&format!("DROP TABLE IF EXISTS {};", to_remove_name)).await;
+        println!("Dropped table {} from cache", to_remove_name);
+    }
+    if !retval.exists {
+        if parquet {
+            match load_parquet_file_as_table(&file_path, &new_local_name).await {
+                Err(e) => return log_err(e),
+                _ => ()
+            }
+        } else {
+            match load_json_file_as_table(file_path, &new_local_name).await {
+                Err(e) => return log_err(e),
+                _ => ()
+            }
         }
     }
     Ok(new_local_name.clone())

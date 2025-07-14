@@ -280,7 +280,7 @@ pub(crate) fn router(include_test_apis: bool) -> Router {
 
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{env, str};
     use std::sync::LazyLock;
 

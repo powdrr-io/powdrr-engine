@@ -1,13 +1,11 @@
-use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::{error::Error, fmt};
-
 use datafusion::arrow::array::RecordBatch;
 use datafusion::error::DataFusionError;
 use idgenerator::IdInstance;
 use serde::Serialize;
 
-use crate::data_access::{self, load_file_as_table, load_parquet_file_as_table};
+use crate::data_access::{self, load_file_as_table, load_file_as_table_with_name};
 use crate::schema_massager::PowdrrSchema;
 use crate::state_peers::PrivateSqlInvocation;
 use crate::state_hosted_service::*;
@@ -22,14 +20,6 @@ struct ExtensionFileSpec {
     file_path: String,
 }
 
-#[derive(Debug)]
-struct LoadedFileInfo {
-    local_name: String,
-    // extension_files: Vec<ExtensionFileSpec>
-}
-
-
-static LOADED_FILES: std::sync::LazyLock<HashMap<String, LoadedFileInfo>> = std::sync::LazyLock::new(|| HashMap::new());
 
 
 #[derive(Debug)]
@@ -157,31 +147,26 @@ fn get_extension_files(invocation: &PrivateSqlInvocation, file_path: &String) ->
 
 
 async fn ensure_loaded(invocation: &PrivateSqlInvocation, file_path: &String, parquet: bool) -> Result<String, DataFusionError> {
-    match LOADED_FILES.get(file_path) {
-        Some(loaded_file_info) => return Ok(loaded_file_info.local_name.clone()),
-        None => {
-            let new_local_name= match load_file_as_table(file_path, parquet).await {
-                Err(e) => return Err(e),
-                Ok(nln) => nln,
-            };
-            
-            let extension_files = get_extension_files(invocation, file_path);
-            for extension_file in extension_files {
-                let extension_local_name = format!("{}_{}", new_local_name, extension_file.suffix);
-                match load_parquet_file_as_table(&extension_file.file_path, &extension_local_name).await {
-                    Err(e) => {
-                        let error = format!("{}", e);
-                        println!("{}", error);
-                        return Err(e)
-                    },
-                    _ => ()
-                };
-                
-            }
+    let new_local_name= match load_file_as_table(file_path, 0, None, parquet).await {
+        Err(e) => return Err(e),
+        Ok(nln) => nln,
+    };
 
-            Ok(new_local_name.clone())
-        }
+    let extension_files = get_extension_files(invocation, file_path);
+    for extension_file in extension_files {
+        let extension_local_name = format!("{}_{}", &new_local_name, extension_file.suffix);
+        match load_file_as_table_with_name(&extension_local_name, &extension_file.file_path, 0, Some(new_local_name.clone()), true).await {
+            Err(e) => {
+                let error = format!("{}", e);
+                println!("{}", error);
+                return Err(e)
+            },
+            _ => ()
+        };
+
     }
+
+    Ok(new_local_name.clone())
 }
 
 

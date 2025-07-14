@@ -1,10 +1,9 @@
 use std::error::Error;
 
 use datafusion::{arrow::datatypes::DataType, dataframe::DataFrameWriteOptions};
-use idgenerator::IdInstance;
 
-use crate::{data_access::{execute_sql, exists, load_json_file_as_table, load_parquet_file_as_table}, state_hosted_service::{ExtensionCommit, ExtensionFile, ExtensionFileMetadata, ExtensionMetadata, TableMetadataCheckpoint, API_SERVICE_CLIENT}, util::add_file_suffix};
-
+use crate::{data_access::{execute_sql, exists}, state_hosted_service::{ExtensionCommit, ExtensionFile, ExtensionFileMetadata, ExtensionMetadata, TableMetadataCheckpoint, API_SERVICE_CLIENT}, util::add_file_suffix};
+use crate::data_access::load_file_as_table;
 
 #[allow(dead_code)]
 pub(crate) struct IndexError {
@@ -135,16 +134,14 @@ pub(crate) async fn create_index_jsonl(file_path: &String, doc_id_field_name: &S
         return Ok(None)
     }
     
-    let new_local_name = format!("table_{}", IdInstance::next_id().to_string());
-
-    let result = load_json_file_as_table(file_path, &new_local_name).await;
-    match result {
+    let result = load_file_as_table(file_path, 0, None, false).await;
+    let new_local_name = match result {
         Err(e) => {
             let error = format!("{}", e);
             println!("{}", error);
             return Err(Box::new(e))
         },
-        _ => ()
+        Ok(name) => name,
     };
 
     match create_index_worker(&new_local_name, doc_id_field_name, &target_file_path).await {
@@ -160,12 +157,10 @@ pub(crate) async fn create_index_parquet(file_path: &String, doc_id_field_name: 
         return Ok(None)
     }
 
-    let new_local_name = format!("table_{}", IdInstance::next_id().to_string());
-
-    let result = load_parquet_file_as_table(file_path, &new_local_name).await;
-    match result {
+    let result = load_file_as_table(file_path, 0, None, true).await;
+    let new_local_name = match result {
         Err(e) => return Err(Box::new(e)),
-        _ => ()
+        Ok(name) => name,
     };
 
     match create_index_worker(&new_local_name, doc_id_field_name, &target_file_path).await {
@@ -247,22 +242,31 @@ pub(crate) async fn create_index_inner(table_metadata: &TableMetadataCheckpoint)
 #[cfg(test)]
 mod tests {
     use std::env;
+    use gotham::test::Server;
     use crate::elastic_search_index::{create_index_jsonl, create_index_parquet};
 
-    #[tokio::test]
-    async fn test_simple_create_index_parquet() {
-        match create_index_parquet(&format!("file://{}/tests/data/flights.parquet", env::current_dir().unwrap().to_str().unwrap()), &"index_col".to_string()).await {
-            Err(_) => panic!("failed"),
-            Ok(_) => ()
-        }
+    #[test]
+    fn test_simple_create_index_parquet() {
+        let test_server = &*crate::router::tests::TEST_SERVER;
+
+        test_server.run_future(async {
+            match create_index_parquet(&format!("file://{}/tests/data/flights.parquet", env::current_dir().unwrap().to_str().unwrap()), &"index_col".to_string()).await {
+                Err(_) => panic!("failed"),
+                Ok(_) => ()
+            }
+        });
     }
 
-    #[tokio::test]
-    async fn test_simple_create_index_json() {
-        match create_index_jsonl(&format!("file://{}/tests/data/logs.json", env::current_dir().unwrap().to_str().unwrap()), &"index_col".to_string()).await {
-            Err(_) => panic!("failed"),
-            Ok(_) => ()
-        }
+    #[test]
+    fn test_simple_create_index_json() {
+        let test_server = &*crate::router::tests::TEST_SERVER;
+
+        test_server.run_future(async {
+            match create_index_jsonl(&format!("file://{}/tests/data/logs.json", env::current_dir().unwrap().to_str().unwrap()), &"index_col".to_string()).await {
+                Err(_) => panic!("failed"),
+                Ok(_) => ()
+            }
+        });
     }
 
 }
