@@ -1,11 +1,12 @@
 
 use std::{error::Error, fmt};
+use std::fs::read_to_string;
 use iceberg_lib::iceberg::{compact_logs, load_table_metadata, CompactionResult};
 use idgenerator::IdInstance;
 use tokio::sync::oneshot::error::RecvError;
 
 use crate::{state_hosted_service::{CompactionCommit, IcebergCommit, IcebergMetadata, SpeedboatCommit, SpeedboatCommitTableInfo, API_SERVICE_CLIENT}, util::log_err};
-use crate::schema_massager::PowdrrSchema;
+use crate::schema_massager::{extract_powdrr_schema_str, PowdrrSchema};
 use crate::state_hosted_service::CompactionWorkItem;
 
 #[derive(Debug)]
@@ -77,10 +78,6 @@ async fn do_speedboat_commit(table_name: &String, file_path: &String, compaction
 pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkItem)>, last_snapshot_id: i64) -> Result<i64, CompactionError> {
     let mut new_last_snapshot_id = 0;
     for (table_name, work_item) in work_items.iter() {
-        // if table_group.0 != "logs" {
-        //    panic!("Only logs supported");
-        //}
-
         let files = work_item.files.clone();
         let compaction_id = IdInstance::next_id().to_string();
 
@@ -98,6 +95,7 @@ pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkIt
             Err(_) => return Err(CompactionError { message: "api call failed".to_string() }),
         }   
 
+        // Need the compactor to normalize the schema for all the files first.
         match compact_logs(
             &"default".to_string(),
             &table_name,
@@ -117,11 +115,9 @@ pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkIt
                 },
                 CompactionResult::Speedboat{ file_location, num_records } => {
                     tracing::info!("Speedboat compaction: {} speedboat files, {} records", files.len(), num_records);
-                    for file in files {
-                        tracing::info!("compaction file: {}", file);
-                    }
-                    // TODO: need to get a real schema here
-                    let schema = PowdrrSchema{ fields: vec!() };
+                    // TODO: need the compactor to tell me the schema eventually
+                    let schema = extract_powdrr_schema_str(read_to_string(&file_location).unwrap().as_str());
+
                     match do_speedboat_commit(&table_name, &file_location, &compaction_id, num_records.try_into().unwrap(), &schema).await {
                         Ok(_) => (),
                         Err(_) => return log_err(CompactionError{ message: "dunno".to_string() })

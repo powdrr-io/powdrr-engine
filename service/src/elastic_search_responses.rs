@@ -89,6 +89,9 @@ pub(crate) struct QueryResultHit {
 
 impl QueryResultHit {
     pub fn from_record(index: &Option<String>, value: &Value, found: Option<bool>) -> Self {
+        // TEST CODE
+        let value_str = serde_json::to_string(value).unwrap();
+        // END TEST CODE
         let value_map = value.as_object().unwrap().clone();
         let score = value_map.get("score").map_or_else(|| None, |f|f.as_f64());
         let id = value_map.get("_id").unwrap().as_str().unwrap().to_string();
