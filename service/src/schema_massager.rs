@@ -792,9 +792,9 @@ pub(crate) fn extract_powdrr_schema(value: &Value) -> PowdrrSchema {
 #[allow(dead_code)]
 pub(crate) fn extract_powdrr_schema_str(value: &str) -> PowdrrSchema {
     let value_split = value.split("\n").filter(|x|x.len() > 0).collect::<Vec<&str>>();
-    let serde_values = value_split.iter().map(|x|serde_json::from_str(x).unwrap()).collect::<Vec<Value>>();
-    assert!(serde_values.len() > 0);
-    extract_powdrr_schema(&serde_values[0])
+    assert!(value_split.len() > 0);
+    let serde_value = serde_json::from_str(value_split[0]).unwrap();
+    extract_powdrr_schema(&serde_value)
 }
 
 pub(crate) fn extract_powdrr_schema_option(value: &Option<Value>) -> PowdrrSchema {

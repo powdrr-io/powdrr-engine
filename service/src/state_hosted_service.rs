@@ -22,7 +22,7 @@ pub(crate) struct SpeedboatCSpeedInfo {
 pub(crate) struct SpeedboatCommitTableInfo {
     pub table_name: String,
     pub files: Vec<String>,
-    pub sizes: Vec<u32>,
+    pub sizes: Vec<u64>,
     pub schema: Option<PowdrrSchema>,
 }
 
@@ -57,7 +57,7 @@ pub(crate) struct IcebergCommit {
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct SpeedboatMetadata {
     pub files: Vec<String>,
-    pub sizes: Vec<u32>,
+    pub sizes: Vec<u64>,
     pub schemas: Vec<PowdrrSchema>,
     pub file_schemas: Vec<u64>,
 }
@@ -99,10 +99,8 @@ pub(crate) struct ExtensionCommit {
 #[derive(Serialize, Clone)]
 pub(crate) struct CompactionCommit {
     pub removed_file_locations: Vec<String>,
-    pub snapshot_ids: Vec<String>,
     pub compaction_id: String
 }
-
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct TableMetadataCheckpoint {
@@ -184,7 +182,9 @@ pub(crate) trait ApiServiceClient : Send + Sync {
 
     async fn get_checkpoint(&mut self, snapshot: &SnapshotDescriptor) -> Result<TableMetadataCheckpoint, Box<dyn Error>>;
 
-    async fn get_workable_tables(&mut self, work_type: &String) -> Result<Vec<TableMetadataCheckpoint>, Box<dyn Error>>;
+    async fn get_extension_work_items(&mut self, extension_name: &String) -> Result<Vec<TableMetadataCheckpoint>, Box<dyn Error>>;
+
+    async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, Box<dyn Error>>;
 }
 
 
@@ -278,10 +278,13 @@ enum ApiServiceClientActorMessage {
         respond_to: oneshot::Sender<TableMetadataCheckpoint>,
         snapshot: SnapshotDescriptor,
     },
-    GetWorkableTables {
+    GetExtensionWorkItems {
         respond_to: oneshot::Sender<Vec<TableMetadataCheckpoint>>,
-        work_type: String,
-    },    
+        extension_type: String,
+    },
+    GetCompactionWorkItems {
+        respond_to: oneshot::Sender<Vec<(String, CompactionWorkItem)>>,
+    },
 }
 
 unsafe impl Send for ApiServiceClientActorMessage {}
@@ -422,14 +425,20 @@ impl ApiServiceClientActor {
                     let _ = respond_to.send(self.real.get_checkpoint(&snapshot).await.expect("nope"));
                 }
             },
-            ApiServiceClientActorMessage::GetWorkableTables { work_type, respond_to } => {
+            ApiServiceClientActorMessage::GetExtensionWorkItems { extension_type, respond_to } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.get_workable_tables(&work_type).await.expect("nope"));
+                    let _ = respond_to.send(self.test.get_extension_work_items(&extension_type).await.expect("nope"));
                 } else {
-                    let _ = respond_to.send(self.real.get_workable_tables(&work_type).await.expect("nope"));
+                    let _ = respond_to.send(self.real.get_extension_work_items(&extension_type).await.expect("nope"));
                 }
             },
-
+            ApiServiceClientActorMessage::GetCompactionWorkItems { respond_to } => {
+                if self.test_mode {
+                    let _ = respond_to.send(self.test.get_compaction_work_items().await.expect("nope"));
+                } else {
+                    let _ = respond_to.send(self.real.get_compaction_work_items().await.expect("nope"));
+                }
+            },
         }
     }
 }
@@ -636,9 +645,10 @@ impl ApiServiceClient for RealApiServiceClient {
         }        
     }
 
-    async fn get_workable_tables(&mut self, work_type: &String) -> Result<Vec<TableMetadataCheckpoint>, Box<dyn Error>> {
+    async fn get_extension_work_items(&mut self, extension_name: &String) -> Result<Vec<TableMetadataCheckpoint>, Box<dyn Error>> {
+        // TODO: this is bogus
         let base_address = &self.base_address;       
-        let url = format!("{base_address}/api/v1/get_workable_tables/{work_type}"); 
+        let url = format!("{base_address}/api/v1/get_workable_tables/{extension_name}");
         let resp = self.client.get(url).send().await;
         match resp {
             Ok(r) => {
@@ -651,10 +661,15 @@ impl ApiServiceClient for RealApiServiceClient {
             Err(e) => Err(Box::new(e))
         }        
     }
+
+    async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, Box<dyn Error>> {
+        todo!("nope")
+    }
+
 }
 
 
-fn do_remove(removed_files: &Vec<String>, files: &mut Vec<String>, sizes: &mut Vec<u32>, file_schema: &mut Vec<u64>) -> () {
+fn do_remove(removed_files: &Vec<String>, files: &mut Vec<String>, sizes: &mut Vec<u64>, file_schema: &mut Vec<u64>) -> () {
     assert_eq!(files.len(), sizes.len());
     assert_eq!(files.len(), file_schema.len());
     let mut i = 0;
@@ -670,6 +685,13 @@ fn do_remove(removed_files: &Vec<String>, files: &mut Vec<String>, sizes: &mut V
 }
 
 
+#[derive(Clone)]
+pub(crate) struct CompactionWorkItem {
+    pub files: Vec<String>,
+    pub sizes: Vec<u64>,
+}
+
+
 struct TestApiServiceClient {
     tables: HashMap<String, TableDescription>,
     // alias name -> table name
@@ -678,8 +700,8 @@ struct TestApiServiceClient {
     pipelines: HashMap<String, PipelineDefinition>,
     lifetime_policies: HashMap<String, ILMPolicyDefinition>,
     latest_checkpoint_id: HashMap<String, String>,
-    index_work_items: Vec<TableMetadataCheckpoint>,
-    compact_work_items: Vec<TableMetadataCheckpoint>,
+    index_work_items: HashMap<String, Vec<TableMetadataCheckpoint>>,
+    compaction_work_items: HashMap<String, CompactionWorkItem>,
     compactions: HashMap<String, CompactionCommit>,
     checkpoints: HashMap<String, TableMetadataCheckpoint>,
 }
@@ -693,8 +715,8 @@ impl TestApiServiceClient {
             pipelines: HashMap::new(),
             lifetime_policies: HashMap::new(),
             latest_checkpoint_id: HashMap::new(),
-            index_work_items: vec!(),
-            compact_work_items: vec!(),
+            index_work_items: HashMap::new(),
+            compaction_work_items: HashMap::new(),
             compactions: HashMap::new(),
             checkpoints: HashMap::new(),
         }
@@ -709,7 +731,7 @@ impl TestApiServiceClient {
         self.lifetime_policies.clear();
         self.latest_checkpoint_id.clear();
         self.index_work_items.clear();
-        self.compact_work_items.clear();
+        self.compaction_work_items.clear();
         self.compactions.clear();
         self.checkpoints.clear();
     }    
@@ -820,7 +842,7 @@ impl TestApiServiceClient {
             assert_eq!(new_speedboat_metadata.files.len(), new_speedboat_metadata.sizes.len());
             assert_eq!(new_speedboat_metadata.files.len(), new_speedboat_metadata.file_schemas.len());
 
-            let total_records: u32 = new_speedboat_metadata.sizes.iter().sum();
+            let total_records: u64 = new_speedboat_metadata.sizes.iter().sum();
             tracing::info!("Speedboat commit {} has {} files with {} records", new_checkpoint_id, new_speedboat_metadata.files.len(), total_records);
             for file in &new_speedboat_metadata.files {
                 tracing::info!("Speedboat file {}", file)
@@ -846,14 +868,34 @@ impl TestApiServiceClient {
             if sync_index {
                 self.create_index(&new_latest_checkpoint).await?;
             } else {
-                self.index_work_items.push(new_latest_checkpoint.clone());
+                match self.index_work_items.get_mut(&table_info.table_name) {
+                    Some(checkpoints) => {
+                        checkpoints.push(new_latest_checkpoint.clone());
+                    },
+                    None => {
+                        let checkpoints = vec!(new_latest_checkpoint.clone());
+                        self.index_work_items.insert(table_info.table_name.clone(), checkpoints);
+                    }
+                }
             }
             self.set_latest_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
 
-            // TODO: Re-enable compaction
-            //if new_speedboat_metadata.files.len() >= 2 {
-            //    self.compact_work_items.push(new_latest_checkpoint.clone());
-            //}
+            // TODO: apply some policy here based on sizes to split up compaction work items
+            match self.compaction_work_items.get_mut(&table_info.table_name) {
+                Some(compaction) => {
+                    compaction.files.extend(table_info.files.clone());
+                    compaction.sizes.extend(table_info.sizes.clone());
+                },
+                None => {
+                    self.compaction_work_items.insert(
+                        table_info.table_name.clone(),
+                        CompactionWorkItem {
+                            files: table_info.files.clone(),
+                            sizes: table_info.sizes.clone(),
+                        }
+                    );
+                }
+            }
         }
         Ok(())
     }    
@@ -911,7 +953,14 @@ impl TestApiServiceClient {
             };
 
             self.checkpoints.insert(format!("{}_{}", &table_info.table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
-            self.index_work_items.push(new_latest_checkpoint.clone());
+            match self.index_work_items.get_mut(&table_info.table_name) {
+                Some(checkpoints) => {
+                    checkpoints.push(new_latest_checkpoint.clone());
+                },
+                None => {
+                    self.index_work_items.insert(table_info.table_name.clone(), vec!(new_latest_checkpoint.clone()));
+                }
+            };
             self.set_latest_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
             // TODO: as we get more sophisticated compaction, we need these to trigger and remove things
             // completely.
@@ -1108,7 +1157,16 @@ impl ApiServiceClient for TestApiServiceClient {
     }
 
     async fn extension_commit(&mut self, table_name: &String, commit: &ExtensionCommit) -> Result<(), Box<dyn std::error::Error>> {
-        self.index_work_items.retain(|x| &x.table_name != table_name && x.checkpoint_id != commit.checkpoint_id);
+        // TODO: seems real weird that we aren't updating the checkpoint to include the location of
+        // the produced files?
+
+        // Index work items can be null on a commit because we are in 'sync' mode
+        match self.index_work_items.get_mut(table_name) {
+            Some(checkpoints) => {
+                checkpoints.retain(|x| x.checkpoint_id != commit.checkpoint_id)
+            },
+            None => ()
+        };
         match self.get_latest_checkpoint_sync(table_name, Some("es".to_string())) {
             Some(latest) => {
                 if commit.checkpoint_id > latest {
@@ -1122,11 +1180,10 @@ impl ApiServiceClient for TestApiServiceClient {
         Ok(())
     }
 
-    async fn compaction_commit(&mut self, table_name: &String, commit: &CompactionCommit) -> Result<(), Box<dyn std::error::Error>> {
-        self.compact_work_items.retain(|x| &x.table_name != table_name && !commit.snapshot_ids.contains(&x.checkpoint_id));
-        self.compactions.insert(commit.compaction_id.clone(), commit.clone());
+    async fn compaction_commit(&mut self, _table_name: &String, commit: &CompactionCommit) -> Result<(), Box<dyn std::error::Error>> {
         // NOTE: this just notes what the compactor is saying. We don't generate the new checkpoint
-        // until we see an iceberg commit with the new info.
+        // until we see an iceberg or speedboat commit with the new info.
+        self.compactions.insert(commit.compaction_id.clone(), commit.clone());
         Ok(())
     }
 
@@ -1142,14 +1199,30 @@ impl ApiServiceClient for TestApiServiceClient {
         }
     }
 
-    async fn get_workable_tables(&mut self, work_type: &String) -> Result<Vec<TableMetadataCheckpoint>, Box<dyn std::error::Error>> {
-        if work_type == "index" {
-            Ok(self.index_work_items.clone())
-        } else if work_type == "compact" {
-            Ok(self.compact_work_items.clone())
+    async fn get_extension_work_items(&mut self, extension_type: &String) -> Result<Vec<TableMetadataCheckpoint>, Box<dyn std::error::Error>> {
+        if extension_type == "es" {
+            // TODO: priority by index? allow index filtering?
+            let mut work_items = vec!();
+            for (_table_name, checkpoints) in self.index_work_items.iter() {
+                work_items.extend(checkpoints.iter().map(|c| c.clone()));
+            }
+            self.index_work_items.clear();
+            Ok(work_items)
         } else {
             Ok(vec!())
         }
+    }
+
+    async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, Box<dyn std::error::Error>> {
+        let mut work_items = vec!();
+        for (table_name, compaction) in self.compaction_work_items.iter_mut() {
+            if compaction.files.len() > 10 {
+                work_items.push((table_name.clone(), compaction.clone()));
+                compaction.files.clear();
+                compaction.sizes.clear();
+            }
+        }
+        Ok(work_items)
     }
 }
 
@@ -1392,16 +1465,27 @@ impl ApiServiceClientHandle {
         recv.await
     }
 
-    pub async fn get_workable_tables(&self, work_type: &String) -> Result<Vec<TableMetadataCheckpoint>, RecvError> {
+    pub async fn get_extension_work_items(&self, extension_type: &String) -> Result<Vec<TableMetadataCheckpoint>, RecvError> {
         let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::GetWorkableTables { 
+        let msg = ApiServiceClientActorMessage::GetExtensionWorkItems {
             respond_to: send,
-            work_type: work_type.clone(),
+            extension_type: extension_type.clone(),
         };
 
         let _ = self.sender.send(msg).await;
         // TODO: deal with errors
         recv.await        
+    }
+
+    pub async fn get_compaction_work_items(&self) -> Result<Vec<(String, CompactionWorkItem)>, RecvError> {
+        let (send, recv) = oneshot::channel();
+        let msg = ApiServiceClientActorMessage::GetCompactionWorkItems {
+            respond_to: send,
+        };
+
+        let _ = self.sender.send(msg).await;
+        // TODO: deal with errors
+        recv.await
     }
 }
 

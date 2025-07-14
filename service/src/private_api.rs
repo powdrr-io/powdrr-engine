@@ -130,7 +130,7 @@ async fn determine_required_files(invocation: &PrivateSqlInvocation) -> Result<R
 
 
 fn get_extension_files(invocation: &PrivateSqlInvocation, file_path: &String) -> Vec<ExtensionFileSpec> {
-    // TODO - need to look at the actual extension and figure out the file required
+    // TODO - need to look at the actual extension metadata and figure out the file required
     if invocation.required_extensions.len() == 0 {
         vec!()
     } else {
