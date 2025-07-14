@@ -70,7 +70,7 @@ impl CacheTrackerActor {
     pub fn new(receiver: mpsc::Receiver<CacheTrackerActorMessage>) -> Self {
         Self {
             receiver,
-            lru_cache: LruCache::new(NonZero::new(10 ).unwrap()),
+            lru_cache: LruCache::new(NonZero::new(1000).unwrap()),
             related: HashMap::new(),
             reservations: HashMap::new(),
             top_level_to_delete: vec!()

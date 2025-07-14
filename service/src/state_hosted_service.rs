@@ -880,6 +880,7 @@ impl TestApiServiceClient {
             }
             self.set_latest_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
 
+            // TODO: apply some policy here based on sizes to split up compaction work items
             match self.compaction_work_items.get_mut(&table_info.table_name) {
                 Some(compaction) => {
                     compaction.files.extend(table_info.files.clone());
@@ -1158,7 +1159,14 @@ impl ApiServiceClient for TestApiServiceClient {
     async fn extension_commit(&mut self, table_name: &String, commit: &ExtensionCommit) -> Result<(), Box<dyn std::error::Error>> {
         // TODO: seems real weird that we aren't updating the checkpoint to include the location of
         // the produced files?
-        self.index_work_items.get_mut(table_name).unwrap().retain(|x| x.checkpoint_id != commit.checkpoint_id);
+
+        // Index work items can be null on a commit because we are in 'sync' mode
+        match self.index_work_items.get_mut(table_name) {
+            Some(checkpoints) => {
+                checkpoints.retain(|x| x.checkpoint_id != commit.checkpoint_id)
+            },
+            None => ()
+        };
         match self.get_latest_checkpoint_sync(table_name, Some("es".to_string())) {
             Some(latest) => {
                 if commit.checkpoint_id > latest {
@@ -1206,8 +1214,14 @@ impl ApiServiceClient for TestApiServiceClient {
     }
 
     async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, Box<dyn std::error::Error>> {
-        let work_items = self.compaction_work_items.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<(String, CompactionWorkItem)>>();
-        self.compaction_work_items.clear();
+        let mut work_items = vec!();
+        for (table_name, compaction) in self.compaction_work_items.iter_mut() {
+            if compaction.files.len() > 10 {
+                work_items.push((table_name.clone(), compaction.clone()));
+                compaction.files.clear();
+                compaction.sizes.clear();
+            }
+        }
         Ok(work_items)
     }
 }
