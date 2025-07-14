@@ -53,15 +53,10 @@ fn default_as_false() -> bool {
 
 #[derive(Clone)]
 pub(crate) struct WriteBuffer {
-    pub lines: Vec<String>,
+    lines: Vec<String>,
     pub schema: Option<PowdrrSchema>
 }
 
-impl Drop for WriteBuffer {
-    fn drop(&mut self) {
-        while let Some(_) = self.lines.pop() {}
-    }
-}
 
 impl WriteBuffer {
     pub fn new() -> Self {
@@ -78,6 +73,10 @@ impl WriteBuffer {
         }
     }
 
+    pub fn push(&mut self, line: String) {
+        self.lines.push(line);
+    }
+
     fn write_to_file(&self, file_name: &String) -> Result<(), IngestError> {
         assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
         let mut file_write = File::create(file_name).expect("Cannot create file");
@@ -90,8 +89,12 @@ impl WriteBuffer {
         Ok(())
     }
 
-    fn len(&self) -> usize {
+    fn num_records(&self) -> usize {
         self.lines.len()
+    }
+
+    fn total_size(&self) -> u64 {
+        self.lines.iter().fold(0, |acc, line| acc + line.len() as u64 + 1)
     }
 }
 
@@ -480,7 +483,7 @@ pub(crate) async fn commit_general(buffer: &WriteBuffer, index: &String, commit_
 
     let new_id = format!("tests/data/ingest/{}-{}-{}.json", commit_type, index, IdInstance::next_id().to_string());
     let write_to_file_result = buffer.write_to_file(&new_id);
-    tracing::info!("Ingest: op {} on table {} wrote {} records", commit_type, index, buffer.len());
+    tracing::info!("Ingest: op {} on table {} wrote {} records", commit_type, index, buffer.num_records());
 
     match write_to_file_result {
         Ok(_) => (),
@@ -490,7 +493,7 @@ pub(crate) async fn commit_general(buffer: &WriteBuffer, index: &String, commit_
     let commit_info = SpeedboatCommitTableInfo {
         table_name: index.clone(),
         files: vec!(new_id),
-        sizes: vec!(buffer.len() as u64),
+        sizes: vec!(buffer.total_size()),
         schema: buffer.schema.clone(),
     };
 
@@ -938,7 +941,7 @@ async fn ingest_and_write(payload: &String) -> Result<IngestAndWriteResult, Inge
         let buffer = buffer_builder.build();
         let new_id = format!("tests/data/ingest/ingest-{}-{}.json", name, IdInstance::next_id().to_string());
         let write_to_file_result = buffer.write_to_file(&new_id);
-        tracing::info!("Ingest: table {} wrote {} records", name, buffer.len());
+        tracing::info!("Ingest: table {} wrote {} records", name, buffer.num_records());
 
         match write_to_file_result {
             Ok(_) => (),
@@ -948,7 +951,7 @@ async fn ingest_and_write(payload: &String) -> Result<IngestAndWriteResult, Inge
         table_infos.push(SpeedboatCommitTableInfo {
             table_name: name.clone(),
             files: vec!(new_id),
-            sizes: vec!(buffer.len() as u64),
+            sizes: vec!(buffer.total_size()),
             schema: buffer.schema.clone()
         });
     }
@@ -1066,7 +1069,7 @@ impl IngestActor {
             let buffer = buffer_builder.build();
             let new_id = format!("tests/data/ingest/ingest-{}-{}.json", name, IdInstance::next_id().to_string());
             let write_to_file_result = buffer.write_to_file(&new_id);
-            tracing::info!("Ingest: table {} wrote {} records", name, buffer.len());
+            tracing::info!("Ingest: table {} wrote {} records", name, buffer.num_records());
             match write_to_file_result {
                 Ok(_) => (),
                 Err(_) => return Err(IngestError { message: "File error".to_string() }),
@@ -1075,7 +1078,7 @@ impl IngestActor {
                 SpeedboatCommitTableInfo { 
                     table_name: name.clone(),
                     files: vec!(new_id),
-                    sizes: vec!(buffer.len().try_into().unwrap()),
+                    sizes: vec!(buffer.total_size()),
                     schema: buffer.schema.clone()
                 }
             );

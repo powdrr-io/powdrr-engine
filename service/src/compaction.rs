@@ -56,14 +56,14 @@ async fn do_iceberg_commit(table_name: &String, last_snapshot_id: i64) -> Result
 }
 
 
-async fn do_speedboat_commit(table_name: &String, file_path: &String, compaction_id: &String, num_records: u64, schema: &PowdrrSchema) -> Result<(), RecvError> {
+async fn do_speedboat_commit(table_name: &String, file_path: &String, compaction_id: &String, total_size: u64, schema: &PowdrrSchema) -> Result<(), RecvError> {
     match API_SERVICE_CLIENT.speedboat_commit(
         &SpeedboatCommit{
             commit_type: "commit".to_string(),
             type_files: vec!(SpeedboatCommitTableInfo { 
                 table_name: table_name.clone(), 
                 files: vec!(file_path.to_string()),
-                sizes: vec!(num_records),
+                sizes: vec!(total_size),
                 schema: Some(schema.clone()),
             }),
             compactions: vec!(compaction_id.clone()),
@@ -116,9 +116,10 @@ pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkIt
                 CompactionResult::Speedboat{ file_location, num_records } => {
                     tracing::info!("Speedboat compaction: {} speedboat files, {} records", files.len(), num_records);
                     // TODO: need the compactor to tell me the schema eventually
-                    let schema = extract_powdrr_schema_str(read_to_string(&file_location).unwrap().as_str());
+                    let content = read_to_string(&file_location).unwrap();
+                    let schema = extract_powdrr_schema_str(content.as_str());
 
-                    match do_speedboat_commit(&table_name, &file_location, &compaction_id, num_records.try_into().unwrap(), &schema).await {
+                    match do_speedboat_commit(&table_name, &file_location, &compaction_id, content.len() as u64, &schema).await {
                         Ok(_) => (),
                         Err(_) => return log_err(CompactionError{ message: "dunno".to_string() })
                     }

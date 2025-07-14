@@ -50,6 +50,7 @@ pub(crate) struct DataQueryResult {
 struct FileDescriptor {
     file_path: String,
     schema: PowdrrSchema,
+    size: u64,
 }
 
 struct RequiredFiles {
@@ -84,7 +85,7 @@ fn filter_iceberg<'a>(invocation: &'a PrivateSqlInvocation, iceberg_metadata: &'
                 if matches_filter(im, idx, file_path) {
                     let schema_index = *im.file_schemas.get(idx).unwrap() as usize;
                     let schema = im.schemas.get(schema_index).unwrap().clone();
-                    filtered_files.push(FileDescriptor{ file_path: file_path.clone(), schema });
+                    filtered_files.push(FileDescriptor{ file_path: file_path.clone(), schema, size: 1 });
                 }
             }
         
@@ -100,6 +101,7 @@ fn filter_speedboat<'a>(_invocation: &'a PrivateSqlInvocation, speedboat_metadat
             sm.files.iter().enumerate().map(|(index, file_path)|FileDescriptor{
                 file_path: file_path.clone(),
                 schema: sm.schemas.get(*sm.file_schemas.get(index).unwrap() as usize).unwrap().clone(),
+                size: sm.sizes.get(index).unwrap().clone(),
             }).collect()
         },
         None => vec!()
@@ -142,11 +144,12 @@ fn get_extension_files(invocation: &PrivateSqlInvocation, file_path: &String) ->
 }
 
 
-async fn ensure_loaded(invocation: &PrivateSqlInvocation, file_path: &String, parquet: bool) -> Result<String, DataFusionError> {
+async fn ensure_loaded(invocation: &PrivateSqlInvocation, file_path: &String, top_level_size: u64, parquet: bool) -> Result<String, DataFusionError> {
     let new_local_name = data_access::path_to_table_name(file_path);
     let extension_files = get_extension_files(invocation, file_path);
     let extension_file_names = extension_files.iter().map(|e| format!("{}_{}", &new_local_name, e.suffix)).collect::<Vec<String>>();
-    let total_size = 0;
+    // TODO: add in extension file sizes
+    let total_size = top_level_size;
 
     data_access::reserve(&new_local_name, total_size, extension_file_names.clone()).await;
     // After this, on error we need to release, on OK we do not release
@@ -215,7 +218,7 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation) -> Result<Data
 
     let mut delete_local_names = vec!();
     for delete_file_path in required_files.delete_files {
-        let local_name = match ensure_loaded(invocation, &delete_file_path, false).await {
+        let local_name = match ensure_loaded(invocation, &delete_file_path, 1, false).await {
             Ok(ln) => ln,
             Err(e) => return log_err(PrivateApiError::from(e)),
         };
@@ -226,7 +229,7 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation) -> Result<Data
 
     let mut all_results: Vec<RecordBatch> = vec!();
     for iceberg_file in required_files.iceberg_files.iter() {
-        let local_name = match ensure_loaded(invocation, &iceberg_file.file_path, true).await {
+        let local_name = match ensure_loaded(invocation, &iceberg_file.file_path, 1,true).await {
             Ok(ln) => ln,
             Err(e) => return Err(PrivateApiError::from(e)),
         };
@@ -241,7 +244,7 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation) -> Result<Data
         data_access::release(&local_name).await;
     }
     for speedboat_file in required_files.speedboat_files.iter() {
-        let local_name = match ensure_loaded(invocation, &speedboat_file.file_path, false).await {
+        let local_name = match ensure_loaded(invocation, &speedboat_file.file_path, speedboat_file.size, false).await {
             Ok(ln) => ln,
             Err(e) => {
                 return log_err(PrivateApiError::from(e))

@@ -453,7 +453,7 @@ impl UpdateByQueryCommand {
                     noop_count += 1;
                 },
                 EvalResult::Delete((doc_id, seq_no)) => {
-                    delete_buffer.lines.push(serde_json::to_string(&elastic_search_ingest::create_delete(&doc_id, seq_no)).unwrap());
+                    delete_buffer.push(serde_json::to_string(&elastic_search_ingest::create_delete(&doc_id, seq_no)).unwrap());
                     delete_count += 1;
                 },
                 EvalResult::Update(value) => {
