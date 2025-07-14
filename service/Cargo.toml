@@ -27,7 +27,7 @@ http = "0.2.12"
 iceberg_lib = { path = "../iceberg_lib" }
 idgenerator = "2.0.0"
 lazy_static = "1.5.0"
-lru = "0.16.0"
+lru-mem = "0.3.0"
 minijinja = "2.10.2"
 object_store = { version = "0.11.2", features = ["aws", "gcp", "azure", "http"] }
 phf = { version = "0.11.3", features = ["macros"] }

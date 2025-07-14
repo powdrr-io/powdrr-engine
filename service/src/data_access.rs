@@ -1,9 +1,8 @@
 use std::{path::Path, sync::Arc};
-use std::num::NonZero;
 use datafusion::{arrow::array::RecordBatch, error::DataFusionError, prelude::{DataFrame, NdJsonReadOptions, ParquetReadOptions, SessionContext}};
 use datafusion::common::HashMap;
 use idgenerator::IdInstance;
-use lru::LruCache;
+use lru_mem::{HeapSize, LruCache, TryInsertError};
 use object_store::{aws::{AmazonS3, AmazonS3Builder}, ObjectStore};
 use tokio::sync::{mpsc, oneshot};
 use url::Url;
@@ -57,10 +56,20 @@ enum CacheTrackerActorMessage {
     },
 }
 
+struct HeapSizeTracker {
+    size: u64,
+}
+
+impl HeapSize for HeapSizeTracker {
+    fn heap_size(&self) -> usize {
+        self.size as usize
+    }
+}
+
 
 struct CacheTrackerActor {
     receiver: mpsc::Receiver<CacheTrackerActorMessage>,
-    lru_cache: LruCache<String, u64>,
+    lru_cache: LruCache<String, HeapSizeTracker>,
     related: HashMap<String, Vec<String>>,
     reservations: HashMap<String, u64>,
     top_level_to_delete: Vec<String>,
@@ -70,7 +79,7 @@ impl CacheTrackerActor {
     pub fn new(receiver: mpsc::Receiver<CacheTrackerActorMessage>) -> Self {
         Self {
             receiver,
-            lru_cache: LruCache::new(NonZero::new(1000).unwrap()),
+            lru_cache: LruCache::new(2 * 1024 * 1024),
             related: HashMap::new(),
             reservations: HashMap::new(),
             top_level_to_delete: vec!()
@@ -104,6 +113,7 @@ impl CacheTrackerActor {
         self.reservations.remove(name);
     }
 
+    #[allow(unused_assignments)]
     async fn handle_message(&mut self, msg: CacheTrackerActorMessage) {
         match msg {
             CacheTrackerActorMessage::Reserve { respond_to, top_level_name, related_names, total_size } => {
@@ -114,16 +124,33 @@ impl CacheTrackerActor {
                 // This will also update the total size for this top level file in the LRU.
                 // That can happen if extension files have been generated since this file was
                 // first loaded.
-                match self.lru_cache.push(top_level_name.clone(), total_size) {
-                    Some((existing_key, _)) => {
-                        if existing_key != top_level_name {
-                            // This means a different top level name has been pushed out of the LRU.
-                            // We need to schedule it for deletion.
-                            self.top_level_to_delete.push(existing_key);
-                        }
-                    },
-                    None => ()
-                };
+
+                // TODO: This is an optimistic add impl which is probably totally misguided since
+                // under normal operation the LRU is always full. This should be replaced
+                // with something that assumes that removes are necessary.
+                assert!(total_size > 0);
+                loop {
+                    let mut local_total_size = total_size;
+                    match self.lru_cache.try_insert(top_level_name.clone(), HeapSizeTracker { size: local_total_size }) {
+                        Err(err) => match err {
+                            TryInsertError::EntryTooLarge { key: _, value: _, entry_size: _, max_size: _ } => panic!("Files with top level {} is too large to fit in the LRU", top_level_name),
+                            TryInsertError::OccupiedEntry { key, value } => {
+                                local_total_size = if local_total_size > value.size { local_total_size } else { value.size };
+                                self.lru_cache.remove(&key);
+                            },
+                            TryInsertError::WouldEjectLru { key: _, value: _, entry_size: _, free_memory: _ } => {
+                                match self.lru_cache.remove_lru() {
+                                    Some((key, value)) => {
+                                        assert!(value.size > 0);
+                                        self.top_level_to_delete.push(key.clone());
+                                    },
+                                    None => panic!("LRU cache is empty")
+                                }
+                            }
+                        },
+                        Ok(_) => break
+                    }
+                }
 
                 // Ensure the related files are tracked appropriately.
                 match self.related.get_mut(&top_level_name) {
@@ -144,17 +171,26 @@ impl CacheTrackerActor {
                 let _ = respond_to.send(());
             },
             CacheTrackerActorMessage::Release { respond_to, top_level_name} => {
-                if self.decrement_reservation(&top_level_name) {
-                    if self.top_level_to_delete.contains(&top_level_name) {
-                        self.drop(&top_level_name).await;
-                        let related_names = self.related.get(&top_level_name)
-                            .map(|names| names.clone())
-                            .unwrap_or_default();
-                        for related_name in related_names {
-                            self.drop(&related_name).await;
-                        }
-                        self.related.remove(&top_level_name);
+                self.decrement_reservation(&top_level_name);
+
+                let mut to_delete = vec!();
+                for possible_delete in self.top_level_to_delete.iter_mut() {
+                    let should_drop = self.reservations.get_mut(possible_delete).unwrap_or(&mut 0) == &0;
+                    if should_drop {
+                        to_delete.push(possible_delete.clone());
                     }
+                }
+                self.top_level_to_delete.retain(|name| !to_delete.contains(name));
+
+                for top_level_name in to_delete {
+                    self.drop(&top_level_name).await;
+                    let related_names = self.related.get(&top_level_name)
+                        .map(|names| names.clone())
+                        .unwrap_or_default();
+                    for related_name in related_names {
+                        self.drop(&related_name).await;
+                    }
+                    self.related.remove(&top_level_name);
                 }
                 let _ = respond_to.send(());
             }
@@ -215,6 +251,7 @@ static LRU_CACHE_HANDLE: std::sync::LazyLock<LRUCacheHandle> = std::sync::LazyLo
 
 
 pub(crate) async fn reserve(top_level_name: &String, total_size: u64, related_names: Vec<String>) -> () {
+    assert!(total_size > 0);
     LRU_CACHE_HANDLE.reserve(top_level_name, total_size, related_names).await
 }
 

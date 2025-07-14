@@ -151,7 +151,8 @@ pub(crate) async fn create_index_jsonl(file_path: &String, doc_id_field_name: &S
     }
 
     let top_level_name = data_access::path_to_table_name(file_path);
-    data_access::reserve(&top_level_name, 0, vec!()).await;
+    // TODO: pass in real size
+    data_access::reserve(&top_level_name, 1000, vec!()).await;
     
     let result = data_access::load_file_as_table(&top_level_name, file_path, false).await;
     match result {
@@ -183,7 +184,8 @@ pub(crate) async fn create_index_parquet(file_path: &String, doc_id_field_name: 
     }
 
     let top_level_name = data_access::path_to_table_name(file_path);
-    data_access::reserve(&top_level_name, 0, vec!()).await;
+    // TODO: pass in real size   
+    data_access::reserve(&top_level_name, 1000, vec!()).await;
 
     let result = load_file_as_table(&top_level_name, file_path, true).await;
     match result {
