@@ -89,7 +89,7 @@ impl WriteBuffer {
         Ok(())
     }
 
-    fn num_records(&self) -> usize {
+    pub(crate) fn num_records(&self) -> usize {
         self.lines.len()
     }
 

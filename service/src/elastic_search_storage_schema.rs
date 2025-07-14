@@ -154,7 +154,7 @@ mod tests {
         ));
 
         let buffer = builder.build();
-        assert_eq!(buffer.lines.len(), 2);
+        assert_eq!(buffer.num_records(), 2);
         assert!(buffer.schema.is_some());
         let schema = buffer.schema.as_ref().unwrap();
         assert_eq!(schema.fields.len(), 10);
