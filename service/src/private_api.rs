@@ -1,19 +1,15 @@
-use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::{error::Error, fmt};
-
 use datafusion::arrow::array::RecordBatch;
 use datafusion::error::DataFusionError;
 use idgenerator::IdInstance;
 use serde::Serialize;
 
-use crate::data_access::{self, load_file_as_table, load_parquet_file_as_table};
+use crate::data_access::{self, load_file_as_table};
 use crate::schema_massager::PowdrrSchema;
 use crate::state_peers::PrivateSqlInvocation;
 use crate::state_hosted_service::*;
 use crate::util::{add_file_suffix, log_err};
-
-
 
 
 #[derive(Debug)]
@@ -21,15 +17,6 @@ struct ExtensionFileSpec {
     suffix: String,
     file_path: String,
 }
-
-#[derive(Debug)]
-struct LoadedFileInfo {
-    local_name: String,
-    // extension_files: Vec<ExtensionFileSpec>
-}
-
-
-static LOADED_FILES: std::sync::LazyLock<HashMap<String, LoadedFileInfo>> = std::sync::LazyLock::new(|| HashMap::new());
 
 
 #[derive(Debug)]
@@ -79,7 +66,6 @@ fn selected_file(invocation: &PrivateSqlInvocation, file_path: &String) -> bool 
     let hash_val = hasher.finish();
     hash_val % invocation.num == invocation.index
 }
-
 
 
 fn matches_filter(_iceberg_metadata: &IcebergMetadata, _index: usize, _file_path: &String) -> bool {
@@ -157,31 +143,37 @@ fn get_extension_files(invocation: &PrivateSqlInvocation, file_path: &String) ->
 
 
 async fn ensure_loaded(invocation: &PrivateSqlInvocation, file_path: &String, parquet: bool) -> Result<String, DataFusionError> {
-    match LOADED_FILES.get(file_path) {
-        Some(loaded_file_info) => return Ok(loaded_file_info.local_name.clone()),
-        None => {
-            let new_local_name= match load_file_as_table(file_path, parquet).await {
-                Err(e) => return Err(e),
-                Ok(nln) => nln,
-            };
-            
-            let extension_files = get_extension_files(invocation, file_path);
-            for extension_file in extension_files {
-                let extension_local_name = format!("{}_{}", new_local_name, extension_file.suffix);
-                match load_parquet_file_as_table(&extension_file.file_path, &extension_local_name).await {
-                    Err(e) => {
-                        let error = format!("{}", e);
-                        println!("{}", error);
-                        return Err(e)
-                    },
-                    _ => ()
-                };
-                
-            }
+    let new_local_name = data_access::path_to_table_name(file_path);
+    let extension_files = get_extension_files(invocation, file_path);
+    let extension_file_names = extension_files.iter().map(|e| format!("{}_{}", &new_local_name, e.suffix)).collect::<Vec<String>>();
+    let total_size = 0;
 
-            Ok(new_local_name.clone())
-        }
+    data_access::reserve(&new_local_name, total_size, extension_file_names.clone()).await;
+    // After this, on error we need to release, on OK we do not release
+    
+    match load_file_as_table(&new_local_name, file_path, parquet).await {
+        Err(e) => {
+            data_access::release(&new_local_name).await;
+            return log_err(e)
+        },
+        Ok(nln) => nln,
+    };
+
+    let extension_files = get_extension_files(invocation, file_path);
+    for (spec, name) in extension_files.iter().zip(extension_file_names.iter()) {
+        match load_file_as_table(&name, &spec.file_path, true).await {
+            Err(e) => {
+                data_access::release(&new_local_name).await;
+                let error = format!("{}", e);
+                println!("{}", error);
+                return log_err(e)
+            },
+            _ => ()
+        };
+
     }
+
+    Ok(new_local_name.clone())
 }
 
 
@@ -240,20 +232,30 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation) -> Result<Data
         };
         let local_results = match execute_sql(&invocation.sql.build(&required_files.table_schema, &iceberg_file.schema), &local_name, &all_deletes_local_name).await {
             Ok(vrb) => vrb,
-            Err(e) => return log_err(PrivateApiError::from(e)),
+            Err(e) => {
+                data_access::release(&local_name).await;
+                return log_err(PrivateApiError::from(e))
+            },
         };
         all_results.extend(local_results);
+        data_access::release(&local_name).await;
     }
     for speedboat_file in required_files.speedboat_files.iter() {
         let local_name = match ensure_loaded(invocation, &speedboat_file.file_path, false).await {
             Ok(ln) => ln,
-            Err(e) => return log_err(PrivateApiError::from(e)),
+            Err(e) => {
+                return log_err(PrivateApiError::from(e))
+            },
         };
         let local_results = match execute_sql(&invocation.sql.build(&required_files.table_schema, &speedboat_file.schema), &local_name, &all_deletes_local_name).await {
             Ok(vrb) => vrb,
-            Err(e) => return log_err(PrivateApiError::from(e)),
+            Err(e) => return {
+                data_access::release(&local_name).await;
+                log_err(PrivateApiError::from(e))
+            },
         };
         all_results.extend(local_results);
+        data_access::release(&local_name).await;
     }
          
     let all_results_refs: Vec<&RecordBatch> = all_results.iter().map(|f| f).collect();

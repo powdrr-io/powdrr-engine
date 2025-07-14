@@ -1,14 +1,29 @@
-use std::error::Error;
-
+use std::fmt::Display;
 use datafusion::{arrow::datatypes::DataType, dataframe::DataFrameWriteOptions};
-use idgenerator::IdInstance;
+use datafusion::error::DataFusionError;
+use crate::{data_access, data_access::{execute_sql, exists}, state_hosted_service::{ExtensionCommit, ExtensionFile, ExtensionFileMetadata, ExtensionMetadata, TableMetadataCheckpoint, API_SERVICE_CLIENT}, util::add_file_suffix};
+use crate::data_access::load_file_as_table;
 
-use crate::{data_access::{execute_sql, exists, load_json_file_as_table, load_parquet_file_as_table}, state_hosted_service::{ExtensionCommit, ExtensionFile, ExtensionFileMetadata, ExtensionMetadata, TableMetadataCheckpoint, API_SERVICE_CLIENT}, util::add_file_suffix};
-
-
-#[allow(dead_code)]
 pub(crate) struct IndexError {
     pub message: String,
+}
+
+unsafe impl Send for IndexError {}
+unsafe impl Sync for IndexError {}
+
+impl IndexError {
+    fn from(data_fusion_error: DataFusionError) -> Self {
+        IndexError {
+            message: format!("{}", data_fusion_error),
+        }
+    }
+}
+
+impl Display for IndexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)?;
+        Ok(())
+    }
 }
 
 
@@ -17,12 +32,12 @@ fn is_string_type(data_type: &DataType) -> bool {
 }
 
 
-async fn create_index_worker(table_name: &String, doc_id_field_name: &String, target_file_path: &String) -> Result<(), Box<dyn Error>> {
+async fn create_index_worker(table_name: &String, doc_id_field_name: &String, target_file_path: &String) -> Result<(), IndexError> {
     let new_local_name = table_name;
     let doc_id_field_name_local = doc_id_field_name;
 
     let raw_table = match execute_sql(&format!("select * from {new_local_name}").to_string()).await {
-        Err(e) => return Err(Box::new(e)),
+        Err(e) => return Err(IndexError::from(e)),
         Ok(rt) => rt,        
     };
 
@@ -43,30 +58,30 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
 
     match execute_sql(&format!("CREATE TABLE {new_local_name}_fields AS {field_normalization_queries_union}")).await {
         Err(e) => {
-            return Err(Box::new(e))
+            return Err(IndexError::from(e))
         },
         _ => ()
     };
 
     match execute_sql(&format!("CREATE TABLE {new_local_name}_split AS SELECT doc_id, field_name, string_to_array(field_value, ' ') as field_terms from {new_local_name}_fields")).await {
-        Err(e) => return Err(Box::new(e)),
+        Err(e) => return Err(IndexError::from(e)),
         _ => ()
     };    
 
     match execute_sql(&format!("CREATE TABLE {new_local_name}_split_unnest AS SELECT doc_id, field_name, unnest(field_terms) as field_term from {new_local_name}_split")).await {
-        Err(e) => return Err(Box::new(e)),
+        Err(e) => return Err(IndexError::from(e)),
         _ => ()
     };
 
     match execute_sql(&format!("CREATE TABLE {new_local_name}_term_frequency AS SELECT doc_id, field_name, doc_id || '_' || field_name as doc_id_field_name, field_term, count(1) as term_cnt from {new_local_name}_split_unnest group by doc_id, field_name, field_term")).await {
         Err(e)  => {
-            return Err(Box::new(e))
+            return Err(IndexError::from(e))
         },
         _ => ()
     }; 
 
     match execute_sql(&format!("CREATE TABLE {new_local_name}_field_size AS SELECT doc_id, field_name, doc_id || '_' || field_name as doc_id_field_name, array_length(field_terms) as word_cnt from {new_local_name}_split")).await {
-        Err(e) => return Err(Box::new(e)),
+        Err(e) => return Err(IndexError::from(e)),
         _ => ()
     }; 
 
@@ -83,7 +98,7 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
 
     match execute_sql(&format!("CREATE TABLE {new_local_name}_joined AS SELECT tf.doc_id, tf.field_name, tf.field_term, tf.term_cnt, fs.word_cnt from {new_local_name}_term_frequency tf INNER JOIN {new_local_name}_field_size fs ON tf.doc_id_field_name = fs.doc_id_field_name WHERE tf.term_cnt > 0")).await {
         Err(e) => {
-            return Err(Box::new(e))
+            return Err(IndexError::from(e))
         },
         _ => ()
     };     
@@ -91,7 +106,7 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
     if target_file_path.starts_with("s3:") {
         let joined_table = match execute_sql(&format!("SELECT * FROM {new_local_name}_joined").to_string()).await {
             Err(e) => {
-                return Err(Box::new(e))
+                return Err(IndexError::from(e))
             },
             Ok(tft) => tft,
         }; 
@@ -101,14 +116,14 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
             DataFrameWriteOptions::new().with_single_file_output(true),
             None).await {
             Err(e) => {
-                return Err(Box::new(e))
+                return Err(IndexError::from(e))
             },
             _ => (),
         };
     } else {
         let joined_table = match execute_sql(&format!("SELECT * FROM {new_local_name}_joined").to_string()).await {
             Err(e) => {
-                return Err(Box::new(e))
+                return Err(IndexError::from(e))
             },
             Ok(tft) => tft,
         }; 
@@ -118,7 +133,7 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
             DataFrameWriteOptions::new().with_single_file_output(true),
             None).await {
             Err(e) => {
-                return Err(Box::new(e))
+                return Err(IndexError::from(e))
             },
             _ => (),
         };
@@ -129,54 +144,69 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
 
 }
 
-pub(crate) async fn create_index_jsonl(file_path: &String, doc_id_field_name: &String) -> Result<Option<String>, Box<dyn Error>> {
+pub(crate) async fn create_index_jsonl(file_path: &String, doc_id_field_name: &String) -> Result<Option<String>, IndexError> {
     let target_file_path = add_file_suffix(file_path, &"search_index".to_string(), Some(&".parquet".to_string()));
     if exists(&target_file_path).await {
         return Ok(None)
     }
-    
-    let new_local_name = format!("table_{}", IdInstance::next_id().to_string());
 
-    let result = load_json_file_as_table(file_path, &new_local_name).await;
+    let top_level_name = data_access::path_to_table_name(file_path);
+    data_access::reserve(&top_level_name, 0, vec!()).await;
+    
+    let result = data_access::load_file_as_table(&top_level_name, file_path, false).await;
     match result {
         Err(e) => {
+            data_access::release(&top_level_name).await;
             let error = format!("{}", e);
             println!("{}", error);
-            return Err(Box::new(e))
+            return Err(IndexError::from(e))
         },
-        _ => ()
+        Ok(_) => ()
     };
 
-    match create_index_worker(&new_local_name, doc_id_field_name, &target_file_path).await {
+    match create_index_worker(&top_level_name, doc_id_field_name, &target_file_path).await {
         Ok(_) => (),
-        Err(e) => return Err(e),
+        Err(e) => {
+            data_access::release(&top_level_name).await;
+            return Err(e)
+        },
     }
+
+    data_access::release(&top_level_name).await;
     Ok(Some(target_file_path))
 }
 
-pub(crate) async fn create_index_parquet(file_path: &String, doc_id_field_name: &String) -> Result<Option<String>, Box<dyn Error>> {
+pub(crate) async fn create_index_parquet(file_path: &String, doc_id_field_name: &String) -> Result<Option<String>, IndexError> {
     let target_file_path = add_file_suffix(file_path, &"search_index".to_string(), Some(&".parquet".to_string()));
     if exists(&target_file_path).await {
         return Ok(None)
     }
 
-    let new_local_name = format!("table_{}", IdInstance::next_id().to_string());
+    let top_level_name = data_access::path_to_table_name(file_path);
+    data_access::reserve(&top_level_name, 0, vec!()).await;
 
-    let result = load_parquet_file_as_table(file_path, &new_local_name).await;
+    let result = load_file_as_table(&top_level_name, file_path, true).await;
     match result {
-        Err(e) => return Err(Box::new(e)),
-        _ => ()
+        Err(e) => {
+            data_access::release(&top_level_name).await;
+            return Err(IndexError::from(e))
+        },
+        Ok(_) => ()
     };
 
-    match create_index_worker(&new_local_name, doc_id_field_name, &target_file_path).await {
+    match create_index_worker(&top_level_name, doc_id_field_name, &target_file_path).await {
         Ok(_) => (),
-        Err(e) => return Err(e),
+        Err(e) => {
+            data_access::release(&top_level_name).await;
+            return Err(e)
+        },
     }
+    data_access::release(&top_level_name).await;
     Ok(Some(target_file_path))
 }
 
 
-pub(crate) async fn create_index(table_metadata: &TableMetadataCheckpoint) -> Result<(), Box<dyn Error>> {
+pub(crate) async fn create_index(table_metadata: &TableMetadataCheckpoint) -> Result<(), IndexError> {
     let files = create_index_inner(table_metadata).await?;
     if files.len() > 0 {
         match API_SERVICE_CLIENT.extension_commit(
@@ -190,14 +220,14 @@ pub(crate) async fn create_index(table_metadata: &TableMetadataCheckpoint) -> Re
             }
         ).await {
             Ok(_) => (),
-            Err(e) => return Err(Box::new(e)),
+            Err(e) => return Err(IndexError{ message: format!("{}", e)}),
         }
     }
 
     Ok(())
 }
 
-pub(crate) async fn create_index_inner(table_metadata: &TableMetadataCheckpoint) -> Result<Vec<ExtensionFileMetadata>, Box<dyn Error>> {
+pub(crate) async fn create_index_inner(table_metadata: &TableMetadataCheckpoint) -> Result<Vec<ExtensionFileMetadata>, IndexError> {
     let mut files: Vec<ExtensionFileMetadata> = vec!();
 
     // TODO: does just "_id" work for everything?
@@ -247,22 +277,31 @@ pub(crate) async fn create_index_inner(table_metadata: &TableMetadataCheckpoint)
 #[cfg(test)]
 mod tests {
     use std::env;
+    use gotham::test::Server;
     use crate::elastic_search_index::{create_index_jsonl, create_index_parquet};
 
-    #[tokio::test]
-    async fn test_simple_create_index_parquet() {
-        match create_index_parquet(&format!("file://{}/tests/data/flights.parquet", env::current_dir().unwrap().to_str().unwrap()), &"index_col".to_string()).await {
-            Err(_) => panic!("failed"),
-            Ok(_) => ()
-        }
+    #[test]
+    fn test_simple_create_index_parquet() {
+        let test_server = &*crate::router::tests::TEST_SERVER;
+
+        test_server.run_future(async {
+            match create_index_parquet(&format!("file://{}/tests/data/flights.parquet", env::current_dir().unwrap().to_str().unwrap()), &"index_col".to_string()).await {
+                Err(_) => panic!("failed"),
+                Ok(_) => ()
+            }
+        });
     }
 
-    #[tokio::test]
-    async fn test_simple_create_index_json() {
-        match create_index_jsonl(&format!("file://{}/tests/data/logs.json", env::current_dir().unwrap().to_str().unwrap()), &"index_col".to_string()).await {
-            Err(_) => panic!("failed"),
-            Ok(_) => ()
-        }
+    #[test]
+    fn test_simple_create_index_json() {
+        let test_server = &*crate::router::tests::TEST_SERVER;
+
+        test_server.run_future(async {
+            match create_index_jsonl(&format!("file://{}/tests/data/logs.json", env::current_dir().unwrap().to_str().unwrap()), &"index_col".to_string()).await {
+                Err(_) => panic!("failed"),
+                Ok(_) => ()
+            }
+        });
     }
 
 }

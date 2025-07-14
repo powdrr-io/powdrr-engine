@@ -789,6 +789,7 @@ pub(crate) fn extract_powdrr_schema(value: &Value) -> PowdrrSchema {
     to_powdrr_schema(&schema)
 }
 
+#[allow(dead_code)]
 pub(crate) fn extract_powdrr_schema_str(value: &str) -> PowdrrSchema {
     let value_split = value.split("\n").filter(|x|x.len() > 0).collect::<Vec<&str>>();
     let serde_values = value_split.iter().map(|x|serde_json::from_str(x).unwrap()).collect::<Vec<Value>>();

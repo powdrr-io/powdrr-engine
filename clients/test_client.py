@@ -30,6 +30,19 @@ QUERY = """{
 }"""
 
 
+ALTERNATE_QUERY = """{
+    "query": {
+      "bool": {
+        "must": [
+            "term" : {
+              {"user.id": "vlb44hny"}
+            }
+        ]
+      }
+    }
+}"""
+
+
 def _create_batch(base_id: int) -> str:
     values = []
     for offset in range(BATCH_SIZE):
@@ -109,7 +122,7 @@ def main(port: int, set_test_mode: bool, num_inserts: int, processes: int):
 
 if __name__ == "__main__":
     main(
-        9200 if sys.argv[1] == "es" else 7784, 
+        9200,
         sys.argv[1] != "es",
         int(sys.argv[2]), 
         int(sys.argv[3])
