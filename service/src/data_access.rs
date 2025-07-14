@@ -145,14 +145,16 @@ impl CacheTrackerActor {
             },
             CacheTrackerActorMessage::Release { respond_to, top_level_name} => {
                 if self.decrement_reservation(&top_level_name) {
-                    self.drop(&top_level_name).await;
-                    let related_names = self.related.get(&top_level_name)
-                        .map(|names| names.clone())
-                        .unwrap_or_default();
-                    for related_name in related_names {
-                        self.drop(&related_name).await;
+                    if self.top_level_to_delete.contains(&top_level_name) {
+                        self.drop(&top_level_name).await;
+                        let related_names = self.related.get(&top_level_name)
+                            .map(|names| names.clone())
+                            .unwrap_or_default();
+                        for related_name in related_names {
+                            self.drop(&related_name).await;
+                        }
+                        self.related.remove(&top_level_name);
                     }
-                    self.related.remove(&top_level_name);
                 }
                 let _ = respond_to.send(());
             }

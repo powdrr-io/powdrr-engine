@@ -149,11 +149,12 @@ async fn ensure_loaded(invocation: &PrivateSqlInvocation, file_path: &String, pa
     let total_size = 0;
 
     data_access::reserve(&new_local_name, total_size, extension_file_names.clone()).await;
-
+    // After this, on error we need to release, on OK we do not release
+    
     match load_file_as_table(&new_local_name, file_path, parquet).await {
         Err(e) => {
             data_access::release(&new_local_name).await;
-            return Err(e)
+            return log_err(e)
         },
         Ok(nln) => nln,
     };
@@ -162,17 +163,15 @@ async fn ensure_loaded(invocation: &PrivateSqlInvocation, file_path: &String, pa
     for (spec, name) in extension_files.iter().zip(extension_file_names.iter()) {
         match load_file_as_table(&name, &spec.file_path, true).await {
             Err(e) => {
+                data_access::release(&new_local_name).await;
                 let error = format!("{}", e);
                 println!("{}", error);
-                data_access::release(&new_local_name).await;
-                return Err(e)
+                return log_err(e)
             },
             _ => ()
         };
 
     }
-
-    data_access::release(&new_local_name).await;
 
     Ok(new_local_name.clone())
 }
@@ -233,20 +232,30 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation) -> Result<Data
         };
         let local_results = match execute_sql(&invocation.sql.build(&required_files.table_schema, &iceberg_file.schema), &local_name, &all_deletes_local_name).await {
             Ok(vrb) => vrb,
-            Err(e) => return log_err(PrivateApiError::from(e)),
+            Err(e) => {
+                data_access::release(&local_name).await;
+                return log_err(PrivateApiError::from(e))
+            },
         };
         all_results.extend(local_results);
+        data_access::release(&local_name).await;
     }
     for speedboat_file in required_files.speedboat_files.iter() {
         let local_name = match ensure_loaded(invocation, &speedboat_file.file_path, false).await {
             Ok(ln) => ln,
-            Err(e) => return log_err(PrivateApiError::from(e)),
+            Err(e) => {
+                return log_err(PrivateApiError::from(e))
+            },
         };
         let local_results = match execute_sql(&invocation.sql.build(&required_files.table_schema, &speedboat_file.schema), &local_name, &all_deletes_local_name).await {
             Ok(vrb) => vrb,
-            Err(e) => return log_err(PrivateApiError::from(e)),
+            Err(e) => return {
+                data_access::release(&local_name).await;
+                log_err(PrivateApiError::from(e))
+            },
         };
         all_results.extend(local_results);
+        data_access::release(&local_name).await;
     }
          
     let all_results_refs: Vec<&RecordBatch> = all_results.iter().map(|f| f).collect();

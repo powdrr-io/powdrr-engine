@@ -920,7 +920,10 @@ impl TestApiServiceClient {
     }    
 
     async fn create_index(&mut self, new_latest_checkpoint: &TableMetadataCheckpoint) -> Result<(), Box<dyn Error>> {
-        let files = create_index_inner(new_latest_checkpoint).await?;
+        let files = match create_index_inner(new_latest_checkpoint).await {
+            Ok(files) => files,
+            Err(_) => panic!("Unable to create index for {}", new_latest_checkpoint.table_name)
+        };
         self.extension_commit(
             &new_latest_checkpoint.table_name,
             &ExtensionCommit {
