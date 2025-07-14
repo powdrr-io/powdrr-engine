@@ -44,81 +44,118 @@ fn create_session() -> SessionContext {
 }
 
 
-#[derive(Debug, Clone)]
-struct LRUCachePutResponse {
-    exists: bool,
-    to_remove: Vec<String>,
-}
-
-
-enum LRUCacheHandleActorMessage {
-    Put {
-        respond_to: oneshot::Sender<LRUCachePutResponse>,
-        file_location: String,
-        size: u64,
-        upstream_file_location: Option<String>
+enum CacheTrackerActorMessage {
+    Reserve {
+        respond_to: oneshot::Sender<()>,
+        top_level_name: String,
+        related_names: Vec<String>,
+        total_size: u64
+    },
+    Release {
+        respond_to: oneshot::Sender<()>,
+        top_level_name: String,
     },
 }
 
 
-struct LRUCacheHandleActor {
-    receiver: mpsc::Receiver<LRUCacheHandleActorMessage>,
+struct CacheTrackerActor {
+    receiver: mpsc::Receiver<CacheTrackerActorMessage>,
     lru_cache: LruCache<String, u64>,
-    related: HashMap<String, Vec<String>>
+    related: HashMap<String, Vec<String>>,
+    reservations: HashMap<String, u64>,
+    top_level_to_delete: Vec<String>,
 }
 
-impl LRUCacheHandleActor {
-    pub fn new(receiver: mpsc::Receiver<LRUCacheHandleActorMessage>) -> Self {
+impl CacheTrackerActor {
+    pub fn new(receiver: mpsc::Receiver<CacheTrackerActorMessage>) -> Self {
         Self {
             receiver,
-            lru_cache: LruCache::new(NonZero::new(1000).unwrap()),
+            lru_cache: LruCache::new(NonZero::new(10 ).unwrap()),
             related: HashMap::new(),
+            reservations: HashMap::new(),
+            top_level_to_delete: vec!()
         }
     }
 
-    fn handle_message(&mut self, msg: LRUCacheHandleActorMessage) {
+    fn increment_reservation(&mut self, name: &String) -> () {
+        match self.reservations.get_mut(name) {
+            Some(r) => {
+                *r += 1;
+            },
+            None => {
+                self.reservations.insert(name.clone(), 1);
+            }
+        }
+    }
+
+    fn decrement_reservation(&mut self, name: &String) -> bool {
+        match self.reservations.get_mut(name) {
+            Some(r) => {
+                *r -= 1;
+                *r == 0
+            },
+            None => panic!("Tried to decrement reservation for {} but it doesn't exist", name)
+        }
+    }
+
+    async fn drop(&mut self, name: &String) -> () {
+        let _ = DATA_FUSION_CONTEXT.sql(format!("DROP TABLE IF EXISTS {};", name).as_str()).await;
+        println!("Dropped table {} from cache", name);
+        self.reservations.remove(name);
+    }
+
+    async fn handle_message(&mut self, msg: CacheTrackerActorMessage) {
         match msg {
-            LRUCacheHandleActorMessage::Put { respond_to, file_location, size, upstream_file_location } => {
-                match upstream_file_location {
-                    Some(ufl) => {
-                        if !self.related.contains_key(&ufl) {
-                            self.related.insert(ufl.clone(), vec!());
+            CacheTrackerActorMessage::Reserve { respond_to, top_level_name, related_names, total_size } => {
+                // Increment the reservation count on the top level.
+                self.increment_reservation(&top_level_name);
+
+                // Touch the top level file in the LRU to load it or keep it fresh.
+                // This will also update the total size for this top level file in the LRU.
+                // That can happen if extension files have been generated since this file was
+                // first loaded.
+                match self.lru_cache.push(top_level_name.clone(), total_size) {
+                    Some((existing_key, _)) => {
+                        if existing_key != top_level_name {
+                            // This means a different top level name has been pushed out of the LRU.
+                            // We need to schedule it for deletion.
+                            self.top_level_to_delete.push(existing_key);
                         }
-                        self.related.get_mut(&ufl).unwrap().push(file_location.clone());
                     },
                     None => ()
-                }
-                let retval = match self.lru_cache.push(file_location.clone(), size) {
-                    Some((existing_key, _)) => {
-                        if existing_key == file_location {
-                            LRUCachePutResponse{
-                                exists: true,
-                                to_remove: vec!()
-                            }
-                        } else {
-                            let mut to_remove = vec!(existing_key.clone());
-                            match self.related.get(&existing_key) {
-                                Some(related_files) => {
-                                    to_remove.extend(related_files.clone());
-                                    self.related.remove(&existing_key);
-                                },
-                                None => ()
-                            };
-                            LRUCachePutResponse{
-                                exists: false,
-                                to_remove
+                };
+
+                // Ensure the related files are tracked appropriately.
+                match self.related.get_mut(&top_level_name) {
+                    Some(existing_related_names) => {
+                        // Add any new related files to the list.
+                        // TODO: This is O(n^2) but we expect the number of related files to be small.
+                        // If it becomes a problem, we can optimize this.
+                        for related_name in related_names.iter() {
+                            if !existing_related_names.contains(related_name) {
+                                existing_related_names.push(related_name.clone());
                             }
                         }
                     },
                     None => {
-                        LRUCachePutResponse{
-                            exists: false,
-                            to_remove: vec!()
-                        }
+                        self.related.insert(top_level_name.clone(), related_names.clone());
                     }
                 };
-                let _ = respond_to.send(retval);
+                let _ = respond_to.send(());
             },
+            CacheTrackerActorMessage::Release { respond_to, top_level_name} => {
+                if self.decrement_reservation(&top_level_name) {
+                    self.drop(&top_level_name).await;
+                    let related_names = self.related.get(&top_level_name)
+                        .map(|names| names.clone())
+                        .unwrap_or_default();
+                    for related_name in related_names {
+                        self.drop(&related_name).await;
+                    }
+                    self.related.remove(&top_level_name);
+                }
+                let _ = respond_to.send(());
+            }
         }
     }
 }
@@ -126,30 +163,42 @@ impl LRUCacheHandleActor {
 
 #[derive(Clone)]
 pub struct LRUCacheHandle {
-    sender: mpsc::Sender<LRUCacheHandleActorMessage>,
+    sender: mpsc::Sender<CacheTrackerActorMessage>,
 }
 
-async fn run_lru_cache_actor_message_pump(mut actor: LRUCacheHandleActor) {
+async fn run_lru_cache_actor_message_pump(mut actor: CacheTrackerActor) {
     while let Some(msg) = actor.receiver.recv().await {
-        actor.handle_message(msg);
+        actor.handle_message(msg).await;
     }
 }
 
 impl LRUCacheHandle {
     fn new() -> Self {
         let (sender, receiver) = mpsc::channel(1);
-        let actor = LRUCacheHandleActor::new(receiver);
+        let actor = CacheTrackerActor::new(receiver);
         tokio::spawn(run_lru_cache_actor_message_pump(actor));
         Self { sender }
     }
 
-    async fn put(&self, file_location: &String, size: u64, upstream_file_location: Option<String>) -> LRUCachePutResponse {
+    async fn reserve(&self, top_level_name: &String, size: u64, related_names: Vec<String>) -> () {
         let (send, recv) = oneshot::channel();
-        let msg = LRUCacheHandleActorMessage::Put {
+        let msg = CacheTrackerActorMessage::Reserve {
             respond_to: send,
-            file_location: file_location.clone(),
-            size: size,
-            upstream_file_location: upstream_file_location.clone(),
+            top_level_name: top_level_name.clone(),
+            total_size: size,
+            related_names
+        };
+
+        let _ = self.sender.send(msg).await;
+        // TODO: deal with errors
+        recv.await.expect("Actor task has been killed")
+    }
+
+    async fn release(&self, top_level_name: &String) -> () {
+        let (send, recv) = oneshot::channel();
+        let msg = CacheTrackerActorMessage::Release {
+            respond_to: send,
+            top_level_name: top_level_name.clone(),
         };
 
         let _ = self.sender.send(msg).await;
@@ -162,6 +211,14 @@ impl LRUCacheHandle {
 static DATA_FUSION_CONTEXT: std::sync::LazyLock<SessionContext> = std::sync::LazyLock::new(|| create_session());
 static LRU_CACHE_HANDLE: std::sync::LazyLock<LRUCacheHandle> = std::sync::LazyLock::new(|| LRUCacheHandle::new());
 
+
+pub(crate) async fn reserve(top_level_name: &String, total_size: u64, related_names: Vec<String>) -> () {
+    LRU_CACHE_HANDLE.reserve(top_level_name, total_size, related_names).await
+}
+
+pub(crate) async fn release(top_level_name: &String) -> () {
+    LRU_CACHE_HANDLE.release(top_level_name).await
+}
 
 async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> Result<(), DataFusionError> {
     match DATA_FUSION_CONTEXT.table_exist(local_name) {
@@ -181,7 +238,7 @@ async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> 
             match DATA_FUSION_CONTEXT.sql(&query_str).await {
                 Err(e) => {
                     println!("Transient s3 error? {}", e);
-                    let _ = DATA_FUSION_CONTEXT.sql("DROP TABLE IF EXISTS {local_name_var};").await;
+                    let _ = DATA_FUSION_CONTEXT.sql(format!("DROP TABLE IF EXISTS {local_name_var};").as_str()).await;
                 },
                 _ => return Ok(())
             }
@@ -223,7 +280,7 @@ async fn load_json_file_as_table(file_path: &String, local_name: &String) -> Res
 }
 
 
-fn path_to_table_name(file_path: &String) -> String {
+pub(crate) fn path_to_table_name(file_path: &String) -> String {
     let safe_name = file_path
         .replace("/", "_")
         .replace(".", "_")
@@ -232,31 +289,19 @@ fn path_to_table_name(file_path: &String) -> String {
     format!("table_{}", safe_name)   
 }
 
-pub(crate) async fn load_file_as_table(file_path: &String, size: u64, upstream_table_name: Option<String>, parquet: bool) -> Result<String, DataFusionError> {
-    let new_local_name = path_to_table_name(file_path);
-    load_file_as_table_with_name(&new_local_name, file_path, size, upstream_table_name, parquet).await
-}
-
-pub(crate) async fn load_file_as_table_with_name(new_local_name: &String, file_path: &String, size: u64, upstream_table_name: Option<String>, parquet: bool) -> Result<String, DataFusionError> {
-    let retval = LRU_CACHE_HANDLE.put(new_local_name, size, upstream_table_name).await;
-    for to_remove_name in retval.to_remove.iter() {
-        let _ = DATA_FUSION_CONTEXT.sql(&format!("DROP TABLE IF EXISTS {};", to_remove_name)).await;
-        println!("Dropped table {} from cache", to_remove_name);
-    }
-    if !retval.exists {
-        if parquet {
-            match load_parquet_file_as_table(&file_path, &new_local_name).await {
-                Err(e) => return log_err(e),
-                _ => ()
-            }
-        } else {
-            match load_json_file_as_table(file_path, &new_local_name).await {
-                Err(e) => return log_err(e),
-                _ => ()
-            }
+pub(crate) async fn load_file_as_table(new_local_name: &String, file_path: &String, parquet: bool) -> Result<(), DataFusionError> {
+    if parquet {
+        match load_parquet_file_as_table(&file_path, &new_local_name).await {
+            Err(e) => return log_err(e),
+            Ok(_) => println!("Loaded parquet table {} from {}", new_local_name, file_path)
+        }
+    } else {
+        match load_json_file_as_table(file_path, &new_local_name).await {
+            Err(e) => return log_err(e),
+            Ok(_) => println!("Loaded json table {} from {}", new_local_name, file_path)
         }
     }
-    Ok(new_local_name.clone())
+    Ok(())
 }
 
 pub(crate) async fn load_memtable(records: &Vec<RecordBatch>) -> Result<String, DataFusionError> {

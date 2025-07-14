@@ -2,7 +2,7 @@ use std::error::Error;
 
 use datafusion::{arrow::datatypes::DataType, dataframe::DataFrameWriteOptions};
 
-use crate::{data_access::{execute_sql, exists}, state_hosted_service::{ExtensionCommit, ExtensionFile, ExtensionFileMetadata, ExtensionMetadata, TableMetadataCheckpoint, API_SERVICE_CLIENT}, util::add_file_suffix};
+use crate::{data_access, data_access::{execute_sql, exists}, state_hosted_service::{ExtensionCommit, ExtensionFile, ExtensionFileMetadata, ExtensionMetadata, TableMetadataCheckpoint, API_SERVICE_CLIENT}, util::add_file_suffix};
 use crate::data_access::load_file_as_table;
 
 #[allow(dead_code)]
@@ -133,21 +133,30 @@ pub(crate) async fn create_index_jsonl(file_path: &String, doc_id_field_name: &S
     if exists(&target_file_path).await {
         return Ok(None)
     }
+
+    let top_level_name = data_access::path_to_table_name(file_path);
+    data_access::reserve(&top_level_name, 0, vec!()).await;
     
-    let result = load_file_as_table(file_path, 0, None, false).await;
-    let new_local_name = match result {
+    let result = data_access::load_file_as_table(&top_level_name, file_path, false).await;
+    match result {
         Err(e) => {
+            data_access::release(&top_level_name).await;
             let error = format!("{}", e);
             println!("{}", error);
             return Err(Box::new(e))
         },
-        Ok(name) => name,
+        Ok(_) => ()
     };
 
-    match create_index_worker(&new_local_name, doc_id_field_name, &target_file_path).await {
+    match create_index_worker(&top_level_name, doc_id_field_name, &target_file_path).await {
         Ok(_) => (),
-        Err(e) => return Err(e),
+        Err(e) => {
+            data_access::release(&top_level_name).await;
+            return Err(e)
+        },
     }
+    
+    data_access::release(&top_level_name).await;
     Ok(Some(target_file_path))
 }
 
@@ -156,17 +165,27 @@ pub(crate) async fn create_index_parquet(file_path: &String, doc_id_field_name: 
     if exists(&target_file_path).await {
         return Ok(None)
     }
+    
+    let top_level_name = data_access::path_to_table_name(file_path);
+    data_access::reserve(&top_level_name, 0, vec!()).await;
 
-    let result = load_file_as_table(file_path, 0, None, true).await;
-    let new_local_name = match result {
-        Err(e) => return Err(Box::new(e)),
-        Ok(name) => name,
+    let result = load_file_as_table(&top_level_name, file_path, true).await;
+    match result {
+        Err(e) => {
+            data_access::release(&top_level_name).await;
+            return Err(Box::new(e))
+        },
+        Ok(_) => ()
     };
 
-    match create_index_worker(&new_local_name, doc_id_field_name, &target_file_path).await {
+    match create_index_worker(&top_level_name, doc_id_field_name, &target_file_path).await {
         Ok(_) => (),
-        Err(e) => return Err(e),
+        Err(e) => {
+            data_access::release(&top_level_name).await;
+            return Err(e)
+        },
     }
+    data_access::release(&top_level_name).await;
     Ok(Some(target_file_path))
 }
 

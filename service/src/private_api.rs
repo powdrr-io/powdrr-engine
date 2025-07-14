@@ -5,13 +5,11 @@ use datafusion::error::DataFusionError;
 use idgenerator::IdInstance;
 use serde::Serialize;
 
-use crate::data_access::{self, load_file_as_table, load_file_as_table_with_name};
+use crate::data_access::{self, load_file_as_table};
 use crate::schema_massager::PowdrrSchema;
 use crate::state_peers::PrivateSqlInvocation;
 use crate::state_hosted_service::*;
 use crate::util::{add_file_suffix, log_err};
-
-
 
 
 #[derive(Debug)]
@@ -19,7 +17,6 @@ struct ExtensionFileSpec {
     suffix: String,
     file_path: String,
 }
-
 
 
 #[derive(Debug)]
@@ -69,7 +66,6 @@ fn selected_file(invocation: &PrivateSqlInvocation, file_path: &String) -> bool 
     let hash_val = hasher.finish();
     hash_val % invocation.num == invocation.index
 }
-
 
 
 fn matches_filter(_iceberg_metadata: &IcebergMetadata, _index: usize, _file_path: &String) -> bool {
@@ -147,24 +143,36 @@ fn get_extension_files(invocation: &PrivateSqlInvocation, file_path: &String) ->
 
 
 async fn ensure_loaded(invocation: &PrivateSqlInvocation, file_path: &String, parquet: bool) -> Result<String, DataFusionError> {
-    let new_local_name= match load_file_as_table(file_path, 0, None, parquet).await {
-        Err(e) => return Err(e),
+    let new_local_name = data_access::path_to_table_name(file_path);
+    let extension_files = get_extension_files(invocation, file_path);
+    let extension_file_names = extension_files.iter().map(|e| format!("{}_{}", &new_local_name, e.suffix)).collect::<Vec<String>>();
+    let total_size = 0;
+
+    data_access::reserve(&new_local_name, total_size, extension_file_names.clone()).await;
+
+    match load_file_as_table(&new_local_name, file_path, parquet).await {
+        Err(e) => {
+            data_access::release(&new_local_name).await;
+            return Err(e)
+        },
         Ok(nln) => nln,
     };
 
     let extension_files = get_extension_files(invocation, file_path);
-    for extension_file in extension_files {
-        let extension_local_name = format!("{}_{}", &new_local_name, extension_file.suffix);
-        match load_file_as_table_with_name(&extension_local_name, &extension_file.file_path, 0, Some(new_local_name.clone()), true).await {
+    for (spec, name) in extension_files.iter().zip(extension_file_names.iter()) {
+        match load_file_as_table(&name, &spec.file_path, true).await {
             Err(e) => {
                 let error = format!("{}", e);
                 println!("{}", error);
+                data_access::release(&new_local_name).await;
                 return Err(e)
             },
             _ => ()
         };
 
     }
+
+    data_access::release(&new_local_name).await;
 
     Ok(new_local_name.clone())
 }
