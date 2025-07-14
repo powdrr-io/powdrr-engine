@@ -66,8 +66,10 @@ pub fn test_v1_set_testing_mode(state: State) -> Pin<Box<HandlerFuture>> {
 pub(crate) async fn do_all_available_work() -> () {
     loop {
         let mut work_done = false;
-        let mut last_snapshot_id: i64 = 0;
-        let index_work = match API_SERVICE_CLIENT.get_workable_tables(&"index".to_string()).await {
+        // We keep track of this to see what all iceberg snapshots we should look through to
+        // see what types of compactions have happened.
+        let mut last_iceberg_snapshot_id: i64 = 0;
+        let index_work = match API_SERVICE_CLIENT.get_extension_work_items(&"es".to_string()).await {
             Ok(work) => work,
             Err(_) => panic!("oh no"),
         };
@@ -79,14 +81,14 @@ pub(crate) async fn do_all_available_work() -> () {
             }
         }
 
-        let compact_work = match API_SERVICE_CLIENT.get_workable_tables(&"compact".to_string()).await {
+        let compact_work = match API_SERVICE_CLIENT.get_compaction_work_items().await {
             Ok(work) => work,
             Err(_) => panic!("oh no"),
         };
         if compact_work.len() > 0 {
             work_done = true;
-            match perform_compaction(compact_work, last_snapshot_id).await {
-                Ok(id) => { last_snapshot_id = id; },
+            match perform_compaction(compact_work, last_iceberg_snapshot_id).await {
+                Ok(id) => { last_iceberg_snapshot_id = id; },
                 Err(_) => panic!("Need some real error handling some day"),
             }
         }

@@ -1,11 +1,12 @@
 
-use std::{collections::HashMap, error::Error, fmt};
+use std::{error::Error, fmt};
 use iceberg_lib::iceberg::{compact_logs, load_table_metadata, CompactionResult};
 use idgenerator::IdInstance;
 use tokio::sync::oneshot::error::RecvError;
 
-use crate::{state_hosted_service::{CompactionCommit, IcebergCommit, IcebergMetadata, SpeedboatCommit, SpeedboatCommitTableInfo, TableMetadataCheckpoint, API_SERVICE_CLIENT}, util::log_err};
+use crate::{state_hosted_service::{CompactionCommit, IcebergCommit, IcebergMetadata, SpeedboatCommit, SpeedboatCommitTableInfo, API_SERVICE_CLIENT}, util::log_err};
 use crate::schema_massager::PowdrrSchema;
+use crate::state_hosted_service::CompactionWorkItem;
 
 #[derive(Debug)]
 pub(crate) struct CompactionError {
@@ -18,36 +19,6 @@ impl fmt::Display for CompactionError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.message)
     }
-}
-
-
-fn group_by_table(items: &Vec<TableMetadataCheckpoint>) -> HashMap<String, Vec<&TableMetadataCheckpoint>> {
-    let mut output = HashMap::new();
-    for item in items.iter() {
-        match output.get(&item.table_name) {
-            Some(_) => (),
-            None => {
-                let new_vec = vec!();
-                output.insert(item.table_name.clone(), new_vec);
-            }
-        };
-        output.get_mut(&item.table_name).unwrap().push(item);
-    }
-    output
-}
-
-
-fn collect_speedboat_files<'a>(metadata: &'a Vec<&TableMetadataCheckpoint>) -> Vec<String> {
-    // These checkpoints very likely include the same speedboat files so we need to
-    // deduplicate file name or we end up with duplicate data.
-    let mut output : Vec<String> = metadata.iter()
-        .filter(|&m|m.speedboat_metadata.is_some())
-        .map(|&m|m.speedboat_metadata.clone().unwrap().files)
-        .flatten()
-        .collect();
-    output.sort();
-    output.dedup();
-    output
 }
 
 
@@ -84,7 +55,7 @@ async fn do_iceberg_commit(table_name: &String, last_snapshot_id: i64) -> Result
 }
 
 
-async fn do_speedboat_commit(table_name: &String, file_path: &String, compaction_id: &String, num_records: u32, schema: &PowdrrSchema) -> Result<(), RecvError> {
+async fn do_speedboat_commit(table_name: &String, file_path: &String, compaction_id: &String, num_records: u64, schema: &PowdrrSchema) -> Result<(), RecvError> {
     match API_SERVICE_CLIENT.speedboat_commit(
         &SpeedboatCommit{
             commit_type: "commit".to_string(),
@@ -103,16 +74,14 @@ async fn do_speedboat_commit(table_name: &String, file_path: &String, compaction
 }
 
 
-pub(crate) async fn perform_compaction(work_items: Vec<TableMetadataCheckpoint>, last_snapshot_id: i64) -> Result<i64, CompactionError> {
-    let table_groups = group_by_table(&work_items);
+pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkItem)>, last_snapshot_id: i64) -> Result<i64, CompactionError> {
     let mut new_last_snapshot_id = 0;
-    for (table_name, checkpoints) in table_groups.iter() {
+    for (table_name, work_item) in work_items.iter() {
         // if table_group.0 != "logs" {
         //    panic!("Only logs supported");
         //}
 
-        let files = collect_speedboat_files(checkpoints);
-        let snapshot_ids: Vec<String> = checkpoints.iter().map(|c| c.checkpoint_id.clone()).collect();
+        let files = work_item.files.clone();
         let compaction_id = IdInstance::next_id().to_string();
 
         // NOTE: the api commit must happen before the iceberg commit. The service is designed to understand that
@@ -122,7 +91,6 @@ pub(crate) async fn perform_compaction(work_items: Vec<TableMetadataCheckpoint>,
             table_name,
             &CompactionCommit {
                 removed_file_locations: files.iter().cloned().collect(),
-                snapshot_ids: snapshot_ids,
                 compaction_id: compaction_id.clone(),
             }
         ).await {

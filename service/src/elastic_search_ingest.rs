@@ -490,7 +490,7 @@ pub(crate) async fn commit_general(buffer: &WriteBuffer, index: &String, commit_
     let commit_info = SpeedboatCommitTableInfo {
         table_name: index.clone(),
         files: vec!(new_id),
-        sizes: vec!(buffer.len() as u32),
+        sizes: vec!(buffer.len() as u64),
         schema: buffer.schema.clone(),
     };
 
@@ -948,7 +948,7 @@ async fn ingest_and_write(payload: &String) -> Result<IngestAndWriteResult, Inge
         table_infos.push(SpeedboatCommitTableInfo {
             table_name: name.clone(),
             files: vec!(new_id),
-            sizes: vec!(buffer.len() as u32),
+            sizes: vec!(buffer.len() as u64),
             schema: buffer.schema.clone()
         });
     }
