@@ -43,6 +43,7 @@ fn create_session() -> SessionContext {
 }
 
 
+#[allow(dead_code)]
 enum CacheTrackerActorMessage {
     Reserve {
         respond_to: oneshot::Sender<()>,
@@ -298,6 +299,7 @@ impl LRUCacheHandle {
         recv.await.expect("Actor task has been killed")
     }
 
+    #[allow(dead_code)]
     async fn get_tables(&self) -> Vec<String> {
         let (send, recv) = oneshot::channel();
         let msg = CacheTrackerActorMessage::GetTables {
@@ -485,6 +487,7 @@ pub(crate) async fn drop(table_name: &String) -> () {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) async fn get_tables() -> Vec<String> {
     LRU_CACHE_HANDLE.get_tables().await
 }
