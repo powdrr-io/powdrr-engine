@@ -1,5 +1,6 @@
 use std::{path::Path, sync::Arc};
 use datafusion::{arrow::array::RecordBatch, error::DataFusionError, prelude::{DataFrame, NdJsonReadOptions, ParquetReadOptions, SessionContext}};
+use datafusion::arrow::datatypes::Schema;
 use datafusion::common::HashMap;
 use idgenerator::IdInstance;
 use lru_mem::{HeapSize, LruCache, TryInsertError};
@@ -93,7 +94,7 @@ impl CacheTrackerActor {
     pub fn new(receiver: mpsc::Receiver<CacheTrackerActorMessage>) -> Self {
         Self {
             receiver,
-            lru_cache: LruCache::new(2 * 1024 * 1024),
+            lru_cache: LruCache::new(2 * 1024 * 1024 * 1024),
             related: HashMap::new(),
             reservations: HashMap::new(),
             top_level_to_delete: vec!(),
@@ -371,7 +372,7 @@ async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> 
 }
 
 
-async fn load_json_file_as_table(file_path: &String, local_name: &String) -> Result<(), DataFusionError> {
+async fn load_json_file_as_table(file_path: &String, local_name: &String, schema: &Schema) -> Result<(), DataFusionError> {
     match DATA_FUSION_CONTEXT.table_exist(local_name) {
         Ok(exists) => match exists {
             true => return Ok(()),
@@ -380,7 +381,8 @@ async fn load_json_file_as_table(file_path: &String, local_name: &String) -> Res
         Err(e) => return log_err(e),
     };
     LRU_CACHE_HANDLE.table_created(local_name).await;
-    match DATA_FUSION_CONTEXT.register_json(local_name, file_path, NdJsonReadOptions::default()).await {
+    let reader_options = NdJsonReadOptions::default().schema(&schema);
+    match DATA_FUSION_CONTEXT.register_json(local_name, file_path, reader_options).await {
         Ok(_) => Ok(()),
         Err(e) => {
             if e.message().contains("already exists") {
@@ -402,14 +404,15 @@ pub(crate) fn path_to_table_name(file_path: &String) -> String {
     format!("table_{}", safe_name)   
 }
 
-pub(crate) async fn load_file_as_table(new_local_name: &String, file_path: &String, parquet: bool) -> Result<(), DataFusionError> {
+pub(crate) async fn load_file_as_table(new_local_name: &String, file_path: &String, parquet: bool, schema: Option<Schema>) -> Result<(), DataFusionError> {
     if parquet {
         match load_parquet_file_as_table(&file_path, &new_local_name).await {
             Err(e) => return log_err(e),
             Ok(_) => ()
         }
     } else {
-        match load_json_file_as_table(file_path, &new_local_name).await {
+        assert!(schema.is_some(), "You must provide a schema for a JSON file");
+        match load_json_file_as_table(file_path, &new_local_name, &schema.unwrap()).await {
             Err(e) => return log_err(e),
             Ok(_) => ()
         }

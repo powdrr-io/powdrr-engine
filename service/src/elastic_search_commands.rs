@@ -35,6 +35,13 @@ pub(crate) async fn to_serde_value(data_frame: &DataFrame) -> (Vec<Value>, Optio
         }
     };
 
+    // TEST CODE
+    for batch in record_batches.iter() {
+        let fields = batch.schema().fields().iter().map(|f| format!("{:?}", f)).collect::<Vec<String>>();
+        println!("{:?}", fields);
+    }
+    // END TEST CODE    
+
     let schema = match record_batches.len() {
         0 => None,
         _ => Some(to_powdrr_schema(&record_batches.get(0).unwrap().schema())),
