@@ -64,7 +64,7 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
 
     let field_normalization_queries_union = field_normalization_queries.join(" UNION ");
 
-    match execute_sql(&format!("CREATE TABLE {new_local_name}_fields AS {field_normalization_queries_union}")).await {
+    match data_access::create_table(&format!("{new_local_name}_fields"), &field_normalization_queries_union).await {
         Err(e) => {
             return Err(IndexError::from(e))
         },
@@ -72,7 +72,7 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
     };
     created_tables.push(format!("{new_local_name}_fields"));
 
-    match execute_sql(&format!("CREATE TABLE {new_local_name}_split AS SELECT doc_id, field_name, string_to_array(field_value, ' ') as field_terms from {new_local_name}_fields")).await {
+    match data_access::create_table(&format!("{new_local_name}_split"), &format!("SELECT doc_id, field_name, string_to_array(field_value, ' ') as field_terms from {new_local_name}_fields")).await {
         Err(e) => {
             drop_all(&created_tables).await;
             return Err(IndexError::from(e))
@@ -81,7 +81,7 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
     };
     created_tables.push(format!("{new_local_name}_split"));
 
-    match execute_sql(&format!("CREATE TABLE {new_local_name}_split_unnest AS SELECT doc_id, field_name, unnest(field_terms) as field_term from {new_local_name}_split")).await {
+    match data_access::create_table(&format!("{new_local_name}_split_unnest"), &format!("SELECT doc_id, field_name, unnest(field_terms) as field_term from {new_local_name}_split")).await {
         Err(e) => {
             drop_all(&created_tables).await;
             return Err(IndexError::from(e))
@@ -90,7 +90,7 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
     };
     created_tables.push(format!("{new_local_name}_split_unnest"));
 
-    match execute_sql(&format!("CREATE TABLE {new_local_name}_term_frequency AS SELECT doc_id, field_name, doc_id || '_' || field_name as doc_id_field_name, field_term, count(1) as term_cnt from {new_local_name}_split_unnest group by doc_id, field_name, field_term")).await {
+    match data_access::create_table(&format!("{new_local_name}_term_frequency"), &format!("SELECT doc_id, field_name, doc_id || '_' || field_name as doc_id_field_name, field_term, count(1) as term_cnt from {new_local_name}_split_unnest group by doc_id, field_name, field_term")).await {
         Err(e)  => {
             drop_all(&created_tables).await;
             return Err(IndexError::from(e))
@@ -99,7 +99,7 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
     }; 
     created_tables.push(format!("{new_local_name}_term_frequency"));
 
-    match execute_sql(&format!("CREATE TABLE {new_local_name}_field_size AS SELECT doc_id, field_name, doc_id || '_' || field_name as doc_id_field_name, array_length(field_terms) as word_cnt from {new_local_name}_split")).await {
+    match data_access::create_table(&format!("{new_local_name}_field_size"), &format!("SELECT doc_id, field_name, doc_id || '_' || field_name as doc_id_field_name, array_length(field_terms) as word_cnt from {new_local_name}_split")).await {
         Err(e) => {
             drop_all(&created_tables).await;
             return Err(IndexError::from(e))
@@ -119,7 +119,7 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
     // (THIS SHOUDL BE IN THE METADATA) N = select count(1) from base_table
     // n(qi) = num results in f(Qi, D)
 
-    match execute_sql(&format!("CREATE TABLE {new_local_name}_joined AS SELECT tf.doc_id, tf.field_name, tf.field_term, tf.term_cnt, fs.word_cnt from {new_local_name}_term_frequency tf INNER JOIN {new_local_name}_field_size fs ON tf.doc_id_field_name = fs.doc_id_field_name WHERE tf.term_cnt > 0")).await {
+    match data_access::create_table(&format!("{new_local_name}_joined"), &format!("SELECT tf.doc_id, tf.field_name, tf.field_term, tf.term_cnt, fs.word_cnt from {new_local_name}_term_frequency tf INNER JOIN {new_local_name}_field_size fs ON tf.doc_id_field_name = fs.doc_id_field_name WHERE tf.term_cnt > 0")).await {
         Err(e) => {
             drop_all(&created_tables).await;
             return Err(IndexError::from(e))

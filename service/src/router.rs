@@ -285,8 +285,9 @@ pub(crate) mod tests {
     use std::sync::LazyLock;
 
     use gotham::mime;
-    use gotham::test::TestServer;
+    use gotham::test::{Server, TestServer};
     use serde_json::Value;
+    use crate::data_access;
     use crate::elastic_search_responses::{QueryResultTotal, QueryResults};
     use crate::router::router;
     use crate::schema_massager::{extract_powdrr_schema_str, PowdrrDataType, PowdrrField, PowdrrSchema, SqlBuilder, SqlExpression};
@@ -2282,7 +2283,6 @@ pub(crate) mod tests {
                 panic!("Failed {}", e)
             }
         }
-
     }
 
 }

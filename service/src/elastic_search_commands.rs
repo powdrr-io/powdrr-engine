@@ -210,13 +210,12 @@ impl SqlCommand {
             let constant_b = 0.75;
             let avgdl = 5.6;
 
-            let bm25_sql = format!("CREATE TABLE {final_table_name} AS SELECT {column_names_joined}, ln(({total_records} - {records_with_term} + 0.5)/({records_with_term} + 0.5) + 1) * (term_cnt * ({constant_k} + 1)) / (term_cnt + {constant_k} * (1 - {constant_b} + ({constant_b} * word_cnt / {avgdl}))) as score FROM {temp_table_name} order by score desc");
-            let _sql_data_frame = match execute_sql(&bm25_sql).await {
-                Ok(df) => df,
+            match data_access::create_table(&final_table_name, &format!("SELECT {column_names_joined}, ln(({total_records} - {records_with_term} + 0.5)/({records_with_term} + 0.5) + 1) * (term_cnt * ({constant_k} + 1)) / (term_cnt + {constant_k} * (1 - {constant_b} + ({constant_b} * word_cnt / {avgdl}))) as score FROM {temp_table_name} order by score desc")).await {
+                Ok(_) => (),
                 Err(_) => panic!("nope"),
             };
         } else {
-            match execute_sql(&format!("CREATE TABLE {final_table_name} AS SELECT * from {temp_table_name};")).await {
+            match data_access::create_table(&final_table_name, &format!("SELECT * from {temp_table_name};")).await {
                 Ok(_) => (),
                 Err(_) => panic!("nope"),
             };

@@ -198,12 +198,12 @@ async fn create_all_deletes_table(local_names: &Vec<String>) -> Result<String, P
     let table_name = format!("table_{}", IdInstance::next_id());
     let ddl_stmt;
     if local_names.len() == 0 {
-        ddl_stmt = format!("create table {table_name} as select null as _id, null as _seq_no");
+        ddl_stmt = "select null as _id, null as _seq_no".to_string();
     } else {
         let union_selects = local_names.iter().map(|x|format!("select * from {x}")).collect::<Vec<String>>().join(" union all ");
-        ddl_stmt = format!("create table {table_name} as select _id, max(_seq_no) as _seq_no from ({union_selects}) group by _id");
+        ddl_stmt = format!("select _id, max(_seq_no) as _seq_no from ({union_selects}) group by _id");
     }
-    match data_access::execute_sql(&ddl_stmt).await {
+    match data_access::create_table(&table_name, &ddl_stmt).await {
         Ok(_) => Ok(table_name.clone()),
         Err(e) => return log_err(PrivateApiError::from(e)),
     }
