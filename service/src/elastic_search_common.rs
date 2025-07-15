@@ -4,10 +4,8 @@ use std::fmt::Display;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
-use arrow_json::reader::infer_json_schema;
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::error::ArrowError;
 use futures::future::try_join_all;
 use gotham::helpers::http::response::create_response;
 use gotham::mime::Mime;
@@ -20,7 +18,6 @@ use crate::elastic_search_responses::QueryFailure;
 use crate::schema_massager::SqlQuery;
 use crate::state_peers::{self, PeerClient, PeerClientError, PrivateSqlInvocation, SnapshotDescriptor};
 use crate::state_common::FileFilter;
-use crate::util::log_err;
 
 
 pub(crate) const MIME_ES_JSON: LazyLock<Mime> = LazyLock::new(|| "application/vnd.elasticsearch+json;compatible-with=8".parse().unwrap());
@@ -98,7 +95,7 @@ pub(crate) async fn call_private_sql(
     target_snapshots: &Vec<SnapshotDescriptor>,
     index: u64,
     num: u64,
-) -> Result<String, PeerClientError> {
+) -> Result<Vec<RecordBatch>, PeerClientError> {
     let invocation = PrivateSqlInvocation {
         sql: target_sql.clone(),
         required_extensions: required_extensions.clone(),
@@ -120,21 +117,9 @@ pub(crate) async fn call_private_sql_and_load(
     index: u64,
     num: u64,
 ) -> Result<Option<Vec<RecordBatch>>, PeerClientError> {
-    let result = match call_private_sql(peer_client, target_sql, required_extensions, target_snapshots, index, num).await {
-        Ok(r) => r,
-        Err(e) => return Err(e),
-    };
-    
-    let inferred_schema = infer_json_schema(result.as_bytes(), None).unwrap();
-    let json_reader = match arrow_json::ReaderBuilder::new(Arc::new(inferred_schema.0)).build(result.as_bytes()) {
-        Ok(d) => d,
-        Err(_) => panic!("Private API returned result that does not match schema")
-    };
-
-    let record_batches: Result<Vec<RecordBatch>, ArrowError> = json_reader.collect();
-    match record_batches {
-        Ok(rb) => Ok(Some(rb)),
-        Err(_) => log_err(PeerClientError{ message: "Arrow error".to_string() })
+    match call_private_sql(peer_client, target_sql, required_extensions, target_snapshots, index, num).await {
+        Ok(r) => Ok(Some(r)),
+        Err(e) => Err(e),
     }
 }
 

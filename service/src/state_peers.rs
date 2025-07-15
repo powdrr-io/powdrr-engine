@@ -1,7 +1,12 @@
 use std::{error::Error, fmt::Display};
-
+use arrow_flight::decode::FlightRecordBatchStream;
+use arrow_flight::error::FlightError;
+use arrow_flight::FlightData;
 use async_trait::async_trait;
+use datafusion::arrow::array::RecordBatch;
+use futures_util::{stream, StreamExt};
 use gotham::test::TestServer;
+use prost::Message;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -85,7 +90,7 @@ unsafe impl Sync for PeerClientError {}
 
 #[async_trait]
 pub trait PeerClient: Send + Sync {
-    async fn private_sql(&self, invocation: &PrivateSqlInvocation) -> Result<String, PeerClientError>;
+    async fn private_sql(&self, invocation: &PrivateSqlInvocation) -> Result<Vec<RecordBatch>, PeerClientError>;
 }
 
 #[allow(dead_code)]
@@ -111,7 +116,7 @@ unsafe impl Sync for RemotePeer {}
 
 #[async_trait]
 impl PeerClient for RemotePeer {
-    async fn private_sql(&self, invocation: &PrivateSqlInvocation) -> Result<String, PeerClientError> {
+    async fn private_sql(&self, invocation: &PrivateSqlInvocation) -> Result<Vec<RecordBatch>, PeerClientError> {
         let address = &self.address;
         let body = serde_json::to_string(invocation);
         match body {
@@ -124,7 +129,7 @@ impl PeerClient for RemotePeer {
                     Ok(r) => {
                         let text = r.text().await;
                         match text {
-                            Ok(t) => Ok(t),
+                            Ok(_) => Ok(vec!()),
                             Err(_) => Err(PeerClientError{ message: "Error".to_string() }),
                         }
                     },
@@ -181,11 +186,23 @@ unsafe impl Sync for SelfPeer {}
 
 #[async_trait]
 impl PeerClient for SelfPeer {
-    async fn private_sql(&self, invocation: &PrivateSqlInvocation) -> Result<String, PeerClientError> {
+    async fn private_sql(&self, invocation: &PrivateSqlInvocation) -> Result<Vec<RecordBatch>, PeerClientError> {
         let query_result = data_query(invocation).await;
         match query_result {
             Ok(qr) => {
-                Ok(qr.result)
+                let mut retval = Vec::new();
+                let flight_data = qr.result.iter().map(|x|Ok(FlightData::decode(&x[..]).unwrap())).collect::<Vec<Result<FlightData, FlightError>>>();
+                let mut record_batch_stream = FlightRecordBatchStream::new_from_flight_data(stream::iter(flight_data));
+                while let Some(batch) = record_batch_stream.next().await {
+                    match batch {
+                        Ok(batch) => retval.push(batch),
+                        Err(e) => {
+                            let error = format!("Error: {}", e);
+                            panic!("{}", error);
+                        }
+                    };
+                }
+                Ok(retval)
             },
             Err(e) => {
                 Err(PeerClientError { message: e.message })
@@ -248,6 +265,7 @@ pub mod tests {
     use std::str;
 
     use async_trait::async_trait;
+    use datafusion::arrow::array::RecordBatch;
     use gotham::{mime, test::TestServer};
 
     use crate::router::router;
@@ -269,7 +287,7 @@ pub mod tests {
 
     #[async_trait]
     impl PeerClient for TestPeerClient {
-        async fn private_sql(&self, invocation: &PrivateSqlInvocation) -> Result<String, PeerClientError> {
+        async fn private_sql(&self, invocation: &PrivateSqlInvocation) -> Result<Vec<RecordBatch>, PeerClientError> {
             let body_obj = match serde_json::to_string(invocation) {
                 Ok(bo) => bo,
                 Err(_) => panic!("bad format")
@@ -283,7 +301,7 @@ pub mod tests {
             if response.status() == 200 {
                 let body = response.read_body().unwrap();
                 let str_body = str::from_utf8(&body).unwrap();
-                Ok(str_body.to_string())
+                panic!("Oops, need to do something: {}", str_body);
             } else {
                 Err(PeerClientError { message: "Something go boom".to_string() })
             }

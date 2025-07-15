@@ -1,23 +1,33 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
 use std::ops::Deref;
+use std::sync::Arc;
 use arrow_json::reader::infer_json_schema;
-use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
 pub(crate) enum PowdrrDataType {
-    String,
-    Integer,
+    Array(Box<PowdrrDataType>),
     Boolean,
     Float,
-    Array(Box<PowdrrDataType>),
+    Integer,
+    Null,
     Object(Box<PowdrrSchema>),
+    String,
 }
 
 impl PowdrrDataType {
+    pub fn is_null(&self) -> bool {
+        match self {
+            PowdrrDataType::Null => true,
+            _ => false,
+        }
+    }
+
     pub fn is_object(&self) -> bool {
         match self {
             PowdrrDataType::Object(_) => true,
@@ -31,6 +41,48 @@ impl PowdrrDataType {
             _ => None
         }
     }
+
+    pub fn is_array(&self) -> bool {
+        match self {
+            PowdrrDataType::Array(_) => true,
+            _ => false,
+        }
+    }
+
+    pub fn array_element_type(&self) -> PowdrrDataType {
+        match self {
+            PowdrrDataType::Array(element) => element.deref().clone(),
+            _ => panic!("Check to see that it is an array first.")
+        }
+    }
+
+    pub fn to_sql_type(&self) -> String {
+        match self {
+            PowdrrDataType::Array(_) => todo!(),
+            PowdrrDataType::Boolean => "BOOLEAN".to_string(),
+            PowdrrDataType::Float => "DOUBLE".to_string(),
+            PowdrrDataType::Integer => "BIGINT".to_string(),
+            PowdrrDataType::Object(_) => todo!(),
+            PowdrrDataType::Null => panic!("Cannot convert null to SQL type"),
+            PowdrrDataType::String => "STRING".to_string(),
+        }
+    }
+
+    pub fn to_arrow_type(&self) -> DataType {
+        match self {
+            PowdrrDataType::Array(element_type) => DataType::List(Arc::new(Field::new("value".to_string(), element_type.to_arrow_type(), true))),
+            PowdrrDataType::Boolean => DataType::Boolean,
+            PowdrrDataType::Float => DataType::Float64,
+            PowdrrDataType::Integer => DataType::Int64,
+            PowdrrDataType::Object(schema) => {
+                DataType::Struct(Fields::from(
+                    schema.to_arrow_fields()
+                ))
+            },
+            PowdrrDataType::Null => DataType::Null,
+            PowdrrDataType::String => DataType::LargeUtf8,
+        }
+    }
 }
 
 
@@ -40,6 +92,19 @@ pub(crate) struct PowdrrField {
     pub data_type: PowdrrDataType
 }
 
+impl Display for PowdrrField {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(format!("{}: {:?}", &self.name, &self.data_type).as_str())?;
+        Ok(())
+    }
+}
+
+impl PowdrrField {
+    fn to_arrow_field(&self) -> Field {
+        Field::new(self.name.clone(), self.data_type.to_arrow_type(), true)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
 pub(crate) struct PowdrrSchema {
     pub fields: Vec<PowdrrField>
@@ -47,13 +112,25 @@ pub(crate) struct PowdrrSchema {
 
 impl PowdrrSchema {
     pub fn from(fields: &Vec<PowdrrField>) -> Self {
+        let mut fields_clone = fields.clone();
+        fields_clone.sort_by(|a, b| a.name.partial_cmp(&b.name).unwrap());
         PowdrrSchema{
-            fields: fields.clone()
+            fields: fields_clone
         }
     }
 
     pub fn to_map(&self) -> HashMap<String, PowdrrField> {
         self.fields.iter().map(|x| (x.name.clone(), x.clone())).collect::<HashMap<String, PowdrrField>>()
+    }
+
+    fn to_arrow_fields(&self) -> Vec<Field> {
+        let mut fields = self.fields.iter().map(|x| x.to_arrow_field()).collect::<Vec<Field>>();
+        fields.sort_by(|a, b| a.name().partial_cmp(b.name()).unwrap());
+        fields
+    }
+
+    pub fn to_arrow_schema(&self) -> Schema {
+        Schema::new(self.to_arrow_fields())
     }
 
     pub(crate) fn merge_all(schemas: Vec<Self>) -> Self {
@@ -65,7 +142,48 @@ impl PowdrrSchema {
         for schema in iter {
             merged_schema.merge_from(schema);
         }
+        merged_schema.fields.sort_by(|a, b| a.name.partial_cmp(&b.name).unwrap());
         merged_schema
+    }
+
+    fn merge_field(self_field: &PowdrrField, other_field: &PowdrrField) -> Option<PowdrrField> {
+        if other_field.data_type.is_null() {
+            None
+        } else if self_field.data_type.is_null() && !other_field.data_type.is_null() {
+            // If our existing field is null, we can just replace it with the other field
+            Some(other_field.clone())
+        } else if other_field.data_type.is_object() && self_field.data_type.is_object() {
+            // Both are objects so merge the schema in the field itself (recursive call)
+            let mut self_field_schema = self_field.data_type.as_object_schema().unwrap();
+            let other_field_schema = other_field.data_type.as_object_schema().unwrap();
+            self_field_schema.merge_from(&other_field_schema);
+            let merged_field = PowdrrField { name: other_field.name.clone(), data_type: PowdrrDataType::Object(Box::new(self_field_schema)) };
+            Some(merged_field)
+        } else if other_field.data_type.is_array() && self_field.data_type.is_array() {
+            // Both are arrays so merge the schema in the field itself (recursive call)
+            let self_element_type = self_field.data_type.array_element_type();
+            let other_element_type = other_field.data_type.array_element_type();
+            if other_element_type.is_null() {
+                None
+            } else if self_field.data_type.is_null() && !other_field.data_type.is_null() {
+                // If our existing field is null, we can just replace it with the other field
+                Some(other_field.clone())
+            } else if other_element_type.is_object() && self_element_type.is_object() {
+                let mut self_field_schema = self_element_type.as_object_schema().unwrap();
+                let other_field_schema = other_element_type.as_object_schema().unwrap();
+                self_field_schema.merge_from( & other_field_schema);
+                let merged_field = PowdrrField { name: other_field.name.clone(), data_type: PowdrrDataType::Array(Box::new(PowdrrDataType::Object(Box::new(self_field_schema)))) };
+                Some(merged_field)
+            } else if self_element_type != other_element_type {
+                panic!("Array element types are changing, it is bad")
+            } else {
+                None
+            }
+        } else if self_field.data_type != other_field.data_type {
+            panic!("Data types are changing, it is bad")
+        } else {
+            None
+        }
     }
 
     pub fn merge_from(&mut self, other: &PowdrrSchema) -> () {
@@ -74,17 +192,13 @@ impl PowdrrSchema {
         for other_field in other.fields.iter() {
             match self_map.get(&other_field.name) {
                 Some(self_field) => {
-                    // TODO - Compare the fields to make sure they are identical or if objects then merge
-
-                    if other_field.data_type.is_object() && self_field.data_type.is_object() {
-                        // Merge the schema in the field itself (recursive call)
-                        let mut self_field_schema = self_field.data_type.as_object_schema().unwrap();
-                        let other_field_schema = other_field.data_type.as_object_schema().unwrap();
-                        self_field_schema.merge_from(&other_field_schema);
-                        let merged_field = PowdrrField{ name: other_field.name.clone(), data_type: PowdrrDataType::Object(Box::new(self_field_schema))};
-                        let position = self.fields.iter().position(|f| f.name == other_field.name).unwrap();
-                        self.fields[position] = merged_field;
-                    }
+                    match Self::merge_field(self_field, other_field) {
+                        Some(merged_field) => {
+                            let position = self.fields.iter().position(|f| f.name == other_field.name).unwrap();
+                            self.fields[position] = merged_field;
+                        },
+                        None => ()
+                    };
                 },
                 None => {
                     self.fields.push(other_field.clone());
@@ -163,6 +277,7 @@ pub(crate) enum SqlExpression {
     LiteralString(String),
     NamedStruct(Vec<NamedStructEntry>),
     Not(Box<SqlExpression>),
+    Null(PowdrrDataType),
     Or(Vec<SqlExpression>),
 }
 
@@ -211,9 +326,15 @@ impl SqlExpression {
     }
 
     fn explode_partial_ref(&self, prefix: &String, original_field: &PowdrrField, target_field: &PowdrrField) -> HashMap<String, Self> {
-        let original_inner_fields = match &original_field.data_type {
+        let target_inner_fields_map = match &target_field.data_type {
             PowdrrDataType::Object(schema) => {
-                schema.fields.clone()
+                schema.to_map()
+            },
+            PowdrrDataType::Null => {
+                return HashMap::from([(
+                    prefix.clone(),
+                    SqlExpression::Null(original_field.data_type.clone())
+                )])
             },
             _ => {
                 return HashMap::from([(
@@ -223,9 +344,9 @@ impl SqlExpression {
             }
         };
 
-        let target_inner_fields_map = match &target_field.data_type {
+        let original_inner_fields = match &original_field.data_type {
             PowdrrDataType::Object(schema) => {
-                schema.to_map()
+                schema.fields.clone()
             },
             _ => {
                 return HashMap::from([(
@@ -260,7 +381,7 @@ impl SqlExpression {
                 result
             },
             _ => {
-                HashMap::from([(prefix.clone(), Self::literal_default(field))])
+                HashMap::from([(prefix.clone(), SqlExpression::Null(field.data_type.clone()))])
             }
         }
     }
@@ -313,7 +434,7 @@ impl SqlExpression {
                 } else if target_schema_field.is_some() {
                     self.populate_field(&denormalized_name, &original_schema_field.unwrap(), &target_schema_field.unwrap())
                 } else {
-                    Self::literal_default(&original_schema_field.unwrap())
+                    SqlExpression::Null(original_schema_field.unwrap().data_type)
                 }
             },
             SqlExpression::FieldRef(table, _name) => {
@@ -350,6 +471,7 @@ impl SqlExpression {
                     Box::new(value.finalize(original_schema, target_schema)),
                 )
             },
+            SqlExpression::Null(_) => self.clone(),
             SqlExpression::Or(exprs) => {
                 SqlExpression::Or(exprs.iter().map(|x| x.finalize(original_schema, target_schema)).collect())
             }
@@ -381,7 +503,7 @@ impl SqlExpression {
                     self.populate_field(&full_name, &original_field, &target_field)
                 },
                 None => {
-                    Self::literal_default(&original_field)
+                    SqlExpression::Null(original_field.data_type.clone())
                 }
             };
             entries.push(NamedStructEntry {
@@ -390,14 +512,6 @@ impl SqlExpression {
             });
         }
         SqlExpression::NamedStruct(entries)
-    }
-
-    fn literal_default(field: &PowdrrField) -> SqlExpression {
-        match &field.data_type {
-            PowdrrDataType::Array(_element_type) => SqlExpression::LiteralNonString("null".to_string()),
-            PowdrrDataType::Object(_schema) => SqlExpression::LiteralNonString("null".to_string()),
-            _ => SqlExpression::LiteralNonString("null".to_string())
-        }
     }
 
     fn stringize(&self) -> String {
@@ -450,6 +564,15 @@ impl SqlExpression {
             SqlExpression::Not(value) => {
                 format!("NOT({})", value.stringize())
             },
+            SqlExpression::Null(data_type) => {
+                match data_type {
+                    PowdrrDataType::Object(_) => "NULL".to_string(),
+                    PowdrrDataType::Array(_) => "NULL".to_string(),
+                    PowdrrDataType::Boolean => "false".to_string(),
+                    PowdrrDataType::Null => "NULL".to_string(),
+                    _ => format!("CAST(NULL AS {})", data_type.to_sql_type())
+                }
+            }
             SqlExpression::Or(exprs) => {
                 let exprs_str = exprs.iter().map(|x| x.stringize()).collect::<Vec<String>>();
                 format!("({})", exprs_str.join(" OR "))
@@ -681,6 +804,7 @@ impl SqlQuery {
                 });
             }
         }
+        fields_copy.sort_by(|a, b|a.name.partial_cmp(&b.name).unwrap());
         for field in fields_copy.iter() {
             final_fields.extend(field.finalize(original_schema, target_schema).iter().map(|f|f.stringize()));
         }
@@ -752,9 +876,7 @@ impl SqlQuery {
 fn to_powdrr_data_type(data_type: &DataType) -> PowdrrDataType {
     match data_type {
         DataType::Null => {
-            // Null is a wacky type. We could probably do anything here but we'll say
-            // it is a String for now.
-            PowdrrDataType::String
+            PowdrrDataType::Null
         },
         DataType::Int64 => PowdrrDataType::Integer,
         DataType::Boolean => PowdrrDataType::Boolean,
@@ -813,8 +935,8 @@ mod tests {
 
     #[test]
     fn test_default_missing_fields_schema() {
-        let test_val_table = r#"{"_seq_no": 1, "a": 1, "b": "2", "c": 3.3, "d":{"e": 4, "f": 5}, "g": [1, 2, 3], "h": {"i": 1, "j": 2}}"#;
-        let test_val_file = r#"{"_seq_no": 1, "a": 1, "c": 3.3, "d":{"e": 4}, "g": [1, 2, 3]}"#;
+        let test_val_table = r#"{"_seq_no": 1, "a": 1, "b": "2", "c": 3.3, "d":{"e": 4, "f": 5}, "g": [1, 2, 3], "h": {"i": 1, "j": 2}, "k": 15 }"#;
+        let test_val_file = r#"{"_seq_no": 1, "a": 1, "c": 3.3, "d":{"e": 4}, "g": [1, 2, 3], "k": null }"#;
         let (schema, _) = infer_json_schema(test_val_table.as_bytes(), None).unwrap();
         let powdrr_schema_table = to_powdrr_schema(&schema);
         let (schema, _) = infer_json_schema(test_val_file.as_bytes(), None).unwrap();
@@ -823,8 +945,10 @@ mod tests {
         let sql_builder = SqlBuilder::for_query(true);
         let sql_query = sql_builder.build();
         let sql = sql_query.build(&powdrr_schema_table, &powdrr_schema_file);
-        assert!(sql.contains("null as \"b\""));
-        assert!(sql.contains("null as \"d_f\""));
+        assert!(sql.contains("CAST(NULL AS STRING) as \"b\""));
+        assert!(sql.contains("CAST(NULL AS BIGINT) as \"h_i\""));
+        assert!(sql.contains("CAST(NULL AS BIGINT) as \"d_f\""));
+        assert!(sql.contains("CAST(NULL AS BIGINT) as \"k\""));
     }
 
     #[test]

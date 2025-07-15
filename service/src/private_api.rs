@@ -1,12 +1,15 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::{error::Error, fmt};
+use arrow_flight::encode::FlightDataEncoderBuilder;
+use arrow_flight::error::FlightError;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::error::DataFusionError;
+use futures_util::StreamExt;
 use idgenerator::IdInstance;
-use serde::Serialize;
+use prost::Message;
 
 use crate::data_access::{self, load_file_as_table};
-use crate::schema_massager::PowdrrSchema;
+use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
 use crate::state_peers::PrivateSqlInvocation;
 use crate::state_hosted_service::*;
 use crate::util::{add_file_suffix, log_err};
@@ -39,10 +42,10 @@ impl PrivateApiError {
 }
 
 
-#[derive(Serialize)]
 pub(crate) struct DataQueryResult {
+    #[allow(dead_code)]
     pub(crate) num: u32,
-    pub(crate) result: String,
+    pub(crate) result: Vec<Vec<u8>>,
 }
 
 
@@ -144,7 +147,13 @@ fn get_extension_files(invocation: &PrivateSqlInvocation, file_path: &String) ->
 }
 
 
-async fn ensure_loaded(invocation: &PrivateSqlInvocation, file_path: &String, top_level_size: u64, parquet: bool) -> Result<String, DataFusionError> {
+async fn ensure_loaded(
+    invocation: &PrivateSqlInvocation,
+    file_path: &String,
+    top_level_size: u64,
+    parquet: bool,
+    schema: Option<PowdrrSchema>
+) -> Result<String, DataFusionError> {
     let new_local_name = data_access::path_to_table_name(file_path);
     let extension_files = get_extension_files(invocation, file_path);
     let extension_file_names = extension_files.iter().map(|e| format!("{}_{}", &new_local_name, e.suffix)).collect::<Vec<String>>();
@@ -154,7 +163,7 @@ async fn ensure_loaded(invocation: &PrivateSqlInvocation, file_path: &String, to
     data_access::reserve(&new_local_name, total_size, extension_file_names.clone()).await;
     // After this, on error we need to release, on OK we do not release
     
-    match load_file_as_table(&new_local_name, file_path, parquet).await {
+    match load_file_as_table(&new_local_name, file_path, parquet, schema.map(|s|s.to_arrow_schema())).await {
         Err(e) => {
             data_access::release(&new_local_name).await;
             return log_err(e)
@@ -164,7 +173,7 @@ async fn ensure_loaded(invocation: &PrivateSqlInvocation, file_path: &String, to
 
     let extension_files = get_extension_files(invocation, file_path);
     for (spec, name) in extension_files.iter().zip(extension_file_names.iter()) {
-        match load_file_as_table(&name, &spec.file_path, true).await {
+        match load_file_as_table(&name, &spec.file_path, true, None).await {
             Err(e) => {
                 data_access::release(&new_local_name).await;
                 let error = format!("{}", e);
@@ -173,7 +182,6 @@ async fn ensure_loaded(invocation: &PrivateSqlInvocation, file_path: &String, to
             },
             _ => ()
         };
-
     }
 
     Ok(new_local_name.clone())
@@ -217,8 +225,12 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation) -> Result<Data
     };
 
     let mut delete_local_names = vec!();
+    let delete_schema = PowdrrSchema::from(&vec!(
+        PowdrrField{ name: "_id".to_string(), data_type: PowdrrDataType::String },
+        PowdrrField{ name: "_seq_no".to_string(), data_type: PowdrrDataType::Integer },
+    ));
     for delete_file_path in required_files.delete_files {
-        let local_name = match ensure_loaded(invocation, &delete_file_path, 1, false).await {
+        let local_name = match ensure_loaded(invocation, &delete_file_path, 1, false, Some(delete_schema.clone())).await {
             Ok(ln) => ln,
             Err(e) => return log_err(PrivateApiError::from(e)),
         };
@@ -229,7 +241,7 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation) -> Result<Data
 
     let mut all_results: Vec<RecordBatch> = vec!();
     for iceberg_file in required_files.iceberg_files.iter() {
-        let local_name = match ensure_loaded(invocation, &iceberg_file.file_path, 1,true).await {
+        let local_name = match ensure_loaded(invocation, &iceberg_file.file_path, 1,true, None).await {
             Ok(ln) => ln,
             Err(e) => return Err(PrivateApiError::from(e)),
         };
@@ -244,40 +256,48 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation) -> Result<Data
         data_access::release(&local_name).await;
     }
     for speedboat_file in required_files.speedboat_files.iter() {
-        let local_name = match ensure_loaded(invocation, &speedboat_file.file_path, speedboat_file.size, false).await {
+        let local_name = match ensure_loaded(invocation, &speedboat_file.file_path, speedboat_file.size, false, Some(speedboat_file.schema.clone())).await {
             Ok(ln) => ln,
             Err(e) => {
                 return log_err(PrivateApiError::from(e))
             },
         };
-        let local_results = match execute_sql(&invocation.sql.build(&required_files.table_schema, &speedboat_file.schema), &local_name, &all_deletes_local_name).await {
+        let sql = invocation.sql.build(&required_files.table_schema, &speedboat_file.schema);
+        let local_results = match execute_sql(&sql, &local_name, &all_deletes_local_name).await {
             Ok(vrb) => vrb,
             Err(e) => return {
                 data_access::release(&local_name).await;
                 log_err(PrivateApiError::from(e))
             },
         };
+
         all_results.extend(local_results);
         data_access::release(&local_name).await;
     }
 
     data_access::drop(&all_deletes_local_name).await;
-         
-    let all_results_refs: Vec<&RecordBatch> = all_results.iter().map(|f| f).collect();
-    let total_num_rows = match all_results_refs.len() {
-        0 => 0,
-        _ => all_results.iter().map(|v| v.num_rows()).reduce(|l, r| l + r).unwrap()
-    };
-    // TODO: need to convert this whole thing into arrow flight
-    let buf = Vec::new();
-    let mut writer = arrow_json::LineDelimitedWriter::new(buf);
-    writer.write_batches(all_results_refs.as_slice()).unwrap();
-    writer.finish().unwrap();
-    
-    // Get the underlying buffer back,
-    let buf = writer.into_inner();
 
-    let result = String::from_utf8(buf).unwrap();
-
-    Ok(DataQueryResult { num: total_num_rows as u32, result: result })
+    let mut retval = Vec::new();
+    let all_results_ref = all_results.iter().map(|r|Ok(r.clone())).collect::<Vec<Result<RecordBatch, FlightError>>>();
+    let input_stream = futures::stream::iter(all_results_ref);
+    let mut flight_data_stream = FlightDataEncoderBuilder::new()
+        .build(input_stream);
+    while let Some(value) = flight_data_stream.next().await {
+        let mut buf = Vec::new();
+        match value {
+            Ok(v) => match v.encode(&mut buf) {
+                Ok(_) => (),
+                Err(e) => {
+                    let error = format!("Error encoding data: {:?}", e);
+                    panic!("{}", error);
+                },
+            }
+            Err(e) => {
+                let error = format!("Error streaming data: {:?}", e);
+                panic!("{}", error);
+            },
+        };
+        retval.push(buf);
+    }
+    Ok(DataQueryResult { num: 0, result: retval })
 }

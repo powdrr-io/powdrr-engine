@@ -49,12 +49,8 @@ pub fn private_v1_sql(mut state: State) -> Pin<Box<HandlerFuture>> {
         };
         let query_result = private_api::data_query(&invocation_obj).await;
         match query_result {
-            Ok(success) => {
-                let response_json = match serde_json::to_string(&success) {
-                    Ok(v) => v,
-                    Err(_) => panic!("This shouldn't happen"),
-                };
-                let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, response_json);
+            Ok(_success) => {
+                let res = create_response(&state, StatusCode::OK, mime::IMAGE_PNG, "TODO");
                 Ok((state, res))
             },
             Err(error) => {
@@ -285,9 +281,8 @@ pub(crate) mod tests {
     use std::sync::LazyLock;
 
     use gotham::mime;
-    use gotham::test::{Server, TestServer};
+    use gotham::test::TestServer;
     use serde_json::Value;
-    use crate::data_access;
     use crate::elastic_search_responses::{QueryResultTotal, QueryResults};
     use crate::router::router;
     use crate::schema_massager::{extract_powdrr_schema_str, PowdrrDataType, PowdrrField, PowdrrSchema, SqlBuilder, SqlExpression};
