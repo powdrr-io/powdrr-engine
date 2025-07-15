@@ -70,15 +70,16 @@ def _create_checkpoint_payload(index: str, files: List[str], sizes: List[int]) -
     return json.dumps(checkpoint_dict, indent=2)
 
 
-def _create_batch(base_id: int, batch_size: int) -> str:
+def _create_batch(base_id: int, batch_size: int, num_hits: int) -> str:
     values = []
-    values.append(
-        ITEM_TEMPLATE
-            .replace("{timestamp}", datetime.datetime.now().isoformat())
-            .replace("{index}", str(base_id))
-            .replace("{user_id}", "the_user")
-    )
-    for offset in range(batch_size - 1):
+    for _ in range(num_hits):
+        values.append(
+            ITEM_TEMPLATE
+                .replace("{timestamp}", datetime.datetime.now().isoformat())
+                .replace("{index}", str(base_id))
+                .replace("{user_id}", "the_user")
+        )
+    for offset in range(batch_size - num_hits):
         values.append(
             ITEM_TEMPLATE
                 .replace("{timestamp}", datetime.datetime.now().isoformat())
@@ -89,11 +90,11 @@ def _create_batch(base_id: int, batch_size: int) -> str:
     return "\n".join(values)
 
 
-def _create_files(base_index: int, num_files: int, num_records_per_file: int) -> Tuple[List[str], List[int]]:
+def _create_files(base_index: int, num_files: int, num_records_per_file: int, num_hits: int) -> Tuple[List[str], List[int]]:
     file_names = []
     sizes = []
     for file_num in range(num_files):
-        content = _create_batch(base_index + file_num * num_records_per_file, num_records_per_file)
+        content = _create_batch(base_index + file_num * num_records_per_file, num_records_per_file, num_hits)
         sizes.append(len(content))
 
         file_name = os.path.join(SCRIPT_DIR, "data_{}.json".format(file_num))
@@ -104,7 +105,8 @@ def _create_files(base_index: int, num_files: int, num_records_per_file: int) ->
     return (file_names, sizes)
 
 
-def main(port: int, num_files: int, num_records_per_file, num_processes: int):
+def main(port: int, num_files: int, num_records_per_file, num_hits: int):
+    num_processes = 1
     base_index = int(time.time() * 10000000)
 
     headers = {'Content-type': 'application/json'}
@@ -125,7 +127,7 @@ def main(port: int, num_files: int, num_records_per_file, num_processes: int):
         print("Create index failed")
 
 
-    files, sizes = _create_files(base_index, num_files, num_records_per_file)
+    files, sizes = _create_files(base_index, num_files, num_records_per_file, num_hits)
     checkpoint_payload = _create_checkpoint_payload("test_index1", files, sizes)
 
     response_create_index = requests.post(
@@ -152,6 +154,7 @@ def main(port: int, num_files: int, num_records_per_file, num_processes: int):
     print("****************************************************************************************")
 
     num = 1
+    all_times = []
     while True:
         time_before_search = time.time()
         search_response = requests.post(
@@ -163,7 +166,11 @@ def main(port: int, num_files: int, num_records_per_file, num_processes: int):
         print(search_response.text)
 
         time_current = time.time()
-        print("{}: Search #{} took {}ms".format(process_id, num, int((time_current - time_before_search)*1000)))
+        elapsed_time = int((time_current - time_before_search)*1000)
+        all_times.append(elapsed_time)
+        average = sum(all_times) / len(all_times)
+        print("{}: Search #{} took {}ms, average {}ms".format(process_id, num, elapsed_time, average))
+
         num += 1
 
 
