@@ -7,7 +7,7 @@ use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::{elastic_search_cluster_info, elastic_search_commands::LookupById, elastic_search_common::{execute_command, CommandContext, CommandResponse}, elastic_search_ingest, elastic_search_parser, elastic_search_pipeline, state_hosted_service::API_SERVICE_CLIENT};
+use crate::{elastic_search_cluster_info, elastic_search_commands::LookupById, elastic_search_common::{execute_command, CommandContext}, elastic_search_ingest, elastic_search_parser, elastic_search_pipeline, state_hosted_service::API_SERVICE_CLIENT};
 use crate::elastic_search_common::MIME_ES_JSON;
 
 #[derive(Deserialize, StateData, StaticResponseExtender)]

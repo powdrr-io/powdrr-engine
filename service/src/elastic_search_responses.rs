@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 
-use gotham::{hyper::StatusCode, mime, state::State};
-use gotham::helpers::http::response::create_response;
+use gotham::{hyper::StatusCode, mime};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::elastic_search_common::CommandResponse;
+use crate::elastic_search_common::ElasticSearchResponse;
 
 
 #[derive(Serialize, Clone)]
@@ -246,9 +245,14 @@ pub(crate) struct QueryResultsNotFound {
     pub found: bool,
 }
 
-impl CommandResponse for QueryResultsNotFound {
-    fn generate_response(&self, state: &State) -> gotham::hyper::Response<gotham::hyper::Body> {
-        create_response(state, StatusCode::NOT_FOUND, mime::APPLICATION_JSON, serde_json::to_string(self).unwrap())
+impl QueryResultsNotFound {
+    pub(crate) fn to_response(&self) -> ElasticSearchResponse {
+        ElasticSearchResponse {
+            status: StatusCode::OK,
+            mime: mime::APPLICATION_JSON,
+            body: serde_json::to_string(self).unwrap(),
+            headers: vec!()
+        }
     }
 }
 
@@ -303,13 +307,14 @@ impl QueryResults {
             aggregations: aggregations,
         }  
     }
-}
 
-
-
-impl CommandResponse for QueryResults {
-    fn generate_response(&self, state: &State) -> gotham::hyper::Response<gotham::hyper::Body> {
-        create_response(state, StatusCode::OK, mime::APPLICATION_JSON, serde_json::to_string(self).unwrap())
+    pub(crate) fn to_response(&self) -> ElasticSearchResponse {
+        ElasticSearchResponse {
+            status: StatusCode::OK,
+            mime: mime::APPLICATION_JSON,
+            body: serde_json::to_string(self).unwrap(),
+            headers: vec!()
+        }
     }
 }
 
@@ -318,9 +323,14 @@ pub(crate) struct QueryFailure {
     pub message: String
 }
 
-impl CommandResponse for QueryFailure {
-    fn generate_response(&self, state: &State) -> gotham::hyper::Response<gotham::hyper::Body> {
-        create_response(state, StatusCode::BAD_REQUEST, mime::TEXT_PLAIN, self.message.clone())
+impl QueryFailure {
+    pub(crate) fn to_response(&self) -> ElasticSearchResponse {
+        ElasticSearchResponse {
+            status: StatusCode::BAD_REQUEST,
+            mime: mime::TEXT_PLAIN,
+            body: self.message.clone(),
+            headers: vec!()
+        }
     }
 }
 
@@ -328,9 +338,14 @@ pub(crate) struct UpdateByQuerySuccess {
     pub result: UpdateByQueryResults
 }
 
-impl CommandResponse for UpdateByQuerySuccess {
-    fn generate_response(&self, state: &State) -> gotham::hyper::Response<gotham::hyper::Body> {
-        create_response(state, StatusCode::OK, mime::APPLICATION_JSON, serde_json::to_string(&self.result).unwrap())
+impl UpdateByQuerySuccess {
+    pub(crate) fn to_response(&self) -> ElasticSearchResponse {
+        ElasticSearchResponse {
+            status: StatusCode::OK,
+            mime: mime::APPLICATION_JSON,
+            body: serde_json::to_string(&self.result).unwrap(),
+            headers: vec!()
+        }
     }
 }
 
@@ -348,9 +363,14 @@ pub(crate) struct SingleDocResult {
 }
 
 
-impl CommandResponse for SingleDocResult {
-    fn generate_response(&self, state: &State) -> gotham::hyper::Response<gotham::hyper::Body> {
-        create_response(state, StatusCode::OK, mime::APPLICATION_JSON, serde_json::to_string(self).unwrap())
+impl SingleDocResult {
+    pub(crate) fn to_response(&self) -> ElasticSearchResponse {
+        ElasticSearchResponse {
+            status: StatusCode::OK,
+            mime: mime::APPLICATION_JSON,
+            body: serde_json::to_string(self).unwrap(),
+            headers: vec!()
+        }
     }
 }
 
@@ -395,10 +415,14 @@ impl ErrorDetails {
 }
 
 
-
-impl CommandResponse for ErrorDetails {
-    fn generate_response(&self, state: &State) -> gotham::hyper::Response<gotham::hyper::Body> {
-        create_response(state, StatusCode::OK, mime::APPLICATION_JSON, serde_json::to_string(self).unwrap())
+impl ErrorDetails {
+    pub(crate) fn to_response(&self) -> ElasticSearchResponse {
+        ElasticSearchResponse {
+            status: StatusCode::OK,
+            mime: mime::APPLICATION_JSON,
+            body: serde_json::to_string(self).unwrap(),
+            headers: vec!()
+        }
     }
 }
 

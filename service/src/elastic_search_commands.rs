@@ -1,5 +1,5 @@
 
-use std::{collections::HashMap, pin::Pin, sync::Arc};
+use std::{collections::HashMap, pin::Pin};
 use std::sync::LazyLock;
 use arrow_json::writer::LineDelimited;
 use arrow_json::WriterBuilder;
@@ -10,7 +10,7 @@ use gotham::mime;
 use http::StatusCode;
 use serde_json::Value;
 
-use crate::{data_access::{self, execute_sql}, distributed_cache, elastic_search_common::{Command, CommandResponse, ResultGeneratorFuture}, elastic_search_ingest::{self, WriteBuffer}, elastic_search_parser::ScriptBlock, elastic_search_responses::{QueryResultHit, QueryResults}, expression_evaluator, painless_parser, state_hosted_service::API_SERVICE_CLIENT, state_peers::SnapshotDescriptor};
+use crate::{data_access::{self, execute_sql}, distributed_cache, elastic_search_common::{Command, ResultGeneratorFuture}, elastic_search_ingest::{self, WriteBuffer}, elastic_search_parser::ScriptBlock, elastic_search_responses::{QueryResultHit, QueryResults}, expression_evaluator, painless_parser, state_hosted_service::API_SERVICE_CLIENT, state_peers::SnapshotDescriptor};
 use crate::elastic_search_common::ElasticSearchResponse;
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::elastic_search_parser::{process_aggregations, Aggregation};
@@ -18,10 +18,10 @@ use crate::elastic_search_responses::{AggregationResult, QueryResultsNotFound, U
 use crate::elastic_search_storage_schema::{RecordInput, WriteBufferBuilder};
 use crate::schema_massager::{to_powdrr_schema, PowdrrSchema, SqlBuilder, SqlExpression, SqlQuery};
 
-async fn empty_result(aggs: Option<Vec<Aggregation>>, total_hits_complex: bool) -> Arc<dyn CommandResponse> {
+async fn empty_result(aggs: Option<Vec<Aggregation>>, total_hits_complex: bool) -> ElasticSearchResponse {
     // TODO: need to record and feed through the requested number of shards from index creation
     let aggregation_results = SqlCommand::generate_aggregations(None, aggs, None).await;
-    Arc::new(QueryResults::empty(50, 1, aggregation_results, total_hits_complex))
+    QueryResults::empty(50, 1, aggregation_results, total_hits_complex).to_response()
 }
 
 
@@ -122,22 +122,21 @@ impl Command for LookupById {
             let result = match LookupById::to_dataframe(result_table_name).await {
                 Some(df) => {
                     let (hits, _) = to_hits(&table, &df, Some(true)).await;
-                    let inner_result: Arc<dyn CommandResponse> = if hits.len() == 0 {
-                        Arc::new(QueryResultsNotFound { _index: table, _id: ids.get(0).unwrap().clone(), found: false })
+                    let inner_result: ElasticSearchResponse = if hits.len() == 0 {
+                        (QueryResultsNotFound { _index: table, _id: ids.get(0).unwrap().clone(), found: false }).to_response()
                     } else {
                         assert_eq!(hits.len(), 1);
-                        let response = ElasticSearchResponse {
+                        ElasticSearchResponse {
                             status: StatusCode::OK,
                             mime: mime::APPLICATION_JSON,
                             body: serde_json::to_string(hits.get(0).unwrap()).unwrap(),
                             headers: vec![],
-                        };
-                        Arc::new(response)
+                        }
                     };
                     inner_result
                 },
                 None => {
-                    Arc::new(QueryResultsNotFound { _index: table, _id: ids.get(0).unwrap().clone(), found: false })
+                    (QueryResultsNotFound { _index: table, _id: ids.get(0).unwrap().clone(), found: false }).to_response()
                 }
             };
             Ok(result)
@@ -185,6 +184,7 @@ static SEARCH_COLUMNS: LazyLock<Vec<String>> = LazyLock::new(|| vec!(
 
 impl SqlCommand {
     async fn get_final_table_name(public_table_name: &String, temp_table_name: &String, calculate_score: bool) -> String {
+        let final_table_name = format!("{temp_table_name}_final");
         if calculate_score {
             let initial_data_frame = match execute_sql(&format!("select * from {temp_table_name}")).await {
                 Ok(df) => df,
@@ -196,7 +196,7 @@ impl SqlCommand {
                 Err(_) => panic!("nope"),
             };
 
-            let mut column_names = initial_data_frame.schema().columns().iter().map(|c|format!("\"{}\"", c.name()).to_string()).collect::<Vec<String>>();
+            let mut column_names = initial_data_frame.schema().columns().iter().map(|c| format!("\"{}\"", c.name()).to_string()).collect::<Vec<String>>();
             column_names.retain(|c| !SEARCH_COLUMNS.contains(c));
             let column_names_joined = column_names.join(", ");
 
@@ -210,16 +210,13 @@ impl SqlCommand {
             let constant_b = 0.75;
             let avgdl = 5.6;
 
-            let final_table_name = format!("{temp_table_name}_final");
             let bm25_sql = format!("CREATE TABLE {final_table_name} AS SELECT {column_names_joined}, ln(({total_records} - {records_with_term} + 0.5)/({records_with_term} + 0.5) + 1) * (term_cnt * ({constant_k} + 1)) / (term_cnt + {constant_k} * (1 - {constant_b} + ({constant_b} * word_cnt / {avgdl}))) as score FROM {temp_table_name} order by score desc");
             let _sql_data_frame = match execute_sql(&bm25_sql).await {
                 Ok(df) => df,
                 Err(_) => panic!("nope"),
             };
-            final_table_name.clone()
-        } else {
-            temp_table_name.clone()
         }
+        final_table_name.clone()
     }
     
     async fn generate_aggregations(schema: Option<PowdrrSchema>, aggs: Option<Vec<Aggregation>>, table_name: Option<String>) -> Option<HashMap<String, AggregationResult>> {
@@ -271,7 +268,7 @@ impl Command for SqlCommand {
 
             let (hits, schema) = to_hits(&table, &first_n_rows, None).await;
 
-            let aggregations = SqlCommand::generate_aggregations(schema, aggs, Some(final_table_name)).await;
+            let aggregations = SqlCommand::generate_aggregations(schema, aggs, Some(final_table_name.clone())).await;
             // TODO: need to calculate the actual max score here
             let max_score = hits.get(0).unwrap()._score;
             let final_result = QueryResults::success(
@@ -282,9 +279,9 @@ impl Command for SqlCommand {
                 hits,
                 aggregations,
                 !query_params.rest_total_hits_as_int.unwrap_or_else(|| false),
-            );
-
-            Ok(Arc::new(final_result))
+            ).to_response();
+            data_access::drop(&final_table_name).await;
+            Ok(final_result)
         }.boxed()
     }
 
@@ -346,7 +343,7 @@ impl UpdateByQueryResult {
         self.update_count + self.delete_count + self.noop_count
     }
     
-    async fn commit(&mut self) -> Result<Arc<dyn CommandResponse>, String> {
+    async fn commit(&mut self) -> Result<ElasticSearchResponse, String> {
         // TODO: ideally this would write all the files once and do a single commit to the service.
         if self.update_buffer.records.len() != 0 {
             match elastic_search_ingest::commit_general(&self.update_buffer.build(), &self.table, &"commit".to_string()).await {
@@ -365,7 +362,7 @@ impl UpdateByQueryResult {
             self.noop_count,
             1,
             self.debug.clone()
-        ))
+        ).to_response())
     }
 }
 
@@ -413,12 +410,12 @@ impl UpdateByQueryCommand {
         }
     }
 
-    fn empty_result() -> Arc<dyn CommandResponse> {
+    fn empty_result() -> UpdateByQuerySuccess {
         UpdateByQueryCommand::success(0, 0, 0, 0, 0, None)
     }
 
-    fn success(total: u64, updated: u64, deleted: u64, noops: u64, batches: u64, debug_data: Option<Vec<Value>>) -> Arc<dyn CommandResponse> {
-        Arc::new(UpdateByQuerySuccess{ result: UpdateByQueryResults{
+    fn success(total: u64, updated: u64, deleted: u64, noops: u64, batches: u64, debug_data: Option<Vec<Value>>) -> UpdateByQuerySuccess {
+       UpdateByQuerySuccess{ result: UpdateByQueryResults{
             took: 0,
             timed_out: false,
             total: total,
@@ -436,7 +433,7 @@ impl UpdateByQueryCommand {
             throttled_until_millis: 0,
             failures: vec![],
             debug: debug_data,
-        }})
+        }}
     }
 
     async fn create_final_result(table: &String, final_values: Vec<EvalResult>) -> UpdateByQueryResult {
@@ -494,7 +491,7 @@ impl Command for UpdateByQueryCommand {
         async move {
             let table_name = match result_table_name {
                 Some(t) => t,
-                None => return Ok(UpdateByQueryCommand::empty_result())
+                None => return Ok(UpdateByQueryCommand::empty_result().to_response())
             };
             let final_table_name = SqlCommand::get_final_table_name(&table, &table_name, calculate_score).await;
             let data_frame = match execute_sql(&format!("select * from {final_table_name}")).await {
@@ -507,6 +504,7 @@ impl Command for UpdateByQueryCommand {
             let final_result_values: Vec<EvalResult> = result_values.iter().map(|x|UpdateByQueryCommand::evaluate(&table, &script_block, x)).collect();
 
             let mut result_info = UpdateByQueryCommand::create_final_result(&table, final_result_values).await;
+            data_access::drop(&final_table_name).await;
             result_info.commit().await
         }.boxed()
     }

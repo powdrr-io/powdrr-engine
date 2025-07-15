@@ -388,3 +388,10 @@ pub(crate) async fn exists(path: &String) -> bool {
         Path::new(path).exists()
     }
 }
+
+pub(crate) async fn drop(table_name: &String) -> () {
+    match DATA_FUSION_CONTEXT.sql(format!("DROP TABLE IF EXISTS {};", table_name).as_str()).await {
+        Ok(_) => (),
+        Err(e) => panic!("Failed to drop table {}: {}", table_name, e)   
+    }   
+}
