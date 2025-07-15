@@ -10,12 +10,12 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::error::ArrowError;
 use futures::future::try_join_all;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{Body, Response};
 use gotham::mime::Mime;
 use gotham::state::State;
 use http::{HeaderName, StatusCode};
 use serde_json::{Map, Value};
-use crate::data_access::{execute_sql, load_memtable};
+use crate::data_access;
+use crate::data_access::{create_table, load_memtable};
 use crate::elastic_search_responses::QueryFailure;
 use crate::schema_massager::SqlQuery;
 use crate::state_peers::{self, PeerClient, PeerClientError, PrivateSqlInvocation, SnapshotDescriptor};
@@ -44,12 +44,6 @@ impl Display for ParseError {
 
 impl Error for ParseError {}
 
-
-pub(crate) trait CommandResponse {
-    fn generate_response(&self, state: &State) -> Response<Body>;
-}
-
-
 pub(crate) struct ElasticSearchResponse {
     pub status: StatusCode, 
     pub mime: Mime, 
@@ -61,8 +55,8 @@ unsafe impl Send for ElasticSearchResponse {}
 unsafe impl Sync for ElasticSearchResponse {}
 
 
-impl CommandResponse for ElasticSearchResponse {
-    fn generate_response(&self, state: &State) -> gotham::hyper::Response<gotham::hyper::Body> {
+impl ElasticSearchResponse {
+    pub(crate) fn generate_response(&self, state: &State) -> gotham::hyper::Response<gotham::hyper::Body> {
         let mut response = create_response(state, self.status.clone(), self.mime.clone(), self.body.clone());
         if self.headers.len() != 0 {
             let response_headers = response.headers_mut();
@@ -75,7 +69,7 @@ impl CommandResponse for ElasticSearchResponse {
 }
 
 
-pub type ResultGeneratorFuture = dyn Future<Output = Result<Arc<dyn CommandResponse>, String>> + Send;
+pub type ResultGeneratorFuture = dyn Future<Output = Result<ElasticSearchResponse, String>> + Send;
 
 #[async_trait]
 pub(crate) trait Command: Send + Sync {
@@ -177,10 +171,13 @@ async fn call_peers_and_load_results(
 
     let final_name = format!("{table_name}_dedup");
 
-    match execute_sql(&format!("create table {final_name} as select distinct on (_id) * from {table_name} order by _id, _version desc")).await {
+    let result = match create_table(&final_name, &format!("select distinct on (_id) * from {table_name} order by _id, _version desc")).await {
         Ok(_) => Ok(Some(final_name)),
         Err(e) => Err(PeerClientError{ message: e.message().to_string() })
-    }
+    };
+
+    data_access::drop(&table_name).await;
+    result
 }
 
 
@@ -192,15 +189,17 @@ pub async fn load_command_raw_result(_context: CommandContext, command: Arc<dyn 
 }
 
 
-pub async fn execute_command(_context: CommandContext, command: Arc<dyn Command>) -> Arc<dyn CommandResponse> {
+pub async fn execute_command(_context: CommandContext, command: Arc<dyn Command>) -> ElasticSearchResponse {
     let result_table_name = match load_command_raw_result(_context, command.clone()).await {
         Ok(t) => t,
-        Err(_) => return Arc::new(QueryFailure{ message: "Failed".to_string() }),
+        Err(_) => return QueryFailure{ message: "Failed".to_string() }.to_response(),
     };         
-    let response = match command.result_generator(result_table_name).await {
-        Ok(d) => d,
-        Err(_e) => return Arc::new(QueryFailure{ message: "Failed".to_string() }),
-    };
+    let response = command.result_generator(result_table_name.clone()).await.unwrap_or_else(|_e| {
+        QueryFailure { message: "Failed".to_string() }.to_response()
+    });
+    if result_table_name.is_some() {
+        data_access::drop(result_table_name.as_ref().unwrap()).await;
+    }
     response
 }
 

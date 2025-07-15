@@ -43,6 +43,7 @@ fn create_session() -> SessionContext {
 }
 
 
+#[allow(dead_code)]
 enum CacheTrackerActorMessage {
     Reserve {
         respond_to: oneshot::Sender<()>,
@@ -54,7 +55,19 @@ enum CacheTrackerActorMessage {
         respond_to: oneshot::Sender<()>,
         top_level_name: String,
     },
+    TableCreated {
+        respond_to: oneshot::Sender<()>,
+        table_name: String,
+    },
+    TableDropped {
+        respond_to: oneshot::Sender<()>,
+        table_name: String,
+    },
+    GetTables {
+        respond_to: oneshot::Sender<Vec<String>>,
+    }
 }
+
 
 struct HeapSizeTracker {
     size: u64,
@@ -73,6 +86,7 @@ struct CacheTrackerActor {
     related: HashMap<String, Vec<String>>,
     reservations: HashMap<String, u64>,
     top_level_to_delete: Vec<String>,
+    existing_tables: Vec<String>,
 }
 
 impl CacheTrackerActor {
@@ -82,7 +96,8 @@ impl CacheTrackerActor {
             lru_cache: LruCache::new(2 * 1024 * 1024),
             related: HashMap::new(),
             reservations: HashMap::new(),
-            top_level_to_delete: vec!()
+            top_level_to_delete: vec!(),
+            existing_tables: vec!(),
         }
     }
 
@@ -109,8 +124,10 @@ impl CacheTrackerActor {
 
     async fn drop(&mut self, name: &String) -> () {
         let _ = DATA_FUSION_CONTEXT.sql(format!("DROP TABLE IF EXISTS {};", name).as_str()).await;
-        println!("Dropped table {} from cache", name);
+        // assert!(self.existing_tables.contains(&name));
+        self.existing_tables.retain(|n| n != name);
         self.reservations.remove(name);
+        assert!(self.existing_tables.len() >= self.reservations.len());
     }
 
     #[allow(unused_assignments)]
@@ -193,6 +210,20 @@ impl CacheTrackerActor {
                     self.related.remove(&top_level_name);
                 }
                 let _ = respond_to.send(());
+            },
+            CacheTrackerActorMessage::TableCreated { respond_to, table_name } => {
+                if !self.existing_tables.contains(&table_name) {
+                    self.existing_tables.push(table_name.clone());
+                }
+                let _ = respond_to.send(());
+            },
+            CacheTrackerActorMessage::TableDropped { respond_to, table_name } => {
+                assert!(self.existing_tables.contains(&table_name));
+                self.existing_tables.retain(|name| name != &table_name);
+                let _ = respond_to.send(());
+            },
+            CacheTrackerActorMessage::GetTables { respond_to } => {
+                let _ = respond_to.send(self.existing_tables.clone());
             }
         }
     }
@@ -243,6 +274,42 @@ impl LRUCacheHandle {
         // TODO: deal with errors
         recv.await.expect("Actor task has been killed")
     }
+
+    async fn table_created(&self, table_name: &String) -> () {
+        let (send, recv) = oneshot::channel();
+        let msg = CacheTrackerActorMessage::TableCreated {
+            respond_to: send,
+            table_name: table_name.clone(),
+        };
+
+        let _ = self.sender.send(msg).await;
+        // TODO: deal with errors
+        recv.await.expect("Actor task has been killed")
+    }
+
+    async fn table_dropped(&self, table_name: &String) -> () {
+        let (send, recv) = oneshot::channel();
+        let msg = CacheTrackerActorMessage::TableDropped {
+            respond_to: send,
+            table_name: table_name.clone(),
+        };
+
+        let _ = self.sender.send(msg).await;
+        // TODO: deal with errors
+        recv.await.expect("Actor task has been killed")
+    }
+
+    #[allow(dead_code)]
+    async fn get_tables(&self) -> Vec<String> {
+        let (send, recv) = oneshot::channel();
+        let msg = CacheTrackerActorMessage::GetTables {
+            respond_to: send,
+        };
+
+        let _ = self.sender.send(msg).await;
+        // TODO: deal with errors
+        recv.await.expect("Actor task has been killed")
+    }
 }
 
 
@@ -274,10 +341,12 @@ async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> 
         STORED AS PARQUET
         LOCATION '{file_path_var}';"#);
         loop {
+            LRU_CACHE_HANDLE.table_created(local_name_var).await;
             match DATA_FUSION_CONTEXT.sql(&query_str).await {
                 Err(e) => {
                     println!("Transient s3 error? {}", e);
                     let _ = DATA_FUSION_CONTEXT.sql(format!("DROP TABLE IF EXISTS {local_name_var};").as_str()).await;
+                    LRU_CACHE_HANDLE.table_dropped(local_name_var).await;
                 },
                 _ => return Ok(())
             }
@@ -287,12 +356,16 @@ async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> 
         match result {
             Err(e) => {
                 if e.message().contains("already exists") {
+                    LRU_CACHE_HANDLE.table_created(local_name).await;
                     Ok(())
                 } else {
                     log_err(e)
                 }
             },
-            _ => Ok(())
+            _ => {
+                LRU_CACHE_HANDLE.table_created(local_name).await;
+                Ok(())
+            }
         }
     }
 }
@@ -305,7 +378,8 @@ async fn load_json_file_as_table(file_path: &String, local_name: &String) -> Res
             false => ()
         },
         Err(e) => return log_err(e),
-    };     
+    };
+    LRU_CACHE_HANDLE.table_created(local_name).await;
     match DATA_FUSION_CONTEXT.register_json(local_name, file_path, NdJsonReadOptions::default()).await {
         Ok(_) => Ok(()),
         Err(e) => {
@@ -332,12 +406,12 @@ pub(crate) async fn load_file_as_table(new_local_name: &String, file_path: &Stri
     if parquet {
         match load_parquet_file_as_table(&file_path, &new_local_name).await {
             Err(e) => return log_err(e),
-            Ok(_) => println!("Loaded parquet table {} from {}", new_local_name, file_path)
+            Ok(_) => ()
         }
     } else {
         match load_json_file_as_table(file_path, &new_local_name).await {
             Err(e) => return log_err(e),
-            Ok(_) => println!("Loaded json table {} from {}", new_local_name, file_path)
+            Ok(_) => ()
         }
     }
     Ok(())
@@ -357,6 +431,7 @@ pub(crate) async fn load_memtable(records: &Vec<RecordBatch>) -> Result<String, 
         match DATA_FUSION_CONTEXT.table_exist(result_table_name) {
             Ok(exists) => {
                 if !exists {
+                    LRU_CACHE_HANDLE.table_created(result_table_name).await;
                     match DATA_FUSION_CONTEXT.register_table(result_table_name, table) {
                         Ok(_) => return Ok(result_table_name.clone()),
                         Err(e) => return log_err(e)
@@ -370,6 +445,21 @@ pub(crate) async fn load_memtable(records: &Vec<RecordBatch>) -> Result<String, 
 
 
 pub(crate) async fn execute_sql(sql: &String) -> Result<DataFrame, DataFusionError> {
+    assert!(!sql.to_lowercase().contains("create table"), "Use the create_table function instead");
+    assert!(!sql.to_lowercase().contains("drop table"), "Use the drop function instead");
+    private_execute_sql(sql).await
+}
+
+
+pub(crate) async fn create_table(table_name: &String, sql: &String) -> Result<(), DataFusionError> {
+    LRU_CACHE_HANDLE.table_created(table_name).await;
+    match private_execute_sql(&format!("CREATE TABLE {} AS {}", table_name, sql)).await {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+async fn private_execute_sql(sql: &String) -> Result<DataFrame, DataFusionError> {
     match DATA_FUSION_CONTEXT.sql(sql).await {
         Ok(d) => Ok(d),
         Err(e) => log_err(e)
@@ -387,4 +477,17 @@ pub(crate) async fn exists(path: &String) -> bool {
     } else {
         Path::new(path).exists()
     }
+}
+
+pub(crate) async fn drop(table_name: &String) -> () {
+    LRU_CACHE_HANDLE.table_dropped(table_name).await;
+    match DATA_FUSION_CONTEXT.sql(format!("DROP TABLE IF EXISTS {};", table_name).as_str()).await {
+        Ok(_) => (),
+        Err(e) => panic!("Failed to drop table {}: {}", table_name, e)
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) async fn get_tables() -> Vec<String> {
+    LRU_CACHE_HANDLE.get_tables().await
 }
