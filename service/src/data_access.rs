@@ -109,7 +109,6 @@ impl CacheTrackerActor {
 
     async fn drop(&mut self, name: &String) -> () {
         let _ = DATA_FUSION_CONTEXT.sql(format!("DROP TABLE IF EXISTS {};", name).as_str()).await;
-        println!("Dropped table {} from cache", name);
         self.reservations.remove(name);
     }
 
@@ -332,12 +331,12 @@ pub(crate) async fn load_file_as_table(new_local_name: &String, file_path: &Stri
     if parquet {
         match load_parquet_file_as_table(&file_path, &new_local_name).await {
             Err(e) => return log_err(e),
-            Ok(_) => println!("Loaded parquet table {} from {}", new_local_name, file_path)
+            Ok(_) => ()
         }
     } else {
         match load_json_file_as_table(file_path, &new_local_name).await {
             Err(e) => return log_err(e),
-            Ok(_) => println!("Loaded json table {} from {}", new_local_name, file_path)
+            Ok(_) => ()
         }
     }
     Ok(())
@@ -392,6 +391,6 @@ pub(crate) async fn exists(path: &String) -> bool {
 pub(crate) async fn drop(table_name: &String) -> () {
     match DATA_FUSION_CONTEXT.sql(format!("DROP TABLE IF EXISTS {};", table_name).as_str()).await {
         Ok(_) => (),
-        Err(e) => panic!("Failed to drop table {}: {}", table_name, e)   
-    }   
+        Err(e) => panic!("Failed to drop table {}: {}", table_name, e)
+    }
 }

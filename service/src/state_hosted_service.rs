@@ -842,11 +842,8 @@ impl TestApiServiceClient {
             assert_eq!(new_speedboat_metadata.files.len(), new_speedboat_metadata.sizes.len());
             assert_eq!(new_speedboat_metadata.files.len(), new_speedboat_metadata.file_schemas.len());
 
-            let total_records: u64 = new_speedboat_metadata.sizes.iter().sum();
-            tracing::info!("Speedboat commit {} has {} files with {} records", new_checkpoint_id, new_speedboat_metadata.files.len(), total_records);
-            for file in &new_speedboat_metadata.files {
-                tracing::info!("Speedboat file {}", file)
-            }
+            let total_size: u64 = new_speedboat_metadata.sizes.iter().sum();
+            tracing::info!("Speedboat commit {} has {} files with total size {}", new_checkpoint_id, new_speedboat_metadata.files.len(), total_size);
 
             let mut merged_schema = latest_checkpoint.schema.clone();
             if table_info.schema.is_some() {

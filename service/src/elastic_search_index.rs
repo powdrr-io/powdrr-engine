@@ -32,9 +32,17 @@ fn is_string_type(data_type: &DataType) -> bool {
 }
 
 
+async fn drop_all(tables: &Vec<String>) -> () {
+    for table in tables {
+        data_access::drop(table).await;
+    }
+}
+
+
 async fn create_index_worker(table_name: &String, doc_id_field_name: &String, target_file_path: &String) -> Result<(), IndexError> {
     let new_local_name = table_name;
     let doc_id_field_name_local = doc_id_field_name;
+    let mut created_tables = vec!();
 
     let raw_table = match execute_sql(&format!("select * from {new_local_name}").to_string()).await {
         Err(e) => return Err(IndexError::from(e)),
@@ -62,28 +70,43 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
         },
         _ => ()
     };
+    created_tables.push(format!("{new_local_name}_fields"));
 
     match execute_sql(&format!("CREATE TABLE {new_local_name}_split AS SELECT doc_id, field_name, string_to_array(field_value, ' ') as field_terms from {new_local_name}_fields")).await {
-        Err(e) => return Err(IndexError::from(e)),
-        _ => ()
-    };    
-
-    match execute_sql(&format!("CREATE TABLE {new_local_name}_split_unnest AS SELECT doc_id, field_name, unnest(field_terms) as field_term from {new_local_name}_split")).await {
-        Err(e) => return Err(IndexError::from(e)),
+        Err(e) => {
+            drop_all(&created_tables).await;
+            return Err(IndexError::from(e))
+        },
         _ => ()
     };
+    created_tables.push(format!("{new_local_name}_split"));
+
+    match execute_sql(&format!("CREATE TABLE {new_local_name}_split_unnest AS SELECT doc_id, field_name, unnest(field_terms) as field_term from {new_local_name}_split")).await {
+        Err(e) => {
+            drop_all(&created_tables).await;
+            return Err(IndexError::from(e))
+        },
+        _ => ()
+    };
+    created_tables.push(format!("{new_local_name}_split_unnest"));
 
     match execute_sql(&format!("CREATE TABLE {new_local_name}_term_frequency AS SELECT doc_id, field_name, doc_id || '_' || field_name as doc_id_field_name, field_term, count(1) as term_cnt from {new_local_name}_split_unnest group by doc_id, field_name, field_term")).await {
         Err(e)  => {
+            drop_all(&created_tables).await;
             return Err(IndexError::from(e))
         },
         _ => ()
     }; 
+    created_tables.push(format!("{new_local_name}_term_frequency"));
 
     match execute_sql(&format!("CREATE TABLE {new_local_name}_field_size AS SELECT doc_id, field_name, doc_id || '_' || field_name as doc_id_field_name, array_length(field_terms) as word_cnt from {new_local_name}_split")).await {
-        Err(e) => return Err(IndexError::from(e)),
+        Err(e) => {
+            drop_all(&created_tables).await;
+            return Err(IndexError::from(e))
+        },
         _ => ()
     }; 
+    created_tables.push(format!("{new_local_name}_field_size"));
 
     // TODO: need to think about multiple term search still
     // TODO: can you search multiple fields at once?
@@ -98,14 +121,17 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
 
     match execute_sql(&format!("CREATE TABLE {new_local_name}_joined AS SELECT tf.doc_id, tf.field_name, tf.field_term, tf.term_cnt, fs.word_cnt from {new_local_name}_term_frequency tf INNER JOIN {new_local_name}_field_size fs ON tf.doc_id_field_name = fs.doc_id_field_name WHERE tf.term_cnt > 0")).await {
         Err(e) => {
+            drop_all(&created_tables).await;
             return Err(IndexError::from(e))
         },
         _ => ()
-    };     
+    };
+    created_tables.push(format!("{new_local_name}_joined"));
 
     if target_file_path.starts_with("s3:") {
         let joined_table = match execute_sql(&format!("SELECT * FROM {new_local_name}_joined").to_string()).await {
             Err(e) => {
+                drop_all(&created_tables).await;
                 return Err(IndexError::from(e))
             },
             Ok(tft) => tft,
@@ -116,6 +142,7 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
             DataFrameWriteOptions::new().with_single_file_output(true),
             None).await {
             Err(e) => {
+                drop_all(&created_tables).await;
                 return Err(IndexError::from(e))
             },
             _ => (),
@@ -123,6 +150,7 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
     } else {
         let joined_table = match execute_sql(&format!("SELECT * FROM {new_local_name}_joined").to_string()).await {
             Err(e) => {
+                drop_all(&created_tables).await;
                 return Err(IndexError::from(e))
             },
             Ok(tft) => tft,
@@ -133,13 +161,14 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
             DataFrameWriteOptions::new().with_single_file_output(true),
             None).await {
             Err(e) => {
+                drop_all(&created_tables).await;
                 return Err(IndexError::from(e))
             },
             _ => (),
         };
+
     }
-    
-    // TODO: make sure to drop all tables
+    drop_all(&created_tables).await;
     Ok(())
 
 }

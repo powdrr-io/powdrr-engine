@@ -248,7 +248,7 @@ pub(crate) struct QueryResultsNotFound {
 impl QueryResultsNotFound {
     pub(crate) fn to_response(&self) -> ElasticSearchResponse {
         ElasticSearchResponse {
-            status: StatusCode::OK,
+            status: StatusCode::NOT_FOUND,
             mime: mime::APPLICATION_JSON,
             body: serde_json::to_string(self).unwrap(),
             headers: vec!()
@@ -364,6 +364,7 @@ pub(crate) struct SingleDocResult {
 
 
 impl SingleDocResult {
+    #[allow(dead_code)]
     pub(crate) fn to_response(&self) -> ElasticSearchResponse {
         ElasticSearchResponse {
             status: StatusCode::OK,
@@ -416,6 +417,7 @@ impl ErrorDetails {
 
 
 impl ErrorDetails {
+    #[allow(dead_code)]
     pub(crate) fn to_response(&self) -> ElasticSearchResponse {
         ElasticSearchResponse {
             status: StatusCode::OK,

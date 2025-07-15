@@ -526,6 +526,7 @@ async fn get_existing_docs(index: &String, doc_ids: &Vec<String>) -> Result<Exis
                 };
 
                 let (docs, schema) = to_serde_value(&df).await;
+                data_access::drop(&raw_table).await;
                 ExistingDocs{ docs, schema }
             },
             None => ExistingDocs{ docs: vec!(), schema: None }

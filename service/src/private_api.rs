@@ -260,6 +260,8 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation) -> Result<Data
         all_results.extend(local_results);
         data_access::release(&local_name).await;
     }
+
+    data_access::drop(&all_deletes_local_name).await;
          
     let all_results_refs: Vec<&RecordBatch> = all_results.iter().map(|f| f).collect();
     let total_num_rows = match all_results_refs.len() {

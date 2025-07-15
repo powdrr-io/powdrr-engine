@@ -215,6 +215,11 @@ impl SqlCommand {
                 Ok(df) => df,
                 Err(_) => panic!("nope"),
             };
+        } else {
+            match execute_sql(&format!("CREATE TABLE {final_table_name} AS SELECT * from {temp_table_name};")).await {
+                Ok(_) => (),
+                Err(_) => panic!("nope"),
+            };
         }
         final_table_name.clone()
     }
