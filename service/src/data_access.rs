@@ -1,6 +1,7 @@
 use std::{path::Path, sync::Arc};
 use datafusion::{arrow::array::RecordBatch, error::DataFusionError, prelude::{DataFrame, NdJsonReadOptions, ParquetReadOptions, SessionContext}};
 use datafusion::arrow::datatypes::Schema;
+use datafusion::arrow::error::ArrowError;
 use datafusion::common::HashMap;
 use idgenerator::IdInstance;
 use lru_mem::{HeapSize, LruCache, TryInsertError};
@@ -371,7 +372,6 @@ async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> 
     }
 }
 
-
 async fn load_json_file_as_table(file_path: &String, local_name: &String, schema: &Schema) -> Result<(), DataFusionError> {
     match DATA_FUSION_CONTEXT.table_exist(local_name) {
         Ok(exists) => match exists {
@@ -420,7 +420,39 @@ pub(crate) async fn load_file_as_table(new_local_name: &String, file_path: &Stri
     Ok(())
 }
 
+
+pub(crate) async fn load_json_as_memtable(file_path: &String, local_name: &String, schema: &Schema) -> Result<(), DataFusionError> {
+    let final_file_path = if file_path.starts_with("file://") {
+        file_path.replace("file://", "")
+    } else {
+        file_path.clone()
+    };
+
+    let file_contents = match std::fs::read(final_file_path) {
+        Ok(c) => c,
+        Err(_) => panic!("Could not read file {}", file_path)
+    };
+
+    let json_reader = match arrow_json::ReaderBuilder::new(Arc::new(schema.clone())).build(file_contents.as_slice()) {
+        Ok(d) => d,
+        Err(_) => panic!("Private API returned result that does not match schema")
+    };
+
+    let record_batches: Vec<RecordBatch> = match json_reader.collect() {
+        Ok(batches) => batches,
+        Err(e) => return log_err(DataFusionError::ArrowError(e, None))
+    };
+
+    load_memtable_with_name(local_name, &record_batches).await
+}
+
 pub(crate) async fn load_memtable(records: &Vec<RecordBatch>) -> Result<String, DataFusionError> {
+    let result_table_name = format!("table_{}", IdInstance::next_id().to_string());
+    load_memtable_with_name(&result_table_name, records).await?;
+    Ok(result_table_name)
+}
+
+pub(crate) async fn load_memtable_with_name(result_table_name: &String, records: &Vec<RecordBatch>) -> Result<(), DataFusionError> {
     if records.len() == 0 {
         panic!("Do not call this if you have no records");
     }
@@ -430,15 +462,16 @@ pub(crate) async fn load_memtable(records: &Vec<RecordBatch>) -> Result<String, 
         Err(e) => return log_err(e),
     };
     loop {
-        let result_table_name = &format!("table_{}", IdInstance::next_id().to_string());
         match DATA_FUSION_CONTEXT.table_exist(result_table_name) {
             Ok(exists) => {
                 if !exists {
                     LRU_CACHE_HANDLE.table_created(result_table_name).await;
                     match DATA_FUSION_CONTEXT.register_table(result_table_name, table) {
-                        Ok(_) => return Ok(result_table_name.clone()),
+                        Ok(_) => return Ok(()),
                         Err(e) => return log_err(e)
                     }
+                } else {
+                    return Ok(())
                 }
             },
             Err(e) => return log_err(e)
