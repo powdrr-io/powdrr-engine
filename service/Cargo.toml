@@ -10,12 +10,11 @@ edition.workspace = true
 
 
 [dependencies]
-arrow-flight = "54.3.1"
-arrow-json = "54.3.1"
+arrow-flight = "55.2"
+arrow-json = "55.2"
 async-trait = "0.1.88"
-bytes = "1.10.1"
 chrono = "0.4.41"
-datafusion = "46.0.0"
+datafusion = "47"
 flamegraph = "0.6.8"
 futures = "0.3.31"
 futures-util = "0.3.31"
@@ -25,7 +24,7 @@ iceberg_lib = { path = "../iceberg_lib" }
 idgenerator = "2.0.0"
 lru-mem = "0.3.0"
 minijinja = "2.10.2"
-object_store = { version = "0.11.2", features = ["aws", "gcp", "azure", "http"] }
+object_store = { version = "0.12.3", features = ["aws", "gcp", "azure", "http"] }
 prost = "0.13.5"
 redis = "0.30.0"
 reqwest = { version = "0.12.14", features = ["json", "blocking"] }

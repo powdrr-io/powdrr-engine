@@ -6,6 +6,7 @@ use arrow_schema::ArrowError;
 use futures::{future::try_join_all, FutureExt, TryStreamExt};
 use iceberg::{arrow::arrow_schema_to_schema, table::Table, writer::{base_writer::data_file_writer::DataFileWriterBuilder, file_writer::{location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator}, ParquetWriterBuilder}, IcebergWriter, IcebergWriterBuilder}, Catalog, NamespaceIdent, TableCreation, TableIdent};
 use iceberg::io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY};
+use iceberg::transaction::ApplyTransactionAction;
 use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use idgenerator::{IdGeneratorOptions, IdInstance};
 use parquet::{arrow::arrow_reader::ParquetRecordBatchReaderBuilder, file::properties::WriterProperties};
@@ -135,20 +136,11 @@ async fn append_iceberg_table(
     };
 
     let tx = iceberg::transaction::Transaction::new(&table);
-    let mut action = tx.fast_append_with_properties(
-        None, 
-        vec![],
-        HashMap::from([("compaction".to_string(), compaction_id.clone())])).unwrap();
-    match action.add_data_files(data_files.clone()) {
-        Ok(_) => (),
-        Err(e) => {
-            let error = format!("{}", e);
-            println!("{}", error);
-            return Err(e)               
-        }
-    }
+    let mut action = tx.fast_append();
+    action = action.set_snapshot_properties(HashMap::from([("compaction".to_string(), compaction_id.clone())]));
+    action = action.add_data_files(data_files.clone());
     let catalog = REST_CATALOG.clone();
-    action.apply().await.unwrap().commit(catalog.as_ref()).await.unwrap();
+    action.apply(tx)?.commit(catalog.as_ref()).await?;
 
     Ok(())
 }
