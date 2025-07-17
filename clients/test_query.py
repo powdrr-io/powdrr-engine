@@ -105,41 +105,42 @@ def _create_files(base_index: int, num_files: int, num_records_per_file: int, nu
     return (file_names, sizes)
 
 
-def main(port: int, num_files: int, num_records_per_file, num_hits: int):
+def main(do_setup: bool, port: int, num_files: int, num_records_per_file, num_hits: int):
     num_processes = 1
-    base_index = int(time.time() * 10000000)
-
     headers = {'Content-type': 'application/json'}
 
-    response = requests.put("http://localhost:{}/_test/v1/_testing_and_processing_mode".format(port))
-    if response.status_code != 200:
-        raise Exception("Failed to put into test mode")
+    if do_setup:
+        base_index = int(time.time() * 10000000)
 
-    response_create_index = requests.put(
-        "http://localhost:{}/test_index1".format(port),
-        data=CREATE_INDEX,
-        headers=headers
-    )
+        response = requests.put("http://localhost:{}/_test/v1/_testing_and_processing_mode".format(port))
+        if response.status_code != 200:
+            raise Exception("Failed to put into test mode")
 
-    print("Create Index Response:")
-    print(response_create_index.text)
-    if response_create_index.status_code != 200:
-        print("Create index failed")
+        response_create_index = requests.put(
+            "http://localhost:{}/test_index1".format(port),
+            data=CREATE_INDEX,
+            headers=headers
+        )
+
+        print("Create Index Response:")
+        print(response_create_index.text)
+        if response_create_index.status_code != 200:
+            print("Create index failed")
 
 
-    files, sizes = _create_files(base_index, num_files, num_records_per_file, num_hits)
-    checkpoint_payload = _create_checkpoint_payload("test_index1", files, sizes)
+        files, sizes = _create_files(base_index, num_files, num_records_per_file, num_hits)
+        checkpoint_payload = _create_checkpoint_payload("test_index1", files, sizes)
 
-    response_create_index = requests.post(
-        "http://localhost:{}/_test/v1/_add_checkpoint".format(port),
-        data=checkpoint_payload,
-        headers=headers
-    )
+        response_create_index = requests.post(
+            "http://localhost:{}/_test/v1/_add_checkpoint".format(port),
+            data=checkpoint_payload,
+            headers=headers
+        )
 
-    print("Create Checkpoint Response, status = {} :".format(response_create_index.status_code))
-    print(response_create_index.text)
-    if response_create_index.status_code != 200:
-        print("Create Checkpoint failed")
+        print("Create Checkpoint Response, status = {} :".format(response_create_index.status_code))
+        print(response_create_index.text)
+        if response_create_index.status_code != 200:
+            print("Create Checkpoint failed")
 
     process_id = 0
     for index in range(num_processes - 1):
@@ -163,7 +164,7 @@ def main(port: int, num_files: int, num_records_per_file, num_hits: int):
         if search_response.status_code != 200:
             raise Exception("Search failed: {}".format(search_response.text))
 
-        print(search_response.text)
+        # print(search_response.text)
 
         time_current = time.time()
         elapsed_time = int((time_current - time_before_search)*1000)
@@ -176,6 +177,7 @@ def main(port: int, num_files: int, num_records_per_file, num_hits: int):
 
 if __name__ == "__main__":
     main(
+        sys.argv[4] == "true",
         9200,
         int(sys.argv[1]),
         int(sys.argv[2]),

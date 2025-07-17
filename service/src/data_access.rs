@@ -1,8 +1,9 @@
 use std::{path::Path, sync::Arc};
 use datafusion::{arrow::array::RecordBatch, error::DataFusionError, prelude::{DataFrame, NdJsonReadOptions, ParquetReadOptions, SessionContext}};
 use datafusion::arrow::datatypes::Schema;
-use datafusion::arrow::error::ArrowError;
 use datafusion::common::HashMap;
+use datafusion::config::ConfigOptions;
+use datafusion::prelude::SessionConfig;
 use idgenerator::IdInstance;
 use lru_mem::{HeapSize, LruCache, TryInsertError};
 use object_store::{aws::{AmazonS3, AmazonS3Builder}, ObjectStore};
@@ -35,7 +36,12 @@ static S3_FILE_STORE: std::sync::LazyLock<Arc<AmazonS3>> = std::sync::LazyLock::
 
 
 fn create_session() -> SessionContext {
-    let ctx = SessionContext::new();
+    let options = ConfigOptions::default();
+    // UNCOMMENT TO ENABLE 'SHOW TABLES'
+    //options.set("datafusion.catalog.information_schema", "true").unwrap();
+
+    let config = SessionConfig::from(options);
+    let ctx = SessionContext::new_with_config(config);
 
     let s3_url = Url::parse("s3://icebergdata").unwrap();  
 
@@ -421,6 +427,7 @@ pub(crate) async fn load_file_as_table(new_local_name: &String, file_path: &Stri
 }
 
 
+#[allow(dead_code)]
 pub(crate) async fn load_json_as_memtable(file_path: &String, local_name: &String, schema: &Schema) -> Result<(), DataFusionError> {
     let final_file_path = if file_path.starts_with("file://") {
         file_path.replace("file://", "")
@@ -524,6 +531,18 @@ pub(crate) async fn drop(table_name: &String) -> () {
 }
 
 #[allow(dead_code)]
-pub(crate) async fn get_tables() -> Vec<String> {
+pub(crate) async fn get_tracked_tables() -> Vec<String> {
     LRU_CACHE_HANDLE.get_tables().await
+}
+
+pub(crate) async fn print_datafusion_tables() -> () {
+    let table_df = match DATA_FUSION_CONTEXT.sql("show tables;").await {
+        Ok(df) => df,
+        Err(e) => {
+            let error = format!("{}", e);
+            panic!("Failed to show tables: {}", e)
+        }
+    };
+
+    table_df.show().await.unwrap();
 }

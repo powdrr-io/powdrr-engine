@@ -1,0 +1,12 @@
+{
+    "query": {
+      "bool": {
+        "must": [
+            { "term" :
+              {"user_id": "the_user"}
+            }
+        ]
+      }
+    }
+}
+
