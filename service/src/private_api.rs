@@ -10,8 +10,8 @@ use idgenerator::IdInstance;
 use prost::Message;
 
 use crate::data_access::{self, load_file_as_table};
-use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
-use crate::state_peers::PrivateSqlInvocation;
+use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema, SqlQuery};
+use crate::state_peers::{PrivateCompactionInvocation, PrivateSqlInvocation};
 use crate::state_hosted_service::*;
 use crate::util::{add_file_suffix, log_err};
 
@@ -60,7 +60,9 @@ struct FileDescriptor {
 struct RequiredFiles {
     table_schema: PowdrrSchema,
     iceberg_files: Vec<FileDescriptor>,
+    iceberg_file_extensions: Vec<Vec<ExtensionFileSpec>>,
     speedboat_files: Vec<FileDescriptor>,
+    speedboat_file_extensions: Vec<Vec<ExtensionFileSpec>>,
     delete_files: Vec<String>,
 }
 
@@ -129,9 +131,30 @@ async fn determine_required_files(invocation: &PrivateSqlInvocation) -> Result<R
     Ok(RequiredFiles {
         table_schema: table_metadata.schema.clone(),
         iceberg_files: filtered_iceberg_files.to_vec(),
+        iceberg_file_extensions: filtered_iceberg_files.iter().map(|_|vec!()).collect(),
         speedboat_files: filtered_speedboat_files.to_vec(),
+        speedboat_file_extensions: filtered_speedboat_files.iter().map(|f|get_extension_files(invocation, &f.file_path)).collect(),
         delete_files: table_metadata.deletes_metadata.map_or_else(|| vec!(), |d|d.files.clone()),
     })
+}
+
+fn generate_required_files(invocation: &PrivateCompactionInvocation) -> RequiredFiles {
+    let speedboat_files = invocation.speedboat_files.iter().zip(invocation.file_schemas.iter()).enumerate().map(
+        |(index, (file_path, schema_index))| FileDescriptor{
+            file_path: file_path.clone(),
+            schema: invocation.schemas.get(*schema_index as usize).unwrap().clone(),
+            size: 1,
+        }
+    ).collect::<Vec<FileDescriptor>>();
+    
+    RequiredFiles {
+        table_schema: invocation.table_schema.clone(),
+        iceberg_files: vec![],
+        iceberg_file_extensions: vec![],
+        speedboat_files,
+        speedboat_file_extensions: vec![],
+        delete_files: invocation.delete_files.clone(),
+    }
 }
 
 
@@ -149,14 +172,13 @@ fn get_extension_files(invocation: &PrivateSqlInvocation, file_path: &String) ->
 
 
 async fn ensure_loaded(
-    invocation: &PrivateSqlInvocation,
     file_path: &String,
+    extension_files: &Vec<ExtensionFileSpec>,
     top_level_size: u64,
     parquet: bool,
     schema: Option<PowdrrSchema>
 ) -> Result<String, DataFusionError> {
     let new_local_name = data_access::path_to_table_name(file_path);
-    let extension_files = get_extension_files(invocation, file_path);
     let extension_file_names = extension_files.iter().map(|e| format!("{}_{}", &new_local_name, e.suffix)).collect::<Vec<String>>();
     // TODO: add in extension file sizes
     let total_size = top_level_size;
@@ -172,7 +194,6 @@ async fn ensure_loaded(
         Ok(nln) => nln,
     };
 
-    let extension_files = get_extension_files(invocation, file_path);
     for (spec, name) in extension_files.iter().zip(extension_file_names.iter()) {
         match load_file_as_table(&name, &spec.file_path, true, None).await {
             Err(e) => {
@@ -219,12 +240,18 @@ async fn create_all_deletes_table(local_names: &Vec<String>) -> Result<String, P
 }
 
 
-async fn process_iceberg_file(invocation: &PrivateSqlInvocation, iceberg_file: &FileDescriptor, table_schema: &PowdrrSchema, deletes_table_name: &String) -> Result<Vec<RecordBatch>, PrivateApiError> {
-    let local_name = match ensure_loaded(invocation, &iceberg_file.file_path, 1,true, None).await {
+async fn process_iceberg_file(
+    sql: &SqlQuery,
+    iceberg_file: &FileDescriptor,
+    iceberg_file_extensions: &Vec<ExtensionFileSpec>,
+    table_schema: &PowdrrSchema,
+    deletes_table_name: &String
+) -> Result<Vec<RecordBatch>, PrivateApiError> {
+    let local_name = match ensure_loaded(&iceberg_file.file_path, iceberg_file_extensions,1,true, None).await {
         Ok(ln) => ln,
         Err(e) => return Err(PrivateApiError::from(e)),
     };
-    let local_results = match execute_sql(&invocation.sql.build(table_schema, &iceberg_file.schema), &local_name, deletes_table_name).await {
+    let local_results = match execute_sql(&sql.build(table_schema, &iceberg_file.schema), &local_name, deletes_table_name).await {
         Ok(vrb) => vrb,
         Err(e) => {
             data_access::release(&local_name).await;
@@ -235,14 +262,20 @@ async fn process_iceberg_file(invocation: &PrivateSqlInvocation, iceberg_file: &
     Ok(local_results)
 }
 
-async fn process_speedboat_file(invocation: &PrivateSqlInvocation, speedboat_file: &FileDescriptor, table_schema: &PowdrrSchema, deletes_table_name: &String) -> Result<Vec<RecordBatch>, PrivateApiError> {
-    let local_name = match ensure_loaded(invocation, &speedboat_file.file_path, speedboat_file.size, false, Some(speedboat_file.schema.clone())).await {
+async fn process_speedboat_file(
+    sql: &SqlQuery,
+    speedboat_file: &FileDescriptor,
+    speedboat_file_extensions: &Vec<ExtensionFileSpec>,
+    table_schema: &PowdrrSchema,
+    deletes_table_name: &String
+) -> Result<Vec<RecordBatch>, PrivateApiError> {
+    let local_name = match ensure_loaded(&speedboat_file.file_path, speedboat_file_extensions, speedboat_file.size, false, Some(speedboat_file.schema.clone())).await {
         Ok(ln) => ln,
         Err(e) => {
             return log_err(PrivateApiError::from(e))
         },
     };
-    let sql = invocation.sql.build(table_schema, &speedboat_file.schema);
+    let sql = sql.build(table_schema, &speedboat_file.schema);
     let local_results = match execute_sql(&sql, &local_name, &deletes_table_name).await {
         Ok(vrb) => vrb,
         Err(e) => return {
@@ -261,13 +294,32 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation) -> Result<Data
         Err(e) => return log_err(e),
     };
 
+    data_query_worker(
+        &invocation.sql,
+        &required_files,
+    ).await
+}
+
+
+pub(crate) async fn compaction_query(invocation: PrivateCompactionInvocation) -> Result<DataQueryResult, PrivateApiError> {
+    let required_files = generate_required_files(&invocation);
+    
+    data_query_worker(
+        &invocation.sql,
+        &required_files
+    ).await
+}
+
+
+async fn data_query_worker(sql: &SqlQuery, required_files: &RequiredFiles) -> Result<DataQueryResult, PrivateApiError> {
     let mut delete_local_names = vec!();
     let delete_schema = PowdrrSchema::from(&vec!(
         PowdrrField{ name: "_id".to_string(), data_type: PowdrrDataType::String },
         PowdrrField{ name: "_seq_no".to_string(), data_type: PowdrrDataType::Integer },
     ));
-    for delete_file_path in required_files.delete_files {
-        let local_name = match ensure_loaded(invocation, &delete_file_path, 1, false, Some(delete_schema.clone())).await {
+    let extension_file_vecs = vec!();
+    for delete_file_path in required_files.delete_files.iter() {
+        let local_name = match ensure_loaded(&delete_file_path, &extension_file_vecs, 1, false, Some(delete_schema.clone())).await {
             Ok(ln) => ln,
             Err(e) => return log_err(PrivateApiError::from(e)),
         };
@@ -276,10 +328,10 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation) -> Result<Data
     // TODO: need to make a stable name here and skip this if it is already loaded
     let all_deletes_local_name = create_all_deletes_table(&delete_local_names).await?;
 
-    let iceberg_calls = required_files.iceberg_files.iter().map(
-        |iceberg_file| process_iceberg_file(&invocation, iceberg_file, &required_files.table_schema, &all_deletes_local_name));
-    let speedboat_calls = required_files.speedboat_files.iter().map(
-        |speedboat_file| process_speedboat_file(&invocation, speedboat_file, &required_files.table_schema, &all_deletes_local_name));
+    let iceberg_calls = required_files.iceberg_files.iter().zip(required_files.iceberg_file_extensions.iter()).map(
+        |(iceberg_file, iceberg_file_extensions)| process_iceberg_file(sql, iceberg_file, iceberg_file_extensions, &required_files.table_schema, &all_deletes_local_name));
+    let speedboat_calls = required_files.speedboat_files.iter().zip(required_files.speedboat_file_extensions.iter()).map(
+        |(speedboat_file, speedboat_file_extensions)| process_speedboat_file(sql, speedboat_file, speedboat_file_extensions, &required_files.table_schema, &all_deletes_local_name));
 
     let iceberg_results: Vec<Result<RecordBatch, FlightError>> = match try_join_all(iceberg_calls).await {
         Ok(ar) => ar.iter().flatten().map(|x|Ok(x.clone())).collect::<Vec<Result<RecordBatch, FlightError>>>(),

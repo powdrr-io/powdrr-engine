@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{private_api::data_query, state_common::FileFilter, state_leader};
 use crate::elastic_search_common::result_to_record_batch;
-use crate::schema_massager::SqlQuery;
+use crate::schema_massager::{PowdrrSchema, SqlQuery};
 
 #[derive(Serialize, Deserialize)]
 pub struct FieldFileFilterDescriptor {
@@ -33,6 +33,19 @@ pub(crate) struct PrivateSqlInvocation {
     pub required_extensions: Vec<String>,
     pub file_filter: Vec<FileFilterDescriptor>,
     pub snapshots: Vec<SnapshotDescriptor>,
+    pub index: u64,
+    pub num: u64,
+}
+
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct PrivateCompactionInvocation {
+    pub sql: SqlQuery,
+    pub speedboat_files: Vec<String>,
+    pub schemas: Vec<PowdrrSchema>,
+    pub file_schemas: Vec<u64>,
+    pub table_schema: PowdrrSchema,
+    pub delete_files: Vec<String>,
     pub index: u64,
     pub num: u64,
 }

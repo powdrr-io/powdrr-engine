@@ -769,8 +769,8 @@ pub(crate) async fn delete(index: &String, doc_id: &String) -> Result<ElasticSea
         Err(_) => panic!("Need to convert to an ingest error")
     };
     let mut buffer = WriteBuffer::new();
-    // TODO: need to include a version or timestamp in the delete
-    buffer.lines.push(serde_json::to_string(&create_delete(doc_id, seq_no)).unwrap());
+    let target_seq_no = docs.docs[0].get("_seq_no").unwrap().as_i64().unwrap();
+    buffer.lines.push(serde_json::to_string(&create_delete(doc_id, target_seq_no)).unwrap());
     commit_general(&buffer, &table_description.name, &"delete".to_string()).await?;
     Ok(ElasticSearchResponse { status: StatusCode::OK, mime: mime::APPLICATION_JSON, body: "deleted!".to_string(), headers: vec!() })
 }
