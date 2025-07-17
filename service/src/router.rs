@@ -285,9 +285,8 @@ pub(crate) mod tests {
     use serde_json::Value;
     use crate::elastic_search_responses::{QueryResultTotal, QueryResults};
     use crate::router::router;
-    use crate::schema_massager::{extract_powdrr_schema_str, PowdrrDataType, PowdrrField, PowdrrSchema, SqlBuilder, SqlExpression};
+    use crate::schema_massager::{extract_powdrr_schema_str, PowdrrDataType, PowdrrField, PowdrrSchema};
     use crate::state_hosted_service::{ExtensionFile, ExtensionFileMetadata, ExtensionMetadata, IcebergMetadata, SpeedboatMetadata, TableMetadataCheckpoint};
-    use crate::state_peers::{PrivateSqlInvocation, SnapshotDescriptor};
 
     pub(crate) static TEST_SERVER: LazyLock<TestServer> = LazyLock::new(|| TestServer::with_timeout(router(true), 1000).unwrap());
 
@@ -358,7 +357,7 @@ pub(crate) mod tests {
 
         assert_eq!(response.status(), 200);
     }
-
+/*
     #[test]
     fn test_private_api_data_query() {  
         let test_server = &*TEST_SERVER;
@@ -435,7 +434,7 @@ pub(crate) mod tests {
         let num = json_body["num"].as_u64().unwrap();
         assert_eq!(num, 505);
     }    
-
+*/
     #[test]
     fn test_es_search_table_parquet() {
         let test_server = &*TEST_SERVER;

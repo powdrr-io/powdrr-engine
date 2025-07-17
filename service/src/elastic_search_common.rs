@@ -4,13 +4,18 @@ use std::fmt::Display;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
+use arrow_flight::decode::FlightRecordBatchStream;
+use arrow_flight::error::FlightError;
+use arrow_flight::FlightData;
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use futures::future::try_join_all;
+use futures_util::{stream, StreamExt};
 use gotham::helpers::http::response::create_response;
 use gotham::mime::Mime;
 use gotham::state::State;
 use http::{HeaderName, StatusCode};
+use prost::Message;
 use serde_json::{Map, Value};
 use crate::data_access;
 use crate::data_access::{create_table, load_memtable};
@@ -226,6 +231,23 @@ pub fn create_denormalized_value(value: &Value) -> Value {
     create_denormalized_value_worker(&mut new_map, &"".to_string(), value);
 
     Value::from(new_map)
+}
+
+
+pub(crate) async fn result_to_record_batch(result: Vec<Vec<u8>>) -> Vec<RecordBatch> {
+    let mut retval = Vec::new();
+    let flight_data = result.iter().map(|x|Ok(FlightData::decode(&x[..]).unwrap())).collect::<Vec<Result<FlightData, FlightError>>>();
+    let mut record_batch_stream = FlightRecordBatchStream::new_from_flight_data(stream::iter(flight_data));
+    while let Some(batch) = record_batch_stream.next().await {
+        match batch {
+            Ok(batch) => retval.push(batch),
+            Err(e) => {
+                let error = format!("Error: {}", e);
+                panic!("{}", error);
+            }
+        };
+    }
+    retval
 }
 
 

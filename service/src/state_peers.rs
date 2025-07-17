@@ -1,16 +1,12 @@
 use std::{error::Error, fmt::Display};
-use arrow_flight::decode::FlightRecordBatchStream;
-use arrow_flight::error::FlightError;
-use arrow_flight::FlightData;
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
-use futures_util::{stream, StreamExt};
 use gotham::test::TestServer;
-use prost::Message;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::{private_api::data_query, state_common::FileFilter, state_leader};
+use crate::elastic_search_common::result_to_record_batch;
 use crate::schema_massager::SqlQuery;
 
 #[derive(Serialize, Deserialize)]
@@ -190,19 +186,7 @@ impl PeerClient for SelfPeer {
         let query_result = data_query(invocation).await;
         match query_result {
             Ok(qr) => {
-                let mut retval = Vec::new();
-                let flight_data = qr.result.iter().map(|x|Ok(FlightData::decode(&x[..]).unwrap())).collect::<Vec<Result<FlightData, FlightError>>>();
-                let mut record_batch_stream = FlightRecordBatchStream::new_from_flight_data(stream::iter(flight_data));
-                while let Some(batch) = record_batch_stream.next().await {
-                    match batch {
-                        Ok(batch) => retval.push(batch),
-                        Err(e) => {
-                            let error = format!("Error: {}", e);
-                            panic!("{}", error);
-                        }
-                    };
-                }
-                Ok(retval)
+                Ok(result_to_record_batch(qr.result).await)
             },
             Err(e) => {
                 Err(PeerClientError { message: e.message })

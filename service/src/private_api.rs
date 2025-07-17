@@ -270,7 +270,6 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation) -> Result<Data
                 log_err(PrivateApiError::from(e))
             },
         };
-
         all_results.extend(local_results);
         data_access::release(&local_name).await;
     }

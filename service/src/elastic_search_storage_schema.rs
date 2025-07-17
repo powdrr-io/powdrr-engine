@@ -123,8 +123,6 @@ impl WriteBufferBuilder {
         self.records.iter_mut().for_each(|r| r.ensure_normalized_value());
         let input_schemas = self.records.iter().map(|v|extract_powdrr_schema_option(&v.existing_normalized)).collect::<Vec<PowdrrSchema>>();
         let merged_schema = PowdrrSchema::merge_all(input_schemas);
-        let powdrr_fields = merged_schema.fields.iter().map(|f| format!("{:?}", f)).collect::<Vec<String>>();
-        println!("{:?}", powdrr_fields);
         self.records.iter_mut().for_each(|r| merged_schema.coerce_value_option(&mut r.existing_normalized));
 
         let final_records = self.records.iter().map(|r| r.to_record()).collect::<Vec<Value>>();
