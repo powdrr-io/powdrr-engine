@@ -635,6 +635,7 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
     let docs = get_existing_docs(&table_description.name, &vec!(doc_id.to_string())).await?;
 
     let mut buffer = WriteBufferBuilder::new();
+    let mut delete_buffer = WriteBuffer::new();
     let result = if docs.docs.len() != 0 {
         assert_eq!(docs.docs.len(), 1);
         if update_request.doc.is_none() {
@@ -656,6 +657,7 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
         updated_doc.ensure_source();
         updated_doc.ensure_normalized_value();
         buffer.records.push(updated_doc.clone());
+        delete_buffer.lines.push(create_delete(existing_doc.id(), existing_doc.seq_no()).to_string());
         OperationResult{
             _index: table_description.name.clone(),
             _id: existing_doc.id().clone(),
@@ -717,6 +719,7 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
     };
 
     commit(&buffer.build(), &table_description.name).await?;
+    commit_general(&delete_buffer, &&table_description.name, &"delete".to_string()).await?;
     let headers = vec!((LOCATION, format!("/{}/_doc/{}", table_description.name, url_escape::encode_userinfo(doc_id))));
     Ok(ElasticSearchResponse {
         status: StatusCode::CREATED,

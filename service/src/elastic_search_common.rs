@@ -18,7 +18,7 @@ use http::{HeaderName, StatusCode};
 use prost::Message;
 use serde_json::{Map, Value};
 use crate::data_access;
-use crate::data_access::{create_table, load_memtable};
+use crate::data_access::load_memtable;
 use crate::elastic_search_responses::QueryFailure;
 use crate::schema_massager::SqlQuery;
 use crate::state_peers::{self, PeerClient, PeerClientError, PrivateSqlInvocation, SnapshotDescriptor};
@@ -159,15 +159,7 @@ async fn call_peers_and_load_results(
         Err(e) => return Err(PeerClientError{ message: e.message().to_string() })
     };
 
-    let final_name = format!("{table_name}_dedup");
-
-    let result = match create_table(&final_name, &format!("select distinct on (_id) * from {table_name} order by _id, _version desc")).await {
-        Ok(_) => Ok(Some(final_name)),
-        Err(e) => Err(PeerClientError{ message: e.message().to_string() })
-    };
-
-    data_access::drop(&table_name).await;
-    result
+    Ok(Some(table_name))
 }
 
 

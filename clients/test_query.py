@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import json
+import gc
 
 import requests
 
@@ -171,7 +172,7 @@ def main(do_setup: bool, port: int, num_files: int, num_records_per_file, num_hi
         all_times.append(elapsed_time)
         average = sum(all_times) / len(all_times)
         print("{}: Search #{} took {}ms, average {}ms".format(process_id, num, elapsed_time, average))
-
+        gc.collect()
         num += 1
 
 

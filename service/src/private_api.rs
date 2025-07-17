@@ -1,6 +1,5 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::{error::Error, fmt};
-use std::future::Future;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use datafusion::arrow::array::RecordBatch;
@@ -11,7 +10,6 @@ use idgenerator::IdInstance;
 use prost::Message;
 
 use crate::data_access::{self, load_file_as_table};
-use crate::elastic_search_common::call_private_sql_and_load;
 use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
 use crate::state_peers::PrivateSqlInvocation;
 use crate::state_hosted_service::*;
