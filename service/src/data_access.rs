@@ -535,11 +535,11 @@ pub(crate) async fn get_tracked_tables() -> Vec<String> {
     LRU_CACHE_HANDLE.get_tables().await
 }
 
+#[allow(dead_code)]
 pub(crate) async fn print_datafusion_tables() -> () {
     let table_df = match DATA_FUSION_CONTEXT.sql("show tables;").await {
         Ok(df) => df,
         Err(e) => {
-            let error = format!("{}", e);
             panic!("Failed to show tables: {}", e)
         }
     };

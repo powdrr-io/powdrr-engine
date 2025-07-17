@@ -325,10 +325,10 @@ pub(crate) struct UpdateByQueryCommand {
 
 
 enum EvalResult {
-    Update(RecordInput),
+    Update(RecordInput, i64),
     Noop,
     #[allow(dead_code)]
-    Delete((String, i64)),
+    Delete(String, i64),
 }
 
 struct UpdateByQueryResult {
@@ -395,12 +395,15 @@ impl UpdateByQueryCommand {
                     Err(_) => panic!("nope"),
                 };
 
-                EvalResult::Update(RecordInput::new(
-                    value.id().clone(),
-                    seq_no,
-                    value.version() + 1,
-                    &output.source,
-                ))
+                EvalResult::Update(
+                        RecordInput::new(
+                        value.id().clone(),
+                        seq_no,
+                        value.version() + 1,
+                        &output.source,
+                    ),
+                    value.seq_no(),
+                )
             },
             "noop" => {
                 EvalResult::Noop
@@ -453,11 +456,12 @@ impl UpdateByQueryCommand {
                 EvalResult::Noop => {
                     noop_count += 1;
                 },
-                EvalResult::Delete((doc_id, seq_no)) => {
+                EvalResult::Delete(doc_id, seq_no) => {
                     delete_buffer.push(serde_json::to_string(&elastic_search_ingest::create_delete(&doc_id, seq_no)).unwrap());
                     delete_count += 1;
                 },
-                EvalResult::Update(value) => {
+                EvalResult::Update(value, seq_no) => {
+                    delete_buffer.push(serde_json::to_string(&elastic_search_ingest::create_delete(value.id(), seq_no)).unwrap());
                     update_buffer.records.push(value);
                     update_count += 1;
                 }
