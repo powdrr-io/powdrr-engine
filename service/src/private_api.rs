@@ -1,14 +1,17 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::{error::Error, fmt};
+use std::future::Future;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::error::DataFusionError;
+use futures_util::future::try_join_all;
 use futures_util::StreamExt;
 use idgenerator::IdInstance;
 use prost::Message;
 
 use crate::data_access::{self, load_file_as_table};
+use crate::elastic_search_common::call_private_sql_and_load;
 use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
 use crate::state_peers::PrivateSqlInvocation;
 use crate::state_hosted_service::*;
@@ -218,6 +221,42 @@ async fn create_all_deletes_table(local_names: &Vec<String>) -> Result<String, P
 }
 
 
+async fn process_iceberg_file(invocation: &PrivateSqlInvocation, iceberg_file: &FileDescriptor, table_schema: &PowdrrSchema, deletes_table_name: &String) -> Result<Vec<RecordBatch>, PrivateApiError> {
+    let local_name = match ensure_loaded(invocation, &iceberg_file.file_path, 1,true, None).await {
+        Ok(ln) => ln,
+        Err(e) => return Err(PrivateApiError::from(e)),
+    };
+    let local_results = match execute_sql(&invocation.sql.build(table_schema, &iceberg_file.schema), &local_name, deletes_table_name).await {
+        Ok(vrb) => vrb,
+        Err(e) => {
+            data_access::release(&local_name).await;
+            return log_err(PrivateApiError::from(e))
+        },
+    };
+    data_access::release(&local_name).await;
+    Ok(local_results)
+}
+
+async fn process_speedboat_file(invocation: &PrivateSqlInvocation, speedboat_file: &FileDescriptor, table_schema: &PowdrrSchema, deletes_table_name: &String) -> Result<Vec<RecordBatch>, PrivateApiError> {
+    let local_name = match ensure_loaded(invocation, &speedboat_file.file_path, speedboat_file.size, false, Some(speedboat_file.schema.clone())).await {
+        Ok(ln) => ln,
+        Err(e) => {
+            return log_err(PrivateApiError::from(e))
+        },
+    };
+    let sql = invocation.sql.build(table_schema, &speedboat_file.schema);
+    let local_results = match execute_sql(&sql, &local_name, &deletes_table_name).await {
+        Ok(vrb) => vrb,
+        Err(e) => return {
+            data_access::release(&local_name).await;
+            log_err(PrivateApiError::from(e))
+        },
+    };
+    data_access::release(&local_name).await;
+    Ok(local_results)
+}
+
+
 pub(crate) async fn data_query(invocation: &PrivateSqlInvocation) -> Result<DataQueryResult, PrivateApiError> {
     let required_files = match determine_required_files(invocation).await {
         Ok(rf) => rf,
@@ -237,48 +276,35 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation) -> Result<Data
         delete_local_names.push(local_name);
     }
     // TODO: need to make a stable name here and skip this if it is already loaded
-    let all_deletes_local_name = create_all_deletes_table(&delete_local_names).await?;     
+    let all_deletes_local_name = create_all_deletes_table(&delete_local_names).await?;
 
-    let mut all_results: Vec<RecordBatch> = vec!();
-    for iceberg_file in required_files.iceberg_files.iter() {
-        let local_name = match ensure_loaded(invocation, &iceberg_file.file_path, 1,true, None).await {
-            Ok(ln) => ln,
-            Err(e) => return Err(PrivateApiError::from(e)),
-        };
-        let local_results = match execute_sql(&invocation.sql.build(&required_files.table_schema, &iceberg_file.schema), &local_name, &all_deletes_local_name).await {
-            Ok(vrb) => vrb,
-            Err(e) => {
-                data_access::release(&local_name).await;
-                return log_err(PrivateApiError::from(e))
-            },
-        };
-        all_results.extend(local_results);
-        data_access::release(&local_name).await;
-    }
-    for speedboat_file in required_files.speedboat_files.iter() {
-        let local_name = match ensure_loaded(invocation, &speedboat_file.file_path, speedboat_file.size, false, Some(speedboat_file.schema.clone())).await {
-            Ok(ln) => ln,
-            Err(e) => {
-                return log_err(PrivateApiError::from(e))
-            },
-        };
-        let sql = invocation.sql.build(&required_files.table_schema, &speedboat_file.schema);
-        let local_results = match execute_sql(&sql, &local_name, &all_deletes_local_name).await {
-            Ok(vrb) => vrb,
-            Err(e) => return {
-                data_access::release(&local_name).await;
-                log_err(PrivateApiError::from(e))
-            },
-        };
-        all_results.extend(local_results);
-        data_access::release(&local_name).await;
-    }
+    let iceberg_calls = required_files.iceberg_files.iter().map(
+        |iceberg_file| process_iceberg_file(&invocation, iceberg_file, &required_files.table_schema, &all_deletes_local_name));
+    let speedboat_calls = required_files.speedboat_files.iter().map(
+        |speedboat_file| process_speedboat_file(&invocation, speedboat_file, &required_files.table_schema, &all_deletes_local_name));
+
+    let iceberg_results: Vec<Result<RecordBatch, FlightError>> = match try_join_all(iceberg_calls).await {
+        Ok(ar) => ar.iter().flatten().map(|x|Ok(x.clone())).collect::<Vec<Result<RecordBatch, FlightError>>>(),
+        Err(e) => {
+            let error = format!("{}", e.message);
+            println!("{}", error);
+            panic!("dude")
+        },
+    };
+
+    let speedboat_results: Vec<Result<RecordBatch, FlightError>> = match try_join_all(speedboat_calls).await {
+        Ok(ar) => ar.iter().flatten().map(|x|Ok(x.clone())).collect::<Vec<Result<RecordBatch, FlightError>>>(),
+        Err(e) => {
+            let error = format!("{}", e.message);
+            println!("{}", error);
+            panic!("dude")
+        },
+    };    
 
     data_access::drop(&all_deletes_local_name).await;
 
     let mut retval = Vec::new();
-    let all_results_ref = all_results.iter().map(|r|Ok(r.clone())).collect::<Vec<Result<RecordBatch, FlightError>>>();
-    let input_stream = futures::stream::iter(all_results_ref);
+    let input_stream = futures::stream::iter(iceberg_results).chain(futures::stream::iter(speedboat_results));
     let mut flight_data_stream = FlightDataEncoderBuilder::new()
         .build(input_stream);
     while let Some(value) = flight_data_stream.next().await {
