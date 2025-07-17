@@ -687,8 +687,10 @@ fn do_remove(removed_files: &Vec<String>, files: &mut Vec<String>, sizes: &mut V
 
 #[derive(Clone)]
 pub(crate) struct CompactionWorkItem {
-    pub files: Vec<String>,
+    pub speedboat_files: Vec<String>,
+    pub iceberg_files: Vec<String>,
     pub sizes: Vec<u64>,
+    pub delete_files: Vec<String>,
 }
 
 
@@ -880,15 +882,17 @@ impl TestApiServiceClient {
             // TODO: apply some policy here based on sizes to split up compaction work items
             match self.compaction_work_items.get_mut(&table_info.table_name) {
                 Some(compaction) => {
-                    compaction.files.extend(table_info.files.clone());
+                    compaction.speedboat_files.extend(table_info.files.clone());
                     compaction.sizes.extend(table_info.sizes.clone());
                 },
                 None => {
                     self.compaction_work_items.insert(
                         table_info.table_name.clone(),
                         CompactionWorkItem {
-                            files: table_info.files.clone(),
+                            speedboat_files: table_info.files.clone(),
                             sizes: table_info.sizes.clone(),
+                            delete_files: vec!(),
+                            iceberg_files: vec!(),
                         }
                     );
                 }
@@ -1213,9 +1217,9 @@ impl ApiServiceClient for TestApiServiceClient {
     async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, Box<dyn std::error::Error>> {
         let mut work_items = vec!();
         for (table_name, compaction) in self.compaction_work_items.iter_mut() {
-            if compaction.files.len() > 10 {
+            if compaction.speedboat_files.len() > 10 {
                 work_items.push((table_name.clone(), compaction.clone()));
-                compaction.files.clear();
+                compaction.speedboat_files.clear();
                 compaction.sizes.clear();
             }
         }

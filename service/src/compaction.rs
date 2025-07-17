@@ -1,13 +1,21 @@
 
 use std::{error::Error, fmt};
 use std::fs::read_to_string;
+use std::pin::Pin;
+use async_trait::async_trait;
+use futures_util::FutureExt;
+use gotham::mime;
+use http::StatusCode;
 use iceberg_lib::iceberg::{compact_logs, load_table_metadata, CompactionResult};
 use idgenerator::IdInstance;
 use tokio::sync::oneshot::error::RecvError;
 
-use crate::{state_hosted_service::{CompactionCommit, IcebergCommit, IcebergMetadata, SpeedboatCommit, SpeedboatCommitTableInfo, API_SERVICE_CLIENT}, util::log_err};
-use crate::schema_massager::{extract_powdrr_schema_str, PowdrrSchema};
+use crate::{data_access, state_hosted_service::{CompactionCommit, IcebergCommit, IcebergMetadata, SpeedboatCommit, SpeedboatCommitTableInfo, API_SERVICE_CLIENT}, util::log_err};
+use crate::data_access::execute_sql;
+use crate::elastic_search_common::{Command, ElasticSearchResponse, ResultGeneratorFuture};
+use crate::schema_massager::{extract_powdrr_schema_str, PowdrrSchema, SqlBuilder, SqlQuery};
 use crate::state_hosted_service::CompactionWorkItem;
+use crate::state_peers::SnapshotDescriptor;
 
 #[derive(Debug)]
 pub(crate) struct CompactionError {
@@ -21,6 +29,78 @@ impl fmt::Display for CompactionError {
         write!(f, "{}", self.message)
     }
 }
+
+
+struct CompactionCommand {
+    table: String,
+    work_item: CompactionWorkItem,
+    compaction_id: String,
+}
+
+#[async_trait]
+impl Command for CompactionCommand {
+    fn get_name(&self) -> String {
+        "CompactionCommand".to_string()
+    }
+
+    fn get_tables(&self) -> Vec<String> {
+        vec!(self.table.clone())
+    }
+
+    fn result_generator(&self, result_table_name: Option<String>) -> Pin<Box<ResultGeneratorFuture>> {
+        let table = self.table.clone();
+        async move {
+            // TODO: Need to come up with a real result here.
+            let result = Ok(ElasticSearchResponse {
+                status: StatusCode::OK,
+                mime: mime::TEXT_PLAIN,
+                body: "Success".to_string(),
+                headers: vec![],
+            });
+
+            let table_name = match result_table_name {
+                Some(t) => t,
+                None => {
+                    // TODO: Need to commit that after this compaction there is....nothing?
+                    // Maybe this should panic since it shouldn't be possible to get here.
+                    return result
+                }
+            };
+            let remaining_deletes_data_frame = match execute_sql(&format!("select * from {table_name} where t._id = null")).await {
+                Ok(df) => df,
+                Err(_) => panic!("nope")
+            };
+            let results_data_frame = match execute_sql(&format!("select * from {table_name} where t._id = null")).await {
+                Ok(df) => df,
+                Err(_) => panic!("nope")
+            };
+
+            // TODO 1: Write remaining delete to a file
+            // TODO 2: Write results to a file
+            // TODO 3: Commit the update to Iceberg as necessary
+            // TODO 4: Commit the update to Speedboat as necessary
+            data_access::drop(&table_name).await;
+            result
+        }.boxed()
+    }
+
+    fn generate_sql(&self) -> SqlQuery {
+        SqlBuilder::for_compaction().build()
+    }
+
+    fn generate_filters(&self) -> Vec<&crate::state_common::FileFilter> {
+        vec!()
+    }
+
+    fn required_extensions(&self) -> Vec<String> {
+        vec!()
+    }
+
+    async fn current_target_snapshots(&self) -> Vec<SnapshotDescriptor> {
+        vec!()
+    }
+}
+
 
 
 async fn do_iceberg_commit(table_name: &String, last_snapshot_id: i64) -> Result<i64, RecvError> {
@@ -78,7 +158,11 @@ async fn do_speedboat_commit(table_name: &String, file_path: &String, compaction
 pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkItem)>, last_snapshot_id: i64) -> Result<i64, CompactionError> {
     let mut new_last_snapshot_id = 0;
     for (table_name, work_item) in work_items.iter() {
-        let files = work_item.files.clone();
+        assert_eq!(work_item.iceberg_files.len(), 0, "Iceberg file compaction is not yet implemented");
+
+        // TODO: this is all wrong
+        let files = work_item.speedboat_files.clone();
+
         let compaction_id = IdInstance::next_id().to_string();
 
         // NOTE: the api commit must happen before the iceberg commit. The service is designed to understand that

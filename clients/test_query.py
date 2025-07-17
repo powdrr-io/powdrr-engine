@@ -112,6 +112,8 @@ def main(do_setup: bool, port: int, num_files: int, num_records_per_file, num_hi
 
     if do_setup:
         base_index = int(time.time() * 10000000)
+        files, sizes = _create_files(base_index, num_files, num_records_per_file, num_hits)
+        checkpoint_payload = _create_checkpoint_payload("test_index1", files, sizes)
 
         response = requests.put("http://localhost:{}/_test/v1/_testing_and_processing_mode".format(port))
         if response.status_code != 200:
@@ -127,10 +129,6 @@ def main(do_setup: bool, port: int, num_files: int, num_records_per_file, num_hi
         print(response_create_index.text)
         if response_create_index.status_code != 200:
             print("Create index failed")
-
-
-        files, sizes = _create_files(base_index, num_files, num_records_per_file, num_hits)
-        checkpoint_payload = _create_checkpoint_payload("test_index1", files, sizes)
 
         response_create_index = requests.post(
             "http://localhost:{}/_test/v1/_add_checkpoint".format(port),

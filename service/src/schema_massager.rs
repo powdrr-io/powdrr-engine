@@ -641,7 +641,6 @@ pub(crate) struct SqlBuilder {
     pub(crate) calculate_score: bool,
     pub(crate) order_by: Vec<SqlExpression>,
     pub(crate) group_by: Vec<SqlExpression>,
-    top_level: bool,
 }
 
 
@@ -661,13 +660,12 @@ impl SqlBuilder {
         SqlBuilder {
             all_fields,
             fields: vec!(),
-            joins: vec!(),
-            filter_stack: RefCell::new(vec!(vec!())),
+            joins: vec!("LEFT JOIN {deletes_table} dt ON dt._id = t._id AND dt._seq_no = t._seq_no".to_string()),
+            filter_stack: RefCell::new(vec!(vec!(SqlExpression::IsNull(Box::new(SqlExpression::FieldRef("dt".to_string(), "_seq_no".to_string())))))),
             limit: None,
             calculate_score: false,
             order_by: vec!(),
             group_by: vec!(),
-            top_level: true,
         }
     }
 
@@ -681,7 +679,19 @@ impl SqlBuilder {
             calculate_score: false,
             order_by: vec!(),
             group_by: vec!(),
-            top_level: false,
+        }
+    }
+
+    pub(crate) fn for_compaction() -> Self {
+        SqlBuilder {
+            all_fields: true,
+            fields: vec!(),
+            joins: vec!("OUTER JOIN {deletes_table} dt ON dt._id = t._id AND dt._seq_no = t._seq_no".to_string()),
+            filter_stack: RefCell::new(vec!(vec!())),
+            limit: None,
+            calculate_score: false,
+            order_by: vec!(),
+            group_by: vec!(),
         }
     }
 
@@ -734,9 +744,6 @@ impl SqlBuilder {
         if self.calculate_score {
             joins_copy.push("INNER JOIN {target_table}_search_index si on si.doc_id = t._id".to_string())
         }
-        if self.top_level {
-            joins_copy.push("LEFT JOIN {deletes_table} dt ON dt._id = t._id".to_string())
-        }
         joins_copy
     }
 
@@ -755,9 +762,6 @@ impl SqlBuilder {
         let mut local_filter_stack = self.filter_stack.borrow().clone();
         assert_eq!(local_filter_stack.len(), 1);
         let mut top_copy = local_filter_stack.pop().unwrap().clone();
-        if self.top_level {
-            top_copy.push(SqlBuilder::_latest())
-        }
         SqlExpression::and(top_copy)
     }
 
