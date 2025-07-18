@@ -753,8 +753,7 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
 
 pub(crate) fn create_delete(doc_id: &String, seq_no: i64) -> Value {
     let mut map = serde_json::Map::new();
-    map.insert("_id".to_string(), json!(doc_id));
-    map.insert("_seq_no".to_string(), json!(seq_no));
+    map.insert("_id_seq_no".to_string(), json!(format!("{}_{}", doc_id, seq_no)));
     Value::Object(map)
 }
 

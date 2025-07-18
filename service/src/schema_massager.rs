@@ -660,8 +660,8 @@ impl SqlBuilder {
         SqlBuilder {
             all_fields,
             fields: vec!(),
-            joins: vec!("LEFT JOIN {deletes_table} dt ON dt._id = t._id AND dt._seq_no = t._seq_no".to_string()),
-            filter_stack: RefCell::new(vec!(vec!(SqlExpression::IsNull(Box::new(SqlExpression::FieldRef("dt".to_string(), "_seq_no".to_string())))))),
+            joins: vec!("LEFT JOIN {deletes_table} dt ON dt._id_seq_no = t._id_seq_no".to_string()),
+            filter_stack: RefCell::new(vec!(vec!(SqlExpression::IsNull(Box::new(SqlExpression::FieldRef("dt".to_string(), "_id_seq_no".to_string())))))),
             limit: None,
             calculate_score: false,
             order_by: vec!(),
@@ -687,15 +687,11 @@ impl SqlBuilder {
             all_fields: true,
             fields: vec!(
                 FieldExpression{
-                    name: "_dt_id".to_string(),
-                    expression: SqlExpression::FieldRef("dt".to_string(), "_id".to_string())
+                    name: "_dt_id_seq_no".to_string(),
+                    expression: SqlExpression::FieldRef("dt".to_string(), "_id_seq_no".to_string())
                 },
-                FieldExpression{
-                    name: "_dt_seq_no".to_string(),
-                    expression: SqlExpression::FieldRef("dt".to_string(), "_seq_no".to_string())
-                },                
             ),
-            joins: vec!("FULL OUTER JOIN {deletes_table} dt ON (dt._id = t._id AND dt._seq_no = t._seq_no)".to_string()),
+            joins: vec!("FULL OUTER JOIN {deletes_table} dt ON (dt._id_seq_no = t._id_seq_no)".to_string()),
             filter_stack: RefCell::new(vec!(vec!())),
             limit: None,
             calculate_score: false,
@@ -751,22 +747,11 @@ impl SqlBuilder {
     fn _joins(&self) -> Vec<String> {
         let mut joins_copy = self.joins.clone();
         if self.calculate_score {
-            joins_copy.push("INNER JOIN {target_table}_search_index si on si.doc_id = t._id".to_string())
+            joins_copy.push("INNER JOIN {target_table}_search_index si on si.doc_id = t._id_seq_no".to_string())
         }
         joins_copy
     }
-
-    fn _latest() -> SqlExpression {
-        SqlExpression::Or(vec!(
-            SqlExpression::Comparison(
-                Box::new(SqlExpression::FieldRef("t".to_string(), "_seq_no".to_string())),
-                ">".to_string(),
-                Box::new(SqlExpression::FieldRef("dt".to_string(), "_seq_no".to_string()))
-            ),
-            SqlExpression::IsNull(Box::new(SqlExpression::FieldRef("dt".to_string(), "_seq_no".to_string())))
-        ))
-    }
-
+    
     fn _filters(&self) -> Option<SqlExpression> {
         let mut local_filter_stack = self.filter_stack.borrow().clone();
         assert_eq!(local_filter_stack.len(), 1);

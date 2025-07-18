@@ -527,13 +527,13 @@ pub(crate) mod tests {
             PowdrrField{ name: "_id".to_string(), data_type: PowdrrDataType::String },
             PowdrrField{ name: "_version".to_string(), data_type: PowdrrDataType::Integer },
             PowdrrField{ name: "_seq_no".to_string(), data_type: PowdrrDataType::Integer },
+            PowdrrField{ name: "_id_seq_no".to_string(), data_type: PowdrrDataType::String },
             PowdrrField{ name: "message".to_string(), data_type: PowdrrDataType::String },
             PowdrrField{ name: "_source".to_string(), data_type: PowdrrDataType::String },
             PowdrrField{ name: "index_col".to_string(), data_type: PowdrrDataType::Integer },
         ));
 
         let data_file_path = format!("file://{}/tests/data/logs.json", env::current_dir().unwrap().to_str().unwrap());
-        let index_file_path = format!("file://{}/tests/data/logs_search_index.parquet", env::current_dir().unwrap().to_str().unwrap());
 
         let checkpoint = TableMetadataCheckpoint {
             table_name: "logs".to_string(),
@@ -546,17 +546,7 @@ pub(crate) mod tests {
                 file_schemas: vec!(0),
             }),
             deletes_metadata: None,
-            extension_metadata: Some(
-                vec!((
-                    "es".to_string(),
-                    ExtensionMetadata {
-                        files: vec!(ExtensionFileMetadata {
-                            data_file_location: data_file_path.clone(),
-                            extension_file_locations: vec!(ExtensionFile { suffix: "search_index".to_string(), location: index_file_path }),
-                        })
-                    }
-                ))
-            ),
+            extension_metadata: None,
             schema: schema.clone(),
         };
 
@@ -570,6 +560,14 @@ pub(crate) mod tests {
             Err(_) => panic!("test setup failed"),
             Ok(_) => ()
         };
+
+        let process_work_response = test_server.client().put(
+            "http://localhost/_test/v1/_process_work",
+            "",
+            mime::TEXT_PLAIN,
+        ).perform().unwrap();
+
+        assert_eq!(process_work_response.status(), 200);        
   
         let body_obj  = r#"
         {

@@ -268,7 +268,7 @@ pub(crate) async fn create_index_inner(table_metadata: &TableMetadataCheckpoint)
     match &table_metadata.iceberg_metadata {
         Some(im) => {
             for file_path in im.files.iter() {
-                match create_index_parquet(file_path, &"_id".to_string()).await {
+                match create_index_parquet(file_path, &"_id_seq_no".to_string()).await {
                     Ok(output) => match output {
                         Some(extension_file_path) => files.push(ExtensionFileMetadata {
                             data_file_location: file_path.clone(),
@@ -291,7 +291,7 @@ pub(crate) async fn create_index_inner(table_metadata: &TableMetadataCheckpoint)
         Some(im) => {
             for (file_path, schema_index) in im.files.iter().zip(im.file_schemas.iter()) {
                 let powdrr_schema = &im.schemas[*schema_index as usize];
-                match create_index_jsonl(file_path, &"_id".to_string(), powdrr_schema).await {
+                match create_index_jsonl(file_path, &"_id_seq_no".to_string(), powdrr_schema).await {
                     Ok(output) => match output {
                         Some(extension_file_path) => files.push(ExtensionFileMetadata {
                             data_file_location: file_path.clone(),
