@@ -582,7 +582,7 @@ pub fn es_search(mut state: State) -> Pin<Box<HandlerFuture>> {
                 return Ok((state, res))
             }
         };
-        let response = execute_command(CommandContext{}, command).await;
+        let response = execute_command(CommandContext{}, Arc::new(command)).await;
         let res = response.generate_response(&state);
         Ok((state, res))
     }.boxed()
@@ -613,7 +613,7 @@ pub fn es_update_by_query(mut state: State) -> Pin<Box<HandlerFuture>> {
                 return Ok((state, res))
             }
         };
-        let response = execute_command(CommandContext{}, command).await;
+        let response = execute_command(CommandContext{}, Arc::new(command)).await;
         let res = response.generate_response(&state);
         Ok((state, res))
     }.boxed()
@@ -645,7 +645,7 @@ pub fn es_search_table(mut state: State) -> Pin<Box<HandlerFuture>> {
                 return Ok((state, res))
             }
         };
-        let response = execute_command(CommandContext{}, command).await;
+        let response = execute_command(CommandContext{}, Arc::new(command)).await;
         let res = response.generate_response(&state);
         Ok((state, res))
     }.boxed()

@@ -761,7 +761,7 @@ impl SqlBuilder {
     fn _filters(&self) -> Option<SqlExpression> {
         let mut local_filter_stack = self.filter_stack.borrow().clone();
         assert_eq!(local_filter_stack.len(), 1);
-        let mut top_copy = local_filter_stack.pop().unwrap().clone();
+        let top_copy = local_filter_stack.pop().unwrap().clone();
         SqlExpression::and(top_copy)
     }
 

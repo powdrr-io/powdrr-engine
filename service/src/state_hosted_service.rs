@@ -98,7 +98,9 @@ pub(crate) struct ExtensionCommit {
 
 #[derive(Serialize, Clone)]
 pub(crate) struct CompactionCommit {
-    pub removed_file_locations: Vec<String>,
+    pub removed_speedboat_files: Vec<String>,
+    pub removed_iceberg_files: Vec<String>,
+    pub removed_delete_files: Vec<String>,
     pub compaction_id: String
 }
 
@@ -687,7 +689,10 @@ fn do_remove(removed_files: &Vec<String>, files: &mut Vec<String>, sizes: &mut V
 
 #[derive(Clone)]
 pub(crate) struct CompactionWorkItem {
+    pub table_schema: PowdrrSchema,
     pub speedboat_files: Vec<String>,
+    pub schemas: Vec<PowdrrSchema>,
+    pub file_schemas: Vec<u64>,
     pub iceberg_files: Vec<String>,
     pub sizes: Vec<u64>,
     pub delete_files: Vec<String>,
@@ -765,7 +770,7 @@ impl TestApiServiceClient {
 
     fn get_removed_files(&self, compactions: &Vec<String>) -> Vec<String> {
         let compactions_data: Vec<&CompactionCommit> = compactions.iter().map(|x| self.compactions.get(x).unwrap()).collect();
-        compactions_data.iter().map(|x| x.removed_file_locations.clone()).flatten().collect()
+        compactions_data.iter().map(|x| x.removed_speedboat_files.clone()).flatten().collect()
     } 
 
     fn get_latest_checkpoint_sync(&mut self, table_name: &String, extensions: Option<String>) -> Option<String> {
@@ -879,6 +884,7 @@ impl TestApiServiceClient {
             }
             self.set_latest_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
 
+            /*
             // TODO: apply some policy here based on sizes to split up compaction work items
             match self.compaction_work_items.get_mut(&table_info.table_name) {
                 Some(compaction) => {
@@ -890,6 +896,7 @@ impl TestApiServiceClient {
                         table_info.table_name.clone(),
                         CompactionWorkItem {
                             speedboat_files: table_info.files.clone(),
+                            schemas: table_info.
                             sizes: table_info.sizes.clone(),
                             delete_files: vec!(),
                             iceberg_files: vec!(),
@@ -897,6 +904,7 @@ impl TestApiServiceClient {
                     );
                 }
             }
+             */
         }
         Ok(())
     }    

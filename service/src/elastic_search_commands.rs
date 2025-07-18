@@ -17,6 +17,7 @@ use crate::elastic_search_parser::{process_aggregations, Aggregation};
 use crate::elastic_search_responses::{AggregationResult, QueryResultsNotFound, UpdateByQueryResults, UpdateByQueryResultsRetries, UpdateByQuerySuccess};
 use crate::elastic_search_storage_schema::{RecordInput, WriteBufferBuilder};
 use crate::schema_massager::{to_powdrr_schema, PowdrrSchema, SqlBuilder, SqlExpression, SqlQuery};
+use crate::state_peers::{PrivateInvocation, PrivateSqlInvocation};
 
 async fn empty_result(aggs: Option<Vec<Aggregation>>, total_hits_complex: bool) -> ElasticSearchResponse {
     // TODO: need to record and feed through the requested number of shards from index creation
@@ -103,16 +104,25 @@ impl LookupById {
             None => None
         }
     }
+
+    async fn current_target_snapshots(&self) -> Vec<SnapshotDescriptor> {
+        let checkpoint_id = API_SERVICE_CLIENT.get_latest_checkpoint(&self.table, None).await.unwrap();
+        match checkpoint_id {
+            Some(c) => vec!(SnapshotDescriptor{ table_name: self.table.clone(), snapshot_id: c }),
+            None => vec!(),
+        }
+    }
 }
 
 #[async_trait]
 impl Command for LookupById {
-    fn get_name(&self) -> String {
-        "LookupById".to_string()
-    }
-
-    fn get_tables(&self) -> Vec<String> {
-        vec!(self.table.clone())
+    async fn get_private_invocation(&self) -> PrivateInvocation {
+        PrivateInvocation::Sql(PrivateSqlInvocation {
+            sql: self.sql.clone(),
+            required_extensions: vec![],
+            file_filter: vec![],
+            snapshots: self.current_target_snapshots().await,
+        })
     }
 
     fn result_generator(&self, result_table_name: Option<String>) -> Pin<Box<ResultGeneratorFuture>> {
@@ -142,26 +152,6 @@ impl Command for LookupById {
             Ok(result)
         }.boxed()
     }
-
-    fn generate_sql(&self) -> SqlQuery {
-        self.sql.clone()
-    }
-
-    fn generate_filters(&self) -> Vec<&crate::state_common::FileFilter> {
-        vec!()
-    }
-
-    fn required_extensions(&self) -> Vec<String> {
-        vec!()
-    }
-
-    async fn current_target_snapshots(&self) -> Vec<SnapshotDescriptor> {
-        let checkpoint_id = API_SERVICE_CLIENT.get_latest_checkpoint(&self.table, None).await.unwrap();
-        match checkpoint_id {
-            Some(c) => vec!(SnapshotDescriptor{ table_name: self.table.clone(), snapshot_id: c }),
-            None => vec!(),
-        }
-    }    
 }
 
 
@@ -230,19 +220,41 @@ impl SqlCommand {
         
         Some(process_aggregations(schema, aggs, table_name).await)
     }
+
+    fn required_extensions(&self) -> Vec<String> {
+        if self.calculate_score {
+            vec!("es".to_string())
+        } else {
+            vec!()
+        }
+    }
+
+    async fn current_target_snapshots(&self) -> Vec<SnapshotDescriptor> {
+        let extension = match self.calculate_score {
+            true => Some("es".to_string()),
+            false => None
+        };
+        let checkpoint_id = API_SERVICE_CLIENT.get_latest_checkpoint(&self.table, extension).await.unwrap();
+        match checkpoint_id {
+            Some(c) => vec!(SnapshotDescriptor{ table_name: self.table.clone(), snapshot_id: c }),
+            None => vec!(),
+        }
+    }
+
 }
 
 
 #[async_trait]
 impl Command for SqlCommand {
-    fn get_name(&self) -> String {
-        "SqlCommand".to_string()
+    async fn get_private_invocation(&self) -> PrivateInvocation {
+        PrivateInvocation::Sql(PrivateSqlInvocation{
+            sql: self.sql.clone(),
+            required_extensions: self.required_extensions(),
+            file_filter: vec![],
+            snapshots: self.current_target_snapshots().await,
+        })
     }
-
-    fn get_tables(&self) -> Vec<String> {
-        vec!(self.table.clone())
-    }
-
+    
     fn result_generator(&self, result_table_name: Option<String>) -> Pin<Box<ResultGeneratorFuture>> {
         let table = self.table.clone();
         let calculate_score = self.calculate_score;
@@ -288,34 +300,6 @@ impl Command for SqlCommand {
             Ok(final_result)
         }.boxed()
     }
-
-    fn generate_sql(&self) -> SqlQuery {
-        self.sql.clone()
-    }
-
-    fn generate_filters(&self) -> Vec<&crate::state_common::FileFilter> {
-        vec!()
-    }
-
-    fn required_extensions(&self) -> Vec<String> {
-        if self.calculate_score {
-            vec!("es".to_string())
-        } else {
-            vec!()
-        }
-    }
-
-    async fn current_target_snapshots(&self) -> Vec<SnapshotDescriptor> {
-        let extension = match self.calculate_score {
-            true => Some("es".to_string()),
-            false => None
-        };
-        let checkpoint_id = API_SERVICE_CLIENT.get_latest_checkpoint(&self.table, extension).await.unwrap();
-        match checkpoint_id {
-            Some(c) => vec!(SnapshotDescriptor{ table_name: self.table.clone(), snapshot_id: c }),
-            None => vec!(),
-        }
-    }    
 }
 
 pub(crate) struct UpdateByQueryCommand {
@@ -484,14 +468,10 @@ impl UpdateByQueryCommand {
 
 #[async_trait]
 impl Command for UpdateByQueryCommand {
-    fn get_name(&self) -> String {
-        "UpdateByQueryCommand".to_string()
+    async fn get_private_invocation(&self) -> PrivateInvocation {
+        self.query_command.get_private_invocation().await
     }
-
-    fn get_tables(&self) -> Vec<String> {
-        vec!(self.query_command.table.clone())
-    }
-
+    
     fn result_generator(&self, result_table_name: Option<String>) -> Pin<Box<ResultGeneratorFuture>> {
         let table = self.query_command.table.clone();
         let calculate_score = self.query_command.calculate_score;
@@ -516,22 +496,6 @@ impl Command for UpdateByQueryCommand {
             result_info.commit().await
         }.boxed()
     }
-
-    fn generate_sql(&self) -> SqlQuery {
-        self.query_command.generate_sql()
-    }
-
-    fn generate_filters(&self) -> Vec<&crate::state_common::FileFilter> {
-        self.query_command.generate_filters()
-    }
-
-    fn required_extensions(&self) -> Vec<String> {
-        self.query_command.required_extensions()
-    }    
-
-    async fn current_target_snapshots(&self) -> Vec<SnapshotDescriptor> {
-        self.query_command.current_target_snapshots().await
-    }    
 }
 
 

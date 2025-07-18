@@ -20,9 +20,7 @@ use serde_json::{Map, Value};
 use crate::data_access;
 use crate::data_access::load_memtable;
 use crate::elastic_search_responses::QueryFailure;
-use crate::schema_massager::SqlQuery;
-use crate::state_peers::{self, PeerClient, PeerClientError, PrivateSqlInvocation, SnapshotDescriptor};
-use crate::state_common::FileFilter;
+use crate::state_peers::{self, PeerClient, PeerClientError, PrivateInvocation};
 
 
 pub(crate) const MIME_ES_JSON: LazyLock<Mime> = LazyLock::new(|| "application/vnd.elasticsearch+json;compatible-with=8".parse().unwrap());
@@ -73,56 +71,39 @@ impl ElasticSearchResponse {
 
 pub type ResultGeneratorFuture = dyn Future<Output = Result<ElasticSearchResponse, String>> + Send;
 
+
 #[async_trait]
 pub(crate) trait Command: Send + Sync {
-    #[allow(dead_code)]
-    fn get_name(&self) -> String;
-
-    #[allow(dead_code)]
-    fn get_tables(&self) -> Vec<String>;
+    async fn get_private_invocation(&self) -> PrivateInvocation;
 
     fn result_generator(&self, result_table_name: Option<String>) -> Pin<Box<ResultGeneratorFuture>>;
-
-    fn generate_sql(&self) -> SqlQuery;
-
-    #[allow(dead_code)]
-    fn generate_filters(&self) -> Vec<&FileFilter>;
-
-    fn required_extensions(&self) -> Vec<String>;
-
-    async fn current_target_snapshots(&self) -> Vec<SnapshotDescriptor>;
 }
+
 
 pub(crate) async fn call_private_sql(
     peer_client: &dyn PeerClient,
-    target_sql: &SqlQuery,
-    required_extensions: &Vec<String>,
-    target_snapshots: &Vec<SnapshotDescriptor>,
+    invocation: &PrivateInvocation,
     index: u64,
     num: u64,
 ) -> Result<Vec<RecordBatch>, PeerClientError> {
-    let invocation = PrivateSqlInvocation {
-        sql: target_sql.clone(),
-        required_extensions: required_extensions.clone(),
-        file_filter: vec!(),
-        snapshots: target_snapshots.clone(),
-        index: index,
-        num: num,
-    };
-
-    peer_client.private_sql(&invocation).await
+    match invocation {
+        PrivateInvocation::Sql(sql_invocation) => {
+            peer_client.private_sql(sql_invocation, index, num).await
+        },
+        PrivateInvocation::Compaction(compaction_invocation) => {
+            peer_client.private_compaction(compaction_invocation, index, num).await
+        }
+    }
 }
 
 
 pub(crate) async fn call_private_sql_and_load(
     peer_client: &dyn PeerClient,
-    target_sql: &SqlQuery,
-    required_extensions: &Vec<String>,
-    target_snapshots: &Vec<SnapshotDescriptor>,
+    invocation: &PrivateInvocation,
     index: u64,
     num: u64,
 ) -> Result<Option<Vec<RecordBatch>>, PeerClientError> {
-    match call_private_sql(peer_client, target_sql, required_extensions, target_snapshots, index, num).await {
+    match call_private_sql(peer_client, invocation, index, num).await {
         Ok(r) => Ok(Some(r)),
         Err(e) => Err(e),
     }
@@ -130,18 +111,12 @@ pub(crate) async fn call_private_sql_and_load(
 
 
 async fn call_peers_and_load_results(
-    required_extensions: &Vec<String>,
-    target_snapshots: &Vec<SnapshotDescriptor>, 
-    sql: &SqlQuery
+    invocation: &PrivateInvocation
 ) -> Result<Option<String>, PeerClientError> {
-    if target_snapshots.len() == 0 {
-        return Ok(None)
-    }
-
     let peer_clients: Vec<Box<dyn PeerClient>> = state_peers::get_peer_clients();
 
     let all_calls = peer_clients.iter().enumerate().map(
-        |(index, client)| call_private_sql_and_load(client.as_ref(), sql, required_extensions, target_snapshots, index as u64, peer_clients.len() as u64));
+        |(index, client)| call_private_sql_and_load(client.as_ref(), invocation, index as u64, peer_clients.len() as u64));
     let all_records: Vec<RecordBatch> = match try_join_all(all_calls).await {
         Ok(ar) => ar.iter().filter(|x| x.is_some()).map(|x| x.clone().unwrap()).flatten().collect(),
         Err(e) => {
@@ -164,10 +139,8 @@ async fn call_peers_and_load_results(
 
 
 pub async fn load_command_raw_result(_context: CommandContext, command: Arc<dyn Command>) -> Result<Option<String>, PeerClientError> {
-    let target_snapshots = command.current_target_snapshots().await;
-    let required_extensions = command.required_extensions();
-    let target_sql = command.generate_sql();
-    call_peers_and_load_results(&required_extensions, &target_snapshots, &target_sql).await
+    let invocation = command.get_private_invocation().await;
+    call_peers_and_load_results(&invocation).await
 }
 
 

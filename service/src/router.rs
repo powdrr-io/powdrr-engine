@@ -27,7 +27,7 @@ use crate::elastic_search_endpoints::QueryStringAliases;
 use crate::elastic_search_endpoints::QueryStringClusterSettings;
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::private_api;
-use crate::state_peers::PrivateSqlInvocation;
+use crate::state_peers::PrivateSqlInvocationExternal;
 use crate::test_api::test_v1_add_checkpoint;
 use crate::test_api::test_v1_create_index;
 use crate::test_api::test_v1_process_work;
@@ -43,11 +43,11 @@ pub fn private_v1_sql(mut state: State) -> Pin<Box<HandlerFuture>> {
             Err(_) => panic!("Oh no"),
         };
         let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
-        let invocation_obj: PrivateSqlInvocation = match serde_json::from_str(&body_content) {
+        let invocation_obj: PrivateSqlInvocationExternal = match serde_json::from_str(&body_content) {
             Ok(io) => io,
             Err(_) => panic!("This should not happen"),
         };
-        let query_result = private_api::data_query(&invocation_obj).await;
+        let query_result = private_api::data_query(&invocation_obj.invocation, invocation_obj.index, invocation_obj.num).await;
         match query_result {
             Ok(_success) => {
                 let res = create_response(&state, StatusCode::OK, mime::IMAGE_PNG, "TODO");

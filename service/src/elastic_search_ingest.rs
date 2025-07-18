@@ -764,7 +764,7 @@ pub(crate) async fn delete(index: &String, doc_id: &String) -> Result<ElasticSea
         };
         return Ok(ElasticSearchResponse { status: StatusCode::NOT_FOUND, mime: mime::APPLICATION_JSON, body: serde_json::to_string(&result).unwrap(), headers: vec!() })
     }
-    let seq_no = match distributed_cache::delete_operator(&table_description.name, 1) {
+    let _seq_no = match distributed_cache::delete_operator(&table_description.name, 1) {
         Ok(v) => v,
         Err(_) => panic!("Need to convert to an ingest error")
     };

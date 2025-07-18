@@ -6,16 +6,15 @@ use async_trait::async_trait;
 use futures_util::FutureExt;
 use gotham::mime;
 use http::StatusCode;
-use iceberg_lib::iceberg::{compact_logs, load_table_metadata, CompactionResult};
 use idgenerator::IdInstance;
 use tokio::sync::oneshot::error::RecvError;
 
-use crate::{data_access, state_hosted_service::{CompactionCommit, IcebergCommit, IcebergMetadata, SpeedboatCommit, SpeedboatCommitTableInfo, API_SERVICE_CLIENT}, util::log_err};
+use crate::{data_access, state_hosted_service::{CompactionCommit, SpeedboatCommit, SpeedboatCommitTableInfo, API_SERVICE_CLIENT}, util::log_err};
 use crate::data_access::execute_sql;
 use crate::elastic_search_common::{Command, ElasticSearchResponse, ResultGeneratorFuture};
-use crate::schema_massager::{extract_powdrr_schema_str, PowdrrSchema, SqlBuilder, SqlQuery};
+use crate::schema_massager::{extract_powdrr_schema_str, PowdrrSchema, SqlBuilder};
 use crate::state_hosted_service::CompactionWorkItem;
-use crate::state_peers::SnapshotDescriptor;
+use crate::state_peers::{PrivateCompactionInvocation, PrivateInvocation};
 
 #[derive(Debug)]
 pub(crate) struct CompactionError {
@@ -30,25 +29,41 @@ impl fmt::Display for CompactionError {
     }
 }
 
+#[allow(dead_code)]
+pub enum CompactionResult {
+    None,
+    Iceberg {
+        num_records: usize,
+    },
+    Speedboat {
+        file_location: String,
+        num_records: usize,
+    }
+}
 
 struct CompactionCommand {
     table: String,
     work_item: CompactionWorkItem,
+    #[allow(dead_code)]
     compaction_id: String,
 }
 
 #[async_trait]
 impl Command for CompactionCommand {
-    fn get_name(&self) -> String {
-        "CompactionCommand".to_string()
-    }
-
-    fn get_tables(&self) -> Vec<String> {
-        vec!(self.table.clone())
+    async fn get_private_invocation(&self) -> PrivateInvocation {
+        assert_eq!(self.work_item.iceberg_files.len(), 0, "Iceberg file compaction is not yet implemented");
+        PrivateInvocation::Compaction(PrivateCompactionInvocation {
+            sql: SqlBuilder::for_compaction().build(),
+            speedboat_files: self.work_item.speedboat_files.clone(),
+            schemas: self.work_item.schemas.clone(),
+            file_schemas: self.work_item.file_schemas.clone(),
+            table_schema: self.work_item.table_schema.clone(),
+            delete_files: self.work_item.delete_files.clone(),
+        })
     }
 
     fn result_generator(&self, result_table_name: Option<String>) -> Pin<Box<ResultGeneratorFuture>> {
-        let table = self.table.clone();
+        let _table = self.table.clone();
         async move {
             // TODO: Need to come up with a real result here.
             let result = Ok(ElasticSearchResponse {
@@ -66,11 +81,11 @@ impl Command for CompactionCommand {
                     return result
                 }
             };
-            let remaining_deletes_data_frame = match execute_sql(&format!("select * from {table_name} where t._id = null")).await {
+            let _remaining_deletes_data_frame = match execute_sql(&format!("select * from {table_name} where t._id = null")).await {
                 Ok(df) => df,
                 Err(_) => panic!("nope")
             };
-            let results_data_frame = match execute_sql(&format!("select * from {table_name} where t._id = null")).await {
+            let _results_data_frame = match execute_sql(&format!("select * from {table_name} where t._id = null")).await {
                 Ok(df) => df,
                 Err(_) => panic!("nope")
             };
@@ -83,27 +98,16 @@ impl Command for CompactionCommand {
             result
         }.boxed()
     }
-
-    fn generate_sql(&self) -> SqlQuery {
-        SqlBuilder::for_compaction().build()
-    }
-
-    fn generate_filters(&self) -> Vec<&crate::state_common::FileFilter> {
-        vec!()
-    }
-
-    fn required_extensions(&self) -> Vec<String> {
-        vec!()
-    }
-
-    async fn current_target_snapshots(&self) -> Vec<SnapshotDescriptor> {
-        vec!()
-    }
 }
 
 
+async fn compact_logs(_command: &CompactionCommand) -> Result<CompactionResult, CompactionError>{
+    Ok(CompactionResult::None)
+}
 
-async fn do_iceberg_commit(table_name: &String, last_snapshot_id: i64) -> Result<i64, RecvError> {
+
+async fn do_iceberg_commit(_table_name: &String, _last_snapshot_id: i64) -> Result<i64, RecvError> {
+    /*
     let lib_metadata = match load_table_metadata(
         &"default".to_string(), 
         table_name, 
@@ -132,7 +136,10 @@ async fn do_iceberg_commit(table_name: &String, last_snapshot_id: i64) -> Result
         Err(e) => return Err(e)
     };
 
-    return Ok(lib_metadata.snapshot_id)    
+    return Ok(lib_metadata.snapshot_id)
+    */
+
+    todo!("Need to implement this")
 }
 
 
@@ -171,23 +178,23 @@ pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkIt
         match API_SERVICE_CLIENT.compaction_commit(
             table_name,
             &CompactionCommit {
-                removed_file_locations: files.iter().cloned().collect(),
+                removed_speedboat_files: work_item.speedboat_files.clone(),
+                removed_iceberg_files: work_item.iceberg_files.clone(),
                 compaction_id: compaction_id.clone(),
+                removed_delete_files: work_item.delete_files.clone(),
             }
         ).await {
             Ok(_) => (),
             Err(_) => return Err(CompactionError { message: "api call failed".to_string() }),
-        }   
+        }
 
-        // Need the compactor to normalize the schema for all the files first.
-        match compact_logs(
-            &"default".to_string(),
-            &table_name,
-            &compaction_id,
-            &files,
-            &vec!(),
-            10_000,
-        ).await {
+        let command = CompactionCommand {
+            table: table_name.clone(),
+            work_item: work_item.clone(),
+            compaction_id: compaction_id.clone(),
+        };
+
+        match compact_logs(&command).await {
             Ok(result) => match result {
                 CompactionResult::None => (),
                 CompactionResult::Iceberg{ num_records} => {

@@ -27,12 +27,24 @@ pub(crate) struct SnapshotDescriptor {
     pub snapshot_id: String,
 }
 
+
+#[derive(Serialize, Deserialize)]
+pub(crate) enum PrivateInvocation {
+    Sql(PrivateSqlInvocation),
+    Compaction(PrivateCompactionInvocation)
+}
+
 #[derive(Serialize, Deserialize)]
 pub(crate) struct PrivateSqlInvocation {
     pub sql: SqlQuery,
     pub required_extensions: Vec<String>,
     pub file_filter: Vec<FileFilterDescriptor>,
     pub snapshots: Vec<SnapshotDescriptor>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct PrivateSqlInvocationExternal {
+    pub invocation: PrivateSqlInvocation,
     pub index: u64,
     pub num: u64,
 }
@@ -46,8 +58,6 @@ pub(crate) struct PrivateCompactionInvocation {
     pub file_schemas: Vec<u64>,
     pub table_schema: PowdrrSchema,
     pub delete_files: Vec<String>,
-    pub index: u64,
-    pub num: u64,
 }
 
 
@@ -59,16 +69,12 @@ impl PrivateSqlInvocation {
         required_extensions: Vec<String>,
         file_filter: Vec<FileFilterDescriptor>,
         snapshots: Vec<SnapshotDescriptor>,
-        index: u64,
-        num: u64,        
     ) -> Self {
         PrivateSqlInvocation {
             sql: sql,
             required_extensions: required_extensions,
             file_filter: file_filter,
             snapshots: snapshots,
-            index: index,
-            num: num,
         }
     }
 }
@@ -99,7 +105,9 @@ unsafe impl Sync for PeerClientError {}
 
 #[async_trait]
 pub trait PeerClient: Send + Sync {
-    async fn private_sql(&self, invocation: &PrivateSqlInvocation) -> Result<Vec<RecordBatch>, PeerClientError>;
+    async fn private_sql(&self, invocation: &PrivateSqlInvocation, index: u64, num: u64) -> Result<Vec<RecordBatch>, PeerClientError>;
+
+    async fn private_compaction(&self, invocation: &PrivateCompactionInvocation, index: u64, num: u64) -> Result<Vec<RecordBatch>, PeerClientError>;
 }
 
 #[allow(dead_code)]
@@ -125,7 +133,7 @@ unsafe impl Sync for RemotePeer {}
 
 #[async_trait]
 impl PeerClient for RemotePeer {
-    async fn private_sql(&self, invocation: &PrivateSqlInvocation) -> Result<Vec<RecordBatch>, PeerClientError> {
+    async fn private_sql(&self, invocation: &PrivateSqlInvocation, _index: u64, _num: u64) -> Result<Vec<RecordBatch>, PeerClientError> {
         let address = &self.address;
         let body = serde_json::to_string(invocation);
         match body {
@@ -150,6 +158,11 @@ impl PeerClient for RemotePeer {
             }
         }
     }
+
+    async fn private_compaction(&self, _invocation: &PrivateCompactionInvocation, _index: u64, _num: u64) -> Result<Vec<RecordBatch>, PeerClientError> {
+        todo!()
+    }
+
 /* 
     async fn private_metadata(&self, invocation: &PrivateMetadataInvocation) -> Result<String, PeerClientError> {
         let address = &self.address;
@@ -195,8 +208,8 @@ unsafe impl Sync for SelfPeer {}
 
 #[async_trait]
 impl PeerClient for SelfPeer {
-    async fn private_sql(&self, invocation: &PrivateSqlInvocation) -> Result<Vec<RecordBatch>, PeerClientError> {
-        let query_result = data_query(invocation).await;
+    async fn private_sql(&self, invocation: &PrivateSqlInvocation, index: u64, num: u64) -> Result<Vec<RecordBatch>, PeerClientError> {
+        let query_result = data_query(invocation, index, num).await;
         match query_result {
             Ok(qr) => {
                 Ok(result_to_record_batch(qr.result).await)
@@ -205,6 +218,10 @@ impl PeerClient for SelfPeer {
                 Err(PeerClientError { message: e.message })
             }
         }
+    }
+
+    async fn private_compaction(&self, _invocation: &PrivateCompactionInvocation, _index: u64, _num: u64) -> Result<Vec<RecordBatch>, PeerClientError> {
+        todo!()
     }
 }
 
@@ -267,7 +284,7 @@ pub mod tests {
 
     use crate::router::router;
 
-    use super::{PeerClient, PeerClientError, PeerClientGenerator, PrivateSqlInvocation};
+    use super::{PeerClient, PeerClientError, PeerClientGenerator, PrivateCompactionInvocation, PrivateSqlInvocation};
 
     pub(crate) struct TestPeerClient {
         server: TestServer,
@@ -284,7 +301,7 @@ pub mod tests {
 
     #[async_trait]
     impl PeerClient for TestPeerClient {
-        async fn private_sql(&self, invocation: &PrivateSqlInvocation) -> Result<Vec<RecordBatch>, PeerClientError> {
+        async fn private_sql(&self, invocation: &PrivateSqlInvocation, _index: u64, _num: u64) -> Result<Vec<RecordBatch>, PeerClientError> {
             let body_obj = match serde_json::to_string(invocation) {
                 Ok(bo) => bo,
                 Err(_) => panic!("bad format")
@@ -302,6 +319,10 @@ pub mod tests {
             } else {
                 Err(PeerClientError { message: "Something go boom".to_string() })
             }
+        }
+
+        async fn private_compaction(&self, _invocation: &PrivateCompactionInvocation, _index: u64, _num: u64) -> Result<Vec<RecordBatch>, PeerClientError> {
+            todo!()
         }
     }
 
