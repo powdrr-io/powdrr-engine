@@ -144,7 +144,7 @@ async fn determine_required_files(invocation: &PrivateSqlInvocation, index: u64,
 fn generate_required_files(invocation: &PrivateCompactionInvocation, index: u64, num: u64) -> RequiredFiles {
     let speedboat_files = invocation.speedboat_files.iter().zip(invocation.file_schemas.iter()).map(
         |(file_path, schema_index)| {
-            if selected_file(file_path, num, index) {
+            if selected_file(file_path, index, num) {
                 Some(FileDescriptor {
                     file_path: file_path.clone(),
                     schema: invocation.schemas.get(*schema_index as usize).unwrap().clone(),
@@ -159,9 +159,9 @@ fn generate_required_files(invocation: &PrivateCompactionInvocation, index: u64,
     RequiredFiles {
         table_schema: invocation.table_schema.clone(),
         iceberg_files: vec![],
-        speedboat_files,
+        speedboat_files: speedboat_files.clone(),
         iceberg_file_extensions: vec![],
-        speedboat_file_extensions: vec![],
+        speedboat_file_extensions: speedboat_files.iter().map(|_|vec![]).collect(),
         delete_files: invocation.delete_files.clone(),
     }
 }
@@ -226,7 +226,6 @@ async fn execute_sql(sql_template: &String, local_name: &String, deletes_local_n
         Ok(df) => df,
         Err(e) => return log_err(e),
     };
-
     match results.collect().await {
         Ok(r) => Ok(r),
         Err(e) => log_err(e)
@@ -317,8 +316,8 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation, index: u64, nu
 }
 
 
-pub(crate) async fn compaction_query(invocation: PrivateCompactionInvocation, index: u64, num: u64) -> Result<DataQueryResult, PrivateApiError> {
-    let required_files = generate_required_files(&invocation, index, num);
+pub(crate) async fn compaction_query(invocation: &PrivateCompactionInvocation, index: u64, num: u64) -> Result<DataQueryResult, PrivateApiError> {
+    let required_files = generate_required_files(invocation, index, num);
     
     data_query_worker(
         &invocation.sql,

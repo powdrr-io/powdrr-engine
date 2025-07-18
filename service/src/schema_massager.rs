@@ -685,8 +685,17 @@ impl SqlBuilder {
     pub(crate) fn for_compaction() -> Self {
         SqlBuilder {
             all_fields: true,
-            fields: vec!(),
-            joins: vec!("OUTER JOIN {deletes_table} dt ON dt._id = t._id AND dt._seq_no = t._seq_no".to_string()),
+            fields: vec!(
+                FieldExpression{
+                    name: "_dt_id".to_string(),
+                    expression: SqlExpression::FieldRef("dt".to_string(), "_id".to_string())
+                },
+                FieldExpression{
+                    name: "_dt_seq_no".to_string(),
+                    expression: SqlExpression::FieldRef("dt".to_string(), "_seq_no".to_string())
+                },                
+            ),
+            joins: vec!("FULL OUTER JOIN {deletes_table} dt ON (dt._id = t._id AND dt._seq_no = t._seq_no)".to_string()),
             filter_stack: RefCell::new(vec!(vec!())),
             limit: None,
             calculate_score: false,

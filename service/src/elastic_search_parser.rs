@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::string::ToString;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use crate::data_access::execute_sql;
 use crate::elastic_search_commands::{to_serde_value, SqlCommand, UpdateByQueryCommand};
-use crate::elastic_search_common::{Command, ParseError};
+use crate::elastic_search_common::ParseError;
 use crate::elastic_search_datetime_parser;
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::elastic_search_responses::{AggregationResult, AverageAggregationResult, CardinalityAggregationResult, FilterAggregationResult, HistogramAggregationResult, RangeAggregationBucket, RangeAggregationResult, TermAggregationBucket, TermAggregationResult};
@@ -1193,12 +1193,9 @@ fn to_sql_simple_query(builder: &mut SqlBuilder, query_obj: &SimpleQueryString) 
 
 #[cfg(test)]
 mod tests {
-    use gotham::test::Server;
     use crate::elastic_search_endpoints::QueryStringSearch;
     use crate::elastic_search_parser::{parse, UpdateByQueryBody};
-    use crate::router::tests::TEST_SERVER;
     use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
-    use crate::state_peers::PrivateInvocation;
     use super::{to_command, SearchBody};
 
     #[test]

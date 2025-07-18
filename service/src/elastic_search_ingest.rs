@@ -77,6 +77,10 @@ impl WriteBuffer {
         self.lines.push(line);
     }
 
+    pub fn push_many(&mut self, lines: Vec<String>) {
+        self.lines.extend(lines);
+    }
+
     fn write_to_file(&self, file_name: &String) -> Result<(), IngestError> {
         assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
         let mut file_write = File::create(file_name).expect("Cannot create file");
@@ -476,11 +480,7 @@ pub(crate) async fn commit(buffer: &WriteBuffer, index: &String) -> Result<(), I
     commit_general(buffer, index, &"commit".to_string()).await
 }
 
-pub(crate) async fn commit_general(buffer: &WriteBuffer, index: &String, commit_type: &String) -> Result<(), IngestError> {
-    if buffer.lines.len() == 0 {
-        return Ok(())
-    }
-
+pub(crate) fn write_to_file(buffer: &WriteBuffer, index: &String, commit_type: &String) -> Result<String, IngestError> {
     let new_id = format!("tests/data/ingest/{}-{}-{}.json", commit_type, index, IdInstance::next_id().to_string());
     let write_to_file_result = buffer.write_to_file(&new_id);
     tracing::info!("Ingest: op {} on table {} wrote {} records", commit_type, index, buffer.num_records());
@@ -490,17 +490,36 @@ pub(crate) async fn commit_general(buffer: &WriteBuffer, index: &String, commit_
         Err(_) => return Err(IngestError{ message: "File error".to_string() })
     }
 
-    let commit_info = SpeedboatCommitTableInfo {
-        table_name: index.clone(),
-        files: vec!(new_id),
-        sizes: vec!(buffer.total_size()),
-        schema: buffer.schema.clone(),
+    Ok(new_id)
+}
+
+pub(crate) async fn commit_general(buffer: &WriteBuffer, index: &String, commit_type: &String) -> Result<(), IngestError> {
+    commit_general_compactions(buffer, index, commit_type, &vec!()).await
+}
+
+
+pub(crate) async fn commit_general_compactions(buffer: &WriteBuffer, index: &String, commit_type: &String, compactions: &Vec<String>) -> Result<(), IngestError> {
+    if buffer.lines.len() == 0 && compactions.len() == 0 {
+        return Ok(())
+    }
+    
+    let type_files = if buffer.lines.len() != 0 {
+        let new_id = write_to_file(buffer, index, commit_type)?;
+
+        vec!(SpeedboatCommitTableInfo {
+            table_name: index.clone(),
+            files: vec!(new_id),
+            sizes: vec!(buffer.total_size()),
+            schema: buffer.schema.clone(),
+        })
+    } else {
+        vec!()
     };
 
     match API_SERVICE_CLIENT.speedboat_commit(&SpeedboatCommit {
         commit_type: commit_type.clone(),
-        type_files: vec!(commit_info),
-        compactions: vec!(),
+        type_files: type_files,
+        compactions: compactions.clone(),
     }).await {
         Ok(_) => (),
         Err(_) => panic!("nope")
@@ -943,15 +962,10 @@ async fn ingest_and_write(payload: &String) -> Result<IngestAndWriteResult, Inge
     let mut table_infos = vec!();
     for (name, buffer_builder) in buffer_items.tables.iter_mut() {
         let buffer = buffer_builder.build();
-        let new_id = format!("tests/data/ingest/ingest-{}-{}.json", name, IdInstance::next_id().to_string());
-        let write_to_file_result = buffer.write_to_file(&new_id);
-        tracing::info!("Ingest: table {} wrote {} records", name, buffer.num_records());
-
-        match write_to_file_result {
-            Ok(_) => (),
+        let new_id = match write_to_file(&buffer, &name, &"ingest".to_string()) {
+            Ok(id) => id,
             Err(_) => return Err(IngestError{ message: "File error".to_string() })
-        }
-
+        };
         table_infos.push(SpeedboatCommitTableInfo {
             table_name: name.clone(),
             files: vec!(new_id),
@@ -1071,13 +1085,10 @@ impl IngestActor {
 
         for (name, buffer_builder) in self.tables.iter_mut() {
             let buffer = buffer_builder.build();
-            let new_id = format!("tests/data/ingest/ingest-{}-{}.json", name, IdInstance::next_id().to_string());
-            let write_to_file_result = buffer.write_to_file(&new_id);
-            tracing::info!("Ingest: table {} wrote {} records", name, buffer.num_records());
-            match write_to_file_result {
-                Ok(_) => (),
-                Err(_) => return Err(IngestError { message: "File error".to_string() }),
-            }
+            let new_id = match write_to_file(&buffer, &name, &"ingest".to_string()) {
+                Ok(id) => id,
+                Err(e) => return Err(e)
+            };
             commit_table_info.push(
                 SpeedboatCommitTableInfo { 
                     table_name: name.clone(),

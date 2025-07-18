@@ -1,18 +1,21 @@
 
 use std::{error::Error, fmt};
-use std::fs::read_to_string;
 use std::pin::Pin;
+use std::sync::Arc;
 use async_trait::async_trait;
 use futures_util::FutureExt;
 use gotham::mime;
 use http::StatusCode;
 use idgenerator::IdInstance;
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot::error::RecvError;
 
-use crate::{data_access, state_hosted_service::{CompactionCommit, SpeedboatCommit, SpeedboatCommitTableInfo, API_SERVICE_CLIENT}, util::log_err};
+use crate::{elastic_search_ingest, state_hosted_service::{CompactionCommit, API_SERVICE_CLIENT}};
 use crate::data_access::execute_sql;
-use crate::elastic_search_common::{Command, ElasticSearchResponse, ResultGeneratorFuture};
-use crate::schema_massager::{extract_powdrr_schema_str, PowdrrSchema, SqlBuilder};
+use crate::elastic_search_commands::to_serde_value;
+use crate::elastic_search_common::{execute_command, Command, CommandContext, ElasticSearchResponse, ResultGeneratorFuture};
+use crate::elastic_search_ingest::WriteBuffer;
+use crate::schema_massager::SqlBuilder;
 use crate::state_hosted_service::CompactionWorkItem;
 use crate::state_peers::{PrivateCompactionInvocation, PrivateInvocation};
 
@@ -29,7 +32,7 @@ impl fmt::Display for CompactionError {
     }
 }
 
-#[allow(dead_code)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum CompactionResult {
     None,
     Iceberg {
@@ -63,49 +66,76 @@ impl Command for CompactionCommand {
     }
 
     fn result_generator(&self, result_table_name: Option<String>) -> Pin<Box<ResultGeneratorFuture>> {
-        let _table = self.table.clone();
+        let table = self.table.clone();
+        let compactions = vec!(self.compaction_id.clone());
+        let schema = self.work_item.table_schema.clone();
         async move {
-            // TODO: Need to come up with a real result here.
-            let result = Ok(ElasticSearchResponse {
-                status: StatusCode::OK,
-                mime: mime::TEXT_PLAIN,
-                body: "Success".to_string(),
-                headers: vec![],
-            });
-
             let table_name = match result_table_name {
                 Some(t) => t,
                 None => {
                     // TODO: Need to commit that after this compaction there is....nothing?
                     // Maybe this should panic since it shouldn't be possible to get here.
-                    return result
+                    let none = CompactionResult::None;
+                    return Ok(ElasticSearchResponse {
+                        status: StatusCode::OK,
+                        mime: mime::APPLICATION_JSON,
+                        body: serde_json::to_string(&none).unwrap(),
+                        headers: vec![],
+                    });
                 }
             };
-            let _remaining_deletes_data_frame = match execute_sql(&format!("select * from {table_name} where t._id = null")).await {
+            let remaining_deletes_data_frame = match execute_sql(&format!("select _dt_id as _id, _dt_seq_no from {table_name} where _id is null and _dt_id is not null")).await {
                 Ok(df) => df,
                 Err(_) => panic!("nope")
             };
-            let _results_data_frame = match execute_sql(&format!("select * from {table_name} where t._id = null")).await {
-                Ok(df) => df,
+            let results_data_frame = match execute_sql(&format!("select * from {table_name} where _id is not null and _dt_id is null")).await {
+                Ok(df) => {
+                    match df.drop_columns(&["_dt_id", "_dt_seq_no"]) {
+                        Ok(df) => df,
+                        Err(_) => panic!("nope")
+                    }
+                },
                 Err(_) => panic!("nope")
             };
 
-            // TODO 1: Write remaining delete to a file
-            // TODO 2: Write results to a file
-            // TODO 3: Commit the update to Iceberg as necessary
-            // TODO 4: Commit the update to Speedboat as necessary
-            data_access::drop(&table_name).await;
-            result
+            let (compacted_deletes, _) = to_serde_value(&remaining_deletes_data_frame).await;
+            let (compacted_results, _) = to_serde_value(&results_data_frame).await;
+
+            let mut result_buffer = WriteBuffer::new();
+            result_buffer.schema = Some(schema);
+            result_buffer.push_many(compacted_results.iter().map(|x|serde_json::to_string(x).unwrap()).collect());
+            match elastic_search_ingest::commit_general_compactions(&result_buffer, &table, &"compact".to_string(), &compactions).await {
+                Ok(_) => (),
+                Err(_) => panic!("nope"),
+            };
+
+            if compacted_deletes.len() != 0 {
+                let mut deletes_buffer = WriteBuffer::new();
+                deletes_buffer.push_many(compacted_deletes.iter().map(|x| serde_json::to_string(x).unwrap()).collect());
+                match elastic_search_ingest::commit_general_compactions(&deletes_buffer, &table, &"delete".to_string(), &compactions).await {
+                    Ok(_) => (),
+                    Err(_) => panic!("nope"),
+                };
+            }
+
+            Ok(ElasticSearchResponse {
+                status: StatusCode::OK,
+                mime: mime::TEXT_PLAIN,
+                body: "success".to_string(),
+                headers: vec![],
+            })
         }.boxed()
     }
 }
 
 
-async fn compact_logs(_command: &CompactionCommand) -> Result<CompactionResult, CompactionError>{
-    Ok(CompactionResult::None)
+async fn compact_logs(command: Arc<dyn Command>) -> Result<(), CompactionError>{
+    let _response = execute_command(CommandContext{}, command).await;
+    // TODO: look at response to see if there are errors?
+    Ok(())
 }
 
-
+#[allow(dead_code)]
 async fn do_iceberg_commit(_table_name: &String, _last_snapshot_id: i64) -> Result<i64, RecvError> {
     /*
     let lib_metadata = match load_table_metadata(
@@ -143,32 +173,10 @@ async fn do_iceberg_commit(_table_name: &String, _last_snapshot_id: i64) -> Resu
 }
 
 
-async fn do_speedboat_commit(table_name: &String, file_path: &String, compaction_id: &String, total_size: u64, schema: &PowdrrSchema) -> Result<(), RecvError> {
-    match API_SERVICE_CLIENT.speedboat_commit(
-        &SpeedboatCommit{
-            commit_type: "commit".to_string(),
-            type_files: vec!(SpeedboatCommitTableInfo { 
-                table_name: table_name.clone(), 
-                files: vec!(file_path.to_string()),
-                sizes: vec!(total_size),
-                schema: Some(schema.clone()),
-            }),
-            compactions: vec!(compaction_id.clone()),
-        }
-    ).await {
-        Ok(_) => Ok(()),
-        Err(e) => Err(e)
-    }
-}
-
-
 pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkItem)>, last_snapshot_id: i64) -> Result<i64, CompactionError> {
-    let mut new_last_snapshot_id = 0;
+    let new_last_snapshot_id = last_snapshot_id;
     for (table_name, work_item) in work_items.iter() {
         assert_eq!(work_item.iceberg_files.len(), 0, "Iceberg file compaction is not yet implemented");
-
-        // TODO: this is all wrong
-        let files = work_item.speedboat_files.clone();
 
         let compaction_id = IdInstance::next_id().to_string();
 
@@ -194,30 +202,8 @@ pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkIt
             compaction_id: compaction_id.clone(),
         };
 
-        match compact_logs(&command).await {
-            Ok(result) => match result {
-                CompactionResult::None => (),
-                CompactionResult::Iceberg{ num_records} => {
-                    tracing::info!("Iceberg compaction: {} speedboat files, {} records", files.len(), num_records);
-                    match do_iceberg_commit(&table_name, last_snapshot_id).await {
-                        Ok(s) => { new_last_snapshot_id = s },
-                        Err(e) => return log_err(CompactionError{ message: format!("{}", e) }),
-                    }
-                },
-                CompactionResult::Speedboat{ file_location, num_records } => {
-                    tracing::info!("Speedboat compaction: {} speedboat files, {} records", files.len(), num_records);
-                    // TODO: need the compactor to tell me the schema eventually
-                    let content = read_to_string(&file_location).unwrap();
-                    let schema = extract_powdrr_schema_str(content.as_str());
-
-                    match do_speedboat_commit(&table_name, &file_location, &compaction_id, content.len() as u64, &schema).await {
-                        Ok(_) => (),
-                        Err(_) => return log_err(CompactionError{ message: "dunno".to_string() })
-                    }
-                },
-            },
-            Err(e) => return log_err(CompactionError{ message: format!("{}", e) })
-        };
+        compact_logs(Arc::new(command)).await?;
+        // TODO: need to figure out the last snapshot stuff when iceberg is implemented
     }
    
     Ok(new_last_snapshot_id)
