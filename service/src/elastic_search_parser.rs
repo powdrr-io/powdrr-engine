@@ -360,13 +360,13 @@ pub(crate) async fn process_aggregations(schema: Option<PowdrrSchema>, aggregati
 }
 
 
-pub fn parse(table: Option<String>, val: &String, query: &QueryStringSearch) -> Result<Arc<dyn Command>, ParseError> {
+pub fn parse(table: Option<String>, val: &String, query: &QueryStringSearch) -> Result<SqlCommand, ParseError> {
     let body: SearchBody = serde_json::from_str(val.as_str()).map_err(|e|ParseError{ message: format!("{}", e)})?;
     let command = to_command(table, &body, query)?;
-    Ok(Arc::new(command))
+    Ok(command)
 }
 
-pub fn parse_update_by_query(table: Option<String>, val: &String) -> Result<Arc<dyn Command>, ParseError> {
+pub fn parse_update_by_query(table: Option<String>, val: &String) -> Result<UpdateByQueryCommand, ParseError> {
     let body: UpdateByQueryBody = match serde_json::from_str::<UpdateByQueryBody>(val.as_str()) {
       Ok(b) => b,
       Err(e) => {
@@ -376,7 +376,7 @@ pub fn parse_update_by_query(table: Option<String>, val: &String) -> Result<Arc<
       }
     };
     let command = to_command_update_by_query(table, &body)?;
-    Ok(Arc::new(command))
+    Ok(command)
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1193,9 +1193,12 @@ fn to_sql_simple_query(builder: &mut SqlBuilder, query_obj: &SimpleQueryString) 
 
 #[cfg(test)]
 mod tests {
+    use gotham::test::Server;
     use crate::elastic_search_endpoints::QueryStringSearch;
     use crate::elastic_search_parser::{parse, UpdateByQueryBody};
+    use crate::router::tests::TEST_SERVER;
     use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
+    use crate::state_peers::PrivateInvocation;
     use super::{to_command, SearchBody};
 
     #[test]
@@ -1217,8 +1220,8 @@ mod tests {
 
         match parse_result {
             Ok(pr) => {
-                assert_eq!("SqlCommand", pr.get_name());
-                ()
+                let sql = pr.sql.build_debug();
+                assert!(sql.contains("this is a test"))
             }
             _ => panic!("Parsing error")
         }
