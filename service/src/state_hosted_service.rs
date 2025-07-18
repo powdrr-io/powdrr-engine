@@ -251,7 +251,8 @@ enum ApiServiceClientActorMessage {
     AddCheckpoint {
         respond_to: oneshot::Sender<()>,
         checkpoint: TableMetadataCheckpoint,
-    }, 
+    },
+    #[allow(dead_code)]
     IcebergCommit {
         respond_to: oneshot::Sender<()>,
         table_name: String,
@@ -671,7 +672,8 @@ impl ApiServiceClient for RealApiServiceClient {
 }
 
 
-fn do_remove(removed_files: &Vec<String>, files: &mut Vec<String>, sizes: &mut Vec<u64>, file_schema: &mut Vec<u64>) -> () {
+fn do_remove_with_schemas(removed_files: &Vec<String>, files: &mut Vec<String>, sizes: &mut Vec<u64>, file_schema: &mut Vec<u64>) -> () {
+    // TODO: faster if you put removed files into a set
     assert_eq!(files.len(), sizes.len());
     assert_eq!(files.len(), file_schema.len());
     let mut i = 0;
@@ -680,6 +682,18 @@ fn do_remove(removed_files: &Vec<String>, files: &mut Vec<String>, sizes: &mut V
             files.remove(i);
             sizes.remove(i);
             file_schema.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn do_remove(removed_files: &Vec<String>, files: &mut Vec<String>) -> () {
+    // TODO: faster if you put removed files into a set
+    let mut i = 0;
+    while i < files.len() {
+        if removed_files.contains(files.get(i).unwrap()) {
+            files.remove(i);
         } else {
             i += 1;
         }
@@ -768,9 +782,12 @@ impl TestApiServiceClient {
         }
     }
 
-    fn get_removed_files(&self, compactions: &Vec<String>) -> Vec<String> {
+    fn get_removed_files(&self, compactions: &Vec<String>) -> (Vec<String>, Vec<String>) {
         let compactions_data: Vec<&CompactionCommit> = compactions.iter().map(|x| self.compactions.get(x).unwrap()).collect();
-        compactions_data.iter().map(|x| x.removed_speedboat_files.clone()).flatten().collect()
+        (
+            compactions_data.iter().map(|x| x.removed_speedboat_files.clone()).flatten().collect(),
+            compactions_data.iter().map(|x| x.removed_delete_files.clone()).flatten().collect(),
+        )
     } 
 
     fn get_latest_checkpoint_sync(&mut self, table_name: &String, extensions: Option<String>) -> Option<String> {
@@ -795,6 +812,7 @@ impl TestApiServiceClient {
     }
 
     async fn speedboat_commit_type_commit(&mut self, commit: &SpeedboatCommit, sync_index: bool) -> Result<(), Box<dyn std::error::Error>> {
+        let (all_removed_speedboat_files, _) = self.get_removed_files(&commit.compactions);
         for table_info in commit.type_files.iter() {
             let latest_checkpoint = match self.get_latest_checkpoint_sync(&table_info.table_name, None) {
                 Some(checkpoint_id) => {
@@ -830,11 +848,12 @@ impl TestApiServiceClient {
                     let mut sizes = existing.sizes.clone();
                     let mut schemas = existing.schemas.clone();
                     let mut file_schemas = existing.file_schemas.clone();
-                    let all_removed_files = self.get_removed_files(&commit.compactions);
-                    do_remove(&all_removed_files, &mut files, &mut sizes, &mut file_schemas);
+                    do_remove_with_schemas(&all_removed_speedboat_files, &mut files, &mut sizes, &mut file_schemas);
                     files.extend(table_info.files.clone());
                     sizes.extend(table_info.sizes.clone());
                     // TODO: look for existing schemas that match and reuse
+                    // NOTE: file schema extend needs to be before schema extend for the index
+                    // to be correct here.
                     file_schemas.extend(table_info.files.iter().map(|_|schemas.len() as u64));
                     schemas.push(table_info.schema.as_ref().unwrap().clone());
                     SpeedboatMetadata {
@@ -884,27 +903,32 @@ impl TestApiServiceClient {
             }
             self.set_latest_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
 
-            /*
             // TODO: apply some policy here based on sizes to split up compaction work items
             match self.compaction_work_items.get_mut(&table_info.table_name) {
                 Some(compaction) => {
+                    compaction.table_schema = new_latest_checkpoint.schema.clone();
                     compaction.speedboat_files.extend(table_info.files.clone());
                     compaction.sizes.extend(table_info.sizes.clone());
+                    // NOTE: file schema extend needs to be before schema extend for the index
+                    // to be correct here.
+                    compaction.file_schemas.extend(table_info.files.iter().map(|_|compaction.schemas.len() as u64));
+                    compaction.schemas.push(table_info.schema.as_ref().unwrap().clone());
                 },
                 None => {
                     self.compaction_work_items.insert(
                         table_info.table_name.clone(),
                         CompactionWorkItem {
+                            table_schema: new_latest_checkpoint.schema.clone(),
                             speedboat_files: table_info.files.clone(),
-                            schemas: table_info.
+                            schemas: vec!(table_info.schema.as_ref().unwrap().clone()),
+                            file_schemas: table_info.files.iter().map(|_|0).collect(),
                             sizes: table_info.sizes.clone(),
-                            delete_files: vec!(),
+                            delete_files: new_latest_checkpoint.deletes_metadata.as_ref().map_or_else(|| vec!(), |m|m.files.clone()),
                             iceberg_files: vec!(),
                         }
                     );
                 }
             }
-             */
         }
         Ok(())
     }    
@@ -933,7 +957,7 @@ impl TestApiServiceClient {
             };
 
             let new_checkpoint_id = IdInstance::next_id().to_string();
-            let new_deletes_metadata = match &latest_checkpoint.deletes_metadata {
+            let mut new_deletes_metadata = match &latest_checkpoint.deletes_metadata {
                 None => DeletesMetadata {
                     files: table_info.files.clone(),
                 },
@@ -950,6 +974,9 @@ impl TestApiServiceClient {
             for file in &new_deletes_metadata.files {
                 tracing::info!("Delete file {}", file)
             }
+
+            let (_, all_removed_delete_files) = self.get_removed_files(&commit.compactions);
+            do_remove(&all_removed_delete_files, &mut new_deletes_metadata.files);
 
             let new_latest_checkpoint = TableMetadataCheckpoint {
                 table_name: table_info.table_name.clone(),
@@ -971,8 +998,12 @@ impl TestApiServiceClient {
                 }
             };
             self.set_latest_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
-            // TODO: as we get more sophisticated compaction, we need these to trigger and remove things
-            // completely.
+            match self.compaction_work_items.get_mut(&table_info.table_name) {
+                Some(work_item) => {
+                    work_item.delete_files.extend(table_info.files.clone());
+                },
+                None => {}
+            }
         }
         Ok(())
     }    
@@ -1098,7 +1129,7 @@ impl ApiServiceClient for TestApiServiceClient {
 
 
     async fn speedboat_commit(&mut self, commit: &SpeedboatCommit, sync_index: bool) -> Result<(), Box<dyn std::error::Error>> {
-        if commit.commit_type == "commit" {
+        if commit.commit_type == "commit" || commit.commit_type == "compact" {
             self.speedboat_commit_type_commit(commit, sync_index).await
         } else if commit.commit_type == "delete" {
             self.speedboat_commit_type_delete(commit).await
@@ -1225,7 +1256,7 @@ impl ApiServiceClient for TestApiServiceClient {
     async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, Box<dyn std::error::Error>> {
         let mut work_items = vec!();
         for (table_name, compaction) in self.compaction_work_items.iter_mut() {
-            if compaction.speedboat_files.len() > 10 {
+            if compaction.speedboat_files.len() > 1 {
                 work_items.push((table_name.clone(), compaction.clone()));
                 compaction.speedboat_files.clear();
                 compaction.sizes.clear();
@@ -1398,6 +1429,7 @@ impl ApiServiceClientHandle {
         recv.await.expect("Actor task has been killed")        
     }
 
+    #[allow(dead_code)]
     pub async fn iceberg_commit(&self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), RecvError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::IcebergCommit { 

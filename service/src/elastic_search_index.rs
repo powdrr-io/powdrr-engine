@@ -156,11 +156,12 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
             },
             Ok(tft) => tft,
         }; 
-
+        
         match joined_table.write_parquet(
             target_file_path,
             DataFrameWriteOptions::new().with_single_file_output(true),
-            None).await {
+            None
+        ).await {
             Err(e) => {
                 drop_all(&created_tables).await;
                 return Err(IndexError::from(e))

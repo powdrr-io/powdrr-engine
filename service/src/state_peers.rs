@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{private_api::data_query, state_common::FileFilter, state_leader};
 use crate::elastic_search_common::result_to_record_batch;
+use crate::private_api::compaction_query;
 use crate::schema_massager::{PowdrrSchema, SqlQuery};
 
 #[derive(Serialize, Deserialize)]
@@ -220,8 +221,16 @@ impl PeerClient for SelfPeer {
         }
     }
 
-    async fn private_compaction(&self, _invocation: &PrivateCompactionInvocation, _index: u64, _num: u64) -> Result<Vec<RecordBatch>, PeerClientError> {
-        todo!()
+    async fn private_compaction(&self, invocation: &PrivateCompactionInvocation, index: u64, num: u64) -> Result<Vec<RecordBatch>, PeerClientError> {
+        let query_result = compaction_query(invocation, index, num).await;
+        match query_result {
+            Ok(qr) => {
+                Ok(result_to_record_batch(qr.result).await)
+            },
+            Err(e) => {
+                Err(PeerClientError { message: e.message })
+            }
+        }
     }
 }
 
