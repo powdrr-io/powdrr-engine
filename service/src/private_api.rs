@@ -236,10 +236,10 @@ async fn create_all_deletes_table(local_names: &Vec<String>) -> Result<String, P
     let table_name = format!("table_{}", IdInstance::next_id());
     let ddl_stmt;
     if local_names.len() == 0 {
-        ddl_stmt = "select null as _id, null as _seq_no".to_string();
+        ddl_stmt = "select null as _id_seq_no".to_string();
     } else {
         let union_selects = local_names.iter().map(|x|format!("select * from {x}")).collect::<Vec<String>>().join(" union all ");
-        ddl_stmt = format!("select _id, max(_seq_no) as _seq_no from ({union_selects}) group by _id");
+        ddl_stmt = format!("select * from ({union_selects})");
     }
     match data_access::create_table(&table_name, &ddl_stmt).await {
         Ok(_) => Ok(table_name.clone()),
@@ -329,8 +329,7 @@ pub(crate) async fn compaction_query(invocation: &PrivateCompactionInvocation, i
 async fn data_query_worker(sql: &SqlQuery, required_files: &RequiredFiles) -> Result<DataQueryResult, PrivateApiError> {
     let mut delete_local_names = vec!();
     let delete_schema = PowdrrSchema::from(&vec!(
-        PowdrrField{ name: "_id".to_string(), data_type: PowdrrDataType::String },
-        PowdrrField{ name: "_seq_no".to_string(), data_type: PowdrrDataType::Integer },
+        PowdrrField{ name: "_id_seq_no".to_string(), data_type: PowdrrDataType::String },
     ));
     let extension_file_vecs = vec!();
     for delete_file_path in required_files.delete_files.iter() {

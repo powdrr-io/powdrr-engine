@@ -780,6 +780,7 @@ impl TestApiServiceClient {
                 }
             }
         }
+        self.index_work_items.insert(metadata.table_name.clone(), vec![metadata.clone()]);
     }
 
     fn get_removed_files(&self, compactions: &Vec<String>) -> (Vec<String>, Vec<String>) {

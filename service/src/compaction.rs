@@ -84,11 +84,11 @@ impl Command for CompactionCommand {
                     });
                 }
             };
-            let remaining_deletes_data_frame = match execute_sql(&format!("select _dt_id as _id, _dt_seq_no from {table_name} where _id is null and _dt_id is not null")).await {
+            let remaining_deletes_data_frame = match execute_sql(&format!("select _dt_id_seq_no as _id_seq_no from {table_name} where _id is null and _dt_id_seq_no is not null")).await {
                 Ok(df) => df,
                 Err(_) => panic!("nope")
             };
-            let results_data_frame = match execute_sql(&format!("select * from {table_name} where _id is not null and _dt_id is null")).await {
+            let results_data_frame = match execute_sql(&format!("select * from {table_name} where _id is not null and _dt_id_seq_no is null")).await {
                 Ok(df) => {
                     match df.drop_columns(&["_dt_id", "_dt_seq_no"]) {
                         Ok(df) => df,

@@ -75,6 +75,7 @@ impl RecordInput {
             let denormalized_value = create_denormalized_value(self.source.as_ref().unwrap());
             values.insert("_id".to_string(), Value::String(self.id.clone()));
             values.insert("_seq_no".to_string(), Value::Number(self.seq_no.into()));
+            values.insert("_id_seq_no".to_string(), Value::String(format!("{}_{}", self.id, self.seq_no)));
             values.insert("_version".to_string(), Value::Number(self.version.into()));
             if self.source_str.is_some() {
                 values.insert("_source".to_string(), Value::String(self.source_str.as_ref().unwrap().clone()));
@@ -156,7 +157,7 @@ mod tests {
         assert_eq!(buffer.num_records(), 2);
         assert!(buffer.schema.is_some());
         let schema = buffer.schema.as_ref().unwrap();
-        assert_eq!(schema.fields.len(), 10);
+        assert_eq!(schema.fields.len(), 11);
         let schema_map = schema.to_map();
         let source_field = schema_map.get("_source").unwrap();
         assert_eq!(source_field.data_type, PowdrrDataType::String);
