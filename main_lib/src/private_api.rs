@@ -86,7 +86,7 @@ fn filter_iceberg<'a>(iceberg_metadata: &'a Option<IcebergMetadata>, index: u64,
         Some(im) => {
             let mut filtered_files = vec!();
             for (idx, file_path) in im.files.iter().enumerate() {
-                if !selected_file(file_path, num, index) {
+                if !selected_file(file_path, index, num) {
                     continue;
                 }
                 if matches_filter(im, idx, file_path) {

@@ -69,6 +69,7 @@ pub(crate) async fn do_all_available_work() -> () {
         // We keep track of this to see what all iceberg snapshots we should look through to
         // see what types of compactions have happened.
         let mut last_iceberg_snapshot_id: i64 = 0;
+
         let index_work = match API_SERVICE_CLIENT.get_extension_work_items(&"es".to_string()).await {
             Ok(work) => work,
             Err(_) => panic!("oh no"),

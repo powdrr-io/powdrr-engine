@@ -25,7 +25,7 @@ fn create_store() -> Arc<AmazonS3> {
         .with_secret_access_key(S3_SECRET_ACCESS_KEY_VALUE)
         .with_region(S3_REGION_VALUE)
         .with_endpoint(S3_ENDPOINT_VALUE)
-        .with_bucket_name("icebergdata")
+        .with_bucket_name("warehouse")
         .with_allow_http(true)
         .build().unwrap();
 
@@ -43,7 +43,7 @@ fn create_session() -> SessionContext {
     let config = SessionConfig::from(options);
     let ctx = SessionContext::new_with_config(config);
 
-    let s3_url = Url::parse("s3://icebergdata").unwrap();  
+    let s3_url = Url::parse("s3://warehouse").unwrap();
 
     ctx.register_object_store(&s3_url, S3_FILE_STORE.clone());
 

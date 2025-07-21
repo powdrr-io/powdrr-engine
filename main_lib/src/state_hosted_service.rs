@@ -1249,7 +1249,7 @@ impl ApiServiceClient for TestApiServiceClient {
     async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, Box<dyn std::error::Error>> {
         let mut work_items = vec!();
         for (table_name, compaction) in self.compaction_work_items.iter_mut() {
-            if compaction.speedboat_files.len() > 1 {
+            if compaction.speedboat_files.len() > 100 {
                 work_items.push((table_name.clone(), compaction.clone()));
                 compaction.speedboat_files.clear();
                 compaction.sizes.clear();
