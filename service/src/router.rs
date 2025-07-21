@@ -286,7 +286,7 @@ pub(crate) mod tests {
     use crate::elastic_search_responses::{QueryResultTotal, QueryResults};
     use crate::router::router;
     use crate::schema_massager::{extract_powdrr_schema_str, PowdrrDataType, PowdrrField, PowdrrSchema};
-    use crate::state_hosted_service::{ExtensionFile, ExtensionFileMetadata, ExtensionMetadata, IcebergMetadata, SpeedboatMetadata, TableMetadataCheckpoint};
+    use crate::state_hosted_service::{IcebergMetadata, SpeedboatMetadata, TableMetadataCheckpoint};
 
     pub(crate) static TEST_SERVER: LazyLock<TestServer> = LazyLock::new(|| TestServer::with_timeout(router(true), 1000).unwrap());
 
@@ -457,8 +457,10 @@ pub(crate) mod tests {
             table_name: "flights".to_string(),
             checkpoint_id: "fake_id".to_string(),
             iceberg_metadata: Some(IcebergMetadata {
+                table_schema: schema.clone(),
                 snapshot_id: "fake_iceberg_snapshot".to_string(),
                 files: vec!(file_path),
+                sizes: vec!(1),
                 column_names: vec!(),
                 column_stats: vec!(),
                 schemas: vec!(schema.clone()),
