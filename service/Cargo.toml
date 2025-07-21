@@ -20,6 +20,8 @@ futures = "0.3.31"
 futures-util = "0.3.31"
 gotham = { version = "0.7.4", features = ["rustls"] }
 http = "0.2.12"
+iceberg = { path = "../../iceberg-rust/crates/iceberg" }
+iceberg-catalog-rest = { path = "../../iceberg-rust/crates/catalog/rest" }
 iceberg_lib = { path = "../iceberg_lib" }
 idgenerator = "2.0.0"
 lru-mem = "0.3.0"

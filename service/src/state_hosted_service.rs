@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot::{self, error::RecvError}};
 
 use crate::{distributed_cache, elastic_search_ingest::CreateIndexTemplateBody, pipeline::PipelineDefinition, state_peers::SnapshotDescriptor};
+use crate::compaction::drop_all_tables;
 use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::schema_massager::PowdrrSchema;
@@ -37,8 +38,10 @@ pub(crate) struct SpeedboatCommit {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct IcebergMetadata {
+    pub table_schema: PowdrrSchema,
     pub snapshot_id: String,
     pub files: Vec<String>,
+    pub sizes: Vec<u64>,
     pub column_names: Vec<String>,
     // per file, per column lower and upper bounds
     // TODO: this needs to be generalized to support bloom filters
@@ -66,7 +69,6 @@ pub(crate) struct SpeedboatMetadata {
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct DeletesMetadata {
     pub files: Vec<String>,
-    // TODO: bloom filters here?
 }
 
 
@@ -309,7 +311,7 @@ impl ApiServiceClientActor {
             ApiServiceClientActorMessage::Testing { respond_to, sync_index } => {
                 self.test_mode = true;
                 self.sync_index = sync_index;
-                self.test.clear();
+                self.test.clear().await;
                 let _ = respond_to.send(());
             },
             ApiServiceClientActorMessage::CreatePipeline { respond_to, name, pipeline } => {
@@ -672,35 +674,6 @@ impl ApiServiceClient for RealApiServiceClient {
 }
 
 
-fn do_remove_with_schemas(removed_files: &Vec<String>, files: &mut Vec<String>, sizes: &mut Vec<u64>, file_schema: &mut Vec<u64>) -> () {
-    // TODO: faster if you put removed files into a set
-    assert_eq!(files.len(), sizes.len());
-    assert_eq!(files.len(), file_schema.len());
-    let mut i = 0;
-    while i < files.len() {
-        if removed_files.contains(files.get(i).unwrap()) {
-            files.remove(i);
-            sizes.remove(i);
-            file_schema.remove(i);
-        } else {
-            i += 1;
-        }
-    }
-}
-
-fn do_remove(removed_files: &Vec<String>, files: &mut Vec<String>) -> () {
-    // TODO: faster if you put removed files into a set
-    let mut i = 0;
-    while i < files.len() {
-        if removed_files.contains(files.get(i).unwrap()) {
-            files.remove(i);
-        } else {
-            i += 1;
-        }
-    }
-}
-
-
 #[derive(Clone)]
 pub(crate) struct CompactionWorkItem {
     pub table_schema: PowdrrSchema,
@@ -743,7 +716,7 @@ impl TestApiServiceClient {
         }
     }
 
-    fn clear(&mut self) -> () {
+    async fn clear(&mut self) -> () {
         distributed_cache::clear(&self.tables.keys().into_iter().map(|x|x.clone()).collect()).unwrap();
         self.tables.clear();
         self.table_aliases.clear();
@@ -755,6 +728,7 @@ impl TestApiServiceClient {
         self.compaction_work_items.clear();
         self.compactions.clear();
         self.checkpoints.clear();
+        drop_all_tables(&"default".to_string()).await.expect("Failed while dropping all tables");
     }    
 
     fn add_checkpoint(&mut self, metadata: &TableMetadataCheckpoint) -> () {
@@ -781,6 +755,44 @@ impl TestApiServiceClient {
             }
         }
         self.index_work_items.insert(metadata.table_name.clone(), vec![metadata.clone()]);
+    }
+
+    fn handle_compaction(&mut self, compactions: &Vec<String>, checkpoint: &mut TableMetadataCheckpoint) -> () {
+        let (removed_speedboat, removed_deletes) = self.get_removed_files(compactions);
+
+        match checkpoint.speedboat_metadata.as_mut() {
+            Some(speedboat) => {
+                let mut i = 0;
+                while i < speedboat.files.len() {
+                    let file_name = speedboat.files.get(i).unwrap();
+                    if removed_speedboat.contains(file_name) {
+                        speedboat.files.remove(i);
+                        speedboat.sizes.remove(i);
+                        speedboat.file_schemas.remove(i);
+                    } else {
+                        i += 1;
+                    }
+                }
+            },
+            None => ()
+        };
+
+        match checkpoint.deletes_metadata.as_mut() {
+            Some(deletes) => {
+                deletes.files.retain(|x|!removed_deletes.contains(x));
+            },
+            None => ()
+        };
+
+        match checkpoint.extension_metadata.as_mut() {
+            Some(extensions) => {
+                extensions.retain(|(file_path, _)|!removed_speedboat.contains(file_path));
+            },
+            None => ()
+        }
+
+        // TODO: cleanup compactions
+        // self.compactions.retain(|x, _|!compactions.contains(x));
     }
 
     fn get_removed_files(&self, compactions: &Vec<String>) -> (Vec<String>, Vec<String>) {
@@ -813,7 +825,6 @@ impl TestApiServiceClient {
     }
 
     async fn speedboat_commit_type_commit(&mut self, commit: &SpeedboatCommit, sync_index: bool) -> Result<(), Box<dyn std::error::Error>> {
-        let (all_removed_speedboat_files, _) = self.get_removed_files(&commit.compactions);
         for table_info in commit.type_files.iter() {
             let latest_checkpoint = match self.get_latest_checkpoint_sync(&table_info.table_name, None) {
                 Some(checkpoint_id) => {
@@ -849,7 +860,6 @@ impl TestApiServiceClient {
                     let mut sizes = existing.sizes.clone();
                     let mut schemas = existing.schemas.clone();
                     let mut file_schemas = existing.file_schemas.clone();
-                    do_remove_with_schemas(&all_removed_speedboat_files, &mut files, &mut sizes, &mut file_schemas);
                     files.extend(table_info.files.clone());
                     sizes.extend(table_info.sizes.clone());
                     // TODO: look for existing schemas that match and reuse
@@ -877,7 +887,7 @@ impl TestApiServiceClient {
                 merged_schema.merge_from(table_info.schema.as_ref().unwrap());
             }
 
-            let new_latest_checkpoint = TableMetadataCheckpoint {
+            let mut new_latest_checkpoint = TableMetadataCheckpoint {
                 table_name: table_info.table_name.clone(),
                 checkpoint_id: new_checkpoint_id.clone(),
                 iceberg_metadata: latest_checkpoint.iceberg_metadata.clone(),
@@ -886,6 +896,8 @@ impl TestApiServiceClient {
                 extension_metadata: latest_checkpoint.extension_metadata.clone(),   
                 schema: merged_schema,
             };
+
+            self.handle_compaction(&commit.compactions, &mut new_latest_checkpoint);
 
             self.checkpoints.insert(format!("{}_{}", &table_info.table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
 
@@ -958,7 +970,7 @@ impl TestApiServiceClient {
             };
 
             let new_checkpoint_id = IdInstance::next_id().to_string();
-            let mut new_deletes_metadata = match &latest_checkpoint.deletes_metadata {
+            let new_deletes_metadata = match &latest_checkpoint.deletes_metadata {
                 None => DeletesMetadata {
                     files: table_info.files.clone(),
                 },
@@ -976,10 +988,7 @@ impl TestApiServiceClient {
                 tracing::info!("Delete file {}", file)
             }
 
-            let (_, all_removed_delete_files) = self.get_removed_files(&commit.compactions);
-            do_remove(&all_removed_delete_files, &mut new_deletes_metadata.files);
-
-            let new_latest_checkpoint = TableMetadataCheckpoint {
+            let mut new_latest_checkpoint = TableMetadataCheckpoint {
                 table_name: table_info.table_name.clone(),
                 checkpoint_id: new_checkpoint_id.clone(),
                 iceberg_metadata: latest_checkpoint.iceberg_metadata.clone(),
@@ -988,6 +997,7 @@ impl TestApiServiceClient {
                 extension_metadata: latest_checkpoint.extension_metadata.clone(),  
                 schema: latest_checkpoint.schema.clone(),
             };
+            self.handle_compaction(&commit.compactions, &mut new_latest_checkpoint);
 
             self.checkpoints.insert(format!("{}_{}", &table_info.table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
             match self.index_work_items.get_mut(&table_info.table_name) {
@@ -1156,41 +1166,23 @@ impl ApiServiceClient for TestApiServiceClient {
                     speedboat_metadata: None,
                     deletes_metadata: None,
                     extension_metadata: None,
-                    schema: PowdrrSchema{ fields: vec!() },
+                    schema: iceberg_commit.metadata.table_schema.clone()
                 }
             },
         };
 
         let new_checkpoint_id = IdInstance::next_id().to_string();
-        let new_speedboat_metadata = match &latest_checkpoint.speedboat_metadata {
-            None => None,
-            Some(_existing) => {
-                todo!("This needs fixing for powdrrschema stuff");
-                /*
-                let mut files = existing.files.clone();
-                let mut sizes = existing.sizes.clone();
-                let all_removed_files = self.get_removed_files(&iceberg_commit.compactions);
-                do_remove(&all_removed_files, &mut files, &mut sizes, );
-                Some(SpeedboatMetadata {
-                    files: files,
-                    sizes: sizes,
-                    schemas: vec!(),
-                    file_schemas: vec!(),
-                })
 
-                 */
-            },
-        };     
-
-        let new_latest_checkpoint = TableMetadataCheckpoint {
+        let mut new_latest_checkpoint = TableMetadataCheckpoint {
             table_name: table_name.clone(),
             checkpoint_id: new_checkpoint_id.clone(),
             iceberg_metadata: Some(iceberg_commit.metadata.clone()),
-            speedboat_metadata: new_speedboat_metadata,
+            speedboat_metadata: latest_checkpoint.speedboat_metadata.clone(),
             deletes_metadata: latest_checkpoint.deletes_metadata.clone(),
-            extension_metadata: latest_checkpoint.extension_metadata.clone(), 
-            schema: latest_checkpoint.schema.clone(),
+            extension_metadata: latest_checkpoint.extension_metadata.clone(),
+            schema: iceberg_commit.metadata.table_schema.clone(),
         };
+        self.handle_compaction(&iceberg_commit.compactions, &mut new_latest_checkpoint);
 
         self.checkpoints.insert(format!("{}_{}", &table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
         self.set_latest_checkpoint(&table_name, None, &new_checkpoint_id);

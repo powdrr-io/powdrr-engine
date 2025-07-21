@@ -6,6 +6,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 use arrow_json::reader::infer_json_schema;
 use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema};
+use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -80,7 +81,7 @@ impl PowdrrDataType {
                 ))
             },
             PowdrrDataType::Null => DataType::Null,
-            PowdrrDataType::String => DataType::LargeUtf8,
+            PowdrrDataType::String => DataType::Utf8,
         }
     }
 }
@@ -100,8 +101,11 @@ impl Display for PowdrrField {
 }
 
 impl PowdrrField {
-    fn to_arrow_field(&self) -> Field {
-        Field::new(self.name.clone(), self.data_type.to_arrow_type(), true)
+    fn to_arrow_field(&self, index: usize) -> Field {
+        assert!(index > 0, "These need to be 1-indexed, not 0-indexed");
+        Field::new(self.name.clone(), self.data_type.to_arrow_type(), true).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), index.to_string())])
+        )
     }
 }
 
@@ -124,8 +128,13 @@ impl PowdrrSchema {
     }
 
     fn to_arrow_fields(&self) -> Vec<Field> {
-        let mut fields = self.fields.iter().map(|x| x.to_arrow_field()).collect::<Vec<Field>>();
+        let mut fields = self.fields.iter().enumerate().map(|(index, x)| x.to_arrow_field(index + 1)).collect::<Vec<Field>>();
         fields.sort_by(|a, b| a.name().partial_cmp(b.name()).unwrap());
+        for field in fields.iter() {
+            if field.name() == "dude" {
+                assert_eq!(field.metadata().len(), 1);
+            }
+        }
         fields
     }
 

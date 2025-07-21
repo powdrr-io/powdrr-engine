@@ -3985,6 +3985,8 @@ dependencies = [
  "futures-util",
  "gotham",
  "http 0.2.12",
+ "iceberg",
+ "iceberg-catalog-rest",
  "iceberg_lib",
  "idgenerator",
  "lru-mem",

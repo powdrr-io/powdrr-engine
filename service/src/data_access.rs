@@ -364,7 +364,6 @@ async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> 
         match result {
             Err(e) => {
                 if e.message().contains("already exists") {
-                    LRU_CACHE_HANDLE.table_created(local_name).await;
                     Ok(())
                 } else {
                     log_err(e)
