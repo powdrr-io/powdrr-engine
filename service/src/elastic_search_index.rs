@@ -323,7 +323,7 @@ mod tests {
                 Err(_) => panic!("failed"),
                 Ok(_) => ()
             }
-        }); 
+        });
     }
 /*
     #[test]

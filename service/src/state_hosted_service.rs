@@ -757,7 +757,7 @@ impl TestApiServiceClient {
         self.index_work_items.insert(metadata.table_name.clone(), vec![metadata.clone()]);
     }
 
-    fn handle_compaction(&self, compactions: &Vec<String>, checkpoint: &mut TableMetadataCheckpoint) -> () {
+    fn handle_compaction(&mut self, compactions: &Vec<String>, checkpoint: &mut TableMetadataCheckpoint) -> () {
         let (removed_speedboat, removed_deletes) = self.get_removed_files(compactions);
 
         match checkpoint.speedboat_metadata.as_mut() {
@@ -790,6 +790,9 @@ impl TestApiServiceClient {
             },
             None => ()
         }
+
+        // TODO: cleanup compactions
+        // self.compactions.retain(|x, _|!compactions.contains(x));
     }
 
     fn get_removed_files(&self, compactions: &Vec<String>) -> (Vec<String>, Vec<String>) {

@@ -102,6 +102,7 @@ impl Display for PowdrrField {
 
 impl PowdrrField {
     fn to_arrow_field(&self, index: usize) -> Field {
+        assert!(index > 0, "These need to be 1-indexed, not 0-indexed");
         Field::new(self.name.clone(), self.data_type.to_arrow_type(), true).with_metadata(
             HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), index.to_string())])
         )
