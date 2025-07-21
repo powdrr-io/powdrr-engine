@@ -119,7 +119,7 @@ struct PathExtractor {
 /// | {tables}/_search --> POST 
 
 /// matching on.
-pub(crate) fn router(include_test_apis: bool) -> Router {
+pub fn router(include_test_apis: bool) -> Router {
     let (chain, pipelines) = single_pipeline(new_pipeline().add(RouterMiddleware).build());
 
     build_router(chain, pipelines, |route| {

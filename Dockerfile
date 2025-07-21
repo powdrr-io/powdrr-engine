@@ -24,8 +24,8 @@ WORKDIR /app/build
 # output directory before the cache mounted /app/target is unmounted.
 RUN --mount=type=bind,source=iceberg_lib/src,target=iceberg_lib/src \
     --mount=type=bind,source=iceberg_lib/Cargo.toml,target=iceberg_lib/Cargo.toml \
-    --mount=type=bind,source=service/src,target=service/src \
-    --mount=type=bind,source=service/Cargo.toml,target=service/Cargo.toml \
+    --mount=type=bind,source=main_lib/src,target=main_lib/src \
+    --mount=type=bind,source=main_lib/Cargo.toml,target=main_lib/Cargo.toml \
     --mount=type=bind,source=Cargo.toml,target=Cargo.toml \
     --mount=type=bind,source=Cargo.lock,target=Cargo.lock \
     --mount=type=cache,target=/app/build/target/ \

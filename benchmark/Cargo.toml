@@ -1,0 +1,11 @@
+[package]
+name = "powdrr-benchmark"
+description = "Powdrr.io Benchmarking Tool"
+keywords = ["arrow", "query", "sql"]
+publish = false
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+
+
+[dependencies]

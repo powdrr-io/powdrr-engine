@@ -1423,7 +1423,7 @@ mod tests {
         assert_eq!(index.aliases.map_or_else(|| 0, |x| x.len()), 2);
 
 /* 
-        let file_content = match read_to_string("service/tests/data/example_create_index.json") {
+        let file_content = match read_to_string("main_lib/tests/data/example_create_index.json") {
             Ok(f) => f,
             Err(_) => panic!("Missing test file")
         };
@@ -1432,7 +1432,7 @@ mod tests {
             Err(e) => {
                 let error = format!("{}", e);
                 println!("{}", error);
-                let _ = fs::write("service/output.txt", error);
+                let _ = fs::write("main_lib/output.txt", error);
                 panic!("nope");
             }
         };
@@ -1445,7 +1445,7 @@ mod tests {
             Err(e) => {
                 let error = format!("{}", e);
                 println!("{}", error);
-                let _ = fs::write("service/output.txt", error);
+                let _ = fs::write("../output.txt", error);
                 panic!("nope");
             }
         };
@@ -1584,7 +1584,7 @@ mod tests {
             Err(e) => {
                 let error = format!("{}", e);
                 println!("{}", error);
-                let _ = fs::write("service/output.txt", error);
+                let _ = fs::write("../output.txt", error);
                 panic!("nope");
             }
         };        
@@ -2394,7 +2394,7 @@ mod tests {
                 let error = format!("{}", e);
                 let error_str = error.as_str();
                 println!("{}", error_str);
-                let _ = fs::write("/Users/gregory/code/powdrr-engine/service/output.txt", error);
+                let _ = fs::write("/Users/gregory/code/powdrr-engine/main_lib/output.txt", error);
                 panic!("nope");
             }
         };
@@ -2406,7 +2406,7 @@ mod tests {
             Err(e) => {
                 let error = format!("{}", e);
                 println!("{}", error);
-                let _ = fs::write("service/output.txt", error);
+                let _ = fs::write("../output.txt", error);
                 panic!("nope");
             }
         };
@@ -2414,7 +2414,7 @@ mod tests {
 
     #[test]
     fn test_create_index_template() {
-        let test_val = r#"{"version":1,"index_patterns":[".apm-source-map"],"template":{"settings":{"index":{"number_of_shards":1,"auto_expand_replicas":"0-2","hidden":true}},"mappings":{"dynamic":"strict","properties":{"fleet_id":{"type":"keyword"},"created":{"type":"date"},"content":{"type":"binary"},"content_sha256":{"type":"keyword"},"file.path":{"type":"keyword"},"service.name":{"type":"keyword"},"service.version":{"type":"keyword"}}}}}"#;
+        let test_val = r#"{"version":1,"index_patterns":[".apm-source-map"],"template":{"settings":{"index":{"number_of_shards":1,"auto_expand_replicas":"0-2","hidden":true}},"mappings":{"dynamic":"strict","properties":{"fleet_id":{"type":"keyword"},"created":{"type":"date"},"content":{"type":"binary"},"content_sha256":{"type":"keyword"},"file.path":{"type":"keyword"},"main_lib.name":{"type":"keyword"},"main_lib.version":{"type":"keyword"}}}}}"#;
 
         let _deser: CreateIndexTemplateBody = match serde_json::from_str(test_val) {
             Ok(d) => d,

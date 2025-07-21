@@ -332,7 +332,7 @@ impl UpdateByQueryResult {
     }
     
     async fn commit(&mut self) -> Result<ElasticSearchResponse, String> {
-        // TODO: ideally this would write all the files once and do a single commit to the service.
+        // TODO: ideally this would write all the files once and do a single commit to the main_lib.
         if self.update_buffer.records.len() != 0 {
             match elastic_search_ingest::commit_general(&self.update_buffer.build(), &self.table, &"commit".to_string()).await {
                 Ok(_) => (),
