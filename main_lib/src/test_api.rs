@@ -69,6 +69,8 @@ pub(crate) async fn do_all_available_work() -> () {
         // We keep track of this to see what all iceberg snapshots we should look through to
         // see what types of compactions have happened.
         let mut last_iceberg_snapshot_id: i64 = 0;
+        /*
+
         let index_work = match API_SERVICE_CLIENT.get_extension_work_items(&"es".to_string()).await {
             Ok(work) => work,
             Err(_) => panic!("oh no"),
@@ -80,7 +82,7 @@ pub(crate) async fn do_all_available_work() -> () {
                 Err(_) => panic!("Need some real error handling some day"),
             }
         }
-
+        */
         let compact_work = match API_SERVICE_CLIENT.get_compaction_work_items().await {
             Ok(work) => work,
             Err(_) => panic!("oh no"),
@@ -112,7 +114,7 @@ fn do_work_for_forever(wait_time_ms: u64) -> impl Future<Output = ()> {
 
 pub fn test_v1_set_testing_processing_mode(state: State) -> Pin<Box<HandlerFuture>> {
     async {
-        API_SERVICE_CLIENT.set_testing_mode(true).await;
+        API_SERVICE_CLIENT.set_testing_mode(false).await;
         tokio::spawn(do_work_for_forever(1000));
         let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "Ok");
         Ok((state, res))        

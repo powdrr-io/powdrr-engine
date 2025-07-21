@@ -30,7 +30,7 @@ fn get_connection() -> Result<redis::Connection, CacheError> {
 
 
 fn increment(key: &String, delta: i64) -> Result<i64, CacheError>  {
-    let con = &mut get_connection()?;
+    let con = get_connection()?;
 
     match redis::pipe()
         .atomic()
