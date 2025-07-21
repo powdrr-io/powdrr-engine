@@ -1,7 +1,6 @@
-
 [package]
 name = "powdrr-io-engine"
-description = "Powdrr.io Monolith"
+description = "Powdrr.io Engine"
 keywords = ["arrow", "query", "sql"]
 publish = false
 readme = "README.md"
@@ -22,9 +21,9 @@ gotham = { version = "0.7.4", features = ["rustls"] }
 http = "0.2.12"
 iceberg = { path = "../../iceberg-rust/crates/iceberg" }
 iceberg-catalog-rest = { path = "../../iceberg-rust/crates/catalog/rest" }
-iceberg_lib = { path = "../iceberg_lib" }
 idgenerator = "2.0.0"
 lru-mem = "0.3.0"
+powdrr_lib = { path = "../main_lib" }
 minijinja = "2.10.2"
 object_store = { version = "0.12.3", features = ["aws", "gcp", "azure", "http"] }
 prost = "0.13.5"

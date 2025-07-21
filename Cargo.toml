@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = [ "iceberg_lib","service"]
+members = [ "benchmark", "cli", "engine", "main_lib"]
 
 
 [workspace.package]

@@ -161,7 +161,7 @@ mod tests {
                 let error = format!("{}", e);
                 let error_str = error.as_str();
                 println!("{}", error_str);
-                let _ = fs::write("/Users/gregory/code/powdrr-engine/service/output.txt", error);
+                let _ = fs::write("/Users/gregory/code/powdrr-engine/main_lib/output.txt", error);
                 panic!("nope");
             }
         }
@@ -174,7 +174,7 @@ mod tests {
                 let error = format!("{}", e);
                 let error_str = error.as_str();
                 println!("{}", error_str);
-                let _ = fs::write("/Users/gregory/code/powdrr-engine/service/output.txt", error);
+                let _ = fs::write("/Users/gregory/code/powdrr-engine/main_lib/output.txt", error);
                 panic!("nope");
             }
         }

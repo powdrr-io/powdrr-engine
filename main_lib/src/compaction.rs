@@ -66,6 +66,7 @@ fn get_catalog() -> RestCatalog {
 static REST_CATALOG: LazyLock<Arc<RestCatalog>> = LazyLock::new(|| Arc::new(get_catalog()));
 
 
+#[allow(dead_code)]
 async fn list_all_tables(namespace: &String) -> Result<Vec<TableIdent>, iceberg::Error> {
     let catalog = REST_CATALOG.clone();
     let namespace_ident = NamespaceIdent::new(namespace.clone());
@@ -75,6 +76,7 @@ async fn list_all_tables(namespace: &String) -> Result<Vec<TableIdent>, iceberg:
     }
 }
 
+#[allow(dead_code)]
 async fn drop_table(namespace: &String, name: &String) -> Result<(), iceberg::Error> {
     let catalog = REST_CATALOG.clone();
 
@@ -318,6 +320,7 @@ impl CompactionCommand {
         Ok(())
     }
 
+    #[allow(dead_code)] // Used in testing
     fn fix_fields(fields: &Fields) -> Schema {
         let mut builder = SchemaBuilder::new();
         for (index, field) in fields.iter().enumerate() {
@@ -522,9 +525,9 @@ pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkIt
 
         let compaction_id = IdInstance::next_id().to_string();
 
-        // NOTE: the api commit must happen before the iceberg commit. The service is designed to understand that
+        // NOTE: the api commit must happen before the iceberg commit. The main_lib is designed to understand that
         // a compaction commit might get committed to it but fail afterwards. If we commit to Iceberg and fail to
-        // record that in the service then that leads to correctness errors that aren't really possible to fix.
+        // record that in the main_lib then that leads to correctness errors that aren't really possible to fix.
         match API_SERVICE_CLIENT.compaction_commit(
             table_name,
             &CompactionCommit {
