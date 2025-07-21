@@ -411,103 +411,101 @@ impl Command for CompactionCommand {
         })
     }
 
-    fn result_generator(&self, result_table_name: Option<String>) -> Pin<Box<ResultGeneratorFuture>> {
+    async fn result_generator(&self, result_table_name: Option<String>) -> ElasticSearchResponse {
         let table = self.table.clone();
         let compactions = vec!(self.compaction_id.clone());
         let schema = self.work_item.table_schema.clone();
         let old_snapshot_id = self.last_snapshot_id;
-        async move {
-            let table_name = match result_table_name {
-                Some(t) => t,
-                None => {
-                    // TODO: Need to commit that after this compaction there is....nothing?
-                    // Maybe this should panic since it shouldn't be possible to get here.
-                    let none = CompactionResult::None;
-                    return Ok(ElasticSearchResponse {
-                        status: StatusCode::OK,
-                        mime: mime::APPLICATION_JSON,
-                        body: serde_json::to_string(&none).unwrap(),
-                        headers: vec![],
-                    });
+        let table_name = match result_table_name {
+            Some(t) => t,
+            None => {
+                // TODO: Need to commit that after this compaction there is....nothing?
+                // Maybe this should panic since it shouldn't be possible to get here.
+                let none = CompactionResult::None;
+                return ElasticSearchResponse {
+                    status: StatusCode::OK,
+                    mime: mime::APPLICATION_JSON,
+                    body: serde_json::to_string(&none).unwrap(),
+                    headers: vec![],
+                };
+            }
+        };
+        let remaining_deletes_data_frame = match execute_sql(&format!("select _dt_id_seq_no as _id_seq_no from {table_name} where _id is null and _dt_id_seq_no is not null")).await {
+            Ok(df) => df,
+            Err(_) => panic!("nope")
+        };
+        let results_data_frame = match execute_sql(&format!("select * from {table_name} where _id is not null and _dt_id_seq_no is null")).await {
+            Ok(df) => {
+                match df.drop_columns(&["_dt_id", "_dt_seq_no", "_dt_id_seq_no"]) {
+                    Ok(df) => df,
+                    Err(_) => panic!("nope")
                 }
+            },
+            Err(_) => panic!("nope")
+        };
+
+        let (compacted_deletes, _) = to_serde_value(&remaining_deletes_data_frame).await;
+        if compacted_deletes.len() != 0 {
+            let mut deletes_buffer = WriteBuffer::new();
+            deletes_buffer.push_many(compacted_deletes.iter().map(|x| serde_json::to_string(x).unwrap()).collect());
+            match elastic_search_ingest::commit_general_compactions(&deletes_buffer, &table, &"delete".to_string(), &compactions).await {
+                Ok(_) => (),
+                Err(_) => panic!("nope"),
             };
-            let remaining_deletes_data_frame = match execute_sql(&format!("select _dt_id_seq_no as _id_seq_no from {table_name} where _id is null and _dt_id_seq_no is not null")).await {
+        }
+
+        let results_count = match results_data_frame.clone().count().await {
+            Ok(c) => c,
+            Err(_) => panic!("nope")
+        };
+
+        let new_snapshot_id: i64 = if results_count < MIN_PARQUET_SIZE {
+            let (compacted_results, _) = to_serde_value(&results_data_frame).await;
+
+            let mut result_buffer = WriteBuffer::new();
+            result_buffer.schema = Some(schema);
+            result_buffer.push_many(compacted_results.iter().map(|x| serde_json::to_string(x).unwrap()).collect());
+            match elastic_search_ingest::commit_general_compactions(&result_buffer, &table, &"compact".to_string(), &compactions).await {
+                Ok(_) => (),
+                Err(_) => panic!("nope"),
+            };
+
+            old_snapshot_id
+        } else {
+            // TODO: if nulls can come out there that probably means we need to intercept earlier
+            // in the pipeline to cast nulls to real types.
+            let null_fields = results_data_frame.schema().fields().iter()
+                .filter(|f| f.data_type() == &DataType::Null || f.metadata().get(PARQUET_FIELD_ID_META_KEY).is_none())
+                .map(|f|f.name().as_str())
+                .collect::<Vec<&str>>();
+            let non_null_results = match results_data_frame.clone().drop_columns(null_fields.as_slice()) {
                 Ok(df) => df,
                 Err(_) => panic!("nope")
             };
-            let results_data_frame = match execute_sql(&format!("select * from {table_name} where _id is not null and _dt_id_seq_no is null")).await {
-                Ok(df) => {
-                    match df.drop_columns(&["_dt_id", "_dt_seq_no", "_dt_id_seq_no"]) {
-                        Ok(df) => df,
-                        Err(_) => panic!("nope")
-                    }
-                },
+
+            let data = match non_null_results.collect().await {
+                Ok(d) => d,
                 Err(_) => panic!("nope")
             };
+            Self::update_iceberg(
+                &data,
+                &table,
+                &compactions[0]
+            ).await;
 
-            let (compacted_deletes, _) = to_serde_value(&remaining_deletes_data_frame).await;
-            if compacted_deletes.len() != 0 {
-                let mut deletes_buffer = WriteBuffer::new();
-                deletes_buffer.push_many(compacted_deletes.iter().map(|x| serde_json::to_string(x).unwrap()).collect());
-                match elastic_search_ingest::commit_general_compactions(&deletes_buffer, &table, &"delete".to_string(), &compactions).await {
-                    Ok(_) => (),
-                    Err(_) => panic!("nope"),
-                };
-            }
+            Self::do_iceberg_commit(
+                &table,
+                &schema,
+                0
+            ).await.unwrap()
+        };
 
-            let results_count = match results_data_frame.clone().count().await {
-                Ok(c) => c,
-                Err(_) => panic!("nope")
-            };
-
-            let new_snapshot_id: i64 = if results_count < MIN_PARQUET_SIZE {
-                let (compacted_results, _) = to_serde_value(&results_data_frame).await;
-
-                let mut result_buffer = WriteBuffer::new();
-                result_buffer.schema = Some(schema);
-                result_buffer.push_many(compacted_results.iter().map(|x| serde_json::to_string(x).unwrap()).collect());
-                match elastic_search_ingest::commit_general_compactions(&result_buffer, &table, &"compact".to_string(), &compactions).await {
-                    Ok(_) => (),
-                    Err(_) => panic!("nope"),
-                };
-
-                old_snapshot_id
-            } else {
-                // TODO: if nulls can come out there that probably means we need to intercept earlier
-                // in the pipeline to cast nulls to real types.
-                let null_fields = results_data_frame.schema().fields().iter()
-                    .filter(|f| f.data_type() == &DataType::Null || f.metadata().get(PARQUET_FIELD_ID_META_KEY).is_none())
-                    .map(|f|f.name().as_str())
-                    .collect::<Vec<&str>>();
-                let non_null_results = match results_data_frame.clone().drop_columns(null_fields.as_slice()) {
-                    Ok(df) => df,
-                    Err(_) => panic!("nope")
-                };
-
-                let data = match non_null_results.collect().await {
-                    Ok(d) => d,
-                    Err(_) => panic!("nope")
-                };
-                Self::update_iceberg(
-                    &data,
-                    &table,
-                    &compactions[0]
-                ).await;
-
-                Self::do_iceberg_commit(
-                    &table,
-                    &schema,
-                    0
-                ).await.unwrap()
-            };
-
-            Ok(ElasticSearchResponse {
-                status: StatusCode::OK,
-                mime: mime::TEXT_PLAIN,
-                body: new_snapshot_id.to_string(),
-                headers: vec![],
-            })
-        }.boxed()
+        ElasticSearchResponse {
+            status: StatusCode::OK,
+            mime: mime::TEXT_PLAIN,
+            body: new_snapshot_id.to_string(),
+            headers: vec![],
+        }
     }
 }
 

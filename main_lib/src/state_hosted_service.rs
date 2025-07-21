@@ -717,7 +717,7 @@ impl TestApiServiceClient {
     }
 
     async fn clear(&mut self) -> () {
-        distributed_cache::clear(&self.tables.keys().into_iter().map(|x|x.clone()).collect()).unwrap();
+        distributed_cache::clear(&self.tables.keys().into_iter().map(|x|x.clone()).collect()).await.unwrap();
         self.tables.clear();
         self.table_aliases.clear();
         self.table_templates.clear();
@@ -1081,7 +1081,7 @@ impl ApiServiceClient for TestApiServiceClient {
     }
 
     async fn create_table(&mut self, create_table: &CreateTable) -> Result<(), Box<dyn Error>> {
-        match distributed_cache::create_table(&create_table.name) {
+        match distributed_cache::create_table(&create_table.name).await {
             Ok(_) => (),
             Err(e) => panic!("Unable to create table = {}", e),
         };

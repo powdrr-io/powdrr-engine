@@ -266,76 +266,69 @@ pub fn es_get_index_template(state: State) -> Pin<Box<HandlerFuture>> {
 }
 
 
-pub fn es_create_with_id(mut state: State) -> Pin<Box<HandlerFuture>> {
+pub async fn es_create_with_id(mut state: State) -> Box<HandlerFuture> {
     tracing::info!("es_create_with_id"); 
-    async {
-        let path_extractor = NameIdPathExtractor::borrow_from(&state);
-        let index_name = path_extractor.name.to_string();
-        let doc_id = path_extractor.id.to_string();
-        let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
-            Ok(vb) => vb,
-            Err(_) => panic!("Oh no"),
-        };
-        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();    
-        let create_single_result = elastic_search_ingest::create_single(&index_name, &doc_id, &body_content).await;
-        match create_single_result {
-            Ok(success) => {
-                let res = success.generate_response(&state);
-                Ok((state, res))
-            }
-            Err(e) => {
-                let res = create_response(&state, StatusCode::ALREADY_REPORTED, mime::TEXT_PLAIN, e.message);
-                Ok((state, res))
-            }
+    let path_extractor = NameIdPathExtractor::borrow_from(&state);
+    let index_name = path_extractor.name.to_string();
+    let doc_id = path_extractor.id.to_string();
+    let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
+        Ok(vb) => vb,
+        Err(_) => panic!("Oh no"),
+    };
+    let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+    let create_single_result = elastic_search_ingest::create_single(&index_name, &doc_id, &body_content).await;
+    match create_single_result {
+        Ok(success) => {
+            let res = success.generate_response(&state);
+            Box::new(Ok((state, res)))
         }
-    }.boxed()
+        Err(e) => {
+            let res = create_response(&state, StatusCode::ALREADY_REPORTED, mime::TEXT_PLAIN, e.message);
+            Box::new(Ok((state, res)))
+        }
+    }
 }
 
-pub fn es_update_with_id(mut state: State) -> Pin<Box<HandlerFuture>> {
+pub async fn es_update_with_id(mut state: State) -> Box<HandlerFuture> {
     tracing::info!("es_update_with_id"); 
-    async {
-        let path_extractor = NameIdPathExtractor::borrow_from(&state);
-        let index_name = path_extractor.name.to_string();
-        let doc_id = path_extractor.id.to_string();
-        let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
-            Ok(vb) => vb,
-            Err(_) => panic!("Oh no"),
-        };
-        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();    
-        let create_single_result = elastic_search_ingest::upsert_single(&index_name, &doc_id, &body_content).await;
-        match create_single_result {
-            Ok(success_response) => {
-                let res = success_response.generate_response(&state);
-                Ok((state, res))
-            }
-            Err(e) => {
-                let res = create_response(&state, StatusCode::ALREADY_REPORTED, mime::TEXT_PLAIN, e.message);
-                Ok((state, res))
-            }
+    let path_extractor = NameIdPathExtractor::borrow_from(&state);
+    let index_name = path_extractor.name.to_string();
+    let doc_id = path_extractor.id.to_string();
+    let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
+        Ok(vb) => vb,
+        Err(_) => panic!("Oh no"),
+    };
+    let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+    let create_single_result = elastic_search_ingest::upsert_single(&index_name, &doc_id, &body_content).await;
+    match create_single_result {
+        Ok(success_response) => {
+            let res = success_response.generate_response(&state);
+            Box::new(Ok((state, res)))
         }
-    }.boxed()
+        Err(e) => {
+            let res = create_response(&state, StatusCode::ALREADY_REPORTED, mime::TEXT_PLAIN, e.message);
+            Box::new(Ok((state, res)))
+        }
+    }
 }
 
-pub fn es_get_with_id(state: State) -> Pin<Box<HandlerFuture>> {
+pub async fn es_get_with_id(state: State) -> Box<HandlerFuture> {
     tracing::info!("es_get_with_id"); 
-    async {
-        let path_extractor = NameIdPathExtractor::borrow_from(&state);
-        let index_name = path_extractor.name.to_string();
-        let doc_id = path_extractor.id.to_string();
-        let table_desc = API_SERVICE_CLIENT.describe_table(&index_name).await;
-        match table_desc {
-            Some(td) => {
-                let command = LookupById::new(&td.name, &vec!(doc_id));
-                let response = execute_command(CommandContext{}, Arc::new(command)).await;
-                let res = response.generate_response(&state);
-                Ok((state, res))
-            },
-            None => {
-                panic!("Table not found");
-            }
+    let path_extractor = NameIdPathExtractor::borrow_from(&state);
+    let index_name = path_extractor.name.to_string();
+    let doc_id = path_extractor.id.to_string();
+    let table_desc = API_SERVICE_CLIENT.describe_table(&index_name).await;
+    match table_desc {
+        Some(td) => {
+            let command = LookupById::new(&td.name, &vec!(doc_id));
+            let response = execute_command(CommandContext{}, Arc::new(command)).await;
+            let res = response.generate_response(&state);
+            Box::new(Ok((state, res)))
+        },
+        None => {
+            panic!("Table not found");
         }
-
-    }.boxed()
+    }
 }
 
 

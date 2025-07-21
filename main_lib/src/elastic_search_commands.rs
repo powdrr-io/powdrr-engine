@@ -6,6 +6,7 @@ use arrow_json::WriterBuilder;
 use async_trait::async_trait;
 use datafusion::{arrow::array::RecordBatch, prelude::DataFrame};
 use futures::FutureExt;
+use futures_util::future::try_join_all;
 use gotham::mime;
 use http::StatusCode;
 use serde_json::Value;
@@ -125,32 +126,30 @@ impl Command for LookupById {
         })
     }
 
-    fn result_generator(&self, result_table_name: Option<String>) -> Pin<Box<ResultGeneratorFuture>> {
+    async fn result_generator(&self, result_table_name: Option<String>) -> ElasticSearchResponse {
         let table = self.table.clone();
         let ids = self.ids.clone();
-        async move {
-            let result = match LookupById::to_dataframe(result_table_name).await {
-                Some(df) => {
-                    let (hits, _) = to_hits(&table, &df, Some(true)).await;
-                    let inner_result: ElasticSearchResponse = if hits.len() == 0 {
-                        (QueryResultsNotFound { _index: table, _id: ids.get(0).unwrap().clone(), found: false }).to_response()
-                    } else {
-                        assert_eq!(hits.len(), 1);
-                        ElasticSearchResponse {
-                            status: StatusCode::OK,
-                            mime: mime::APPLICATION_JSON,
-                            body: serde_json::to_string(hits.get(0).unwrap()).unwrap(),
-                            headers: vec![],
-                        }
-                    };
-                    inner_result
-                },
-                None => {
+        let result = match LookupById::to_dataframe(result_table_name).await {
+            Some(df) => {
+                let (hits, _) = to_hits(&table, &df, Some(true)).await;
+                let inner_result: ElasticSearchResponse = if hits.len() == 0 {
                     (QueryResultsNotFound { _index: table, _id: ids.get(0).unwrap().clone(), found: false }).to_response()
-                }
-            };
-            Ok(result)
-        }.boxed()
+                } else {
+                    assert_eq!(hits.len(), 1);
+                    ElasticSearchResponse {
+                        status: StatusCode::OK,
+                        mime: mime::APPLICATION_JSON,
+                        body: serde_json::to_string(hits.get(0).unwrap()).unwrap(),
+                        headers: vec![],
+                    }
+                };
+                inner_result
+            },
+            None => {
+                (QueryResultsNotFound { _index: table, _id: ids.get(0).unwrap().clone(), found: false }).to_response()
+            }
+        };
+        result
     }
 }
 
@@ -191,7 +190,7 @@ impl SqlCommand {
             let column_names_joined = column_names.join(", ");
 
             // TODO: need to get more of the metadata tracking system working to get total_records and avgdl for real
-            let total_records: f64 = match distributed_cache::get_approx_num_records(public_table_name) {
+            let total_records: f64 = match distributed_cache::get_approx_num_records(public_table_name).await {
                 Ok(t) => t as f64,
                 Err(_) => panic!("nope")
             };
@@ -255,50 +254,48 @@ impl Command for SqlCommand {
         })
     }
     
-    fn result_generator(&self, result_table_name: Option<String>) -> Pin<Box<ResultGeneratorFuture>> {
+    async fn result_generator(&self, result_table_name: Option<String>) -> ElasticSearchResponse {
         let table = self.table.clone();
         let calculate_score = self.calculate_score;
         let aggs = self.aggs.clone();
         let query_params = self.query_params.clone();
-        async move {
-            let table_name = match result_table_name {
-                Some(t) => t,
-                None => return Ok(empty_result(aggs, !query_params.rest_total_hits_as_int.unwrap_or_else(|| false)).await)
-            };
-            let final_table_name = SqlCommand::get_final_table_name(&table, &table_name, calculate_score).await;
-            let data_frame = match execute_sql(&format!("select * from {final_table_name}")).await {
-                Ok(df) => df,
-                Err(_) => panic!("nope")
-            };
-            let num_records = match data_frame.clone().count().await {
-                Ok(tr) => tr,
-                Err(_) => panic!("nope"),
-            };
+        let table_name = match result_table_name {
+            Some(t) => t,
+            None => return empty_result(aggs, !query_params.rest_total_hits_as_int.unwrap_or_else(|| false)).await
+        };
+        let final_table_name = SqlCommand::get_final_table_name(&table, &table_name, calculate_score).await;
+        let data_frame = match execute_sql(&format!("select * from {final_table_name}")).await {
+            Ok(df) => df,
+            Err(_) => panic!("nope")
+        };
+        let num_records = match data_frame.clone().count().await {
+            Ok(tr) => tr,
+            Err(_) => panic!("nope"),
+        };
 
-            // TODO: figure out the real size to return. There is default and then size can
-            // be passed in.
-            let first_n_rows = match data_frame.clone().limit(0, Some(100)) {
-                Ok(ftr) => ftr,
-                Err(_) => panic!("nope"),
-            };
+        // TODO: figure out the real size to return. There is default and then size can
+        // be passed in.
+        let first_n_rows = match data_frame.clone().limit(0, Some(100)) {
+            Ok(ftr) => ftr,
+            Err(_) => panic!("nope"),
+        };
 
-            let (hits, schema) = to_hits(&table, &first_n_rows, None).await;
+        let (hits, schema) = to_hits(&table, &first_n_rows, None).await;
 
-            let aggregations = SqlCommand::generate_aggregations(schema, aggs, Some(final_table_name.clone())).await;
-            // TODO: need to calculate the actual max score here
-            let max_score = hits.get(0).unwrap()._score;
-            let final_result = QueryResults::success(
-                50,
-                1,
-                num_records,
-                max_score,
-                hits,
-                aggregations,
-                !query_params.rest_total_hits_as_int.unwrap_or_else(|| false),
-            ).to_response();
-            data_access::drop(&final_table_name).await;
-            Ok(final_result)
-        }.boxed()
+        let aggregations = SqlCommand::generate_aggregations(schema, aggs, Some(final_table_name.clone())).await;
+        // TODO: need to calculate the actual max score here
+        let max_score = hits.get(0).unwrap()._score;
+        let final_result = QueryResults::success(
+            50,
+            1,
+            num_records,
+            max_score,
+            hits,
+            aggregations,
+            !query_params.rest_total_hits_as_int.unwrap_or_else(|| false),
+        ).to_response();
+        data_access::drop(&final_table_name).await;
+        final_result
     }
 }
 
@@ -331,7 +328,7 @@ impl UpdateByQueryResult {
         self.update_count + self.delete_count + self.noop_count
     }
     
-    async fn commit(&mut self) -> Result<ElasticSearchResponse, String> {
+    async fn commit(&mut self) -> ElasticSearchResponse {
         // TODO: ideally this would write all the files once and do a single commit to the main_lib.
         if self.update_buffer.records.len() != 0 {
             match elastic_search_ingest::commit_general(&self.update_buffer.build(), &self.table, &"commit".to_string()).await {
@@ -343,20 +340,20 @@ impl UpdateByQueryResult {
             Ok(_) => (),
             Err(_) => panic!("nope"),
         };
-        Ok(UpdateByQueryCommand::success(
+        UpdateByQueryCommand::success(
             self.total_count(),
             self.update_count,
             self.delete_count,
             self.noop_count,
             1,
             self.debug.clone()
-        ).to_response())
+        ).to_response()
     }
 }
 
 
 impl UpdateByQueryCommand {
-    fn evaluate(table_name: &String, script: &ScriptBlock, value: &RecordInput) -> EvalResult {
+    async fn evaluate(table_name: &String, script: &ScriptBlock, value: &RecordInput) -> Result<EvalResult, ()> {
         let translated_script = match painless_parser::translate(&script.source) {
             Ok(t) => t,
             Err(_) => panic!("Need to make an error path")
@@ -374,12 +371,12 @@ impl UpdateByQueryCommand {
 
         match op {
             "update" => {
-                let seq_no: i64 = match distributed_cache::update_operator(&table_name) {
+                let seq_no: i64 = match distributed_cache::update_operator(&table_name).await {
                     Ok(t) => t,
                     Err(_) => panic!("nope"),
                 };
 
-                EvalResult::Update(
+                Ok(EvalResult::Update(
                         RecordInput::new(
                         value.id().clone(),
                         seq_no,
@@ -387,10 +384,10 @@ impl UpdateByQueryCommand {
                         &output.source,
                     ),
                     value.seq_no(),
-                )
+                ))
             },
             "noop" => {
-                EvalResult::Noop
+                Ok(EvalResult::Noop)
             },
             "delete" => {
                 todo!("Need to implement delete")
@@ -472,30 +469,29 @@ impl Command for UpdateByQueryCommand {
         self.query_command.get_private_invocation().await
     }
     
-    fn result_generator(&self, result_table_name: Option<String>) -> Pin<Box<ResultGeneratorFuture>> {
+    async fn result_generator(&self, result_table_name: Option<String>) -> ElasticSearchResponse {
         let table = self.query_command.table.clone();
         let calculate_score = self.query_command.calculate_score;
         let script_block = self.script_block.clone();
-        async move {
-            let table_name = match result_table_name {
-                Some(t) => t,
-                None => return Ok(UpdateByQueryCommand::empty_result().to_response())
-            };
-            let final_table_name = SqlCommand::get_final_table_name(&table, &table_name, calculate_score).await;
-            let data_frame = match execute_sql(&format!("select * from {final_table_name}")).await {
-                Ok(df) => df,
-                Err(_) => panic!("nope")
-            };
+        let table_name = match result_table_name {
+            Some(t) => t,
+            None => return UpdateByQueryCommand::empty_result().to_response()
+        };
+        let final_table_name = SqlCommand::get_final_table_name(&table, &table_name, calculate_score).await;
+        let data_frame = match execute_sql(&format!("select * from {final_table_name}")).await {
+            Ok(df) => df,
+            Err(_) => panic!("nope")
+        };
 
-            let (mut result_values, _) = to_record_inputs(&data_frame).await;
-            result_values.iter_mut().for_each(|x|x.ensure_source());
-            let final_result_values: Vec<EvalResult> = result_values.iter().map(|x|UpdateByQueryCommand::evaluate(&table, &script_block, x)).collect();
+        let (mut result_values, _) = to_record_inputs(&data_frame).await;
+        result_values.iter_mut().for_each(|x|x.ensure_source());
+        let final_result_values = match try_join_all(result_values.iter().map(|x|UpdateByQueryCommand::evaluate(&table, &script_block, x))).await {
+            Ok(val) => val,
+            Err(_) => panic!("nope")
+        };
 
-            let mut result_info = UpdateByQueryCommand::create_final_result(&table, final_result_values).await;
-            data_access::drop(&final_table_name).await;
-            result_info.commit().await
-        }.boxed()
+        let mut result_info = UpdateByQueryCommand::create_final_result(&table, final_result_values).await;
+        data_access::drop(&final_table_name).await;
+        result_info.commit().await
     }
 }
-
-

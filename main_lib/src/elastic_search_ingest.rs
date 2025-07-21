@@ -580,7 +580,7 @@ async fn create_single_worker(index: &String, doc_id: &String, payload: &String)
                 return Ok(ElasticSearchResponse { status: StatusCode::CONFLICT, mime: mime::APPLICATION_JSON, body: serde_json::to_string(&response).unwrap(), headers: vec!() })
             };
 
-            let seq_no: i64 = match distributed_cache::insert_operator(&table_description.name, 1) {
+            let seq_no: i64 = match distributed_cache::insert_operator(&table_description.name, 1).await {
                 Ok(v) => v,
                 Err(_) => panic!("nope")
             };
@@ -662,7 +662,7 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
         }
         let mut existing_doc = RecordInput::from_record(&docs.docs[0]);
         existing_doc.ensure_source();
-        let seq_no: i64 = match distributed_cache::update_operator(&table_description.name) {
+        let seq_no: i64 = match distributed_cache::update_operator(&table_description.name).await {
             Ok(v) => v,
             Err(_) => panic!("nope")
         };
@@ -707,7 +707,7 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
             todo!("Need to implement upsert")
         }
 
-        let seq_no: i64 = match distributed_cache::insert_operator(&table_description.name, 1) {
+        let seq_no: i64 = match distributed_cache::insert_operator(&table_description.name, 1).await {
             Ok(v) => v,
             Err(_) => panic!("nope")
         };
@@ -782,7 +782,7 @@ pub(crate) async fn delete(index: &String, doc_id: &String) -> Result<ElasticSea
         };
         return Ok(ElasticSearchResponse { status: StatusCode::NOT_FOUND, mime: mime::APPLICATION_JSON, body: serde_json::to_string(&result).unwrap(), headers: vec!() })
     }
-    let _seq_no = match distributed_cache::delete_operator(&table_description.name, 1) {
+    let _seq_no = match distributed_cache::delete_operator(&table_description.name, 1).await {
         Ok(v) => v,
         Err(_) => panic!("Need to convert to an ingest error")
     };
@@ -831,7 +831,7 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
                             Some(t) => t,
                             None => return Err(IngestError{ message: "Index does not exist".to_string() })
                         };
-                        let seq_no: i64 = match distributed_cache::insert_operator(&table_description.name, 1) {
+                        let seq_no: i64 = match distributed_cache::insert_operator(&table_description.name, 1).await {
                             Ok(v) => v,
                             Err(_) => panic!("nope")
                         };
@@ -880,7 +880,7 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
                         };
                         let existing_docs = get_existing_docs(&table_description.name, &vec!(u.update.id.unwrap())).await?;
                         if existing_docs.docs.len() == 0 {
-                            let _seq_no: i64 = match distributed_cache::insert_operator(&table_description.name, 1) {
+                            let _seq_no: i64 = match distributed_cache::insert_operator(&table_description.name, 1).await {
                                 Ok(v) => v,
                                 Err(_) => panic!("nope")
                             };
@@ -898,7 +898,7 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
                                 }
                                 let mut existing_doc = RecordInput::from_record(&existing_docs.docs[0]);
                                 existing_doc.ensure_source();
-                                let seq_no: i64 = match distributed_cache::update_operator(&table_description.name) {
+                                let seq_no: i64 = match distributed_cache::update_operator(&table_description.name).await {
                                     Ok(v) => v,
                                     Err(_) => panic!("nope")
                                 };

@@ -1,6 +1,8 @@
+use redis::AsyncCommands;
 use std::{error::Error, fmt::Display};
-
+use std::sync::Mutex;
 use redis::{Commands, FromRedisValue, ToRedisArgs};
+use redis::{aio::MultiplexedConnection, RedisResult};
 
 #[derive(Debug)]
 pub(crate) struct CacheError {}
@@ -17,20 +19,28 @@ impl Error for CacheError {}
 const REDIS_URL: &str = "redis://127.0.0.1:6379/";
 
 
-fn get_connection() -> Result<redis::Connection, CacheError> {
-    let client = match redis::Client::open(REDIS_URL) {
-        Ok(c) => c,
-        Err(_) => return Err(CacheError { }),
+static REDIS_CONNECTION: Mutex<Option<MultiplexedConnection>> = Mutex::new(None);
+
+async fn create_connection() -> RedisResult<MultiplexedConnection> {
+    let client = redis::Client::open(REDIS_URL)?;
+    let con = client.get_multiplexed_tokio_connection().await?;
+    Ok(con)
+}
+
+pub async fn get_connection() -> Result<MultiplexedConnection, CacheError> {
+    let mut opt_guard = match REDIS_CONNECTION.lock() {
+        Ok(guard) => guard,
+        Err(_) => panic!("Time for some debug")
     };
-    match client.get_connection() {
-        Ok(c) => Ok(c),
-        Err(_) => Err(CacheError {  })
+    if opt_guard.is_none() {
+        *opt_guard = Some(create_connection().await.map_err(|_|CacheError{})?);
     }
+    Ok(opt_guard.clone().unwrap())
 }
 
 
-fn increment(key: &String, delta: i64) -> Result<i64, CacheError>  {
-    let con = &mut get_connection()?;
+async fn increment(key: &String, delta: i64) -> Result<i64, CacheError>  {
+    let mut con= get_connection().await?;
 
     match redis::pipe()
         .atomic()
@@ -40,7 +50,7 @@ fn increment(key: &String, delta: i64) -> Result<i64, CacheError>  {
         .ignore()
         .cmd("GET")
         .arg(key)
-        .query::<Vec<String>>(con) {
+        .query_async::<Vec<String>>(&mut con).await {
         Ok(v) => {
             Ok(v.get(0).unwrap().parse::<i64>().unwrap())
         }
@@ -53,10 +63,10 @@ fn increment(key: &String, delta: i64) -> Result<i64, CacheError>  {
 }
 
 
-fn get<T: FromRedisValue>(key: &String) -> Result<T, CacheError> {
-    let mut con = get_connection()?;
+async fn get<T: FromRedisValue>(key: &String) -> Result<T, CacheError> {
+    let mut con = get_connection().await?;
 
-    match con.get(key) {
+    match con.get(key).await {
         Ok(v) => Ok(v),
         Err(_) => panic!("Time for some debug")
     }
@@ -64,10 +74,10 @@ fn get<T: FromRedisValue>(key: &String) -> Result<T, CacheError> {
 
 
 
-fn set<T: ToRedisArgs>(key: &String, value: T) -> Result<(), CacheError> {
-    let mut con = get_connection()?;
+async fn set<T: ToRedisArgs + Send + Sync>(key: &String, value: T) -> Result<(), CacheError> {
+    let mut con = get_connection().await?;
 
-    match con.set::<&String, T, String>(key, value) {
+    match con.set::<&String, T, String>(key, value).await {
         Ok(_) => Ok(()),
         Err(e) => {
             let error = format!("{}", e);
@@ -86,36 +96,36 @@ fn table_seq_no_key(table: &String) -> String {
     format!("{}_seq_no", table)    
 }
 
-pub(crate) fn get_approx_num_records(table: &String) -> Result<u64, CacheError> {
-    get::<u64>(&approx_num_records_key(table))
+pub(crate) async fn get_approx_num_records(table: &String) -> Result<u64, CacheError> {
+    get::<u64>(&approx_num_records_key(table)).await
 }
 
-pub(crate) fn create_table(table: &String) -> Result<(), CacheError> {
-    set(&approx_num_records_key(table), 0)?;
-    set(&table_seq_no_key(table), 0)
+pub(crate) async fn create_table(table: &String) -> Result<(), CacheError> {
+    set(&approx_num_records_key(table), 0).await?;
+    set(&table_seq_no_key(table), 0).await
 }
 
-pub(crate) fn insert_operator(table: &String, num_records: i64) -> Result<i64, CacheError> {
+pub(crate) async fn insert_operator(table: &String, num_records: i64) -> Result<i64, CacheError> {
     // Increase the number of records
-    increment(&approx_num_records_key(table), num_records)?;
+    increment(&approx_num_records_key(table), num_records).await?;
     // ...and bump the seq no
-    increment(&table_seq_no_key(table), 1)
+    increment(&table_seq_no_key(table), 1).await
 }
 
-pub(crate) fn delete_operator(table: &String, num_records: i64) -> Result<i64, CacheError> {
+pub(crate) async fn delete_operator(table: &String, num_records: i64) -> Result<i64, CacheError> {
     // Decrease the number of records
-    increment(&approx_num_records_key(table), -num_records)?;
+    increment(&approx_num_records_key(table), -num_records).await?;
     // ...and up the seq no
-    increment(&table_seq_no_key(table), 1)
+    increment(&table_seq_no_key(table), 1).await
 }
 
-pub(crate) fn update_operator(table: &String) -> Result<i64, CacheError> {
-    increment(&table_seq_no_key(table), 1)
+pub(crate) async fn update_operator(table: &String) -> Result<i64, CacheError> {
+    increment(&table_seq_no_key(table), 1).await
 }
 
-pub(crate) fn clear(tables: &Vec<String>) -> Result<(), CacheError> {
+pub(crate) async fn clear(tables: &Vec<String>) -> Result<(), CacheError> {
     for table in tables.into_iter() {
-        create_table(&table)?;
+        create_table(&table).await?;
     }
     Ok(())
 }

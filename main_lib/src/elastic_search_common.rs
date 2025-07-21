@@ -76,7 +76,7 @@ pub type ResultGeneratorFuture = dyn Future<Output = Result<ElasticSearchRespons
 pub(crate) trait Command: Send + Sync {
     async fn get_private_invocation(&self) -> PrivateInvocation;
 
-    fn result_generator(&self, result_table_name: Option<String>) -> Pin<Box<ResultGeneratorFuture>>;
+    async fn result_generator(&self, result_table_name: Option<String>) -> ElasticSearchResponse;
 }
 
 
@@ -149,9 +149,7 @@ pub async fn execute_command(_context: CommandContext, command: Arc<dyn Command>
         Ok(t) => t,
         Err(_) => return QueryFailure{ message: "Failed".to_string() }.to_response(),
     };         
-    let response = command.result_generator(result_table_name.clone()).await.unwrap_or_else(|_e| {
-        QueryFailure { message: "Failed".to_string() }.to_response()
-    });
+    let response = command.result_generator(result_table_name.clone()).await;
     if result_table_name.is_some() {
         data_access::drop(result_table_name.as_ref().unwrap()).await;
     }
