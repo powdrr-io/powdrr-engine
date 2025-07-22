@@ -362,8 +362,7 @@ impl CompactionCommand {
 
     }
 
-    async fn do_iceberg_commit(table_name: &String, schema: &PowdrrSchema, last_snapshot_id: i64) -> Result<i64, RecvError> {
-        // TODO: this needs to take the deletes updates from the caller into account.
+    async fn do_iceberg_commit(table_name: &String, schema: &PowdrrSchema, last_snapshot_id: i64, deletes_buffer: &WriteBuffer) -> Result<i64, RecvError> {
         let lib_metadata = match load_table_metadata(
             &"default".to_string(),
             table_name,
@@ -386,11 +385,28 @@ impl CompactionCommand {
                     schemas: vec!(schema.clone()),
                     file_schemas: lib_metadata.files.iter().map(|_|0).collect(),
                 },
-                compactions: lib_metadata.compactions,
+                compactions: lib_metadata.compactions.clone(),
             }
         ).await {
             Ok(_) => (),
             Err(e) => return Err(e)
+        };
+
+        // Note: the Iceberg and Speedboat commits are done separately here and are
+        // therefore NOT ATOMIC. The Speedboat commit here is just deletions where
+        // the new file is a subset of the existing files. If this update is lost the
+        // worst case is that the next compaction sees all the same deletes in the same
+        // files and once again tries to compact them.
+
+        match elastic_search_ingest::commit_speedboat(
+            table_name,
+            &WriteBuffer::empty(),
+            deletes_buffer,
+            &lib_metadata.compactions,
+            &"compact".to_string(),
+        ).await {
+            Ok(_) => (),
+            Err(e) => panic!("oh no = {}", e),
         };
 
         return Ok(lib_metadata.snapshot_id)
@@ -489,6 +505,8 @@ impl Command for CompactionCommand {
                     Ok(d) => d,
                     Err(_) => panic!("nope")
                 };
+
+                assert_eq!(compactions.len(), 1);
                 Self::update_iceberg(
                     &data,
                     &table,
@@ -498,7 +516,8 @@ impl Command for CompactionCommand {
                 Self::do_iceberg_commit(
                     &table,
                     &schema,
-                    0
+                    0,
+                    &deletes_buffer
                 ).await.unwrap()
             };
 

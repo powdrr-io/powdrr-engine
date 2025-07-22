@@ -59,6 +59,13 @@ pub(crate) struct WriteBuffer {
 
 
 impl WriteBuffer {
+    pub fn empty() -> Self {
+        WriteBuffer {
+            lines: vec!(),
+            schema: None
+        }
+    }
+
     pub fn insert_and_update(schema: PowdrrSchema, lines: Vec<String>) -> Self {
         WriteBuffer {
             lines,
