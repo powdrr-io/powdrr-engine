@@ -22,7 +22,7 @@ pub(crate) struct OperationResult {
     pub _version: u64,
     pub result: String,
     pub _shards: Shards,
-    pub _seq_no: i64,
+    pub _seq_no: u64,
     pub _primary_term: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<u32>,
@@ -76,7 +76,7 @@ pub(crate) struct QueryResultHit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub _id: Option<String>,
     pub _version: u64,
-    pub _seq_no: i64,
+    pub _seq_no: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub _score: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -92,7 +92,7 @@ impl QueryResultHit {
         let score = value_map.get("score").map_or_else(|| None, |f|f.as_f64());
         let id = value_map.get("_id").unwrap().as_str().unwrap().to_string();
         let version = value_map.get("_version").unwrap().as_u64().unwrap();
-        let seq_no = value_map.get("_seq_no").unwrap().as_i64().unwrap();
+        let seq_no = value_map.get("_seq_no").unwrap().as_u64().unwrap();
         let source = value_map.get("_source").unwrap().as_str().unwrap();
         // TODO: we are parsing the string into a value just to put it an object
         // that will get serialized out again. That is lame. If we can get the serializer
@@ -105,7 +105,7 @@ impl QueryResultHit {
             _seq_no: seq_no,
             _score: score,
             _primary_term: Some(1),
-            found: found,
+            found,
             _source: source_value,
         }
     }
@@ -427,4 +427,3 @@ impl ErrorDetails {
         }
     }
 }
-

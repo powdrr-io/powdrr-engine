@@ -15,7 +15,7 @@ use crate::elastic_search_common::ElasticSearchResponse;
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::elastic_search_parser::{process_aggregations, Aggregation};
 use crate::elastic_search_responses::{AggregationResult, QueryResultsNotFound, UpdateByQueryResults, UpdateByQueryResultsRetries, UpdateByQuerySuccess};
-use crate::elastic_search_storage_schema::{RecordInput, WriteBufferBuilder};
+use crate::elastic_search_storage_schema::{FullRecord, RecordInput, WriteBufferBuilder};
 use crate::schema_massager::{to_powdrr_schema, PowdrrSchema, SqlBuilder, SqlExpression, SqlQuery};
 use crate::state_peers::{PrivateInvocation, PrivateSqlInvocation};
 
@@ -59,12 +59,21 @@ pub(crate) async fn to_serde_value(data_frame: &DataFrame) -> (Vec<Value>, Optio
     (parsed_json, schema)
 }
 
+async fn to_full_records(data_frame: &DataFrame) -> (Vec<FullRecord>, Option<PowdrrSchema>) {
+    let (parsed_json, schema) = to_serde_value(data_frame).await;
+
+    let full_records = parsed_json.iter().map(|x| FullRecord::from_record(&x)).collect();
+    (full_records, schema)
+}
+
+/*
 async fn to_record_inputs(data_frame: &DataFrame) -> (Vec<RecordInput>, Option<PowdrrSchema>) {
     let (parsed_json, schema) = to_serde_value(data_frame).await;
 
     let record_inputs = parsed_json.iter().map(|x| RecordInput::from_record(&x)).collect();
     (record_inputs, schema)
 }
+ */
 
 async fn to_hits(index: &String, data_frame: &DataFrame, found: Option<bool>) -> (Vec<QueryResultHit>, Option<PowdrrSchema>) {
     let (parsed_json, schema) = to_serde_value(data_frame).await;
@@ -309,10 +318,10 @@ pub(crate) struct UpdateByQueryCommand {
 
 
 enum EvalResult {
-    Update(RecordInput, i64),
+    Update(RecordInput, u64),
     Noop,
     #[allow(dead_code)]
-    Delete(String, i64),
+    Delete(String, u64),
 }
 
 struct UpdateByQueryResult {
@@ -333,8 +342,9 @@ impl UpdateByQueryResult {
     
     async fn commit(&mut self) -> Result<ElasticSearchResponse, String> {
         // TODO: ideally this would write all the files once and do a single commit to the main_lib.
-        if self.update_buffer.records.len() != 0 {
-            match elastic_search_ingest::commit_general(&self.update_buffer.build(), &self.table, &"commit".to_string()).await {
+        if self.update_buffer.num_records() != 0 {
+            let build_result = &self.update_buffer.build(&self.table);
+            match elastic_search_ingest::commit_general(&build_result.write_buffer, &self.table, &"commit".to_string()).await {
                 Ok(_) => (),
                 Err(_) => panic!("nope"),
             };
@@ -356,14 +366,14 @@ impl UpdateByQueryResult {
 
 
 impl UpdateByQueryCommand {
-    fn evaluate(table_name: &String, script: &ScriptBlock, value: &RecordInput) -> EvalResult {
+    fn evaluate( script: &ScriptBlock, value: &FullRecord) -> EvalResult {
         let translated_script = match painless_parser::translate(&script.source) {
             Ok(t) => t,
             Err(_) => panic!("Need to make an error path")
         };
         let output = expression_evaluator::eval_template(
             &translated_script,
-            &value.source().unwrap(),
+            &value.record_input.source().unwrap(),
             HashMap::from([
                 ("op".to_string(), minijinja::Value::from("update"))
             ]),
@@ -374,19 +384,14 @@ impl UpdateByQueryCommand {
 
         match op {
             "update" => {
-                let seq_no: i64 = match distributed_cache::update_operator(&table_name) {
-                    Ok(t) => t,
-                    Err(_) => panic!("nope"),
-                };
-
                 EvalResult::Update(
-                        RecordInput::new(
-                        value.id().clone(),
-                        seq_no,
-                        value.version() + 1,
+                    RecordInput::new(
+                        value.record_input.id().clone(),
+                        value.record_input.version() + 1,
                         &output.source,
+                        None,
                     ),
-                    value.seq_no(),
+                    value.seq_no,
                 )
             },
             "noop" => {
@@ -446,7 +451,7 @@ impl UpdateByQueryCommand {
                 },
                 EvalResult::Update(value, seq_no) => {
                     delete_buffer.push(serde_json::to_string(&elastic_search_ingest::create_delete(value.id(), seq_no)).unwrap());
-                    update_buffer.records.push(value);
+                    update_buffer.update_records.push(value);
                     update_count += 1;
                 }
             }
@@ -487,9 +492,9 @@ impl Command for UpdateByQueryCommand {
                 Err(_) => panic!("nope")
             };
 
-            let (mut result_values, _) = to_record_inputs(&data_frame).await;
-            result_values.iter_mut().for_each(|x|x.ensure_source());
-            let final_result_values: Vec<EvalResult> = result_values.iter().map(|x|UpdateByQueryCommand::evaluate(&table, &script_block, x)).collect();
+            let (mut result_values, _) = to_full_records(&data_frame).await;
+            result_values.iter_mut().for_each(|x|x.record_input.ensure_source());
+            let final_result_values: Vec<EvalResult> = result_values.iter().map(|x|UpdateByQueryCommand::evaluate(&script_block, x)).collect();
 
             let mut result_info = UpdateByQueryCommand::create_final_result(&table, final_result_values).await;
             data_access::drop(&final_table_name).await;
@@ -497,5 +502,3 @@ impl Command for UpdateByQueryCommand {
         }.boxed()
     }
 }
-
-
