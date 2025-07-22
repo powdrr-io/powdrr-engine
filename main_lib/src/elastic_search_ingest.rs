@@ -22,7 +22,7 @@ use crate::elastic_search_common::{load_command_raw_result, CommandContext, Elas
 use crate::elastic_search_responses::{BulkResult, ErrorDetails, OperationResult, QueryResultHit, Shards, SingleDocCreateFailedResult};
 use crate::{data_access, distributed_cache};
 use crate::elastic_search_parser::UpdateBody;
-use crate::elastic_search_storage_schema::{RecordInput, WriteBufferBuilder};
+use crate::elastic_search_storage_schema::{FullRecord, RecordInput, WriteBufferBuilder};
 use crate::schema_massager::PowdrrSchema;
 use crate::state_hosted_service::{CreateTable, SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription, API_SERVICE_CLIENT};
 use crate::util::log_err;
@@ -394,40 +394,23 @@ pub(crate) async fn update_aliases(body: &String) -> Result<(), IngestError> {
 
 
 pub(crate) fn ingest_create(
-    table_description: &TableDescription, 
     create: &Create, 
     doc: &Value,
     version: u64,
-    seq_no: i64,
     status: Option<u32>,
     buffer: &mut WriteBufferBuilder
-) -> OperationResult {
+) -> () {
     let id = match &create.create.id {
         Some(id) => id.clone(),
         None => UuidB64::new().to_string()
     };
     let doc_with_id = RecordInput::new(
         id.clone(),
-        seq_no,
         version,
         &doc,
+        status,
     );
-    buffer.records.push(doc_with_id);
-    OperationResult{
-        _index: table_description.name.clone(),
-        _id: id,
-        _version: 1,
-        result: "created".to_string(),
-        _shards: Shards {
-            total: 1,
-            successful: 1,
-            failed: 0,
-        },
-        status: status,
-        _seq_no: seq_no,
-        _primary_term: 1,
-        get: None,
-    }
+    buffer.insert_records.push(doc_with_id);
 }
 
 pub(crate) struct IngestResult {
@@ -580,28 +563,24 @@ async fn create_single_worker(index: &String, doc_id: &String, payload: &String)
                 return Ok(ElasticSearchResponse { status: StatusCode::CONFLICT, mime: mime::APPLICATION_JSON, body: serde_json::to_string(&response).unwrap(), headers: vec!() })
             };
 
-            let seq_no: i64 = match distributed_cache::insert_operator(&table_description.name, 1) {
-                Ok(v) => v,
-                Err(_) => panic!("nope")
-            };
-            
             let mut buffer = WriteBufferBuilder::new();
-            let result = ingest_create(
-                &table_description,
+            ingest_create(
                 &Create{ create: IndexOrCreateBody { index: None, id: Some(doc_id.clone()), list_executed_pipelines: false, require_alias: false, dynamic_templates: None }},
                 &valid_doc,
                 1,
-                seq_no,
                 None,
                 &mut buffer
             );
-            
-            commit(&buffer.build(), &table_description.name).await?;
+
+            let build_result = buffer.build(&table_description.name);
+            assert_eq!(build_result.results.len(), 1);
+            assert_eq!(build_result.results.len(), build_result.write_buffer.num_records());
+            commit(&build_result.write_buffer, &table_description.name).await?;
             let headers = vec!((LOCATION, format!("/{}/_doc/{}", table_description.name, url_escape::encode_userinfo(doc_id))));
             Ok(ElasticSearchResponse {
                 status: StatusCode::CREATED,
                 mime: MIME_ES_JSON.clone(),
-                body: serde_json::to_string(&result).unwrap(),
+                body: serde_json::to_string(&build_result.results[0]).unwrap(),
                 headers: headers
             })
         },
@@ -655,95 +634,47 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
 
     let mut buffer = WriteBufferBuilder::new();
     let mut delete_buffer = WriteBuffer::new();
-    let result = if docs.docs.len() != 0 {
+    if docs.docs.len() != 0 {
         assert_eq!(docs.docs.len(), 1);
         if update_request.doc.is_none() {
             todo!("What do we do here?")
         }
-        let mut existing_doc = RecordInput::from_record(&docs.docs[0]);
-        existing_doc.ensure_source();
-        let seq_no: i64 = match distributed_cache::update_operator(&table_description.name) {
-            Ok(v) => v,
-            Err(_) => panic!("nope")
-        };
-
+        let mut existing_doc = FullRecord::from_record(&docs.docs[0]);
+        existing_doc.record_input.ensure_source();
         let mut updated_doc = RecordInput::new(
-            existing_doc.id().clone(),
-            seq_no,
-            existing_doc.version() + 1,
-            &merge_source(existing_doc.source().unwrap(), update_request.doc.as_ref().unwrap()),
+            existing_doc.record_input.id().clone(),
+            existing_doc.record_input.version() + 1,
+            &merge_source(existing_doc.record_input.source().unwrap(), update_request.doc.as_ref().unwrap()),
+            None
         );
         updated_doc.ensure_source();
-        updated_doc.ensure_normalized_value();
-        buffer.records.push(updated_doc.clone());
-        delete_buffer.lines.push(create_delete(existing_doc.id(), existing_doc.seq_no()).to_string());
-        OperationResult{
-            _index: table_description.name.clone(),
-            _id: existing_doc.id().clone(),
-            _version: updated_doc.version(),
-            result: "updated".to_string(),
-            _shards: Shards {
-                total: 1,
-                successful: 1,
-                failed: 0,
-            },
-            status: None,
-            _seq_no: seq_no,
-            _primary_term: 1,
-            get: Some(QueryResultHit {
-                _index: None,
-                _id: None,
-                _version: 1,
-                _seq_no: seq_no,
-                _score: None,
-                _primary_term: Some(1),
-                found: Some(true),
-                _source: updated_doc.source().cloned().unwrap()
-            })
-        }
+        buffer.update_records.push(updated_doc.clone());
+        delete_buffer.lines.push(create_delete(existing_doc.record_input.id(), existing_doc.seq_no).to_string());
     } else {
         if update_request.upsert.is_none() {
             // TODO: this is the doc_as_upsert path to figure out
             todo!("Need to implement upsert")
         }
 
-        let seq_no: i64 = match distributed_cache::insert_operator(&table_description.name, 1) {
-            Ok(v) => v,
-            Err(_) => panic!("nope")
-        };
-
         let upsert_doc = update_request.upsert.unwrap();
-        let mut result = ingest_create(
-            &table_description,
+        ingest_create(
             &Create { create: IndexOrCreateBody { index: None, id: Some(doc_id.clone()), list_executed_pipelines: false, require_alias: false, dynamic_templates: None } },
             &upsert_doc,
             1,
-            seq_no,
             None,
             &mut buffer
         );
-
-        result.get = Some(QueryResultHit {
-            _index: None,
-            _id: None,
-            _version: 1,
-            _seq_no: seq_no,
-            _score: None,
-            _primary_term: Some(1),
-            found: None,
-            _source: upsert_doc.clone()
-        });
-
-        result
     };
 
-    commit(&buffer.build(), &table_description.name).await?;
+    let result = buffer.build(&table_description.name);
+    assert_eq!(result.results.len(), 1);
+    commit(&result.write_buffer, &table_description.name).await?;
     commit_general(&delete_buffer, &&table_description.name, &"delete".to_string()).await?;
     let headers = vec!((LOCATION, format!("/{}/_doc/{}", table_description.name, url_escape::encode_userinfo(doc_id))));
     Ok(ElasticSearchResponse {
         status: StatusCode::CREATED,
         mime: MIME_ES_JSON.clone(),
-        body: serde_json::to_string(&result).unwrap(),
+        body: serde_json::to_string(&result.results[0]).unwrap(),
         headers: headers
     })
 
@@ -751,7 +682,7 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
 
 
 
-pub(crate) fn create_delete(doc_id: &String, seq_no: i64) -> Value {
+pub(crate) fn create_delete(doc_id: &String, seq_no: u64) -> Value {
     let mut map = serde_json::Map::new();
     map.insert("_id_seq_no".to_string(), json!(format!("{}_{}", doc_id, seq_no)));
     Value::Object(map)
@@ -787,7 +718,7 @@ pub(crate) async fn delete(index: &String, doc_id: &String) -> Result<ElasticSea
         Err(_) => panic!("Need to convert to an ingest error")
     };
     let mut buffer = WriteBuffer::new();
-    let target_seq_no = docs.docs[0].get("_seq_no").unwrap().as_i64().unwrap();
+    let target_seq_no = docs.docs[0].get("_seq_no").unwrap().as_u64().unwrap();
     buffer.lines.push(serde_json::to_string(&create_delete(doc_id, target_seq_no)).unwrap());
     commit_general(&buffer, &table_description.name, &"delete".to_string()).await?;
     Ok(ElasticSearchResponse { status: StatusCode::OK, mime: mime::APPLICATION_JSON, body: "deleted!".to_string(), headers: vec!() })
@@ -831,10 +762,6 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
                             Some(t) => t,
                             None => return Err(IngestError{ message: "Index does not exist".to_string() })
                         };
-                        let seq_no: i64 = match distributed_cache::insert_operator(&table_description.name, 1) {
-                            Ok(v) => v,
-                            Err(_) => panic!("nope")
-                        };
                         let doc_str = match iterator.next() {
                             Some(ds) => ds.trim(),
                             None => panic!("How do I make my own error? This should return an error instead of panic")                            
@@ -842,16 +769,13 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
                         let doc: Result<Value, serde_json::Error>  = serde_json::from_str(doc_str);
                         match doc {
                             Ok(valid_doc) => {
-                                let operation_result = ingest_create(
-                                    &table_description,
+                                ingest_create(
                                     &c,
                                     &valid_doc,
                                     1,
-                                    seq_no,
                                     Some(201),
                                     ingest_result.get(index)
                                 );
-                                ingest_result.operations.push(operation_result)
                             },
                             Err(_) => return Err(IngestError{ message: "Serde error".to_string() })
                         }
@@ -880,10 +804,6 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
                         };
                         let existing_docs = get_existing_docs(&table_description.name, &vec!(u.update.id.unwrap())).await?;
                         if existing_docs.docs.len() == 0 {
-                            let _seq_no: i64 = match distributed_cache::insert_operator(&table_description.name, 1) {
-                                Ok(v) => v,
-                                Err(_) => panic!("nope")
-                            };
                             todo!("Need to handle this case")
                         }
                         let doc_str = match iterator.next() {
@@ -896,38 +816,18 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
                                 if update_request.doc.is_none() {
                                     todo!("What do we do here?")
                                 }
-                                let mut existing_doc = RecordInput::from_record(&existing_docs.docs[0]);
-                                existing_doc.ensure_source();
-                                let seq_no: i64 = match distributed_cache::update_operator(&table_description.name) {
-                                    Ok(v) => v,
-                                    Err(_) => panic!("nope")
-                                };
+                                let mut existing_doc = FullRecord::from_record(&existing_docs.docs[0]);
+                                existing_doc.record_input.ensure_source();
 
                                 let mut updated_doc = RecordInput::new(
-                                    existing_doc.id().clone(),
-                                    seq_no,
-                                    existing_doc.version() + 1,
-                                    &merge_source(existing_doc.source().unwrap(), update_request.doc.as_ref().unwrap()),
+                                    existing_doc.record_input.id().clone(),
+                                    existing_doc.record_input.version() + 1,
+                                    &merge_source(existing_doc.record_input.source().unwrap(), update_request.doc.as_ref().unwrap()),
+                                    Some(201)
                                 );
                                 updated_doc.ensure_source();
-                                updated_doc.ensure_normalized_value();
-                                let operation_result = OperationResult{
-                                    _index: table_description.name.clone(),
-                                    _id: existing_doc.id().clone(),
-                                    _version: updated_doc.version(),
-                                    result: "updated".to_string(),
-                                    _shards: Shards {
-                                        total: 1,
-                                        successful: 1,
-                                        failed: 0,
-                                    },
-                                    status: Some(201),
-                                    _seq_no: seq_no,
-                                    _primary_term: 1,
-                                    get: None,
-                                };
-                                ingest_result.get(index).records.push(updated_doc.clone());
-                                ingest_result.operations.push(operation_result);
+                                ingest_result.get(index).update_records.push(updated_doc.clone());
+                                ingest_result.get(index).delete_records.lines.push(create_delete(existing_doc.record_input.id(), existing_doc.seq_no).to_string());
                             },
                             Err(_) => return Err(IngestError{ message: "Serde error".to_string() })
                         }
@@ -959,18 +859,20 @@ async fn ingest_and_write(payload: &String) -> Result<IngestAndWriteResult, Inge
     };
 
     let mut table_infos = vec!();
+    let mut operations = vec!();
     for (name, buffer_builder) in buffer_items.tables.iter_mut() {
-        let buffer = buffer_builder.build();
-        let new_id = match write_to_file(&buffer, &name, &"ingest".to_string()) {
+        let result = buffer_builder.build(name);
+        let new_id = match write_to_file(&result.write_buffer, &name, &"ingest".to_string()) {
             Ok(id) => id,
             Err(_) => return Err(IngestError{ message: "File error".to_string() })
         };
         table_infos.push(SpeedboatCommitTableInfo {
             table_name: name.clone(),
             files: vec!(new_id),
-            sizes: vec!(buffer.total_size()),
-            schema: buffer.schema.clone()
+            sizes: vec!(result.write_buffer.total_size()),
+            schema: result.write_buffer.schema.clone()
         });
+        operations.extend(result.results);
     }
 
     Ok(IngestAndWriteResult{ table_infos, result: BulkResult::success(0, buffer_items.operations)})
@@ -1083,8 +985,9 @@ impl IngestActor {
         let mut commit_table_info = vec!();
 
         for (name, buffer_builder) in self.tables.iter_mut() {
-            let buffer = buffer_builder.build();
-            let new_id = match write_to_file(&buffer, &name, &"ingest".to_string()) {
+            assert_eq!(buffer_builder.delete_records.lines.len(), 0, "Need to implement deletes here");
+            let result = buffer_builder.build(name);
+            let new_id = match write_to_file(&result.write_buffer, &name, &"ingest".to_string()) {
                 Ok(id) => id,
                 Err(e) => return Err(e)
             };
@@ -1092,8 +995,8 @@ impl IngestActor {
                 SpeedboatCommitTableInfo { 
                     table_name: name.clone(),
                     files: vec!(new_id),
-                    sizes: vec!(buffer.total_size()),
-                    schema: buffer.schema.clone()
+                    sizes: vec!(result.write_buffer.total_size()),
+                    schema: result.write_buffer.schema.clone()
                 }
             );
         }

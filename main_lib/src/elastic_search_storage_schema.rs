@@ -1,24 +1,26 @@
 use serde_json::Value;
+use crate::distributed_cache;
 use crate::elastic_search_common::create_denormalized_value;
 use crate::elastic_search_ingest::WriteBuffer;
+use crate::elastic_search_responses::{OperationResult, QueryResultHit, Shards};
 use crate::schema_massager::{extract_powdrr_schema_option, PowdrrSchema};
 
 #[derive(Clone)]
 pub(crate) struct RecordInput {
     id: String,
-    seq_no: i64,
     version: u64,
+    status: Option<u32>,
     existing_normalized: Option<Value>,
     source: Option<Value>,
     source_str: Option<String>,
 }
 
 impl RecordInput {
-    pub fn new(id: String, seq_no: i64, version: u64, source: &Value) -> Self {
+    pub fn new(id: String, version: u64, source: &Value, status: Option<u32>) -> Self {
         RecordInput {
             id,
             version,
-            seq_no,
+            status,
             existing_normalized: None,
             source: Some(source.clone()),
             source_str: None,
@@ -29,12 +31,11 @@ impl RecordInput {
         let value_map = value.as_object().unwrap().clone();
         let id = value_map.get("_id").unwrap().as_str().unwrap().to_string();
         let version = value_map.get("_version").unwrap().as_u64().unwrap();
-        let seq_no = value_map.get("_seq_no").unwrap().as_i64().unwrap();
         let source = value_map.get("_source").unwrap().as_str().unwrap();
         RecordInput {
             id,
             version,
-            seq_no,
+            status: None,
             existing_normalized: None,
             source: None,
             source_str: Some(source.to_string()),
@@ -47,11 +48,6 @@ impl RecordInput {
 
     pub fn version(&self) -> u64 {
         self.version
-    }
-
-    #[allow(dead_code)]
-    pub fn seq_no(&self) -> i64 {
-        self.seq_no
     }
 
     #[allow(dead_code)]
@@ -68,14 +64,15 @@ impl RecordInput {
         self.source_str.as_ref()
     }
 
-    pub fn ensure_normalized_value(&mut self) -> () {
+    pub fn ensure_normalized_value(&mut self, seq_no: Option<u64>) -> () {
         if self.existing_normalized.is_none() {
+            assert!(seq_no.is_some(), "Need to pass in a seq_no when calling ensure_normalized_value() on a record that doesn't have one already.");
             self.ensure_source();
             let mut values = serde_json::Map::new();
             let denormalized_value = create_denormalized_value(self.source.as_ref().unwrap());
             values.insert("_id".to_string(), Value::String(self.id.clone()));
-            values.insert("_seq_no".to_string(), Value::Number(self.seq_no.into()));
-            values.insert("_id_seq_no".to_string(), Value::String(format!("{}_{}", self.id, self.seq_no)));
+            values.insert("_seq_no".to_string(), Value::Number(seq_no.unwrap().into()));
+            values.insert("_id_seq_no".to_string(), Value::String(format!("{}_{}", self.id, seq_no.unwrap())));
             values.insert("_version".to_string(), Value::Number(self.version.into()));
             if self.source_str.is_some() {
                 values.insert("_source".to_string(), Value::String(self.source_str.as_ref().unwrap().clone()));
@@ -93,41 +90,128 @@ impl RecordInput {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn ensure_source_str(&mut self) -> () {
-        if self.source.is_some() && self.source_str.is_none() {
-            self.source_str = Some(serde_json::to_string(&self.source.as_ref().unwrap()).unwrap());
-        }
+    pub fn as_record(&mut self, seq_no: Option<u64>) -> Value {
+        self.ensure_normalized_value(seq_no);
+        self.existing_normalized.as_ref().unwrap().clone()
     }
 
-    pub fn to_record(&self) -> Value {
-        assert!(self.existing_normalized.is_some(), "You forgot to call ensure_normalized_value() on the record before calling to_record()");
-        self.existing_normalized.as_ref().unwrap().clone()
+    pub fn as_operation(&self, table: &String, seq_no: u64, update: bool) -> OperationResult {
+        if update {
+            OperationResult {
+                _index: table.clone(),
+                _id: self.id().clone(),
+                _version: self.version(),
+                result: "updated".to_string(),
+                _shards: Shards {
+                    total: 1,
+                    successful: 1,
+                    failed: 0,
+                },
+                status: self.status,
+                _seq_no: seq_no,
+                _primary_term: 1,
+                get: Some(QueryResultHit {
+                    _index: None,
+                    _id: None,
+                    _version: 1,
+                    _seq_no: seq_no,
+                    _score: None,
+                    _primary_term: Some(1),
+                    found: Some(true),
+                    _source: self.source().cloned().unwrap()
+                })
+            }
+        } else {
+            OperationResult {
+                _index: table.clone(),
+                _id: self.id().clone(),
+                _version: self.version(),
+                result: "inserted".to_string(),
+                _shards: Shards {
+                    total: 1,
+                    successful: 1,
+                    failed: 0,
+                },
+                status: self.status,
+                _seq_no: seq_no,
+                _primary_term: 1,
+                get: None
+            }
+        }
     }
 }
 
 #[derive(Clone)]
+pub(crate) struct FullRecord {
+    pub record_input: RecordInput,
+    pub seq_no: u64
+}
+
+
+impl FullRecord {
+    pub fn from_record(value: &Value) -> Self {
+        let seq_no = value.as_object().unwrap().get("_seq_no").unwrap().as_u64().unwrap();
+        let record_input = RecordInput::from_record(value);
+        FullRecord {
+            record_input,
+            seq_no,
+        }
+    }
+}
+
+pub struct WriteBufferBuilderResult {
+    pub write_buffer: WriteBuffer,
+    pub results: Vec<OperationResult>
+}
+
+#[derive(Clone)]
 pub(crate) struct WriteBufferBuilder {
-    pub records: Vec<RecordInput>
+    pub insert_records: Vec<RecordInput>,
+    pub update_records: Vec<RecordInput>,
+    pub delete_records: WriteBuffer,
 }
 
 impl WriteBufferBuilder {
     pub fn new() -> Self {
-        WriteBufferBuilder{ records: vec!() }
+        WriteBufferBuilder{
+            insert_records: vec!(),
+            update_records: vec!(),
+            delete_records: WriteBuffer::new(),
+        }
+    }
+
+    pub fn num_records(&self) -> usize {
+        self.insert_records.len() + self.update_records.len()
     }
 
     pub fn extend(&mut self, builder: &WriteBufferBuilder) {
-        self.records.extend(builder.records.iter().map(|r| r.clone()));
+        self.insert_records.extend(builder.insert_records.iter().map(|r| r.clone()));
+        self.update_records.extend(builder.update_records.iter().map(|r| r.clone()));
     }
 
-    pub fn build(&mut self) -> WriteBuffer {
-        self.records.iter_mut().for_each(|r| r.ensure_normalized_value());
-        let input_schemas = self.records.iter().map(|v|extract_powdrr_schema_option(&v.existing_normalized)).collect::<Vec<PowdrrSchema>>();
-        let merged_schema = PowdrrSchema::merge_all(input_schemas);
-        self.records.iter_mut().for_each(|r| merged_schema.coerce_value_option(&mut r.existing_normalized));
+    pub fn build(&mut self, table: &String) -> WriteBufferBuilderResult {
+        // TODO: update seq no for deletes
+        let seq_no_vec = distributed_cache::insert_and_update_operator(table, self.insert_records.len(), self.update_records.len()).unwrap();
+        self.insert_records.iter_mut().chain(self.update_records.iter_mut()).zip(seq_no_vec.iter())
+            .for_each(|(record, seq_no)| record.ensure_normalized_value(Some(*seq_no as u64)));
 
-        let final_records = self.records.iter().map(|r| r.to_record()).collect::<Vec<Value>>();
-        WriteBuffer::from(merged_schema, final_records.iter().map(|r|serde_json::to_string(&r).unwrap()).collect())
+        let mut operations = self.insert_records.iter().zip(seq_no_vec.iter())
+            .map(|(record, seq_no)| record.as_operation(table, *seq_no, false)).collect::<Vec<OperationResult>>();
+        operations.extend(self.update_records.iter().zip(seq_no_vec[self.insert_records.len()..].iter())
+            .map(|(record, seq_no)| record.as_operation(table, *seq_no, true)));
+
+        let input_schemas = self.insert_records.iter().chain(self.update_records.iter())
+            .map(|v|extract_powdrr_schema_option(&v.existing_normalized)).collect::<Vec<PowdrrSchema>>();
+        let merged_schema = PowdrrSchema::merge_all(input_schemas);
+        self.insert_records.iter_mut().chain(self.update_records.iter_mut()).for_each(|r| merged_schema.coerce_value_option(&mut r.existing_normalized));
+
+        let final_records = self.insert_records.iter_mut().chain(self.update_records.iter_mut()).map(|r| r.as_record(None)).collect::<Vec<Value>>();
+        let write_buffer = WriteBuffer::from(merged_schema, final_records.iter().map(|r|serde_json::to_string(&r).unwrap()).collect());
+
+        WriteBufferBuilderResult {
+            write_buffer,
+            results: operations,
+        }
     }
 }
 
@@ -140,23 +224,23 @@ mod tests {
     #[test]
     fn test_builder_basic() {
         let mut builder = WriteBufferBuilder::new();
-        builder.records.push(RecordInput::new(
+        builder.insert_records.push(RecordInput::new(
             "abc".to_string(),
             1,
-            1,
-            &serde_json::from_str(r#"{"a": 1, "b": "2", "c": 3.3, "d":{"e": 4, "f": 5}, "g": [1, 2, 3]}"#).unwrap()
+            &serde_json::from_str(r#"{"a": 1, "b": "2", "c": 3.3, "d":{"e": 4, "f": 5}, "g": [1, 2, 3]}"#).unwrap(),
+            None
         ));
-        builder.records.push(RecordInput::new(
+        builder.insert_records.push(RecordInput::new(
             "def".to_string(),
             1,
-            1,
             &serde_json::from_str(r#"{"a": 2, "c": 4.3, "d":{"e": 8}, "g": [4, 5, 6]}"#).unwrap(),
+            None,
         ));
 
-        let buffer = builder.build();
-        assert_eq!(buffer.num_records(), 2);
-        assert!(buffer.schema.is_some());
-        let schema = buffer.schema.as_ref().unwrap();
+        let buffer = builder.build(&"fake".to_string());
+        assert_eq!(buffer.write_buffer.num_records(), 2);
+        assert!(buffer.write_buffer.schema.is_some());
+        let schema = buffer.write_buffer.schema.as_ref().unwrap();
         assert_eq!(schema.fields.len(), 11);
         let schema_map = schema.to_map();
         let source_field = schema_map.get("_source").unwrap();
