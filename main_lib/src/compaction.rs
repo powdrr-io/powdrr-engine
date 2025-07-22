@@ -363,6 +363,7 @@ impl CompactionCommand {
     }
 
     async fn do_iceberg_commit(table_name: &String, schema: &PowdrrSchema, last_snapshot_id: i64) -> Result<i64, RecvError> {
+        // TODO: this needs to take the deletes updates from the caller into account.
         let lib_metadata = match load_table_metadata(
             &"default".to_string(),
             table_name,
@@ -420,7 +421,7 @@ impl Command for CompactionCommand {
             let table_name = match result_table_name {
                 Some(t) => t,
                 None => {
-                    // TODO: Need to commit that after this compaction there is....nothing?
+                    // TODO: After this compaction there is....nothing?
                     // Maybe this should panic since it shouldn't be possible to get here.
                     let none = CompactionResult::None;
                     return Ok(ElasticSearchResponse {
@@ -446,14 +447,7 @@ impl Command for CompactionCommand {
             };
 
             let (compacted_deletes, _) = to_serde_value(&remaining_deletes_data_frame).await;
-            if compacted_deletes.len() != 0 {
-                let mut deletes_buffer = WriteBuffer::new();
-                deletes_buffer.push_many(compacted_deletes.iter().map(|x| serde_json::to_string(x).unwrap()).collect());
-                match elastic_search_ingest::commit_general_compactions(&deletes_buffer, &table, &"delete".to_string(), &compactions).await {
-                    Ok(_) => (),
-                    Err(_) => panic!("nope"),
-                };
-            }
+            let deletes_buffer = WriteBuffer::delete(compacted_deletes.iter().map(|x| serde_json::to_string(x).unwrap()).collect());
 
             let results_count = match results_data_frame.clone().count().await {
                 Ok(c) => c,
@@ -463,10 +457,17 @@ impl Command for CompactionCommand {
             let new_snapshot_id: i64 = if results_count < MIN_PARQUET_SIZE {
                 let (compacted_results, _) = to_serde_value(&results_data_frame).await;
 
-                let mut result_buffer = WriteBuffer::new();
-                result_buffer.schema = Some(schema);
-                result_buffer.push_many(compacted_results.iter().map(|x| serde_json::to_string(x).unwrap()).collect());
-                match elastic_search_ingest::commit_general_compactions(&result_buffer, &table, &"compact".to_string(), &compactions).await {
+                let result_buffer = WriteBuffer::insert_and_update(
+                    schema,
+                    compacted_results.iter().map(|x| serde_json::to_string(x).unwrap()).collect()
+                );
+                match elastic_search_ingest::commit_speedboat(
+                    &table,
+                    &result_buffer,
+                    &deletes_buffer,
+                    &compactions,
+                    &"compact".to_string(),
+                ).await {
                     Ok(_) => (),
                     Err(_) => panic!("nope"),
                 };

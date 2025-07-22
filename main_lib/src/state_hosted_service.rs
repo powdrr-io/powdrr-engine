@@ -21,6 +21,7 @@ pub(crate) struct SpeedboatCSpeedInfo {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct SpeedboatCommitTableInfo {
+    pub commit_type: String,
     pub table_name: String,
     pub files: Vec<String>,
     pub sizes: Vec<u64>,
@@ -30,7 +31,6 @@ pub(crate) struct SpeedboatCommitTableInfo {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct SpeedboatCommit {
-    pub commit_type: String,
     pub type_files: Vec<SpeedboatCommitTableInfo>,
     pub compactions: Vec<String>,    
 }
@@ -824,197 +824,193 @@ impl TestApiServiceClient {
         self.latest_checkpoint_id.insert(key.clone(), checkpoint_id.clone());        
     }
 
-    async fn speedboat_commit_type_commit(&mut self, commit: &SpeedboatCommit, sync_index: bool) -> Result<(), Box<dyn std::error::Error>> {
-        for table_info in commit.type_files.iter() {
-            let latest_checkpoint = match self.get_latest_checkpoint_sync(&table_info.table_name, None) {
-                Some(checkpoint_id) => {
-                    let key = format!("{}_{}", &table_info.table_name, checkpoint_id);
-                    match self.checkpoints.get(&key) {
-                        Some(c) => c,
-                        None => panic!("Found latest checkpoint id but checkpoint missing = {}", key)
-                    }
-                },
-                None => {
-                    &TableMetadataCheckpoint {
-                        table_name: table_info.table_name.clone(),
-                        checkpoint_id: "".to_string(),
-                        iceberg_metadata: None,
-                        speedboat_metadata: None,
-                        deletes_metadata: None,
-                        extension_metadata: None,
-                        schema: table_info.schema.as_ref().unwrap().clone()
-                    }
-                },
-            };
-
-            let new_checkpoint_id = IdInstance::next_id().to_string();
-            let new_speedboat_metadata = match &latest_checkpoint.speedboat_metadata {
-                None => SpeedboatMetadata {
-                    files: table_info.files.clone(),
-                    sizes: table_info.sizes.clone(),
-                    schemas: vec!(table_info.schema.as_ref().unwrap().clone()),
-                    file_schemas: table_info.files.iter().map(|_|0).collect(),
-                },
-                Some(existing) => {
-                    let mut files = existing.files.clone();
-                    let mut sizes = existing.sizes.clone();
-                    let mut schemas = existing.schemas.clone();
-                    let mut file_schemas = existing.file_schemas.clone();
-                    files.extend(table_info.files.clone());
-                    sizes.extend(table_info.sizes.clone());
-                    // TODO: look for existing schemas that match and reuse
-                    // NOTE: file schema extend needs to be before schema extend for the index
-                    // to be correct here.
-                    file_schemas.extend(table_info.files.iter().map(|_|schemas.len() as u64));
-                    schemas.push(table_info.schema.as_ref().unwrap().clone());
-                    SpeedboatMetadata {
-                        files,
-                        sizes,
-                        schemas,
-                        file_schemas,
-                    }
-                },
-            };
-            
-            assert_eq!(new_speedboat_metadata.files.len(), new_speedboat_metadata.sizes.len());
-            assert_eq!(new_speedboat_metadata.files.len(), new_speedboat_metadata.file_schemas.len());
-
-            let total_size: u64 = new_speedboat_metadata.sizes.iter().sum();
-            tracing::info!("Speedboat commit {} has {} files with total size {}", new_checkpoint_id, new_speedboat_metadata.files.len(), total_size);
-
-            let mut merged_schema = latest_checkpoint.schema.clone();
-            if table_info.schema.is_some() {
-                merged_schema.merge_from(table_info.schema.as_ref().unwrap());
-            }
-
-            let mut new_latest_checkpoint = TableMetadataCheckpoint {
-                table_name: table_info.table_name.clone(),
-                checkpoint_id: new_checkpoint_id.clone(),
-                iceberg_metadata: latest_checkpoint.iceberg_metadata.clone(),
-                speedboat_metadata: Some(new_speedboat_metadata.clone()),
-                deletes_metadata: latest_checkpoint.deletes_metadata.clone(),
-                extension_metadata: latest_checkpoint.extension_metadata.clone(),   
-                schema: merged_schema,
-            };
-
-            self.handle_compaction(&commit.compactions, &mut new_latest_checkpoint);
-
-            self.checkpoints.insert(format!("{}_{}", &table_info.table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
-
-            if sync_index {
-                self.create_index(&new_latest_checkpoint).await?;
-            } else {
-                match self.index_work_items.get_mut(&table_info.table_name) {
-                    Some(checkpoints) => {
-                        checkpoints.push(new_latest_checkpoint.clone());
-                    },
-                    None => {
-                        let checkpoints = vec!(new_latest_checkpoint.clone());
-                        self.index_work_items.insert(table_info.table_name.clone(), checkpoints);
-                    }
+    async fn speedboat_commit_type_commit(&mut self, table_info: &SpeedboatCommitTableInfo, compactions: &Vec<String>, sync_index: bool) -> Result<(), Box<dyn std::error::Error>> {
+        let latest_checkpoint = match self.get_latest_checkpoint_sync(&table_info.table_name, None) {
+            Some(checkpoint_id) => {
+                let key = format!("{}_{}", &table_info.table_name, checkpoint_id);
+                match self.checkpoints.get(&key) {
+                    Some(c) => c,
+                    None => panic!("Found latest checkpoint id but checkpoint missing = {}", key)
                 }
-            }
-            self.set_latest_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
-
-            // TODO: apply some policy here based on sizes to split up compaction work items
-            match self.compaction_work_items.get_mut(&table_info.table_name) {
-                Some(compaction) => {
-                    compaction.table_schema = new_latest_checkpoint.schema.clone();
-                    compaction.speedboat_files.extend(table_info.files.clone());
-                    compaction.sizes.extend(table_info.sizes.clone());
-                    // NOTE: file schema extend needs to be before schema extend for the index
-                    // to be correct here.
-                    compaction.file_schemas.extend(table_info.files.iter().map(|_|compaction.schemas.len() as u64));
-                    compaction.schemas.push(table_info.schema.as_ref().unwrap().clone());
-                },
-                None => {
-                    self.compaction_work_items.insert(
-                        table_info.table_name.clone(),
-                        CompactionWorkItem {
-                            table_schema: new_latest_checkpoint.schema.clone(),
-                            speedboat_files: table_info.files.clone(),
-                            schemas: vec!(table_info.schema.as_ref().unwrap().clone()),
-                            file_schemas: table_info.files.iter().map(|_|0).collect(),
-                            sizes: table_info.sizes.clone(),
-                            delete_files: new_latest_checkpoint.deletes_metadata.as_ref().map_or_else(|| vec!(), |m|m.files.clone()),
-                            iceberg_files: vec!(),
-                        }
-                    );
+            },
+            None => {
+                &TableMetadataCheckpoint {
+                    table_name: table_info.table_name.clone(),
+                    checkpoint_id: "".to_string(),
+                    iceberg_metadata: None,
+                    speedboat_metadata: None,
+                    deletes_metadata: None,
+                    extension_metadata: None,
+                    schema: table_info.schema.as_ref().unwrap().clone()
                 }
-            }
+            },
+        };
+
+        let new_checkpoint_id = IdInstance::next_id().to_string();
+        let new_speedboat_metadata = match &latest_checkpoint.speedboat_metadata {
+            None => SpeedboatMetadata {
+                files: table_info.files.clone(),
+                sizes: table_info.sizes.clone(),
+                schemas: vec!(table_info.schema.as_ref().unwrap().clone()),
+                file_schemas: table_info.files.iter().map(|_|0).collect(),
+            },
+            Some(existing) => {
+                let mut files = existing.files.clone();
+                let mut sizes = existing.sizes.clone();
+                let mut schemas = existing.schemas.clone();
+                let mut file_schemas = existing.file_schemas.clone();
+                files.extend(table_info.files.clone());
+                sizes.extend(table_info.sizes.clone());
+                // TODO: look for existing schemas that match and reuse
+                // NOTE: file schema extend needs to be before schema extend for the index
+                // to be correct here.
+                file_schemas.extend(table_info.files.iter().map(|_|schemas.len() as u64));
+                schemas.push(table_info.schema.as_ref().unwrap().clone());
+                SpeedboatMetadata {
+                    files,
+                    sizes,
+                    schemas,
+                    file_schemas,
+                }
+            },
+        };
+
+        assert_eq!(new_speedboat_metadata.files.len(), new_speedboat_metadata.sizes.len());
+        assert_eq!(new_speedboat_metadata.files.len(), new_speedboat_metadata.file_schemas.len());
+
+        let total_size: u64 = new_speedboat_metadata.sizes.iter().sum();
+        tracing::info!("Speedboat commit {} has {} files with total size {}", new_checkpoint_id, new_speedboat_metadata.files.len(), total_size);
+
+        let mut merged_schema = latest_checkpoint.schema.clone();
+        if table_info.schema.is_some() {
+            merged_schema.merge_from(table_info.schema.as_ref().unwrap());
         }
-        Ok(())
-    }    
 
-    async fn speedboat_commit_type_delete(&mut self, commit: &SpeedboatCommit) -> Result<(), Box<dyn std::error::Error>> {
-        for table_info in commit.type_files.iter() {
-            let latest_checkpoint = match self.get_latest_checkpoint_sync(&table_info.table_name, None) {
-                Some(checkpoint_id) => {
-                    let key = format!("{}_{}", &table_info.table_name, checkpoint_id);
-                    match self.checkpoints.get(&key) {
-                        Some(c) => c,
-                        None => panic!("Found latest checkpoint id but checkpoint missing = {}", key)
-                    }
-                },
-                None => {
-                    &TableMetadataCheckpoint {
-                        table_name: table_info.table_name.clone(),
-                        checkpoint_id: "".to_string(),
-                        iceberg_metadata: None,
-                        speedboat_metadata: None,
-                        deletes_metadata: None,
-                        extension_metadata: None,
-                        schema: PowdrrSchema{ fields: vec!() },
-                    }
-                },
-            };
+        let mut new_latest_checkpoint = TableMetadataCheckpoint {
+            table_name: table_info.table_name.clone(),
+            checkpoint_id: new_checkpoint_id.clone(),
+            iceberg_metadata: latest_checkpoint.iceberg_metadata.clone(),
+            speedboat_metadata: Some(new_speedboat_metadata.clone()),
+            deletes_metadata: latest_checkpoint.deletes_metadata.clone(),
+            extension_metadata: latest_checkpoint.extension_metadata.clone(),
+            schema: merged_schema,
+        };
 
-            let new_checkpoint_id = IdInstance::next_id().to_string();
-            let new_deletes_metadata = match &latest_checkpoint.deletes_metadata {
-                None => DeletesMetadata {
-                    files: table_info.files.clone(),
-                },
-                Some(existing) => {
-                    let mut files = existing.files.clone();
-                    files.extend(table_info.files.clone());
-                    DeletesMetadata {
-                        files: files
-                    }
-                }
-            };
+        self.handle_compaction(compactions, &mut new_latest_checkpoint);
 
-            tracing::info!("Delete commit has {} files", new_deletes_metadata.files.len());
-            for file in &new_deletes_metadata.files {
-                tracing::info!("Delete file {}", file)
-            }
+        self.checkpoints.insert(format!("{}_{}", &table_info.table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
 
-            let mut new_latest_checkpoint = TableMetadataCheckpoint {
-                table_name: table_info.table_name.clone(),
-                checkpoint_id: new_checkpoint_id.clone(),
-                iceberg_metadata: latest_checkpoint.iceberg_metadata.clone(),
-                speedboat_metadata: latest_checkpoint.speedboat_metadata.clone(),
-                deletes_metadata: Some(new_deletes_metadata),
-                extension_metadata: latest_checkpoint.extension_metadata.clone(),  
-                schema: latest_checkpoint.schema.clone(),
-            };
-            self.handle_compaction(&commit.compactions, &mut new_latest_checkpoint);
-
-            self.checkpoints.insert(format!("{}_{}", &table_info.table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
+        if sync_index {
+            self.create_index(&new_latest_checkpoint).await?;
+        } else {
             match self.index_work_items.get_mut(&table_info.table_name) {
                 Some(checkpoints) => {
                     checkpoints.push(new_latest_checkpoint.clone());
                 },
                 None => {
-                    self.index_work_items.insert(table_info.table_name.clone(), vec!(new_latest_checkpoint.clone()));
+                    let checkpoints = vec!(new_latest_checkpoint.clone());
+                    self.index_work_items.insert(table_info.table_name.clone(), checkpoints);
                 }
-            };
-            self.set_latest_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
-            match self.compaction_work_items.get_mut(&table_info.table_name) {
-                Some(work_item) => {
-                    work_item.delete_files.extend(table_info.files.clone());
-                },
-                None => {}
             }
+        }
+        self.set_latest_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
+
+        // TODO: apply some policy here based on sizes to split up compaction work items
+        match self.compaction_work_items.get_mut(&table_info.table_name) {
+            Some(compaction) => {
+                compaction.table_schema = new_latest_checkpoint.schema.clone();
+                compaction.speedboat_files.extend(table_info.files.clone());
+                compaction.sizes.extend(table_info.sizes.clone());
+                // NOTE: file schema extend needs to be before schema extend for the index
+                // to be correct here.
+                compaction.file_schemas.extend(table_info.files.iter().map(|_|compaction.schemas.len() as u64));
+                compaction.schemas.push(table_info.schema.as_ref().unwrap().clone());
+            },
+            None => {
+                self.compaction_work_items.insert(
+                    table_info.table_name.clone(),
+                    CompactionWorkItem {
+                        table_schema: new_latest_checkpoint.schema.clone(),
+                        speedboat_files: table_info.files.clone(),
+                        schemas: vec!(table_info.schema.as_ref().unwrap().clone()),
+                        file_schemas: table_info.files.iter().map(|_|0).collect(),
+                        sizes: table_info.sizes.clone(),
+                        delete_files: new_latest_checkpoint.deletes_metadata.as_ref().map_or_else(|| vec!(), |m|m.files.clone()),
+                        iceberg_files: vec!(),
+                    }
+                );
+            }
+        }
+        Ok(())
+    }    
+
+    async fn speedboat_commit_type_delete(&mut self, table_info: &SpeedboatCommitTableInfo, compactions: &Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+        let latest_checkpoint = match self.get_latest_checkpoint_sync(&table_info.table_name, None) {
+            Some(checkpoint_id) => {
+                let key = format!("{}_{}", &table_info.table_name, checkpoint_id);
+                match self.checkpoints.get(&key) {
+                    Some(c) => c,
+                    None => panic!("Found latest checkpoint id but checkpoint missing = {}", key)
+                }
+            },
+            None => {
+                &TableMetadataCheckpoint {
+                    table_name: table_info.table_name.clone(),
+                    checkpoint_id: "".to_string(),
+                    iceberg_metadata: None,
+                    speedboat_metadata: None,
+                    deletes_metadata: None,
+                    extension_metadata: None,
+                    schema: PowdrrSchema{ fields: vec!() },
+                }
+            },
+        };
+
+        let new_checkpoint_id = IdInstance::next_id().to_string();
+        let new_deletes_metadata = match &latest_checkpoint.deletes_metadata {
+            None => DeletesMetadata {
+                files: table_info.files.clone(),
+            },
+            Some(existing) => {
+                let mut files = existing.files.clone();
+                files.extend(table_info.files.clone());
+                DeletesMetadata {
+                    files
+                }
+            }
+        };
+
+        tracing::info!("Delete commit has {} files", new_deletes_metadata.files.len());
+        for file in &new_deletes_metadata.files {
+            tracing::info!("Delete file {}", file)
+        }
+
+        let mut new_latest_checkpoint = TableMetadataCheckpoint {
+            table_name: table_info.table_name.clone(),
+            checkpoint_id: new_checkpoint_id.clone(),
+            iceberg_metadata: latest_checkpoint.iceberg_metadata.clone(),
+            speedboat_metadata: latest_checkpoint.speedboat_metadata.clone(),
+            deletes_metadata: Some(new_deletes_metadata),
+            extension_metadata: latest_checkpoint.extension_metadata.clone(),
+            schema: latest_checkpoint.schema.clone(),
+        };
+        self.handle_compaction(&compactions, &mut new_latest_checkpoint);
+
+        self.checkpoints.insert(format!("{}_{}", &table_info.table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
+        match self.index_work_items.get_mut(&table_info.table_name) {
+            Some(checkpoints) => {
+                checkpoints.push(new_latest_checkpoint.clone());
+            },
+            None => {
+                self.index_work_items.insert(table_info.table_name.clone(), vec!(new_latest_checkpoint.clone()));
+            }
+        };
+        self.set_latest_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
+        match self.compaction_work_items.get_mut(&table_info.table_name) {
+            Some(work_item) => {
+                work_item.delete_files.extend(table_info.files.clone());
+            },
+            None => {}
         }
         Ok(())
     }    
@@ -1140,13 +1136,16 @@ impl ApiServiceClient for TestApiServiceClient {
 
 
     async fn speedboat_commit(&mut self, commit: &SpeedboatCommit, sync_index: bool) -> Result<(), Box<dyn std::error::Error>> {
-        if commit.commit_type == "commit" || commit.commit_type == "compact" {
-            self.speedboat_commit_type_commit(commit, sync_index).await
-        } else if commit.commit_type == "delete" {
-            self.speedboat_commit_type_delete(commit).await
-        } else {
-            panic!("Unknown Speedboat commit type")
+        for table_info in commit.type_files.iter() {
+            if table_info.commit_type == "commit" || table_info.commit_type == "compact" {
+                self.speedboat_commit_type_commit(table_info, &commit.compactions, sync_index).await?;
+            } else if table_info.commit_type == "delete" {
+                self.speedboat_commit_type_delete(table_info, &commit.compactions).await?;
+            } else {
+                panic!("Unknown Speedboat commit type")
+            }
         }
+        Ok(())
     }
 
     async fn iceberg_commit(&mut self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), Box<dyn std::error::Error>> {
@@ -1249,7 +1248,7 @@ impl ApiServiceClient for TestApiServiceClient {
     async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, Box<dyn std::error::Error>> {
         let mut work_items = vec!();
         for (table_name, compaction) in self.compaction_work_items.iter_mut() {
-            if compaction.speedboat_files.len() > 100 {
+            if compaction.sizes.iter().sum::<u64>() > 10 * 1024 * 1024 {
                 work_items.push((table_name.clone(), compaction.clone()));
                 compaction.speedboat_files.clear();
                 compaction.sizes.clear();
