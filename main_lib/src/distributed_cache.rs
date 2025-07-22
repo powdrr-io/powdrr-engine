@@ -95,38 +95,22 @@ pub(crate) fn create_table(table: &String) -> Result<(), CacheError> {
     set(&table_seq_no_key(table), 0)
 }
 
-pub(crate) fn insert_and_update_operator(table: &String, num_inserts: usize, num_updates: usize) -> Result<Vec<u64>, CacheError> {
-    if num_inserts + num_updates == 0 {
+pub(crate) fn report_table_changes(table: &String, num_inserts: usize, num_updates: usize, num_deletes: usize) -> Result<Vec<u64>, CacheError> {
+    // Nothing to do if there are no changes - these are unsigned so they only way the
+    // sum can equal zero is if all three are zero.
+    if num_inserts + num_updates + num_deletes == 0 {
         return Ok(vec![]);
     }
-    // Increase the number of records by the number of inserts
-    increment(&approx_num_records_key(table), num_inserts as i64)?;
+    // Increase the number of records by the number of inserts minus the number of deletes
+    // Deletes might be larger than inserts so we need signed integers.
+    increment(&approx_num_records_key(table), num_inserts as i64 - num_deletes as i64)?;
     // ...and bump the seq no by the total number of operations
-    let delta = (num_inserts + num_updates) as i64;
+    let delta = (num_inserts + num_updates + num_deletes) as i64;
     assert!(delta > 0);
     let new_last_seq_no = increment(&table_seq_no_key(table), delta)?;
     let values: Vec<u64> = (0..delta).map(|offset: i64| (new_last_seq_no - offset) as u64).collect();
     assert_eq!(values.len(), delta as usize);
     Ok(values)
-}
-
-pub(crate) fn delete_operator(table: &String, num_records: i64) -> Result<i64, CacheError> {
-    // Decrease the number of records
-    increment(&approx_num_records_key(table), -num_records)?;
-    // ...and up the seq no
-    increment(&table_seq_no_key(table), 1)
-}
-
-pub(crate) fn insert_operator(table: &String) -> Result<u64, CacheError> {
-    let insert = insert_and_update_operator(table, 1, 0)?;
-    assert_eq!(insert.len(), 1);
-    Ok(insert[0])
-}
-
-pub(crate) fn update_operator(table: &String) -> Result<u64, CacheError> {
-    let update = insert_and_update_operator(table, 0, 1)?;
-    assert_eq!(update.len(), 1);
-    Ok(update[0])
 }
 
 pub(crate) fn clear(tables: &Vec<String>) -> Result<(), CacheError> {

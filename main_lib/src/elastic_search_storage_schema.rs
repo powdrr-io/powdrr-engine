@@ -1,7 +1,7 @@
 use serde_json::Value;
 use crate::distributed_cache;
 use crate::elastic_search_common::create_denormalized_value;
-use crate::elastic_search_ingest::WriteBuffer;
+use crate::elastic_search_ingest::{commit_speedboat, IngestError, WriteBuffer};
 use crate::elastic_search_responses::{OperationResult, QueryResultHit, Shards};
 use crate::schema_massager::{extract_powdrr_schema_option, PowdrrSchema};
 
@@ -159,71 +159,154 @@ impl FullRecord {
     }
 }
 
-pub struct WriteBufferBuilderResult {
-    pub write_buffer: WriteBuffer,
-    pub results: Vec<OperationResult>
+#[derive(Clone)]
+pub struct RecordDelete {
+    id: String,
+    seq_no: u64,
+    version: u64,
+}
+
+impl RecordDelete {
+    pub fn new(id: &String, seq_no: u64, version: u64) -> Self {
+        RecordDelete {
+            id: id.clone(),
+            seq_no,
+            version,
+        }
+    }
+
+    pub fn as_value(&self) -> Value {
+        Value::Object(
+            serde_json::Map::from_iter(vec![
+                ("_id_seq_no".to_string(), Value::String(format!("{}_{}", self.id, self.seq_no)))
+            ])
+        )
+    }
+
+    pub fn as_operation(&self, table: &String) -> OperationResult {
+        OperationResult {
+            _index: table.clone(),
+            _id: self.id.clone(),
+            _version: self.version,
+            result: "delete".to_string(),
+            _shards: Shards {
+                total: 1,
+                successful: 1,
+                failed: 0,
+            },
+            _seq_no: self.seq_no,
+            _primary_term: 1,
+            status: None,
+            get: None,
+        }
+    }
+}
+
+pub struct SpeedboatCommitResult {
+    pub operations: Vec<OperationResult>,
 }
 
 #[derive(Clone)]
-pub(crate) struct WriteBufferBuilder {
-    pub insert_records: Vec<RecordInput>,
-    pub update_records: Vec<RecordInput>,
-    pub delete_records: WriteBuffer,
+pub(crate) struct SpeedboatCommitBuilder {
+    table_name: String,
+    insert_records: Vec<RecordInput>,
+    update_records: Vec<RecordInput>,
+    delete_records: Vec<RecordDelete>,
 }
 
-impl WriteBufferBuilder {
-    pub fn new() -> Self {
-        WriteBufferBuilder{
+impl SpeedboatCommitBuilder {
+    pub fn new(table_name: &String) -> Self {
+        SpeedboatCommitBuilder {
+            table_name: table_name.clone(),
             insert_records: vec!(),
             update_records: vec!(),
-            delete_records: WriteBuffer::new(),
+            delete_records: vec!(),
         }
     }
 
-    pub fn num_records(&self) -> usize {
-        self.insert_records.len() + self.update_records.len()
+    pub fn insert(&mut self, record: &RecordInput) -> () {
+        self.insert_records.push(record.clone());
     }
 
-    pub fn extend(&mut self, builder: &WriteBufferBuilder) {
+    pub fn update(&mut self, record: &RecordInput) -> () {
+        self.update_records.push(record.clone());
+    }
+
+    pub fn delete(&mut self, record: &RecordDelete) -> () {
+        self.delete_records.push(record.clone())
+    }
+
+    pub fn num_inserts(&self) -> usize {
+        self.insert_records.len()
+    }
+
+    pub fn num_updates(&self) -> usize {
+        self.update_records.len()
+    }
+
+    pub fn num_deletes(&self) -> usize {
+        self.delete_records.len()
+    }
+
+    pub fn extend(&mut self, builder: &SpeedboatCommitBuilder) {
         self.insert_records.extend(builder.insert_records.iter().map(|r| r.clone()));
         self.update_records.extend(builder.update_records.iter().map(|r| r.clone()));
+        self.delete_records.extend(builder.delete_records.iter().map(|r| r.clone()));
     }
 
-    pub fn build(&mut self, table: &String) -> WriteBufferBuilderResult {
-        // TODO: update seq no for deletes
-        let seq_no_vec = distributed_cache::insert_and_update_operator(table, self.insert_records.len(), self.update_records.len()).unwrap();
-        self.insert_records.iter_mut().chain(self.update_records.iter_mut()).zip(seq_no_vec.iter())
-            .for_each(|(record, seq_no)| record.ensure_normalized_value(Some(*seq_no as u64)));
+    pub fn build_buffers(&mut self) -> (WriteBuffer, WriteBuffer, Vec<OperationResult>) {
+        let mut operations = vec!();
+        let seq_no_vec = distributed_cache::report_table_changes(&self.table_name, self.insert_records.len(), self.update_records.len(), self.delete_records.len()).unwrap();
+        let insert_update_write_buffer = if self.insert_records.len() > 0 || self.update_records.len() > 0 {
+            self.insert_records.iter_mut().chain(self.update_records.iter_mut()).zip(seq_no_vec.iter())
+                .for_each(|(record, seq_no)| record.ensure_normalized_value(Some(*seq_no as u64)));
 
-        let mut operations = self.insert_records.iter().zip(seq_no_vec.iter())
-            .map(|(record, seq_no)| record.as_operation(table, *seq_no, false)).collect::<Vec<OperationResult>>();
-        operations.extend(self.update_records.iter().zip(seq_no_vec[self.insert_records.len()..].iter())
-            .map(|(record, seq_no)| record.as_operation(table, *seq_no, true)));
+            operations.extend(self.insert_records.iter().zip(seq_no_vec.iter())
+                .map(|(record, seq_no)| record.as_operation(&self.table_name, *seq_no, false)));
+            operations.extend(self.update_records.iter().zip(seq_no_vec[self.insert_records.len()..].iter())
+                .map(|(record, seq_no)| record.as_operation(&self.table_name, *seq_no, true)));
 
-        let input_schemas = self.insert_records.iter().chain(self.update_records.iter())
-            .map(|v|extract_powdrr_schema_option(&v.existing_normalized)).collect::<Vec<PowdrrSchema>>();
-        let merged_schema = PowdrrSchema::merge_all(input_schemas);
-        self.insert_records.iter_mut().chain(self.update_records.iter_mut()).for_each(|r| merged_schema.coerce_value_option(&mut r.existing_normalized));
+            let input_schemas = self.insert_records.iter().chain(self.update_records.iter())
+                .map(|v| extract_powdrr_schema_option(&v.existing_normalized)).collect::<Vec<PowdrrSchema>>();
+            let merged_schema = PowdrrSchema::merge_all(input_schemas);
+            self.insert_records.iter_mut().chain(self.update_records.iter_mut()).for_each(|r| merged_schema.coerce_value_option(&mut r.existing_normalized));
 
-        let final_records = self.insert_records.iter_mut().chain(self.update_records.iter_mut()).map(|r| r.as_record(None)).collect::<Vec<Value>>();
-        let write_buffer = WriteBuffer::from(merged_schema, final_records.iter().map(|r|serde_json::to_string(&r).unwrap()).collect());
+            let final_records = self.insert_records.iter_mut().chain(self.update_records.iter_mut()).map(|r| r.as_record(None)).collect::<Vec<Value>>();
+            WriteBuffer::insert_and_update(merged_schema, final_records.iter().map(|r| serde_json::to_string(&r).unwrap()).collect())
+        } else {
+            WriteBuffer::empty()
+        };
 
-        WriteBufferBuilderResult {
-            write_buffer,
-            results: operations,
-        }
+        operations.extend(self.delete_records.iter().map(|r|r.as_operation(&self.table_name)));
+        let delete_write_buffer = WriteBuffer::delete(self.delete_records.iter().map(|r| serde_json::to_string(&r.as_value()).unwrap()).collect());
+        (insert_update_write_buffer, delete_write_buffer, operations)
+    }
+
+    pub async fn commit(&mut self) -> Result<SpeedboatCommitResult, IngestError> {
+        let (insert_update_write_buffer, delete_write_buffer, operations) = self.build_buffers();
+        commit_speedboat(
+            &self.table_name,
+            &insert_update_write_buffer,
+            &delete_write_buffer,
+            &vec!(),
+            &"commit".to_string()
+        ).await?;
+
+        Ok(SpeedboatCommitResult {
+            operations,
+        })
     }
 }
 
 
 #[cfg(test)]
 mod tests {
-    use crate::elastic_search_storage_schema::{RecordInput, WriteBufferBuilder};
+    use crate::elastic_search_storage_schema::{RecordInput, SpeedboatCommitBuilder};
     use crate::schema_massager::PowdrrDataType;
 
     #[test]
     fn test_builder_basic() {
-        let mut builder = WriteBufferBuilder::new();
+        let mut builder = SpeedboatCommitBuilder::new(&"fake".to_string());
         builder.insert_records.push(RecordInput::new(
             "abc".to_string(),
             1,
@@ -237,10 +320,10 @@ mod tests {
             None,
         ));
 
-        let buffer = builder.build(&"fake".to_string());
-        assert_eq!(buffer.write_buffer.num_records(), 2);
-        assert!(buffer.write_buffer.schema.is_some());
-        let schema = buffer.write_buffer.schema.as_ref().unwrap();
+        let (insert_buffer, _, _) = builder.build_buffers();
+        assert_eq!(insert_buffer.num_records(), 2);
+        assert!(insert_buffer.schema().is_some());
+        let schema = insert_buffer.schema().as_ref().unwrap().clone();
         assert_eq!(schema.fields.len(), 11);
         let schema_map = schema.to_map();
         let source_field = schema_map.get("_source").unwrap();

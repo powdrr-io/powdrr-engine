@@ -3960,7 +3960,9 @@ dependencies = [
 name = "powdrr-benchmark"
 version = "0.0.1"
 dependencies = [
+ "futures",
  "reqwest 0.12.22",
+ "tokio",
 ]
 
 [[package]]

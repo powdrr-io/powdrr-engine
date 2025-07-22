@@ -10,12 +10,13 @@ use gotham::mime;
 use http::StatusCode;
 use serde_json::Value;
 
-use crate::{data_access::{self, execute_sql}, distributed_cache, elastic_search_common::{Command, ResultGeneratorFuture}, elastic_search_ingest::{self, WriteBuffer}, elastic_search_parser::ScriptBlock, elastic_search_responses::{QueryResultHit, QueryResults}, expression_evaluator, painless_parser, state_hosted_service::API_SERVICE_CLIENT, state_peers::SnapshotDescriptor};
+use crate::{data_access::{self, execute_sql}, distributed_cache, elastic_search_common::{Command, ResultGeneratorFuture}, elastic_search_parser::ScriptBlock, elastic_search_responses::{QueryResultHit, QueryResults}, expression_evaluator, painless_parser, state_hosted_service::API_SERVICE_CLIENT, state_peers::SnapshotDescriptor};
 use crate::elastic_search_common::ElasticSearchResponse;
 use crate::elastic_search_endpoints::QueryStringSearch;
+use crate::elastic_search_ingest::IngestError;
 use crate::elastic_search_parser::{process_aggregations, Aggregation};
 use crate::elastic_search_responses::{AggregationResult, QueryResultsNotFound, UpdateByQueryResults, UpdateByQueryResultsRetries, UpdateByQuerySuccess};
-use crate::elastic_search_storage_schema::{FullRecord, RecordInput, WriteBufferBuilder};
+use crate::elastic_search_storage_schema::{FullRecord, RecordDelete, RecordInput, SpeedboatCommitBuilder};
 use crate::schema_massager::{to_powdrr_schema, PowdrrSchema, SqlBuilder, SqlExpression, SqlQuery};
 use crate::state_peers::{PrivateInvocation, PrivateSqlInvocation};
 
@@ -321,43 +322,27 @@ enum EvalResult {
     Update(RecordInput, u64),
     Noop,
     #[allow(dead_code)]
-    Delete(String, u64),
+    Delete(String, u64, u64),
 }
 
 struct UpdateByQueryResult {
-    table: String,
-    update_buffer: WriteBufferBuilder,
-    #[allow(dead_code)]
-    delete_buffer: WriteBuffer,
-    update_count: u64,
-    delete_count: u64,
-    noop_count: u64,
+    buffer: SpeedboatCommitBuilder,
+    noop_count: usize,
     debug: Option<Vec<Value>>,
 }
 
 impl UpdateByQueryResult {
-    fn total_count(&self) -> u64 {
-        self.update_count + self.delete_count + self.noop_count
+    fn total_count(&self) -> usize {
+        self.buffer.num_inserts() + self.buffer.num_updates() + self.buffer.num_deletes() + self.noop_count
     }
     
-    async fn commit(&mut self) -> Result<ElasticSearchResponse, String> {
-        // TODO: ideally this would write all the files once and do a single commit to the main_lib.
-        if self.update_buffer.num_records() != 0 {
-            let build_result = &self.update_buffer.build(&self.table);
-            match elastic_search_ingest::commit_general(&build_result.write_buffer, &self.table, &"commit".to_string()).await {
-                Ok(_) => (),
-                Err(_) => panic!("nope"),
-            };
-        }
-        match elastic_search_ingest::commit_general(&self.delete_buffer, &self.table, &"delete".to_string()).await {
-            Ok(_) => (),
-            Err(_) => panic!("nope"),
-        };
+    async fn commit(&mut self) -> Result<ElasticSearchResponse, IngestError> {
+        self.buffer.commit().await?;
         Ok(UpdateByQueryCommand::success(
-            self.total_count(),
-            self.update_count,
-            self.delete_count,
-            self.noop_count,
+            self.total_count() as u64,
+            self.buffer.num_updates() as u64,
+            self.buffer.num_deletes() as u64,
+            self.noop_count as u64,
             1,
             self.debug.clone()
         ).to_response())
@@ -433,36 +418,27 @@ impl UpdateByQueryCommand {
     }
 
     async fn create_final_result(table: &String, final_values: Vec<EvalResult>) -> UpdateByQueryResult {
-        let mut update_buffer = WriteBufferBuilder::new();
-        let mut delete_buffer = WriteBuffer::new();
-        
-        let mut update_count: u64 = 0;
-        let mut delete_count: u64 = 0;
-        let mut noop_count: u64 = 0;
+        let mut buffer = SpeedboatCommitBuilder::new(table);
+
+        let mut noop_count: usize = 0;
         
         for result in final_values {
             match result {
                 EvalResult::Noop => {
                     noop_count += 1;
                 },
-                EvalResult::Delete(doc_id, seq_no) => {
-                    delete_buffer.push(serde_json::to_string(&elastic_search_ingest::create_delete(&doc_id, seq_no)).unwrap());
-                    delete_count += 1;
+                EvalResult::Delete(doc_id, seq_no, version) => {
+                    buffer.delete(&RecordDelete::new(&doc_id, seq_no, version));
                 },
-                EvalResult::Update(value, seq_no) => {
-                    delete_buffer.push(serde_json::to_string(&elastic_search_ingest::create_delete(value.id(), seq_no)).unwrap());
-                    update_buffer.update_records.push(value);
-                    update_count += 1;
+                EvalResult::Update(value, old_seq_no) => {
+                    buffer.delete(&RecordDelete::new(value.id(), old_seq_no,value.version() - 1));
+                    buffer.update(&value);
                 }
             }
         }
         
         UpdateByQueryResult {
-            table: table.clone(),
-            update_buffer: update_buffer.clone(),
-            delete_buffer: delete_buffer,
-            update_count: update_count,
-            delete_count: delete_count,
+            buffer: buffer.clone(),
             noop_count: noop_count,
             // UNCOMMENT FOR DEBUGGING: debug: Some(update_buffer.records.iter().map(|x|x.source().unwrap().clone()).collect()),
             debug: None,
@@ -498,7 +474,10 @@ impl Command for UpdateByQueryCommand {
 
             let mut result_info = UpdateByQueryCommand::create_final_result(&table, final_result_values).await;
             data_access::drop(&final_table_name).await;
-            result_info.commit().await
+            match result_info.commit().await {
+                Ok(r) => Ok(r),
+                Err(e) => Err(e.to_string())
+            }
         }.boxed()
     }
 }

@@ -312,7 +312,7 @@ pub(crate) async fn create_index_inner(table_metadata: &TableMetadataCheckpoint)
 mod tests {
     use std::env;
     use gotham::test::Server;
-    use crate::elastic_search_index::{create_index_jsonl, create_index_parquet};
+    use crate::elastic_search_index::create_index_parquet;
 
     #[test]
     fn test_simple_create_index_parquet() {
