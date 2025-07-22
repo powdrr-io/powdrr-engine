@@ -322,7 +322,7 @@ enum EvalResult {
     Update(RecordInput, u64),
     Noop,
     #[allow(dead_code)]
-    Delete(String, u64),
+    Delete(String, u64, u64),
 }
 
 struct UpdateByQueryResult {
@@ -427,11 +427,11 @@ impl UpdateByQueryCommand {
                 EvalResult::Noop => {
                     noop_count += 1;
                 },
-                EvalResult::Delete(doc_id, seq_no) => {
-                    buffer.delete(&RecordDelete::new(&doc_id, seq_no));
+                EvalResult::Delete(doc_id, seq_no, version) => {
+                    buffer.delete(&RecordDelete::new(&doc_id, seq_no, version));
                 },
-                EvalResult::Update(value, seq_no) => {
-                    buffer.delete(&RecordDelete::new(value.id(), seq_no));
+                EvalResult::Update(value, old_seq_no) => {
+                    buffer.delete(&RecordDelete::new(value.id(), old_seq_no,value.version() - 1));
                     buffer.update(&value);
                 }
             }

@@ -394,7 +394,7 @@ impl CompactionCommand {
 
         // Note: the Iceberg and Speedboat commits are done separately here and are
         // therefore NOT ATOMIC. The Speedboat commit here is just deletions where
-        // the new file is a subset of the existing files. If this update is lost the
+        // the new file contains a subset of deletes from the existing files. If this update is lost the
         // worst case is that the next compaction sees all the same deletes in the same
         // files and once again tries to compact them.
 

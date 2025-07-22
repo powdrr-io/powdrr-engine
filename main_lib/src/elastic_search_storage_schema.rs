@@ -1,4 +1,3 @@
-use serde::Serialize;
 use serde_json::Value;
 use crate::distributed_cache;
 use crate::elastic_search_common::create_denormalized_value;
@@ -160,17 +159,45 @@ impl FullRecord {
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone)]
 pub struct RecordDelete {
     id: String,
     seq_no: u64,
+    version: u64,
 }
 
 impl RecordDelete {
-    pub fn new(id: &String, seq_no: u64) -> Self {
+    pub fn new(id: &String, seq_no: u64, version: u64) -> Self {
         RecordDelete {
             id: id.clone(),
             seq_no,
+            version,
+        }
+    }
+
+    pub fn as_value(&self) -> Value {
+        Value::Object(
+            serde_json::Map::from_iter(vec![
+                ("_id_seq_no".to_string(), Value::String(format!("{}_{}", self.id, self.seq_no)))
+            ])
+        )
+    }
+
+    pub fn as_operation(&self, table: &String) -> OperationResult {
+        OperationResult {
+            _index: table.clone(),
+            _id: self.id.clone(),
+            _version: self.version,
+            result: "delete".to_string(),
+            _shards: Shards {
+                total: 1,
+                successful: 1,
+                failed: 0,
+            },
+            _seq_no: self.seq_no,
+            _primary_term: 1,
+            status: None,
+            get: None,
         }
     }
 }
@@ -227,31 +254,42 @@ impl SpeedboatCommitBuilder {
         self.delete_records.extend(builder.delete_records.iter().map(|r| r.clone()));
     }
 
-    pub async fn commit(&mut self) -> Result<SpeedboatCommitResult, IngestError> {
+    pub fn build_buffers(&mut self) -> (WriteBuffer, WriteBuffer, Vec<OperationResult>) {
+        let mut operations = vec!();
         let seq_no_vec = distributed_cache::report_table_changes(&self.table_name, self.insert_records.len(), self.update_records.len(), self.delete_records.len()).unwrap();
-        self.insert_records.iter_mut().chain(self.update_records.iter_mut()).zip(seq_no_vec.iter())
-            .for_each(|(record, seq_no)| record.ensure_normalized_value(Some(*seq_no as u64)));
+        let insert_update_write_buffer = if self.insert_records.len() > 0 || self.update_records.len() > 0 {
+            self.insert_records.iter_mut().chain(self.update_records.iter_mut()).zip(seq_no_vec.iter())
+                .for_each(|(record, seq_no)| record.ensure_normalized_value(Some(*seq_no as u64)));
 
-        let mut operations = self.insert_records.iter().zip(seq_no_vec.iter())
-            .map(|(record, seq_no)| record.as_operation(&self.table_name, *seq_no, false)).collect::<Vec<OperationResult>>();
-        operations.extend(self.update_records.iter().zip(seq_no_vec[self.insert_records.len()..].iter())
-            .map(|(record, seq_no)| record.as_operation(&self.table_name, *seq_no, true)));
+            operations.extend(self.insert_records.iter().zip(seq_no_vec.iter())
+                .map(|(record, seq_no)| record.as_operation(&self.table_name, *seq_no, false)));
+            operations.extend(self.update_records.iter().zip(seq_no_vec[self.insert_records.len()..].iter())
+                .map(|(record, seq_no)| record.as_operation(&self.table_name, *seq_no, true)));
 
-        let input_schemas = self.insert_records.iter().chain(self.update_records.iter())
-            .map(|v|extract_powdrr_schema_option(&v.existing_normalized)).collect::<Vec<PowdrrSchema>>();
-        let merged_schema = PowdrrSchema::merge_all(input_schemas);
-        self.insert_records.iter_mut().chain(self.update_records.iter_mut()).for_each(|r| merged_schema.coerce_value_option(&mut r.existing_normalized));
+            let input_schemas = self.insert_records.iter().chain(self.update_records.iter())
+                .map(|v| extract_powdrr_schema_option(&v.existing_normalized)).collect::<Vec<PowdrrSchema>>();
+            let merged_schema = PowdrrSchema::merge_all(input_schemas);
+            self.insert_records.iter_mut().chain(self.update_records.iter_mut()).for_each(|r| merged_schema.coerce_value_option(&mut r.existing_normalized));
 
-        let final_records = self.insert_records.iter_mut().chain(self.update_records.iter_mut()).map(|r| r.as_record(None)).collect::<Vec<Value>>();
-        let insert_update_write_buffer = WriteBuffer::insert_and_update(merged_schema, final_records.iter().map(|r|serde_json::to_string(&r).unwrap()).collect());
-        let delete_write_buffer = WriteBuffer::delete(self.delete_records.iter().map(|r| serde_json::to_string(&r).unwrap()).collect());
+            let final_records = self.insert_records.iter_mut().chain(self.update_records.iter_mut()).map(|r| r.as_record(None)).collect::<Vec<Value>>();
+            WriteBuffer::insert_and_update(merged_schema, final_records.iter().map(|r| serde_json::to_string(&r).unwrap()).collect())
+        } else {
+            WriteBuffer::empty()
+        };
 
+        operations.extend(self.delete_records.iter().map(|r|r.as_operation(&self.table_name)));
+        let delete_write_buffer = WriteBuffer::delete(self.delete_records.iter().map(|r| serde_json::to_string(&r.as_value()).unwrap()).collect());
+        (insert_update_write_buffer, delete_write_buffer, operations)
+    }
+
+    pub async fn commit(&mut self) -> Result<SpeedboatCommitResult, IngestError> {
+        let (insert_update_write_buffer, delete_write_buffer, operations) = self.build_buffers();
         commit_speedboat(
             &self.table_name,
             &insert_update_write_buffer,
             &delete_write_buffer,
             &vec!(),
-            &"ingest".to_string()
+            &"commit".to_string()
         ).await?;
 
         Ok(SpeedboatCommitResult {
@@ -268,7 +306,7 @@ mod tests {
 
     #[test]
     fn test_builder_basic() {
-        let mut builder = SpeedboatCommitBuilder::new();
+        let mut builder = SpeedboatCommitBuilder::new(&"fake".to_string());
         builder.insert_records.push(RecordInput::new(
             "abc".to_string(),
             1,
@@ -282,10 +320,10 @@ mod tests {
             None,
         ));
 
-        let buffer = builder.build(&"fake".to_string());
-        assert_eq!(buffer.write_buffer.num_records(), 2);
-        assert!(buffer.write_buffer.schema.is_some());
-        let schema = buffer.write_buffer.schema.as_ref().unwrap();
+        let (insert_buffer, _, _) = builder.build_buffers();
+        assert_eq!(insert_buffer.num_records(), 2);
+        assert!(insert_buffer.schema().is_some());
+        let schema = insert_buffer.schema().as_ref().unwrap().clone();
         assert_eq!(schema.fields.len(), 11);
         let schema_map = schema.to_map();
         let source_field = schema_map.get("_source").unwrap();

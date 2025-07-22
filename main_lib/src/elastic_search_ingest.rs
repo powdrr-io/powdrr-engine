@@ -92,6 +92,11 @@ impl WriteBuffer {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn schema(&self) -> Option<PowdrrSchema> {
+        self.schema.clone()
+    }
+
     pub(crate) fn num_records(&self) -> usize {
         self.lines.len()
     }
@@ -642,7 +647,7 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
         );
         updated_doc.ensure_source();
         buffer.update(&updated_doc);
-        buffer.delete(&RecordDelete::new(&existing_doc.record_input.id(), existing_doc.seq_no));
+        buffer.delete(&RecordDelete::new(&existing_doc.record_input.id(), existing_doc.seq_no, existing_doc.record_input.version()));
     } else {
         if update_request.upsert.is_none() {
             // TODO: this is the doc_as_upsert path to figure out
@@ -699,7 +704,8 @@ pub(crate) async fn delete(index: &String, doc_id: &String) -> Result<ElasticSea
     }
     let mut buffer = SpeedboatCommitBuilder::new(&table_description.name);
     let target_seq_no = docs.docs[0].get("_seq_no").unwrap().as_u64().unwrap();
-    buffer.delete(&RecordDelete::new(doc_id, target_seq_no));
+    let target_version = docs.docs[0].get("_version").unwrap().as_u64().unwrap();
+    buffer.delete(&RecordDelete::new(doc_id, target_seq_no, target_version));
     let result = buffer.commit().await?;
     assert_eq!(result.operations.len(), 1);
     Ok(ElasticSearchResponse { status: StatusCode::OK, mime: mime::APPLICATION_JSON, body: serde_json::to_string(&result.operations[0]).unwrap(), headers: vec!() })
@@ -808,7 +814,7 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
                                 );
                                 updated_doc.ensure_source();
                                 ingest_result.get(index).update(&updated_doc);
-                                ingest_result.get(index).delete(&RecordDelete::new(existing_doc.record_input.id(), existing_doc.seq_no));
+                                ingest_result.get(index).delete(&RecordDelete::new(existing_doc.record_input.id(), existing_doc.seq_no, existing_doc.record_input.version()));
                             },
                             Err(_) => return Err(IngestError{ message: "Serde error".to_string() })
                         }
