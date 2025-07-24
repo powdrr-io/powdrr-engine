@@ -50,13 +50,15 @@ pub(crate) struct DataQueryResult {
 }
 
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct FileDescriptor {
     file_path: String,
     schema: PowdrrSchema,
     size: u64,
 }
 
+
+#[derive(Debug)]
 struct RequiredFiles {
     table_schema: PowdrrSchema,
     iceberg_files: Vec<FileDescriptor>,
@@ -85,14 +87,14 @@ fn filter_iceberg<'a>(iceberg_metadata: &'a Option<IcebergMetadata>, index: u64,
     match iceberg_metadata {
         Some(im) => {
             let mut filtered_files = vec!();
-            for (idx, file_path) in im.files.iter().enumerate() {
+            for (idx, (file_path, size)) in im.files.iter().zip(im.sizes.iter()).enumerate() {
                 if !selected_file(file_path, index, num) {
                     continue;
                 }
                 if matches_filter(im, idx, file_path) {
                     let schema_index = *im.file_schemas.get(idx).unwrap() as usize;
                     let schema = im.schemas.get(schema_index).unwrap().clone();
-                    filtered_files.push(FileDescriptor{ file_path: file_path.clone(), schema, size: 1 });
+                    filtered_files.push(FileDescriptor{ file_path: file_path.clone(), schema, size: size.clone() });
                 }
             }
         
@@ -310,6 +312,10 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation, index: u64, nu
         Ok(rf) => rf,
         Err(e) => return log_err(e),
     };
+
+    let parquet_size = required_files.iceberg_files.iter().map(|f|f.size).sum::<u64>();
+    let speedboat_size = required_files.speedboat_files.iter().map(|f|f.size).sum::<u64>();
+    tracing::info!("Query: parquet = {}, {}, speedboat = {}, {}", required_files.iceberg_files.len(), parquet_size, required_files.speedboat_files.len(), speedboat_size);
 
     data_query_worker(
         &invocation.sql,

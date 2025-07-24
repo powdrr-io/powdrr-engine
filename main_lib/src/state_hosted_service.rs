@@ -1232,6 +1232,8 @@ impl ApiServiceClient for TestApiServiceClient {
     }
 
     async fn get_extension_work_items(&mut self, extension_type: &String) -> Result<Vec<TableMetadataCheckpoint>, Box<dyn std::error::Error>> {
+        Ok(vec!())
+        /*
         if extension_type == "es" {
             // TODO: priority by index? allow index filtering?
             let mut work_items = vec!();
@@ -1243,6 +1245,8 @@ impl ApiServiceClient for TestApiServiceClient {
         } else {
             Ok(vec!())
         }
+
+         */
     }
 
     async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, Box<dyn std::error::Error>> {
@@ -1252,7 +1256,7 @@ impl ApiServiceClient for TestApiServiceClient {
                 compaction.sizes.iter().sum::<u64>(),
                 compaction.speedboat_files.len()
             );
-            if compaction.sizes.iter().sum::<u64>() > 10 * 1024 * 1024 || compaction.speedboat_files.len() > 200 {
+            if compaction.sizes.iter().sum::<u64>() > 100 * 1024 * 1024 || compaction.speedboat_files.len() > 200 {
                 work_items.push((table_name.clone(), compaction.clone()));
                 compaction.speedboat_files.clear();
                 compaction.sizes.clear();

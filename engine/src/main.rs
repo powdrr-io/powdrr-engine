@@ -31,7 +31,7 @@ fn run_server() -> () {
     tracing_subscriber::fmt().init();
     let addr = "0.0.0.0:9200";
     println!("Listening for requests at http://{}", addr);
-    gotham::start_with_num_threads(addr, powdrr_lib::router::router(true), 16).unwrap()
+    gotham::start_with_num_threads(addr, powdrr_lib::router::router(true), 32).unwrap()
 }
 
 
