@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaBuilder};
+use datafusion::arrow::datatypes::DataType;
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use datafusion::parquet::file::properties::WriterProperties;
 use futures_util::{FutureExt, TryStreamExt};
@@ -22,9 +22,8 @@ use iceberg::writer::file_writer::location_generator::{DefaultFileNameGenerator,
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
-use idgenerator::{IdGeneratorOptions, IdInstance};
+use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot::error::RecvError;
 
 use crate::{elastic_search_ingest, state_hosted_service::{CompactionCommit, API_SERVICE_CLIENT}};
 use crate::data_access::execute_sql;
@@ -76,7 +75,7 @@ async fn list_all_tables(namespace: &String) -> Result<Vec<TableIdent>, iceberg:
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 async fn drop_table(namespace: &String, name: &String) -> Result<(), iceberg::Error> {
     let catalog = REST_CATALOG.clone();
 
@@ -128,7 +127,13 @@ async fn ensure_table(namespace: &String, name: &String, iceberg_schema: &iceber
                 .schema(iceberg_schema.clone())
                 .build();
 
-            catalog.create_table(&namespace_ident, creation).await
+            match catalog.create_table(&namespace_ident, creation).await {
+                Ok(t) => Ok(t),
+                Err(e) => {
+                    tracing::info!("Failed to create table {}: {}", name, e);
+                    Err(e)
+                }
+            }
         }
     }
 
@@ -186,7 +191,7 @@ pub async fn load_table_metadata(namespace: &String, name: &String, last_snapsho
     let table: Table = match catalog.load_table(&table_ident).await {
         Ok(t) => t,
         Err(_) => {
-            return Err(iceberg::Error::new(iceberg::ErrorKind::DataInvalid, "No such table"))
+            return Err(iceberg::Error::new(iceberg::ErrorKind::DataInvalid, format!("No such table {}", name)))
         }
     };
 
@@ -195,7 +200,10 @@ pub async fn load_table_metadata(namespace: &String, name: &String, last_snapsho
     for snapshot_info in snapshot_log.iter().rev() {
         let snapshot = match table.metadata().snapshot_by_id(snapshot_info.snapshot_id) {
             Some(s) => s,
-            None => panic!("That's weird")
+            None => {
+                tracing::info!("Unable to find iceberg snapshot {}", snapshot_info.snapshot_id);
+                return Err(iceberg::Error::new(iceberg::ErrorKind::DataInvalid, format!("Unable to find iceberg snapshot {}", snapshot_info.snapshot_id)))
+            }
         };
 
         if snapshot_info.snapshot_id == last_snapshot_id {
@@ -269,12 +277,6 @@ impl CompactionCommand {
         compaction_id: &String,
         data: &Vec<RecordBatch>
     ) -> Result<(), iceberg::Error> {
-        let options = IdGeneratorOptions::new().worker_id(1).worker_id_bit_len(6);
-        match IdInstance::init(options) {
-            Ok(_) => (),
-            Err(_) => panic!("What happened?")
-        }
-
         let table = ensure_table(namespace, name, &iceberg_schema).await?;
         let location_generator = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
         let file_name_generator = DefaultFileNameGenerator::new(
@@ -304,8 +306,6 @@ impl CompactionCommand {
         let data_files = match data_file_writer.close().await {
             Ok(df) => df,
             Err(e) => {
-                let error = format!("{}", e);
-                println!("{}", error);
                 return Err(e)
             }
         };
@@ -320,58 +320,37 @@ impl CompactionCommand {
         Ok(())
     }
 
-    #[allow(dead_code)] // Used in testing
-    fn fix_fields(fields: &Fields) -> Schema {
-        let mut builder = SchemaBuilder::new();
-        for (index, field) in fields.iter().enumerate() {
-            let new_field = Field::new(
-                field.name().clone(),
-                field.data_type().clone(),
-                field.is_nullable(),
-            ).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                (index + 1).to_string()
-            )]));
-            builder.push(new_field);
-        }
-        builder.finish()
-    }
-
-
-    async fn update_iceberg(data: &Vec<RecordBatch>, table_name: &String, compaction_id: &String) -> () {
+    async fn update_iceberg(data: &Vec<RecordBatch>, table_name: &String, compaction_id: &String) -> Result<(), iceberg::Error> {
         let converted_schema = match arrow_schema_to_schema(&data[0].schema()) {
             Ok(s) => s,
             Err(e) => {
-                let error = format!("{}", e);
-                panic!("oh no = {}", error);
+                return Err(e)
             },
         };
 
-        match Self::append_iceberg_table(
+        Self::append_iceberg_table(
             &"default".to_string(),
             table_name,
             converted_schema,
             compaction_id,
             &data,
-        ).await {
-            Ok(_) => (),
-            Err(_) => {
-                panic!("nope");
-            },
-        }
-
+        ).await
     }
 
-    async fn do_iceberg_commit(table_name: &String, schema: &PowdrrSchema, last_snapshot_id: i64, deletes_buffer: &WriteBuffer) -> Result<i64, RecvError> {
+    async fn do_iceberg_commit(table_name: &String, schema: &PowdrrSchema, last_snapshot_id: i64, deletes_buffer: &WriteBuffer) -> Result<i64, iceberg::Error> {
+        tracing::info!("!!!!!!!!!!!!!!!!!!!!!!!! Trying to read Iceberg Metadata !!!!!!!!!!!!!!!!!!!!!!!");
         let lib_metadata = match load_table_metadata(
             &"default".to_string(),
             table_name,
             last_snapshot_id
         ).await {
             Ok(m) => m,
-            Err(_) => panic!("nope"),
+            Err(e) => {
+                let error = format!("{}", e);
+                tracing::info!("Iceberg Metadata load failed: {}", error);
+                return Err(e)
+            },
         };
-
         match API_SERVICE_CLIENT.iceberg_commit(
             table_name,
             &IcebergCommit {
@@ -389,7 +368,7 @@ impl CompactionCommand {
             }
         ).await {
             Ok(_) => (),
-            Err(e) => return Err(e)
+            Err(e) => return Err(iceberg::Error::new(iceberg::ErrorKind::DataInvalid, format!("Iceberg commit failed, {}", e))),
         };
 
         // Note: the Iceberg and Speedboat commits are done separately here and are
@@ -406,7 +385,7 @@ impl CompactionCommand {
             &"compact".to_string(),
         ).await {
             Ok(_) => (),
-            Err(e) => panic!("oh no = {}", e),
+            Err(e) => return Err(iceberg::Error::new(iceberg::ErrorKind::DataInvalid, format!("Iceberg commit failed, {}", e))),
         };
 
         return Ok(lib_metadata.snapshot_id)
@@ -490,6 +469,7 @@ impl Command for CompactionCommand {
 
                 old_snapshot_id
             } else {
+                tracing::info!("!!!!!!!!!!!!!!!!!!!! Compacting to Iceberg !!!!!!!!!!!!!!!!!!!!!!!");
                 // TODO: if nulls can come out there that probably means we need to intercept earlier
                 // in the pipeline to cast nulls to real types.
                 let null_fields = results_data_frame.schema().fields().iter()
@@ -511,7 +491,7 @@ impl Command for CompactionCommand {
                     &data,
                     &table,
                     &compactions[0]
-                ).await;
+                ).await.unwrap();
 
                 Self::do_iceberg_commit(
                     &table,
@@ -539,7 +519,7 @@ async fn compact_logs(command: Arc<dyn Command>) -> Result<i64, CompactionError>
 
 
 pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkItem)>, last_snapshot_id: i64) -> Result<i64, CompactionError> {
-    let new_last_snapshot_id = last_snapshot_id;
+    let mut new_last_snapshot_id = last_snapshot_id;
     for (table_name, work_item) in work_items.iter() {
         assert_eq!(work_item.iceberg_files.len(), 0, "Iceberg file compaction is not yet implemented");
 
@@ -568,8 +548,7 @@ pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkIt
             last_snapshot_id: last_snapshot_id,
         };
 
-        compact_logs(Arc::new(command)).await?;
-        // TODO: need to figure out the last snapshot stuff when iceberg is implemented
+        new_last_snapshot_id = compact_logs(Arc::new(command)).await?;
     }
    
     Ok(new_last_snapshot_id)
@@ -580,9 +559,9 @@ pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkIt
 mod tests {
     use std::io::BufReader;
     use std::sync::Arc;
-    use arrow_json::reader::infer_json_schema;
     use datafusion::arrow::array::RecordBatch;
     use datafusion::arrow::error::ArrowError;
+    use datafusion::parquet::data_type::AsBytes;
     use gotham::test::Server;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
@@ -590,6 +569,7 @@ mod tests {
     use iceberg::io::{
         FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY,
     };
+    use crate::elastic_search_storage_schema::{FullRecord, RecordInput, SpeedboatCommitBuilder};
     use crate::router::tests::TEST_SERVER;
     use super::list_all_tables;
 
@@ -644,25 +624,48 @@ mod tests {
     }
 
     async fn test_iceberg_compact_simple_worker() {
-        match drop_table(&"default".to_string(), &"logs".to_string()).await {
+        match drop_table(&"default".to_string(), &"simple".to_string()).await {
             Ok(_) => (),
             Err(_) => {
             }
         }
 
         let file_content = include_str!("../tests/data/logs.json");
-        let (schema, _) = infer_json_schema(BufReader::new(file_content.as_bytes()), None).unwrap();
-        let fixed_schema = CompactionCommand::fix_fields(&schema.fields);
-        let json = arrow_json::ReaderBuilder::new(Arc::new(fixed_schema)).build(BufReader::new(file_content.as_bytes())).unwrap();
+        let mut values = vec!();
+        for split_str in file_content.split("\n") {
+            if split_str.len() == 0 {
+                continue;
+            }
+            let parsed_val = match serde_json::from_str(split_str) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _error = format!("{}", e);
+                    panic!("oh no");
+                }
+            };
+            values.push(parsed_val)
+        }
+        let mut builder = SpeedboatCommitBuilder::new(&"simple".to_string());
+        let records = values.iter().map(|x|FullRecord::from_record(x).record_input).collect::<Vec<RecordInput>>();
+        for record in records.iter() {
+            builder.insert(record)
+        }
+        let (insert_buffer, _, _) = builder.build_buffers();
+        let json = arrow_json::ReaderBuilder::new(Arc::new(insert_buffer.schema().unwrap().to_arrow_schema())).build(BufReader::new(file_content.as_bytes())).unwrap();
         let batch = json.collect::<Result<Vec<RecordBatch>, ArrowError>>().unwrap();
 
-        CompactionCommand::update_iceberg(
+        match CompactionCommand::update_iceberg(
             &batch,
-            &"logs".to_string(),
+            &"simple".to_string(),
             &"thing1".to_string()
-        ).await;
+        ).await {
+            Ok(_) => (),
+            Err(e) => {
+                panic!("oh no = {}", e)
+            }
+        }
 
-        let metadata = match load_table_metadata(&"default".to_string(), &"logs".to_string(), -1).await {
+        let metadata = match load_table_metadata(&"default".to_string(), &"simple".to_string(), -1).await {
             Ok(m) => m,
             Err(e) => {
                 panic!("nope {}", e)
@@ -674,13 +677,80 @@ mod tests {
         assert_eq!(metadata.column_names.len(), 0);
         assert_eq!(metadata.column_stats.len(), 0);
 
-        match drop_table(&"default".to_string(), &"logs".to_string()).await {
+        match drop_table(&"default".to_string(), &"simple".to_string()).await {
             Ok(_) => (),
             Err(_) => {
             }
         }
     }
 
+    #[test]
+    fn test_iceberg_compact_okta() {
+        let test_server = &*TEST_SERVER;
+
+        test_server.run_future(test_iceberg_compact_okta_worker());
+    }
+
+    async fn test_iceberg_compact_okta_worker() {
+        match drop_table(&"default".to_string(), &"okta".to_string()).await {
+            Ok(_) => (),
+            Err(_) => {
+            }
+        }
+
+        let okta_1 = include_str!("../tests/data/okta_system_log_1.json").replace("\n", "");
+        let okta_2 = include_str!("../tests/data/okta_system_log_2.json").replace("\n", "");
+        let okta_3 = include_str!("../tests/data/okta_system_log_3.json").replace("\n", "");
+        let okta_4 = include_str!("../tests/data/okta_system_log_4.json").replace("\n", "");
+        let values = vec!(
+            serde_json::from_str::<serde_json::Value>(&okta_1).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&okta_2).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&okta_3).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&okta_4).unwrap(),
+        );
+        let mut builder = SpeedboatCommitBuilder::new(&"simple".to_string());
+        let records = values.iter().enumerate().map(|(id, x)|RecordInput::new(format!("id_{}", id), 1, x, None)).collect::<Vec<RecordInput>>();
+        for record in records.iter() {
+            builder.insert(record)
+        }
+        let (insert_buffer, _, _) = builder.build_buffers();
+        let insert_buffer_vec = insert_buffer.as_byte_vec();
+        let arrow_schema = insert_buffer.schema().unwrap().to_arrow_schema();
+        for field in arrow_schema.fields() {
+            println!("Field: {:?}", field);
+        }
+        let json = arrow_json::ReaderBuilder::new(Arc::new(arrow_schema)).build(BufReader::new(insert_buffer_vec.as_bytes())).unwrap();
+        let batch = json.collect::<Result<Vec<RecordBatch>, ArrowError>>().unwrap();
+
+        match CompactionCommand::update_iceberg(
+            &batch,
+            &"okta".to_string(),
+            &"thing1".to_string()
+        ).await {
+            Ok(_) => (),
+            Err(e) => {
+                panic!("oh no = {}", e)
+            }
+        }
+
+        let metadata = match load_table_metadata(&"default".to_string(), &"okta".to_string(), -1).await {
+            Ok(m) => m,
+            Err(e) => {
+                panic!("nope {}", e)
+            },
+        };
+
+        assert_eq!(metadata.files.len(), 1);
+        assert_eq!(metadata.compactions.len(), 1);
+        assert_eq!(metadata.column_names.len(), 0);
+        assert_eq!(metadata.column_stats.len(), 0);
+
+        match drop_table(&"default".to_string(), &"okta".to_string()).await {
+            Ok(_) => (),
+            Err(_) => {
+            }
+        }
+    }
 
     async fn test_s3_file_io_worker() {
         let file_io = FileIOBuilder::new("s3")

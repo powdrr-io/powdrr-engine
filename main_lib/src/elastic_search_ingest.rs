@@ -93,6 +93,16 @@ impl WriteBuffer {
     }
 
     #[cfg(test)]
+    pub(crate) fn as_byte_vec(&self) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        for line in self.lines.iter() {
+            buffer.extend(line.as_bytes());
+            buffer.push(b'\n');
+        }
+        buffer
+    }
+
+    #[cfg(test)]
     pub(crate) fn schema(&self) -> Option<PowdrrSchema> {
         self.schema.clone()
     }
@@ -764,7 +774,7 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
                                     ingest_result.get(&table_description.name)
                                 );
                             },
-                            Err(_) => return Err(IngestError{ message: "Serde error".to_string() })
+                            Err(e) => return Err(IngestError{ message: format!("Serde error doc: {}", e) })
                         }
                     },
                     IngestCommand::Update(u) => {
@@ -816,7 +826,7 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
                                 ingest_result.get(index).update(&updated_doc);
                                 ingest_result.get(index).delete(&RecordDelete::new(existing_doc.record_input.id(), existing_doc.seq_no, existing_doc.record_input.version()));
                             },
-                            Err(_) => return Err(IngestError{ message: "Serde error".to_string() })
+                            Err(e) => return Err(IngestError{ message: format!("Serde error doc: {}", e) })
                         }
                     }
                     _ => {
@@ -824,7 +834,7 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
                     },
                 }
             },
-            Err(_) => return Err(IngestError{ message: "Serde error".to_string() })
+            Err(e) => return Err(IngestError{ message: format!("Serde error command: {}", e) })
         }
     }
 

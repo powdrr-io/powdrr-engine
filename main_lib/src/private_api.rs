@@ -134,7 +134,7 @@ async fn determine_required_files(invocation: &PrivateSqlInvocation, index: u64,
     Ok(RequiredFiles {
         table_schema: table_metadata.schema.clone(),
         iceberg_files: filtered_iceberg_files.to_vec(),
-        iceberg_file_extensions: filtered_iceberg_files.iter().map(|_|vec!()).collect(),
+        iceberg_file_extensions: filtered_iceberg_files.iter().map(|f|get_extension_files(invocation, &f.file_path)).collect(),
         speedboat_files: filtered_speedboat_files.to_vec(),
         speedboat_file_extensions: filtered_speedboat_files.iter().map(|f|get_extension_files(invocation, &f.file_path)).collect(),
         delete_files: table_metadata.deletes_metadata.map_or_else(|| vec!(), |d|d.files.clone()),
@@ -194,7 +194,7 @@ async fn ensure_loaded(
 
     data_access::reserve(&new_local_name, total_size, extension_file_names.clone()).await;
     // After this, on error we need to release, on OK we do not release
-    
+
     match load_file_as_table(&new_local_name, file_path, parquet, schema.map(|s|s.to_arrow_schema())).await {
         Err(e) => {
             data_access::release(&new_local_name).await;
@@ -224,7 +224,9 @@ async fn execute_sql(sql_template: &String, local_name: &String, deletes_local_n
     let final_sql = sql_template.replace("{target_table}", local_name).replace("{deletes_table}", deletes_local_name);
     let results = match data_access::execute_sql(&final_sql).await {
         Ok(df) => df,
-        Err(e) => return log_err(e),
+        Err(e) => {
+            return log_err(e)
+        },
     };
     match results.collect().await {
         Ok(r) => Ok(r),

@@ -1,4 +1,5 @@
 use std::{path::Path, sync::Arc};
+use std::time::Duration;
 use datafusion::{arrow::array::RecordBatch, error::DataFusionError, prelude::{DataFrame, NdJsonReadOptions, ParquetReadOptions, SessionContext}};
 use datafusion::arrow::datatypes::Schema;
 use datafusion::common::HashMap;
@@ -486,10 +487,39 @@ pub(crate) async fn load_memtable_with_name(result_table_name: &String, records:
 }
 
 
+const NUM_TRIES: u32 = 4;
+
+
 pub(crate) async fn execute_sql(sql: &String) -> Result<DataFrame, DataFusionError> {
     assert!(!sql.to_lowercase().contains("create table"), "Use the create_table function instead");
+    assert!(!sql.to_lowercase().contains("create external table"), "Use the create_table function instead");
     assert!(!sql.to_lowercase().contains("drop table"), "Use the drop function instead");
-    private_execute_sql(sql).await
+    for try_num in 1..=NUM_TRIES {
+        match private_execute_sql(sql).await {
+            Ok(df) => return Ok(df),
+            Err(e) => {
+                if try_num == NUM_TRIES {
+                    return Err(e)
+                } else {
+                    match e {
+                        // The metadata tracking means that in normal operation we'll never ask for an S3 object
+                        // that we don't have a record of. Therefore most likely if there is an issue
+                        // fetching an object it is some eventually consistency or rate limiting issue.
+                        // We'll do some exponential backoff and hope that the issue resolves itself.
+                        DataFusionError::ParquetError(_) => {
+                            tokio::time::sleep(Duration::from_millis(3_u64.pow(try_num))).await;
+                        }
+                        DataFusionError::ObjectStore(_) => {
+                            tokio::time::sleep(Duration::from_millis(3_u64.pow(try_num))).await;
+                        }
+                        _ => return Err(e)
+                    }
+                }
+            }
+        }
+    }
+    // Unreachable
+    panic!("Should not reach this point");
 }
 
 

@@ -129,50 +129,29 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
     };
     created_tables.push(format!("{new_local_name}_joined"));
 
+    let joined_table = match execute_sql(&format!("SELECT * FROM {new_local_name}_joined").to_string()).await {
+        Err(e) => {
+            drop_all(&created_tables).await;
+            return Err(IndexError::from(e))
+        },
+        Ok(tft) => tft,
+    };
     if target_file_path.starts_with("s3:") {
-        let joined_table = match execute_sql(&format!("SELECT * FROM {new_local_name}_joined").to_string()).await {
-            Err(e) => {
-                drop_all(&created_tables).await;
-                return Err(IndexError::from(e))
-            },
-            Ok(tft) => tft,
-        }; 
-
-        match joined_table.write_parquet(
-            target_file_path,
-            DataFrameWriteOptions::new().with_single_file_output(true),
-            None).await {
-            Err(e) => {
-                drop_all(&created_tables).await;
-                return Err(IndexError::from(e))
-            },
-            _ => (),
-        };
-    } else {
-        let joined_table = match execute_sql(&format!("SELECT * FROM {new_local_name}_joined").to_string()).await {
-            Err(e) => {
-                drop_all(&created_tables).await;
-                return Err(IndexError::from(e))
-            },
-            Ok(tft) => tft,
-        }; 
-        
-        match joined_table.write_parquet(
-            target_file_path,
-            DataFrameWriteOptions::new().with_single_file_output(true),
-            None
-        ).await {
-            Err(e) => {
-                drop_all(&created_tables).await;
-                return Err(IndexError::from(e))
-            },
-            _ => (),
-        };
-
+        tracing::info!("writing index parquet to s3");
     }
+
+    match joined_table.write_parquet(
+        target_file_path,
+        DataFrameWriteOptions::new().with_single_file_output(true),
+        None).await {
+        Err(e) => {
+            drop_all(&created_tables).await;
+            return Err(IndexError::from(e))
+        },
+        _ => (),
+    };
     drop_all(&created_tables).await;
     Ok(())
-
 }
 
 pub(crate) async fn create_index_jsonl(file_path: &String, doc_id_field_name: &String, schema: &PowdrrSchema) -> Result<Option<String>, IndexError> {
@@ -248,7 +227,7 @@ pub(crate) async fn create_index(table_metadata: &TableMetadataCheckpoint) -> Re
                 extension: "es".to_string(),
                 checkpoint_id: table_metadata.checkpoint_id.clone(),
                 partial_metadata: ExtensionMetadata {
-                    files: files,
+                    files,
                 },
             }
         ).await {
@@ -262,8 +241,6 @@ pub(crate) async fn create_index(table_metadata: &TableMetadataCheckpoint) -> Re
 
 pub(crate) async fn create_index_inner(table_metadata: &TableMetadataCheckpoint) -> Result<Vec<ExtensionFileMetadata>, IndexError> {
     let mut files: Vec<ExtensionFileMetadata> = vec!();
-
-    // TODO: does just "_id" work for everything?
 
     match &table_metadata.iceberg_metadata {
         Some(im) => {

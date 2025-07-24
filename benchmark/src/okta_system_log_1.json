@@ -1,6 +1,7 @@
 {
+  "orgId": "{org_id}",
   "uuid": "{unique_id}",
-  "published": "2024-07-12T21:55:00.000Z",
+  "published": "{published}",
   "eventType": "user.session.start",
   "version": "1.0",
   "displayMessage": "User login to Okta",
@@ -36,7 +37,7 @@
     "reason": null
   },
   "actor": {
-    "id": "00u1a1a1a1a1a1a1a1a1",
+    "id": "{user_id}",
     "type": "User",
     "alternateId": "john.doe@example.com",
     "displayName": "John Doe",
