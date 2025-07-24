@@ -477,7 +477,7 @@ pub(crate) fn write_to_file(buffer: &WriteBuffer, index: &String, label: &String
     // TODO: need real paths into S3
     let file_path = format!("tests/data/ingest/{}-{}-{}.json", label, index, IdInstance::next_id().to_string());
     let write_to_file_result = buffer.write_to_file(&file_path);
-    tracing::info!("Ingest: op {} on table {} wrote {} records", label, index, buffer.num_records());
+    //tracing::info!("Ingest: op {} on table {} wrote {} records", label, index, buffer.num_records());
 
     match write_to_file_result {
         Ok(_) => (),
