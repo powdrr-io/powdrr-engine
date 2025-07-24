@@ -61,19 +61,22 @@ pub fn test_v1_set_testing_mode(state: State) -> Pin<Box<HandlerFuture>> {
     }.boxed()
 }
 
-
 #[allow(warnings)]
-pub(crate) async fn do_all_available_work() -> () {
+pub(crate) async fn do_all_available_extension_work(extensions: &Vec<String>) -> () {
     loop {
         let mut work_done = false;
         // We keep track of this to see what all iceberg snapshots we should look through to
         // see what types of compactions have happened.
         let mut last_iceberg_snapshot_id: i64 = 0;
 
+        tracing::info!("Checking for indexing work");
         let index_work = match API_SERVICE_CLIENT.get_extension_work_items(&"es".to_string()).await {
             Ok(work) => work,
             Err(_) => panic!("oh no"),
         };
+        tracing::info!("Doing indexing work");
+
+        // TODO: probably need to parallel iter here
         for table_metadata in index_work.iter() {
             work_done = true;
             match create_index(&table_metadata).await {
@@ -81,11 +84,27 @@ pub(crate) async fn do_all_available_work() -> () {
                 Err(_) => panic!("Need some real error handling some day"),
             }
         }
+        tracing::info!("Done with indexing work");
 
+        if !work_done {
+            break;
+        }            
+    }    
+}
+
+pub(crate) async fn do_all_available_compaction_work(start_snapshot_id: i64) -> i64 {
+    // We keep track of snapshot id to see what all iceberg snapshots we should look through to
+    // see what types of compactions have happened.
+    let mut last_iceberg_snapshot_id: i64 = start_snapshot_id;
+    loop {
+        let mut work_done = false;
+
+        tracing::info!("Checking for compaction work");
         let compact_work = match API_SERVICE_CLIENT.get_compaction_work_items().await {
             Ok(work) => work,
             Err(_) => panic!("oh no"),
         };
+        tracing::info!("Doing compaction work");
         if compact_work.len() > 0 {
             work_done = true;
             match perform_compaction(compact_work, last_iceberg_snapshot_id).await {
@@ -96,28 +115,47 @@ pub(crate) async fn do_all_available_work() -> () {
                 },
             }
         }
+        tracing::info!("Done with compaction work");
 
         if !work_done {
             break;
-        }            
-    }    
+        }
+    }
+    last_iceberg_snapshot_id
 }
 
 
-fn do_work_for_forever(wait_time_ms: u64) -> impl Future<Output = ()> {
+fn do_extension_work_for_forever(extensions: Vec<String>, wait_time_ms: u64) -> impl Future<Output = ()> {
     async move {
         loop {
-            do_all_available_work().await;
+            tracing::info!("!!!!!!!!!!!!!!!!!!!! Doing extension work !!!!!!!!!!!!!!!!!!!!!!!");
+            do_all_available_extension_work(&extensions).await;
+            tracing::info!("!!!!!!!!!!!!!!!!!!!! Sleeping extension work !!!!!!!!!!!!!!!!!!!!!!!");
             tokio::time::sleep(Duration::from_millis(wait_time_ms)).await;
         }
     }
 }
 
 
+fn do_compaction_work_for_forever(wait_time_ms: u64) -> impl Future<Output = ()> {
+    async move {
+        let mut last_iceberg_snapshot_id: i64 = -1;
+        loop {
+            tracing::info!("!!!!!!!!!!!!!!!!!!!! Doing compaction work !!!!!!!!!!!!!!!!!!!!!!!");
+            last_iceberg_snapshot_id = do_all_available_compaction_work(last_iceberg_snapshot_id).await;
+            tracing::info!("!!!!!!!!!!!!!!!!!!!! Sleeping compaction work !!!!!!!!!!!!!!!!!!!!!!!");
+            tokio::time::sleep(Duration::from_millis(wait_time_ms)).await;
+        }
+    }
+}
+
+
+
 pub fn test_v1_set_testing_processing_mode(state: State) -> Pin<Box<HandlerFuture>> {
     async {
         API_SERVICE_CLIENT.set_testing_mode(false).await;
-        tokio::spawn(do_work_for_forever(1000));
+        tokio::spawn(do_extension_work_for_forever(vec!("es".to_string()), 1000));
+        tokio::spawn(do_compaction_work_for_forever(1000));
         let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "Ok");
         Ok((state, res))        
     }.boxed()
@@ -126,7 +164,8 @@ pub fn test_v1_set_testing_processing_mode(state: State) -> Pin<Box<HandlerFutur
 
 pub fn test_v1_process_work(state: State) -> Pin<Box<HandlerFuture>> {
     async {
-        do_all_available_work().await;
+        do_all_available_extension_work(&vec!("es".to_string())).await;
+        do_all_available_compaction_work(-1).await;
         let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "Ok");
         Ok((state, res))        
     }.boxed()

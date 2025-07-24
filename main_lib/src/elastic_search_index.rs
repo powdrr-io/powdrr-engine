@@ -136,9 +136,6 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
         },
         Ok(tft) => tft,
     };
-    if target_file_path.starts_with("s3:") {
-        tracing::info!("writing index parquet to s3");
-    }
 
     match joined_table.write_parquet(
         target_file_path,

@@ -513,7 +513,9 @@ impl Command for CompactionCommand {
 
 
 async fn compact_logs(command: Arc<dyn Command>) -> Result<i64, CompactionError>{
+    tracing::info!("!!!!!!!!!!!!!!!!!!!! Compacting Start !!!!!!!!!!!!!!!!!!!!!!!");
     let response = execute_command(CommandContext{}, command).await;
+    tracing::info!("!!!!!!!!!!!!!!!!!!!! Compacting End !!!!!!!!!!!!!!!!!!!!!!!");
     Ok(response.body.parse::<i64>().unwrap())
 }
 
