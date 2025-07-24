@@ -324,7 +324,7 @@ mod tests {
         assert_eq!(insert_buffer.num_records(), 2);
         assert!(insert_buffer.schema().is_some());
         let schema = insert_buffer.schema().as_ref().unwrap().clone();
-        assert_eq!(schema.fields.len(), 11);
+        assert_eq!(schema.fields.len(), 10);
         let schema_map = schema.to_map();
         let source_field = schema_map.get("_source").unwrap();
         assert_eq!(source_field.data_type, PowdrrDataType::String);

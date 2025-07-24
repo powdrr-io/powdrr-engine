@@ -224,11 +224,12 @@ pub(crate) async fn result_to_record_batch(result: Vec<Vec<u8>>) -> Vec<RecordBa
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
     use crate::elastic_search_common::create_denormalized_value;
 
     #[test]
     fn test_denormalized() {
-        let test_val = r#"{"A":{"B":null,"C":"NOT NULL"}}"#;
+        let test_val = r#"{"A":{"A":null,"B":4,"C":"NOT NULL","D":[1,2,3]}}"#;
 
         let parsed_val = serde_json::from_str::<serde_json::Value>(test_val).unwrap();
 
@@ -237,7 +238,7 @@ mod tests {
 
         let denormalized_val = create_denormalized_value(&parsed_val);
         assert_eq!(denormalized_val.as_object().unwrap().len(), 2);
-        assert_eq!(denormalized_val.as_object().unwrap().get("A_B").unwrap(), &serde_json::Value::Null);
+        assert_eq!(denormalized_val.as_object().unwrap().get("A_B").unwrap(), &json!(4));
         assert_eq!(denormalized_val.as_object().unwrap().get("A_C").unwrap(), &serde_json::Value::String("NOT NULL".to_string()));
         let denormalized_val_str = serde_json::to_string(&denormalized_val).unwrap();
         assert!(denormalized_val_str.contains("A_B"));

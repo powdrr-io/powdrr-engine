@@ -299,7 +299,6 @@ impl CompactionCommand {
             match data_file_writer.write(batch.clone()).await {
                 Ok(_) => (),
                 Err(e) => {
-                    let _backtrace = format!("{:?}", e.backtrace());
                     return Err(e)
                 }
             }
@@ -307,8 +306,6 @@ impl CompactionCommand {
         let data_files = match data_file_writer.close().await {
             Ok(df) => df,
             Err(e) => {
-                let error = format!("{}", e);
-                println!("{}", error);
                 return Err(e)
             }
         };
@@ -327,8 +324,7 @@ impl CompactionCommand {
         let converted_schema = match arrow_schema_to_schema(&data[0].schema()) {
             Ok(s) => s,
             Err(e) => {
-                let error = format!("{}", e);
-                return Err(iceberg::Error::new(iceberg::ErrorKind::DataInvalid, error))
+                return Err(e)
             },
         };
 
@@ -658,11 +654,16 @@ mod tests {
         let json = arrow_json::ReaderBuilder::new(Arc::new(insert_buffer.schema().unwrap().to_arrow_schema())).build(BufReader::new(file_content.as_bytes())).unwrap();
         let batch = json.collect::<Result<Vec<RecordBatch>, ArrowError>>().unwrap();
 
-        CompactionCommand::update_iceberg(
+        match CompactionCommand::update_iceberg(
             &batch,
             &"simple".to_string(),
             &"thing1".to_string()
-        ).await;
+        ).await {
+            Ok(_) => (),
+            Err(e) => {
+                panic!("oh no = {}", e)
+            }
+        }
 
         let metadata = match load_table_metadata(&"default".to_string(), &"simple".to_string(), -1).await {
             Ok(m) => m,
@@ -721,11 +722,16 @@ mod tests {
         let json = arrow_json::ReaderBuilder::new(Arc::new(arrow_schema)).build(BufReader::new(insert_buffer_vec.as_bytes())).unwrap();
         let batch = json.collect::<Result<Vec<RecordBatch>, ArrowError>>().unwrap();
 
-        CompactionCommand::update_iceberg(
+        match CompactionCommand::update_iceberg(
             &batch,
             &"okta".to_string(),
             &"thing1".to_string()
-        ).await;
+        ).await {
+            Ok(_) => (),
+            Err(e) => {
+                panic!("oh no = {}", e)
+            }
+        }
 
         let metadata = match load_table_metadata(&"default".to_string(), &"okta".to_string(), -1).await {
             Ok(m) => m,
