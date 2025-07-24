@@ -1,6 +1,7 @@
 use std::{future::Future, pin::Pin, time::Duration};
 
 use futures::FutureExt;
+use futures_util::future::{join_all, try_join_all};
 use gotham::{handler::HandlerFuture, helpers::http::response::create_response, hyper::{body, Body, StatusCode}, mime, state::{FromState, State}};
 use serde::{Deserialize, Serialize};
 
@@ -69,22 +70,16 @@ pub(crate) async fn do_all_available_extension_work(extensions: &Vec<String>) ->
         // see what types of compactions have happened.
         let mut last_iceberg_snapshot_id: i64 = 0;
 
-        tracing::info!("Checking for indexing work");
         let index_work = match API_SERVICE_CLIENT.get_extension_work_items(&"es".to_string()).await {
             Ok(work) => work,
             Err(_) => panic!("oh no"),
         };
-        tracing::info!("Doing indexing work");
 
-        // TODO: probably need to parallel iter here
-        for table_metadata in index_work.iter() {
-            work_done = true;
-            match create_index(&table_metadata).await {
-                Ok(_) => (),
-                Err(_) => panic!("Need some real error handling some day"),
-            }
+        work_done = index_work.len() > 0;
+        match try_join_all(index_work.iter().map(|table_metadata| create_index(table_metadata))).await {
+            Ok(_) => (),
+            Err(_) => panic!("Need some real error handling some day"),
         }
-        tracing::info!("Done with indexing work");
 
         if !work_done {
             break;
