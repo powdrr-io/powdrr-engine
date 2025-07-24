@@ -1248,7 +1248,11 @@ impl ApiServiceClient for TestApiServiceClient {
     async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, Box<dyn std::error::Error>> {
         let mut work_items = vec!();
         for (table_name, compaction) in self.compaction_work_items.iter_mut() {
-            if compaction.sizes.iter().sum::<u64>() > 10 * 1024 * 1024 {
+            tracing::info!("Compaction work item stats: size = {}, files = {}",
+                compaction.sizes.iter().sum::<u64>(),
+                compaction.speedboat_files.len()
+            );
+            if compaction.sizes.iter().sum::<u64>() > 10 * 1024 * 1024 || compaction.speedboat_files.len() > 200 {
                 work_items.push((table_name.clone(), compaction.clone()));
                 compaction.speedboat_files.clear();
                 compaction.sizes.clear();

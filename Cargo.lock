@@ -3960,8 +3960,12 @@ dependencies = [
 name = "powdrr-benchmark"
 version = "0.0.1"
 dependencies = [
+ "chrono",
  "futures",
+ "idgenerator",
+ "rand 0.9.1",
  "reqwest 0.12.22",
+ "serde_json",
  "tokio",
 ]
 

@@ -1,0 +1,143 @@
+{
+  "orgId": "{org_id}",
+  "uuid": "{unique_id}",
+  "published": "{published}",
+  "eventType": "application.lifecycle.grant",
+  "version": "1.0",
+  "displayMessage": "User assigned to application Salesforce",
+  "severity": "INFO",
+  "client": {
+    "id": null,
+    "ipAddress": "203.0.113.100",
+    "device": "Computer",
+    "os": "Windows",
+    "userAgent": {
+      "rawUserAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+      "os": "Windows",
+      "browser": "Chrome",
+      "version": "121.0.0.0"
+    },
+    "zone": {
+      "id": "zone_0oaz9b2b9b2b9b2b9",
+      "name": "Trusted IP Zone"
+    },
+    "geographicalContext": {
+      "city": "London",
+      "state": null,
+      "country": "United Kingdom",
+      "postalCode": "SW1A 0AA",
+      "geolocation": {
+        "lat": 51.5074,
+        "lon": 0.1278
+      }
+    }
+  },
+  "outcome": {
+    "result": "SUCCESS",
+    "reason": null
+  },
+  "actor": {
+    "id": "{user_id}",
+    "type": "User",
+    "alternateId": "security.admin@example.com",
+    "displayName": "Security Admin",
+    "credentialProvider": "OKTA",
+    "credentialType": "PASSWORD",
+    "detail": null
+  },
+  "authenticationContext": {
+    "authenticationStep": 1,
+    "externalSessionId": "lmno1234567890",
+    "credentialProvider": "OKTA",
+    "credentialType": "PASSWORD",
+    "issuer": {
+      "id": "0oa1a1a1a1a1a1a1a1a1",
+      "type": "Org",
+      "alternateId": "example.okta.com",
+      "displayName": "Example Okta Org",
+      "detail": null
+    },
+    "interface": null,
+    "authenticationSources": [],
+    "contextProperty": {}
+  },
+  "target": [
+    {
+      "id": "0oaf4e4e4e4e4e4e4e4e",
+      "type": "AppInstance",
+      "alternateId": "Salesforce Production",
+      "displayName": "Salesforce",
+      "detail": {
+        "appName": "salesforce",
+        "label": "Salesforce Production"
+      }
+    },
+    {
+      "id": "00u1d1d1d1d1d1d1d1d1",
+      "type": "User",
+      "alternateId": "charles.brown@example.com",
+      "displayName": "Charles Brown",
+      "detail": {
+        "firstName": "Charles",
+        "lastName": "Brown"
+      }
+    }
+  ],
+  "transaction": {
+    "id": "txn_0oaz9b2b9b2b9b2c1",
+    "type": "ADMIN_UI",
+    "detail": null
+  },
+  "request": {
+    "ipChain": [
+      {
+        "ip": "203.0.113.100",
+        "geographicalContext": {
+          "city": "London",
+          "state": null,
+          "country": "United Kingdom",
+          "postalCode": "SW1A 0AA",
+          "geolocation": {
+            "lat": 51.5074,
+            "lon": 0.1278
+          }
+        },
+        "version": "HTTP/1.1",
+        "header": {
+          "User-Agent": [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+          ],
+          "Accept-Language": [
+            "en-US,en;q=0.9,en-GB;q=0.8"
+          ]
+        }
+      }
+    ]
+  },
+  "debugContext": {
+    "debugData": {
+      "requestUri": "/api/v1/apps/0oaf4e4e4e4e4e4e4e4e/assignments",
+      "adminUserId": "00u3d3d3d3d3d3d3d3d3",
+      "targetUserId": "00u1d1d1d1d1d1d1d1d1",
+      "targetAppId": "0oaf4e4e4e4e4e4e4e4e",
+      "oktaRequestId": "okta_req_id_mnop3456789012",
+      "policyId": null,
+      "policyRuleId": null,
+      "policyResult": null,
+      "assignmentType": "USER_ASSIGNMENT"
+    }
+  },
+  "securityContext": {
+    "asNumber": 64514,
+    "asOrg": "GlobalNet Ltd.",
+    "isp": "GlobalNet Ltd.",
+    "domain": "example.co.uk",
+    "isProxy": false,
+    "isTor": false,
+    "threatEvent": {
+      "threatClassification": null,
+      "threatConfidence": null
+    }
+  },
+  "legacyEventType": "app.user.assignment.add"
+}

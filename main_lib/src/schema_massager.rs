@@ -69,19 +69,26 @@ impl PowdrrDataType {
         }
     }
 
-    pub fn to_arrow_type(&self) -> DataType {
+    pub fn to_arrow_type(&self, index: usize) -> (DataType, usize) {
         match self {
-            PowdrrDataType::Array(element_type) => DataType::List(Arc::new(Field::new("value".to_string(), element_type.to_arrow_type(), true))),
-            PowdrrDataType::Boolean => DataType::Boolean,
-            PowdrrDataType::Float => DataType::Float64,
-            PowdrrDataType::Integer => DataType::Int64,
-            PowdrrDataType::Object(schema) => {
-                DataType::Struct(Fields::from(
-                    schema.to_arrow_fields()
-                ))
+            PowdrrDataType::Array(element_type) => {
+                let (element_arrow_type, next_index) = element_type.to_arrow_type(index);
+                let element_arrow_field = Field::new("value".to_string(), element_arrow_type, true).with_metadata(
+                    HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), next_index.to_string())])
+                );
+                let arrow_type = DataType::List(Arc::new(element_arrow_field));
+                (arrow_type, next_index + 1)
             },
-            PowdrrDataType::Null => DataType::Null,
-            PowdrrDataType::String => DataType::Utf8,
+            PowdrrDataType::Boolean => (DataType::Boolean, index),
+            PowdrrDataType::Float => (DataType::Float64, index),
+            PowdrrDataType::Integer => (DataType::Int64, index),
+            PowdrrDataType::Object(schema) => {
+                let (arrow_fields, next_index) = schema.to_arrow_fields_internal(index);
+                let arrow_type = DataType::Struct(Fields::from(arrow_fields));
+                (arrow_type, next_index)
+            },
+            PowdrrDataType::Null => (DataType::Utf8, index),
+            PowdrrDataType::String => (DataType::Utf8, index),
         }
     }
 }
@@ -101,11 +108,12 @@ impl Display for PowdrrField {
 }
 
 impl PowdrrField {
-    fn to_arrow_field(&self, index: usize) -> Field {
+    fn to_arrow_field(&self, index: usize) -> (Field, usize) {
         assert!(index > 0, "These need to be 1-indexed, not 0-indexed");
-        Field::new(self.name.clone(), self.data_type.to_arrow_type(), true).with_metadata(
-            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), index.to_string())])
-        )
+        let (arrow_data_type, next_index) = self.data_type.to_arrow_type(index);
+        let arrow_field = Field::new(self.name.clone(), arrow_data_type, true).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), next_index.to_string())]));
+        (arrow_field, next_index + 1)
     }
 }
 
@@ -128,14 +136,26 @@ impl PowdrrSchema {
     }
 
     fn to_arrow_fields(&self) -> Vec<Field> {
-        let mut fields = self.fields.iter().enumerate().map(|(index, x)| x.to_arrow_field(index + 1)).collect::<Vec<Field>>();
+        let (fields, _) = self.to_arrow_fields_internal(1);
+        fields
+    }
+
+    fn to_arrow_fields_internal(&self, index: usize) -> (Vec<Field>, usize) {
+        let mut fields = vec!();
+        let mut next_field_id = index;
+        for field in self.fields.iter() {
+            let (arrow_field, returned_next_field_id) = field.to_arrow_field(next_field_id);
+            assert!(returned_next_field_id > next_field_id);
+            next_field_id = returned_next_field_id;
+            fields.push(arrow_field);
+        }
         fields.sort_by(|a, b| a.name().partial_cmp(b.name()).unwrap());
         for field in fields.iter() {
             if field.name() == "dude" {
                 assert_eq!(field.metadata().len(), 1);
             }
         }
-        fields
+        (fields, next_field_id)
     }
 
     pub fn to_arrow_schema(&self) -> Schema {
@@ -174,7 +194,7 @@ impl PowdrrSchema {
             let other_element_type = other_field.data_type.array_element_type();
             if other_element_type.is_null() {
                 None
-            } else if self_field.data_type.is_null() && !other_field.data_type.is_null() {
+            } else if self_element_type.is_null() && !other_element_type.is_null() {
                 // If our existing field is null, we can just replace it with the other field
                 Some(other_field.clone())
             } else if other_element_type.is_object() && self_element_type.is_object() {
@@ -328,7 +348,6 @@ impl SqlExpression {
             HashMap::from([("".to_string(), self.clone())])
         } else if target_schema_field.is_some() {
             self.explode_partial_ref(&"".to_string(), &original_schema_field.unwrap(), &target_schema_field.unwrap())
-            //self.populate_field(&denormalized_name, &original_schema_field.unwrap(), &target_schema_field.unwrap())
         } else {
             self.explode_full_ref(&"".to_string(), &original_schema_field.unwrap())
         }

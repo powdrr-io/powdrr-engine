@@ -90,7 +90,10 @@ pub(crate) async fn do_all_available_work() -> () {
             work_done = true;
             match perform_compaction(compact_work, last_iceberg_snapshot_id).await {
                 Ok(id) => { last_iceberg_snapshot_id = id; },
-                Err(_) => panic!("Need some real error handling some day"),
+                Err(e) => {
+                    tracing::error!("Error performing compaction: {:?}", e);
+                    // TODO: do something to trigger a retry of this compaction
+                },
             }
         }
 

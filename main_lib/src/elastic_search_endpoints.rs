@@ -680,7 +680,7 @@ pub fn es_delete_pit(state: State) -> Pin<Box<HandlerFuture>> {
 
 /// Handler function for `POST` and 'PUT' requests directed to `/_bulk'
 pub fn es_bulk_ingest(mut state: State) -> Pin<Box<HandlerFuture>> {
-    tracing::info!("es_bulk_ingest");
+    //tracing::info!("es_bulk_ingest");
     async move {
         let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
             Ok(vb) => vb,

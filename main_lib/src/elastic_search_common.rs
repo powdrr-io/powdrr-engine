@@ -183,6 +183,12 @@ fn create_denormalized_value_worker(target_map: &mut Map<String, Value>, prefix:
             Value::Object(_) => {
                 create_denormalized_value_worker(target_map, &format!("{}{}_", prefix, map_key), &map_value);
             },
+            Value::Array(_) => {
+                // We just skip all arrays for now.
+            },
+            Value::Null => {
+                // We just skip all nulls for now.
+            },
             _ => {
                 target_map.insert(format!("{}{}", prefix, map_key), map_value.clone());
             }
