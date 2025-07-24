@@ -1232,8 +1232,6 @@ impl ApiServiceClient for TestApiServiceClient {
     }
 
     async fn get_extension_work_items(&mut self, extension_type: &String) -> Result<Vec<TableMetadataCheckpoint>, Box<dyn std::error::Error>> {
-        Ok(vec!())
-        /*
         if extension_type == "es" {
             // TODO: priority by index? allow index filtering?
             let mut work_items = vec!();
@@ -1245,8 +1243,6 @@ impl ApiServiceClient for TestApiServiceClient {
         } else {
             Ok(vec!())
         }
-
-         */
     }
 
     async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, Box<dyn std::error::Error>> {
