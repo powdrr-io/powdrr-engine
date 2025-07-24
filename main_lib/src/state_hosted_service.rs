@@ -1252,7 +1252,7 @@ impl ApiServiceClient for TestApiServiceClient {
                 compaction.sizes.iter().sum::<u64>(),
                 compaction.speedboat_files.len()
             );
-            if compaction.sizes.iter().sum::<u64>() > 10 * 1024 * 1024 || compaction.speedboat_files.len() > 200 {
+            if compaction.sizes.iter().sum::<u64>() > 100 * 1024 * 1024 || compaction.speedboat_files.len() > 200 {
                 work_items.push((table_name.clone(), compaction.clone()));
                 compaction.speedboat_files.clear();
                 compaction.sizes.clear();

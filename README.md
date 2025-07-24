@@ -12,6 +12,12 @@ Some of the tests use shared data state so they must be run single threaded.
 RUST_BACKTRACE=1 cargo test -- --nocapture --test-threads=1
 ```
 
+Run flamegraph
+
+```
+CARGO_PROFILE_RELEASE_DEBUG=true cargo flamegraph
+```
+
 
 Run test script
 
@@ -344,4 +350,3 @@ http://es01:9200/_nodes/_local/stats
 http://es01:9200/_bulk?refresh=false&_source_includes=originId&require_alias=true
 {"update":{"_id":"task:reports:monitor","_index":".kibana_task_manager_8.7.1","if_seq_no":5411,"if_primary_term":19}}
 {"doc":{"task":{"runAt":"2025-05-15T02:26:58.128Z","state":"{}","schedule":{"interval":"3s"},"attempts":0,"status":"idle","startedAt":null,"retryAt":null,"ownerId":null,"params":"{}","taskType":"reports:monitor","traceparent":"00-e7d70636652eeb3c700b1f32893ea4d8-83855c04f24e0e61-00","scheduledAt":"2025-05-15T02:26:52.067Z"},"updated_at":"2025-05-15T02:26:55.271Z"}}
-

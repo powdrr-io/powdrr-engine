@@ -6,7 +6,7 @@ use idgenerator::{IdGeneratorOptions, IdInstance};
 use rand::TryRngCore;
 use rand::rngs::OsRng;
 
-const LINE_LIMIT: u64 = 1000000;
+const LINE_LIMIT: u64 = 100000;
 
 const EVENT_TEMPLATES: [&str; 4] = [
     include_str!("okta_system_log_1.json"),
@@ -160,15 +160,19 @@ async fn search() -> Result<(), std::io::Error> {
             Err(e) => panic!("Error: {}", e),
         };
         let time_after = current_time();
-        all_response_times.push((time_after - time_before).as_millis() as u128);
+        let latest_response_time = (time_after - time_before).as_millis() as u128;
+        all_response_times.push(latest_response_time);
 
         assert!(res.status().is_success());
         let response_val = serde_json::from_str::<serde_json::Value>(res.text().await.unwrap().as_str()).unwrap();
         let hits = response_val.as_object().unwrap().get("hits").unwrap().as_object().unwrap().get("total").unwrap().as_object().unwrap().get("value").unwrap().as_u64().unwrap();
         println!("Org Id = {}, User Id = {}, Hits = {}", org_id, user_id, hits);
+        println!("Search - latest response time: {} ms", latest_response_time);
         println!("Search - average response time: {} ms", all_response_times.iter().sum::<u128>() / all_response_times.len() as u128);
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        if latest_response_time < 20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }
 
