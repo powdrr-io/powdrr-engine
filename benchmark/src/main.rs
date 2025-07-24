@@ -1,12 +1,9 @@
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
 use idgenerator::{IdGeneratorOptions, IdInstance};
-use rand::prelude::ThreadRng;
-use rand::{Rng, TryRngCore};
+use rand::TryRngCore;
 use rand::rngs::OsRng;
 
 const LINE_LIMIT: u64 = 1000000;
@@ -145,7 +142,7 @@ const QUERY_TEMPLATE: &str = r#"
 async fn search() -> Result<(), std::io::Error> {
     let client = reqwest::Client::new();
 
-    let mut rng = OsRng{};
+    let mut rng = OsRng {};
     let mut all_response_times = vec!();
 
     loop {
@@ -173,8 +170,6 @@ async fn search() -> Result<(), std::io::Error> {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    //println!("Response: {}", res.text().await.unwrap());
-    Ok(())
 }
 
 
