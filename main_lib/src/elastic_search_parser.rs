@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use crate::data_access::execute_sql;
 use crate::elastic_search_commands::{to_serde_value, SqlCommand, UpdateByQueryCommand};
-use crate::elastic_search_common::ParseError;
+use crate::elastic_search_common::{CommandError, ParseError};
 use crate::elastic_search_datetime_parser;
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::elastic_search_responses::{AggregationResult, AverageAggregationResult, CardinalityAggregationResult, FilterAggregationResult, HistogramAggregationResult, RangeAggregationBucket, RangeAggregationResult, TermAggregationBucket, TermAggregationResult};
@@ -70,7 +70,7 @@ impl TermAggProcessor {
         }
     }
 
-    async fn create_buckets(schema: Option<PowdrrSchema>, table_name: &String, query: &SqlQuery) -> Vec<TermAggregationBucket> {
+    async fn create_buckets(schema: Option<PowdrrSchema>, table_name: &String, query: &SqlQuery) -> Result<Vec<TermAggregationBucket>, CommandError> {
         let final_sql = query.build_same(&schema.unwrap_or_else(|| TERM_AGG_SCHEMA.clone())).replace("{target_table}", table_name);
         let data_frame = match execute_sql(&final_sql).await {
             Ok(df) => df,
@@ -79,25 +79,25 @@ impl TermAggProcessor {
 
         assert_eq!(data_frame.schema().columns().len(), 2);
 
-        let (serde_values, _) = to_serde_value(&data_frame).await;
+        let serde_result = to_serde_value(&data_frame).await?;
 
-        serde_values.iter().map(|v| TermAggProcessor::create_aggregation_bucket(v)).collect::<Vec<TermAggregationBucket>>()
+        Ok(serde_result.values.iter().map(|v| TermAggProcessor::create_aggregation_bucket(v)).collect::<Vec<TermAggregationBucket>>())
     }
 
-    async fn process(&self, schema: Option<PowdrrSchema>, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
-        let child_aggs = process_aggregations(schema.clone(), subaggregations, table_name.clone()).await;
+    async fn process(&self, schema: Option<PowdrrSchema>, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> Result<AggregationResult, CommandError> {
+        let child_aggs = process_aggregations(schema.clone(), subaggregations, table_name.clone()).await?;
 
         let buckets = match &table_name {
-            Some(t) => TermAggProcessor::create_buckets(schema.clone(), t, &self.sql).await,
+            Some(t) => TermAggProcessor::create_buckets(schema.clone(), t, &self.sql).await?,
             None => vec!()
         };
 
-        AggregationResult::Terms(TermAggregationResult{
+        Ok(AggregationResult::Terms(TermAggregationResult{
             doc_count_error_upper_bound: 0,
             sum_other_doc_count: 0,
             buckets: buckets,
             aggs: child_aggs
-        })
+        }))
     }
 }
 
@@ -118,8 +118,8 @@ pub(crate) struct RangeAggProcessor {
 }
 
 impl RangeAggProcessor {
-    async fn create_aggregation_bucket(schema: Option<PowdrrSchema>, bucket_spec: &RangeAggBucket, table_name: Option<String>) -> RangeAggregationBucket {
-        let child_aggs = process_aggregations(schema.clone(), bucket_spec.subaggregations.clone(), table_name.clone()).await;
+    async fn create_aggregation_bucket(schema: Option<PowdrrSchema>, bucket_spec: &RangeAggBucket, table_name: Option<String>) -> Result<RangeAggregationBucket, CommandError> {
+        let child_aggs = process_aggregations(schema.clone(), bucket_spec.subaggregations.clone(), table_name.clone()).await?;
 
         let doc_count = match &table_name {
             Some(t) => {
@@ -131,14 +131,14 @@ impl RangeAggProcessor {
 
                 assert_eq!(data_frame.schema().columns().len(), 1);
 
-                let (serde_values, _) = to_serde_value(&data_frame).await;
+                let serde_result = to_serde_value(&data_frame).await?;
 
-                serde_values.get(0).unwrap().as_object().unwrap().get("cnt").unwrap().as_u64().unwrap()
+                serde_result.values.get(0).unwrap().as_object().unwrap().get("cnt").unwrap().as_u64().unwrap()
             },
             None => 0
         };
 
-        RangeAggregationBucket {
+        Ok(RangeAggregationBucket {
             key: bucket_spec.key.clone(),
             from: bucket_spec.from,
             from_as_string: bucket_spec.from_as_string.clone(),
@@ -146,26 +146,26 @@ impl RangeAggProcessor {
             to_as_string: bucket_spec.to_as_string.clone(),
             doc_count: doc_count,
             aggs: child_aggs,
-        }
+        })
     }
 
-    async fn create_buckets(&self, schema: Option<PowdrrSchema>, table_name: Option<String>) -> Vec<RangeAggregationBucket> {
+    async fn create_buckets(&self, schema: Option<PowdrrSchema>, table_name: Option<String>) -> Result<Vec<RangeAggregationBucket>, CommandError> {
         let mut buckets = vec!();
         for bucket_spec in self.buckets.iter() {
-            buckets.push(RangeAggProcessor::create_aggregation_bucket(schema.clone(), &bucket_spec, table_name.clone()).await)
+            buckets.push(RangeAggProcessor::create_aggregation_bucket(schema.clone(), &bucket_spec, table_name.clone()).await?)
         }
-        buckets
+        Ok(buckets)
     }
 
-    async fn process(&self, schema: Option<PowdrrSchema>, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
+    async fn process(&self, schema: Option<PowdrrSchema>, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> Result<AggregationResult, CommandError> {
         // The subaggregations should get passed into each bucket
         assert!(subaggregations.is_none());
 
-        let buckets = self.create_buckets(schema, table_name).await;
+        let buckets = self.create_buckets(schema, table_name).await?;
 
-        AggregationResult::Range(RangeAggregationResult{
+        Ok(AggregationResult::Range(RangeAggregationResult{
             buckets: buckets,
-        })
+        }))
     }
 }
 
@@ -178,32 +178,32 @@ pub(crate) struct AverageAggProcessor {
 }
 
 impl AverageAggProcessor {
-    async fn calculate_average(table_name: &String, query: &String) -> f64 {
+    async fn calculate_average(table_name: &String, query: &String) -> Result<f64, CommandError> {
         let final_sql = query.replace("{target_table}", table_name);
         let data_frame = match execute_sql(&final_sql).await {
             Ok(df) => df,
-            Err(_) => panic!("nope")
+            Err(e) => return Err(CommandError{ message: format!("{}", e)})
         };
 
         assert_eq!(data_frame.schema().columns().len(), 1);
 
-        let (serde_values, _) = to_serde_value(&data_frame).await;
+        let serde_result = to_serde_value(&data_frame).await?;
 
-        serde_values.get(0).unwrap().as_object().unwrap().get("avg").unwrap().as_f64().unwrap()
+        Ok(serde_result.values.get(0).unwrap().as_object().unwrap().get("avg").unwrap().as_f64().unwrap())
     }
 
-    async fn process(&self, schema: Option<PowdrrSchema>, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
-        let child_aggs = process_aggregations(schema.clone(), subaggregations, table_name.clone()).await;
+    async fn process(&self, schema: Option<PowdrrSchema>, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> Result<AggregationResult, CommandError> {
+        let child_aggs = process_aggregations(schema.clone(), subaggregations, table_name.clone()).await?;
 
         let avg = match &table_name {
-            Some(t) => AverageAggProcessor::calculate_average(t, &self.sql.build_same(&schema.unwrap_or_else(||AVERAGE_AGG_SCHEMA.clone()))).await,
+            Some(t) => AverageAggProcessor::calculate_average(t, &self.sql.build_same(&schema.unwrap_or_else(||AVERAGE_AGG_SCHEMA.clone()))).await?,
             None => 0.0
         };
 
-        AggregationResult::Average(AverageAggregationResult{
+        Ok(AggregationResult::Average(AverageAggregationResult{
             value: avg,
             aggs: child_aggs,
-        })
+        }))
     }
 }
 
@@ -213,31 +213,31 @@ pub(crate) struct CardinalityAggProcessor {
 }
 
 impl CardinalityAggProcessor {
-    async fn calculate_cardinality(table_name: &String, query: &String) -> u64 {
+    async fn calculate_cardinality(table_name: &String, query: &String) -> Result<u64, CommandError> {
         let final_sql = query.replace("{target_table}", table_name);
         let data_frame = match execute_sql(&final_sql).await {
             Ok(df) => df,
-            Err(_) => panic!("nope")
+            Err(e) => return Err(CommandError{ message: format!("{}", e)})
         };
 
         assert_eq!(data_frame.schema().columns().len(), 1);
 
-        let (serde_values, _) = to_serde_value(&data_frame).await;
+        let serde_result = to_serde_value(&data_frame).await?;
 
-        serde_values.get(0).unwrap().as_object().unwrap().get("type_count").unwrap().as_u64().unwrap()
+        Ok(serde_result.values.get(0).unwrap().as_object().unwrap().get("type_count").unwrap().as_u64().unwrap())
     }
 
-    async fn process(&self, schema: Option<PowdrrSchema>, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
-        let child_aggs = process_aggregations(schema.clone(), subaggregations, table_name.clone()).await;
+    async fn process(&self, schema: Option<PowdrrSchema>, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> Result<AggregationResult, CommandError> {
+        let child_aggs = process_aggregations(schema.clone(), subaggregations, table_name.clone()).await?;
 
         let value = match &table_name {
-            Some(t) => CardinalityAggProcessor::calculate_cardinality(t, &self.sql.build_same(&schema.unwrap_or_else(||CARDINALITY_AGG_SCHEMA.clone()))).await,
+            Some(t) => CardinalityAggProcessor::calculate_cardinality(t, &self.sql.build_same(&schema.unwrap_or_else(||CARDINALITY_AGG_SCHEMA.clone()))).await?,
             None => 0
         };
-        AggregationResult::Cardinality(CardinalityAggregationResult{
+        Ok(AggregationResult::Cardinality(CardinalityAggregationResult{
             value: value,
             aggs: child_aggs,
-        })
+        }))
     }
 }
 
@@ -254,11 +254,11 @@ pub(crate) struct DateHistogramAggProcessor {
 }
 
 impl DateHistogramAggProcessor {
-    async fn process(&self, _schema: Option<PowdrrSchema>, _table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
+    async fn process(&self, _schema: Option<PowdrrSchema>, _table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> Result<AggregationResult, CommandError> {
         assert!(subaggregations.is_none());
-        AggregationResult::Histogram(HistogramAggregationResult{
+        Ok(AggregationResult::Histogram(HistogramAggregationResult{
             buckets: vec!()
-        })
+        }))
     }
 }
 
@@ -268,23 +268,23 @@ pub(crate) struct FilterAggProcessor {
 }
 
 impl FilterAggProcessor {
-    async fn process(&self, schema: Option<PowdrrSchema>, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
+    async fn process(&self, schema: Option<PowdrrSchema>, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> Result<AggregationResult, CommandError> {
         let doc_count = match &table_name {
             Some(t) => {
                 let final_sql = self.sql.build_same(&schema.clone().unwrap_or_else(||FILTER_AGG_SCHEMA.clone())).replace("{target_table}", t);
                 let data_frame = execute_sql(&final_sql).await.unwrap();
                 assert_eq!(data_frame.schema().columns().len(), 1);
-                let (serde_values, _) = to_serde_value(&data_frame).await;
-                serde_values.get(0).unwrap().as_object().unwrap().get("cnt").unwrap().as_u64().unwrap()
+                let serde_result = to_serde_value(&data_frame).await?;
+                serde_result.values.get(0).unwrap().as_object().unwrap().get("cnt").unwrap().as_u64().unwrap()
             },
             None => 0
         };
-        let child_aggs = process_aggregations(schema.clone(), subaggregations, table_name.clone()).await;
+        let child_aggs = process_aggregations(schema.clone(), subaggregations, table_name.clone()).await?;
 
-        AggregationResult::Filter(FilterAggregationResult {
+        Ok(AggregationResult::Filter(FilterAggregationResult {
             doc_count: doc_count,
             aggs: child_aggs
-        })
+        }))
     }
 }
 
@@ -293,14 +293,14 @@ pub(crate) struct MissingAggProcessor {
 }
 
 impl MissingAggProcessor {
-    async fn process(&self, schema: Option<PowdrrSchema>, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> AggregationResult {
-        let child_aggs = process_aggregations(schema.clone(), subaggregations, table_name).await;
+    async fn process(&self, schema: Option<PowdrrSchema>, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> Result<AggregationResult, CommandError> {
+        let child_aggs = process_aggregations(schema.clone(), subaggregations, table_name).await?;
 
         // TODO: we need to find doc that are actually missing values
-        AggregationResult::Filter(FilterAggregationResult {
+        Ok(AggregationResult::Filter(FilterAggregationResult {
             doc_count: 0,
             aggs: child_aggs
-        })
+        }))
     }
 }
 
@@ -323,7 +323,7 @@ pub(crate) struct Aggregation {
     pub subaggregations: Option<Vec<Aggregation>>
 }
 
-pub(crate) async fn process_aggregation(schema: Option<PowdrrSchema>, aggregation: &Aggregation, table_name: Option<String>) -> AggregationResult {
+pub(crate) async fn process_aggregation(schema: Option<PowdrrSchema>, aggregation: &Aggregation, table_name: Option<String>) -> Result<AggregationResult, CommandError> {
     match &aggregation.processor {
         AggProcessor::Average(average) => {
             average.process(schema, table_name, aggregation.subaggregations.clone()).await
@@ -349,14 +349,14 @@ pub(crate) async fn process_aggregation(schema: Option<PowdrrSchema>, aggregatio
     }
 }
 
-pub(crate) async fn process_aggregations(schema: Option<PowdrrSchema>, aggregations: Option<Vec<Aggregation>>, table_name: Option<String>) -> HashMap<String, AggregationResult> {
+pub(crate) async fn process_aggregations(schema: Option<PowdrrSchema>, aggregations: Option<Vec<Aggregation>>, table_name: Option<String>) -> Result<HashMap<String, AggregationResult>, CommandError> {
     let mut results = HashMap::new();
     if aggregations.is_some() {
         for aggregation in aggregations.unwrap() {
-            results.insert(aggregation.name.clone(), Box::pin(process_aggregation(schema.clone(), &aggregation, table_name.clone())).await);
+            results.insert(aggregation.name.clone(), Box::pin(process_aggregation(schema.clone(), &aggregation, table_name.clone())).await?);
         }
     }
-    results
+    Ok(results)
 }
 
 

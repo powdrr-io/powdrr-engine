@@ -17,7 +17,7 @@ use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::{mpsc, oneshot};
 use uuid_b64::UuidB64;
 
-use crate::elastic_search_commands::{to_serde_value, LookupById};
+use crate::elastic_search_commands::{to_serde_value, LookupById, SerdeValueResult};
 use crate::elastic_search_common::{load_command_raw_result, CommandContext, ElasticSearchResponse, MIME_ES_JSON};
 use crate::elastic_search_responses::{BulkResult, ErrorDetails, OperationResult, Shards, SingleDocCreateFailedResult};
 use crate::data_access;
@@ -522,14 +522,7 @@ pub(crate) async fn commit_speedboat(table: &String, inserts_and_updates: &Write
 }
 
 
-struct ExistingDocs {
-    docs: Vec<Value>,
-    #[allow(dead_code)]
-    schema: Option<PowdrrSchema>
-}
-
-
-async fn get_existing_docs(index: &String, doc_ids: &Vec<String>) -> Result<ExistingDocs, IngestError> {
+async fn get_existing_docs(index: &String, doc_ids: &Vec<String>) -> Result<SerdeValueResult, IngestError> {
     let docs = match load_command_raw_result(CommandContext{}, Arc::new(LookupById::new(&index, &doc_ids))).await {
         Ok(lcrr) => match lcrr {
             Some(raw_table) => {
@@ -538,11 +531,11 @@ async fn get_existing_docs(index: &String, doc_ids: &Vec<String>) -> Result<Exis
                     Err(_) => panic!("weird")
                 };
 
-                let (docs, schema) = to_serde_value(&df).await;
+                let serde_result = to_serde_value(&df).await.map_err(|e|IngestError{ message: e.message.clone() })?;
                 data_access::drop(&raw_table).await;
-                ExistingDocs{ docs, schema }
+                serde_result
             },
-            None => ExistingDocs{ docs: vec!(), schema: None }
+            None => SerdeValueResult{ values: vec!(), schema: None }
         },
         Err(_) => panic!("weird")
     };
@@ -559,7 +552,7 @@ async fn create_single_worker(index: &String, doc_id: &String, payload: &String)
         Ok(valid_doc) => {
             let docs = get_existing_docs(&table_description.name, &vec!(doc_id.to_string())).await?;
             
-            if docs.docs.len() != 0 {
+            if docs.values.len() != 0 {
                 // TODO: get version from existing doc
                 let response = SingleDocCreateFailedResult {
                     error: ErrorDetails::single_cause(
@@ -642,12 +635,12 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
     let docs = get_existing_docs(&table_description.name, &vec!(doc_id.to_string())).await?;
 
     let mut buffer = SpeedboatCommitBuilder::new(&table_description.name);
-    if docs.docs.len() != 0 {
-        assert_eq!(docs.docs.len(), 1);
+    if docs.values.len() != 0 {
+        assert_eq!(docs.values.len(), 1);
         if update_request.doc.is_none() {
             todo!("What do we do here?")
         }
-        let mut existing_doc = FullRecord::from_record(&docs.docs[0]);
+        let mut existing_doc = FullRecord::from_record(&docs.values[0]);
         existing_doc.record_input.ensure_source();
         let mut updated_doc = RecordInput::new(
             existing_doc.record_input.id().clone(),
@@ -694,7 +687,7 @@ pub(crate) async fn delete(index: &String, doc_id: &String) -> Result<ElasticSea
     };
 
     let docs = get_existing_docs(&table_description.name, &vec!(doc_id.clone())).await?;
-    if docs.docs.len() == 0 {
+    if docs.values.len() == 0 {
         let result = OperationResult {
             _index: index.clone(),
             _id: doc_id.clone(),
@@ -713,8 +706,8 @@ pub(crate) async fn delete(index: &String, doc_id: &String) -> Result<ElasticSea
         return Ok(ElasticSearchResponse { status: StatusCode::NOT_FOUND, mime: mime::APPLICATION_JSON, body: serde_json::to_string(&result).unwrap(), headers: vec!() })
     }
     let mut buffer = SpeedboatCommitBuilder::new(&table_description.name);
-    let target_seq_no = docs.docs[0].get("_seq_no").unwrap().as_u64().unwrap();
-    let target_version = docs.docs[0].get("_version").unwrap().as_u64().unwrap();
+    let target_seq_no = docs.values[0].get("_seq_no").unwrap().as_u64().unwrap();
+    let target_version = docs.values[0].get("_version").unwrap().as_u64().unwrap();
     buffer.delete(&RecordDelete::new(doc_id, target_seq_no, target_version));
     let result = buffer.commit().await?;
     assert_eq!(result.operations.len(), 1);
@@ -800,7 +793,7 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
                             None => return Err(IngestError{ message: "Index does not exist".to_string() })
                         };
                         let existing_docs = get_existing_docs(&table_description.name, &vec!(u.update.id.unwrap())).await?;
-                        if existing_docs.docs.len() == 0 {
+                        if existing_docs.values.len() == 0 {
                             todo!("Need to handle this case")
                         }
                         let doc_str = match iterator.next() {
@@ -813,7 +806,7 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
                                 if update_request.doc.is_none() {
                                     todo!("What do we do here?")
                                 }
-                                let mut existing_doc = FullRecord::from_record(&existing_docs.docs[0]);
+                                let mut existing_doc = FullRecord::from_record(&existing_docs.values[0]);
                                 existing_doc.record_input.ensure_source();
 
                                 let mut updated_doc = RecordInput::new(
