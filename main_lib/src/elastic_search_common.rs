@@ -68,8 +68,15 @@ impl ElasticSearchResponse {
     }
 }
 
+pub struct CommandError {
+    pub message: String,
+}
 
-pub type ResultGeneratorFuture = dyn Future<Output = Result<ElasticSearchResponse, String>> + Send;
+unsafe impl Send for CommandError {}
+unsafe impl Sync for CommandError {}
+
+
+pub type ResultGeneratorFuture = dyn Future<Output = Result<ElasticSearchResponse, CommandError>> + Send;
 
 
 #[async_trait]

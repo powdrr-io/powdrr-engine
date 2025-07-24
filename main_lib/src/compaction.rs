@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use crate::{elastic_search_ingest, state_hosted_service::{CompactionCommit, API_SERVICE_CLIENT}};
 use crate::data_access::execute_sql;
 use crate::elastic_search_commands::to_serde_value;
-use crate::elastic_search_common::{execute_command, Command, CommandContext, ElasticSearchResponse, ResultGeneratorFuture};
+use crate::elastic_search_common::{execute_command, Command, CommandContext, CommandError, ElasticSearchResponse, ResultGeneratorFuture};
 use crate::elastic_search_ingest::WriteBuffer;
 use crate::schema_massager::{PowdrrSchema, SqlBuilder};
 use crate::state_hosted_service::{CompactionWorkItem, IcebergCommit, IcebergMetadata};
@@ -429,32 +429,32 @@ impl Command for CompactionCommand {
             };
             let remaining_deletes_data_frame = match execute_sql(&format!("select _dt_id_seq_no as _id_seq_no from {table_name} where _id is null and _dt_id_seq_no is not null")).await {
                 Ok(df) => df,
-                Err(_) => panic!("nope")
+                Err(e) => return Err(CommandError{ message: e.to_string() })
             };
             let results_data_frame = match execute_sql(&format!("select * from {table_name} where _id is not null and _dt_id_seq_no is null")).await {
                 Ok(df) => {
                     match df.drop_columns(&["_dt_id", "_dt_seq_no", "_dt_id_seq_no"]) {
                         Ok(df) => df,
-                        Err(_) => panic!("nope")
+                        Err(e) => return Err(CommandError{ message: e.to_string() })
                     }
                 },
-                Err(_) => panic!("nope")
+                Err(e) => return Err(CommandError{ message: e.to_string() })
             };
 
-            let (compacted_deletes, _) = to_serde_value(&remaining_deletes_data_frame).await;
-            let deletes_buffer = WriteBuffer::delete(compacted_deletes.iter().map(|x| serde_json::to_string(x).unwrap()).collect());
+            let deletes_serde_result = to_serde_value(&remaining_deletes_data_frame).await?;
+            let deletes_buffer = WriteBuffer::delete(deletes_serde_result.values.iter().map(|x| serde_json::to_string(x).unwrap()).collect());
 
             let results_count = match results_data_frame.clone().count().await {
                 Ok(c) => c,
-                Err(_) => panic!("nope")
+                Err(e) => return Err(CommandError{ message: e.to_string() })
             };
 
             let new_snapshot_id: i64 = if results_count < MIN_PARQUET_SIZE {
-                let (compacted_results, _) = to_serde_value(&results_data_frame).await;
+                let values_serde_result = to_serde_value(&results_data_frame).await?;
 
                 let result_buffer = WriteBuffer::insert_and_update(
                     schema,
-                    compacted_results.iter().map(|x| serde_json::to_string(x).unwrap()).collect()
+                    values_serde_result.values.iter().map(|x| serde_json::to_string(x).unwrap()).collect()
                 );
                 match elastic_search_ingest::commit_speedboat(
                     &table,
@@ -464,7 +464,7 @@ impl Command for CompactionCommand {
                     &"compact".to_string(),
                 ).await {
                     Ok(_) => (),
-                    Err(_) => panic!("nope"),
+                    Err(e) => return Err(CommandError{ message: e.message.clone() })
                 };
 
                 old_snapshot_id
@@ -478,12 +478,12 @@ impl Command for CompactionCommand {
                     .collect::<Vec<&str>>();
                 let non_null_results = match results_data_frame.clone().drop_columns(null_fields.as_slice()) {
                     Ok(df) => df,
-                    Err(_) => panic!("nope")
+                    Err(e) => return Err(CommandError{ message: e.to_string() })
                 };
 
                 let data = match non_null_results.collect().await {
                     Ok(d) => d,
-                    Err(_) => panic!("nope")
+                    Err(e) => return Err(CommandError{ message: e.to_string() })
                 };
 
                 assert_eq!(compactions.len(), 1);

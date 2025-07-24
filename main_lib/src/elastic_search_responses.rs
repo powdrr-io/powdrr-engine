@@ -263,6 +263,19 @@ impl QueryResultTotalComplex {
 }
 
 
+pub(crate) fn transient_error(message: &String) -> ElasticSearchResponse {
+    // TODO: probably pass in the error here, put traceback in debug logs
+    // TODO: come up with some kind of code to allow correlating back to the logs
+    tracing::error!("Transient error: {}", message);
+    ElasticSearchResponse {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        mime: mime::TEXT_PLAIN,
+        body: "An error occurred".to_string(),
+        headers: vec!()
+    }
+}
+
+
 impl QueryResults {
     pub fn empty(took: u32, num_shards: u32, aggregations: Option<HashMap<String, AggregationResult>>, total_hits_complex: bool) -> Self {
         let total_hits = match total_hits_complex {
