@@ -10,8 +10,8 @@ edition.workspace = true
 
 
 [dependencies]
-arrow-flight = "55.2"
-arrow-json = "55.2"
+arrow-flight = "55.1"
+arrow-json = "55.1"
 async-trait = "0.1.88"
 chrono = "0.4.41"
 datafusion = "47"
@@ -23,6 +23,7 @@ http = "0.2.12"
 iceberg = { path = "../../iceberg-rust/crates/iceberg" }
 iceberg-catalog-rest = { path = "../../iceberg-rust/crates/catalog/rest" }
 idgenerator = "2.0.0"
+liquid-cache-parquet = "0.1.7"
 lru-mem = "0.3.0"
 minijinja = "2.10.2"
 object_store = { version = "0.12.3", features = ["aws", "gcp", "azure", "http"] }
@@ -33,6 +34,7 @@ rustls-pemfile = "2.2.0"
 rustls-pki-types = "1.12.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
+tempfile = "3.20.0"
 tokio = { version = "1.0", features = ["rt-multi-thread"] }
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
@@ -40,4 +42,3 @@ ttl_cache = "0.5.1"
 url = "2.5.4"
 url-escape = "0.1.1"
 uuid-b64 = "0.2.0"
-

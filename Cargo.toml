@@ -5,7 +5,7 @@ members = [ "benchmark", "cli", "engine", "main_lib"]
 
 [workspace.package]
 version = "0.0.1"
-edition = "2021"
+edition = "2024"
 
 [profile.release]
 opt-level = 3
