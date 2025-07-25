@@ -27,4 +27,3 @@ mod state_leader;
 mod state_peers;
 mod test_api;
 mod util;
-mod object_store_cache;
