@@ -6,7 +6,7 @@ use idgenerator::{IdGeneratorOptions, IdInstance};
 use rand::TryRngCore;
 use rand::rngs::OsRng;
 
-const LINE_LIMIT: u64 = 100000;
+const LINE_LIMIT: u64 = 1000000;
 
 const EVENT_TEMPLATES: [&str; 4] = [
     include_str!("okta_system_log_1.json"),
@@ -95,9 +95,12 @@ async fn load_data() -> Result<bool, std::io::Error> {
         if lines_read % 1000 == 0 {
             all_response_times.extend(join_all(waiting_for_response).await);
             waiting_for_response = vec!();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        if lines_read % 10000 == 0 {
             println!("Events Added: {}", lines_read);
             println!("Ingest - average response time: {} ms", all_response_times.iter().sum::<u128>() / all_response_times.len() as u128);
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
         if lines_read >= LINE_LIMIT {

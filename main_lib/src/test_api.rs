@@ -104,8 +104,8 @@ pub(crate) async fn do_all_available_compaction_work(start_snapshot_id: i64) -> 
             Ok(work) => work,
             Err(_) => panic!("oh no"),
         };
-        tracing::info!("Doing compaction work");
         if compact_work.len() > 0 {
+            tracing::info!("Doing compaction work");
             work_done = true;
             match perform_compaction(compact_work, last_iceberg_snapshot_id).await {
                 Ok(id) => { last_iceberg_snapshot_id = id; },
@@ -114,8 +114,8 @@ pub(crate) async fn do_all_available_compaction_work(start_snapshot_id: i64) -> 
                     // TODO: do something to trigger a retry of this compaction
                 },
             }
+            tracing::info!("Done with compaction work");
         }
-        tracing::info!("Done with compaction work");
 
         if !work_done {
             break;
@@ -128,9 +128,7 @@ pub(crate) async fn do_all_available_compaction_work(start_snapshot_id: i64) -> 
 fn do_extension_work_for_forever(extensions: Vec<String>, wait_time_ms: u64) -> impl Future<Output = ()> {
     async move {
         loop {
-            tracing::info!("!!!!!!!!!!!!!!!!!!!! Doing extension work !!!!!!!!!!!!!!!!!!!!!!!");
             do_all_available_extension_work(&extensions).await;
-            tracing::info!("!!!!!!!!!!!!!!!!!!!! Sleeping extension work !!!!!!!!!!!!!!!!!!!!!!!");
             tokio::time::sleep(Duration::from_millis(wait_time_ms)).await;
         }
     }
@@ -141,9 +139,7 @@ fn do_compaction_work_for_forever(wait_time_ms: u64) -> impl Future<Output = ()>
     async move {
         let mut last_iceberg_snapshot_id: i64 = -1;
         loop {
-            tracing::info!("!!!!!!!!!!!!!!!!!!!! Doing compaction work !!!!!!!!!!!!!!!!!!!!!!!");
             last_iceberg_snapshot_id = do_all_available_compaction_work(last_iceberg_snapshot_id).await;
-            tracing::info!("!!!!!!!!!!!!!!!!!!!! Sleeping compaction work !!!!!!!!!!!!!!!!!!!!!!!");
             tokio::time::sleep(Duration::from_millis(wait_time_ms)).await;
         }
     }
