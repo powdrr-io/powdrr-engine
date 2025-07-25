@@ -6,8 +6,12 @@ use datafusion::common::HashMap;
 use datafusion::config::ConfigOptions;
 use datafusion::prelude::SessionConfig;
 use idgenerator::IdInstance;
+use liquid_cache_parquet::cache::policies::DiscardPolicy;
+use liquid_cache_parquet::common::LiquidCacheMode;
+use liquid_cache_parquet::LiquidCacheInProcessBuilder;
 use lru_mem::{HeapSize, LruCache, TryInsertError};
 use object_store::{aws::{AmazonS3, AmazonS3Builder}, ObjectStore};
+use tempfile::TempDir;
 use tokio::sync::{mpsc, oneshot};
 use url::Url;
 
@@ -42,7 +46,22 @@ fn create_session() -> SessionContext {
     //options.set("datafusion.catalog.information_schema", "true").unwrap();
 
     let config = SessionConfig::from(options);
-    let ctx = SessionContext::new_with_config(config);
+
+    let temp_dir = TempDir::new().unwrap();
+
+    let (ctx, _) = match LiquidCacheInProcessBuilder::new()
+        .with_max_cache_bytes(1024 * 1024 * 1024) // 1GB
+        .with_cache_dir(temp_dir.path().to_path_buf())
+        .with_cache_mode(LiquidCacheMode::Liquid {
+            transcode_in_background: true,
+        })
+        .with_cache_strategy(Box::new(DiscardPolicy))
+        .build(config) {
+        Ok(ctx) => ctx,
+        Err(e) => panic!("Failed to create session: {}", e),
+    };
+
+    //let ctx = SessionContext::new_with_config(config);
 
     let s3_url = Url::parse("s3://warehouse").unwrap();
 
