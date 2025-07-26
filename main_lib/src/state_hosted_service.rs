@@ -985,17 +985,6 @@ impl TestApiServiceClient {
             None => ()
         };
 
-        if speedboat_file_set.len() > 0 || iceberg_file_set.len() > 0 {
-            let key = format!("{}_{}", metadata.table_name, extension_name);
-            if !self.checkpoints_needing_extension_work.contains_key(&key) {
-                self.checkpoints_needing_extension_work.insert(key.clone(), vec![]);
-            }
-            let checkpoint_ids = self.checkpoints_needing_extension_work.get_mut(&key).unwrap();
-            if !checkpoint_ids.contains(&metadata.checkpoint_id) {
-                checkpoint_ids.push(metadata.checkpoint_id.clone());
-            }
-        }
-
         (speedboat_file_set, iceberg_file_set)
     }
 
@@ -1022,34 +1011,53 @@ impl TestApiServiceClient {
                 }
             }
         } else {
-            let es_work_items = self.extension_work_items.get_mut(&"es".to_string()).unwrap();
-            if !es_work_items.contains_key(&metadata.table_name) {
-                es_work_items.insert(
-                    metadata.table_name.clone(),
-                    ExtensionWorkItem {
-                        extension_type: "es".to_string(),
-                        table_name: metadata.table_name.clone(),
-                        table_schema: metadata.schema.clone(),
-                        speedboat_files: metadata.speedboat_metadata.as_ref().map_or(FileSetPayload::new(), |m| m.files.clone()),
-                        iceberg_files: metadata.iceberg_metadata.as_ref().map_or(FileSetPayload::new(), |m| m.files.clone())
-                    }
-                );
-            } else {
-                let table_work_item = es_work_items.get_mut(&metadata.table_name).unwrap();
-                table_work_item.table_schema = metadata.schema.clone();
-                if metadata.speedboat_metadata.is_some() {
-                    table_work_item.speedboat_files = table_work_item.speedboat_files.merge(&metadata.speedboat_metadata.as_ref().unwrap().files);
+            self.fill_extension_work_item(
+                &metadata.table_name,
+                &"es".to_string(),
+                &metadata.checkpoint_id,
+                &metadata.schema,
+                metadata.speedboat_metadata.as_ref().map_or(&FileSetPayload::new(), |m|&m.files),
+                metadata.iceberg_metadata.as_ref().map_or(&FileSetPayload::new(), |m|&m.files)
+            )
+        }
+    }
+
+    fn fill_extension_work_item(
+        &mut self,
+        table_name: &String,
+        extension: &String,
+        checkpoint_id: &String,
+        schema: &PowdrrSchema,
+        speedboat_files: &FileSetPayload,
+        iceberg_files: &FileSetPayload,
+    ) -> () {
+        if speedboat_files.len() == 0 && iceberg_files.len() == 0 {
+            return;
+        }
+
+        let es_work_items = self.extension_work_items.get_mut(&"es".to_string()).unwrap();
+        if !es_work_items.contains_key(table_name) {
+            es_work_items.insert(
+                table_name.clone(),
+                ExtensionWorkItem {
+                    extension_type: extension.clone(),
+                    table_name: table_name.clone(),
+                    table_schema: schema.clone(),
+                    speedboat_files: speedboat_files.clone(),
+                    iceberg_files: iceberg_files.clone()
                 }
-                if metadata.iceberg_metadata.is_some() {
-                    table_work_item.iceberg_files = table_work_item.iceberg_files.merge(&metadata.iceberg_metadata.as_ref().unwrap().files);
-                }
-            }
-            let key = format!("{}_es", &metadata.table_name);
-            if !self.checkpoints_needing_extension_work.contains_key(&key) {
-                self.checkpoints_needing_extension_work.insert(key, vec![metadata.checkpoint_id.clone()]);
-            } else {
-                self.checkpoints_needing_extension_work.get_mut(&key).unwrap().push(metadata.checkpoint_id.clone());
-            }
+            );
+        } else {
+            let table_work_item = es_work_items.get_mut(table_name).unwrap();
+            table_work_item.table_schema =schema.clone();
+            table_work_item.speedboat_files = table_work_item.speedboat_files.merge(speedboat_files);
+            table_work_item.iceberg_files = table_work_item.iceberg_files.merge(&iceberg_files);
+        }
+        let key = format!("{}_{}", table_name, extension);
+        if !self.checkpoints_needing_extension_work.contains_key(&key) {
+            self.checkpoints_needing_extension_work.insert(key, vec![checkpoint_id.clone()]);
+        } else {
+            self.checkpoints_needing_extension_work.get_mut(&key).unwrap().push(checkpoint_id.clone());
         }
     }
 
@@ -1162,30 +1170,21 @@ impl TestApiServiceClient {
         };
 
         self.handle_compaction(compactions, &mut new_latest_checkpoint);
-        let (speedboat_files, _) = self.try_fill_checkpoint_extension_metadata(&"es".to_string(), &mut new_latest_checkpoint);
+        let (speedboat_files, iceberg_files) = self.try_fill_checkpoint_extension_metadata(&"es".to_string(), &mut new_latest_checkpoint);
 
         self.checkpoints.insert(format!("{}_{}", &table_info.table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
 
         if sync_index {
             self.create_index(&new_latest_checkpoint).await?;
         } else {
-            let es_work_items = self.extension_work_items.get_mut(&"es".to_string()).unwrap();
-            if !es_work_items.contains_key(&table_info.table_name) {
-                es_work_items.insert(
-                    table_info.table_name.clone(),
-                    ExtensionWorkItem {
-                        extension_type: "es".to_string(),
-                        table_name: table_info.table_name.clone(),
-                        table_schema: merged_schema.clone(),
-                        speedboat_files: speedboat_files.clone(),
-                        iceberg_files: FileSetPayload::new()
-                    }
-                );
-            } else {
-                let table_work_item = es_work_items.get_mut(&table_info.table_name).unwrap();
-                table_work_item.table_schema = merged_schema.clone();
-                table_work_item.speedboat_files = table_work_item.speedboat_files.merge(&speedboat_files);
-            }
+            self.fill_extension_work_item(
+                &table_info.table_name,
+                &"es".to_string(),
+                &new_checkpoint_id,
+                &merged_schema,
+                &speedboat_files,
+                &iceberg_files
+            )
         }
         self.set_latest_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
 
@@ -1466,28 +1465,19 @@ impl ApiServiceClient for TestApiServiceClient {
             schema: merged_schema.clone(),
         };
         self.handle_compaction(&iceberg_commit.compactions, &mut new_latest_checkpoint);
-        let (_, iceberg_files) = self.try_fill_checkpoint_extension_metadata(&"es".to_string(), &mut new_latest_checkpoint);
+        let (speedboat_files, iceberg_files) = self.try_fill_checkpoint_extension_metadata(&"es".to_string(), &mut new_latest_checkpoint);
 
         self.checkpoints.insert(format!("{}_{}", &table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
         self.set_latest_checkpoint(&table_name, None, &new_checkpoint_id);
 
-        let es_work_items = self.extension_work_items.get_mut(&"es".to_string()).unwrap();
-        if !es_work_items.contains_key(table_name) {
-            es_work_items.insert(
-                table_name.clone(),
-                ExtensionWorkItem {
-                    extension_type: "es".to_string(),
-                    table_name: table_name.clone(),
-                    table_schema: merged_schema.clone(),
-                    speedboat_files: FileSetPayload::new(),
-                    iceberg_files: iceberg_files.clone(),
-                }
-            );
-        } else {
-            let table_work_item = es_work_items.get_mut(table_name).unwrap();
-            table_work_item.table_schema = merged_schema.clone();
-            table_work_item.iceberg_files = table_work_item.iceberg_files.merge(&iceberg_files);
-        }
+        self.fill_extension_work_item(
+            &table_name,
+            &"es".to_string(),
+            &new_checkpoint_id,
+            &merged_schema,
+            &speedboat_files,
+            &iceberg_files
+        );
 
         Ok(())
     }
