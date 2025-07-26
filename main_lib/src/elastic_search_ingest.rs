@@ -80,7 +80,7 @@ impl WriteBuffer {
         }
     }
 
-    fn write_to_file(&self, file_name: &String) -> Result<(), IngestError> {
+    pub(crate) fn write_to_file(&self, file_name: &String) -> Result<(), IngestError> {
         assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
         let mut file_write = File::create(file_name).expect("Cannot create file");
         for line in self.lines.iter() {
@@ -102,7 +102,6 @@ impl WriteBuffer {
         buffer
     }
 
-    #[cfg(test)]
     pub(crate) fn schema(&self) -> Option<PowdrrSchema> {
         self.schema.clone()
     }
@@ -112,7 +111,7 @@ impl WriteBuffer {
         self.lines.len()
     }
 
-    fn total_size(&self) -> u64 {
+    pub(crate) fn total_size(&self) -> u64 {
         self.lines.iter().fold(0, |acc, line| acc + line.len() as u64 + 1)
     }
 }

@@ -1,4 +1,5 @@
 use std::{error::Error, fmt::Display};
+use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use gotham::test::TestServer;
@@ -6,6 +7,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::{private_api::data_query, state_common::FileFilter, state_leader};
+use crate::compaction::{compact_logs, CompactionCommand, CompactionResponse};
 use crate::elastic_search_common::result_to_record_batch;
 use crate::private_api::{compaction_query, extension_query};
 use crate::schema_massager::{PowdrrSchema, SqlQuery};
@@ -105,6 +107,8 @@ pub trait PeerClient: Send + Sync {
     async fn private_compaction(&self, invocation: &PrivateCompactionInvocation, index: u64, num: u64) -> Result<Vec<RecordBatch>, PeerClientError>;
 
     async fn private_extension(&self, invocation: &PrivateExtensionInvocation, index: u64, num: u64) -> Result<ExtensionFileMetadata, PeerClientError>;
+
+    async fn private_compaction_leader(&self, invocation: &CompactionCommand) -> Result<CompactionResponse, PeerClientError>;
 }
 
 #[allow(dead_code)]
@@ -161,6 +165,10 @@ impl PeerClient for RemotePeer {
     }
 
     async fn private_extension(&self, _invocation: &PrivateExtensionInvocation, _index: u64, _num: u64) -> Result<ExtensionFileMetadata, PeerClientError> {
+        todo!()
+    }
+
+    async fn private_compaction_leader(&self, _invocation: &CompactionCommand) -> Result<CompactionResponse, PeerClientError> {
         todo!()
     }
 
@@ -243,6 +251,15 @@ impl PeerClient for SelfPeer {
             }
         }
     }
+
+    async fn private_compaction_leader(&self, invocation: &CompactionCommand) -> Result<CompactionResponse, PeerClientError> {
+        match compact_logs(Arc::new(invocation.clone())).await {
+            Ok(success) => {
+                Ok(serde_json::from_str(success.body.as_str()).unwrap())
+            },
+            Err(e) => Err(PeerClientError{ message: e.to_string() })
+        }
+    }
 }
 
 
@@ -301,7 +318,7 @@ pub mod tests {
     use async_trait::async_trait;
     use datafusion::arrow::array::RecordBatch;
     use gotham::{mime, test::TestServer};
-
+    use crate::compaction::{CompactionCommand, CompactionResponse};
     use crate::router::router;
     use crate::state_hosted_service::ExtensionFileMetadata;
     use super::{PeerClient, PeerClientError, PeerClientGenerator, PrivateCompactionInvocation, PrivateExtensionInvocation, PrivateSqlInvocation};
@@ -346,6 +363,10 @@ pub mod tests {
         }
 
         async fn private_extension(&self, _invocation: &PrivateExtensionInvocation, _index: u64, _num: u64) -> Result<ExtensionFileMetadata, PeerClientError> {
+            todo!()
+        }
+
+        async fn private_compaction_leader(&self, _invocation: &CompactionCommand) -> Result<CompactionResponse, PeerClientError> {
             todo!()
         }
     }

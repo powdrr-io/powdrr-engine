@@ -20,7 +20,7 @@ pub(crate) struct SpeedboatCSpeedInfo {
 }
 
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct SpeedboatCommitTableInfo {
     pub commit_type: String,
     pub table_name: String,
@@ -47,7 +47,7 @@ pub(crate) struct SpeedboatCommit {
     pub compactions: Vec<String>,    
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct FileSetPayload {
     pub file_paths: Vec<String>,
     pub schemas: Vec<PowdrrSchema>,
@@ -868,7 +868,7 @@ impl ExtensionWorkItem {
 }
 
 
-#[derive(Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct CompactionWorkItem {
     pub table_schema: PowdrrSchema,
     pub speedboat_files: FileSetPayload,
