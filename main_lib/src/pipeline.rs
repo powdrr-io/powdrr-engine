@@ -248,8 +248,6 @@ impl<'de> Deserialize<'de> for ProcessorBodies {
             panic!("How do I error here?")
         }
         let only_pair = map_value.iter().next().unwrap();
-        let error = format!("{}", only_pair.1);
-        println!("{}", error);
         match only_pair.0.as_str() {
             "set" => Ok(ProcessorBodies::Set(serde_json::from_value::<SetProcessorBody>(only_pair.1.clone()).unwrap())),
             "rename" => Ok(ProcessorBodies::Rename(serde_json::from_value::<RenameProcessorBody>(only_pair.1.clone()).unwrap())),

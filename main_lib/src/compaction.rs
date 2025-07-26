@@ -31,7 +31,7 @@ use crate::elastic_search_commands::to_serde_value;
 use crate::elastic_search_common::{execute_command, Command, CommandContext, CommandError, ElasticSearchResponse, ResultGeneratorFuture};
 use crate::elastic_search_ingest::WriteBuffer;
 use crate::schema_massager::{PowdrrSchema, SqlBuilder};
-use crate::state_hosted_service::{CompactionWorkItem, IcebergCommit, IcebergMetadata};
+use crate::state_hosted_service::{CompactionWorkItem, FileSetPayload, IcebergCommit, IcebergMetadata};
 use crate::state_peers::{PrivateCompactionInvocation, PrivateInvocation};
 
 
@@ -357,12 +357,14 @@ impl CompactionCommand {
                 metadata: IcebergMetadata {
                     table_schema: schema.clone(),
                     snapshot_id: lib_metadata.snapshot_id.to_string(),
-                    files: lib_metadata.files.clone(),
-                    sizes: lib_metadata.sizes,
+                    files: FileSetPayload {
+                        file_paths: lib_metadata.files.clone(),
+                        schemas: vec!(schema.clone()),
+                        file_schemas: lib_metadata.files.iter().map(|_|0).collect(),
+                        sizes: lib_metadata.sizes
+                    },
                     column_names: lib_metadata.column_names,
                     column_stats: lib_metadata.column_stats,
-                    schemas: vec!(schema.clone()),
-                    file_schemas: lib_metadata.files.iter().map(|_|0).collect(),
                 },
                 compactions: lib_metadata.compactions.clone(),
             }
@@ -396,12 +398,9 @@ impl CompactionCommand {
 #[async_trait]
 impl Command for CompactionCommand {
     async fn get_private_invocation(&self) -> PrivateInvocation {
-        assert_eq!(self.work_item.iceberg_files.len(), 0, "Iceberg file compaction is not yet implemented");
         PrivateInvocation::Compaction(PrivateCompactionInvocation {
             sql: SqlBuilder::for_compaction().build(),
             speedboat_files: self.work_item.speedboat_files.clone(),
-            schemas: self.work_item.schemas.clone(),
-            file_schemas: self.work_item.file_schemas.clone(),
             table_schema: self.work_item.table_schema.clone(),
             delete_files: self.work_item.delete_files.clone(),
         })
@@ -523,8 +522,6 @@ async fn compact_logs(command: Arc<dyn Command>) -> Result<i64, CompactionError>
 pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkItem)>, last_snapshot_id: i64) -> Result<i64, CompactionError> {
     let mut new_last_snapshot_id = last_snapshot_id;
     for (table_name, work_item) in work_items.iter() {
-        assert_eq!(work_item.iceberg_files.len(), 0, "Iceberg file compaction is not yet implemented");
-
         let compaction_id = IdInstance::next_id().to_string();
 
         // NOTE: the api commit must happen before the iceberg commit. The main_lib is designed to understand that
@@ -533,8 +530,7 @@ pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkIt
         match API_SERVICE_CLIENT.compaction_commit(
             table_name,
             &CompactionCommit {
-                removed_speedboat_files: work_item.speedboat_files.clone(),
-                removed_iceberg_files: work_item.iceberg_files.clone(),
+                removed_speedboat_files: work_item.speedboat_files.file_paths.clone(),
                 compaction_id: compaction_id.clone(),
                 removed_delete_files: work_item.delete_files.clone(),
             }
@@ -718,9 +714,6 @@ mod tests {
         let (insert_buffer, _, _) = builder.build_buffers();
         let insert_buffer_vec = insert_buffer.as_byte_vec();
         let arrow_schema = insert_buffer.schema().unwrap().to_arrow_schema();
-        for field in arrow_schema.fields() {
-            println!("Field: {:?}", field);
-        }
         let json = arrow_json::ReaderBuilder::new(Arc::new(arrow_schema)).build(BufReader::new(insert_buffer_vec.as_bytes())).unwrap();
         let batch = json.collect::<Result<Vec<RecordBatch>, ArrowError>>().unwrap();
 

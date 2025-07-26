@@ -638,9 +638,7 @@ pub fn es_search_table(mut state: State) -> Pin<Box<HandlerFuture>> {
         let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
         let command = match elastic_search_parser::parse(Some(table_desc.name), &body_content, &query_extractor) {
             Ok(c) => c,
-            Err(e) => {
-                let error = format!("{}", e);
-                println!("Error: {}", error);
+            Err(_e) => {
                 let res = create_response(&state, StatusCode::BAD_REQUEST, mime::TEXT_PLAIN, "Bad request".to_string());
                 return Ok((state, res))
             }
@@ -695,8 +693,7 @@ pub fn es_bulk_ingest(mut state: State) -> Pin<Box<HandlerFuture>> {
                 Ok((state, res))
             }
             Err(e) => {
-                let error = format!("{}", e.message);
-                println!("{}", error);
+                let _error = format!("{}", e.message);
                 panic!("Oopsie");
             }
         }

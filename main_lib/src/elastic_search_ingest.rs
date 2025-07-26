@@ -107,6 +107,7 @@ impl WriteBuffer {
         self.schema.clone()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn num_records(&self) -> usize {
         self.lines.len()
     }

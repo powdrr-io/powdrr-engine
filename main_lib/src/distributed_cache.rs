@@ -45,8 +45,7 @@ fn increment(key: &String, delta: i64) -> Result<i64, CacheError>  {
             Ok(v.get(0).unwrap().parse::<i64>().unwrap())
         }
         Err(e) => {
-            let error = format!("{}", e);
-            println!("{}", error);
+            let _error = format!("{}", e);
             panic!("Time for some debug");
         }
     }
@@ -70,8 +69,7 @@ fn set<T: ToRedisArgs>(key: &String, value: T) -> Result<(), CacheError> {
     match con.set::<&String, T, String>(key, value) {
         Ok(_) => Ok(()),
         Err(e) => {
-            let error = format!("{}", e);
-            println!("{}", error);
+            let _error = format!("{}", e);
             panic!("Time for some debug and maybe adding more error path")
         }
     }

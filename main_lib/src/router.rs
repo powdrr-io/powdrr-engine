@@ -278,6 +278,7 @@ pub fn router(include_test_apis: bool) -> Router {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::{env, str};
+    use std::collections::HashMap;
     use std::sync::LazyLock;
 
     use gotham::mime;
@@ -286,7 +287,7 @@ pub(crate) mod tests {
     use crate::elastic_search_responses::{QueryResultTotal, QueryResults};
     use crate::router::router;
     use crate::schema_massager::{extract_powdrr_schema_str, PowdrrDataType, PowdrrField, PowdrrSchema};
-    use crate::state_hosted_service::{IcebergMetadata, SpeedboatMetadata, TableMetadataCheckpoint};
+    use crate::state_hosted_service::{FileSetPayload, IcebergMetadata, SpeedboatMetadata, TableMetadataCheckpoint};
 
     pub(crate) static TEST_SERVER: LazyLock<TestServer> = LazyLock::new(|| TestServer::with_timeout(router(true), 1000).unwrap());
 
@@ -306,13 +307,14 @@ pub(crate) mod tests {
             checkpoint_id: "fake_id".to_string(),
             iceberg_metadata: None,
             speedboat_metadata: Some(SpeedboatMetadata{ 
-                files: vec!(format!("file://{}/tests/data/logs.json", env::current_dir().unwrap().to_str().unwrap())),
-                sizes: vec!(6),
-                schemas: vec!(extract_powdrr_schema_str(include_str!("../tests/data/logs.json"))),
-                file_schemas: vec!(0),
+                files: FileSetPayload::single(
+                    format!("file://{}/tests/data/logs.json", env::current_dir().unwrap().to_str().unwrap()),
+                    include_str!("../tests/data/logs.json").len() as u64,
+                    extract_powdrr_schema_str(include_str!("../tests/data/logs.json"))
+                )
             }),
             deletes_metadata: None,
-            extension_metadata: None,
+            extension_metadata: HashMap::new(),
             schema: PowdrrSchema{ fields: vec!() },
         };
 
@@ -459,16 +461,13 @@ pub(crate) mod tests {
             iceberg_metadata: Some(IcebergMetadata {
                 table_schema: schema.clone(),
                 snapshot_id: "fake_iceberg_snapshot".to_string(),
-                files: vec!(file_path),
-                sizes: vec!(1),
+                files: FileSetPayload::single(file_path, 1, schema.clone()),
                 column_names: vec!(),
                 column_stats: vec!(),
-                schemas: vec!(schema.clone()),
-                file_schemas: vec!(0),
             }),
             speedboat_metadata: None,
             deletes_metadata: None,
-            extension_metadata: None,
+            extension_metadata: HashMap::new(),
             schema: schema.clone(),
         };
 
@@ -542,13 +541,10 @@ pub(crate) mod tests {
             checkpoint_id: "fake_id".to_string(),
             iceberg_metadata: None,
             speedboat_metadata: Some(SpeedboatMetadata{ 
-                files: vec!(data_file_path.clone()),
-                sizes: vec!(6),
-                schemas: vec!(schema.clone()),
-                file_schemas: vec!(0),
+                files: FileSetPayload::single(data_file_path.clone(), 6, schema.clone()),
             }),
             deletes_metadata: None,
-            extension_metadata: None,
+            extension_metadata: HashMap::new(),
             schema: schema.clone(),
         };
 

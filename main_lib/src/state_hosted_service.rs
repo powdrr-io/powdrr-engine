@@ -1,5 +1,5 @@
 use std::{collections::HashMap, error::Error};
-
+use std::hash::{DefaultHasher, Hash, Hasher};
 use async_trait::async_trait;
 use idgenerator::IdInstance;
 use reqwest::Client;
@@ -11,6 +11,7 @@ use crate::compaction::drop_all_tables;
 use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::schema_massager::PowdrrSchema;
+
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct SpeedboatCSpeedInfo {
@@ -28,6 +29,17 @@ pub(crate) struct SpeedboatCommitTableInfo {
     pub schema: Option<PowdrrSchema>,
 }
 
+impl SpeedboatCommitTableInfo {
+    fn as_file_set_payload(&self) -> FileSetPayload {
+        FileSetPayload {
+            file_paths: self.files.clone(),
+            sizes: self.sizes.clone(),
+            schemas: vec!(self.schema.as_ref().unwrap().clone()),
+            file_schemas: self.files.iter().map(|_| 0).collect(),
+        }
+    }
+}
+
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct SpeedboatCommit {
@@ -35,19 +47,31 @@ pub(crate) struct SpeedboatCommit {
     pub compactions: Vec<String>,    
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct FileSetPayload {
+    pub file_paths: Vec<String>,
+    pub schemas: Vec<PowdrrSchema>,
+    pub file_schemas: Vec<u64>,
+    pub sizes: Vec<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FileDescriptor {
+    pub(crate) file_path: String,
+    pub(crate) schema: PowdrrSchema,
+    pub(crate) size: u64,
+}
+
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct IcebergMetadata {
     pub table_schema: PowdrrSchema,
     pub snapshot_id: String,
-    pub files: Vec<String>,
-    pub sizes: Vec<u64>,
+    pub files: FileSetPayload,
     pub column_names: Vec<String>,
     // per file, per column lower and upper bounds
     // TODO: this needs to be generalized to support bloom filters
     pub column_stats: Vec<(String, String)>,
-    pub schemas: Vec<PowdrrSchema>,
-    pub file_schemas: Vec<u64>,
 }
 
 
@@ -59,10 +83,7 @@ pub(crate) struct IcebergCommit {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct SpeedboatMetadata {
-    pub files: Vec<String>,
-    pub sizes: Vec<u64>,
-    pub schemas: Vec<PowdrrSchema>,
-    pub file_schemas: Vec<u64>,
+    pub files: FileSetPayload
 }
 
 
@@ -79,29 +100,19 @@ pub(crate) struct ExtensionFile {
 }
 
 
-#[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct ExtensionFileMetadata {
-    pub data_file_location: String,
-    pub extension_file_locations: Vec<ExtensionFile>,
-}
+pub type ExtensionFileMetadata = HashMap<String, Vec<ExtensionFile>>;
 
-#[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct ExtensionMetadata {
-    pub files: Vec<ExtensionFileMetadata>
-}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct ExtensionCommit {
     pub extension: String,
-    pub checkpoint_id: String,
-    pub partial_metadata: ExtensionMetadata,
+    pub files: ExtensionFileMetadata
 }
 
 
 #[derive(Serialize, Clone)]
 pub(crate) struct CompactionCommit {
     pub removed_speedboat_files: Vec<String>,
-    pub removed_iceberg_files: Vec<String>,
     pub removed_delete_files: Vec<String>,
     pub compaction_id: String
 }
@@ -113,10 +124,87 @@ pub(crate) struct TableMetadataCheckpoint {
     pub iceberg_metadata: Option<IcebergMetadata>,
     pub speedboat_metadata: Option<SpeedboatMetadata>,
     pub deletes_metadata: Option<DeletesMetadata>,
-    pub extension_metadata: Option<Vec<(String, ExtensionMetadata)>>,
+    pub extension_metadata: HashMap<String, HashMap<String, Vec<ExtensionFile>>>,
     pub schema: PowdrrSchema,
 }
 
+
+impl TableMetadataCheckpoint {
+    fn fully_covered_for_extension(&self, extension_name: &String) -> bool {
+        let total_num_files =
+            self.speedboat_metadata.as_ref().map_or(0, |x| x.files.file_paths.len()) +
+            self.iceberg_metadata.as_ref().map_or(0, |x| x.files.file_paths.len());
+
+        let total_num_extension_files = self.extension_metadata.get(extension_name).map_or(0, |x| x.len());
+
+        let size_check_method = total_num_files == total_num_extension_files;
+
+        assert_eq!(size_check_method, self.validate_fully_covered_for_extension(extension_name));
+
+        size_check_method
+    }
+
+    fn validate_fully_covered_for_extension(&self, extension_name: &String) -> bool {
+        let extension_metadata_map = self.extension_metadata.get(extension_name).map_or(HashMap::new(), |x| x.clone());
+
+        match &self.iceberg_metadata {
+            Some(im) => {
+                for file_path in im.files.file_paths.iter() {
+                    if !extension_metadata_map.contains_key(file_path) {
+                        return false;
+                    }
+                }
+            },
+            None => {}
+        };
+
+        match &self.speedboat_metadata {
+            Some(im) => {
+                for file_path in im.files.file_paths.iter() {
+                    if !extension_metadata_map.contains_key(file_path) {
+                        return false;
+                    }
+                }
+            },
+            None => {}
+        };
+
+        true
+    }
+
+    fn add_coverage(&mut self, extension_commit: &ExtensionCommit) -> () {
+        assert!(!self.fully_covered_for_extension(&extension_commit.extension), "Already fully covered");
+
+        let existing_extension_metadata_map = self.extension_metadata.get(&extension_commit.extension).map_or(HashMap::new(), |x| x.clone());
+
+        if !self.extension_metadata.contains_key(&extension_commit.extension) {
+            self.extension_metadata.insert(extension_commit.extension.clone(), HashMap::new());
+        }
+
+        match &self.iceberg_metadata {
+            Some(im) => {
+                for file_path in im.files.file_paths.iter() {
+                    if extension_commit.files.contains_key(file_path) && !existing_extension_metadata_map.contains_key(file_path) {
+                        self.extension_metadata.get_mut(&extension_commit.extension).unwrap().insert(file_path.clone(), extension_commit.files[file_path].clone());
+                    }
+                }
+            },
+            None => {}
+        };
+
+        match &self.speedboat_metadata {
+            Some(im) => {
+                for file_path in im.files.file_paths.iter() {
+                    if extension_commit.files.contains_key(file_path) && !existing_extension_metadata_map.contains_key(file_path) {
+                        self.extension_metadata.get_mut(&extension_commit.extension).unwrap().insert(file_path.clone(), extension_commit.files[file_path].clone());
+
+                    }
+                }
+            },
+            None => {}
+        };
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct ProposedCompaction {
@@ -124,7 +212,7 @@ pub(crate) struct ProposedCompaction {
     pub checkpoint_id: String,
     pub iceberg_metadata: Option<IcebergMetadata>,
     pub speedboat_metadata: Option<SpeedboatMetadata>,
-    pub extension_metadata: Option<Vec<(String, ExtensionMetadata)>>,
+    pub extension_metadata: Option<Vec<(String, Vec<ExtensionFileMetadata>)>>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -147,6 +235,104 @@ impl TableDescription {
         }
     }
 }
+
+
+impl FileSetPayload {
+    pub fn new() -> Self {
+        FileSetPayload {
+            file_paths: vec!(),
+            sizes: vec!(),
+            file_schemas: vec!(),
+            schemas: vec!(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn single(file_path: String, size: u64, schema: PowdrrSchema) -> Self {
+        FileSetPayload {
+            file_paths: vec!(file_path),
+            sizes: vec!(size),
+            file_schemas: vec!(0),
+            schemas: vec!(schema),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.file_paths.len()
+    }
+
+    pub fn clear(&mut self) -> () {
+        self.file_paths.clear();
+        self.sizes.clear();
+        self.file_schemas.clear();
+        self.schemas.clear();
+    }
+
+    pub fn remove(&mut self, file_paths_to_remove: &Vec<String>) -> () {
+        let mut i = 0;
+        while i < self.file_paths.len() {
+            let file_name = self.file_paths.get(i).unwrap();
+            if file_paths_to_remove.contains(file_name) {
+                self.file_paths.remove(i);
+                self.sizes.remove(i);
+                self.file_schemas.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+
+        // TODO: find dangling schemas and remove them
+    }
+
+    pub fn as_file_tuples(&self) -> Vec<FileDescriptor> {
+        self.file_paths.iter().zip(self.sizes.iter()).zip(self.file_schemas.iter()).map(
+            |((path, size), schema_index)|
+                FileDescriptor{ file_path: path.clone(), schema: self.schemas[*schema_index as usize].clone(), size: *size }
+        ).collect()
+    }
+
+    fn selected_file(file_path: &String, index: u64, num: u64) -> bool {
+        // TODO: validate this is a stable hash (aka it will give the same value on every machine on every run)
+        let mut hasher = DefaultHasher::new();
+        file_path.hash(&mut hasher);
+        let hash_val = hasher.finish();
+        hash_val % num == index
+    }
+
+    pub fn as_selected_tuples(&self, index: u64, num: u64) -> Vec<FileDescriptor> {
+        self.as_file_tuples().iter().filter(|x|Self::selected_file(&x.file_path, index, num)).cloned().collect()
+    }
+
+    pub fn merge(&self, other: &FileSetPayload) -> Self {
+        // Clone the larger one, merge in the smaller one
+        let (mut cloned, to_merge) = if self.file_paths.len() > other.file_paths.len() {
+            (self.clone(), other)
+        } else {
+            (other.clone(), self)
+        };
+
+        for file_desc in to_merge.as_file_tuples().iter() {
+            cloned.add(file_desc);
+        }
+
+        cloned
+    }
+
+    fn add(&mut self, file_descriptor: &FileDescriptor) -> () {
+        if self.file_paths.contains(&file_descriptor.file_path) {
+            return;
+        }
+        self.file_paths.push(file_descriptor.file_path.clone());
+        self.sizes.push(file_descriptor.size);
+        if let Some(index) = self.schemas.iter().position(|item| item == &file_descriptor.schema) {
+            self.file_schemas.push(index as u64);
+        } else {
+            self.file_schemas.push(self.schemas.len() as u64);
+            self.schemas.push(file_descriptor.schema.clone());
+        }
+    }
+}
+
 
 
 #[async_trait]
@@ -186,7 +372,7 @@ pub(crate) trait ApiServiceClient : Send + Sync {
 
     async fn get_checkpoint(&mut self, snapshot: &SnapshotDescriptor) -> Result<TableMetadataCheckpoint, Box<dyn Error>>;
 
-    async fn get_extension_work_items(&mut self, extension_name: &String) -> Result<Vec<TableMetadataCheckpoint>, Box<dyn Error>>;
+    async fn get_extension_work_items(&mut self, extension_name: &String) -> Result<Vec<ExtensionWorkItem>, Box<dyn Error>>;
 
     async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, Box<dyn Error>>;
 }
@@ -284,7 +470,7 @@ enum ApiServiceClientActorMessage {
         snapshot: SnapshotDescriptor,
     },
     GetExtensionWorkItems {
-        respond_to: oneshot::Sender<Vec<TableMetadataCheckpoint>>,
+        respond_to: oneshot::Sender<Vec<ExtensionWorkItem>>,
         extension_type: String,
     },
     GetCompactionWorkItems {
@@ -650,21 +836,8 @@ impl ApiServiceClient for RealApiServiceClient {
         }        
     }
 
-    async fn get_extension_work_items(&mut self, extension_name: &String) -> Result<Vec<TableMetadataCheckpoint>, Box<dyn Error>> {
-        // TODO: this is bogus
-        let base_address = &self.base_address;       
-        let url = format!("{base_address}/api/v1/get_workable_tables/{extension_name}");
-        let resp = self.client.get(url).send().await;
-        match resp {
-            Ok(r) => {
-                let json = r.json::<Vec<TableMetadataCheckpoint>>().await;
-                match json {
-                    Ok(j) => Ok(j),
-                    Err(e) => Err(Box::new(e))
-                }
-            },
-            Err(e) => Err(Box::new(e))
-        }        
+    async fn get_extension_work_items(&mut self, _extension_name: &String) -> Result<Vec<ExtensionWorkItem>, Box<dyn Error>> {
+        todo!("nope")
     }
 
     async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, Box<dyn Error>> {
@@ -675,13 +848,30 @@ impl ApiServiceClient for RealApiServiceClient {
 
 
 #[derive(Clone)]
+pub(crate) struct ExtensionWorkItem {
+    pub extension_type: String,
+    pub table_name: String,
+    pub table_schema: PowdrrSchema,
+    pub speedboat_files: FileSetPayload,
+    pub iceberg_files: FileSetPayload,
+}
+
+impl ExtensionWorkItem {
+    fn clear(&mut self) -> () {
+        self.speedboat_files.clear();
+        self.iceberg_files.clear();
+    }
+
+    fn has_work(&self) -> bool {
+        self.speedboat_files.len() > 0 || self.iceberg_files.len() > 0
+    }
+}
+
+
+#[derive(Clone)]
 pub(crate) struct CompactionWorkItem {
     pub table_schema: PowdrrSchema,
-    pub speedboat_files: Vec<String>,
-    pub schemas: Vec<PowdrrSchema>,
-    pub file_schemas: Vec<u64>,
-    pub iceberg_files: Vec<String>,
-    pub sizes: Vec<u64>,
+    pub speedboat_files: FileSetPayload,
     pub delete_files: Vec<String>,
 }
 
@@ -694,10 +884,12 @@ struct TestApiServiceClient {
     pipelines: HashMap<String, PipelineDefinition>,
     lifetime_policies: HashMap<String, ILMPolicyDefinition>,
     latest_checkpoint_id: HashMap<String, String>,
-    index_work_items: HashMap<String, Vec<TableMetadataCheckpoint>>,
     compaction_work_items: HashMap<String, CompactionWorkItem>,
+    extension_work_items: HashMap<String, HashMap<String, ExtensionWorkItem>>,
     compactions: HashMap<String, CompactionCommit>,
     checkpoints: HashMap<String, TableMetadataCheckpoint>,
+    checkpoints_needing_extension_work: HashMap<String, Vec<String>>,
+    recent_file_extension_metadata: HashMap<String, Vec<ExtensionFile>>
 }
 
 impl TestApiServiceClient {
@@ -709,10 +901,12 @@ impl TestApiServiceClient {
             pipelines: HashMap::new(),
             lifetime_policies: HashMap::new(),
             latest_checkpoint_id: HashMap::new(),
-            index_work_items: HashMap::new(),
             compaction_work_items: HashMap::new(),
             compactions: HashMap::new(),
             checkpoints: HashMap::new(),
+            checkpoints_needing_extension_work: HashMap::new(),
+            extension_work_items: HashMap::from([("es".to_string(), HashMap::new())]),
+            recent_file_extension_metadata: HashMap::new(),
         }
     }
 
@@ -724,12 +918,86 @@ impl TestApiServiceClient {
         self.pipelines.clear();
         self.lifetime_policies.clear();
         self.latest_checkpoint_id.clear();
-        self.index_work_items.clear();
         self.compaction_work_items.clear();
         self.compactions.clear();
         self.checkpoints.clear();
+        self.checkpoints_needing_extension_work.clear();
+        self.extension_work_items = HashMap::from([("es".to_string(), HashMap::new())]);
+        self.recent_file_extension_metadata.clear();
         drop_all_tables(&"default".to_string()).await.expect("Failed while dropping all tables");
-    }    
+    }
+
+    fn checkpoints_needing_extension_work(&self, table_name: &String, extension_name: &String) -> Option<Vec<String>> {
+        self.checkpoints_needing_extension_work.get(&format!("{}_{}", table_name, extension_name)).cloned()
+    }
+
+    fn recent_file_extension_metadata(&self, table_name: &String, extension_name: &String, file_name: &String) -> Option<Vec<ExtensionFile>> {
+        self.recent_file_extension_metadata.get(&format!("{}_{}_{}", table_name, extension_name, file_name)).cloned()
+    }
+
+    fn add_recent_extension_files(&mut self, table_name: &String, commit: &ExtensionCommit) -> () {
+        for (file_name, extension_files) in commit.files.iter() {
+            self.recent_file_extension_metadata.insert(
+                format!("{}_{}_{}", table_name, commit.extension, file_name),
+                extension_files.clone()
+            );
+        }
+    }
+
+    fn try_fill_checkpoint_extension_metadata(&mut self, extension_name: &String, metadata: &mut TableMetadataCheckpoint) -> (FileSetPayload, FileSetPayload) {
+        if !metadata.extension_metadata.contains_key(extension_name) {
+            metadata.extension_metadata.insert(extension_name.clone(), HashMap::new());
+        }
+
+        let extension_metadata = metadata.extension_metadata.get_mut(extension_name).unwrap();
+
+        let mut iceberg_file_set = FileSetPayload::new();
+        match metadata.iceberg_metadata.as_ref() {
+            Some(im) => {
+                for file_desc in im.files.as_file_tuples() {
+                    match self.recent_file_extension_metadata(&metadata.table_name, extension_name, &file_desc.file_path) {
+                        Some(metadata) => {
+                            extension_metadata.insert(file_desc.file_path.clone(), metadata);
+                        },
+                        None => {
+                            iceberg_file_set.add(&file_desc);
+                        }
+                    }
+                }
+            },
+            None => ()
+        };
+
+        let mut speedboat_file_set = FileSetPayload::new();
+        match metadata.speedboat_metadata.as_ref() {
+            Some(im) => {
+                for file_desc in im.files.as_file_tuples() {
+                    match self.recent_file_extension_metadata(&metadata.table_name, extension_name, &file_desc.file_path) {
+                        Some(metadata) => {
+                            extension_metadata.insert(file_desc.file_path.clone(), metadata);
+                        },
+                        None => {
+                            speedboat_file_set.add(&file_desc);
+                        }
+                    }
+                }
+            },
+            None => ()
+        };
+
+        if speedboat_file_set.len() > 0 || iceberg_file_set.len() > 0 {
+            let key = format!("{}_{}", metadata.table_name, extension_name);
+            if !self.checkpoints_needing_extension_work.contains_key(&key) {
+                self.checkpoints_needing_extension_work.insert(key.clone(), vec![]);
+            }
+            let checkpoint_ids = self.checkpoints_needing_extension_work.get_mut(&key).unwrap();
+            if !checkpoint_ids.contains(&metadata.checkpoint_id) {
+                checkpoint_ids.push(metadata.checkpoint_id.clone());
+            }
+        }
+
+        (speedboat_file_set, iceberg_file_set)
+    }
 
     fn add_checkpoint(&mut self, metadata: &TableMetadataCheckpoint) -> () {
         // To make testing a little easier, we'll just magic up a table as necessary
@@ -746,15 +1014,43 @@ impl TestApiServiceClient {
         if !self.latest_checkpoint_id.contains_key(&metadata.table_name) {
             self.latest_checkpoint_id.insert(metadata.table_name.clone(), metadata.checkpoint_id.clone());            
         }
-        if metadata.extension_metadata.is_some() {
-            for (extension, _) in metadata.extension_metadata.as_ref().unwrap().iter() {
+        if metadata.extension_metadata.len() > 0 {
+            for extension in metadata.extension_metadata.keys() {
                 let key = format!("{}_{}", &metadata.table_name, extension);
                 if !self.latest_checkpoint_id.contains_key(&key) {
                     self.latest_checkpoint_id.insert(key, metadata.checkpoint_id.clone());
                 }
             }
+        } else {
+            let es_work_items = self.extension_work_items.get_mut(&"es".to_string()).unwrap();
+            if !es_work_items.contains_key(&metadata.table_name) {
+                es_work_items.insert(
+                    metadata.table_name.clone(),
+                    ExtensionWorkItem {
+                        extension_type: "es".to_string(),
+                        table_name: metadata.table_name.clone(),
+                        table_schema: metadata.schema.clone(),
+                        speedboat_files: metadata.speedboat_metadata.as_ref().map_or(FileSetPayload::new(), |m| m.files.clone()),
+                        iceberg_files: metadata.iceberg_metadata.as_ref().map_or(FileSetPayload::new(), |m| m.files.clone())
+                    }
+                );
+            } else {
+                let table_work_item = es_work_items.get_mut(&metadata.table_name).unwrap();
+                table_work_item.table_schema = metadata.schema.clone();
+                if metadata.speedboat_metadata.is_some() {
+                    table_work_item.speedboat_files = table_work_item.speedboat_files.merge(&metadata.speedboat_metadata.as_ref().unwrap().files);
+                }
+                if metadata.iceberg_metadata.is_some() {
+                    table_work_item.iceberg_files = table_work_item.iceberg_files.merge(&metadata.iceberg_metadata.as_ref().unwrap().files);
+                }
+            }
+            let key = format!("{}_es", &metadata.table_name);
+            if !self.checkpoints_needing_extension_work.contains_key(&key) {
+                self.checkpoints_needing_extension_work.insert(key, vec![metadata.checkpoint_id.clone()]);
+            } else {
+                self.checkpoints_needing_extension_work.get_mut(&key).unwrap().push(metadata.checkpoint_id.clone());
+            }
         }
-        self.index_work_items.insert(metadata.table_name.clone(), vec![metadata.clone()]);
     }
 
     fn handle_compaction(&mut self, compactions: &Vec<String>, checkpoint: &mut TableMetadataCheckpoint) -> () {
@@ -762,17 +1058,7 @@ impl TestApiServiceClient {
 
         match checkpoint.speedboat_metadata.as_mut() {
             Some(speedboat) => {
-                let mut i = 0;
-                while i < speedboat.files.len() {
-                    let file_name = speedboat.files.get(i).unwrap();
-                    if removed_speedboat.contains(file_name) {
-                        speedboat.files.remove(i);
-                        speedboat.sizes.remove(i);
-                        speedboat.file_schemas.remove(i);
-                    } else {
-                        i += 1;
-                    }
-                }
+                speedboat.files.remove(&removed_speedboat);
             },
             None => ()
         };
@@ -784,11 +1070,8 @@ impl TestApiServiceClient {
             None => ()
         };
 
-        match checkpoint.extension_metadata.as_mut() {
-            Some(extensions) => {
-                extensions.retain(|(file_path, _)|!removed_speedboat.contains(file_path));
-            },
-            None => ()
+        for metadata in checkpoint.extension_metadata.values_mut() {
+            metadata.retain(|key, _|!removed_speedboat.contains(key))
         }
 
         // TODO: cleanup compactions
@@ -840,7 +1123,7 @@ impl TestApiServiceClient {
                     iceberg_metadata: None,
                     speedboat_metadata: None,
                     deletes_metadata: None,
-                    extension_metadata: None,
+                    extension_metadata: HashMap::new(),
                     schema: table_info.schema.as_ref().unwrap().clone()
                 }
             },
@@ -849,37 +1132,19 @@ impl TestApiServiceClient {
         let new_checkpoint_id = IdInstance::next_id().to_string();
         let new_speedboat_metadata = match &latest_checkpoint.speedboat_metadata {
             None => SpeedboatMetadata {
-                files: table_info.files.clone(),
-                sizes: table_info.sizes.clone(),
-                schemas: vec!(table_info.schema.as_ref().unwrap().clone()),
-                file_schemas: table_info.files.iter().map(|_|0).collect(),
+                files: FileSetPayload {
+                    file_paths: table_info.files.clone(),
+                    sizes: table_info.sizes.clone(),
+                    schemas: vec!(table_info.schema.as_ref().unwrap().clone()),
+                    file_schemas: table_info.files.iter().map(|_| 0).collect(),
+                }
             },
             Some(existing) => {
-                let mut files = existing.files.clone();
-                let mut sizes = existing.sizes.clone();
-                let mut schemas = existing.schemas.clone();
-                let mut file_schemas = existing.file_schemas.clone();
-                files.extend(table_info.files.clone());
-                sizes.extend(table_info.sizes.clone());
-                // TODO: look for existing schemas that match and reuse
-                // NOTE: file schema extend needs to be before schema extend for the index
-                // to be correct here.
-                file_schemas.extend(table_info.files.iter().map(|_|schemas.len() as u64));
-                schemas.push(table_info.schema.as_ref().unwrap().clone());
                 SpeedboatMetadata {
-                    files,
-                    sizes,
-                    schemas,
-                    file_schemas,
+                    files: existing.files.merge(&table_info.as_file_set_payload())
                 }
             },
         };
-
-        assert_eq!(new_speedboat_metadata.files.len(), new_speedboat_metadata.sizes.len());
-        assert_eq!(new_speedboat_metadata.files.len(), new_speedboat_metadata.file_schemas.len());
-
-        let total_size: u64 = new_speedboat_metadata.sizes.iter().sum();
-        //tracing::info!("Speedboat commit {} has {} files with total size {}", new_checkpoint_id, new_speedboat_metadata.files.len(), total_size);
 
         let mut merged_schema = latest_checkpoint.schema.clone();
         if table_info.schema.is_some() {
@@ -893,24 +1158,33 @@ impl TestApiServiceClient {
             speedboat_metadata: Some(new_speedboat_metadata.clone()),
             deletes_metadata: latest_checkpoint.deletes_metadata.clone(),
             extension_metadata: latest_checkpoint.extension_metadata.clone(),
-            schema: merged_schema,
+            schema: merged_schema.clone(),
         };
 
         self.handle_compaction(compactions, &mut new_latest_checkpoint);
+        let (speedboat_files, _) = self.try_fill_checkpoint_extension_metadata(&"es".to_string(), &mut new_latest_checkpoint);
 
         self.checkpoints.insert(format!("{}_{}", &table_info.table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
 
         if sync_index {
             self.create_index(&new_latest_checkpoint).await?;
         } else {
-            match self.index_work_items.get_mut(&table_info.table_name) {
-                Some(checkpoints) => {
-                    checkpoints.push(new_latest_checkpoint.clone());
-                },
-                None => {
-                    let checkpoints = vec!(new_latest_checkpoint.clone());
-                    self.index_work_items.insert(table_info.table_name.clone(), checkpoints);
-                }
+            let es_work_items = self.extension_work_items.get_mut(&"es".to_string()).unwrap();
+            if !es_work_items.contains_key(&table_info.table_name) {
+                es_work_items.insert(
+                    table_info.table_name.clone(),
+                    ExtensionWorkItem {
+                        extension_type: "es".to_string(),
+                        table_name: table_info.table_name.clone(),
+                        table_schema: merged_schema.clone(),
+                        speedboat_files: speedboat_files.clone(),
+                        iceberg_files: FileSetPayload::new()
+                    }
+                );
+            } else {
+                let table_work_item = es_work_items.get_mut(&table_info.table_name).unwrap();
+                table_work_item.table_schema = merged_schema.clone();
+                table_work_item.speedboat_files = table_work_item.speedboat_files.merge(&speedboat_files);
             }
         }
         self.set_latest_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
@@ -919,24 +1193,15 @@ impl TestApiServiceClient {
         match self.compaction_work_items.get_mut(&table_info.table_name) {
             Some(compaction) => {
                 compaction.table_schema = new_latest_checkpoint.schema.clone();
-                compaction.speedboat_files.extend(table_info.files.clone());
-                compaction.sizes.extend(table_info.sizes.clone());
-                // NOTE: file schema extend needs to be before schema extend for the index
-                // to be correct here.
-                compaction.file_schemas.extend(table_info.files.iter().map(|_|compaction.schemas.len() as u64));
-                compaction.schemas.push(table_info.schema.as_ref().unwrap().clone());
+                compaction.speedboat_files = compaction.speedboat_files.merge(&table_info.as_file_set_payload())
             },
             None => {
                 self.compaction_work_items.insert(
                     table_info.table_name.clone(),
                     CompactionWorkItem {
                         table_schema: new_latest_checkpoint.schema.clone(),
-                        speedboat_files: table_info.files.clone(),
-                        schemas: vec!(table_info.schema.as_ref().unwrap().clone()),
-                        file_schemas: table_info.files.iter().map(|_|0).collect(),
-                        sizes: table_info.sizes.clone(),
+                        speedboat_files: table_info.as_file_set_payload(),
                         delete_files: new_latest_checkpoint.deletes_metadata.as_ref().map_or_else(|| vec!(), |m|m.files.clone()),
-                        iceberg_files: vec!(),
                     }
                 );
             }
@@ -960,7 +1225,7 @@ impl TestApiServiceClient {
                     iceberg_metadata: None,
                     speedboat_metadata: None,
                     deletes_metadata: None,
-                    extension_metadata: None,
+                    extension_metadata: HashMap::new(),
                     schema: PowdrrSchema{ fields: vec!() },
                 }
             },
@@ -995,16 +1260,9 @@ impl TestApiServiceClient {
             schema: latest_checkpoint.schema.clone(),
         };
         self.handle_compaction(&compactions, &mut new_latest_checkpoint);
+        self.try_fill_checkpoint_extension_metadata(&"es".to_string(), &mut new_latest_checkpoint);
 
         self.checkpoints.insert(format!("{}_{}", &table_info.table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
-        match self.index_work_items.get_mut(&table_info.table_name) {
-            Some(checkpoints) => {
-                checkpoints.push(new_latest_checkpoint.clone());
-            },
-            None => {
-                self.index_work_items.insert(table_info.table_name.clone(), vec!(new_latest_checkpoint.clone()));
-            }
-        };
         self.set_latest_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
         match self.compaction_work_items.get_mut(&table_info.table_name) {
             Some(work_item) => {
@@ -1016,7 +1274,9 @@ impl TestApiServiceClient {
     }    
 
     async fn create_index(&mut self, new_latest_checkpoint: &TableMetadataCheckpoint) -> Result<(), Box<dyn Error>> {
-        let files = match create_index_inner(new_latest_checkpoint).await {
+        let iceberg_files = new_latest_checkpoint.iceberg_metadata.as_ref().map_or(vec!(), |x|x.files.as_file_tuples());
+        let speedboat_files = new_latest_checkpoint.speedboat_metadata.as_ref().map_or(vec!(), |x|x.files.as_file_tuples());
+        let files = match create_index_inner(&iceberg_files, &speedboat_files).await {
             Ok(files) => files,
             Err(_) => panic!("Unable to create index for {}", new_latest_checkpoint.table_name)
         };
@@ -1024,13 +1284,34 @@ impl TestApiServiceClient {
             &new_latest_checkpoint.table_name,
             &ExtensionCommit {
                 extension: "es".to_string(),
-                checkpoint_id: new_latest_checkpoint.checkpoint_id.clone(),
-                partial_metadata: ExtensionMetadata {
-                    files: files,
-                },
+                files: files
             }
         ).await
     }
+
+    fn get_checkpoint_sync(&self, table_name: &String, checkpoint_id: &String) -> Option<TableMetadataCheckpoint> {
+        let key = format!("{}_{}", table_name, checkpoint_id);
+        self.checkpoints.get(&key).cloned()
+    }
+
+    fn add_coverage_for(&mut self, table_name: &String, checkpoint_id: &String, extension_commit: &ExtensionCommit) -> Option<String> {
+        let key = format!("{}_{}", table_name, checkpoint_id);
+
+        let checkpoint = self.checkpoints.get_mut(&key).unwrap();
+
+        checkpoint.add_coverage(extension_commit);
+
+        if checkpoint.fully_covered_for_extension(&extension_commit.extension) {
+            let key = format!("{}_{}", table_name, extension_commit.extension);
+            if self.checkpoints_needing_extension_work.contains_key(&key) {
+                self.checkpoints_needing_extension_work.get_mut(&key).unwrap().retain(|x|x != checkpoint_id);
+            }
+            Some(checkpoint_id.clone())
+        } else {
+            None
+        }
+    }
+
 }
 
 unsafe impl Sync for TestApiServiceClient {}
@@ -1164,13 +1445,16 @@ impl ApiServiceClient for TestApiServiceClient {
                     iceberg_metadata: None,
                     speedboat_metadata: None,
                     deletes_metadata: None,
-                    extension_metadata: None,
+                    extension_metadata: HashMap::new(),
                     schema: iceberg_commit.metadata.table_schema.clone()
                 }
             },
         };
 
         let new_checkpoint_id = IdInstance::next_id().to_string();
+
+        let mut merged_schema = latest_checkpoint.schema.clone();
+        merged_schema.merge_from(&iceberg_commit.metadata.table_schema);
 
         let mut new_latest_checkpoint = TableMetadataCheckpoint {
             table_name: table_name.clone(),
@@ -1179,34 +1463,54 @@ impl ApiServiceClient for TestApiServiceClient {
             speedboat_metadata: latest_checkpoint.speedboat_metadata.clone(),
             deletes_metadata: latest_checkpoint.deletes_metadata.clone(),
             extension_metadata: latest_checkpoint.extension_metadata.clone(),
-            schema: iceberg_commit.metadata.table_schema.clone(),
+            schema: merged_schema.clone(),
         };
         self.handle_compaction(&iceberg_commit.compactions, &mut new_latest_checkpoint);
+        let (_, iceberg_files) = self.try_fill_checkpoint_extension_metadata(&"es".to_string(), &mut new_latest_checkpoint);
 
         self.checkpoints.insert(format!("{}_{}", &table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
         self.set_latest_checkpoint(&table_name, None, &new_checkpoint_id);
-        Ok(())   
+
+        let es_work_items = self.extension_work_items.get_mut(&"es".to_string()).unwrap();
+        if !es_work_items.contains_key(table_name) {
+            es_work_items.insert(
+                table_name.clone(),
+                ExtensionWorkItem {
+                    extension_type: "es".to_string(),
+                    table_name: table_name.clone(),
+                    table_schema: merged_schema.clone(),
+                    speedboat_files: FileSetPayload::new(),
+                    iceberg_files: iceberg_files.clone(),
+                }
+            );
+        } else {
+            let table_work_item = es_work_items.get_mut(table_name).unwrap();
+            table_work_item.table_schema = merged_schema.clone();
+            table_work_item.iceberg_files = table_work_item.iceberg_files.merge(&iceberg_files);
+        }
+
+        Ok(())
     }
 
     async fn extension_commit(&mut self, table_name: &String, commit: &ExtensionCommit) -> Result<(), Box<dyn std::error::Error>> {
-        // TODO: seems real weird that we aren't updating the checkpoint to include the location of
-        // the produced files?
+        let waiting_checkpoint_ids = self.checkpoints_needing_extension_work(table_name, &commit.extension).unwrap_or_else(|| vec!());
+        assert!(waiting_checkpoint_ids.len() > 0);
 
-        // Index work items can be null on a commit because we are in 'sync' mode
-        match self.index_work_items.get_mut(table_name) {
-            Some(checkpoints) => {
-                checkpoints.retain(|x| x.checkpoint_id != commit.checkpoint_id)
-            },
-            None => ()
-        };
+        let removed_checkpoint_ids: Vec<String> = waiting_checkpoint_ids.iter().map(|x|self.add_coverage_for(table_name, x, commit)).flatten().collect();
+        assert!(removed_checkpoint_ids.len() > 0);
+
+        let max_id = removed_checkpoint_ids.iter().max().unwrap();
+
+        self.add_recent_extension_files(table_name, commit);
+
         match self.get_latest_checkpoint_sync(table_name, Some("es".to_string())) {
             Some(latest) => {
-                if commit.checkpoint_id > latest {
-                    self.set_latest_checkpoint(table_name, Some(&"es".to_string()), &commit.checkpoint_id);
+                if max_id > &latest {
+                    self.set_latest_checkpoint(table_name, Some(&"es".to_string()), max_id);
                 }
             },
             None => {
-                self.set_latest_checkpoint(table_name, Some(&"es".to_string()), &commit.checkpoint_id);
+                self.set_latest_checkpoint(table_name, Some(&"es".to_string()), max_id);
             },
         };
         Ok(())
@@ -1223,23 +1527,29 @@ impl ApiServiceClient for TestApiServiceClient {
         Ok(self.get_latest_checkpoint_sync(table_name, extensions))
     }
 
-    async fn get_checkpoint(&mut self, snapshot: &crate::state_peers::SnapshotDescriptor) -> Result<TableMetadataCheckpoint, Box<dyn std::error::Error>> {
-        let key = format!("{}_{}", snapshot.table_name, snapshot.snapshot_id);
-        match self.checkpoints.get(&key) {
+    async fn get_checkpoint(&mut self, snapshot: &SnapshotDescriptor) -> Result<TableMetadataCheckpoint, Box<dyn std::error::Error>> {
+        match self.get_checkpoint_sync(&snapshot.table_name, &snapshot.snapshot_id) {
             Some(v) => Ok(v.clone()),
             None => panic!("Oh no")
         }
     }
 
-    async fn get_extension_work_items(&mut self, extension_type: &String) -> Result<Vec<TableMetadataCheckpoint>, Box<dyn std::error::Error>> {
+    async fn get_extension_work_items(&mut self, extension_type: &String) -> Result<Vec<ExtensionWorkItem>, Box<dyn std::error::Error>> {
         if extension_type == "es" {
             // TODO: priority by index? allow index filtering?
-            let mut work_items = vec!();
-            for (_table_name, checkpoints) in self.index_work_items.iter() {
-                work_items.extend(checkpoints.iter().map(|c| c.clone()));
-            }
-            self.index_work_items.clear();
-            Ok(work_items)
+            let mut collected_work_items= vec!();
+            match self.extension_work_items.get_mut(extension_type) {
+                Some(items) => {
+                    for (_, work_items) in items.iter_mut() {
+                        if work_items.has_work() {
+                            collected_work_items.push(work_items.clone());
+                            work_items.clear();
+                        }
+                    }
+                },
+                None => ()
+            };
+            Ok(collected_work_items)
         } else {
             Ok(vec!())
         }
@@ -1249,13 +1559,12 @@ impl ApiServiceClient for TestApiServiceClient {
         let mut work_items = vec!();
         for (table_name, compaction) in self.compaction_work_items.iter_mut() {
             tracing::info!("Compaction work item stats: size = {}, files = {}",
-                compaction.sizes.iter().sum::<u64>(),
-                compaction.speedboat_files.len()
+                compaction.speedboat_files.sizes.iter().sum::<u64>(),
+                compaction.speedboat_files.sizes.len()
             );
-            if compaction.sizes.iter().sum::<u64>() > 100 * 1024 * 1024 || compaction.speedboat_files.len() > 200 {
+            if compaction.speedboat_files.sizes.iter().sum::<u64>() > 100 * 1024 * 1024 || compaction.speedboat_files.sizes.len() > 200 {
                 work_items.push((table_name.clone(), compaction.clone()));
                 compaction.speedboat_files.clear();
-                compaction.sizes.clear();
             }
         }
         Ok(work_items)
@@ -1502,7 +1811,7 @@ impl ApiServiceClientHandle {
         recv.await
     }
 
-    pub async fn get_extension_work_items(&self, extension_type: &String) -> Result<Vec<TableMetadataCheckpoint>, RecvError> {
+    pub async fn get_extension_work_items(&self, extension_type: &String) -> Result<Vec<ExtensionWorkItem>, RecvError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::GetExtensionWorkItems {
             respond_to: send,
