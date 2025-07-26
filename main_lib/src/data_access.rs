@@ -53,7 +53,7 @@ fn create_session() -> SessionContext {
         .with_max_cache_bytes(10 * 1024 * 1024 * 1024) // 1GB
         .with_cache_dir(temp_dir.path().to_path_buf())
         .with_cache_mode(LiquidCacheMode::Liquid {
-            transcode_in_background: true,
+            transcode_in_background: false,
         })
         .with_cache_strategy(Box::new(DiscardPolicy))
         .build(config) {
