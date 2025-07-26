@@ -11,7 +11,7 @@ use gotham::prelude::StaticResponseExtender;
 use gotham::state::StateData;
 use serde::Deserialize;
 use std::pin::Pin;
-
+use std::sync::Arc;
 use gotham::handler::HandlerFuture;
 use gotham::hyper::StatusCode;
 use gotham::router::Router;
@@ -21,6 +21,7 @@ use gotham::state::FromState;
 use gotham::hyper::{body, Body};
 use http::HeaderMap;
 use crate::{elastic_search_endpoints, elastic_search_lifetime_policy};
+use crate::compaction::{compact_logs, CompactionCommand};
 use crate::elastic_search_endpoints::NameIdPathExtractor;
 use crate::elastic_search_endpoints::NamePathExtractor;
 use crate::elastic_search_endpoints::QueryStringAliases;
@@ -61,6 +62,35 @@ pub fn private_v1_sql(mut state: State) -> Pin<Box<HandlerFuture>> {
         }
     }.boxed()   
 }
+
+
+pub fn private_v1_compact(mut state: State) -> Pin<Box<HandlerFuture>> {
+    async move {
+        let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
+            Ok(vb) => vb,
+            Err(_) => panic!("Oh no"),
+        };
+        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+        let command: CompactionCommand = match serde_json::from_str(&body_content) {
+            Ok(io) => io,
+            Err(_) => panic!("This should not happen"),
+        };
+        let response = compact_logs(Arc::new(command)).await;
+        match response {
+            Ok(success) => {
+                let res = success.generate_response(&state);
+                Ok((state, res))
+            },
+            Err(error) => {
+                let error_message = format!("{}", error);
+                let res = create_response(&state, StatusCode::BAD_REQUEST, mime::TEXT_PLAIN, error_message);
+                Ok((state, res))
+            }
+        }
+    }.boxed()
+}
+
+
 
 #[derive(Clone, NewMiddleware)]
 pub struct RouterMiddleware;
@@ -126,6 +156,7 @@ pub fn router(include_test_apis: bool) -> Router {
         route.scope("/_private", |route| {
             route.scope("/v1", |route| {
                 route.post("/_sql").to(private_v1_sql);
+                route.post("/_compact").to(private_v1_compact);
             })
         });
 

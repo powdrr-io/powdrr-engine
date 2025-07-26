@@ -25,14 +25,14 @@ use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
 
-use crate::{elastic_search_ingest, state_hosted_service::{CompactionCommit, API_SERVICE_CLIENT}};
+use crate::{state_hosted_service::{CompactionCommit, API_SERVICE_CLIENT}};
 use crate::data_access::execute_sql;
 use crate::elastic_search_commands::to_serde_value;
 use crate::elastic_search_common::{execute_command, Command, CommandContext, CommandError, ElasticSearchResponse, ResultGeneratorFuture};
-use crate::elastic_search_ingest::WriteBuffer;
+use crate::elastic_search_ingest::{write_to_file, WriteBuffer};
 use crate::schema_massager::{PowdrrSchema, SqlBuilder};
-use crate::state_hosted_service::{CompactionWorkItem, FileSetPayload, IcebergCommit, IcebergMetadata};
-use crate::state_peers::{PrivateCompactionInvocation, PrivateInvocation};
+use crate::state_hosted_service::{CompactionWorkItem, FileSetPayload, IcebergCommit, IcebergMetadata, SpeedboatCommit, SpeedboatCommitTableInfo};
+use crate::state_peers::{get_peer_clients, PrivateCompactionInvocation, PrivateInvocation};
 
 
 const REST_CATALOG_IP: &str = "localhost";
@@ -40,8 +40,7 @@ const REST_CATALOG_PORT: i16 = 8181;
 const S3_ENDPOINT_VALUE: &str = "http://localhost:9000";
 const S3_ACCESS_KEY_ID_VALUE: &str = "admin";
 const S3_SECRET_ACCESS_KEY_VALUE: &str = "password";
-const S3_REGION_VALUE: &str = "us-east-1";
-const MIN_PARQUET_SIZE: usize = 2; // TODO: figure out a good number here
+const S3_REGION_VALUE: &str = "us-east-1"; // TODO: figure out a good number here
 
 
 fn get_iceberg_catalog_config() -> RestCatalogConfig {
@@ -165,7 +164,7 @@ pub enum CompactionResult {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct IcebergLibMetadata {
     pub snapshot_id: i64,
     pub files: Vec<String>,
@@ -262,7 +261,18 @@ pub async fn load_table_metadata(namespace: &String, name: &String, last_snapsho
 }
 
 
-struct CompactionCommand {
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(crate) struct CompactionResponse {
+    pub table_name: String,
+    pub lib_metadata: IcebergLibMetadata,
+    pub schema: PowdrrSchema,
+    pub deletes_table_info: Option<SpeedboatCommitTableInfo>,
+    pub compactions: Vec<String>
+}
+
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(crate) struct CompactionCommand {
     table: String,
     work_item: CompactionWorkItem,
     compaction_id: String,
@@ -337,36 +347,23 @@ impl CompactionCommand {
         ).await
     }
 
-    async fn do_iceberg_commit(table_name: &String, schema: &PowdrrSchema, last_snapshot_id: i64, deletes_buffer: &WriteBuffer) -> Result<i64, iceberg::Error> {
-        tracing::info!("!!!!!!!!!!!!!!!!!!!!!!!! Trying to read Iceberg Metadata !!!!!!!!!!!!!!!!!!!!!!!");
-        let lib_metadata = match load_table_metadata(
-            &"default".to_string(),
-            table_name,
-            last_snapshot_id
-        ).await {
-            Ok(m) => m,
-            Err(e) => {
-                let error = format!("{}", e);
-                tracing::info!("Iceberg Metadata load failed: {}", error);
-                return Err(e)
-            },
-        };
+    async fn do_iceberg_commit(compaction_response: &CompactionResponse) -> Result<i64, iceberg::Error> {
         match API_SERVICE_CLIENT.iceberg_commit(
-            table_name,
+            &compaction_response.table_name,
             &IcebergCommit {
                 metadata: IcebergMetadata {
-                    table_schema: schema.clone(),
-                    snapshot_id: lib_metadata.snapshot_id.to_string(),
+                    table_schema: compaction_response.schema.clone(),
+                    snapshot_id: compaction_response.lib_metadata.snapshot_id.to_string(),
                     files: FileSetPayload {
-                        file_paths: lib_metadata.files.clone(),
-                        schemas: vec!(schema.clone()),
-                        file_schemas: lib_metadata.files.iter().map(|_|0).collect(),
-                        sizes: lib_metadata.sizes
+                        file_paths: compaction_response.lib_metadata.files.clone(),
+                        schemas: vec!(compaction_response.schema.clone()),
+                        file_schemas: compaction_response.lib_metadata.files.iter().map(|_|0).collect(),
+                        sizes: compaction_response.lib_metadata.sizes.clone()
                     },
-                    column_names: lib_metadata.column_names,
-                    column_stats: lib_metadata.column_stats,
+                    column_names: compaction_response.lib_metadata.column_names.clone(),
+                    column_stats: compaction_response.lib_metadata.column_stats.clone(),
                 },
-                compactions: lib_metadata.compactions.clone(),
+                compactions: compaction_response.lib_metadata.compactions.clone(),
             }
         ).await {
             Ok(_) => (),
@@ -379,18 +376,17 @@ impl CompactionCommand {
         // worst case is that the next compaction sees all the same deletes in the same
         // files and once again tries to compact them.
 
-        match elastic_search_ingest::commit_speedboat(
-            table_name,
-            &WriteBuffer::empty(),
-            deletes_buffer,
-            &lib_metadata.compactions,
-            &"compact".to_string(),
-        ).await {
-            Ok(_) => (),
-            Err(e) => return Err(iceberg::Error::new(iceberg::ErrorKind::DataInvalid, format!("Iceberg commit failed, {}", e))),
-        };
+        if compaction_response.deletes_table_info.is_some() {
+            match API_SERVICE_CLIENT.speedboat_commit(&SpeedboatCommit {
+                type_files: vec!(compaction_response.deletes_table_info.as_ref().unwrap().clone()),
+                compactions: compaction_response.compactions.clone(),
+            }).await {
+                Ok(_) => (),
+                Err(_) => panic!("nope")
+            }
+        }
 
-        return Ok(lib_metadata.snapshot_id)
+        return Ok(compaction_response.lib_metadata.snapshot_id)
     }
 
 }
@@ -407,12 +403,12 @@ impl Command for CompactionCommand {
     }
 
     fn result_generator(&self, result_table_name: Option<String>) -> Pin<Box<ResultGeneratorFuture>> {
-        let table = self.table.clone();
+        let public_table_name = self.table.clone();
         let compactions = vec!(self.compaction_id.clone());
         let schema = self.work_item.table_schema.clone();
         let old_snapshot_id = self.last_snapshot_id;
         async move {
-            let table_name = match result_table_name {
+            let internal_df_table_name = match result_table_name {
                 Some(t) => t,
                 None => {
                     // TODO: After this compaction there is....nothing?
@@ -426,11 +422,11 @@ impl Command for CompactionCommand {
                     });
                 }
             };
-            let remaining_deletes_data_frame = match execute_sql(&format!("select _dt_id_seq_no as _id_seq_no from {table_name} where _id is null and _dt_id_seq_no is not null")).await {
+            let remaining_deletes_data_frame = match execute_sql(&format!("select _dt_id_seq_no as _id_seq_no from {internal_df_table_name} where _id is null and _dt_id_seq_no is not null")).await {
                 Ok(df) => df,
                 Err(e) => return Err(CommandError{ message: e.to_string() })
             };
-            let results_data_frame = match execute_sql(&format!("select * from {table_name} where _id is not null and _dt_id_seq_no is null")).await {
+            let results_data_frame = match execute_sql(&format!("select * from {internal_df_table_name} where _id is not null and _dt_id_seq_no is null")).await {
                 Ok(df) => {
                     match df.drop_columns(&["_dt_id", "_dt_seq_no", "_dt_id_seq_no"]) {
                         Ok(df) => df,
@@ -443,67 +439,75 @@ impl Command for CompactionCommand {
             let deletes_serde_result = to_serde_value(&remaining_deletes_data_frame).await?;
             let deletes_buffer = WriteBuffer::delete(deletes_serde_result.values.iter().map(|x| serde_json::to_string(x).unwrap()).collect());
 
-            let results_count = match results_data_frame.clone().count().await {
-                Ok(c) => c,
+            tracing::info!("!!!!!!!!!!!!!!!!!!!! Compacting to Iceberg !!!!!!!!!!!!!!!!!!!!!!!");
+            // TODO: if nulls can come out there that probably means we need to intercept earlier
+            // in the pipeline to cast nulls to real types.
+            let null_fields = results_data_frame.schema().fields().iter()
+                .filter(|f| f.data_type() == &DataType::Null || f.metadata().get(PARQUET_FIELD_ID_META_KEY).is_none())
+                .map(|f|f.name().as_str())
+                .collect::<Vec<&str>>();
+            let non_null_results = match results_data_frame.clone().drop_columns(null_fields.as_slice()) {
+                Ok(df) => df,
                 Err(e) => return Err(CommandError{ message: e.to_string() })
             };
 
-            let new_snapshot_id: i64 = if results_count < MIN_PARQUET_SIZE {
-                let values_serde_result = to_serde_value(&results_data_frame).await?;
-
-                let result_buffer = WriteBuffer::insert_and_update(
-                    schema,
-                    values_serde_result.values.iter().map(|x| serde_json::to_string(x).unwrap()).collect()
-                );
-                match elastic_search_ingest::commit_speedboat(
-                    &table,
-                    &result_buffer,
-                    &deletes_buffer,
-                    &compactions,
-                    &"compact".to_string(),
-                ).await {
-                    Ok(_) => (),
-                    Err(e) => return Err(CommandError{ message: e.message.clone() })
-                };
-
-                old_snapshot_id
-            } else {
-                tracing::info!("!!!!!!!!!!!!!!!!!!!! Compacting to Iceberg !!!!!!!!!!!!!!!!!!!!!!!");
-                // TODO: if nulls can come out there that probably means we need to intercept earlier
-                // in the pipeline to cast nulls to real types.
-                let null_fields = results_data_frame.schema().fields().iter()
-                    .filter(|f| f.data_type() == &DataType::Null || f.metadata().get(PARQUET_FIELD_ID_META_KEY).is_none())
-                    .map(|f|f.name().as_str())
-                    .collect::<Vec<&str>>();
-                let non_null_results = match results_data_frame.clone().drop_columns(null_fields.as_slice()) {
-                    Ok(df) => df,
-                    Err(e) => return Err(CommandError{ message: e.to_string() })
-                };
-
-                let data = match non_null_results.collect().await {
-                    Ok(d) => d,
-                    Err(e) => return Err(CommandError{ message: e.to_string() })
-                };
-
-                assert_eq!(compactions.len(), 1);
-                Self::update_iceberg(
-                    &data,
-                    &table,
-                    &compactions[0]
-                ).await.unwrap();
-
-                Self::do_iceberg_commit(
-                    &table,
-                    &schema,
-                    0,
-                    &deletes_buffer
-                ).await.unwrap()
+            let data = match non_null_results.collect().await {
+                Ok(d) => d,
+                Err(e) => return Err(CommandError{ message: e.to_string() })
             };
+
+            assert_eq!(compactions.len(), 1);
+            Self::update_iceberg(
+                &data,
+                &public_table_name,
+                &compactions[0]
+            ).await.unwrap();
+
+            let lib_metadata = match load_table_metadata(
+                &"default".to_string(),
+                &public_table_name,
+                old_snapshot_id
+            ).await {
+                Ok(m) => m,
+                Err(e) => {
+                    let error = format!("{}", e);
+                    tracing::info!("Iceberg Metadata load failed: {}", error);
+                    return Err(CommandError{ message: e.to_string() })
+                },
+            };
+
+            let deletes_table_info = if deletes_buffer.total_size() > 0 {
+                let deletes_path = match write_to_file(&deletes_buffer, &public_table_name, &"delete".to_string()) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        return Err(CommandError{ message: e.to_string() })
+                    }
+                };
+                Some(SpeedboatCommitTableInfo {
+                    commit_type: "delete".to_string(),
+                    table_name: public_table_name.clone(),
+                    files: vec!(deletes_path),
+                    sizes: vec!(deletes_buffer.total_size()),
+                    schema: deletes_buffer.schema(),
+                })
+            } else {
+                None
+            };
+
+            let command_response = CompactionResponse {
+                table_name: public_table_name.clone(),
+                lib_metadata,
+                schema,
+                deletes_table_info,
+                compactions,
+            };
+
+
 
             Ok(ElasticSearchResponse {
                 status: StatusCode::OK,
                 mime: mime::TEXT_PLAIN,
-                body: new_snapshot_id.to_string(),
+                body: serde_json::to_string(&command_response).unwrap(),
                 headers: vec![],
             })
         }.boxed()
@@ -511,11 +515,11 @@ impl Command for CompactionCommand {
 }
 
 
-async fn compact_logs(command: Arc<dyn Command>) -> Result<i64, CompactionError>{
+pub(crate) async fn compact_logs(command: Arc<dyn Command>) -> Result<ElasticSearchResponse, CompactionError> {
     tracing::info!("!!!!!!!!!!!!!!!!!!!! Compacting Start !!!!!!!!!!!!!!!!!!!!!!!");
     let response = execute_command(CommandContext{}, command).await;
     tracing::info!("!!!!!!!!!!!!!!!!!!!! Compacting End !!!!!!!!!!!!!!!!!!!!!!!");
-    Ok(response.body.parse::<i64>().unwrap())
+    Ok(response)
 }
 
 
@@ -543,10 +547,20 @@ pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkIt
             table: table_name.clone(),
             work_item: work_item.clone(),
             compaction_id: compaction_id.clone(),
-            last_snapshot_id: last_snapshot_id,
+            last_snapshot_id,
         };
 
-        new_last_snapshot_id = compact_logs(Arc::new(command)).await?;
+        let peers = get_peer_clients();
+        assert!(peers.len() > 0);
+        let response = match peers[0].private_compaction_leader(&command).await {
+            Ok(success) => success,
+            Err(e) => return Err(CompactionError{ message: e.to_string() })
+        };
+
+        new_last_snapshot_id = match CompactionCommand::do_iceberg_commit(&response).await {
+            Ok(id) => id,
+            Err(e) => return Err(CompactionError{ message: e.to_string() })
+        }
     }
    
     Ok(new_last_snapshot_id)
