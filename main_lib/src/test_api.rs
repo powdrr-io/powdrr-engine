@@ -14,6 +14,13 @@ pub(crate) struct TestCreateIndex {
 }
 
 
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct TestProcessingMode {
+    pub sync_indexing: Option<bool>,
+    pub compaction_leader: Option<String>
+}
+
+
 pub fn test_v1_create_index(mut state: State) -> Pin<Box<HandlerFuture>> {
     async move {
         let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
@@ -55,7 +62,7 @@ pub fn test_v1_add_checkpoint(mut state: State) -> Pin<Box<HandlerFuture>> {
 
 pub fn test_v1_set_testing_mode(state: State) -> Pin<Box<HandlerFuture>> {
     async {
-        API_SERVICE_CLIENT.set_testing_mode(false).await;
+        API_SERVICE_CLIENT.set_testing_mode(&TestProcessingMode{ sync_indexing: None, compaction_leader: None }).await;
         let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "Ok");
         Ok((state, res))        
     }.boxed()
@@ -146,9 +153,20 @@ fn do_compaction_work_for_forever(wait_time_ms: u64) -> impl Future<Output = ()>
 
 
 
-pub fn test_v1_set_testing_processing_mode(state: State) -> Pin<Box<HandlerFuture>> {
+pub fn test_v1_set_testing_processing_mode(mut state: State) -> Pin<Box<HandlerFuture>> {
     async {
-        API_SERVICE_CLIENT.set_testing_mode(false).await;
+        let mode = match body::to_bytes(Body::take_from(&mut state)).await {
+            Ok(vb) => {
+                let body_content = String::from_utf8(vb.to_vec()).unwrap();
+                match serde_json::from_str(&body_content) {
+                    Ok(io) => io,
+                    Err(_) => panic!("This should not happen"),
+                }
+            },
+            Err(_) => TestProcessingMode{ sync_indexing: None, compaction_leader: None }
+        };
+
+        API_SERVICE_CLIENT.set_testing_mode(&mode).await;
         tokio::spawn(do_extension_work_for_forever(vec!("es".to_string()), 1000));
         tokio::spawn(do_compaction_work_for_forever(1000));
         let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "Ok");

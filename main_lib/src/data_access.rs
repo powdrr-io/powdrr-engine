@@ -50,7 +50,7 @@ fn create_session() -> SessionContext {
     let temp_dir = TempDir::new().unwrap();
 
     let (ctx, _) = match LiquidCacheInProcessBuilder::new()
-        .with_max_cache_bytes(10 * 1024 * 1024 * 1024) // 1GB
+        .with_max_cache_bytes(10 * 1024 * 1024 * 1024) // 10GB
         .with_cache_dir(temp_dir.path().to_path_buf())
         .with_cache_mode(LiquidCacheMode::Liquid {
             transcode_in_background: false,

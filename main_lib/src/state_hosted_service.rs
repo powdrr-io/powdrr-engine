@@ -11,7 +11,8 @@ use crate::compaction::drop_all_tables;
 use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::schema_massager::PowdrrSchema;
-
+use crate::state_peers::{PeerClient, SelfPeer};
+use crate::test_api::TestProcessingMode;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct SpeedboatCSpeedInfo {
@@ -375,6 +376,8 @@ pub(crate) trait ApiServiceClient : Send + Sync {
     async fn get_extension_work_items(&mut self, extension_name: &String) -> Result<Vec<ExtensionWorkItem>, Box<dyn Error>>;
 
     async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, Box<dyn Error>>;
+
+    async fn get_peer_clients(&mut self) -> Result<Vec<Box<dyn PeerClient>>, Box<dyn Error>>;
 }
 
 
@@ -389,7 +392,7 @@ struct ApiServiceClientActor {
 enum ApiServiceClientActorMessage {
     Testing {
         respond_to: oneshot::Sender<()>,
-        sync_index: bool,
+        mode: TestProcessingMode,
     },
     CreatePipeline {
         respond_to: oneshot::Sender<()>,
@@ -476,6 +479,9 @@ enum ApiServiceClientActorMessage {
     GetCompactionWorkItems {
         respond_to: oneshot::Sender<Vec<(String, CompactionWorkItem)>>,
     },
+    GetPeerClients {
+        respond_to: oneshot::Sender<Vec<Box<dyn PeerClient>>>,
+    },
 }
 
 unsafe impl Send for ApiServiceClientActorMessage {}
@@ -494,9 +500,9 @@ impl ApiServiceClientActor {
 
     async fn handle_message(&mut self, msg: ApiServiceClientActorMessage) {
         match msg {
-            ApiServiceClientActorMessage::Testing { respond_to, sync_index } => {
+            ApiServiceClientActorMessage::Testing { respond_to, mode } => {
                 self.test_mode = true;
-                self.sync_index = sync_index;
+                self.sync_index = mode.sync_indexing.unwrap_or(false);
                 self.test.clear().await;
                 let _ = respond_to.send(());
             },
@@ -628,6 +634,13 @@ impl ApiServiceClientActor {
                     let _ = respond_to.send(self.test.get_compaction_work_items().await.expect("nope"));
                 } else {
                     let _ = respond_to.send(self.real.get_compaction_work_items().await.expect("nope"));
+                }
+            },
+            ApiServiceClientActorMessage::GetPeerClients { respond_to } => {
+                if self.test_mode {
+                    let _ = respond_to.send(self.test.get_peer_clients().await.expect("nope"));
+                } else {
+                    let _ = respond_to.send(self.real.get_peer_clients().await.expect("nope"));
                 }
             },
         }
@@ -841,6 +854,10 @@ impl ApiServiceClient for RealApiServiceClient {
     }
 
     async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, Box<dyn Error>> {
+        todo!("nope")
+    }
+
+    async fn get_peer_clients(&mut self) -> Result<Vec<Box<dyn PeerClient>>, Box<dyn Error>> {
         todo!("nope")
     }
 
@@ -1559,6 +1576,10 @@ impl ApiServiceClient for TestApiServiceClient {
         }
         Ok(work_items)
     }
+
+    async fn get_peer_clients(&mut self) -> Result<Vec<Box<dyn PeerClient>>, Box<dyn Error>> {
+        Ok(vec!(Box::new(SelfPeer::new())))
+    }
 }
 
 #[derive(Clone)]
@@ -1575,11 +1596,11 @@ impl ApiServiceClientHandle {
         Self { sender }
     }
 
-    pub async fn set_testing_mode(&self, sync_index: bool) -> () {
+    pub async fn set_testing_mode(&self, mode: &TestProcessingMode) -> () {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::Testing { 
             respond_to: send,
-            sync_index: sync_index,
+            mode: mode.clone(),
         };
 
         let _ = self.sender.send(msg).await;
@@ -1816,6 +1837,17 @@ impl ApiServiceClientHandle {
     pub async fn get_compaction_work_items(&self) -> Result<Vec<(String, CompactionWorkItem)>, RecvError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::GetCompactionWorkItems {
+            respond_to: send,
+        };
+
+        let _ = self.sender.send(msg).await;
+        // TODO: deal with errors
+        recv.await
+    }
+
+    pub async fn get_peer_clients(&self) -> Result<Vec<Box<dyn PeerClient>>, RecvError> {
+        let (send, recv) = oneshot::channel();
+        let msg = ApiServiceClientActorMessage::GetPeerClients {
             respond_to: send,
         };
 
