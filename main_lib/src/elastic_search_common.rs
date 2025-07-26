@@ -20,7 +20,7 @@ use serde_json::{Map, Value};
 use crate::data_access;
 use crate::data_access::load_memtable;
 use crate::elastic_search_responses::QueryFailure;
-use crate::state_peers::{self, PeerClient, PeerClientError, PrivateInvocation};
+use crate::state_peers::{self, PeerClient, PeerClientError, PrivateInvocation, PrivateInvocationResult};
 
 
 pub(crate) const MIME_ES_JSON: LazyLock<Mime> = LazyLock::new(|| "application/vnd.elasticsearch+json;compatible-with=8".parse().unwrap());
@@ -92,62 +92,69 @@ pub(crate) async fn call_private_sql(
     invocation: &PrivateInvocation,
     index: u64,
     num: u64,
-) -> Result<Vec<RecordBatch>, PeerClientError> {
+) -> Result<PrivateInvocationResult, PeerClientError> {
     match invocation {
         PrivateInvocation::Sql(sql_invocation) => {
-            peer_client.private_sql(sql_invocation, index, num).await
+            match peer_client.private_sql(sql_invocation, index, num).await {
+                Ok(data) => Ok(PrivateInvocationResult::Data(data)),
+                Err(e) => Err(e),
+            }
         },
         PrivateInvocation::Compaction(compaction_invocation) => {
-            peer_client.private_compaction(compaction_invocation, index, num).await
+            match peer_client.private_compaction(compaction_invocation, index, num).await {
+                Ok(data) => Ok(PrivateInvocationResult::Data(data)),
+                Err(e) => Err(e),
+            }
+        },
+        PrivateInvocation::Extension(extension_invocation) => {
+            match peer_client.private_extension(extension_invocation, index, num).await {
+                Ok(result) => Ok(PrivateInvocationResult::Extension(result)),
+                Err(e) => Err(e),
+            }
         }
     }
 }
 
 
-pub(crate) async fn call_private_sql_and_load(
-    peer_client: &dyn PeerClient,
-    invocation: &PrivateInvocation,
-    index: u64,
-    num: u64,
-) -> Result<Option<Vec<RecordBatch>>, PeerClientError> {
-    match call_private_sql(peer_client, invocation, index, num).await {
-        Ok(r) => Ok(Some(r)),
-        Err(e) => Err(e),
-    }
-}
-
-
-async fn call_peers_and_load_results(
+pub async fn call_peers(
     invocation: &PrivateInvocation
-) -> Result<Option<String>, PeerClientError> {
+) -> Result<Vec<PrivateInvocationResult>, PeerClientError> {
     let peer_clients: Vec<Box<dyn PeerClient>> = state_peers::get_peer_clients();
 
     let all_calls = peer_clients.iter().enumerate().map(
-        |(index, client)| call_private_sql_and_load(client.as_ref(), invocation, index as u64, peer_clients.len() as u64));
-    let all_records: Vec<RecordBatch> = match try_join_all(all_calls).await {
-        Ok(ar) => ar.iter().filter(|x| x.is_some()).map(|x| x.clone().unwrap()).flatten().collect(),
-        Err(e) => {
-            let error = format!("{}", e.message);
-            println!("{}", error);
-            panic!("dude")
-        },
-    };
-    if all_records.len() == 0 {
-        return Ok(None)
-    }
-
-    let table_name = match load_memtable(&all_records).await {
-        Ok(name) => name,
-        Err(e) => return Err(PeerClientError{ message: e.message().to_string() })
-    };
-
-    Ok(Some(table_name))
+        |(index, client)| call_private_sql(client.as_ref(), invocation, index as u64, peer_clients.len() as u64));
+    try_join_all(all_calls).await
 }
 
 
 pub async fn load_command_raw_result(_context: CommandContext, command: Arc<dyn Command>) -> Result<Option<String>, PeerClientError> {
     let invocation = command.get_private_invocation().await;
-    call_peers_and_load_results(&invocation).await
+    let all_results = match call_peers(&invocation).await {
+        Ok(results) => results,
+        Err(e) => return Err(e)
+    };
+
+    if all_results.len() == 0 {
+        return Ok(None)
+    }
+
+    let all_records = all_results.iter().map(|x| {
+        match x {
+            PrivateInvocationResult::Extension(_) => panic!("Unexpected"),
+            PrivateInvocationResult::Data(data) => data.clone(),
+        }
+    }).flatten().collect::<Vec<RecordBatch>>();
+
+    if all_records.len() != 0 {
+        let table_name = match load_memtable(&all_records).await {
+            Ok(name) => name,
+            Err(e) => return Err(PeerClientError { message: e.message().to_string() })
+        };
+
+        Ok(Some(table_name))
+    } else {
+        Ok(None)
+    }
 }
 
 

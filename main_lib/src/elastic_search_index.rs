@@ -1,9 +1,12 @@
 use std::fmt::Display;
 use datafusion::{arrow::datatypes::DataType, dataframe::DataFrameWriteOptions};
 use datafusion::error::DataFusionError;
-use crate::{data_access, data_access::{execute_sql, exists}, state_hosted_service::{ExtensionCommit, ExtensionFile, ExtensionFileMetadata, ExtensionMetadata, TableMetadataCheckpoint, API_SERVICE_CLIENT}, util::add_file_suffix};
+use crate::{data_access, data_access::{execute_sql, exists}, state_hosted_service::{ExtensionCommit, ExtensionFile, API_SERVICE_CLIENT}, util::add_file_suffix};
 use crate::data_access::load_file_as_table;
+use crate::elastic_search_common::call_peers;
 use crate::schema_massager::PowdrrSchema;
+use crate::state_hosted_service::{ExtensionFileMetadata, ExtensionWorkItem, FileDescriptor};
+use crate::state_peers::{PrivateExtensionInvocation, PrivateInvocation, PrivateInvocationResult};
 
 pub(crate) struct IndexError {
     pub message: String,
@@ -165,8 +168,6 @@ pub(crate) async fn create_index_jsonl(file_path: &String, doc_id_field_name: &S
     match result {
         Err(e) => {
             data_access::release(&top_level_name).await;
-            let error = format!("{}", e);
-            println!("{}", error);
             return Err(IndexError::from(e))
         },
         Ok(_) => ()
@@ -215,70 +216,84 @@ pub(crate) async fn create_index_parquet(file_path: &String, doc_id_field_name: 
 }
 
 
-pub(crate) async fn create_index(table_metadata: &TableMetadataCheckpoint) -> Result<(), IndexError> {
-    let files = create_index_inner(table_metadata).await?;
-    if files.len() > 0 {
-        match API_SERVICE_CLIENT.extension_commit(
-            &table_metadata.table_name,
-            &ExtensionCommit {
-                extension: "es".to_string(),
-                checkpoint_id: table_metadata.checkpoint_id.clone(),
-                partial_metadata: ExtensionMetadata {
-                    files,
-                },
-            }
-        ).await {
-            Ok(_) => (),
-            Err(e) => return Err(IndexError{ message: format!("{}", e)}),
+pub(crate) async fn create_index(work_item: &ExtensionWorkItem) -> Result<(), IndexError> {
+    let invocation = PrivateInvocation::Extension(PrivateExtensionInvocation {
+        extension_name: work_item.extension_type.clone(),
+        speedboat_files: work_item.speedboat_files.clone(),
+        iceberg_files: work_item.iceberg_files.clone(),
+    });
+
+    let results = match call_peers(&invocation).await {
+        Ok(output) => {
+            output.iter().map(|r| {
+                match r {
+                    PrivateInvocationResult::Data(_) => panic!("Unexpected result from peer calls while indexing"),
+                    PrivateInvocationResult::Extension(files) => files.clone(),
+                }
+            }).collect::<Vec<ExtensionFileMetadata>>()
+        },
+        Err(e) => {
+            return Err(IndexError{ message: e.message.clone() })
         }
+    };
+
+    assert!(results.len() > 0);
+
+    let mut final_result = ExtensionFileMetadata::new();
+    for result in results {
+        final_result.extend(result);
+    }
+
+    match API_SERVICE_CLIENT.extension_commit(
+        &work_item.table_name,
+        &ExtensionCommit {
+            extension: "es".to_string(),
+            files: final_result.clone()
+        }
+    ).await {
+        Ok(_) => (),
+        Err(e) => return Err(IndexError{ message: format!("{}", e)}),
     }
 
     Ok(())
 }
 
-pub(crate) async fn create_index_inner(table_metadata: &TableMetadataCheckpoint) -> Result<Vec<ExtensionFileMetadata>, IndexError> {
-    let mut files: Vec<ExtensionFileMetadata> = vec!();
+pub(crate) async fn create_index_inner(iceberg_files: &Vec<FileDescriptor>, speedboat_files: &Vec<FileDescriptor>) -> Result<ExtensionFileMetadata, IndexError> {
+    let mut files = ExtensionFileMetadata::new();
 
-    match &table_metadata.iceberg_metadata {
-        Some(im) => {
-            for file_path in im.files.iter() {
-                match create_index_parquet(file_path, &"_id_seq_no".to_string()).await {
-                    Ok(output) => match output {
-                        Some(extension_file_path) => files.push(ExtensionFileMetadata {
-                            data_file_location: file_path.clone(),
-                            extension_file_locations: vec!(ExtensionFile{ suffix: "_search_index".to_string(), location: extension_file_path.clone() }),
-                        }),
-                        None => (),
-                    },
-                    Err(e) => {
-                        let error = format!("{}", e);
-                        println!("{}", error);
-                        panic!("nope");
-                    },
-                }
-            }
-        },
-        None => (),
-    };
+    for file_desc in iceberg_files {
+        match create_index_parquet(&file_desc.file_path, &"_id_seq_no".to_string()).await {
+            Ok(output) => match output {
+                Some(extension_file_path) => {
+                    files.insert(
+                        file_desc.file_path.clone(),
+                        vec!(ExtensionFile{ suffix: "_search_index".to_string(), location: extension_file_path.clone() }),
+                    );
+                },
+                None => (),
+            },
+            Err(e) => {
+                let error = format!("{}", e);
+                println!("{}", error);
+                panic!("nope");
+            },
+        }
+    }
 
-    match &table_metadata.speedboat_metadata {
-        Some(im) => {
-            for (file_path, schema_index) in im.files.iter().zip(im.file_schemas.iter()) {
-                let powdrr_schema = &im.schemas[*schema_index as usize];
-                match create_index_jsonl(file_path, &"_id_seq_no".to_string(), powdrr_schema).await {
-                    Ok(output) => match output {
-                        Some(extension_file_path) => files.push(ExtensionFileMetadata {
-                            data_file_location: file_path.clone(),
-                            extension_file_locations: vec!(ExtensionFile{ suffix: "_search_index".to_string(), location: extension_file_path.clone() }),
-                        }),
-                        None => (),
-                    },
-                    Err(_) => panic!("nope"),
-                }
-            }
-        },
-        None => (),
-    };
+    for file_desc in speedboat_files {
+        match create_index_jsonl(&file_desc.file_path, &"_id_seq_no".to_string(), &file_desc.schema).await {
+            Ok(output) => match output {
+                Some(extension_file_path) => {
+                    files.insert(
+                        file_desc.file_path.clone(),
+                        vec!(ExtensionFile{ suffix: "_search_index".to_string(), location: extension_file_path.clone() }),
+                    );
+                },
+                None => (),
+            },
+            Err(_) => panic!("nope"),
+        }
+    }
     Ok(files)
 }
 

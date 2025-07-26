@@ -1,4 +1,3 @@
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::{error::Error, fmt};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
@@ -10,8 +9,9 @@ use idgenerator::IdInstance;
 use prost::Message;
 
 use crate::data_access::{self, load_file_as_table};
+use crate::elastic_search_index::create_index_inner;
 use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema, SqlQuery};
-use crate::state_peers::{PrivateCompactionInvocation, PrivateSqlInvocation};
+use crate::state_peers::{PrivateCompactionInvocation, PrivateExtensionInvocation, PrivateSqlInvocation};
 use crate::state_hosted_service::*;
 use crate::util::{add_file_suffix, log_err};
 
@@ -50,14 +50,6 @@ pub(crate) struct DataQueryResult {
 }
 
 
-#[derive(Clone, Debug)]
-struct FileDescriptor {
-    file_path: String,
-    schema: PowdrrSchema,
-    size: u64,
-}
-
-
 #[derive(Debug)]
 struct RequiredFiles {
     table_schema: PowdrrSchema,
@@ -69,49 +61,23 @@ struct RequiredFiles {
 }
 
 
-fn selected_file(file_path: &String, index: u64, num: u64) -> bool {
-    // TODO: validate this is a stable hash (aka it will give the same value on every machine on every run)
-    let mut hasher = DefaultHasher::new();
-    file_path.hash(&mut hasher);
-    let hash_val = hasher.finish();
-    hash_val % num == index
-}
-
-
-fn matches_filter(_iceberg_metadata: &IcebergMetadata, _index: usize, _file_path: &String) -> bool {
-    true
-}
-
-
 fn filter_iceberg<'a>(iceberg_metadata: &'a Option<IcebergMetadata>, index: u64, num: u64) -> Vec<FileDescriptor> {
     match iceberg_metadata {
         Some(im) => {
-            let mut filtered_files = vec!();
-            for (idx, (file_path, size)) in im.files.iter().zip(im.sizes.iter()).enumerate() {
-                if !selected_file(file_path, index, num) {
-                    continue;
-                }
-                if matches_filter(im, idx, file_path) {
-                    let schema_index = *im.file_schemas.get(idx).unwrap() as usize;
-                    let schema = im.schemas.get(schema_index).unwrap().clone();
-                    filtered_files.push(FileDescriptor{ file_path: file_path.clone(), schema, size: size.clone() });
-                }
-            }
-        
+            let filtered_files = im.files.as_selected_tuples(index, num);
+            // TODO: apply filters
             filtered_files
         },
         None => vec!()
     }    
 }
 
-fn filter_speedboat<'a>(_invocation: &'a PrivateSqlInvocation, speedboat_metadata: &'a Option<SpeedboatMetadata>) -> Vec<FileDescriptor> {
+fn filter_speedboat<'a>(_invocation: &'a PrivateSqlInvocation, speedboat_metadata: &'a Option<SpeedboatMetadata>, index: u64, num: u64) -> Vec<FileDescriptor> {
     match speedboat_metadata {
         Some(sm) => {
-            sm.files.iter().enumerate().map(|(index, file_path)|FileDescriptor{
-                file_path: file_path.clone(),
-                schema: sm.schemas.get(*sm.file_schemas.get(index).unwrap() as usize).unwrap().clone(),
-                size: sm.sizes.get(index).unwrap().clone(),
-            }).collect()
+            let files = sm.files.as_selected_tuples(index, num);
+            // TODO: apply filters
+            files
         },
         None => vec!()
     }
@@ -132,7 +98,7 @@ async fn determine_required_files(invocation: &PrivateSqlInvocation, index: u64,
     // TODO: add logic to select the iceberg and speedboat files for this host.
 
     let filtered_iceberg_files = filter_iceberg(&table_metadata.iceberg_metadata, index, num);
-    let filtered_speedboat_files = filter_speedboat(invocation, &table_metadata.speedboat_metadata);
+    let filtered_speedboat_files = filter_speedboat(invocation, &table_metadata.speedboat_metadata, index, num);
     Ok(RequiredFiles {
         table_schema: table_metadata.schema.clone(),
         iceberg_files: filtered_iceberg_files.to_vec(),
@@ -144,19 +110,7 @@ async fn determine_required_files(invocation: &PrivateSqlInvocation, index: u64,
 }
 
 fn generate_required_files(invocation: &PrivateCompactionInvocation, index: u64, num: u64) -> RequiredFiles {
-    let speedboat_files = invocation.speedboat_files.iter().zip(invocation.file_schemas.iter()).map(
-        |(file_path, schema_index)| {
-            if selected_file(file_path, index, num) {
-                Some(FileDescriptor {
-                    file_path: file_path.clone(),
-                    schema: invocation.schemas.get(*schema_index as usize).unwrap().clone(),
-                    size: 1,
-                })
-            } else {
-                None
-            }
-        }
-    ).flatten().collect::<Vec<FileDescriptor>>();
+    let speedboat_files = invocation.speedboat_files.as_selected_tuples(index, num);
 
     RequiredFiles {
         table_schema: invocation.table_schema.clone(),
@@ -331,6 +285,15 @@ pub(crate) async fn compaction_query(invocation: &PrivateCompactionInvocation, i
         &invocation.sql,
         &required_files
     ).await
+}
+
+pub(crate) async fn extension_query(invocation: &PrivateExtensionInvocation, index: u64, num: u64) -> Result<ExtensionFileMetadata, PrivateApiError> {
+    let iceberg_files = invocation.iceberg_files.as_selected_tuples(index, num);
+    let speedboat_files = invocation.speedboat_files.as_selected_tuples(index, num);
+    match create_index_inner(&iceberg_files, &speedboat_files).await {
+        Ok(result) => Ok(result),
+        Err(e) => Err(PrivateApiError{ message: format!("{}", e) }),
+    }
 }
 
 

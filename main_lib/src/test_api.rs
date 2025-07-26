@@ -76,10 +76,9 @@ pub(crate) async fn do_all_available_extension_work(extensions: &Vec<String>) ->
         };
         tracing::info!("Doing indexing work");
 
-        // TODO: probably need to parallel iter here
-        for table_metadata in index_work.iter() {
+        for work_item in index_work.iter() {
             work_done = true;
-            match create_index(&table_metadata).await {
+            match create_index(&work_item).await {
                 Ok(_) => (),
                 Err(_) => panic!("Need some real error handling some day"),
             }

@@ -371,8 +371,7 @@ async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> 
         loop {
             LRU_CACHE_HANDLE.table_created(local_name_var).await;
             match DATA_FUSION_CONTEXT.sql(&query_str).await {
-                Err(e) => {
-                    println!("Transient s3 error? {}", e);
+                Err(_e) => {
                     let _ = DATA_FUSION_CONTEXT.sql(format!("DROP TABLE IF EXISTS {local_name_var};").as_str()).await;
                     LRU_CACHE_HANDLE.table_dropped(local_name_var).await;
                 },

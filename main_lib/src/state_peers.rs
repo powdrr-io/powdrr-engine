@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{private_api::data_query, state_common::FileFilter, state_leader};
 use crate::elastic_search_common::result_to_record_batch;
-use crate::private_api::compaction_query;
+use crate::private_api::{compaction_query, extension_query};
 use crate::schema_massager::{PowdrrSchema, SqlQuery};
+use crate::state_hosted_service::{ExtensionFileMetadata, FileSetPayload};
 
 #[derive(Serialize, Deserialize)]
 pub struct FieldFileFilterDescriptor {
@@ -32,7 +33,8 @@ pub(crate) struct SnapshotDescriptor {
 #[derive(Serialize, Deserialize)]
 pub(crate) enum PrivateInvocation {
     Sql(PrivateSqlInvocation),
-    Compaction(PrivateCompactionInvocation)
+    Compaction(PrivateCompactionInvocation),
+    Extension(PrivateExtensionInvocation),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -54,36 +56,28 @@ pub(crate) struct PrivateSqlInvocationExternal {
 #[derive(Serialize, Deserialize)]
 pub(crate) struct PrivateCompactionInvocation {
     pub sql: SqlQuery,
-    pub speedboat_files: Vec<String>,
-    pub schemas: Vec<PowdrrSchema>,
-    pub file_schemas: Vec<u64>,
+    pub speedboat_files: FileSetPayload,
     pub table_schema: PowdrrSchema,
     pub delete_files: Vec<String>,
 }
 
-
-// TODO: make all these Vecs into Arc<Vec>?
-impl PrivateSqlInvocation {
-    #[allow(dead_code)]
-    pub fn new(
-        sql: SqlQuery,
-        required_extensions: Vec<String>,
-        file_filter: Vec<FileFilterDescriptor>,
-        snapshots: Vec<SnapshotDescriptor>,
-    ) -> Self {
-        PrivateSqlInvocation {
-            sql: sql,
-            required_extensions: required_extensions,
-            file_filter: file_filter,
-            snapshots: snapshots,
-        }
-    }
+#[derive(Serialize, Deserialize)]
+pub(crate) struct PrivateExtensionInvocation {
+    pub extension_name: String,
+    pub speedboat_files: FileSetPayload,
+    pub iceberg_files: FileSetPayload,
 }
 
 
 #[derive(Serialize)]
 pub struct PrivateMetadataInvocation {
     name: String,
+}
+
+
+pub(crate) enum PrivateInvocationResult {
+    Data(Vec<RecordBatch>),
+    Extension(ExtensionFileMetadata),
 }
 
 
@@ -109,6 +103,8 @@ pub trait PeerClient: Send + Sync {
     async fn private_sql(&self, invocation: &PrivateSqlInvocation, index: u64, num: u64) -> Result<Vec<RecordBatch>, PeerClientError>;
 
     async fn private_compaction(&self, invocation: &PrivateCompactionInvocation, index: u64, num: u64) -> Result<Vec<RecordBatch>, PeerClientError>;
+
+    async fn private_extension(&self, invocation: &PrivateExtensionInvocation, index: u64, num: u64) -> Result<ExtensionFileMetadata, PeerClientError>;
 }
 
 #[allow(dead_code)]
@@ -164,33 +160,37 @@ impl PeerClient for RemotePeer {
         todo!()
     }
 
-/* 
-    async fn private_metadata(&self, invocation: &PrivateMetadataInvocation) -> Result<String, PeerClientError> {
-        let address = &self.address;
-        let body = serde_json::to_string(invocation);
-        match body {
-            Ok(b) => {
-                let resp = futures::executor::block_on(self.client.post(format!("{address}/_private/v1/_metadata"))
-                .header("Content-Type", "application/json")
-                .body(b)
-                .send());
-                match resp {
-                    Ok(r) => {
-                        let text = futures::executor::block_on(r.text());
-                        match text {
-                            Ok(t) => Ok(t),
-                            Err(e) => Err(PeerClientError{ message: "Error".to_string() }),
-                        }
-                    },
-                    Err(e) => Err(PeerClientError{ message: "Error".to_string() })
+    async fn private_extension(&self, _invocation: &PrivateExtensionInvocation, _index: u64, _num: u64) -> Result<ExtensionFileMetadata, PeerClientError> {
+        todo!()
+    }
+
+    /*
+        async fn private_metadata(&self, invocation: &PrivateMetadataInvocation) -> Result<String, PeerClientError> {
+            let address = &self.address;
+            let body = serde_json::to_string(invocation);
+            match body {
+                Ok(b) => {
+                    let resp = futures::executor::block_on(self.client.post(format!("{address}/_private/v1/_metadata"))
+                    .header("Content-Type", "application/json")
+                    .body(b)
+                    .send());
+                    match resp {
+                        Ok(r) => {
+                            let text = futures::executor::block_on(r.text());
+                            match text {
+                                Ok(t) => Ok(t),
+                                Err(e) => Err(PeerClientError{ message: "Error".to_string() }),
+                            }
+                        },
+                        Err(e) => Err(PeerClientError{ message: "Error".to_string() })
+                    }
+                },
+                Err(e) => {
+                    Err(PeerClientError{ message: "Error".to_string() })
                 }
-            },
-            Err(e) => {
-                Err(PeerClientError{ message: "Error".to_string() })
             }
         }
-    } 
-    */   
+        */
 }
 
 
@@ -226,6 +226,17 @@ impl PeerClient for SelfPeer {
         match query_result {
             Ok(qr) => {
                 Ok(result_to_record_batch(qr.result).await)
+            },
+            Err(e) => {
+                Err(PeerClientError { message: e.message })
+            }
+        }
+    }
+
+    async fn private_extension(&self, invocation: &PrivateExtensionInvocation, index: u64, num: u64) -> Result<ExtensionFileMetadata, PeerClientError> {
+        match extension_query(invocation, index, num).await {
+            Ok(result) => {
+                Ok(result)
             },
             Err(e) => {
                 Err(PeerClientError { message: e.message })
@@ -292,8 +303,8 @@ pub mod tests {
     use gotham::{mime, test::TestServer};
 
     use crate::router::router;
-
-    use super::{PeerClient, PeerClientError, PeerClientGenerator, PrivateCompactionInvocation, PrivateSqlInvocation};
+    use crate::state_hosted_service::ExtensionFileMetadata;
+    use super::{PeerClient, PeerClientError, PeerClientGenerator, PrivateCompactionInvocation, PrivateExtensionInvocation, PrivateSqlInvocation};
 
     pub(crate) struct TestPeerClient {
         server: TestServer,
@@ -331,6 +342,10 @@ pub mod tests {
         }
 
         async fn private_compaction(&self, _invocation: &PrivateCompactionInvocation, _index: u64, _num: u64) -> Result<Vec<RecordBatch>, PeerClientError> {
+            todo!()
+        }
+
+        async fn private_extension(&self, _invocation: &PrivateExtensionInvocation, _index: u64, _num: u64) -> Result<ExtensionFileMetadata, PeerClientError> {
             todo!()
         }
     }
