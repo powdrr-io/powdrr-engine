@@ -112,6 +112,12 @@ pub(crate) async fn call_private_sql(
                 Ok(result) => Ok(PrivateInvocationResult::Extension(result)),
                 Err(e) => Err(e),
             }
+        },
+        PrivateInvocation::Prefetch(prefetch_invocation) => {
+            match peer_client.private_prefetch(prefetch_invocation, index, num).await {
+                Ok(_) => Ok(PrivateInvocationResult::Prefetch),
+                Err(e) => Err(e),
+            }
         }
     }
 }
@@ -141,8 +147,9 @@ pub async fn load_command_raw_result(_context: CommandContext, command: Arc<dyn 
 
     let all_records = all_results.iter().map(|x| {
         match x {
-            PrivateInvocationResult::Extension(_) => panic!("Unexpected"),
             PrivateInvocationResult::Data(data) => data.clone(),
+            PrivateInvocationResult::Extension(_) => panic!("Unexpected"),
+            PrivateInvocationResult::Prefetch => panic!("Unexpected"),
         }
     }).flatten().collect::<Vec<RecordBatch>>();
 

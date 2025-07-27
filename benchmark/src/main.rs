@@ -165,7 +165,7 @@ async fn search() -> Result<(), std::io::Error> {
             Err(e) => panic!("Error: {}", e),
         };
         let time_after = current_time();
-        let latest_response_time = (time_after - time_before).as_millis() as u128;
+        let latest_response_time = (time_after - time_before).as_millis() as u64;
         all_response_times.push(latest_response_time);
 
         assert!(res.status().is_success());
@@ -173,10 +173,10 @@ async fn search() -> Result<(), std::io::Error> {
         let hits = response_val.as_object().unwrap().get("hits").unwrap().as_object().unwrap().get("total").unwrap().as_object().unwrap().get("value").unwrap().as_u64().unwrap();
         println!("Org Id = {}, User Id = {}, Hits = {}", org_id, user_id, hits);
         println!("Search - latest response time: {} ms", latest_response_time);
-        println!("Search - average response time: {} ms", all_response_times.iter().sum::<u128>() / all_response_times.len() as u128);
+        println!("Search - average response time: {} ms", all_response_times.iter().sum::<u64>() / all_response_times.len() as u64);
 
         if latest_response_time < 100 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(100 - latest_response_time)).await;
         }
     }
 }

@@ -232,6 +232,7 @@ pub(crate) async fn create_index(work_item: &ExtensionWorkItem) -> Result<(), In
                 match r {
                     PrivateInvocationResult::Data(_) => panic!("Unexpected result from peer calls while indexing"),
                     PrivateInvocationResult::Extension(files) => files.clone(),
+                    PrivateInvocationResult::Prefetch => panic!("Unexpected result from peer calls while indexing"),
                 }
             }).collect::<Vec<ExtensionFileMetadata>>()
         },
