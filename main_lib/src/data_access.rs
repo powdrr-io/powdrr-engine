@@ -361,7 +361,8 @@ async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> 
             false => ()
         },
         Err(e) => return log_err(e),
-    };    
+    };
+    tracing::info!("Loading PARQUET file {}", file_path);
     if file_path.starts_with("s3:") {
         let file_path_var = file_path;
         let local_name_var = local_name;
@@ -404,6 +405,7 @@ async fn load_json_file_as_table(file_path: &String, local_name: &String, schema
         },
         Err(e) => return log_err(e),
     };
+    tracing::info!("Loading JSON file {}", file_path);
     LRU_CACHE_HANDLE.table_created(local_name).await;
     let reader_options = NdJsonReadOptions::default().schema(&schema);
     match DATA_FUSION_CONTEXT.register_json(local_name, file_path, reader_options).await {

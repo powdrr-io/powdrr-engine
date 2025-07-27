@@ -270,7 +270,6 @@ pub(crate) struct CompactionResponse {
     pub compactions: Vec<String>
 }
 
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct CompactionCommand {
     table: String,
@@ -552,15 +551,20 @@ pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkIt
 
         let peers = API_SERVICE_CLIENT.get_peer_clients().await.unwrap();
         assert!(peers.len() > 0);
-        let response = match peers[0].private_compaction_leader(&command).await {
+        let response_maybe = match peers[0].private_compaction_leader(&command).await {
             Ok(success) => success,
             Err(e) => return Err(CompactionError{ message: e.to_string() })
         };
 
-        new_last_snapshot_id = match CompactionCommand::do_iceberg_commit(&response).await {
-            Ok(id) => id,
-            Err(e) => return Err(CompactionError{ message: e.to_string() })
-        }
+        new_last_snapshot_id = match response_maybe {
+            Some(response) => {
+                match CompactionCommand::do_iceberg_commit(&response).await {
+                    Ok(id) => id,
+                    Err(e) => return Err(CompactionError{ message: e.to_string() })
+                }
+            },
+            None => new_last_snapshot_id
+        };
     }
    
     Ok(new_last_snapshot_id)

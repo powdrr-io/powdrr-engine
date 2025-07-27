@@ -15,9 +15,33 @@ pub(crate) struct TestCreateIndex {
 
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct TestProcessingMode {
-    pub sync_indexing: Option<bool>,
-    pub compaction_leader: Option<String>
+pub enum IndexingMode {
+    Sync,
+    Async,
+    Disabled
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub enum CompactionMode {
+    Async,
+    External(String),
+    Disabled
+}
+
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct TestProcessingMode {
+    pub indexing_mode: IndexingMode,
+    pub compaction_mode: CompactionMode
+}
+
+impl TestProcessingMode {
+    pub fn default() -> Self {
+        Self {
+            indexing_mode: IndexingMode::Sync,
+            compaction_mode: CompactionMode::Async
+        }
+    }
 }
 
 
@@ -62,7 +86,7 @@ pub fn test_v1_add_checkpoint(mut state: State) -> Pin<Box<HandlerFuture>> {
 
 pub fn test_v1_set_testing_mode(state: State) -> Pin<Box<HandlerFuture>> {
     async {
-        API_SERVICE_CLIENT.set_testing_mode(&TestProcessingMode{ sync_indexing: None, compaction_leader: None }).await;
+        API_SERVICE_CLIENT.set_testing_mode(&TestProcessingMode::default()).await;
         let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "Ok");
         Ok((state, res))        
     }.boxed()
@@ -105,7 +129,6 @@ pub(crate) async fn do_all_available_compaction_work(start_snapshot_id: i64) -> 
     loop {
         let mut work_done = false;
 
-        tracing::info!("Checking for compaction work");
         let compact_work = match API_SERVICE_CLIENT.get_compaction_work_items().await {
             Ok(work) => work,
             Err(_) => panic!("oh no"),
@@ -116,7 +139,7 @@ pub(crate) async fn do_all_available_compaction_work(start_snapshot_id: i64) -> 
             match perform_compaction(compact_work, last_iceberg_snapshot_id).await {
                 Ok(id) => { last_iceberg_snapshot_id = id; },
                 Err(e) => {
-                    tracing::error!("Error performing compaction: {:?}", e);
+                    tracing::error!("!!!!!!!!!!!!!!!!!!!!!!!!!  Error performing compaction: {:?}", e);
                     // TODO: do something to trigger a retry of this compaction
                 },
             }
@@ -163,7 +186,7 @@ pub fn test_v1_set_testing_processing_mode(mut state: State) -> Pin<Box<HandlerF
                     Err(_) => panic!("This should not happen"),
                 }
             },
-            Err(_) => TestProcessingMode{ sync_indexing: None, compaction_leader: None }
+            Err(_) => TestProcessingMode::default()
         };
 
         API_SERVICE_CLIENT.set_testing_mode(&mode).await;

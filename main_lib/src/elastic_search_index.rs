@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::fmt::Display;
 use datafusion::{arrow::datatypes::DataType, dataframe::DataFrameWriteOptions};
 use datafusion::error::DataFusionError;
@@ -8,10 +9,12 @@ use crate::schema_massager::PowdrrSchema;
 use crate::state_hosted_service::{ExtensionFileMetadata, ExtensionWorkItem, FileDescriptor};
 use crate::state_peers::{PrivateExtensionInvocation, PrivateInvocation, PrivateInvocationResult};
 
+#[derive(Debug)]
 pub(crate) struct IndexError {
     pub message: String,
 }
 
+impl Error for IndexError {}
 unsafe impl Send for IndexError {}
 unsafe impl Sync for IndexError {}
 

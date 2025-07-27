@@ -11,6 +11,7 @@ use crate::elastic_search_common::result_to_record_batch;
 use crate::private_api::{compaction_query, extension_query};
 use crate::schema_massager::{PowdrrSchema, SqlQuery};
 use crate::state_hosted_service::{ExtensionFileMetadata, FileSetPayload};
+use crate::test_api::CompactionMode;
 
 #[derive(Serialize, Deserialize)]
 pub struct FieldFileFilterDescriptor {
@@ -107,7 +108,7 @@ pub trait PeerClient: Send + Sync {
 
     async fn private_extension(&self, invocation: &PrivateExtensionInvocation, index: u64, num: u64) -> Result<ExtensionFileMetadata, PeerClientError>;
 
-    async fn private_compaction_leader(&self, invocation: &CompactionCommand) -> Result<CompactionResponse, PeerClientError>;
+    async fn private_compaction_leader(&self, invocation: &CompactionCommand) -> Result<Option<CompactionResponse>, PeerClientError>;
 }
 
 #[allow(dead_code)]
@@ -167,7 +168,7 @@ impl PeerClient for RemotePeer {
         todo!()
     }
 
-    async fn private_compaction_leader(&self, _invocation: &CompactionCommand) -> Result<CompactionResponse, PeerClientError> {
+    async fn private_compaction_leader(&self, _invocation: &CompactionCommand) -> Result<Option<CompactionResponse>, PeerClientError> {
         todo!()
     }
 
@@ -202,11 +203,12 @@ impl PeerClient for RemotePeer {
 
 
 pub struct SelfPeer {
+    pub compaction_mode: CompactionMode
 }
 
 impl SelfPeer {
-    pub fn new() -> Self {
-        SelfPeer {}
+    pub fn new(compaction_mode: CompactionMode) -> Self {
+        SelfPeer { compaction_mode: compaction_mode.clone() }
     }
 }
 
@@ -251,12 +253,36 @@ impl PeerClient for SelfPeer {
         }
     }
 
-    async fn private_compaction_leader(&self, invocation: &CompactionCommand) -> Result<CompactionResponse, PeerClientError> {
-        match compact_logs(Arc::new(invocation.clone())).await {
-            Ok(success) => {
-                Ok(serde_json::from_str(success.body.as_str()).unwrap())
+    async fn private_compaction_leader(&self, invocation: &CompactionCommand) -> Result<Option<CompactionResponse>, PeerClientError> {
+        match &self.compaction_mode {
+            CompactionMode::Async => {
+                match compact_logs(Arc::new(invocation.clone())).await {
+                    Ok(success) => {
+                        Ok(Some(serde_json::from_str(success.body.as_str()).unwrap()))
+                    },
+                    Err(e) => Err(PeerClientError { message: e.to_string() })
+                }
             },
-            Err(e) => Err(PeerClientError{ message: e.to_string() })
+            CompactionMode::External(compaction_leader) => {
+                let client = Client::new();
+
+                let res = match client.post(format!("{}/_private/v1/_compact", compaction_leader))
+                    .body(serde_json::to_string(&invocation).unwrap())
+                    .send().await {
+                    Ok(res) => res,
+                    Err(e) => panic!("Error: {}", e),
+                };
+
+                assert!(res.status().is_success());
+
+                let response_str = res.text().await.unwrap().clone();
+
+                let response = serde_json::from_str::<CompactionResponse>(response_str.as_str()).unwrap();
+                Ok(Some(response))
+            },
+            CompactionMode::Disabled => {
+                Ok(None)
+            }
         }
     }
 }
