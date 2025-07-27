@@ -149,6 +149,7 @@ async fn search() -> Result<(), std::io::Error> {
 
     let mut rng = OsRng {};
     let mut all_response_times = vec!();
+    let mut longest_response_times = vec!();
 
     loop {
         let (user_id, org_id) = random_user_and_org(&mut rng);
@@ -174,9 +175,19 @@ async fn search() -> Result<(), std::io::Error> {
         println!("Org Id = {}, User Id = {}, Hits = {}", org_id, user_id, hits);
         println!("Search - latest response time: {} ms", latest_response_time);
         println!("Search - average response time: {} ms", all_response_times.iter().sum::<u64>() / all_response_times.len() as u64);
+        println!("Search - longest response times: {} ms", longest_response_times.iter().map(|x: &u64|x.to_string()).collect::<Vec<String>>().join(", "));
 
         if latest_response_time < 100 {
             tokio::time::sleep(Duration::from_millis(100 - latest_response_time)).await;
+        }
+
+        if longest_response_times.len() < 10 {
+            longest_response_times.push(latest_response_time);
+        } else if longest_response_times[9] < latest_response_time {
+            longest_response_times.remove(9);
+            longest_response_times.push(latest_response_time);
+            longest_response_times.sort();
+            longest_response_times.reverse()
         }
     }
 }

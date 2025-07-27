@@ -11,8 +11,10 @@ use liquid_cache_parquet::common::LiquidCacheMode;
 use liquid_cache_parquet::LiquidCacheInProcessBuilder;
 use lru_mem::{HeapSize, LruCache, TryInsertError};
 use object_store::{aws::{AmazonS3, AmazonS3Builder}, ObjectStore};
+use object_store::client::SpawnedReqwestConnector;
 use tempfile::TempDir;
-use tokio::sync::{mpsc, oneshot};
+use tokio::runtime::Handle;
+use tokio::sync::{mpsc, oneshot, Notify};
 use url::Url;
 
 use crate::util::log_err;
@@ -24,6 +26,99 @@ const S3_SECRET_ACCESS_KEY_VALUE: &str = "password";
 const S3_REGION_VALUE: &str = "us-east-1";
 
 
+/// This code is lifted from the 'threadpool' example in the Datafusion repo.
+/// It is slightly modified to use the main Tokio runtime for CPU bound tasks
+/// and shift the IO bound tasks to a separate thread.
+
+/// Creates a Tokio [`Runtime`] for use with IO bound tasks
+///
+/// Tokio forbids dropping `Runtime`s in async contexts, so creating a separate
+/// `Runtime` correctly is somewhat tricky. This structure manages the creation
+/// and shutdown of a separate thread.
+///
+/// # Notes
+/// On drop, the thread will wait for all remaining tasks to complete.
+///
+/// Depending on your application, more sophisticated shutdown logic may be
+/// required, such as ensuring that no new tasks are added to the runtime.
+///
+/// # Credits
+/// This code is derived from code originally written for [InfluxDB 3.0]
+///
+/// [InfluxDB 3.0]: https://github.com/influxdata/influxdb3_core/tree/6fcbb004232738d55655f32f4ad2385523d10696/executor
+///
+struct IORuntime {
+    /// Handle is the tokio structure for interacting with a Runtime.
+    handle: Handle,
+    /// Signal to start shutting down
+    notify_shutdown: Arc<Notify>,
+    /// When thread is active, is Some
+    thread_join_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for IORuntime {
+    fn drop(&mut self) {
+        // Notify the thread to shutdown.
+        self.notify_shutdown.notify_one();
+        // In a production system you also need to ensure your code stops adding
+        // new tasks to the underlying runtime after this point to allow the
+        // thread to complete its work and exit cleanly.
+        if let Some(thread_join_handle) = self.thread_join_handle.take() {
+            // If the thread is still running, we wait for it to finish
+            tracing::info!("Shutting down IO runtime thread...");
+            if let Err(e) = thread_join_handle.join() {
+                tracing::info!("Error joining IO runtime thread: {e:?}",);
+            } else {
+                tracing::info!("IO runtime thread shutdown successfully.");
+            }
+        }
+    }
+}
+
+impl IORuntime {
+    /// Create a new Tokio Runtime for CPU bound tasks
+    pub fn try_new() -> Result<Self, std::io::Error> {
+        let io_runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_time()
+            .enable_io()
+            .build()?;
+        let handle = io_runtime.handle().clone();
+        let notify_shutdown = Arc::new(Notify::new());
+        let notify_shutdown_captured = Arc::clone(&notify_shutdown);
+
+        // The cpu_runtime runs and is dropped on a separate thread
+        let thread_join_handle = std::thread::spawn(move || {
+            io_runtime.block_on(async move {
+                notify_shutdown_captured.notified().await;
+            });
+            // Note: io_runtime is dropped here, which will wait for all tasks
+            // to complete
+        });
+
+        Ok(Self {
+            handle,
+            notify_shutdown,
+            thread_join_handle: Some(thread_join_handle),
+        })
+    }
+
+    /// Return a handle suitable for spawning CPU bound tasks
+    ///
+    /// # Notes
+    ///
+    /// If a task spawned on this handle attempts to do IO, it will error with a
+    /// message such as:
+    ///
+    /// ```text
+    ///A Tokio 1.x context was found, but IO is disabled.
+    /// ```
+    pub fn handle(&self) -> &Handle {
+        &self.handle
+    }
+}
+
+static IO_RUNTIME: std::sync::LazyLock<IORuntime> = std::sync::LazyLock::new(|| IORuntime::try_new().unwrap());
+
 fn create_store() -> Arc<AmazonS3> {
     let s3_file_system: object_store::aws::AmazonS3 = AmazonS3Builder::new()
         .with_access_key_id(S3_ACCESS_KEY_ID_VALUE)
@@ -32,6 +127,7 @@ fn create_store() -> Arc<AmazonS3> {
         .with_endpoint(S3_ENDPOINT_VALUE)
         .with_bucket_name("warehouse")
         .with_allow_http(true)
+        //.with_http_connector(SpawnedReqwestConnector::new(IO_RUNTIME.handle().clone()))
         .build().unwrap();
 
     Arc::new(s3_file_system)
