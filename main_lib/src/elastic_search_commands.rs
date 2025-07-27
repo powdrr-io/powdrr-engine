@@ -10,7 +10,7 @@ use gotham::mime;
 use http::StatusCode;
 use serde_json::Value;
 
-use crate::{data_access::{self, execute_sql}, distributed_cache, elastic_search_common::{Command, ResultGeneratorFuture}, elastic_search_parser::ScriptBlock, elastic_search_responses::{QueryResultHit, QueryResults}, expression_evaluator, painless_parser, state_hosted_service::API_SERVICE_CLIENT, state_peers::SnapshotDescriptor};
+use crate::{data_access::{self, execute_sql}, distributed_cache, elastic_search_common::{Command, ResultGeneratorFuture}, elastic_search_parser::ScriptBlock, elastic_search_responses::{QueryResultHit, QueryResults}, expression_evaluator, painless_parser, state_hosted_service::API_SERVICE_CLIENT, state_peers::CheckpointDescriptor};
 use crate::elastic_search_common::{CommandError, ElasticSearchResponse};
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::elastic_search_ingest::IngestError;
@@ -110,10 +110,10 @@ impl LookupById {
         }
     }
 
-    async fn current_target_snapshots(&self) -> Vec<SnapshotDescriptor> {
+    async fn current_target_snapshots(&self) -> Vec<CheckpointDescriptor> {
         let checkpoint_id = API_SERVICE_CLIENT.get_latest_checkpoint(&self.table, None).await.unwrap();
         match checkpoint_id {
-            Some(c) => vec!(SnapshotDescriptor{ table_name: self.table.clone(), snapshot_id: c }),
+            Some(c) => vec!(CheckpointDescriptor { table_name: self.table.clone(), checkpoint_id: c }),
             None => vec!(),
         }
     }
@@ -126,7 +126,7 @@ impl Command for LookupById {
             sql: self.sql.clone(),
             required_extensions: vec![],
             file_filter: vec![],
-            snapshots: self.current_target_snapshots().await,
+            checkpoints: self.current_target_snapshots().await,
         })
     }
 
@@ -235,14 +235,14 @@ impl SqlCommand {
         }
     }
 
-    async fn current_target_snapshots(&self) -> Vec<SnapshotDescriptor> {
+    async fn current_target_snapshots(&self) -> Vec<CheckpointDescriptor> {
         let extension = match self.calculate_score {
             true => Some("es".to_string()),
             false => None
         };
         let checkpoint_id = API_SERVICE_CLIENT.get_latest_checkpoint(&self.table, extension).await.unwrap();
         match checkpoint_id {
-            Some(c) => vec!(SnapshotDescriptor{ table_name: self.table.clone(), snapshot_id: c }),
+            Some(c) => vec!(CheckpointDescriptor { table_name: self.table.clone(), checkpoint_id: c }),
             None => vec!(),
         }
     }
@@ -257,7 +257,7 @@ impl Command for SqlCommand {
             sql: self.sql.clone(),
             required_extensions: self.required_extensions(),
             file_filter: vec![],
-            snapshots: self.current_target_snapshots().await,
+            checkpoints: self.current_target_snapshots().await,
         })
     }
     

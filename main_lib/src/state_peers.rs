@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::{private_api::data_query, state_common::FileFilter};
 use crate::compaction::{compact_logs, CompactionCommand, CompactionResponse};
 use crate::elastic_search_common::result_to_record_batch;
-use crate::private_api::{compaction_query, extension_query};
+use crate::private_api::{compaction_query, extension_query, prefetch_query};
 use crate::schema_massager::{PowdrrSchema, SqlQuery};
 use crate::state_hosted_service::{ExtensionFileMetadata, FileSetPayload};
 use crate::test_api::CompactionMode;
@@ -25,10 +25,10 @@ pub struct FileFilterDescriptor {
     pub filters: Vec<FieldFileFilterDescriptor>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct SnapshotDescriptor {
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct CheckpointDescriptor {
     pub table_name: String,
-    pub snapshot_id: String,
+    pub checkpoint_id: String,
 }
 
 
@@ -37,6 +37,7 @@ pub(crate) enum PrivateInvocation {
     Sql(PrivateSqlInvocation),
     Compaction(PrivateCompactionInvocation),
     Extension(PrivateExtensionInvocation),
+    Prefetch(PrivatePrefetchInvocation),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -44,7 +45,7 @@ pub(crate) struct PrivateSqlInvocation {
     pub sql: SqlQuery,
     pub required_extensions: Vec<String>,
     pub file_filter: Vec<FileFilterDescriptor>,
-    pub snapshots: Vec<SnapshotDescriptor>,
+    pub checkpoints: Vec<CheckpointDescriptor>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -70,6 +71,12 @@ pub(crate) struct PrivateExtensionInvocation {
     pub iceberg_files: FileSetPayload,
 }
 
+#[derive(Serialize, Deserialize)]
+pub(crate) struct PrivatePrefetchInvocation {
+    pub required_extensions: Vec<String>,
+    pub checkpoints: Vec<CheckpointDescriptor>,
+}
+
 
 #[derive(Serialize)]
 pub struct PrivateMetadataInvocation {
@@ -80,6 +87,7 @@ pub struct PrivateMetadataInvocation {
 pub(crate) enum PrivateInvocationResult {
     Data(Vec<RecordBatch>),
     Extension(ExtensionFileMetadata),
+    Prefetch,
 }
 
 
@@ -107,6 +115,8 @@ pub trait PeerClient: Send + Sync {
     async fn private_compaction(&self, invocation: &PrivateCompactionInvocation, index: u64, num: u64) -> Result<Vec<RecordBatch>, PeerClientError>;
 
     async fn private_extension(&self, invocation: &PrivateExtensionInvocation, index: u64, num: u64) -> Result<ExtensionFileMetadata, PeerClientError>;
+
+    async fn private_prefetch(&self, invocation: &PrivatePrefetchInvocation, index: u64, num: u64) -> Result<(), PeerClientError>;
 
     async fn private_compaction_leader(&self, invocation: &CompactionCommand) -> Result<Option<CompactionResponse>, PeerClientError>;
 }
@@ -165,6 +175,10 @@ impl PeerClient for RemotePeer {
     }
 
     async fn private_extension(&self, _invocation: &PrivateExtensionInvocation, _index: u64, _num: u64) -> Result<ExtensionFileMetadata, PeerClientError> {
+        todo!()
+    }
+
+    async fn private_prefetch(&self, _invocation: &PrivatePrefetchInvocation, _index: u64, _num: u64) -> Result<(), PeerClientError> {
         todo!()
     }
 
@@ -246,6 +260,17 @@ impl PeerClient for SelfPeer {
         match extension_query(invocation, index, num).await {
             Ok(result) => {
                 Ok(result)
+            },
+            Err(e) => {
+                Err(PeerClientError { message: e.message })
+            }
+        }
+    }
+
+    async fn private_prefetch(&self, invocation: &PrivatePrefetchInvocation, index: u64, num: u64) -> Result<(), PeerClientError> {
+        match prefetch_query(invocation, index, num).await {
+            Ok(_) => {
+                Ok(())
             },
             Err(e) => {
                 Err(PeerClientError { message: e.message })

@@ -335,7 +335,7 @@ pub(crate) mod tests {
         
         let checkpoint = TableMetadataCheckpoint {
             table_name: "logs".to_string(),
-            checkpoint_id: "fake_id".to_string(),
+            checkpoint_id: "0".to_string(),
             iceberg_metadata: None,
             speedboat_metadata: Some(SpeedboatMetadata{ 
                 files: FileSetPayload::single(
@@ -411,7 +411,7 @@ pub(crate) mod tests {
 
         let checkpoint = TableMetadataCheckpoint {
             table_name: "flights".to_string(),
-            checkpoint_id: "fake_id".to_string(),
+            checkpoint_id: "0".to_string(),
             iceberg_metadata: Some(IcebergMetadata {
                 snapshot_id: "fake_iceberg_snapshot".to_string(),
                 files: vec!(file_path),
@@ -488,7 +488,7 @@ pub(crate) mod tests {
 
         let checkpoint = TableMetadataCheckpoint {
             table_name: "flights".to_string(),
-            checkpoint_id: "fake_id".to_string(),
+            checkpoint_id: "0".to_string(),
             iceberg_metadata: Some(IcebergMetadata {
                 table_schema: schema.clone(),
                 snapshot_id: "fake_iceberg_snapshot".to_string(),

@@ -11,7 +11,7 @@ use prost::Message;
 use crate::data_access::{self, load_file_as_table};
 use crate::elastic_search_index::create_index_inner;
 use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema, SqlQuery};
-use crate::state_peers::{PrivateCompactionInvocation, PrivateExtensionInvocation, PrivateSqlInvocation};
+use crate::state_peers::{CheckpointDescriptor, PrivateCompactionInvocation, PrivateExtensionInvocation, PrivatePrefetchInvocation, PrivateSqlInvocation};
 use crate::state_hosted_service::*;
 use crate::util::{add_file_suffix, log_err};
 
@@ -72,7 +72,7 @@ fn filter_iceberg<'a>(iceberg_metadata: &'a Option<IcebergMetadata>, index: u64,
     }    
 }
 
-fn filter_speedboat<'a>(_invocation: &'a PrivateSqlInvocation, speedboat_metadata: &'a Option<SpeedboatMetadata>, index: u64, num: u64) -> Vec<FileDescriptor> {
+fn filter_speedboat(speedboat_metadata: &Option<SpeedboatMetadata>, index: u64, num: u64) -> Vec<FileDescriptor> {
     match speedboat_metadata {
         Some(sm) => {
             let files = sm.files.as_selected_tuples(index, num);
@@ -84,12 +84,12 @@ fn filter_speedboat<'a>(_invocation: &'a PrivateSqlInvocation, speedboat_metadat
 }
 
 
-async fn determine_required_files(invocation: &PrivateSqlInvocation, index: u64, num: u64) -> Result<RequiredFiles, PrivateApiError> {
-    if invocation.required_extensions.len() > 1 || invocation.snapshots.len() != 1 {
+async fn determine_required_files(required_extensions: &Vec<String>, checkpoints: &Vec<CheckpointDescriptor>, index: u64, num: u64) -> Result<RequiredFiles, PrivateApiError> {
+    if required_extensions.len() > 1 || checkpoints.len() != 1 {
         return Err(PrivateApiError{ message: "Only read for one table at a time please.".to_string() })
     }
 
-    let target_snapshot = &invocation.snapshots[0];
+    let target_snapshot = &checkpoints[0];
     let table_metadata = match API_SERVICE_CLIENT.get_checkpoint(target_snapshot.clone()).await {
         Ok(tmc) => tmc,
         Err(_e) => return log_err(PrivateApiError{ message: "Error calling get checkpoint".to_string() }),
@@ -98,13 +98,13 @@ async fn determine_required_files(invocation: &PrivateSqlInvocation, index: u64,
     // TODO: add logic to select the iceberg and speedboat files for this host.
 
     let filtered_iceberg_files = filter_iceberg(&table_metadata.iceberg_metadata, index, num);
-    let filtered_speedboat_files = filter_speedboat(invocation, &table_metadata.speedboat_metadata, index, num);
+    let filtered_speedboat_files = filter_speedboat(&table_metadata.speedboat_metadata, index, num);
     Ok(RequiredFiles {
         table_schema: table_metadata.schema.clone(),
         iceberg_files: filtered_iceberg_files.to_vec(),
-        iceberg_file_extensions: filtered_iceberg_files.iter().map(|f|get_extension_files(invocation, &f.file_path)).collect(),
+        iceberg_file_extensions: filtered_iceberg_files.iter().map(|f|get_extension_files(required_extensions, &f.file_path)).collect(),
         speedboat_files: filtered_speedboat_files.to_vec(),
-        speedboat_file_extensions: filtered_speedboat_files.iter().map(|f|get_extension_files(invocation, &f.file_path)).collect(),
+        speedboat_file_extensions: filtered_speedboat_files.iter().map(|f|get_extension_files(required_extensions, &f.file_path)).collect(),
         delete_files: table_metadata.deletes_metadata.map_or_else(|| vec!(), |d|d.files.clone()),
     })
 }
@@ -123,9 +123,9 @@ fn generate_required_files(invocation: &PrivateCompactionInvocation, index: u64,
 }
 
 
-fn get_extension_files(invocation: &PrivateSqlInvocation, file_path: &String) -> Vec<ExtensionFileSpec> {
+fn get_extension_files(required_extensions: &Vec<String>, file_path: &String) -> Vec<ExtensionFileSpec> {
     // TODO - need to look at the actual extension metadata and figure out the file required
-    if invocation.required_extensions.len() == 0 {
+    if required_extensions.len() == 0 {
         vec!()
     } else {
         vec!(ExtensionFileSpec {
@@ -255,14 +255,14 @@ async fn process_speedboat_file(
 
 
 pub(crate) async fn data_query(invocation: &PrivateSqlInvocation, index: u64, num: u64) -> Result<DataQueryResult, PrivateApiError> {
-    if invocation.snapshots.len() == 0 {
+    if invocation.checkpoints.len() == 0 {
         return Ok(DataQueryResult {
             num: 0,
             result: vec![],
         })        
     }
 
-    let required_files = match determine_required_files(invocation, index, num).await {
+    let required_files = match determine_required_files(&invocation.required_extensions, &invocation.checkpoints, index, num).await {
         Ok(rf) => rf,
         Err(e) => return log_err(e),
     };
@@ -294,6 +294,18 @@ pub(crate) async fn extension_query(invocation: &PrivateExtensionInvocation, ind
         Ok(result) => Ok(result),
         Err(e) => Err(PrivateApiError{ message: format!("{}", e) }),
     }
+}
+
+pub(crate) async fn prefetch_query(invocation: &PrivatePrefetchInvocation, index: u64, num: u64) -> Result<DataQueryResult, PrivateApiError> {
+    let required_files = match determine_required_files(&invocation.required_extensions, &invocation.checkpoints, index, num).await {
+        Ok(rf) => rf,
+        Err(e) => return log_err(e),
+    };
+
+    data_query_worker(
+        &SqlQuery::dummy(),
+        &required_files,
+    ).await
 }
 
 

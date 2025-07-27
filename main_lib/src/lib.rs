@@ -26,3 +26,4 @@ mod state_hosted_service;
 mod state_peers;
 pub mod test_api;
 mod util;
+mod prefetch;

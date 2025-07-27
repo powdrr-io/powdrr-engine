@@ -5,7 +5,7 @@ use gotham::{handler::HandlerFuture, helpers::http::response::create_response, h
 use serde::{Deserialize, Serialize};
 
 use crate::{compaction::perform_compaction, elastic_search_index::{self, create_index}, state_hosted_service::{TableMetadataCheckpoint, API_SERVICE_CLIENT}};
-
+use crate::prefetch::perform_prefetch;
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct TestCreateIndex {
@@ -21,6 +21,15 @@ pub enum IndexingMode {
     Disabled
 }
 
+impl IndexingMode {
+    fn is_disabled(&self) -> bool {
+        match self {
+            IndexingMode::Disabled => true,
+            _ => false
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub enum CompactionMode {
     Async,
@@ -28,18 +37,44 @@ pub enum CompactionMode {
     Disabled
 }
 
+impl CompactionMode {
+    fn is_disabled(&self) -> bool {
+        match self {
+            CompactionMode::Disabled => true,
+            _ => false
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub enum PrefetchMode {
+    Enabled,
+    Disabled
+}
+
+impl PrefetchMode {
+    fn is_disable(&self) -> bool {
+        match self {
+            PrefetchMode::Disabled => true,
+            _ => false
+        }
+    }
+}
+
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TestProcessingMode {
     pub indexing_mode: IndexingMode,
-    pub compaction_mode: CompactionMode
+    pub compaction_mode: CompactionMode,
+    pub prefetch_mode: PrefetchMode,
 }
 
 impl TestProcessingMode {
     pub fn default() -> Self {
         Self {
             indexing_mode: IndexingMode::Sync,
-            compaction_mode: CompactionMode::Async
+            compaction_mode: CompactionMode::Async,
+            prefetch_mode: PrefetchMode::Disabled,
         }
     }
 }
@@ -153,6 +188,23 @@ pub(crate) async fn do_all_available_compaction_work(start_snapshot_id: i64) -> 
     last_iceberg_snapshot_id
 }
 
+pub(crate) async fn do_next_prefetch() -> usize {
+    let prefetch_work = match API_SERVICE_CLIENT.get_next_prefetch_checkpoints(None).await {
+        Ok(work) => work,
+        Err(_) => panic!("oh no"),
+    };
+    if prefetch_work.len() > 0 {
+        match perform_prefetch(&vec!(), &prefetch_work).await {
+            Ok(_) => (),
+            Err(e) => {
+                tracing::error!("!!!!!!!!!!!!!!!!!!!!!!!!!  Error performing prefetch: {:?}", e);
+                // TODO: do something? Track how many failed in a row?
+            },
+        }
+    }
+    prefetch_work.len()
+}
+
 
 fn do_extension_work_for_forever(extensions: Vec<String>, wait_time_ms: u64) -> impl Future<Output = ()> {
     async move {
@@ -175,6 +227,17 @@ fn do_compaction_work_for_forever(wait_time_ms: u64) -> impl Future<Output = ()>
 }
 
 
+fn do_prefetch_work_for_forever(wait_time_ms: u64) -> impl Future<Output = ()> {
+    async move {
+        loop {
+            let num = do_next_prefetch().await;
+            if num == 0 {
+                tokio::time::sleep(Duration::from_millis(wait_time_ms)).await;
+            }
+        }
+    }
+}
+
 
 pub fn test_v1_set_testing_processing_mode(mut state: State) -> Pin<Box<HandlerFuture>> {
     async {
@@ -190,8 +253,15 @@ pub fn test_v1_set_testing_processing_mode(mut state: State) -> Pin<Box<HandlerF
         };
 
         API_SERVICE_CLIENT.set_testing_mode(&mode).await;
-        tokio::spawn(do_extension_work_for_forever(vec!("es".to_string()), 1000));
-        tokio::spawn(do_compaction_work_for_forever(1000));
+        if !mode.indexing_mode.is_disabled() {
+            tokio::spawn(do_extension_work_for_forever(vec!("es".to_string()), 1000));
+        }
+        if !mode.compaction_mode.is_disabled() {
+            tokio::spawn(do_compaction_work_for_forever(1000));
+        }
+        if !mode.prefetch_mode.is_disable() {
+            tokio::spawn(do_prefetch_work_for_forever(1000));
+        }
         let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "Ok");
         Ok((state, res))        
     }.boxed()

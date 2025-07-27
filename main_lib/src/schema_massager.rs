@@ -674,6 +674,7 @@ pub(crate) struct SqlBuilder {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct SqlQuery {
+    dummy: bool,
     all_fields: bool,
     fields: Vec<FieldExpression>,
     joins: String,
@@ -804,6 +805,7 @@ impl SqlBuilder {
 
     pub(crate) fn build(&self) -> SqlQuery {
         SqlQuery {
+            dummy: false,
             all_fields: self.all_fields,
             fields: self._fields(),
             joins: self._joins().join(" "),
@@ -817,6 +819,19 @@ impl SqlBuilder {
 
 
 impl SqlQuery {
+    pub fn dummy() -> Self {
+        SqlQuery {
+            dummy: true,
+            all_fields: false,
+            fields: vec!(FieldExpression{ name: "dummy".to_string(), expression: SqlExpression::LiteralNonString("1".to_string()) }),
+            joins: "".to_string(),
+            filters: None,
+            limit: None,
+            order_by: vec!(),
+            group_by: vec!(),
+        }
+    }
+
     fn fields(&self, original_schema: &HashMap<String, PowdrrField>, target_schema: &HashMap<String, PowdrrField>) -> String {
         // Magic up missing fields as nulls
         // TODO: figure out when fields have changed types and do something
@@ -869,21 +884,30 @@ impl SqlQuery {
         }
     }
 
+    fn from(&self) -> String {
+        if self.dummy {
+            " ".to_string()
+        } else {
+            " FROM {target_table} t ".to_string()
+        }
+    }
+
     pub(crate) fn build_same(&self, schema: &PowdrrSchema) -> String {
         self.build(schema, schema)
     }
 
-     pub(crate) fn build(&self, original_schema: &PowdrrSchema, target_schema: &PowdrrSchema) -> String {
-        let original_schema_map = original_schema.to_map();
-        let target_schema_map = target_schema.to_map();
-        let fields = self.fields(&original_schema_map, &target_schema_map);
-        let joins = &self.joins;
-        let filters = self.filters(&original_schema_map, &target_schema_map);
-        let order_by = self.order_by(&original_schema_map, &target_schema_map);
-        let group_by = self.group_by(&original_schema_map, &target_schema_map);
-        let limit = self.limit();
+    pub(crate) fn build(&self, original_schema: &PowdrrSchema, target_schema: &PowdrrSchema) -> String {
+       let original_schema_map = original_schema.to_map();
+       let target_schema_map = target_schema.to_map();
+       let from = self.from();
+       let fields = self.fields(&original_schema_map, &target_schema_map);
+       let joins = &self.joins;
+       let filters = self.filters(&original_schema_map, &target_schema_map);
+       let order_by = self.order_by(&original_schema_map, &target_schema_map);
+       let group_by = self.group_by(&original_schema_map, &target_schema_map);
+       let limit = self.limit();
 
-        format!("SELECT {fields} FROM {{target_table}} t {joins}{filters}{group_by}{order_by}{limit}")
+       format!("SELECT {fields}{from}{joins}{filters}{group_by}{order_by}{limit}")
     }
 
     #[allow(dead_code)]
