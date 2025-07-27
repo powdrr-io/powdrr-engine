@@ -823,7 +823,7 @@ impl SqlQuery {
         SqlQuery {
             dummy: true,
             all_fields: false,
-            fields: vec!(),
+            fields: vec!(FieldExpression{ name: "dummy".to_string(), expression: SqlExpression::LiteralNonString("1".to_string()) }),
             joins: "".to_string(),
             filters: None,
             limit: None,
@@ -886,9 +886,9 @@ impl SqlQuery {
 
     fn from(&self) -> String {
         if self.dummy {
-            "".to_string()
+            " ".to_string()
         } else {
-            " FROM {{target_table}} t".to_string()
+            " FROM {target_table} t ".to_string()
         }
     }
 

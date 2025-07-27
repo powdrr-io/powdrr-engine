@@ -1,12 +1,8 @@
-use std::pin::Pin;
-use std::sync::Arc;
-use async_trait::async_trait;
-use futures_util::FutureExt;
-use gotham::mime;
-use http::StatusCode;
 use serde::{Deserialize, Serialize};
-use crate::elastic_search_common::{execute_command, Command, CommandContext, ElasticSearchResponse, ResultGeneratorFuture};
+use crate::elastic_search_common::call_peers;
+use crate::state_hosted_service::API_SERVICE_CLIENT;
 use crate::state_peers::{CheckpointDescriptor, PrivateInvocation, PrivatePrefetchInvocation};
+
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct PrefetchCommand {
@@ -14,37 +10,28 @@ pub(crate) struct PrefetchCommand {
     checkpoints: Vec<CheckpointDescriptor>
 }
 
-#[async_trait]
-impl Command for PrefetchCommand {
-    async fn get_private_invocation(&self) -> PrivateInvocation {
-        PrivateInvocation::Prefetch(
-            PrivatePrefetchInvocation {
-                required_extensions: self.required_extensions.clone(),
-                checkpoints: self.checkpoints.clone()
-            }
-        )
-    }
-
-    fn result_generator(&self, _result_table_name: Option<String>) -> Pin<Box<ResultGeneratorFuture>> {
-        async {
-            Ok(ElasticSearchResponse {
-                status: StatusCode::OK,
-                mime: mime::TEXT_PLAIN,
-                body: "success".to_string(),
-                headers: vec![],
-            })
-        }.boxed()
-    }
-}
-
-
 pub(crate) async fn perform_prefetch(required_extensions: &Vec<String>, checkpoints: &Vec<CheckpointDescriptor>) -> Result<(), std::io::Error> {
-    let prefetch_command = PrefetchCommand {
-        required_extensions: required_extensions.clone(),
-        checkpoints: checkpoints.clone()
-    };
+    let prefetch_invocation = PrivateInvocation::Prefetch(
+        PrivatePrefetchInvocation {
+            required_extensions: required_extensions.clone(),
+            checkpoints: checkpoints.clone()
+        }
+    );
     tracing::info!("!!!!!!!!!!!!!!!!!!!! Prefetching Start !!!!!!!!!!!!!!!!!!!!!!!");
-    let _response = execute_command(CommandContext{}, Arc::new(prefetch_command)).await;
+    match call_peers(&prefetch_invocation).await {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!("Error during prefetching: {}", e);
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
+        }
+    }
     tracing::info!("!!!!!!!!!!!!!!!!!!!! Prefetching End !!!!!!!!!!!!!!!!!!!!!!!");
+    match API_SERVICE_CLIENT.set_prefetch_checkpoints(checkpoints, if required_extensions.len() == 0 { None } else { Some(required_extensions[0].clone()) }).await {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!("Error during prefetching: {}", e);
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
+        }
+    }
     Ok(())
 }

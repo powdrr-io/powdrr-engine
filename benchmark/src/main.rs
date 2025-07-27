@@ -5,7 +5,7 @@ use futures::future::join_all;
 use idgenerator::{IdGeneratorOptions, IdInstance};
 use rand::TryRngCore;
 use rand::rngs::OsRng;
-use powdrr_lib::test_api::{CompactionMode, IndexingMode, TestProcessingMode};
+use powdrr_lib::test_api::{CompactionMode, IndexingMode, PrefetchMode, TestProcessingMode};
 
 const LINE_LIMIT: u64 = 1000000;
 
@@ -209,6 +209,7 @@ async fn main() -> Result<(), std::io::Error> {
     let main_mode = TestProcessingMode {
         indexing_mode: IndexingMode::Disabled,
         compaction_mode: CompactionMode::External("http://localhost:9201".to_string()),
+        prefetch_mode: PrefetchMode::Enabled,
     };
     
     let _res = match client.put("http://localhost:9200/_test/v1/_testing_and_processing_mode")
@@ -221,6 +222,7 @@ async fn main() -> Result<(), std::io::Error> {
     let compactor_mode = TestProcessingMode {
         indexing_mode: IndexingMode::Disabled,
         compaction_mode: CompactionMode::Disabled,
+        prefetch_mode: PrefetchMode::Disabled,
     };
 
     let _res = match client.put("http://localhost:9201/_test/v1/_testing_and_processing_mode")

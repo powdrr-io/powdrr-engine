@@ -380,6 +380,8 @@ pub(crate) trait ApiServiceClient : Send + Sync {
     async fn get_peer_clients(&mut self) -> Result<Vec<Box<dyn PeerClient>>, Box<dyn Error>>;
 
     async fn get_next_prefetch_checkpoints(&mut self, extension: Option<String>) -> Result<Vec<CheckpointDescriptor>, Box<dyn Error>>;
+
+    async fn set_prefetch_checkpoints(&mut self, checkpoints: &Vec<CheckpointDescriptor>, extension: Option<String>) -> Result<(), Box<dyn Error>>;
 }
 
 
@@ -485,6 +487,11 @@ enum ApiServiceClientActorMessage {
     },
     GetNextPrefetchCheckpoints {
         respond_to: oneshot::Sender<Vec<CheckpointDescriptor>>,
+        extensions: Option<String>,
+    },
+    SetPrefetchCheckpoints {
+        respond_to: oneshot::Sender<()>,
+        checkpoints: Vec<CheckpointDescriptor>,
         extensions: Option<String>,
     },
 }
@@ -651,6 +658,13 @@ impl ApiServiceClientActor {
                     let _ = respond_to.send(self.test.get_next_prefetch_checkpoints(extensions).await.expect("nope"));
                 } else {
                     let _ = respond_to.send(self.real.get_next_prefetch_checkpoints(extensions).await.expect("nope"));
+                }
+            },
+            ApiServiceClientActorMessage::SetPrefetchCheckpoints { respond_to, checkpoints, extensions } => {
+                if self.test_mode {
+                    let _ = respond_to.send(self.test.set_prefetch_checkpoints(&checkpoints, extensions).await.expect("nope"));
+                } else {
+                    let _ = respond_to.send(self.real.set_prefetch_checkpoints(&checkpoints, extensions).await.expect("nope"));
                 }
             },
         }
@@ -872,6 +886,10 @@ impl ApiServiceClient for RealApiServiceClient {
     }
 
     async fn get_next_prefetch_checkpoints(&mut self, _extension: Option<String>) -> Result<Vec<CheckpointDescriptor>, Box<dyn Error>> {
+        todo!()
+    }
+
+    async fn set_prefetch_checkpoints(&mut self, _checkpoints: &Vec<CheckpointDescriptor>, _extension: Option<String>) -> Result<(), Box<dyn Error>> {
         todo!()
     }
 }
@@ -1140,7 +1158,7 @@ impl TestApiServiceClient {
         }
     }     
 
-    fn set_latest_committed_checkpoint(&mut self, table_name: &String, extensions: Option<&String>, checkpoint_id: &String) {
+    fn set_latest_committed_checkpoint(&mut self, table_name: &String, extensions: Option<String>, checkpoint_id: &String) {
         let real_table_name = self.table_aliases.get(table_name).unwrap_or(table_name);
         let key = match extensions {
             Some(e) => &format!("{}_{}", real_table_name, e).to_string(),
@@ -1162,6 +1180,15 @@ impl TestApiServiceClient {
         }
     }
 
+    fn set_latest_fetched_checkpoint(&mut self, table_name: &String, extensions: Option<String>, checkpoint_id: &String) {
+        let real_table_name = self.table_aliases.get(table_name).unwrap_or(table_name);
+        let key = match extensions {
+            Some(e) => &format!("{}_{}", real_table_name, e).to_string(),
+            None => table_name,
+        };
+        assert!(self.latest_fetched_checkpoint_id.get(key).is_none() || self.latest_fetched_checkpoint_id.get(key).unwrap() < checkpoint_id);
+        self.latest_fetched_checkpoint_id.insert(key.clone(), checkpoint_id.clone());
+    }
 
     async fn speedboat_commit_type_commit(&mut self, table_info: &SpeedboatCommitTableInfo, compactions: &Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         let latest_checkpoint = match self.get_latest_committed_checkpoint_sync(&table_info.table_name, None) {
@@ -1381,6 +1408,64 @@ impl ApiServiceClient for TestApiServiceClient {
         todo!()
     }
 
+    async fn create_table(&mut self, create_table: &CreateTable) -> Result<(), Box<dyn Error>> {
+        match distributed_cache::create_table(&create_table.name) {
+            Ok(_) => (),
+            Err(e) => panic!("Unable to create table = {}", e),
+        };
+        match self.tables.get(&create_table.name) {
+            Some(_) => {
+                self.tables.remove(&create_table.name);
+                self.tables.insert(create_table.name.clone(), TableDescription::from_create_table(create_table));
+            }
+            None => {
+                self.tables.insert(create_table.name.clone(), TableDescription::from_create_table(create_table));
+            }
+        }
+        Ok(())
+    }
+
+    async fn describe_table(&mut self, name: &String) -> Result<Option<TableDescription>, Box<dyn Error>> {
+        let final_name = self.table_aliases.get(name).unwrap_or_else(|| name);
+        match self.tables.get(final_name) {
+            Some(d) => Ok(Some(d.clone())),
+            None => Ok(None)
+        }
+    }
+
+    async fn add_alias(&mut self, table_name: &String, alias: &String) -> Result<(), Box<dyn Error>> {
+        // TODO: check if something exists
+        self.table_aliases.insert(alias.clone(), table_name.clone());
+        Ok(())
+    }
+
+    async fn remove_alias(&mut self, _table_name: &String, alias: &String) -> Result<(), Box<dyn Error>> {
+        // TODO: check if something exists
+        self.table_aliases.remove(alias);
+        Ok(())
+    }
+
+    async fn create_table_template(&mut self, name: &String, template: &CreateIndexTemplateBody) -> Result<(), Box<dyn Error>> {
+        match self.table_templates.get(name) {
+            Some(_) => {
+                self.table_templates.remove(name);
+                self.table_templates.insert(name.clone(), template.clone());
+                Ok(())
+            }
+            None => {
+                self.table_templates.insert(name.clone(), template.clone());
+                Ok(())
+            }
+        }
+    }
+
+    async fn describe_table_template(&mut self, name: &String) -> Result<Option<CreateIndexTemplateBody>, Box<dyn Error>> {
+        match self.table_templates.get(name) {
+            Some(d) => Ok(Some(d.clone())),
+            None => Ok(None)
+        }
+    }
+
     async fn create_pipeline(&mut self, name: &String, pipeline: &PipelineDefinition) -> Result<(), Box<dyn std::error::Error>> {
         match self.pipelines.get(name) {
             Some(_) => panic!("Need to do a real error path now"),
@@ -1388,14 +1473,14 @@ impl ApiServiceClient for TestApiServiceClient {
                 self.pipelines.insert(name.clone(), pipeline.clone());
                 Ok(())
             }
-        }        
+        }
     }
 
     async fn describe_pipeline(&mut self, name: &String) -> Result<Option<PipelineDefinition>, Box<dyn std::error::Error>> {
         match self.pipelines.get(name) {
             Some(p) => Ok(Some(p.clone())),
             None => Ok(None)
-        }      
+        }
     }
 
     async fn create_lifetime_policy(&mut self, name: &String, policy: &ILMPolicyDefinition) -> Result<(), Box<dyn Error>> {
@@ -1413,64 +1498,6 @@ impl ApiServiceClient for TestApiServiceClient {
             Some(p) => Ok(Some(p.clone())),
             None => Ok(None)
         }
-    }
-
-    async fn create_table(&mut self, create_table: &CreateTable) -> Result<(), Box<dyn Error>> {
-        match distributed_cache::create_table(&create_table.name) {
-            Ok(_) => (),
-            Err(e) => panic!("Unable to create table = {}", e),
-        };
-        match self.tables.get(&create_table.name) {
-            Some(_) => {
-                self.tables.remove(&create_table.name);
-                self.tables.insert(create_table.name.clone(), TableDescription::from_create_table(create_table));
-            }
-            None => {
-                self.tables.insert(create_table.name.clone(), TableDescription::from_create_table(create_table)); 
-            }
-        }
-        Ok(())
-    } 
-
-    async fn describe_table(&mut self, name: &String) -> Result<Option<TableDescription>, Box<dyn Error>> {
-        let final_name = self.table_aliases.get(name).unwrap_or_else(|| name);
-        match self.tables.get(final_name) {
-            Some(d) => Ok(Some(d.clone())),
-            None => Ok(None)
-        }
-    } 
-
-    async fn add_alias(&mut self, table_name: &String, alias: &String) -> Result<(), Box<dyn Error>> {
-        // TODO: check if something exists
-        self.table_aliases.insert(alias.clone(), table_name.clone());
-        Ok(())
-    }
-
-    async fn remove_alias(&mut self, _table_name: &String, alias: &String) -> Result<(), Box<dyn Error>> {
-        // TODO: check if something exists
-        self.table_aliases.remove(alias);
-        Ok(())
-    }    
-
-    async fn create_table_template(&mut self, name: &String, template: &CreateIndexTemplateBody) -> Result<(), Box<dyn Error>> {
-        match self.table_templates.get(name) {
-            Some(_) => {
-                self.table_templates.remove(name);
-                self.table_templates.insert(name.clone(), template.clone());
-                Ok(())
-            }
-            None => {
-                self.table_templates.insert(name.clone(), template.clone());
-                Ok(())
-            }
-        }
-    }   
-
-    async fn describe_table_template(&mut self, name: &String) -> Result<Option<CreateIndexTemplateBody>, Box<dyn Error>> {
-        match self.table_templates.get(name) {
-            Some(d) => Ok(Some(d.clone())),
-            None => Ok(None)
-        }      
     }
 
 
@@ -1571,11 +1598,11 @@ impl ApiServiceClient for TestApiServiceClient {
         match self.get_latest_committed_checkpoint_sync(table_name, Some("es".to_string())) {
             Some(latest) => {
                 if max_id > &latest {
-                    self.set_latest_committed_checkpoint(table_name, Some(&"es".to_string()), max_id);
+                    self.set_latest_committed_checkpoint(table_name, Some("es".to_string()), max_id);
                 }
             },
             None => {
-                self.set_latest_committed_checkpoint(table_name, Some(&"es".to_string()), max_id);
+                self.set_latest_committed_checkpoint(table_name, Some("es".to_string()), max_id);
             },
         };
         Ok(())
@@ -1655,14 +1682,26 @@ impl ApiServiceClient for TestApiServiceClient {
                 let mut checkpoints = vec!();
                 let all_table_names: Vec<String> = self.tables.keys().cloned().collect();
                 for table_name in all_table_names.iter() {
-                    match self.get_latest_committed_checkpoint_sync(table_name, extension.clone()) {
-                        Some(checkpoint_id) => {
+                    let latest_checkpoint = match self.get_latest_committed_checkpoint_sync(table_name, extension.clone()) {
+                        Some(checkpoint_id) => checkpoint_id,
+                        None => continue
+                    };
+                    match self.get_latest_fetched_checkpoint(table_name, extension.clone()) {
+                        Some(latest_fetched_id) => {
+                            assert!(latest_checkpoint >= latest_fetched_id);
+                            if latest_checkpoint != latest_fetched_id {
+                                checkpoints.push(CheckpointDescriptor {
+                                    table_name: table_name.clone(),
+                                    checkpoint_id: latest_checkpoint.clone(),
+                                });
+                            }
+                        },
+                        None => {
                             checkpoints.push(CheckpointDescriptor {
                                 table_name: table_name.clone(),
-                                checkpoint_id,
+                                checkpoint_id: latest_checkpoint.clone(),
                             });
-                        },
-                        None => ()
+                        }
                     }
                 }
                 Ok(checkpoints)
@@ -1672,6 +1711,21 @@ impl ApiServiceClient for TestApiServiceClient {
             }
         }
     }
+
+    async fn set_prefetch_checkpoints(&mut self, checkpoints: &Vec<CheckpointDescriptor>, extension: Option<String>) -> Result<(), Box<dyn Error>> {
+        match self.mode.prefetch_mode {
+            PrefetchMode::Enabled => {
+                for checkpoint in checkpoints {
+                    self.set_latest_fetched_checkpoint(&checkpoint.table_name, extension.clone(), &checkpoint.checkpoint_id);
+                }
+                Ok(())
+            },
+            PrefetchMode::Disabled => {
+                panic!("Should not be called")
+            }
+        }
+    }
+
 }
 
 #[derive(Clone)]
@@ -1952,6 +2006,19 @@ impl ApiServiceClientHandle {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::GetNextPrefetchCheckpoints {
             respond_to: send,
+            extensions: extension.clone(),
+        };
+
+        let _ = self.sender.send(msg).await;
+        // TODO: deal with errors
+        recv.await
+    }
+
+    pub async fn set_prefetch_checkpoints(&self, checkpoints: &Vec<CheckpointDescriptor>, extension: Option<String>) -> Result<(), RecvError> {
+        let (send, recv) = oneshot::channel();
+        let msg = ApiServiceClientActorMessage::SetPrefetchCheckpoints {
+            respond_to: send,
+            checkpoints: checkpoints.clone(),
             extensions: extension.clone(),
         };
 
