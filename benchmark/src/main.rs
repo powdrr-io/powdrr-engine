@@ -5,6 +5,7 @@ use futures::future::join_all;
 use idgenerator::{IdGeneratorOptions, IdInstance};
 use rand::TryRngCore;
 use rand::rngs::OsRng;
+use powdrr_lib::test_api::{CompactionMode, IndexingMode, TestProcessingMode};
 
 const LINE_LIMIT: u64 = 1000000;
 
@@ -95,12 +96,13 @@ async fn load_data() -> Result<bool, std::io::Error> {
         if lines_read % 1000 == 0 {
             all_response_times.extend(join_all(waiting_for_response).await);
             waiting_for_response = vec!();
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
         if lines_read % 10000 == 0 {
             println!("Events Added: {}", lines_read);
             println!("Ingest - average response time: {} ms", all_response_times.iter().sum::<u128>() / all_response_times.len() as u128);
+            tokio::time::sleep(Duration::from_millis(10000)).await;
         }
 
         if lines_read >= LINE_LIMIT {
@@ -173,7 +175,7 @@ async fn search() -> Result<(), std::io::Error> {
         println!("Search - latest response time: {} ms", latest_response_time);
         println!("Search - average response time: {} ms", all_response_times.iter().sum::<u128>() / all_response_times.len() as u128);
 
-        if latest_response_time < 20 {
+        if latest_response_time < 100 {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
@@ -203,8 +205,26 @@ async fn main() -> Result<(), std::io::Error> {
     }
 
     let client = reqwest::Client::new();
+    
+    let main_mode = TestProcessingMode {
+        indexing_mode: IndexingMode::Disabled,
+        compaction_mode: CompactionMode::External("http://localhost:9201".to_string()),
+    };
+    
     let _res = match client.put("http://localhost:9200/_test/v1/_testing_and_processing_mode")
-        .body("")
+        .body(serde_json::to_string(&main_mode)?)
+        .send().await {
+        Ok(res) => res,
+        Err(e) => panic!("Error: {}", e),
+    };
+
+    let compactor_mode = TestProcessingMode {
+        indexing_mode: IndexingMode::Disabled,
+        compaction_mode: CompactionMode::Disabled,
+    };
+
+    let _res = match client.put("http://localhost:9201/_test/v1/_testing_and_processing_mode")
+        .body(serde_json::to_string(&compactor_mode)?)
         .send().await {
         Ok(res) => res,
         Err(e) => panic!("Error: {}", e),

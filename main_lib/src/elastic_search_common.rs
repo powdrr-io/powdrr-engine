@@ -20,7 +20,8 @@ use serde_json::{Map, Value};
 use crate::data_access;
 use crate::data_access::load_memtable;
 use crate::elastic_search_responses::QueryFailure;
-use crate::state_peers::{self, PeerClient, PeerClientError, PrivateInvocation, PrivateInvocationResult};
+use crate::state_hosted_service::API_SERVICE_CLIENT;
+use crate::state_peers::{PeerClient, PeerClientError, PrivateInvocation, PrivateInvocationResult};
 
 
 pub(crate) const MIME_ES_JSON: LazyLock<Mime> = LazyLock::new(|| "application/vnd.elasticsearch+json;compatible-with=8".parse().unwrap());
@@ -119,7 +120,7 @@ pub(crate) async fn call_private_sql(
 pub async fn call_peers(
     invocation: &PrivateInvocation
 ) -> Result<Vec<PrivateInvocationResult>, PeerClientError> {
-    let peer_clients: Vec<Box<dyn PeerClient>> = state_peers::get_peer_clients();
+    let peer_clients: Vec<Box<dyn PeerClient>> = API_SERVICE_CLIENT.get_peer_clients().await.unwrap();
 
     let all_calls = peer_clients.iter().enumerate().map(
         |(index, client)| call_private_sql(client.as_ref(), invocation, index as u64, peer_clients.len() as u64));

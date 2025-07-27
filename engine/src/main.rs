@@ -27,14 +27,15 @@ fn build_config() -> anyhow::Result<ServerConfig> {
 }
 
 
-fn run_server() -> () {
+fn run_server(port: &String) -> () {
     tracing_subscriber::fmt().init();
-    let addr = "0.0.0.0:9200";
+    let addr = format!("0.0.0.0:{}", port);
     println!("Listening for requests at http://{}", addr);
     gotham::start_with_num_threads(addr, powdrr_lib::router::router(true), 16).unwrap()
 }
 
 
+#[allow(dead_code)]
 fn run_ssl_server() -> () {
     tracing_subscriber::fmt().init();
     let addr = "0.0.0.0:9200";
@@ -53,12 +54,7 @@ fn main() -> () {
     }
 
     match args.get(1) {
-        None => run_server(),
-        Some(val) if val == &"tls".to_string() => run_ssl_server(),
-        Some(_) => {
-            println!("Unrecognized option");
-            panic!("I don't know what to do")
-        }
+        None => run_server(&"9200".to_string()),
+        Some(val) => run_server(val),
     }
 }
-

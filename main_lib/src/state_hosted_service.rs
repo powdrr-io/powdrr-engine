@@ -8,10 +8,11 @@ use tokio::sync::{mpsc, oneshot::{self, error::RecvError}};
 
 use crate::{distributed_cache, elastic_search_ingest::CreateIndexTemplateBody, pipeline::PipelineDefinition, state_peers::SnapshotDescriptor};
 use crate::compaction::drop_all_tables;
-use crate::elastic_search_index::create_index_inner;
+use crate::elastic_search_index::create_index;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::schema_massager::PowdrrSchema;
-
+use crate::state_peers::{PeerClient, SelfPeer};
+use crate::test_api::{IndexingMode, TestProcessingMode};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct SpeedboatCSpeedInfo {
@@ -360,7 +361,7 @@ pub(crate) trait ApiServiceClient : Send + Sync {
 
     async fn describe_lifetime_policy(&mut self, name: &String) -> Result<Option<ILMPolicyDefinition>, Box<dyn Error>>;
     
-    async fn speedboat_commit(&mut self, commit: &SpeedboatCommit, sync_index: bool) -> Result<(), Box<dyn Error>>;
+    async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), Box<dyn Error>>;
 
     async fn iceberg_commit(&mut self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), Box<dyn Error>>;
 
@@ -375,6 +376,8 @@ pub(crate) trait ApiServiceClient : Send + Sync {
     async fn get_extension_work_items(&mut self, extension_name: &String) -> Result<Vec<ExtensionWorkItem>, Box<dyn Error>>;
 
     async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, Box<dyn Error>>;
+
+    async fn get_peer_clients(&mut self) -> Result<Vec<Box<dyn PeerClient>>, Box<dyn Error>>;
 }
 
 
@@ -382,14 +385,13 @@ struct ApiServiceClientActor {
     real: RealApiServiceClient,
     test: TestApiServiceClient,
     test_mode: bool,
-    sync_index: bool,
     receiver: mpsc::Receiver<ApiServiceClientActorMessage>,
 }
 
 enum ApiServiceClientActorMessage {
     Testing {
         respond_to: oneshot::Sender<()>,
-        sync_index: bool,
+        mode: TestProcessingMode,
     },
     CreatePipeline {
         respond_to: oneshot::Sender<()>,
@@ -476,6 +478,9 @@ enum ApiServiceClientActorMessage {
     GetCompactionWorkItems {
         respond_to: oneshot::Sender<Vec<(String, CompactionWorkItem)>>,
     },
+    GetPeerClients {
+        respond_to: oneshot::Sender<Vec<Box<dyn PeerClient>>>,
+    },
 }
 
 unsafe impl Send for ApiServiceClientActorMessage {}
@@ -487,17 +492,15 @@ impl ApiServiceClientActor {
             real: RealApiServiceClient::new(base_address),
             test: TestApiServiceClient::new(),
             test_mode: false,
-            sync_index: false,           
             receiver: receiver,
         }
     }
 
     async fn handle_message(&mut self, msg: ApiServiceClientActorMessage) {
         match msg {
-            ApiServiceClientActorMessage::Testing { respond_to, sync_index } => {
+            ApiServiceClientActorMessage::Testing { respond_to, mode } => {
                 self.test_mode = true;
-                self.sync_index = sync_index;
-                self.test.clear().await;
+                self.test.clear_and_set(mode).await;
                 let _ = respond_to.send(());
             },
             ApiServiceClientActorMessage::CreatePipeline { respond_to, name, pipeline } => {
@@ -583,9 +586,9 @@ impl ApiServiceClientActor {
             },            
             ApiServiceClientActorMessage::SpeedboatCommit { respond_to, speedboat_commit } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.speedboat_commit(&speedboat_commit, self.sync_index).await.expect("nope"));
+                    let _ = respond_to.send(self.test.speedboat_commit(&speedboat_commit).await.expect("nope"));
                 } else {
-                    let _ = respond_to.send(self.real.speedboat_commit(&speedboat_commit, self.sync_index).await.expect("nope"));
+                    let _ = respond_to.send(self.real.speedboat_commit(&speedboat_commit).await.expect("nope"));
                 }                
             },
             ApiServiceClientActorMessage::ExtensionCommit { respond_to, table_name, extension_commit } => {
@@ -628,6 +631,13 @@ impl ApiServiceClientActor {
                     let _ = respond_to.send(self.test.get_compaction_work_items().await.expect("nope"));
                 } else {
                     let _ = respond_to.send(self.real.get_compaction_work_items().await.expect("nope"));
+                }
+            },
+            ApiServiceClientActorMessage::GetPeerClients { respond_to } => {
+                if self.test_mode {
+                    let _ = respond_to.send(self.test.get_peer_clients().await.expect("nope"));
+                } else {
+                    let _ = respond_to.send(self.real.get_peer_clients().await.expect("nope"));
                 }
             },
         }
@@ -718,7 +728,7 @@ impl ApiServiceClient for RealApiServiceClient {
         todo!()
     }          
 
-    async fn speedboat_commit(&mut self, commit: &SpeedboatCommit, _sync_index: bool) -> Result<(), Box<dyn Error>> {
+    async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), Box<dyn Error>> {
         let base_address = &self.base_address;
         let body = serde_json::to_string(commit);
         match body {
@@ -844,6 +854,10 @@ impl ApiServiceClient for RealApiServiceClient {
         todo!("nope")
     }
 
+    async fn get_peer_clients(&mut self) -> Result<Vec<Box<dyn PeerClient>>, Box<dyn Error>> {
+        todo!("nope")
+    }
+
 }
 
 
@@ -877,6 +891,7 @@ pub(crate) struct CompactionWorkItem {
 
 
 struct TestApiServiceClient {
+    mode: TestProcessingMode,
     tables: HashMap<String, TableDescription>,
     // alias name -> table name
     table_aliases: HashMap<String, String>,
@@ -895,6 +910,7 @@ struct TestApiServiceClient {
 impl TestApiServiceClient {
     fn new() -> Self {
         TestApiServiceClient{
+            mode: TestProcessingMode::default(),
             tables: HashMap::new(),
             table_aliases: HashMap::new(),
             table_templates: HashMap::new(),
@@ -910,8 +926,9 @@ impl TestApiServiceClient {
         }
     }
 
-    async fn clear(&mut self) -> () {
+    async fn clear_and_set(&mut self, mode: TestProcessingMode) -> () {
         distributed_cache::clear(&self.tables.keys().into_iter().map(|x|x.clone()).collect()).unwrap();
+        self.mode = mode;
         self.tables.clear();
         self.table_aliases.clear();
         self.table_templates.clear();
@@ -1115,7 +1132,7 @@ impl TestApiServiceClient {
         self.latest_checkpoint_id.insert(key.clone(), checkpoint_id.clone());        
     }
 
-    async fn speedboat_commit_type_commit(&mut self, table_info: &SpeedboatCommitTableInfo, compactions: &Vec<String>, sync_index: bool) -> Result<(), Box<dyn std::error::Error>> {
+    async fn speedboat_commit_type_commit(&mut self, table_info: &SpeedboatCommitTableInfo, compactions: &Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         let latest_checkpoint = match self.get_latest_checkpoint_sync(&table_info.table_name, None) {
             Some(checkpoint_id) => {
                 let key = format!("{}_{}", &table_info.table_name, checkpoint_id);
@@ -1174,18 +1191,31 @@ impl TestApiServiceClient {
 
         self.checkpoints.insert(format!("{}_{}", &table_info.table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
 
-        if sync_index {
-            self.create_index(&new_latest_checkpoint).await?;
-        } else {
-            self.fill_extension_work_item(
-                &table_info.table_name,
-                &"es".to_string(),
-                &new_checkpoint_id,
-                &merged_schema,
-                &speedboat_files,
-                &iceberg_files
-            )
-        }
+        match self.mode.indexing_mode {
+            IndexingMode::Sync => {
+                self.fill_extension_work_item(
+                    &table_info.table_name,
+                    &"es".to_string(),
+                    &new_checkpoint_id,
+                    &merged_schema,
+                    &speedboat_files,
+                    &iceberg_files
+                )
+
+            },
+            IndexingMode::Async => {
+                self.fill_extension_work_item(
+                    &table_info.table_name,
+                    &"es".to_string(),
+                    &new_checkpoint_id,
+                    &merged_schema,
+                    &speedboat_files,
+                    &iceberg_files
+                )
+            },
+            IndexingMode::Disabled => ()
+        };
+
         self.set_latest_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
 
         // TODO: apply some policy here based on sizes to split up compaction work items
@@ -1272,20 +1302,18 @@ impl TestApiServiceClient {
         Ok(())
     }    
 
-    async fn create_index(&mut self, new_latest_checkpoint: &TableMetadataCheckpoint) -> Result<(), Box<dyn Error>> {
-        let iceberg_files = new_latest_checkpoint.iceberg_metadata.as_ref().map_or(vec!(), |x|x.files.as_file_tuples());
-        let speedboat_files = new_latest_checkpoint.speedboat_metadata.as_ref().map_or(vec!(), |x|x.files.as_file_tuples());
-        let files = match create_index_inner(&iceberg_files, &speedboat_files).await {
-            Ok(files) => files,
-            Err(_) => panic!("Unable to create index for {}", new_latest_checkpoint.table_name)
-        };
-        self.extension_commit(
-            &new_latest_checkpoint.table_name,
-            &ExtensionCommit {
-                extension: "es".to_string(),
-                files: files
+    async fn create_index(&mut self) -> Result<(), Box<dyn Error>> {
+        let work_items = self.get_extension_work_items(&"es".to_string()).await?;
+        for work_item in work_items {
+            match create_index(&work_item).await {
+                Ok(_) => (),
+                Err(e) => {
+                    tracing::error!("Failed to create index for table {}: {}", work_item.table_name, e);
+                    return Err(Box::new(e));
+                }
             }
-        ).await
+        }
+        Ok(())
     }
 
     fn get_checkpoint_sync(&self, table_name: &String, checkpoint_id: &String) -> Option<TableMetadataCheckpoint> {
@@ -1415,10 +1443,10 @@ impl ApiServiceClient for TestApiServiceClient {
     }
 
 
-    async fn speedboat_commit(&mut self, commit: &SpeedboatCommit, sync_index: bool) -> Result<(), Box<dyn std::error::Error>> {
+    async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), Box<dyn std::error::Error>> {
         for table_info in commit.type_files.iter() {
             if table_info.commit_type == "commit" || table_info.commit_type == "compact" {
-                self.speedboat_commit_type_commit(table_info, &commit.compactions, sync_index).await?;
+                self.speedboat_commit_type_commit(table_info, &commit.compactions).await?;
             } else if table_info.commit_type == "delete" {
                 self.speedboat_commit_type_delete(table_info, &commit.compactions).await?;
             } else {
@@ -1470,14 +1498,30 @@ impl ApiServiceClient for TestApiServiceClient {
         self.checkpoints.insert(format!("{}_{}", &table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
         self.set_latest_checkpoint(&table_name, None, &new_checkpoint_id);
 
-        self.fill_extension_work_item(
-            &table_name,
-            &"es".to_string(),
-            &new_checkpoint_id,
-            &merged_schema,
-            &speedboat_files,
-            &iceberg_files
-        );
+        match self.mode.indexing_mode {
+            IndexingMode::Sync => {
+                self.fill_extension_work_item(
+                    &table_name,
+                    &"es".to_string(),
+                    &new_checkpoint_id,
+                    &merged_schema,
+                    &speedboat_files,
+                    &iceberg_files
+                );
+                self.create_index().await?;
+            },
+            IndexingMode::Async => {
+                self.fill_extension_work_item(
+                    &table_name,
+                    &"es".to_string(),
+                    &new_checkpoint_id,
+                    &merged_schema,
+                    &speedboat_files,
+                    &iceberg_files
+                );
+            },
+            IndexingMode::Disabled => ()
+        };
 
         Ok(())
     }
@@ -1548,16 +1592,23 @@ impl ApiServiceClient for TestApiServiceClient {
     async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, Box<dyn std::error::Error>> {
         let mut work_items = vec!();
         for (table_name, compaction) in self.compaction_work_items.iter_mut() {
-            tracing::info!("Compaction work item stats: size = {}, files = {}",
+            tracing::info!("Compaction work item stats: size = {}/{}, files = {}/200",
                 compaction.speedboat_files.sizes.iter().sum::<u64>(),
+                100 * 1024 * 1024,
                 compaction.speedboat_files.sizes.len()
             );
-            if compaction.speedboat_files.sizes.iter().sum::<u64>() > 100 * 1024 * 1024 || compaction.speedboat_files.sizes.len() > 200 {
+            let do_compaction = compaction.speedboat_files.sizes.iter().sum::<u64>() > 100 * 1024 * 1024 || compaction.speedboat_files.sizes.len() > 200;
+            //let do_compaction = true;
+            if do_compaction {
                 work_items.push((table_name.clone(), compaction.clone()));
                 compaction.speedboat_files.clear();
             }
         }
         Ok(work_items)
+    }
+
+    async fn get_peer_clients(&mut self) -> Result<Vec<Box<dyn PeerClient>>, Box<dyn Error>> {
+        Ok(vec!(Box::new(SelfPeer::new(self.mode.compaction_mode.clone()))))
     }
 }
 
@@ -1575,11 +1626,11 @@ impl ApiServiceClientHandle {
         Self { sender }
     }
 
-    pub async fn set_testing_mode(&self, sync_index: bool) -> () {
+    pub async fn set_testing_mode(&self, mode: &TestProcessingMode) -> () {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::Testing { 
             respond_to: send,
-            sync_index: sync_index,
+            mode: mode.clone(),
         };
 
         let _ = self.sender.send(msg).await;
@@ -1816,6 +1867,17 @@ impl ApiServiceClientHandle {
     pub async fn get_compaction_work_items(&self) -> Result<Vec<(String, CompactionWorkItem)>, RecvError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::GetCompactionWorkItems {
+            respond_to: send,
+        };
+
+        let _ = self.sender.send(msg).await;
+        // TODO: deal with errors
+        recv.await
+    }
+
+    pub async fn get_peer_clients(&self) -> Result<Vec<Box<dyn PeerClient>>, RecvError> {
+        let (send, recv) = oneshot::channel();
+        let msg = ApiServiceClientActorMessage::GetPeerClients {
             respond_to: send,
         };
 

@@ -23,7 +23,6 @@ pub mod router;
 mod schema_massager;
 mod state_common;
 mod state_hosted_service;
-mod state_leader;
 mod state_peers;
-mod test_api;
+pub mod test_api;
 mod util;

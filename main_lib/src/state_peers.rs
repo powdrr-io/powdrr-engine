@@ -2,16 +2,16 @@ use std::{error::Error, fmt::Display};
 use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
-use gotham::test::TestServer;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::{private_api::data_query, state_common::FileFilter, state_leader};
+use crate::{private_api::data_query, state_common::FileFilter};
 use crate::compaction::{compact_logs, CompactionCommand, CompactionResponse};
 use crate::elastic_search_common::result_to_record_batch;
 use crate::private_api::{compaction_query, extension_query};
 use crate::schema_massager::{PowdrrSchema, SqlQuery};
 use crate::state_hosted_service::{ExtensionFileMetadata, FileSetPayload};
+use crate::test_api::CompactionMode;
 
 #[derive(Serialize, Deserialize)]
 pub struct FieldFileFilterDescriptor {
@@ -108,7 +108,7 @@ pub trait PeerClient: Send + Sync {
 
     async fn private_extension(&self, invocation: &PrivateExtensionInvocation, index: u64, num: u64) -> Result<ExtensionFileMetadata, PeerClientError>;
 
-    async fn private_compaction_leader(&self, invocation: &CompactionCommand) -> Result<CompactionResponse, PeerClientError>;
+    async fn private_compaction_leader(&self, invocation: &CompactionCommand) -> Result<Option<CompactionResponse>, PeerClientError>;
 }
 
 #[allow(dead_code)]
@@ -168,7 +168,7 @@ impl PeerClient for RemotePeer {
         todo!()
     }
 
-    async fn private_compaction_leader(&self, _invocation: &CompactionCommand) -> Result<CompactionResponse, PeerClientError> {
+    async fn private_compaction_leader(&self, _invocation: &CompactionCommand) -> Result<Option<CompactionResponse>, PeerClientError> {
         todo!()
     }
 
@@ -203,11 +203,12 @@ impl PeerClient for RemotePeer {
 
 
 pub struct SelfPeer {
+    pub compaction_mode: CompactionMode
 }
 
 impl SelfPeer {
-    pub fn new() -> Self {
-        SelfPeer {}
+    pub fn new(compaction_mode: CompactionMode) -> Self {
+        SelfPeer { compaction_mode: compaction_mode.clone() }
     }
 }
 
@@ -252,150 +253,36 @@ impl PeerClient for SelfPeer {
         }
     }
 
-    async fn private_compaction_leader(&self, invocation: &CompactionCommand) -> Result<CompactionResponse, PeerClientError> {
-        match compact_logs(Arc::new(invocation.clone())).await {
-            Ok(success) => {
-                Ok(serde_json::from_str(success.body.as_str()).unwrap())
+    async fn private_compaction_leader(&self, invocation: &CompactionCommand) -> Result<Option<CompactionResponse>, PeerClientError> {
+        match &self.compaction_mode {
+            CompactionMode::Async => {
+                match compact_logs(Arc::new(invocation.clone())).await {
+                    Ok(success) => {
+                        Ok(Some(serde_json::from_str(success.body.as_str()).unwrap()))
+                    },
+                    Err(e) => Err(PeerClientError { message: e.to_string() })
+                }
             },
-            Err(e) => Err(PeerClientError{ message: e.to_string() })
-        }
-    }
-}
+            CompactionMode::External(compaction_leader) => {
+                let client = Client::new();
 
+                let res = match client.post(format!("{}/_private/v1/_compact", compaction_leader))
+                    .body(serde_json::to_string(&invocation).unwrap())
+                    .send().await {
+                    Ok(res) => res,
+                    Err(e) => panic!("Error: {}", e),
+                };
 
-pub(crate) trait PeerClientGenerator {
-    fn generate(&self) -> Vec<Box<dyn PeerClient>>;
+                assert!(res.status().is_success());
 
-    #[allow(dead_code)]
-    fn test_server(&self) -> Option<&TestServer>;
-}
+                let response_str = res.text().await.unwrap().clone();
 
-
-struct RealPeerClientGenerator {}
-
-unsafe impl Send for RealPeerClientGenerator {}
-unsafe impl Sync for RealPeerClientGenerator {}
-
-impl RealPeerClientGenerator {
-    fn new() -> Self {
-        RealPeerClientGenerator{}
-    }
-}
-
-impl PeerClientGenerator for RealPeerClientGenerator {
-    fn generate(&self) -> Vec<Box<dyn PeerClient>> {
-        state_leader::get_leader().get_peers()
-    }
-
-    fn test_server(&self) -> Option<&TestServer> {
-        None
-    }
-}
-
-
-pub static mut PEER_CLIENT_GENERATOR: std::sync::LazyLock<Box<dyn PeerClientGenerator>> = 
-    std::sync::LazyLock::new(|| Box::new(RealPeerClientGenerator::new()));
-
-
-pub fn get_peer_clients() -> Vec<Box<dyn PeerClient>> {
-    unsafe {
-        (*PEER_CLIENT_GENERATOR).generate()
-    }
-}
-
-#[allow(dead_code)]
-pub fn get_test_server() -> Option<&'static TestServer> {
-    unsafe {
-        (*PEER_CLIENT_GENERATOR).test_server()
-    }
-}
-
-
-#[cfg(test)]
-pub mod tests {
-    use std::str;
-
-    use async_trait::async_trait;
-    use datafusion::arrow::array::RecordBatch;
-    use gotham::{mime, test::TestServer};
-    use crate::compaction::{CompactionCommand, CompactionResponse};
-    use crate::router::router;
-    use crate::state_hosted_service::ExtensionFileMetadata;
-    use super::{PeerClient, PeerClientError, PeerClientGenerator, PrivateCompactionInvocation, PrivateExtensionInvocation, PrivateSqlInvocation};
-
-    pub(crate) struct TestPeerClient {
-        server: TestServer,
-    }
-
-    impl TestPeerClient {
-        #[allow(dead_code)]
-        pub fn new(server: TestServer) -> Self {
-            TestPeerClient {
-                server: server
+                let response = serde_json::from_str::<CompactionResponse>(response_str.as_str()).unwrap();
+                Ok(Some(response))
+            },
+            CompactionMode::Disabled => {
+                Ok(None)
             }
         }
     }
-
-    #[async_trait]
-    impl PeerClient for TestPeerClient {
-        async fn private_sql(&self, invocation: &PrivateSqlInvocation, _index: u64, _num: u64) -> Result<Vec<RecordBatch>, PeerClientError> {
-            let body_obj = match serde_json::to_string(invocation) {
-                Ok(bo) => bo,
-                Err(_) => panic!("bad format")
-            };
-            let response = self.server.client().post(
-                "http://localhost/_private/v1/_sql",
-                body_obj,
-                mime::APPLICATION_JSON,
-            ).perform().unwrap();
-
-            if response.status() == 200 {
-                let body = response.read_body().unwrap();
-                let str_body = str::from_utf8(&body).unwrap();
-                panic!("Oops, need to do something: {}", str_body);
-            } else {
-                Err(PeerClientError { message: "Something go boom".to_string() })
-            }
-        }
-
-        async fn private_compaction(&self, _invocation: &PrivateCompactionInvocation, _index: u64, _num: u64) -> Result<Vec<RecordBatch>, PeerClientError> {
-            todo!()
-        }
-
-        async fn private_extension(&self, _invocation: &PrivateExtensionInvocation, _index: u64, _num: u64) -> Result<ExtensionFileMetadata, PeerClientError> {
-            todo!()
-        }
-
-        async fn private_compaction_leader(&self, _invocation: &CompactionCommand) -> Result<CompactionResponse, PeerClientError> {
-            todo!()
-        }
-    }
-
-    pub struct TestPeerClientGenerator {
-        server: TestServer,
-    }
-
-    unsafe impl Send for TestPeerClientGenerator {}
-    unsafe impl Sync for TestPeerClientGenerator {}
-    
-    impl TestPeerClientGenerator {
-        #[allow(dead_code)]
-        pub fn new() -> Self {
-            TestPeerClientGenerator{
-                server: TestServer::new(router(true)).unwrap()
-            }
-        }
-    }
-    
-    impl PeerClientGenerator for TestPeerClientGenerator {
-        fn generate(&self) -> Vec<Box<dyn PeerClient>> {
-            vec!(Box::new(TestPeerClient{
-                server: self.server.clone()
-            }))
-        }
-
-        fn test_server(&self) -> Option<&TestServer> {
-            Some(&self.server)
-        }
-    }    
 }

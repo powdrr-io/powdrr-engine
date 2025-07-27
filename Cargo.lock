@@ -4110,6 +4110,7 @@ dependencies = [
  "chrono",
  "futures",
  "idgenerator",
+ "powdrr_lib",
  "rand 0.9.1",
  "reqwest 0.12.22",
  "serde_json",

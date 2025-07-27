@@ -14,6 +14,37 @@ pub(crate) struct TestCreateIndex {
 }
 
 
+#[derive(Serialize, Deserialize, Clone)]
+pub enum IndexingMode {
+    Sync,
+    Async,
+    Disabled
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub enum CompactionMode {
+    Async,
+    External(String),
+    Disabled
+}
+
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct TestProcessingMode {
+    pub indexing_mode: IndexingMode,
+    pub compaction_mode: CompactionMode
+}
+
+impl TestProcessingMode {
+    pub fn default() -> Self {
+        Self {
+            indexing_mode: IndexingMode::Sync,
+            compaction_mode: CompactionMode::Async
+        }
+    }
+}
+
+
 pub fn test_v1_create_index(mut state: State) -> Pin<Box<HandlerFuture>> {
     async move {
         let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
@@ -55,7 +86,7 @@ pub fn test_v1_add_checkpoint(mut state: State) -> Pin<Box<HandlerFuture>> {
 
 pub fn test_v1_set_testing_mode(state: State) -> Pin<Box<HandlerFuture>> {
     async {
-        API_SERVICE_CLIENT.set_testing_mode(false).await;
+        API_SERVICE_CLIENT.set_testing_mode(&TestProcessingMode::default()).await;
         let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "Ok");
         Ok((state, res))        
     }.boxed()
@@ -98,7 +129,6 @@ pub(crate) async fn do_all_available_compaction_work(start_snapshot_id: i64) -> 
     loop {
         let mut work_done = false;
 
-        tracing::info!("Checking for compaction work");
         let compact_work = match API_SERVICE_CLIENT.get_compaction_work_items().await {
             Ok(work) => work,
             Err(_) => panic!("oh no"),
@@ -109,7 +139,7 @@ pub(crate) async fn do_all_available_compaction_work(start_snapshot_id: i64) -> 
             match perform_compaction(compact_work, last_iceberg_snapshot_id).await {
                 Ok(id) => { last_iceberg_snapshot_id = id; },
                 Err(e) => {
-                    tracing::error!("Error performing compaction: {:?}", e);
+                    tracing::error!("!!!!!!!!!!!!!!!!!!!!!!!!!  Error performing compaction: {:?}", e);
                     // TODO: do something to trigger a retry of this compaction
                 },
             }
@@ -146,9 +176,20 @@ fn do_compaction_work_for_forever(wait_time_ms: u64) -> impl Future<Output = ()>
 
 
 
-pub fn test_v1_set_testing_processing_mode(state: State) -> Pin<Box<HandlerFuture>> {
+pub fn test_v1_set_testing_processing_mode(mut state: State) -> Pin<Box<HandlerFuture>> {
     async {
-        API_SERVICE_CLIENT.set_testing_mode(false).await;
+        let mode = match body::to_bytes(Body::take_from(&mut state)).await {
+            Ok(vb) => {
+                let body_content = String::from_utf8(vb.to_vec()).unwrap();
+                match serde_json::from_str(&body_content) {
+                    Ok(io) => io,
+                    Err(_) => panic!("This should not happen"),
+                }
+            },
+            Err(_) => TestProcessingMode::default()
+        };
+
+        API_SERVICE_CLIENT.set_testing_mode(&mode).await;
         tokio::spawn(do_extension_work_for_forever(vec!("es".to_string()), 1000));
         tokio::spawn(do_compaction_work_for_forever(1000));
         let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "Ok");

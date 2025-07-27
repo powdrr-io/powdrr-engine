@@ -32,7 +32,7 @@ use crate::elastic_search_common::{execute_command, Command, CommandContext, Com
 use crate::elastic_search_ingest::{write_to_file, WriteBuffer};
 use crate::schema_massager::{PowdrrSchema, SqlBuilder};
 use crate::state_hosted_service::{CompactionWorkItem, FileSetPayload, IcebergCommit, IcebergMetadata, SpeedboatCommit, SpeedboatCommitTableInfo};
-use crate::state_peers::{get_peer_clients, PrivateCompactionInvocation, PrivateInvocation};
+use crate::state_peers::{PrivateCompactionInvocation, PrivateInvocation};
 
 
 const REST_CATALOG_IP: &str = "localhost";
@@ -269,7 +269,6 @@ pub(crate) struct CompactionResponse {
     pub deletes_table_info: Option<SpeedboatCommitTableInfo>,
     pub compactions: Vec<String>
 }
-
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct CompactionCommand {
@@ -550,17 +549,22 @@ pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkIt
             last_snapshot_id,
         };
 
-        let peers = get_peer_clients();
+        let peers = API_SERVICE_CLIENT.get_peer_clients().await.unwrap();
         assert!(peers.len() > 0);
-        let response = match peers[0].private_compaction_leader(&command).await {
+        let response_maybe = match peers[0].private_compaction_leader(&command).await {
             Ok(success) => success,
             Err(e) => return Err(CompactionError{ message: e.to_string() })
         };
 
-        new_last_snapshot_id = match CompactionCommand::do_iceberg_commit(&response).await {
-            Ok(id) => id,
-            Err(e) => return Err(CompactionError{ message: e.to_string() })
-        }
+        new_last_snapshot_id = match response_maybe {
+            Some(response) => {
+                match CompactionCommand::do_iceberg_commit(&response).await {
+                    Ok(id) => id,
+                    Err(e) => return Err(CompactionError{ message: e.to_string() })
+                }
+            },
+            None => new_last_snapshot_id
+        };
     }
    
     Ok(new_last_snapshot_id)
