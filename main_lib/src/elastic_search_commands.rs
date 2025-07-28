@@ -11,6 +11,7 @@ use http::StatusCode;
 use serde_json::Value;
 
 use crate::{data_access::{self, execute_sql}, distributed_cache, elastic_search_common::{Command, ResultGeneratorFuture}, elastic_search_parser::ScriptBlock, elastic_search_responses::{QueryResultHit, QueryResults}, expression_evaluator, painless_parser, state_hosted_service::API_SERVICE_CLIENT, state_peers::CheckpointDescriptor};
+use crate::data_access::execute_sql_async;
 use crate::elastic_search_common::{CommandError, ElasticSearchResponse};
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::elastic_search_ingest::IngestError;
@@ -38,12 +39,16 @@ pub struct SerdeValueResult {
 }
 
 
-pub(crate) async fn to_serde_value(data_frame: &DataFrame) -> Result<SerdeValueResult, CommandError> {
+pub(crate) async fn df_to_serde_value(data_frame: &DataFrame) -> Result<SerdeValueResult, CommandError> {
     let record_batches: Vec<RecordBatch> = match data_frame.clone().collect().await {
         Ok(b) => b,
-        Err(e) => return Err(CommandError{ message: e.to_string() })
+        Err(e) => return Err(CommandError { message: e.to_string() })
     };
 
+    batches_to_serde_value(&record_batches).await
+}
+
+pub(crate) async fn batches_to_serde_value(record_batches: &Vec<RecordBatch>) -> Result<SerdeValueResult, CommandError> {
     let schema = match record_batches.len() {
         0 => None,
         _ => Some(to_powdrr_schema(&record_batches.get(0).unwrap().schema())),
@@ -68,7 +73,7 @@ pub(crate) async fn to_serde_value(data_frame: &DataFrame) -> Result<SerdeValueR
 }
 
 async fn to_full_records(data_frame: &DataFrame) -> Result<Vec<FullRecord>, CommandError> {
-    let result = to_serde_value(data_frame).await?;
+    let result = df_to_serde_value(data_frame).await?;
 
     Ok(result.values.iter().map(|x| FullRecord::from_record(&x)).collect())
 }
@@ -136,7 +141,7 @@ impl Command for LookupById {
         async move {
             let result = match LookupById::to_dataframe(result_table_name).await {
                 Some(df) => {
-                    let serde_result = to_serde_value(&df).await?;
+                    let serde_result = df_to_serde_value(&df).await?;
                     let hits = to_hits(&table, &serde_result.values, Some(true));
                     let inner_result: ElasticSearchResponse = if hits.len() == 0 {
                         (QueryResultsNotFound { _index: table, _id: ids.get(0).unwrap().clone(), found: false }).to_response()
@@ -179,7 +184,7 @@ static SEARCH_COLUMNS: LazyLock<Vec<String>> = LazyLock::new(|| vec!(
 ));
 
 impl SqlCommand {
-    async fn get_final_table_name(public_table_name: &String, temp_table_name: &String, calculate_score: bool) -> Result<String, CommandError> {
+    async fn get_final_table_name(public_table_name: &String, temp_table_name: &String, calculate_score: bool) -> Result<Option<String>, CommandError> {
         let final_table_name = format!("{temp_table_name}_final");
         if calculate_score {
             let initial_data_frame = match execute_sql(&format!("select * from {temp_table_name}")).await {
@@ -210,13 +215,14 @@ impl SqlCommand {
                 Ok(_) => (),
                 Err(e) => return Err(CommandError{ message: e.to_string() })
             };
+            Ok(Some(final_table_name.clone()))
         } else {
             match data_access::create_table(&final_table_name, &format!("SELECT * from {temp_table_name};")).await {
                 Ok(_) => (),
                 Err(e) => return Err(CommandError{ message: e.to_string() })
             };
+            Ok(None)
         }
-        Ok(final_table_name.clone())
     }
     
     async fn generate_aggregations(schema: Option<PowdrrSchema>, aggs: Option<Vec<Aggregation>>, table_name: Option<String>) -> Result<Option<HashMap<String, AggregationResult>>, CommandError> {
@@ -271,24 +277,19 @@ impl Command for SqlCommand {
                 Some(t) => t,
                 None => return Ok(empty_result(aggs, !query_params.rest_total_hits_as_int.unwrap_or_else(|| false)).await)
             };
-            let final_table_name = SqlCommand::get_final_table_name(&table, &table_name, calculate_score).await?;
-            let data_frame = match execute_sql(&format!("select * from {final_table_name}")).await {
+            let created_table_name = SqlCommand::get_final_table_name(&table, &table_name, calculate_score).await?;
+            let final_table_name = match created_table_name.as_ref() {
+                Some(t) => t.clone(),
+                None => table_name.clone()
+            };
+            // TODO: Need to grab limit from the request
+            let batches = match execute_sql_async(&format!("select * from {final_table_name} limit 100")).await {
                 Ok(df) => df,
                 Err(e) => return Err(CommandError{ message: e.to_string() })
             };
-            let num_records = match data_frame.clone().count().await {
-                Ok(tr) => tr,
-                Err(e) => return Err(CommandError{ message: e.to_string() })
-            };
+            let num_records = batches.iter().map(|x|x.num_rows()).sum::<usize>();
 
-            // TODO: figure out the real size to return. There is default and then size can
-            // be passed in.
-            let first_n_rows = match data_frame.clone().limit(0, Some(100)) {
-                Ok(ftr) => ftr,
-                Err(e) => return Err(CommandError{ message: e.to_string() })
-            };
-
-            let serde_result = to_serde_value(&first_n_rows).await?;
+            let serde_result = batches_to_serde_value(&batches).await?;
             let hits= to_hits(&table, &serde_result.values, None);
 
             let aggregations = SqlCommand::generate_aggregations(serde_result.schema, aggs, Some(final_table_name.clone())).await?;
@@ -303,7 +304,9 @@ impl Command for SqlCommand {
                 aggregations,
                 !query_params.rest_total_hits_as_int.unwrap_or_else(|| false),
             ).to_response();
-            data_access::drop(&final_table_name).await;
+            if created_table_name.is_some() {
+                data_access::drop(&created_table_name.unwrap()).await;
+            }
             Ok(final_result)
         }.boxed()
     }
@@ -459,7 +462,12 @@ impl Command for UpdateByQueryCommand {
                 Some(t) => t,
                 None => return Ok(UpdateByQueryCommand::empty_result().to_response())
             };
-            let final_table_name = SqlCommand::get_final_table_name(&table, &table_name, calculate_score).await?;
+            let created_table_name = SqlCommand::get_final_table_name(&table, &table_name, calculate_score).await?;
+            let final_table_name = match created_table_name.as_ref() {
+                Some(t) => t.clone(),
+                None => table_name.clone()
+            };
+
             let data_frame = match execute_sql(&format!("select * from {final_table_name}")).await {
                 Ok(df) => df,
                 Err(e) => return Err(CommandError{ message: e.to_string() })
@@ -470,7 +478,9 @@ impl Command for UpdateByQueryCommand {
             let final_result_values: Vec<EvalResult> = records.iter().map(|x|UpdateByQueryCommand::evaluate(&script_block, x)).collect();
 
             let mut result_info = UpdateByQueryCommand::create_final_result(&table, final_result_values).await;
-            data_access::drop(&final_table_name).await;
+            if created_table_name.is_some() {
+                data_access::drop(&created_table_name.unwrap()).await;
+            }
             match result_info.commit().await {
                 Ok(r) => Ok(r),
                 Err(e) => Err(CommandError{ message: e.to_string() })

@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{state_hosted_service::{CompactionCommit, API_SERVICE_CLIENT}};
 use crate::data_access::execute_sql;
-use crate::elastic_search_commands::to_serde_value;
+use crate::elastic_search_commands::df_to_serde_value;
 use crate::elastic_search_common::{execute_command, Command, CommandContext, CommandError, ElasticSearchResponse, ResultGeneratorFuture};
 use crate::elastic_search_ingest::{write_to_file, WriteBuffer};
 use crate::schema_massager::{PowdrrSchema, SqlBuilder};
@@ -435,7 +435,7 @@ impl Command for CompactionCommand {
                 Err(e) => return Err(CommandError{ message: e.to_string() })
             };
 
-            let deletes_serde_result = to_serde_value(&remaining_deletes_data_frame).await?;
+            let deletes_serde_result = df_to_serde_value(&remaining_deletes_data_frame).await?;
             let deletes_buffer = WriteBuffer::delete(deletes_serde_result.values.iter().map(|x| serde_json::to_string(x).unwrap()).collect());
 
             tracing::info!("!!!!!!!!!!!!!!!!!!!! Compacting to Iceberg !!!!!!!!!!!!!!!!!!!!!!!");
