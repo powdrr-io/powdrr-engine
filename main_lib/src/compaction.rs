@@ -436,7 +436,7 @@ impl Command for CompactionCommand {
             };
 
             let deletes_serde_result = df_to_serde_value(&remaining_deletes_data_frame).await?;
-            let deletes_buffer = WriteBuffer::delete(deletes_serde_result.values.iter().map(|x| serde_json::to_string(x).unwrap()).collect());
+            let deletes_buffer = WriteBuffer::delete(deletes_serde_result.values.iter().map(|x| x.clone()).collect());
 
             tracing::info!("!!!!!!!!!!!!!!!!!!!! Compacting to Iceberg !!!!!!!!!!!!!!!!!!!!!!!");
             // TODO: if nulls can come out there that probably means we need to intercept earlier
@@ -475,8 +475,8 @@ impl Command for CompactionCommand {
                 },
             };
 
-            let deletes_table_info = if deletes_buffer.total_size() > 0 {
-                let deletes_path = match write_to_file(&deletes_buffer, &public_table_name, &"delete".to_string()) {
+            let deletes_table_info = if deletes_buffer.num_records() > 0 {
+                let (deletes_path, size) = match write_to_file(&deletes_buffer, &public_table_name, &"delete".to_string()) {
                     Ok(file) => file,
                     Err(e) => {
                         return Err(CommandError{ message: e.to_string() })
@@ -486,7 +486,7 @@ impl Command for CompactionCommand {
                     commit_type: "delete".to_string(),
                     table_name: public_table_name.clone(),
                     files: vec!(deletes_path),
-                    sizes: vec!(deletes_buffer.total_size()),
+                    sizes: vec!(size),
                     schema: deletes_buffer.schema(),
                 })
             } else {

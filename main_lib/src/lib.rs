@@ -1,3 +1,4 @@
+extern crate core;
 
 mod compaction;
 mod data_access;
