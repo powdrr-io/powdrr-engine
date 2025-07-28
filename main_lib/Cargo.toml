@@ -12,6 +12,7 @@ edition.workspace = true
 [dependencies]
 arrow-flight = "55.1"
 arrow-json = "55.1"
+serde_arrow = { version = "0.13.4", features = ["arrow-55"] }
 async-trait = "0.1.88"
 chrono = "0.4.41"
 datafusion = "47"

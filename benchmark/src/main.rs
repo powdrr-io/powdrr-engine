@@ -102,7 +102,7 @@ async fn load_data() -> Result<bool, std::io::Error> {
         if lines_read % 10000 == 0 {
             println!("Events Added: {}", lines_read);
             println!("Ingest - average response time: {} ms", all_response_times.iter().sum::<u128>() / all_response_times.len() as u128);
-            tokio::time::sleep(Duration::from_millis(10000)).await;
+            tokio::time::sleep(Duration::from_millis(1000)).await;
         }
 
         if lines_read >= LINE_LIMIT {

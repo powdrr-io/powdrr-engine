@@ -19,6 +19,14 @@ CARGO_PROFILE_RELEASE_DEBUG=true cargo flamegraph
 ```
 
 
+Run the benchmark
+
+```
+cargo run --package powdrr-io-engine --release 9200
+cargo run --package powdrr-io-engine --release 9201
+cargo run --package benchmark
+```
+
 Run test script
 
 Monolith

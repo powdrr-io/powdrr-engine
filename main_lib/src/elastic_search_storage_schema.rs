@@ -272,13 +272,13 @@ impl SpeedboatCommitBuilder {
             self.insert_records.iter_mut().chain(self.update_records.iter_mut()).for_each(|r| merged_schema.coerce_value_option(&mut r.existing_normalized));
 
             let final_records = self.insert_records.iter_mut().chain(self.update_records.iter_mut()).map(|r| r.as_record(None)).collect::<Vec<Value>>();
-            WriteBuffer::insert_and_update(merged_schema, final_records.iter().map(|r| serde_json::to_string(&r).unwrap()).collect())
+            WriteBuffer::insert_and_update(merged_schema, final_records.iter().map(|r| r.clone()).collect())
         } else {
             WriteBuffer::empty()
         };
 
         operations.extend(self.delete_records.iter().map(|r|r.as_operation(&self.table_name)));
-        let delete_write_buffer = WriteBuffer::delete(self.delete_records.iter().map(|r| serde_json::to_string(&r.as_value()).unwrap()).collect());
+        let delete_write_buffer = WriteBuffer::delete(self.delete_records.iter().map(|r| r.as_value()).collect());
         (insert_update_write_buffer, delete_write_buffer, operations)
     }
 

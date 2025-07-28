@@ -6,12 +6,16 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashMap, fs::File};
 use std::io::Write;
+use datafusion::arrow::datatypes::FieldRef;
+use datafusion::arrow::ipc::writer::FileWriter;
+use datafusion::parquet::arrow::ArrowWriter;
 use futures::FutureExt;
 use gotham::mime;
 use http::header::LOCATION;
 use http::StatusCode;
 use idgenerator::*;
 use serde::{Deserialize, Serialize};
+use serde_arrow::schema::{SchemaLike, TracingOptions};
 use serde_json::Value;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::{mpsc, oneshot};
@@ -23,7 +27,7 @@ use crate::elastic_search_responses::{BulkResult, ErrorDetails, OperationResult,
 use crate::data_access;
 use crate::elastic_search_parser::UpdateBody;
 use crate::elastic_search_storage_schema::{FullRecord, RecordDelete, RecordInput, SpeedboatCommitBuilder};
-use crate::schema_massager::PowdrrSchema;
+use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
 use crate::state_hosted_service::{CreateTable, SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription, API_SERVICE_CLIENT};
 use crate::util::log_err;
 
@@ -53,10 +57,12 @@ fn default_as_false() -> bool {
 
 #[derive(Clone)]
 pub(crate) struct WriteBuffer {
-    lines: Vec<String>,
+    lines: Vec<Value>,
     schema: Option<PowdrrSchema>
 }
 
+
+pub(crate) const JSON_MODE: bool = false;
 
 impl WriteBuffer {
     pub fn empty() -> Self {
@@ -66,21 +72,35 @@ impl WriteBuffer {
         }
     }
 
-    pub fn insert_and_update(schema: PowdrrSchema, lines: Vec<String>) -> Self {
+    pub fn insert_and_update(schema: PowdrrSchema, lines: Vec<Value>) -> Self {
         WriteBuffer {
             lines,
             schema: Some(schema)
         }
     }
 
-    pub fn delete(lines: Vec<String>) -> Self {
+    pub fn delete(lines: Vec<Value>) -> Self {
         WriteBuffer {
             lines,
-            schema: None
+            schema: Some(PowdrrSchema {
+                fields: vec![
+                    PowdrrField {
+                        name: "_id_seq_no".to_string(), data_type: PowdrrDataType::String
+                    }
+                ],
+            })
         }
     }
 
-    pub(crate) fn write_to_file(&self, file_name: &String) -> Result<(), IngestError> {
+    pub(crate) fn write_to_file(&self, file_name: &String) -> Result<u64, IngestError> {
+        if JSON_MODE {
+            self.write_to_json_file(&format!("{}.json", file_name))
+        } else {
+            self.write_to_arrow_file(&format!("{}.arrow", file_name))
+        }
+    }
+
+    fn write_to_json_file(&self, file_name: &String) -> Result<u64, IngestError> {
         assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
         let mut file_write = File::create(file_name).expect("Cannot create file");
         for line in self.lines.iter() {
@@ -89,14 +109,30 @@ impl WriteBuffer {
                 _ => ()
             }
         }
-        Ok(())
+        Ok(self.lines.iter().map(|l|l.to_string().len()).sum::<usize>() as u64)
+    }
+
+    fn write_to_arrow_file(&self, file_name: &String) -> Result<u64, IngestError> {
+        assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
+        assert!(self.schema.is_some(), "Cannot write buffer without schema");
+        let arrow_schema = self.schema.as_ref().unwrap().to_arrow_schema();
+        let fields = arrow_schema.fields.as_ref();
+        let record_batch = serde_arrow::to_record_batch(fields, &self.lines).unwrap();
+        let file = File::create(file_name).unwrap();
+        let mut writer =
+            FileWriter::try_new_buffered(file, &record_batch.schema())
+                .unwrap();
+        writer.write(&record_batch).unwrap();
+        writer.finish().unwrap();
+        let len = File::open(file_name).unwrap().metadata().as_ref().map(|m| m.len()).unwrap();
+        Ok(len)
     }
 
     #[cfg(test)]
     pub(crate) fn as_byte_vec(&self) -> Vec<u8> {
         let mut buffer = Vec::new();
         for line in self.lines.iter() {
-            buffer.extend(line.as_bytes());
+            buffer.extend(line.to_string().as_bytes());
             buffer.push(b'\n');
         }
         buffer
@@ -109,10 +145,6 @@ impl WriteBuffer {
     #[allow(dead_code)]
     pub(crate) fn num_records(&self) -> usize {
         self.lines.len()
-    }
-
-    pub(crate) fn total_size(&self) -> u64 {
-        self.lines.iter().fold(0, |acc, line| acc + line.len() as u64 + 1)
     }
 }
 
@@ -473,40 +505,40 @@ pub(crate) async fn upsert_single(index: &String, doc_id: &String, payload: &Str
     update_single_worker(index, doc_id, payload).await
 }
 
-pub(crate) fn write_to_file(buffer: &WriteBuffer, index: &String, label: &String) -> Result<String, IngestError> {
+pub(crate) fn write_to_file(buffer: &WriteBuffer, index: &String, label: &String) -> Result<(String, u64), IngestError> {
     // TODO: need real paths into S3
-    let file_path = format!("tests/data/ingest/{}-{}-{}.json", label, index, IdInstance::next_id().to_string());
+    let file_path = format!("tests/data/ingest/{}-{}-{}", label, index, IdInstance::next_id().to_string());
     let write_to_file_result = buffer.write_to_file(&file_path);
     //tracing::info!("Ingest: op {} on table {} wrote {} records", label, index, buffer.num_records());
 
-    match write_to_file_result {
-        Ok(_) => (),
+    let size = match write_to_file_result {
+        Ok(size) => size,
         Err(_) => return Err(IngestError{ message: "File error".to_string() })
-    }
+    };
 
-    Ok(file_path)
+    Ok((file_path, size))
 }
 
 
 pub(crate) async fn commit_speedboat(table: &String, inserts_and_updates: &WriteBuffer, deletes: &WriteBuffer, compactions: &Vec<String>, commit_type: &String) -> Result<(), IngestError> {
     let mut table_infos = vec!();
     if inserts_and_updates.lines.len() != 0 {
-        let insert_update_path = write_to_file(inserts_and_updates, table, commit_type)?;
+        let (insert_update_path, size) = write_to_file(inserts_and_updates, table, commit_type)?;
         table_infos.push(SpeedboatCommitTableInfo {
             commit_type: commit_type.clone(),
             table_name: table.clone(),
             files: vec!(insert_update_path),
-            sizes: vec!(inserts_and_updates.total_size()),
+            sizes: vec!(size),
             schema: inserts_and_updates.schema.clone(),
         });
     }
     if deletes.lines.len() != 0 {
-        let deletes_path = write_to_file(deletes, table, &"delete".to_string())?;
+        let (deletes_path, size) = write_to_file(deletes, table, &"delete".to_string())?;
         table_infos.push(SpeedboatCommitTableInfo {
             commit_type: "delete".to_string(),
             table_name: table.clone(),
             files: vec!(deletes_path),
-            sizes: vec!(deletes.total_size()),
+            sizes: vec!(size),
             schema: deletes.schema.clone(),
         });
     }
