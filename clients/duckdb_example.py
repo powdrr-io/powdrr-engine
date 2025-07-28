@@ -17,6 +17,10 @@ SET s3_use_ssl = false;
 
 
 def queries(manifest_path: str) -> None:
+    duckdb.sql("CREATE TABLE logs_iceberg AS SELECT * from iceberg_scan('s3://{}');".format(manifest_path))
+
+    print(duckdb.sql("DESCRIBE logs_iceberg"))
+
     print(duckdb.sql("SELECT count(*) FROM iceberg_scan('s3://{}');".format(manifest_path)))
 
     print(duckdb.sql("SELECT * FROM iceberg_scan('s3://{}') limit 10;".format(manifest_path)))
