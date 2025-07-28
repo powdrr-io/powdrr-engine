@@ -5,7 +5,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use crate::data_access::execute_sql;
-use crate::elastic_search_commands::{to_serde_value, SqlCommand, UpdateByQueryCommand};
+use crate::elastic_search_commands::{df_to_serde_value, SqlCommand, UpdateByQueryCommand};
 use crate::elastic_search_common::{CommandError, ParseError};
 use crate::elastic_search_datetime_parser;
 use crate::elastic_search_endpoints::QueryStringSearch;
@@ -79,7 +79,7 @@ impl TermAggProcessor {
 
         assert_eq!(data_frame.schema().columns().len(), 2);
 
-        let serde_result = to_serde_value(&data_frame).await?;
+        let serde_result = df_to_serde_value(&data_frame).await?;
 
         Ok(serde_result.values.iter().map(|v| TermAggProcessor::create_aggregation_bucket(v)).collect::<Vec<TermAggregationBucket>>())
     }
@@ -131,7 +131,7 @@ impl RangeAggProcessor {
 
                 assert_eq!(data_frame.schema().columns().len(), 1);
 
-                let serde_result = to_serde_value(&data_frame).await?;
+                let serde_result = df_to_serde_value(&data_frame).await?;
 
                 serde_result.values.get(0).unwrap().as_object().unwrap().get("cnt").unwrap().as_u64().unwrap()
             },
@@ -187,7 +187,7 @@ impl AverageAggProcessor {
 
         assert_eq!(data_frame.schema().columns().len(), 1);
 
-        let serde_result = to_serde_value(&data_frame).await?;
+        let serde_result = df_to_serde_value(&data_frame).await?;
 
         Ok(serde_result.values.get(0).unwrap().as_object().unwrap().get("avg").unwrap().as_f64().unwrap())
     }
@@ -222,7 +222,7 @@ impl CardinalityAggProcessor {
 
         assert_eq!(data_frame.schema().columns().len(), 1);
 
-        let serde_result = to_serde_value(&data_frame).await?;
+        let serde_result = df_to_serde_value(&data_frame).await?;
 
         Ok(serde_result.values.get(0).unwrap().as_object().unwrap().get("type_count").unwrap().as_u64().unwrap())
     }
@@ -274,7 +274,7 @@ impl FilterAggProcessor {
                 let final_sql = self.sql.build_same(&schema.clone().unwrap_or_else(||FILTER_AGG_SCHEMA.clone())).replace("{target_table}", t);
                 let data_frame = execute_sql(&final_sql).await.unwrap();
                 assert_eq!(data_frame.schema().columns().len(), 1);
-                let serde_result = to_serde_value(&data_frame).await?;
+                let serde_result = df_to_serde_value(&data_frame).await?;
                 serde_result.values.get(0).unwrap().as_object().unwrap().get("cnt").unwrap().as_u64().unwrap()
             },
             None => 0

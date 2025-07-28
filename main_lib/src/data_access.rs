@@ -15,6 +15,7 @@ use object_store::client::SpawnedReqwestConnector;
 use tempfile::TempDir;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::task::JoinSet;
 use url::Url;
 
 use crate::util::log_err;
@@ -47,7 +48,7 @@ const S3_REGION_VALUE: &str = "us-east-1";
 ///
 /// [InfluxDB 3.0]: https://github.com/influxdata/influxdb3_core/tree/6fcbb004232738d55655f32f4ad2385523d10696/executor
 ///
-struct IORuntime {
+struct CPURuntime {
     /// Handle is the tokio structure for interacting with a Runtime.
     handle: Handle,
     /// Signal to start shutting down
@@ -56,7 +57,7 @@ struct IORuntime {
     thread_join_handle: Option<std::thread::JoinHandle<()>>,
 }
 
-impl Drop for IORuntime {
+impl Drop for CPURuntime {
     fn drop(&mut self) {
         // Notify the thread to shutdown.
         self.notify_shutdown.notify_one();
@@ -75,7 +76,7 @@ impl Drop for IORuntime {
     }
 }
 
-impl IORuntime {
+impl CPURuntime {
     /// Create a new Tokio Runtime for CPU bound tasks
     pub fn try_new() -> Result<Self, std::io::Error> {
         let io_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -117,9 +118,10 @@ impl IORuntime {
     }
 }
 
-static IO_RUNTIME: std::sync::LazyLock<IORuntime> = std::sync::LazyLock::new(|| IORuntime::try_new().unwrap());
+static CPU_RUNTIME: std::sync::LazyLock<CPURuntime> = std::sync::LazyLock::new(|| CPURuntime::try_new().unwrap());
 
 fn create_store() -> Arc<AmazonS3> {
+    let io_runtime = Handle::current();
     let s3_file_system: object_store::aws::AmazonS3 = AmazonS3Builder::new()
         .with_access_key_id(S3_ACCESS_KEY_ID_VALUE)
         .with_secret_access_key(S3_SECRET_ACCESS_KEY_VALUE)
@@ -127,7 +129,7 @@ fn create_store() -> Arc<AmazonS3> {
         .with_endpoint(S3_ENDPOINT_VALUE)
         .with_bucket_name("warehouse")
         .with_allow_http(true)
-        //.with_http_connector(SpawnedReqwestConnector::new(IO_RUNTIME.handle().clone()))
+        .with_http_connector(SpawnedReqwestConnector::new(io_runtime))
         .build().unwrap();
 
     Arc::new(s3_file_system)
@@ -604,6 +606,32 @@ pub(crate) async fn load_memtable_with_name(result_table_name: &String, records:
 
 
 const NUM_TRIES: u32 = 4;
+
+
+pub(crate) async fn execute_sql_async(sql: &String) -> Result<Vec<RecordBatch>, DataFusionError> {
+    let (tx, mut rx) = mpsc::channel(2);
+    let sql_owned = sql.clone();
+    let driver_task = async move {
+        // Plan / execute the query
+        let results = match execute_sql(&sql_owned).await {
+            Ok(r) => r,
+            Err(e) => return Err(e)
+        };
+
+        let batches = match results.collect().await {
+            Ok(r) => Ok(r),
+            Err(e) => log_err(e)
+        };
+
+        tx.send(batches).await.unwrap();
+
+        Ok(())
+    };
+
+    let mut join_set = JoinSet::new();
+    join_set.spawn_on(driver_task, CPU_RUNTIME.handle());
+    rx.recv().await.unwrap()
+}
 
 
 pub(crate) async fn execute_sql(sql: &String) -> Result<DataFrame, DataFusionError> {

@@ -17,7 +17,7 @@ use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::{mpsc, oneshot};
 use uuid_b64::UuidB64;
 
-use crate::elastic_search_commands::{to_serde_value, LookupById, SerdeValueResult};
+use crate::elastic_search_commands::{df_to_serde_value, LookupById, SerdeValueResult};
 use crate::elastic_search_common::{load_command_raw_result, CommandContext, ElasticSearchResponse, MIME_ES_JSON};
 use crate::elastic_search_responses::{BulkResult, ErrorDetails, OperationResult, Shards, SingleDocCreateFailedResult};
 use crate::data_access;
@@ -531,7 +531,7 @@ async fn get_existing_docs(index: &String, doc_ids: &Vec<String>) -> Result<Serd
                     Err(_) => panic!("weird")
                 };
 
-                let serde_result = to_serde_value(&df).await.map_err(|e|IngestError{ message: e.message.clone() })?;
+                let serde_result = df_to_serde_value(&df).await.map_err(|e|IngestError{ message: e.message.clone() })?;
                 data_access::drop(&raw_table).await;
                 serde_result
             },
