@@ -1659,10 +1659,10 @@ impl ApiServiceClient for TestApiServiceClient {
         for (table_name, compaction) in self.compaction_work_items.iter_mut() {
             tracing::info!("Compaction work item stats: size = {}/{}, files = {}/200",
                 compaction.speedboat_files.sizes.iter().sum::<u64>(),
-                100 * 1024 * 1024,
+                10 * 1024 * 1024,
                 compaction.speedboat_files.sizes.len()
             );
-            let do_compaction = compaction.speedboat_files.sizes.iter().sum::<u64>() > 100 * 1024 * 1024 || compaction.speedboat_files.sizes.len() > 200;
+            let do_compaction = compaction.speedboat_files.sizes.iter().sum::<u64>() > 10 * 1024 * 1024 || compaction.speedboat_files.sizes.len() > 200;
             //let do_compaction = true;
             if do_compaction {
                 work_items.push((table_name.clone(), compaction.clone()));
