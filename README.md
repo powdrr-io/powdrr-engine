@@ -16,6 +16,7 @@ Run flamegraph
 
 ```
 CARGO_PROFILE_RELEASE_DEBUG=true cargo flamegraph
+CARGO_PROFILE_RELEASE_DEBUG=true cargo flamegraph --package powdrr-io-engine -- 9200
 ```
 
 

@@ -175,12 +175,23 @@ async fn ensure_loaded(
 }
 
 
-async fn execute_sql(sql_template: &String, local_name: &String, deletes_local_name: &String) -> Result<Vec<RecordBatch>, DataFusionError> {
+async fn execute_sql(sql_template: &String, local_name: &String, deletes_local_name: &String, use_cpu_threadpool: bool) -> Result<Vec<RecordBatch>, DataFusionError> {
     // create a plan to run a SQL query
     let final_sql = sql_template.replace("{target_table}", local_name).replace("{deletes_table}", deletes_local_name);
-    match data_access::execute_sql_async(&final_sql).await {
-        Ok(val) => Ok(val),
-        Err(e) => log_err(e)
+    if use_cpu_threadpool {
+        match data_access::execute_sql_async(&final_sql).await {
+            Ok(val) => Ok(val),
+            Err(e) => log_err(e)
+        }
+    } else {
+        let results = match data_access::execute_sql(&final_sql).await {
+            Ok(val) => val,
+            Err(e) => return log_err(e)
+        };
+        match results.collect().await {
+            Ok(r) => Ok(r),
+            Err(e) => log_err(e)
+        }
     }
 }
 
@@ -205,13 +216,14 @@ async fn process_iceberg_file(
     iceberg_file: &FileDescriptor,
     iceberg_file_extensions: &Vec<ExtensionFileSpec>,
     table_schema: &PowdrrSchema,
-    deletes_table_name: &String
+    deletes_table_name: &String,
+    use_cpu_threadpool: bool,
 ) -> Result<Vec<RecordBatch>, PrivateApiError> {
     let local_name = match ensure_loaded(&iceberg_file.file_path, iceberg_file_extensions,1,true, None).await {
         Ok(ln) => ln,
         Err(e) => return Err(PrivateApiError::from(e)),
     };
-    let local_results = match execute_sql(&sql.build(table_schema, &iceberg_file.schema), &local_name, deletes_table_name).await {
+    let local_results = match execute_sql(&sql.build(table_schema, &iceberg_file.schema), &local_name, deletes_table_name, use_cpu_threadpool).await {
         Ok(vrb) => vrb,
         Err(e) => {
             data_access::release(&local_name).await;
@@ -227,7 +239,8 @@ async fn process_speedboat_file(
     speedboat_file: &FileDescriptor,
     speedboat_file_extensions: &Vec<ExtensionFileSpec>,
     table_schema: &PowdrrSchema,
-    deletes_table_name: &String
+    deletes_table_name: &String,
+    use_cpu_threadpool: bool,
 ) -> Result<Vec<RecordBatch>, PrivateApiError> {
     let local_name = match ensure_loaded(&speedboat_file.file_path, speedboat_file_extensions, speedboat_file.size, false, Some(speedboat_file.schema.clone())).await {
         Ok(ln) => ln,
@@ -236,7 +249,7 @@ async fn process_speedboat_file(
         },
     };
     let sql = sql.build(table_schema, &speedboat_file.schema);
-    let local_results = match execute_sql(&sql, &local_name, &deletes_table_name).await {
+    let local_results = match execute_sql(&sql, &local_name, &deletes_table_name, use_cpu_threadpool).await {
         Ok(vrb) => vrb,
         Err(e) => return {
             data_access::release(&local_name).await;
@@ -268,6 +281,7 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation, index: u64, nu
     data_query_worker(
         &invocation.sql,
         &required_files,
+        true,
     ).await
 }
 
@@ -277,7 +291,8 @@ pub(crate) async fn compaction_query(invocation: &PrivateCompactionInvocation, i
     
     data_query_worker(
         &invocation.sql,
-        &required_files
+        &required_files,
+        true
     ).await
 }
 
@@ -299,11 +314,12 @@ pub(crate) async fn prefetch_query(invocation: &PrivatePrefetchInvocation, index
     data_query_worker(
         &SqlQuery::dummy(),
         &required_files,
+        false
     ).await
 }
 
 
-async fn data_query_worker(sql: &SqlQuery, required_files: &RequiredFiles) -> Result<DataQueryResult, PrivateApiError> {
+async fn data_query_worker(sql: &SqlQuery, required_files: &RequiredFiles, use_cpu_threadpool: bool) -> Result<DataQueryResult, PrivateApiError> {
     let mut delete_local_names = vec!();
     let delete_schema = PowdrrSchema::from(&vec!(
         PowdrrField{ name: "_id_seq_no".to_string(), data_type: PowdrrDataType::String },
@@ -320,9 +336,9 @@ async fn data_query_worker(sql: &SqlQuery, required_files: &RequiredFiles) -> Re
     let all_deletes_local_name = create_all_deletes_table(&delete_local_names).await?;
 
     let iceberg_calls = required_files.iceberg_files.iter().zip(required_files.iceberg_file_extensions.iter()).map(
-        |(iceberg_file, iceberg_file_extensions)| process_iceberg_file(sql, iceberg_file, iceberg_file_extensions, &required_files.table_schema, &all_deletes_local_name));
+        |(iceberg_file, iceberg_file_extensions)| process_iceberg_file(sql, iceberg_file, iceberg_file_extensions, &required_files.table_schema, &all_deletes_local_name, use_cpu_threadpool));
     let speedboat_calls = required_files.speedboat_files.iter().zip(required_files.speedboat_file_extensions.iter()).map(
-        |(speedboat_file, speedboat_file_extensions)| process_speedboat_file(sql, speedboat_file, speedboat_file_extensions, &required_files.table_schema, &all_deletes_local_name));
+        |(speedboat_file, speedboat_file_extensions)| process_speedboat_file(sql, speedboat_file, speedboat_file_extensions, &required_files.table_schema, &all_deletes_local_name, use_cpu_threadpool));
 
     let iceberg_results: Vec<Result<RecordBatch, FlightError>> = match try_join_all(iceberg_calls).await {
         Ok(ar) => ar.iter().flatten().map(|x|Ok(x.clone())).collect::<Vec<Result<RecordBatch, FlightError>>>(),

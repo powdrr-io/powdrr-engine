@@ -93,13 +93,13 @@ async fn load_data() -> Result<bool, std::io::Error> {
         waiting_for_response.push(push_to_service(accumulator.clone()));
         accumulator.clear();
 
-        if lines_read % 1000 == 0 {
+        if lines_read % 3000 == 0 {
             all_response_times.extend(join_all(waiting_for_response).await);
             waiting_for_response = vec!();
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        if lines_read % 10000 == 0 {
+        if lines_read % 30000 == 0 {
             println!("Events Added: {}", lines_read);
             println!("Ingest - average response time: {} ms", all_response_times.iter().sum::<u128>() / all_response_times.len() as u128);
             tokio::time::sleep(Duration::from_millis(1000)).await;
