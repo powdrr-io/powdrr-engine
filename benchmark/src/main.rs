@@ -93,16 +93,16 @@ async fn load_data() -> Result<bool, std::io::Error> {
         waiting_for_response.push(push_to_service(accumulator.clone()));
         accumulator.clear();
 
-        if lines_read % 3000 == 0 {
+        if lines_read % 1000 == 0 {
             all_response_times.extend(join_all(waiting_for_response).await);
             waiting_for_response = vec!();
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        if lines_read % 30000 == 0 {
+        if lines_read % 10000 == 0 {
             println!("Events Added: {}", lines_read);
             println!("Ingest - average response time: {} ms", all_response_times.iter().sum::<u128>() / all_response_times.len() as u128);
-            tokio::time::sleep(Duration::from_millis(1000)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
         if lines_read >= LINE_LIMIT {
@@ -186,9 +186,9 @@ async fn search() -> Result<(), std::io::Error> {
         } else if longest_response_times[9] < latest_response_time {
             longest_response_times.remove(9);
             longest_response_times.push(latest_response_time);
-            longest_response_times.sort();
-            longest_response_times.reverse()
         }
+        longest_response_times.sort();
+        longest_response_times.reverse()
     }
 }
 
