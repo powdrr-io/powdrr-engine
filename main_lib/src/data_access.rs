@@ -9,7 +9,7 @@ use datafusion::prelude::SessionConfig;
 use idgenerator::IdInstance;
 use liquid_cache_parquet::cache::policies::DiscardPolicy;
 use liquid_cache_parquet::common::LiquidCacheMode;
-use liquid_cache_parquet::LiquidCacheInProcessBuilder;
+use liquid_cache_parquet::{LiquidCacheInProcessBuilder, LiquidCacheRef};
 use lru_mem::{HeapSize, LruCache, TryInsertError};
 use object_store::{aws::{AmazonS3, AmazonS3Builder}, ObjectStore};
 use object_store::client::SpawnedReqwestConnector;
@@ -139,7 +139,7 @@ fn create_store() -> Arc<AmazonS3> {
 static S3_FILE_STORE: std::sync::LazyLock<Arc<AmazonS3>> = std::sync::LazyLock::new(|| create_store());
 
 
-fn create_session() -> SessionContext {
+fn create_session() -> (SessionContext, LiquidCacheRef) {
     let options = ConfigOptions::default();
     // UNCOMMENT TO ENABLE 'SHOW TABLES'
     //options.set("datafusion.catalog.information_schema", "true").unwrap();
@@ -148,7 +148,7 @@ fn create_session() -> SessionContext {
 
     let temp_dir = TempDir::new().unwrap();
 
-    let (ctx, _) = match LiquidCacheInProcessBuilder::new()
+    let (ctx, cache) = match LiquidCacheInProcessBuilder::new()
         .with_max_cache_bytes(10 * 1024 * 1024 * 1024) // 10GB
         .with_cache_dir(temp_dir.path().to_path_buf())
         .with_cache_mode(LiquidCacheMode::Liquid {
@@ -166,7 +166,7 @@ fn create_session() -> SessionContext {
 
     ctx.register_object_store(&s3_url, S3_FILE_STORE.clone());
 
-    ctx
+    (ctx, cache)
 }
 
 
@@ -250,7 +250,7 @@ impl CacheTrackerActor {
     }
 
     async fn drop(&mut self, name: &String) -> () {
-        let _ = DATA_FUSION_CONTEXT.sql(format!("DROP TABLE IF EXISTS {};", name).as_str()).await;
+        let _ = DATA_FUSION_CONTEXT.0.sql(format!("DROP TABLE IF EXISTS {};", name).as_str()).await;
         // assert!(self.existing_tables.contains(&name));
         self.existing_tables.retain(|n| n != name);
         self.reservations.remove(name);
@@ -440,7 +440,7 @@ impl LRUCacheHandle {
 }
 
 
-static DATA_FUSION_CONTEXT: std::sync::LazyLock<SessionContext> = std::sync::LazyLock::new(|| create_session());
+static DATA_FUSION_CONTEXT: std::sync::LazyLock<(SessionContext, LiquidCacheRef)> = std::sync::LazyLock::new(|| create_session());
 static LRU_CACHE_HANDLE: std::sync::LazyLock<LRUCacheHandle> = std::sync::LazyLock::new(|| LRUCacheHandle::new());
 
 
@@ -453,8 +453,12 @@ pub(crate) async fn release(top_level_name: &String) -> () {
     LRU_CACHE_HANDLE.release(top_level_name).await
 }
 
+pub(crate) fn load_file(file_path: &String) -> () {
+    DATA_FUSION_CONTEXT.1.register_or_get_file(file_path.clone());
+}
+
 async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> Result<(), DataFusionError> {
-    match DATA_FUSION_CONTEXT.table_exist(local_name) {
+    match DATA_FUSION_CONTEXT.0.table_exist(local_name) {
         Ok(exists) => match exists {
             true => return Ok(()),
             false => ()
@@ -470,16 +474,16 @@ async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> 
         LOCATION '{file_path_var}';"#);
         loop {
             LRU_CACHE_HANDLE.table_created(local_name_var).await;
-            match DATA_FUSION_CONTEXT.sql(&query_str).await {
+            match DATA_FUSION_CONTEXT.0.sql(&query_str).await {
                 Err(_e) => {
-                    let _ = DATA_FUSION_CONTEXT.sql(format!("DROP TABLE IF EXISTS {local_name_var};").as_str()).await;
+                    let _ = DATA_FUSION_CONTEXT.0.sql(format!("DROP TABLE IF EXISTS {local_name_var};").as_str()).await;
                     LRU_CACHE_HANDLE.table_dropped(local_name_var).await;
                 },
                 _ => return Ok(())
             }
         }
     } else {
-        let result = DATA_FUSION_CONTEXT.register_parquet(local_name, file_path, ParquetReadOptions::new()).await;
+        let result = DATA_FUSION_CONTEXT.0.register_parquet(local_name, file_path, ParquetReadOptions::new()).await;
         match result {
             Err(e) => {
                 if e.message().contains("already exists") {
@@ -497,7 +501,7 @@ async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> 
 }
 
 async fn load_json_file_as_table(file_path_without_suffix: &String, local_name: &String, schema: &Schema) -> Result<(), DataFusionError> {
-    match DATA_FUSION_CONTEXT.table_exist(local_name) {
+    match DATA_FUSION_CONTEXT.0.table_exist(local_name) {
         Ok(exists) => match exists {
             true => return Ok(()),
             false => ()
@@ -514,7 +518,7 @@ async fn load_json_file_as_table(file_path_without_suffix: &String, local_name: 
         tracing::info!("Loading JSON file {}", file_path);
         LRU_CACHE_HANDLE.table_created(local_name).await;
         let reader_options = NdJsonReadOptions::default().schema(&schema);
-        match DATA_FUSION_CONTEXT.register_json(local_name, file_path, reader_options).await {
+        match DATA_FUSION_CONTEXT.0.register_json(local_name, file_path, reader_options).await {
             Ok(_) => Ok(()),
             Err(e) => {
                 if e.message().contains("already exists") {
@@ -527,7 +531,7 @@ async fn load_json_file_as_table(file_path_without_suffix: &String, local_name: 
     } else {
         let file_path = format!("{}.arrow", file_path_without_suffix);
         tracing::info!("Loading Arrow file {}", file_path);
-        DATA_FUSION_CONTEXT.register_arrow(local_name, &file_path, ArrowReadOptions::default()).await
+        DATA_FUSION_CONTEXT.0.register_arrow(local_name, &file_path, ArrowReadOptions::default()).await
     }
 }
 
@@ -600,11 +604,11 @@ pub(crate) async fn load_memtable_with_name(result_table_name: &String, records:
         Err(e) => return log_err(e),
     };
     loop {
-        match DATA_FUSION_CONTEXT.table_exist(result_table_name) {
+        match DATA_FUSION_CONTEXT.0.table_exist(result_table_name) {
             Ok(exists) => {
                 if !exists {
                     LRU_CACHE_HANDLE.table_created(result_table_name).await;
-                    match DATA_FUSION_CONTEXT.register_table(result_table_name, table) {
+                    match DATA_FUSION_CONTEXT.0.register_table(result_table_name, table) {
                         Ok(_) => return Ok(()),
                         Err(e) => return log_err(e)
                     }
@@ -689,7 +693,7 @@ pub(crate) async fn create_table(table_name: &String, sql: &String) -> Result<()
 }
 
 async fn private_execute_sql(sql: &String) -> Result<DataFrame, DataFusionError> {
-    match DATA_FUSION_CONTEXT.sql(sql).await {
+    match DATA_FUSION_CONTEXT.0.sql(sql).await {
         Ok(d) => Ok(d),
         Err(e) => log_err(e)
     }
@@ -710,7 +714,7 @@ pub(crate) async fn exists(path: &String) -> bool {
 
 pub(crate) async fn drop(table_name: &String) -> () {
     LRU_CACHE_HANDLE.table_dropped(table_name).await;
-    match DATA_FUSION_CONTEXT.sql(format!("DROP TABLE IF EXISTS {};", table_name).as_str()).await {
+    match DATA_FUSION_CONTEXT.0.sql(format!("DROP TABLE IF EXISTS {};", table_name).as_str()).await {
         Ok(_) => (),
         Err(e) => panic!("Failed to drop table {}: {}", table_name, e)
     }
@@ -723,7 +727,7 @@ pub(crate) async fn get_tracked_tables() -> Vec<String> {
 
 #[allow(dead_code)]
 pub(crate) async fn print_datafusion_tables() -> () {
-    let table_df = match DATA_FUSION_CONTEXT.sql("show tables;").await {
+    let table_df = match DATA_FUSION_CONTEXT.0.sql("show tables;").await {
         Ok(df) => df,
         Err(e) => {
             panic!("Failed to show tables: {}", e)
