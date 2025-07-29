@@ -4,7 +4,7 @@ use futures::FutureExt;
 use gotham::{handler::HandlerFuture, helpers::http::response::create_response, hyper::{body, Body, StatusCode}, mime, state::{FromState, State}};
 use serde::{Deserialize, Serialize};
 
-use crate::{compaction::perform_compaction, elastic_search_index::{self, create_index}, state_hosted_service::{TableMetadataCheckpoint, API_SERVICE_CLIENT}};
+use crate::{compaction::perform_compaction, data_access, elastic_search_index::{self, create_index}, state_hosted_service::{TableMetadataCheckpoint, API_SERVICE_CLIENT}};
 use crate::prefetch::perform_prefetch;
 
 #[derive(Serialize, Deserialize)]
@@ -254,13 +254,13 @@ pub fn test_v1_set_testing_processing_mode(mut state: State) -> Pin<Box<HandlerF
 
         API_SERVICE_CLIENT.set_testing_mode(&mode).await;
         if !mode.indexing_mode.is_disabled() {
-            tokio::spawn(do_extension_work_for_forever(vec!("es".to_string()), 1000));
+            data_access::CPU_RUNTIME.handle().spawn(do_extension_work_for_forever(vec!("es".to_string()), 1000));
         }
         if !mode.compaction_mode.is_disabled() {
-            tokio::spawn(do_compaction_work_for_forever(1000));
+            data_access::CPU_RUNTIME.handle().spawn(do_compaction_work_for_forever(1000));
         }
         if !mode.prefetch_mode.is_disable() {
-            tokio::spawn(do_prefetch_work_for_forever(1000));
+            data_access::CPU_RUNTIME.handle().spawn(do_prefetch_work_for_forever(1000));
         }
         let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "Ok");
         Ok((state, res))        

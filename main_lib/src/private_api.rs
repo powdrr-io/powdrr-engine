@@ -281,7 +281,7 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation, index: u64, nu
     data_query_worker(
         &invocation.sql,
         &required_files,
-        true,
+        false,
     ).await
 }
 
@@ -292,7 +292,7 @@ pub(crate) async fn compaction_query(invocation: &PrivateCompactionInvocation, i
     data_query_worker(
         &invocation.sql,
         &required_files,
-        true
+        false
     ).await
 }
 

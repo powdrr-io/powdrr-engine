@@ -49,7 +49,7 @@ const S3_REGION_VALUE: &str = "us-east-1";
 ///
 /// [InfluxDB 3.0]: https://github.com/influxdata/influxdb3_core/tree/6fcbb004232738d55655f32f4ad2385523d10696/executor
 ///
-struct CPURuntime {
+pub(crate) struct CPURuntime {
     /// Handle is the tokio structure for interacting with a Runtime.
     handle: Handle,
     /// Signal to start shutting down
@@ -81,8 +81,9 @@ impl CPURuntime {
     /// Create a new Tokio Runtime for CPU bound tasks
     pub fn try_new() -> Result<Self, std::io::Error> {
         let cpu_runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(16)
+            .worker_threads(4)
             .enable_time()
+            .enable_io()
             .build()?;
         let handle = cpu_runtime.handle().clone();
         let notify_shutdown = Arc::new(Notify::new());
@@ -119,7 +120,7 @@ impl CPURuntime {
     }
 }
 
-static CPU_RUNTIME: std::sync::LazyLock<CPURuntime> = std::sync::LazyLock::new(|| CPURuntime::try_new().unwrap());
+pub(crate) static CPU_RUNTIME: std::sync::LazyLock<CPURuntime> = std::sync::LazyLock::new(|| CPURuntime::try_new().unwrap());
 
 fn create_store() -> Arc<AmazonS3> {
     let io_runtime = Handle::current();
@@ -130,7 +131,7 @@ fn create_store() -> Arc<AmazonS3> {
         .with_endpoint(S3_ENDPOINT_VALUE)
         .with_bucket_name("warehouse")
         .with_allow_http(true)
-        .with_http_connector(SpawnedReqwestConnector::new(io_runtime))
+        //.with_http_connector(SpawnedReqwestConnector::new(io_runtime))
         .build().unwrap();
 
     Arc::new(s3_file_system)
