@@ -183,6 +183,8 @@ async fn search() -> Result<(), std::io::Error> {
 
         if longest_response_times.len() < 10 {
             longest_response_times.push(latest_response_time);
+            longest_response_times.sort();
+            longest_response_times.reverse()            
         } else if longest_response_times[9] < latest_response_time {
             longest_response_times.remove(9);
             longest_response_times.push(latest_response_time);

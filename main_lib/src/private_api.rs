@@ -210,6 +210,26 @@ async fn create_all_deletes_table(local_names: &Vec<String>) -> Result<String, P
     }
 }
 
+struct ProcessFileResult {
+    query_table: String,
+    reserve_table: String,
+}
+
+async fn process_file(
+    iceberg: bool,
+    sql: &SqlQuery,
+    iceberg_file: &FileDescriptor,
+    iceberg_file_extensions: &Vec<ExtensionFileSpec>,
+    table_schema: &PowdrrSchema,
+    deletes_table_name: &String,
+    use_cpu_threadpool: bool,
+) -> Result<ProcessFileResult, PrivateApiError> {
+    if iceberg {
+        process_iceberg_file(sql, iceberg_file, iceberg_file_extensions, table_schema, deletes_table_name, use_cpu_threadpool).await
+    } else {
+        process_speedboat_file(sql, iceberg_file, iceberg_file_extensions, table_schema, deletes_table_name, use_cpu_threadpool).await
+    }
+}
 
 async fn process_iceberg_file(
     sql: &SqlQuery,
@@ -217,21 +237,22 @@ async fn process_iceberg_file(
     iceberg_file_extensions: &Vec<ExtensionFileSpec>,
     table_schema: &PowdrrSchema,
     deletes_table_name: &String,
-    use_cpu_threadpool: bool,
-) -> Result<Vec<RecordBatch>, PrivateApiError> {
+    _use_cpu_threadpool: bool,
+) -> Result<ProcessFileResult, PrivateApiError> {
     let local_name = match ensure_loaded(&iceberg_file.file_path, iceberg_file_extensions,1,true, None).await {
         Ok(ln) => ln,
         Err(e) => return Err(PrivateApiError::from(e)),
     };
-    let local_results = match execute_sql(&sql.build(table_schema, &iceberg_file.schema), &local_name, deletes_table_name, use_cpu_threadpool).await {
-        Ok(vrb) => vrb,
-        Err(e) => {
-            data_access::release(&local_name).await;
-            return log_err(PrivateApiError::from(e))
-        },
+    let temp_table_name = format!("table_{}", IdInstance::next_id());
+    let final_ddl_stmt = &sql.build(table_schema, &iceberg_file.schema).replace("{target_table}", &local_name).replace("{deletes_table}", deletes_table_name);
+    match data_access::create_table(&temp_table_name, &final_ddl_stmt).await {
+        Ok(_) => (),
+        Err(e) => return Err(PrivateApiError::from(e)),
     };
-    data_access::release(&local_name).await;
-    Ok(local_results)
+    Ok(ProcessFileResult {
+        query_table: temp_table_name.clone(),
+        reserve_table: local_name.clone()
+    })
 }
 
 async fn process_speedboat_file(
@@ -240,24 +261,28 @@ async fn process_speedboat_file(
     speedboat_file_extensions: &Vec<ExtensionFileSpec>,
     table_schema: &PowdrrSchema,
     deletes_table_name: &String,
-    use_cpu_threadpool: bool,
-) -> Result<Vec<RecordBatch>, PrivateApiError> {
+    _use_cpu_threadpool: bool,
+) -> Result<ProcessFileResult, PrivateApiError> {
     let local_name = match ensure_loaded(&speedboat_file.file_path, speedboat_file_extensions, speedboat_file.size, false, Some(speedboat_file.schema.clone())).await {
         Ok(ln) => ln,
         Err(e) => {
             return log_err(PrivateApiError::from(e))
         },
     };
-    let sql = sql.build(table_schema, &speedboat_file.schema);
-    let local_results = match execute_sql(&sql, &local_name, &deletes_table_name, use_cpu_threadpool).await {
-        Ok(vrb) => vrb,
-        Err(e) => return {
-            data_access::release(&local_name).await;
-            log_err(PrivateApiError::from(e))
+    let temp_table_name = format!("table_{}", IdInstance::next_id());
+    let final_ddl_stmt = &sql.build(table_schema, &speedboat_file.schema).replace("{target_table}", &local_name).replace("{deletes_table}", deletes_table_name);
+    match data_access::create_table(&temp_table_name, &final_ddl_stmt).await {
+        Ok(_) => (),
+        Err(e) => {
+            let error = format!("{}", e);
+            return Err(PrivateApiError::from(e))
         },
     };
-    data_access::release(&local_name).await;
-    Ok(local_results)
+    Ok(ProcessFileResult {
+        query_table: temp_table_name.clone(),
+        reserve_table: local_name.clone()
+    })
+
 }
 
 
@@ -319,6 +344,23 @@ pub(crate) async fn prefetch_query(invocation: &PrivatePrefetchInvocation, index
 }
 
 
+async fn create_results(process_file_results: &Vec<ProcessFileResult>, use_cpu_threadpool: bool) -> Vec<Result<RecordBatch, FlightError>> {
+    let selects = process_file_results.iter().map(|pfr|format!("select * from {}", pfr.query_table)).collect::<Vec<String>>();
+    let union_sql_query = format!("SELECT * FROM ({});", selects.join(" UNION ALL "));
+    let result = match execute_sql(&union_sql_query, &"".to_string(), &"".to_string(), use_cpu_threadpool).await {
+        Ok(batches) => batches.iter().map(|rb|Ok(rb.clone())).collect::<Vec<Result<RecordBatch, FlightError>>>(),
+        Err(e) => vec!(Err(FlightError::ExternalError(Box::new(e))))
+    };
+    result
+}
+
+async fn drop_all_tables(process_file_results: &Vec<ProcessFileResult>) -> () {
+    for result in process_file_results.iter() {
+        data_access::drop(&result.query_table).await;
+        data_access::release(&result.reserve_table).await;
+    }
+}
+
 async fn data_query_worker(sql: &SqlQuery, required_files: &RequiredFiles, use_cpu_threadpool: bool) -> Result<DataQueryResult, PrivateApiError> {
     let mut delete_local_names = vec!();
     let delete_schema = PowdrrSchema::from(&vec!(
@@ -336,32 +378,20 @@ async fn data_query_worker(sql: &SqlQuery, required_files: &RequiredFiles, use_c
     let all_deletes_local_name = create_all_deletes_table(&delete_local_names).await?;
 
     let iceberg_calls = required_files.iceberg_files.iter().zip(required_files.iceberg_file_extensions.iter()).map(
-        |(iceberg_file, iceberg_file_extensions)| process_iceberg_file(sql, iceberg_file, iceberg_file_extensions, &required_files.table_schema, &all_deletes_local_name, use_cpu_threadpool));
+        |(iceberg_file, iceberg_file_extensions)| process_file(true, sql, iceberg_file, iceberg_file_extensions, &required_files.table_schema, &all_deletes_local_name, use_cpu_threadpool));
     let speedboat_calls = required_files.speedboat_files.iter().zip(required_files.speedboat_file_extensions.iter()).map(
-        |(speedboat_file, speedboat_file_extensions)| process_speedboat_file(sql, speedboat_file, speedboat_file_extensions, &required_files.table_schema, &all_deletes_local_name, use_cpu_threadpool));
+        |(speedboat_file, speedboat_file_extensions)| process_file(false, sql, speedboat_file, speedboat_file_extensions, &required_files.table_schema, &all_deletes_local_name, use_cpu_threadpool));
 
-    let iceberg_results: Vec<Result<RecordBatch, FlightError>> = match try_join_all(iceberg_calls).await {
-        Ok(ar) => ar.iter().flatten().map(|x|Ok(x.clone())).collect::<Vec<Result<RecordBatch, FlightError>>>(),
-        Err(e) => {
-            let error = format!("{}", e.message);
-            println!("{}", error);
-            panic!("dude")
-        },
-    };
+    let process_file_results = try_join_all(iceberg_calls.chain(speedboat_calls)).await?;
 
-    let speedboat_results: Vec<Result<RecordBatch, FlightError>> = match try_join_all(speedboat_calls).await {
-        Ok(ar) => ar.iter().flatten().map(|x|Ok(x.clone())).collect::<Vec<Result<RecordBatch, FlightError>>>(),
-        Err(e) => {
-            let error = format!("{}", e.message);
-            println!("{}", error);
-            panic!("dude")
-        },
-    };    
+    let all_results = create_results(&process_file_results, use_cpu_threadpool).await;
+
+    drop_all_tables(&process_file_results).await;
 
     data_access::drop(&all_deletes_local_name).await;
 
     let mut retval = Vec::new();
-    let input_stream = futures::stream::iter(iceberg_results).chain(futures::stream::iter(speedboat_results));
+    let input_stream = futures::stream::iter(all_results);
     let mut flight_data_stream = FlightDataEncoderBuilder::new()
         .build(input_stream);
     while let Some(value) = flight_data_stream.next().await {
