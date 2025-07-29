@@ -821,9 +821,9 @@ impl SqlBuilder {
 impl SqlQuery {
     pub fn dummy() -> Self {
         SqlQuery {
-            dummy: true,
+            dummy: false,
             all_fields: false,
-            fields: vec!(FieldExpression{ name: "dummy".to_string(), expression: SqlExpression::LiteralNonString("1".to_string()) }),
+            fields: vec!(FieldExpression{ name: "cnt".to_string(), expression: SqlExpression::Count }),
             joins: "".to_string(),
             filters: None,
             limit: None,

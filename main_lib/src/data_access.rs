@@ -80,17 +80,17 @@ impl Drop for CPURuntime {
 impl CPURuntime {
     /// Create a new Tokio Runtime for CPU bound tasks
     pub fn try_new() -> Result<Self, std::io::Error> {
-        let io_runtime = tokio::runtime::Builder::new_multi_thread()
+        let cpu_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(16)
             .enable_time()
-            .enable_io()
             .build()?;
-        let handle = io_runtime.handle().clone();
+        let handle = cpu_runtime.handle().clone();
         let notify_shutdown = Arc::new(Notify::new());
         let notify_shutdown_captured = Arc::clone(&notify_shutdown);
 
         // The cpu_runtime runs and is dropped on a separate thread
         let thread_join_handle = std::thread::spawn(move || {
-            io_runtime.block_on(async move {
+            cpu_runtime.block_on(async move {
                 notify_shutdown_captured.notified().await;
             });
             // Note: io_runtime is dropped here, which will wait for all tasks
