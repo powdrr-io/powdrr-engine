@@ -8,7 +8,7 @@ use crate::elastic_search_common::ElasticSearchResponse;
 
 
 #[derive(Serialize, Clone)]
-pub(crate) struct Shards {
+pub struct Shards {
     pub total: u32,
     pub successful: u32,
     pub failed: u32,
@@ -16,7 +16,7 @@ pub(crate) struct Shards {
 
 
 #[derive(Serialize, Clone)]
-pub(crate) struct OperationResult {
+pub struct OperationResult {
     pub _index: String,
     pub _id: String,
     pub _version: u64,
@@ -31,7 +31,7 @@ pub(crate) struct OperationResult {
 }
 
 #[derive(Serialize)]
-pub(crate) struct BulkResult {
+pub struct BulkResult {
     pub errors: bool,
     pub took: u32,
     pub items: Vec<HashMap<String, OperationResult>>
@@ -64,13 +64,13 @@ pub(crate) struct QueryResultTotalComplex {
 
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(untagged)]
-pub(crate) enum QueryResultTotal {
+pub enum QueryResultTotal {
     Simple(u64),
     Complex(QueryResultTotalComplex),
 }
 
 #[derive(Deserialize, Serialize, Clone)]
-pub(crate) struct QueryResultHit {
+pub struct QueryResultHit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub _index: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

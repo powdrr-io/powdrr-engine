@@ -9,6 +9,7 @@ use serde_json::json;
 
 use crate::{elastic_search_cluster_info, elastic_search_commands::LookupById, elastic_search_common::{execute_command, CommandContext}, elastic_search_ingest, elastic_search_parser, elastic_search_pipeline, state_hosted_service::API_SERVICE_CLIENT};
 use crate::elastic_search_common::MIME_ES_JSON;
+use crate::util::{log_service_err, log_service_err_response};
 
 #[derive(Deserialize, StateData, StaticResponseExtender)]
 pub struct NamePathExtractor {
@@ -181,7 +182,13 @@ pub fn es_get_index(state: State) -> Pin<Box<HandlerFuture>> {
         let path_extractor = NamePathExtractor::borrow_from(&state);
 
         for table_name in path_extractor.name.to_string().split(",") {
-            let table_desc = API_SERVICE_CLIENT.describe_table(&table_name.to_string()).await;
+            let table_desc = match API_SERVICE_CLIENT.describe_table(&table_name.to_string()).await {
+                Ok(td) => td,
+                Err(e) => {
+                    let res = log_service_err(e).generate_response(&state);
+                    return Ok((state, res))
+                }
+            };
             if table_desc.is_none() {
                 continue;
             }
@@ -205,7 +212,13 @@ pub fn es_head_index(state: State) -> Pin<Box<HandlerFuture>> {
         let path_extractor = NamePathExtractor::borrow_from(&state);
 
         for table_name in path_extractor.name.to_string().split(",") {
-            let table_desc = API_SERVICE_CLIENT.describe_table(&table_name.to_string()).await;
+            let table_desc = match API_SERVICE_CLIENT.describe_table(&table_name.to_string()).await {
+                Ok(td) => td,
+                Err(e) => {
+                    let res = log_service_err(e).generate_response(&state);
+                    return Ok((state, res));
+                }
+            };
             let res = if table_desc.is_none() {
                 create_empty_response(&state, StatusCode::NOT_FOUND)
             } else {
@@ -253,7 +266,10 @@ pub fn es_get_index_template(state: State) -> Pin<Box<HandlerFuture>> {
         let path_extractor = NamePathExtractor::borrow_from(&state);
         let index_name = path_extractor.name.to_string();
 
-        let table_desc = API_SERVICE_CLIENT.describe_table_template(&index_name).await;
+        let table_desc = match API_SERVICE_CLIENT.describe_table_template(&index_name).await {
+            Ok(td) => td,
+            Err(e) => return Ok(log_service_err_response(e, state))
+        };
 
         let response = table_desc.map_or_else(
             || "{}".to_string(), 
@@ -322,7 +338,10 @@ pub fn es_get_with_id(state: State) -> Pin<Box<HandlerFuture>> {
         let path_extractor = NameIdPathExtractor::borrow_from(&state);
         let index_name = path_extractor.name.to_string();
         let doc_id = path_extractor.id.to_string();
-        let table_desc = API_SERVICE_CLIENT.describe_table(&index_name).await;
+        let table_desc = match API_SERVICE_CLIENT.describe_table(&index_name).await {
+            Ok(td) => td,
+            Err(e) => return Ok(log_service_err_response(e, state))
+        };
         match table_desc {
             Some(td) => {
                 let command = LookupById::new(&td.name, &vec!(doc_id));
@@ -484,15 +503,17 @@ pub fn es_head_template(state: State) -> Pin<Box<HandlerFuture>> {
         let table = path_extractor.name.to_string();
 
         match API_SERVICE_CLIENT.describe_table_template(&table).await {
-            Some(_) => {
-                let res = create_empty_response(&state, StatusCode::OK);
-                Ok((state, res))
+            Ok(tt) => match tt {
+                Some(_) => {
+                    let res = create_empty_response(&state, StatusCode::OK);
+                    Ok((state, res))
+                },
+                None => {
+                    let res = create_empty_response(&state, StatusCode::NOT_FOUND);
+                    Ok((state, res))
+                }
             },
-            None => {
-                let res = create_empty_response(&state, StatusCode::NOT_FOUND);
-                Ok((state, res))
-            }
-
+            Err(e) => return Ok(log_service_err_response(e, state))
         }
     }.boxed()
 }
@@ -504,15 +525,17 @@ pub fn es_get_template(state: State) -> Pin<Box<HandlerFuture>> {
         let table = path_extractor.name.to_string();
 
         match API_SERVICE_CLIENT.describe_table_template(&table).await {
-            Some(t) => {
-                let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, serde_json::to_string(&t).unwrap());
-                Ok((state, res))
+            Ok(tt) => match tt {
+                Some(t) => {
+                    let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, serde_json::to_string(&t).unwrap());
+                    Ok((state, res))
+                },
+                None => {
+                    let res = create_empty_response(&state, StatusCode::NOT_FOUND);
+                    Ok((state, res))
+                }
             },
-            None => {
-                let res = create_empty_response(&state, StatusCode::NOT_FOUND);
-                Ok((state, res))
-            }
-
+            Err(e) => return Ok(log_service_err_response(e, state))
         }
     }.boxed()
 }
@@ -599,11 +622,14 @@ pub fn es_update_by_query(mut state: State) -> Pin<Box<HandlerFuture>> {
         };
         let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
         let table_description = match API_SERVICE_CLIENT.describe_table(&table).await {
-            Some(td) => td,
-            None =>  {
-                let res = create_response(&state, StatusCode::BAD_REQUEST, mime::TEXT_PLAIN, "Index does not exist".to_string());
-                return Ok((state, res))
-            }
+            Ok(td) => match td {
+                Some(td) => td,
+                None => {
+                    let res = create_response(&state, StatusCode::BAD_REQUEST, mime::TEXT_PLAIN, "Index does not exist".to_string());
+                    return Ok((state, res))
+                }
+            },
+            Err(e) => return Ok(log_service_err_response(e, state))
         };
         
         let command = match elastic_search_parser::parse_update_by_query(Some(table_description.name), &body_content) {
@@ -628,12 +654,21 @@ pub fn es_search_table(mut state: State) -> Pin<Box<HandlerFuture>> {
         let query_extractor = QueryStringSearch::take_from(&mut state);
         let table = path_extractor.name.to_string();
         let table_desc = match API_SERVICE_CLIENT.describe_table(&table).await {
-            Some(td) => td,
-            None => panic!("Oh no"),
+            Ok(td) => match td {
+                Some(td) => td,
+                None => {
+                    let res = create_response(&state, StatusCode::BAD_REQUEST, mime::TEXT_PLAIN, "Bad request".to_string());
+                    return Ok((state, res))
+                },
+            },
+            Err(e) => return Ok(log_service_err_response(e, state))
         };
         let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
             Ok(vb) => vb,
-            Err(_) => panic!("Oh no"),
+            Err(_) => {
+                let res = create_response(&state, StatusCode::BAD_REQUEST, mime::TEXT_PLAIN, "Bad request".to_string());
+                return Ok((state, res))
+            },
         };
         let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
         let command = match elastic_search_parser::parse(Some(table_desc.name), &body_content, &query_extractor) {

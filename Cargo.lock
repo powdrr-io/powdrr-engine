@@ -4174,7 +4174,9 @@ dependencies = [
  "powdrr_lib",
  "rustls-pemfile 2.2.0",
  "rustls-pki-types",
+ "serde",
  "serde_json",
+ "tracing",
  "tracing-subscriber",
 ]
 

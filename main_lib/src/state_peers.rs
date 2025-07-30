@@ -31,6 +31,12 @@ pub struct CheckpointDescriptor {
     pub checkpoint_id: String,
 }
 
+impl Display for CheckpointDescriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.table_name, self.checkpoint_id)
+    }
+}
+
 
 #[derive(Serialize, Deserialize)]
 pub enum PrivateInvocation {

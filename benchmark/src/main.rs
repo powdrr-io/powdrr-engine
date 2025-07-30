@@ -5,7 +5,7 @@ use futures::future::join_all;
 use idgenerator::{IdGeneratorOptions, IdInstance};
 use rand::TryRngCore;
 use rand::rngs::OsRng;
-use powdrr_lib::test_api::{CompactionMode, IndexingMode, PrefetchMode, TestProcessingMode};
+use powdrr_lib::test_api::{CompactionMode, IndexingMode, PrefetchMode, TestProcessingMode, TestingMode};
 
 const LINE_LIMIT: u64 = 1000000;
 
@@ -218,26 +218,14 @@ async fn main() -> Result<(), std::io::Error> {
     let client = reqwest::Client::new();
     
     let main_mode = TestProcessingMode {
+        testing_mode: TestingMode::Disabled,
         indexing_mode: IndexingMode::Disabled,
-        compaction_mode: CompactionMode::External("http://localhost:9201".to_string()),
+        compaction_mode: CompactionMode::Async,
         prefetch_mode: PrefetchMode::Enabled,
     };
     
     let _res = match client.put("http://localhost:9200/_test/v1/_testing_and_processing_mode")
         .body(serde_json::to_string(&main_mode)?)
-        .send().await {
-        Ok(res) => res,
-        Err(e) => panic!("Error: {}", e),
-    };
-
-    let compactor_mode = TestProcessingMode {
-        indexing_mode: IndexingMode::Disabled,
-        compaction_mode: CompactionMode::Disabled,
-        prefetch_mode: PrefetchMode::Disabled,
-    };
-
-    let _res = match client.put("http://localhost:9201/_test/v1/_testing_and_processing_mode")
-        .body(serde_json::to_string(&compactor_mode)?)
         .send().await {
         Ok(res) => res,
         Err(e) => panic!("Error: {}", e),

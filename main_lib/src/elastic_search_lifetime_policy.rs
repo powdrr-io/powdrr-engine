@@ -13,6 +13,7 @@ use crate::elastic_search_common::MIME_ES_JSON;
 use crate::elastic_search_endpoints::NamePathExtractor;
 use crate::elastic_search_responses::{ErrorDetails, SingleDocCreateFailedResult};
 use crate::state_hosted_service::API_SERVICE_CLIENT;
+use crate::util::log_service_err_response;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ILMPolicyDeleteAction {}
@@ -77,24 +78,27 @@ pub fn es_get_ilm_policy(state: State) -> Pin<Box<HandlerFuture>> {
         let table = path_extractor.name.to_string();
 
         match API_SERVICE_CLIENT.describe_lifetime_policy(&table).await {
-            Some(_) => {
-                let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, "{}".to_string());
-                Ok((state, res))
+            Ok(lp) => match lp {
+                Some(_) => {
+                    let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, "{}".to_string());
+                    Ok((state, res))
+                },
+                None => {
+                    let response = SingleDocCreateFailedResult {
+                        error: ErrorDetails::single_cause(
+                            &"resource_not_found_exception".to_string(),
+                            &format!("Lifecycle policy not found: {table}"),
+                            None,
+                            None,
+                            None,
+                        ),
+                        status: 404,
+                    };
+                    let res = create_response(&state, StatusCode::NOT_FOUND, mime::APPLICATION_JSON, serde_json::to_string(&response).unwrap());
+                    Ok((state, res))
+                }
             },
-            None => {
-                let response = SingleDocCreateFailedResult {
-                    error: ErrorDetails::single_cause(
-                        &"resource_not_found_exception".to_string(),
-                        &format!("Lifecycle policy not found: {table}"),
-                        None,
-                        None,
-                        None,
-                    ),
-                    status: 404,
-                };
-                let res = create_response(&state, StatusCode::NOT_FOUND, mime::APPLICATION_JSON, serde_json::to_string(&response).unwrap());
-                Ok((state, res))
-            }
+            Err(e) => return Ok(log_service_err_response(e, state))
         }
 
     }.boxed()
@@ -119,7 +123,10 @@ pub fn es_post_ilm_policy(mut state: State) -> Pin<Box<HandlerFuture>> {
             Err(_) => panic!("Oh no"),
         };
 
-        API_SERVICE_CLIENT.create_lifetime_policy(&table, &policy).await;
+        match API_SERVICE_CLIENT.create_lifetime_policy(&table, &policy).await {
+            Ok(_) => (),
+            Err(e) => return Ok(log_service_err_response(e, state))
+        };
 
         let response = HashMap::from([("acknowledged", true)]);
 
@@ -181,4 +188,3 @@ mod tests {
 
     }
 }
-

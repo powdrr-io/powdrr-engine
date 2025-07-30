@@ -31,7 +31,7 @@ use crate::elastic_search_commands::df_to_serde_value;
 use crate::elastic_search_common::{execute_command, Command, CommandContext, CommandError, ElasticSearchResponse, ResultGeneratorFuture};
 use crate::elastic_search_ingest::{write_to_file, WriteBuffer};
 use crate::schema_massager::{PowdrrSchema, SqlBuilder};
-use crate::state_hosted_service::{CompactionWorkItem, FileSetPayload, IcebergCommit, IcebergMetadata, SpeedboatCommit, SpeedboatCommitTableInfo};
+use crate::state_hosted_service::{CompactionWorkItem, FileSetPayload, IcebergCommit, IcebergMetadata, ServiceApiError, SpeedboatCommit, SpeedboatCommitTableInfo};
 use crate::state_peers::{PrivateCompactionInvocation, PrivateInvocation};
 
 
@@ -346,8 +346,8 @@ impl CompactionCommand {
         ).await
     }
 
-    async fn do_iceberg_commit(compaction_response: &CompactionResponse) -> Result<i64, iceberg::Error> {
-        match API_SERVICE_CLIENT.iceberg_commit(
+    async fn do_iceberg_commit(compaction_response: &CompactionResponse) -> Result<i64, ServiceApiError> {
+        API_SERVICE_CLIENT.iceberg_commit(
             &compaction_response.table_name,
             &IcebergCommit {
                 metadata: IcebergMetadata {
@@ -364,10 +364,7 @@ impl CompactionCommand {
                 },
                 compactions: compaction_response.lib_metadata.compactions.clone(),
             }
-        ).await {
-            Ok(_) => (),
-            Err(e) => return Err(iceberg::Error::new(iceberg::ErrorKind::DataInvalid, format!("Iceberg commit failed, {}", e))),
-        };
+        ).await?;
 
         // Note: the Iceberg and Speedboat commits are done separately here and are
         // therefore NOT ATOMIC. The Speedboat commit here is just deletions where
@@ -376,16 +373,13 @@ impl CompactionCommand {
         // files and once again tries to compact them.
 
         if compaction_response.deletes_table_info.is_some() {
-            match API_SERVICE_CLIENT.speedboat_commit(&SpeedboatCommit {
+            API_SERVICE_CLIENT.speedboat_commit(&SpeedboatCommit {
                 type_files: vec!(compaction_response.deletes_table_info.as_ref().unwrap().clone()),
                 compactions: compaction_response.compactions.clone(),
-            }).await {
-                Ok(_) => (),
-                Err(_) => panic!("nope")
-            }
+            }).await?
         }
 
-        return Ok(compaction_response.lib_metadata.snapshot_id)
+        Ok(compaction_response.lib_metadata.snapshot_id)
     }
 
 }
@@ -549,7 +543,7 @@ pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkIt
             last_snapshot_id,
         };
 
-        let peers = API_SERVICE_CLIENT.get_peer_clients().await.unwrap();
+        let peers = API_SERVICE_CLIENT.get_peer_clients().await;
         assert!(peers.len() > 0);
         let response_maybe = match peers[0].private_compaction_leader(&command).await {
             Ok(success) => success,

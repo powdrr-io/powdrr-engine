@@ -25,13 +25,13 @@ use crate::data_access;
 use crate::elastic_search_parser::UpdateBody;
 use crate::elastic_search_storage_schema::{FullRecord, RecordDelete, RecordInput, SpeedboatCommitBuilder};
 use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
-use crate::state_hosted_service::{CreateTable, SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription, API_SERVICE_CLIENT};
-use crate::util::log_err;
+use crate::state_hosted_service::{CreateTable, ServiceApiError, SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription, API_SERVICE_CLIENT};
+use crate::util::{describe_table_log_error_then_none, log_err, log_service_err};
 
 
 
 #[derive(Debug)]
-pub(crate) struct IngestError {
+pub struct IngestError {
     pub message: String,
 }
 
@@ -43,6 +43,13 @@ impl Display for IngestError {
 }
 
 impl Error for IngestError {}
+
+impl IngestError {
+    fn from_service_api_error(e: ServiceApiError) -> Self {
+        log_service_err(e.clone());
+        IngestError { message: format!("{}", e) }
+    }
+}
 
 
 fn default_as_false() -> bool {
@@ -340,11 +347,11 @@ pub(crate) async fn create_index(table: &String, body: &String) -> Result<Create
     API_SERVICE_CLIENT.create_table(&CreateTable{ 
         name: table.clone(),
         tags: HashMap::from([("_es_original".to_string(), serialized_body)])
-    }).await;
+    }).await.map_err(|e|IngestError::from_service_api_error(e))?;
 
     if parsed_body.aliases.is_some() {
         for (name, _) in parsed_body.aliases.unwrap() {
-            API_SERVICE_CLIENT.add_alias(table, &name).await;
+            API_SERVICE_CLIENT.add_alias(table, &name).await.map_err(|e|IngestError::from_service_api_error(e))?;
         }
     }
 
@@ -358,7 +365,7 @@ pub(crate) async fn create_index_template(table: &String, body: &String) -> Resu
         Err(_e) => return log_err(IngestError{ message: "body parsing error".to_string() })
     };
 
-    API_SERVICE_CLIENT.create_table_template(&table, &parsed_body).await;
+    API_SERVICE_CLIENT.create_table_template(&table, &parsed_body).await.map_err(|e|IngestError::from_service_api_error(e))?;
     
     Ok(CreateIndexResult { index: table.clone(), shards_acknowledged: true, acknowledged: true })
 }
@@ -422,10 +429,10 @@ pub(crate) async fn update_aliases(body: &String) -> Result<(), IngestError> {
     for action in parsed_body.actions {
         match action {
             AliasAction::Add(a) => {
-                API_SERVICE_CLIENT.add_alias(&a.add.index, &a.add.alias).await;
+                API_SERVICE_CLIENT.add_alias(&a.add.index, &a.add.alias).await.map_err(|e|IngestError::from_service_api_error(e))?;
             },
             AliasAction::Remove(r) => {
-                API_SERVICE_CLIENT.remove_alias(&r.remove.index, &r.remove.alias).await;
+                API_SERVICE_CLIENT.remove_alias(&r.remove.index, &r.remove.alias).await.map_err(|e|IngestError::from_service_api_error(e))?;
             },
             AliasAction::RemoveIndex(_) => {
                 panic!("TODO: What does this mean?")
@@ -572,9 +579,9 @@ async fn get_existing_docs(index: &String, doc_ids: &Vec<String>) -> Result<Serd
 }
 
 async fn create_single_worker(index: &String, doc_id: &String, payload: &String) -> Result<ElasticSearchResponse, IngestError> {
-    let table_description: TableDescription = match API_SERVICE_CLIENT.describe_table(&index).await {
+    let table_description: TableDescription = match describe_table_log_error_then_none(&index).await {
         Some(t) => t,
-        None => return Err(IngestError{ message: "Index does not exist".to_string() })
+        None => return Err(IngestError { message: "Index does not exist".to_string() })
     };
     let doc: Result<Value, serde_json::Error> = serde_json::from_str(payload);
     match doc {
@@ -650,8 +657,14 @@ fn merge_source(existing_doc: &Value, update_doc: &Value) -> Value {
 
 async fn update_single_worker(index: &String, doc_id: &String, payload: &String) -> Result<ElasticSearchResponse, IngestError> {
     let table_description: TableDescription = match API_SERVICE_CLIENT.describe_table(&index).await {
-        Some(t) => t,
-        None => return Err(IngestError{ message: "Index does not exist".to_string() })
+        Ok(t) => match t {
+            Some(t) => t,
+            None => return Err(IngestError { message: "Index does not exist".to_string() })
+        },
+        Err(e) => {
+            log_service_err(e);
+            return Err(IngestError { message: "Index does not exist".to_string() })
+        }
     };
 
     let update_request: UpdateBody = match serde_json::from_str(payload) {
@@ -710,7 +723,7 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
 
 
 pub(crate) async fn delete(index: &String, doc_id: &String) -> Result<ElasticSearchResponse, IngestError> {
-    let table_description: TableDescription = match API_SERVICE_CLIENT.describe_table(&index).await {
+    let table_description: TableDescription = match describe_table_log_error_then_none(&index).await {
         Some(t) => t,
         None => return Err(IngestError{ message: "Index does not exist".to_string() })
     };
@@ -777,7 +790,7 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
                                 }
                             }                               
                         };
-                        let table_description = match API_SERVICE_CLIENT.describe_table(&index).await {
+                        let table_description = match describe_table_log_error_then_none(&index).await {
                             Some(t) => t,
                             None => return Err(IngestError{ message: "Index does not exist".to_string() })
                         };
@@ -817,7 +830,7 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
                                 }
                             }
                         };
-                        let table_description = match API_SERVICE_CLIENT.describe_table(&index).await {
+                        let table_description = match describe_table_log_error_then_none(&index).await {
                             Some(t) => t,
                             None => return Err(IngestError{ message: "Index does not exist".to_string() })
                         };

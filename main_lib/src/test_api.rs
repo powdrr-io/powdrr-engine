@@ -15,6 +15,13 @@ pub(crate) struct TestCreateIndex {
 
 
 #[derive(Serialize, Deserialize, Clone)]
+pub enum TestingMode {
+    Enabled,
+    Disabled
+}
+
+
+#[derive(Serialize, Deserialize, Clone)]
 pub enum IndexingMode {
     Sync,
     Async,
@@ -64,6 +71,7 @@ impl PrefetchMode {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TestProcessingMode {
+    pub testing_mode: TestingMode,
     pub indexing_mode: IndexingMode,
     pub compaction_mode: CompactionMode,
     pub prefetch_mode: PrefetchMode,
@@ -72,6 +80,7 @@ pub struct TestProcessingMode {
 impl TestProcessingMode {
     pub fn default() -> Self {
         Self {
+            testing_mode: TestingMode::Enabled,
             indexing_mode: IndexingMode::Sync,
             compaction_mode: CompactionMode::Async,
             prefetch_mode: PrefetchMode::Disabled,
