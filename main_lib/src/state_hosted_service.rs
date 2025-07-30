@@ -14,15 +14,9 @@ use crate::schema_massager::PowdrrSchema;
 use crate::state_peers::{PeerClient, SelfPeer};
 use crate::test_api::{IndexingMode, PrefetchMode, TestProcessingMode};
 
-#[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct SpeedboatCSpeedInfo {
-    pub table_name: String,
-    pub files: Vec<String>,
-}
-
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub(crate) struct SpeedboatCommitTableInfo {
+pub struct SpeedboatCommitTableInfo {
     pub commit_type: String,
     pub table_name: String,
     pub files: Vec<String>,
@@ -43,13 +37,13 @@ impl SpeedboatCommitTableInfo {
 
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct SpeedboatCommit {
+pub struct SpeedboatCommit {
     pub type_files: Vec<SpeedboatCommitTableInfo>,
     pub compactions: Vec<String>,    
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub(crate) struct FileSetPayload {
+pub struct FileSetPayload {
     pub file_paths: Vec<String>,
     pub schemas: Vec<PowdrrSchema>,
     pub file_schemas: Vec<u64>,
@@ -57,15 +51,15 @@ pub(crate) struct FileSetPayload {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct FileDescriptor {
-    pub(crate) file_path: String,
-    pub(crate) schema: PowdrrSchema,
-    pub(crate) size: u64,
+pub struct FileDescriptor {
+    pub file_path: String,
+    pub schema: PowdrrSchema,
+    pub size: u64,
 }
 
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct IcebergMetadata {
+pub struct IcebergMetadata {
     pub table_schema: PowdrrSchema,
     pub snapshot_id: String,
     pub files: FileSetPayload,
@@ -77,25 +71,25 @@ pub(crate) struct IcebergMetadata {
 
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct IcebergCommit {
+pub struct IcebergCommit {
     pub metadata: IcebergMetadata,
     pub compactions: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct SpeedboatMetadata {
+pub struct SpeedboatMetadata {
     pub files: FileSetPayload
 }
 
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct DeletesMetadata {
+pub struct DeletesMetadata {
     pub files: Vec<String>,
 }
 
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct ExtensionFile {
+pub struct ExtensionFile {
     pub suffix: String,
     pub location: String,
 }
@@ -105,21 +99,21 @@ pub type ExtensionFileMetadata = HashMap<String, Vec<ExtensionFile>>;
 
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct ExtensionCommit {
+pub struct ExtensionCommit {
     pub extension: String,
     pub files: ExtensionFileMetadata
 }
 
 
 #[derive(Serialize, Clone)]
-pub(crate) struct CompactionCommit {
+pub struct CompactionCommit {
     pub removed_speedboat_files: Vec<String>,
     pub removed_delete_files: Vec<String>,
     pub compaction_id: String
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct TableMetadataCheckpoint {
+pub struct TableMetadataCheckpoint {
     pub table_name: String,
     pub checkpoint_id: String,
     pub iceberg_metadata: Option<IcebergMetadata>,
@@ -216,14 +210,14 @@ pub(crate) struct ProposedCompaction {
     pub extension_metadata: Option<Vec<(String, Vec<ExtensionFileMetadata>)>>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct CreateTable {
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CreateTable {
     pub name: String,
     pub tags: HashMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct TableDescription {
+pub struct TableDescription {
     pub name: String,
     pub tags: HashMap<String, String>
 }
@@ -896,7 +890,7 @@ impl ApiServiceClient for RealApiServiceClient {
 
 
 #[derive(Clone)]
-pub(crate) struct ExtensionWorkItem {
+pub struct ExtensionWorkItem {
     pub extension_type: String,
     pub table_name: String,
     pub table_schema: PowdrrSchema,
@@ -917,7 +911,7 @@ impl ExtensionWorkItem {
 
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub(crate) struct CompactionWorkItem {
+pub struct CompactionWorkItem {
     pub table_schema: PowdrrSchema,
     pub speedboat_files: FileSetPayload,
     pub delete_files: Vec<String>,
@@ -2028,4 +2022,4 @@ impl ApiServiceClientHandle {
     }
 }
 
-pub(crate) static API_SERVICE_CLIENT: std::sync::LazyLock<ApiServiceClientHandle> = std::sync::LazyLock::new(|| ApiServiceClientHandle::new("localhost:7783".to_string()));
+pub static API_SERVICE_CLIENT: std::sync::LazyLock<ApiServiceClientHandle> = std::sync::LazyLock::new(|| ApiServiceClientHandle::new("localhost:7783".to_string()));

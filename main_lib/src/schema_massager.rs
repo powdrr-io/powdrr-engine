@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
-pub(crate) enum PowdrrDataType {
+pub enum PowdrrDataType {
     Array(Box<PowdrrDataType>),
     Boolean,
     Float,
@@ -95,7 +95,7 @@ impl PowdrrDataType {
 
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
-pub(crate) struct PowdrrField {
+pub struct PowdrrField {
     pub name: String,
     pub data_type: PowdrrDataType
 }
@@ -118,7 +118,7 @@ impl PowdrrField {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
-pub(crate) struct PowdrrSchema {
+pub struct PowdrrSchema {
     pub fields: Vec<PowdrrField>
 }
 
@@ -660,7 +660,7 @@ impl FieldExpression {
 }
 
 #[derive(Clone)]
-pub(crate) struct SqlBuilder {
+pub struct SqlBuilder {
     pub(crate) all_fields: bool,
     pub(crate) fields: Vec<FieldExpression>,
     pub(crate) joins: Vec<String>,
@@ -673,7 +673,7 @@ pub(crate) struct SqlBuilder {
 
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct SqlQuery {
+pub struct SqlQuery {
     dummy: bool,
     all_fields: bool,
     fields: Vec<FieldExpression>,

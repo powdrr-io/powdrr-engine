@@ -15,39 +15,39 @@ use crate::elastic_search_responses::{ErrorDetails, SingleDocCreateFailedResult}
 use crate::state_hosted_service::API_SERVICE_CLIENT;
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct ILMPolicyDeleteAction {}
+pub struct ILMPolicyDeleteAction {}
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct ILMPolicyDelete {
+pub struct ILMPolicyDelete {
     pub min_age: String,
     pub actions: ILMPolicyActions,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct ILMPolicyRolloverAction {
+pub struct ILMPolicyRolloverAction {
     pub max_size: Option<String>,
     pub max_age: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct ILMPolicyActions {
+pub struct ILMPolicyActions {
     pub rollover: Option<ILMPolicyRolloverAction>,
     pub delete: Option<ILMPolicyDeleteAction>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct ILMPolicyHot {
+pub struct ILMPolicyHot {
     pub actions: ILMPolicyActions,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct ILMPolicyPhases {
+pub struct ILMPolicyPhases {
     pub hot: Option<ILMPolicyHot>,
     pub delete: Option<ILMPolicyDelete>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct ILMPolicyMeta {
+pub struct ILMPolicyMeta {
     pub managed: bool,
     pub index_patterns: Option<Vec<String>>,
     pub version: Option<i64>,
@@ -58,13 +58,13 @@ pub(crate) struct ILMPolicyMeta {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct ILMPolicyPolicy {
+pub struct ILMPolicyPolicy {
     pub _meta: Option<ILMPolicyMeta>,
     pub phases: ILMPolicyPhases,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct ILMPolicyDefinition {
+pub struct ILMPolicyDefinition {
     pub policy: ILMPolicyPolicy,
 }
 
