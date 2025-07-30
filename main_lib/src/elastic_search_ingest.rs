@@ -305,7 +305,7 @@ enum CreateIndexSettingsOption {
 
 
 #[derive(Serialize)]
-pub(crate) struct CreateIndexResult {
+pub struct CreateIndexResult {
     acknowledged: bool,
     shards_acknowledged: bool,
     index: String,
@@ -313,7 +313,7 @@ pub(crate) struct CreateIndexResult {
 
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct CreateIndexTemplateBody {
+pub struct CreateIndexTemplateBody {
     #[serde(default)]
     index_patterns: Vec<String>,
     priority: Option<u32>,

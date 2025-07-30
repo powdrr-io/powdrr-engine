@@ -26,14 +26,14 @@ pub struct FileFilterDescriptor {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub(crate) struct CheckpointDescriptor {
+pub struct CheckpointDescriptor {
     pub table_name: String,
     pub checkpoint_id: String,
 }
 
 
 #[derive(Serialize, Deserialize)]
-pub(crate) enum PrivateInvocation {
+pub enum PrivateInvocation {
     Sql(PrivateSqlInvocation),
     Compaction(PrivateCompactionInvocation),
     Extension(PrivateExtensionInvocation),
@@ -41,7 +41,7 @@ pub(crate) enum PrivateInvocation {
 }
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct PrivateSqlInvocation {
+pub struct PrivateSqlInvocation {
     pub sql: SqlQuery,
     pub required_extensions: Vec<String>,
     pub file_filter: Vec<FileFilterDescriptor>,
@@ -49,7 +49,7 @@ pub(crate) struct PrivateSqlInvocation {
 }
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct PrivateSqlInvocationExternal {
+pub struct PrivateSqlInvocationExternal {
     pub invocation: PrivateSqlInvocation,
     pub index: u64,
     pub num: u64,
@@ -57,7 +57,7 @@ pub(crate) struct PrivateSqlInvocationExternal {
 
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct PrivateCompactionInvocation {
+pub struct PrivateCompactionInvocation {
     pub sql: SqlQuery,
     pub speedboat_files: FileSetPayload,
     pub table_schema: PowdrrSchema,
@@ -65,14 +65,14 @@ pub(crate) struct PrivateCompactionInvocation {
 }
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct PrivateExtensionInvocation {
+pub struct PrivateExtensionInvocation {
     pub extension_name: String,
     pub speedboat_files: FileSetPayload,
     pub iceberg_files: FileSetPayload,
 }
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct PrivatePrefetchInvocation {
+pub struct PrivatePrefetchInvocation {
     pub required_extensions: Vec<String>,
     pub checkpoints: Vec<CheckpointDescriptor>,
 }
@@ -84,7 +84,7 @@ pub struct PrivateMetadataInvocation {
 }
 
 
-pub(crate) enum PrivateInvocationResult {
+pub enum PrivateInvocationResult {
     Data(Vec<RecordBatch>),
     Extension(ExtensionFileMetadata),
     Prefetch,
@@ -92,7 +92,7 @@ pub(crate) enum PrivateInvocationResult {
 
 
 #[derive(Debug)]
-pub(crate) struct PeerClientError {
+pub struct PeerClientError {
     pub message: String,
 }
 

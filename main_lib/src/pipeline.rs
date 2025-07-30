@@ -11,7 +11,7 @@ fn is_false(b: &bool) -> bool { !b }
 
 
 #[derive(Debug)]
-pub(crate) struct PipelineError {}
+pub struct PipelineError {}
 
 impl Display for PipelineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -25,7 +25,7 @@ impl Error for PipelineError {}
 
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct SetProcessorBody {
+pub struct SetProcessorBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(rename = "if")]
@@ -88,7 +88,7 @@ impl SetProcessorBody {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct AppendProcessorBody {
+pub struct AppendProcessorBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(rename = "if")]
@@ -121,7 +121,7 @@ impl AppendProcessorBody {
 
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct RemoveProcessorBody {
+pub struct RemoveProcessorBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(rename = "if")]
@@ -148,7 +148,7 @@ impl RemoveProcessorBody {
 
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct PipelineProcessorBody {
+pub struct PipelineProcessorBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(rename = "if")]
@@ -175,7 +175,7 @@ impl PipelineProcessorBody {
 
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct RenameProcessorBody {
+pub struct RenameProcessorBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(rename = "if")]
@@ -204,7 +204,7 @@ impl RenameProcessorBody {
 
 
 #[derive(Clone)]
-pub(crate) enum ProcessorBodies {
+pub enum ProcessorBodies {
     Set(SetProcessorBody),
     Remove(RemoveProcessorBody),
     Pipeline(PipelineProcessorBody),
@@ -307,7 +307,7 @@ fn apply_processor(processor: &ProcessorBodies, value: &mut Value) -> Result<(),
 
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct PipelineDefinition {
+pub struct PipelineDefinition {
     pub description: Option<String>,
     pub processors: Vec<ProcessorBodies>,
     pub on_failure: Vec<ProcessorBodies>,

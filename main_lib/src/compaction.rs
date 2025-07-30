@@ -262,7 +262,7 @@ pub async fn load_table_metadata(namespace: &String, name: &String, last_snapsho
 
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub(crate) struct CompactionResponse {
+pub struct CompactionResponse {
     pub table_name: String,
     pub lib_metadata: IcebergLibMetadata,
     pub schema: PowdrrSchema,
@@ -271,7 +271,7 @@ pub(crate) struct CompactionResponse {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub(crate) struct CompactionCommand {
+pub struct CompactionCommand {
     table: String,
     work_item: CompactionWorkItem,
     compaction_id: String,
