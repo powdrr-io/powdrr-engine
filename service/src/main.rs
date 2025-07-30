@@ -10,7 +10,7 @@ fn run_server(port: &String) -> () {
     tracing_subscriber::fmt().init();
     let addr = format!("0.0.0.0:{}", port);
     println!("Listening for requests at http://{}", addr);
-    gotham::start_with_num_threads(addr, router::router(true), 4).unwrap()
+    gotham::start_with_num_threads(addr, router::router(true), 32).unwrap()
 }
 
 

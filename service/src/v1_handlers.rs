@@ -162,7 +162,6 @@ body_handler! { create_table(input: CreateTable) -> GenericResponse {
 }}
 
 name_handler! { describe_table(name: String) -> GenericResponse {
-    tracing::info!("describe_table: {:?}", name);
     handle_result_option(API_SERVICE_CLIENT.describe_table(&name).await)
 }}
 
@@ -222,7 +221,6 @@ body_with_name_handler! { compaction_commit(name: String, input: CompactionCommi
 }}
 
 body_handler! { get_latest_checkpoint(input: GetLatestCheckpoint) -> GenericResponse {
-    tracing::info!("get_latest_checkpoint: {:?}", input);
     handle_result_option(API_SERVICE_CLIENT.get_latest_checkpoint(&input.table_name, input.extension).await)
 }}
 
