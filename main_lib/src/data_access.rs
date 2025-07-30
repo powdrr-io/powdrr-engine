@@ -182,9 +182,22 @@ enum CacheTrackerActorMessage {
         respond_to: oneshot::Sender<()>,
         top_level_name: String,
     },
-    TableCreated {
-        respond_to: oneshot::Sender<()>,
+    LoadTable {
+        respond_to: oneshot::Sender<Result<(), DataFusionError>>,
         table_name: String,
+        records: Vec<RecordBatch>,
+    },
+    CreateTable {
+        respond_to: oneshot::Sender<Result<(), DataFusionError>>,
+        table_name: String,
+        file_path: String,
+        parquet: bool,
+        schema: Option<Schema>,
+    },
+    CreateTableAs {
+        respond_to: oneshot::Sender<Result<(), DataFusionError>>,
+        table_name: String,
+        sql: String,
     },
     TableDropped {
         respond_to: oneshot::Sender<()>,
@@ -338,12 +351,15 @@ impl CacheTrackerActor {
                 }
                 let _ = respond_to.send(());
             },
-            CacheTrackerActorMessage::TableCreated { respond_to, table_name } => {
-                if !self.existing_tables.contains(&table_name) {
-                    self.existing_tables.push(table_name.clone());
-                }
-                let _ = respond_to.send(());
+            CacheTrackerActorMessage::LoadTable { respond_to, table_name, records } => {
+                let _ = respond_to.send(self.load_table(&table_name, &records).await);
             },
+            CacheTrackerActorMessage::CreateTable { respond_to, table_name, file_path, parquet, schema } => {
+                let _ = respond_to.send(self.create_table(&table_name, &file_path, parquet, schema).await);
+            },
+            CacheTrackerActorMessage::CreateTableAs { respond_to, table_name, sql } => {
+                let _ = respond_to.send(self.create_table_as(&table_name, &sql).await);
+            }
             CacheTrackerActorMessage::TableDropped { respond_to, table_name } => {
                 assert!(self.existing_tables.contains(&table_name));
                 self.existing_tables.retain(|name| name != &table_name);
@@ -352,6 +368,55 @@ impl CacheTrackerActor {
             CacheTrackerActorMessage::GetTables { respond_to } => {
                 let _ = respond_to.send(self.existing_tables.clone());
             }
+        }
+    }
+
+    async fn track_table(&mut self, table_name: &String) -> () {
+        if !self.existing_tables.contains(&table_name) {
+            self.existing_tables.push(table_name.clone());
+        }
+    }
+
+    async fn load_table(&mut self, table_name: &String, records: &Vec<RecordBatch>) -> Result< (), DataFusionError> {
+        let schema = records.get(0).unwrap().schema();
+        let table = match datafusion::datasource::MemTable::try_new(schema, vec!(records.to_vec())) {
+            Ok(t) => Arc::new(t),
+            Err(e) => return log_err(e),
+        };
+        match DATA_FUSION_CONTEXT.register_table(table_name, table) {
+            Ok(_) => {
+                self.track_table(&table_name).await;
+                Ok(())
+            },
+            Err(e) => log_err(e)
+        }
+    }
+
+    async fn create_table(&mut self, table_name: &String, file_path: &String, parquet: bool, schema: Option<Schema>) -> Result< (), DataFusionError> {
+        if parquet {
+            match load_parquet_file_as_table(&file_path, &table_name).await {
+                Err(e) => return log_err(e),
+                Ok(_) => ()
+            }
+        } else {
+            assert!(schema.is_some(), "You must provide a schema for a JSON file");
+            match load_json_file_as_table(file_path, &table_name, &schema.unwrap()).await {
+                Err(e) => return log_err(e),
+                Ok(_) => ()
+            }
+        }
+        self.track_table(&table_name).await;
+
+        Ok(())
+    }
+
+    async fn create_table_as(&mut self, table_name: &String, sql: &String) -> Result< (), DataFusionError> {
+        match private_execute_sql(&format!("CREATE TABLE {} AS {}", table_name, sql)).await {
+            Ok(_) => {
+                self.track_table(&table_name).await;
+                Ok(())
+            },
+            Err(e) => Err(e),
         }
     }
 }
@@ -402,11 +467,40 @@ impl LRUCacheHandle {
         recv.await.expect("Actor task has been killed")
     }
 
-    async fn table_created(&self, table_name: &String) -> () {
+    async fn load_table(&self, table_name: &String, records: &Vec<RecordBatch>) -> Result<(), DataFusionError> {
         let (send, recv) = oneshot::channel();
-        let msg = CacheTrackerActorMessage::TableCreated {
+        let msg = CacheTrackerActorMessage::LoadTable {
             respond_to: send,
             table_name: table_name.clone(),
+            records: records.clone(),
+        };
+
+        let _ = self.sender.send(msg).await;
+        // TODO: deal with errors
+        recv.await.expect("Actor task has been killed")
+    }
+
+    async fn create_table(&self, table_name: &String, file_path: &String, parquet: bool, schema: Option<Schema>) -> Result< (), DataFusionError> {
+        let (send, recv) = oneshot::channel();
+        let msg = CacheTrackerActorMessage::CreateTable {
+            respond_to: send,
+            table_name: table_name.clone(),
+            file_path: file_path.clone(),
+            parquet,
+            schema,
+        };
+
+        let _ = self.sender.send(msg).await;
+        // TODO: deal with errors
+        recv.await.expect("Actor task has been killed")
+    }
+
+    async fn create_table_as(&self, table_name: &String, sql: &String) -> Result< (), DataFusionError> {
+        let (send, recv) = oneshot::channel();
+        let msg = CacheTrackerActorMessage::CreateTableAs {
+            respond_to: send,
+            table_name: table_name.clone(),
+            sql: sql.clone()
         };
 
         let _ = self.sender.send(msg).await;
@@ -469,7 +563,6 @@ async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> 
         STORED AS PARQUET
         LOCATION '{file_path_var}';"#);
         loop {
-            LRU_CACHE_HANDLE.table_created(local_name_var).await;
             match DATA_FUSION_CONTEXT.sql(&query_str).await {
                 Err(_e) => {
                     let _ = DATA_FUSION_CONTEXT.sql(format!("DROP TABLE IF EXISTS {local_name_var};").as_str()).await;
@@ -489,7 +582,6 @@ async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> 
                 }
             },
             _ => {
-                LRU_CACHE_HANDLE.table_created(local_name).await;
                 Ok(())
             }
         }
@@ -512,7 +604,6 @@ async fn load_json_file_as_table(file_path_without_suffix: &String, local_name: 
             format!("{}.json", file_path_without_suffix)
         };
         tracing::info!("Loading JSON file {}", file_path);
-        LRU_CACHE_HANDLE.table_created(local_name).await;
         let reader_options = NdJsonReadOptions::default().schema(&schema);
         match DATA_FUSION_CONTEXT.register_json(local_name, file_path, reader_options).await {
             Ok(_) => Ok(()),
@@ -542,19 +633,7 @@ pub(crate) fn path_to_table_name(file_path: &String) -> String {
 }
 
 pub(crate) async fn load_file_as_table(new_local_name: &String, file_path: &String, parquet: bool, schema: Option<Schema>) -> Result<(), DataFusionError> {
-    if parquet {
-        match load_parquet_file_as_table(&file_path, &new_local_name).await {
-            Err(e) => return log_err(e),
-            Ok(_) => ()
-        }
-    } else {
-        assert!(schema.is_some(), "You must provide a schema for a JSON file");
-        match load_json_file_as_table(file_path, &new_local_name, &schema.unwrap()).await {
-            Err(e) => return log_err(e),
-            Ok(_) => ()
-        }
-    }
-    Ok(())
+    LRU_CACHE_HANDLE.create_table(new_local_name, file_path, parquet, schema).await
 }
 
 
@@ -594,27 +673,7 @@ pub(crate) async fn load_memtable_with_name(result_table_name: &String, records:
     if records.len() == 0 {
         panic!("Do not call this if you have no records");
     }
-    let schema = records.get(0).unwrap().schema();
-    let table = match datafusion::datasource::MemTable::try_new(schema, vec!(records.to_vec())) {
-        Ok(t) => Arc::new(t),
-        Err(e) => return log_err(e),
-    };
-    loop {
-        match DATA_FUSION_CONTEXT.table_exist(result_table_name) {
-            Ok(exists) => {
-                if !exists {
-                    LRU_CACHE_HANDLE.table_created(result_table_name).await;
-                    match DATA_FUSION_CONTEXT.register_table(result_table_name, table) {
-                        Ok(_) => return Ok(()),
-                        Err(e) => return log_err(e)
-                    }
-                } else {
-                    return Ok(())
-                }
-            },
-            Err(e) => return log_err(e)
-        }
-    }    
+    LRU_CACHE_HANDLE.load_table(result_table_name, records).await
 }
 
 
@@ -681,12 +740,9 @@ pub(crate) async fn execute_sql(sql: &String) -> Result<DataFrame, DataFusionErr
 
 
 pub(crate) async fn create_table(table_name: &String, sql: &String) -> Result<(), DataFusionError> {
-    LRU_CACHE_HANDLE.table_created(table_name).await;
-    match private_execute_sql(&format!("CREATE TABLE {} AS {}", table_name, sql)).await {
-        Ok(_) => Ok(()),
-        Err(e) => Err(e),
-    }
+    LRU_CACHE_HANDLE.create_table_as(table_name, sql).await
 }
+
 
 async fn private_execute_sql(sql: &String) -> Result<DataFrame, DataFusionError> {
     match DATA_FUSION_CONTEXT.sql(sql).await {
