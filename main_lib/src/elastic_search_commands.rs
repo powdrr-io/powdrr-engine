@@ -246,13 +246,19 @@ impl SqlCommand {
             true => Some("es".to_string()),
             false => None
         };
-        let checkpoint_id = API_SERVICE_CLIENT.get_latest_checkpoint(&self.table, extension).await.unwrap();
-        match checkpoint_id {
-            Some(c) => vec!(CheckpointDescriptor { table_name: self.table.clone(), checkpoint_id: c }),
-            None => vec!(),
-        }
+        let checkpoint_id = match API_SERVICE_CLIENT.get_latest_checkpoint(&self.table, extension).await {
+            Ok(c) => match c {
+                Some(c) => vec!(CheckpointDescriptor { table_name: self.table.clone(), checkpoint_id: c }),
+                None => vec!(),
+            },
+            Err(e) => {
+                let error = format!("Error getting latest checkpoint for table {}: {}", self.table, e);
+                tracing::error!("{}", error);
+                vec!()
+            }
+        };
+        checkpoint_id
     }
-
 }
 
 

@@ -215,21 +215,45 @@ async fn main() -> Result<(), std::io::Error> {
         Err(_) => panic!("What happened?")
     }
 
+    println!("Setting Modes");
+
     let client = reqwest::Client::new();
-    
+
+    let coordinator_mode = TestProcessingMode {
+        testing_mode: TestingMode::Enabled,
+        indexing_mode: IndexingMode::Disabled,
+        compaction_mode: CompactionMode::Disabled,
+        prefetch_mode: PrefetchMode::Disabled,
+    };
+
+    let _res = match client.put("http://localhost:7784/_test/v1/_testing_and_processing_mode")
+        .body(serde_json::to_string(&coordinator_mode)?)
+        .send().await {
+        Ok(res) => res,
+        Err(e) => panic!("Error: {}", e),
+    };
+
+    println!("Coordinator mode set");
+
     let main_mode = TestProcessingMode {
         testing_mode: TestingMode::Disabled,
         indexing_mode: IndexingMode::Disabled,
-        compaction_mode: CompactionMode::Async,
-        prefetch_mode: PrefetchMode::Enabled,
+        compaction_mode: CompactionMode::Disabled,
+        prefetch_mode: PrefetchMode::Disabled,
     };
     
     let _res = match client.put("http://localhost:9200/_test/v1/_testing_and_processing_mode")
         .body(serde_json::to_string(&main_mode)?)
         .send().await {
         Ok(res) => res,
-        Err(e) => panic!("Error: {}", e),
+        Err(e) => {
+            panic!("Error: {}", e)
+        },
     };
+
+    println!("Engine mode set");
+
+
 
     println!("Starting Benchmark!!!!!!!!!!!!!!!!!!!!!!!!!!");
 

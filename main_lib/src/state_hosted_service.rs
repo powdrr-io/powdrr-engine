@@ -3,7 +3,7 @@ use std::fmt::{Display, Formatter};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use async_trait::async_trait;
 use idgenerator::IdInstance;
-use reqwest::{Client, Response};
+use reqwest::{Client, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 use tokio::sync::{mpsc, oneshot};
@@ -551,8 +551,12 @@ impl ApiServiceClientActor {
     async fn handle_message(&mut self, msg: ApiServiceClientActorMessage) {
         match msg {
             ApiServiceClientActorMessage::Testing { respond_to, mode } => {
-                self.test_mode = true;
-                self.test.clear_and_set(mode).await;
+                self.test_mode = mode.testing_mode.is_enabled();
+                if self.test_mode {
+                    self.test.clear_and_set(mode).await;
+                } else {
+                    self.real.clear_and_set(mode).await;
+                }
                 let _ = respond_to.send(());
             },
             ApiServiceClientActorMessage::CreatePipeline { respond_to, name, pipeline } => {
@@ -686,11 +690,7 @@ impl ApiServiceClientActor {
                 }
             },
             ApiServiceClientActorMessage::GetPeerClients { respond_to } => {
-                if self.test_mode {
-                    let _ = respond_to.send(self.test.get_peer_clients().await);
-                } else {
-                    let _ = respond_to.send(self.real.get_peer_clients().await);
-                }
+                let _ = respond_to.send(self.test.get_peer_clients().await);
             },
             ApiServiceClientActorMessage::GetNextPrefetchCheckpoints { respond_to, extensions } => {
                 if self.test_mode {
@@ -731,13 +731,17 @@ impl RealApiServiceClient {
         }
     }
 
+    async fn clear_and_set(&mut self, _mode: TestProcessingMode) {
+    }
+
     async fn handle_response_body<T>(request_result: Result<Response, reqwest::Error>) -> Result<T, ServiceApiError>
         where T: Sized + DeserializeOwned
     {
         match request_result {
             Ok(success) => {
                 if success.status().is_success() {
-                    let json = success.json::<T>().await;
+                    let body = success.text().await.unwrap();
+                    let json = serde_json::from_str::<T>(body.as_str());
                     match json {
                         Ok(j) => Ok(j),
                         Err(e) => Err(ServiceApiError { message: format!("Request body failed to parse: {}", e) })
@@ -751,6 +755,31 @@ impl RealApiServiceClient {
             }
         }
     }
+
+    async fn handle_response_body_option<T>(request_result: Result<Response, reqwest::Error>) -> Result<Option<T>, ServiceApiError>
+    where T: Sized + DeserializeOwned
+    {
+        match request_result {
+            Ok(success) => {
+                if success.status().is_success() {
+                    let body = success.text().await.unwrap();
+                    let json = serde_json::from_str::<T>(body.as_str());
+                    match json {
+                        Ok(j) => Ok(Some(j)),
+                        Err(e) => Err(ServiceApiError { message: format!("Request body failed to parse: {}", e) })
+                    }
+                } else if success.status() == StatusCode::NOT_FOUND {
+                    Ok(None)
+                } else {
+                    Err(ServiceApiError { message: success.text().await.unwrap() })
+                }
+            },
+            Err(e) => {
+                Err(ServiceApiError::from_reqwest(e))
+            }
+        }
+    }
+
 
     async fn handle_response(request_result: Result<Response, reqwest::Error>) -> Result<(), ServiceApiError> {
         match request_result {
@@ -798,7 +827,7 @@ impl ApiServiceClient for RealApiServiceClient {
     }
 
     async fn describe_table(&mut self, name: &String) -> Result<Option<TableDescription>, ServiceApiError> {
-        Self::handle_response_body(self.client.get(format!("{}/api/v1/describe_table/{}", self.base_address, name))
+        Self::handle_response_body_option(self.client.get(format!("{}/api/v1/describe_table/{}", self.base_address, name))
             .send().await
         ).await
     }
@@ -833,7 +862,7 @@ impl ApiServiceClient for RealApiServiceClient {
     }
 
     async fn describe_table_template(&mut self, name: &String) -> Result<Option<CreateIndexTemplateBody>, ServiceApiError> {
-        Self::handle_response_body(self.client.get(format!("{}/api/v1/describe_table_template/{}", self.base_address, name))
+        Self::handle_response_body_option(self.client.get(format!("{}/api/v1/describe_table_template/{}", self.base_address, name))
             .send().await
         ).await
     }
@@ -846,7 +875,7 @@ impl ApiServiceClient for RealApiServiceClient {
     }
 
     async fn describe_pipeline(&mut self, name: &String) -> Result<Option<PipelineDefinition>, ServiceApiError> {
-        Self::handle_response_body(self.client.get(format!("{}/api/v1/describe_pipeline/{}", self.base_address, name))
+        Self::handle_response_body_option(self.client.get(format!("{}/api/v1/describe_pipeline/{}", self.base_address, name))
             .send().await
         ).await
     }
@@ -859,7 +888,7 @@ impl ApiServiceClient for RealApiServiceClient {
     }
 
     async fn describe_lifetime_policy(&mut self, name: &String) -> Result<Option<ILMPolicyDefinition>, ServiceApiError> {
-        Self::handle_response_body(self.client.get(format!("{}/api/v1/describe_lifetime_policy/{}", self.base_address, name))
+        Self::handle_response_body_option(self.client.get(format!("{}/api/v1/describe_lifetime_policy/{}", self.base_address, name))
             .send().await
         ).await
     }          
@@ -897,14 +926,14 @@ impl ApiServiceClient for RealApiServiceClient {
             table_name: table_name.to_owned(),
             extension: extensions,
         };
-        Self::handle_response_body(self.client.get(format!("{}/api/v1/get_latest_checkpoint", self.base_address))
+        Self::handle_response_body_option(self.client.get(format!("{}/api/v1/get_latest_checkpoint", self.base_address))
             .body(serde_json::to_string(&payload).unwrap())
             .send().await
         ).await
     }
 
     async fn get_checkpoint(&mut self, checkpoint: &CheckpointDescriptor) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
-        Self::handle_response_body(self.client.get(format!("{}/api/v1/get_checkpoint", self.base_address))
+        Self::handle_response_body_option(self.client.get(format!("{}/api/v1/get_checkpoint", self.base_address))
             .body(serde_json::to_string(&checkpoint).unwrap())
             .send().await
         ).await
@@ -2068,4 +2097,4 @@ impl ApiServiceClientHandle {
     }
 }
 
-pub static API_SERVICE_CLIENT: std::sync::LazyLock<ApiServiceClientHandle> = std::sync::LazyLock::new(|| ApiServiceClientHandle::new("localhost:7783".to_string()));
+pub static API_SERVICE_CLIENT: std::sync::LazyLock<ApiServiceClientHandle> = std::sync::LazyLock::new(|| ApiServiceClientHandle::new("http://localhost:7784".to_string()));

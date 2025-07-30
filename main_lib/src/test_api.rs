@@ -20,6 +20,15 @@ pub enum TestingMode {
     Disabled
 }
 
+impl TestingMode {
+    pub(crate) fn is_enabled(&self) -> bool {
+        match self {
+            TestingMode::Enabled => true,
+            _ => false
+        }
+    }
+}
+
 
 #[derive(Serialize, Deserialize, Clone)]
 pub enum IndexingMode {
@@ -60,7 +69,7 @@ pub enum PrefetchMode {
 }
 
 impl PrefetchMode {
-    fn is_disable(&self) -> bool {
+    fn is_disabled(&self) -> bool {
         match self {
             PrefetchMode::Disabled => true,
             _ => false
@@ -175,7 +184,9 @@ pub(crate) async fn do_all_available_compaction_work(start_snapshot_id: i64) -> 
 
         let compact_work = match API_SERVICE_CLIENT.get_compaction_work_items().await {
             Ok(work) => work,
-            Err(_) => panic!("oh no"),
+            Err(_e) => {
+                panic!("oh no")
+            },
         };
         if compact_work.len() > 0 {
             tracing::info!("Doing compaction work");
@@ -268,7 +279,7 @@ pub fn test_v1_set_testing_processing_mode(mut state: State) -> Pin<Box<HandlerF
         if !mode.compaction_mode.is_disabled() {
             tokio::spawn(do_compaction_work_for_forever(1000));
         }
-        if !mode.prefetch_mode.is_disable() {
+        if !mode.prefetch_mode.is_disabled() {
             tokio::spawn(do_prefetch_work_for_forever(1000));
         }
         let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "Ok");
