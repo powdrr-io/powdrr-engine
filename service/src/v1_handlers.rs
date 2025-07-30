@@ -57,6 +57,12 @@ mod tests {
     fn test_create_table() {
         let test_server = &*TEST_SERVER;
 
+        test_server.client().put(
+            "http://localhost/_test/v1/_testing_mode",
+            "",
+            mime::TEXT_PLAIN
+        ).perform().unwrap();
+
         let body = CreateTable {
             name: "the name".to_string(),
             tags: Default::default(),

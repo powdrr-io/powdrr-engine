@@ -1,6 +1,7 @@
 use gotham::pipeline::{new_pipeline, single_pipeline};
 use gotham::prelude::{DefineSingleRoute, DrawRoutes};
 use gotham::router::{build_router, Router};
+use powdrr_lib::test_api;
 use crate::v1_handlers;
 
 /// Create a `Router`
@@ -54,7 +55,7 @@ use crate::v1_handlers;
 //
 //     async fn set_prefetch_checkpoints(&mut self, checkpoints: &Vec<CheckpointDescriptor>, extension: Option<String>) -> Result<(), Box<dyn Error>>;
 ///
-pub fn router(_include_test_apis: bool) -> Router {
+pub fn router(include_test_apis: bool) -> Router {
     let (chain, pipelines) = single_pipeline(new_pipeline().build());
 
     build_router(chain, pipelines, |route| {
@@ -83,18 +84,18 @@ pub fn router(_include_test_apis: bool) -> Router {
                  */
             })
         });
-/*
+
         if include_test_apis {
             route.scope("/_test", |route| {
                 route.scope("/v1", |route| {
-                    route.post("/_create_index").to(test_v1_create_index);
-                    route.post("/_add_checkpoint").to(test_v1_add_checkpoint);
-                    route.put("/_testing_mode").to(test_v1_set_testing_mode);
-                    route.put("/_testing_and_processing_mode").to(test_v1_set_testing_processing_mode);
-                    route.put("/_process_work").to(test_v1_process_work);
+                    route.post("/_create_index").to(test_api::test_v1_create_index);
+                    route.post("/_add_checkpoint").to(test_api::test_v1_add_checkpoint);
+                    route.put("/_testing_mode").to(test_api::test_v1_set_testing_mode);
+                    route.put("/_testing_and_processing_mode").to(test_api::test_v1_set_testing_processing_mode);
+                    route.put("/_process_work").to(test_api::test_v1_process_work);
                 })
             });
         }
-       */
+
     })
 }
