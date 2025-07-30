@@ -1,18 +1,52 @@
 use std::{collections::HashMap, error::Error};
+use std::fmt::{Display, Formatter};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use async_trait::async_trait;
 use idgenerator::IdInstance;
-use reqwest::Client;
+use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot::{self, error::RecvError}};
+use serde::de::DeserializeOwned;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{distributed_cache, elastic_search_ingest::CreateIndexTemplateBody, pipeline::PipelineDefinition, state_peers::CheckpointDescriptor};
 use crate::compaction::drop_all_tables;
-use crate::elastic_search_index::create_index;
+use crate::elastic_search_index::{create_index, IndexError};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::schema_massager::PowdrrSchema;
 use crate::state_peers::{PeerClient, SelfPeer};
 use crate::test_api::{IndexingMode, PrefetchMode, TestProcessingMode};
+
+
+#[derive(Debug, Clone)]
+pub struct ServiceApiError {
+    message: String,
+}
+
+impl Error for ServiceApiError {}
+
+impl Display for ServiceApiError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+unsafe impl Send for ServiceApiError {}
+unsafe impl Sync for ServiceApiError {}
+
+
+impl ServiceApiError {
+    fn from_index_error(index_error: &IndexError) -> Self {
+        ServiceApiError {
+            message: format!("{}", index_error),
+        }
+    }
+
+    pub fn from_reqwest(error: reqwest::Error) -> Self {
+        ServiceApiError {
+            message: format!("{}", error),
+        }
+    }
+}
 
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -33,6 +67,12 @@ impl SpeedboatCommitTableInfo {
             file_schemas: self.files.iter().map(|_| 0).collect(),
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct GetLatestCheckpoint {
+    pub table_name: String,
+    pub extension: Option<String>,
 }
 
 
@@ -105,7 +145,7 @@ pub struct ExtensionCommit {
 }
 
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct CompactionCommit {
     pub removed_speedboat_files: Vec<String>,
     pub removed_delete_files: Vec<String>,
@@ -231,6 +271,12 @@ impl TableDescription {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AddAlias {
+    pub table_name: String,
+    pub alias: String,
+}
+
 
 impl FileSetPayload {
     pub fn new() -> Self {
@@ -333,49 +379,49 @@ impl FileSetPayload {
 #[async_trait]
 pub(crate) trait ApiServiceClient : Send + Sync {
     #[allow(dead_code)]
-    async fn get_all_iceberg_tables(&mut self) -> Result<Vec<String>, Box<dyn Error>>;
+    async fn get_all_iceberg_tables(&mut self) -> Result<Vec<String>, ServiceApiError>;
 
-    async fn create_table(&mut self, create_table: &CreateTable) -> Result<(), Box<dyn Error>>;
+    async fn create_table(&mut self, create_table: &CreateTable) -> Result<(), ServiceApiError>;
 
-    async fn describe_table(&mut self, name: &String) -> Result<Option<TableDescription>, Box<dyn Error>>;
+    async fn describe_table(&mut self, name: &String) -> Result<Option<TableDescription>, ServiceApiError>;
  
-    async fn add_alias(&mut self, table_name: &String, alias: &String) -> Result<(), Box<dyn Error>>;
+    async fn add_alias(&mut self, table_name: &String, alias: &String) -> Result<(), ServiceApiError>;
 
-    async fn remove_alias(&mut self, table_name: &String, alias: &String) -> Result<(), Box<dyn Error>>;
+    async fn remove_alias(&mut self, table_name: &String, alias: &String) -> Result<(), ServiceApiError>;
 
-    async fn create_table_template(&mut self, name: &String, template: &CreateIndexTemplateBody) -> Result<(), Box<dyn Error>>;
+    async fn create_table_template(&mut self, name: &String, template: &CreateIndexTemplateBody) -> Result<(), ServiceApiError>;
 
-    async fn describe_table_template(&mut self, name: &String) -> Result<Option<CreateIndexTemplateBody>, Box<dyn Error>>;
+    async fn describe_table_template(&mut self, name: &String) -> Result<Option<CreateIndexTemplateBody>, ServiceApiError>;
 
-    async fn create_pipeline(&mut self, name: &String, pipeline: &PipelineDefinition) -> Result<(), Box<dyn Error>>;
+    async fn create_pipeline(&mut self, name: &String, pipeline: &PipelineDefinition) -> Result<(), ServiceApiError>;
 
-    async fn describe_pipeline(&mut self, name: &String) -> Result<Option<PipelineDefinition>, Box<dyn Error>>;
+    async fn describe_pipeline(&mut self, name: &String) -> Result<Option<PipelineDefinition>, ServiceApiError>;
 
-    async fn create_lifetime_policy(&mut self, name: &String, policy: &ILMPolicyDefinition) -> Result<(), Box<dyn Error>>;
+    async fn create_lifetime_policy(&mut self, name: &String, policy: &ILMPolicyDefinition) -> Result<(), ServiceApiError>;
 
-    async fn describe_lifetime_policy(&mut self, name: &String) -> Result<Option<ILMPolicyDefinition>, Box<dyn Error>>;
+    async fn describe_lifetime_policy(&mut self, name: &String) -> Result<Option<ILMPolicyDefinition>, ServiceApiError>;
     
-    async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), Box<dyn Error>>;
+    async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), ServiceApiError>;
 
-    async fn iceberg_commit(&mut self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), Box<dyn Error>>;
+    async fn iceberg_commit(&mut self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError>;
 
-    async fn extension_commit(&mut self, table_name: &String, commit: &ExtensionCommit) -> Result<(), Box<dyn Error>>;
+    async fn extension_commit(&mut self, table_name: &String, commit: &ExtensionCommit) -> Result<(), ServiceApiError>;
 
-    async fn compaction_commit(&mut self, table_name: &String, commit: &CompactionCommit) -> Result<(), Box<dyn Error>>;
+    async fn compaction_commit(&mut self, table_name: &String, commit: &CompactionCommit) -> Result<(), ServiceApiError>;
 
-    async fn get_latest_checkpoint(&mut self, table_name: &String, extensions: Option<String>) -> Result<Option<String>, Box<dyn Error>>;
+    async fn get_latest_checkpoint(&mut self, table_name: &String, extensions: Option<String>) -> Result<Option<String>, ServiceApiError>;
 
-    async fn get_checkpoint(&mut self, snapshot: &CheckpointDescriptor) -> Result<TableMetadataCheckpoint, Box<dyn Error>>;
+    async fn get_checkpoint(&mut self, snapshot: &CheckpointDescriptor) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError>;
 
-    async fn get_extension_work_items(&mut self, extension_name: &String) -> Result<Vec<ExtensionWorkItem>, Box<dyn Error>>;
+    async fn get_extension_work_items(&mut self, extension_name: &String) -> Result<Vec<ExtensionWorkItem>, ServiceApiError>;
 
-    async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, Box<dyn Error>>;
+    async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError>;
 
-    async fn get_peer_clients(&mut self) -> Result<Vec<Box<dyn PeerClient>>, Box<dyn Error>>;
+    async fn get_peer_clients(&mut self) -> Vec<Box<dyn PeerClient>>;
 
-    async fn get_next_prefetch_checkpoints(&mut self, extension: Option<String>) -> Result<Vec<CheckpointDescriptor>, Box<dyn Error>>;
+    async fn get_next_prefetch_checkpoints(&mut self, extension: Option<String>) -> Result<Vec<CheckpointDescriptor>, ServiceApiError>;
 
-    async fn set_prefetch_checkpoints(&mut self, checkpoints: &Vec<CheckpointDescriptor>, extension: Option<String>) -> Result<(), Box<dyn Error>>;
+    async fn set_prefetch_checkpoints(&mut self, checkpoints: &Vec<CheckpointDescriptor>, extension: Option<String>) -> Result<(), ServiceApiError>;
 }
 
 
@@ -392,99 +438,98 @@ enum ApiServiceClientActorMessage {
         mode: TestProcessingMode,
     },
     CreatePipeline {
-        respond_to: oneshot::Sender<()>,
+        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
         name: String,
         pipeline: PipelineDefinition,
     },
     DescribePipeline {
-        respond_to: oneshot::Sender<Option<PipelineDefinition>>,
+        respond_to: oneshot::Sender<Result<Option<PipelineDefinition>, ServiceApiError>>,
         name: String,
     },
     CreateLifetimePolicy {
-        respond_to: oneshot::Sender<()>,
+        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
         name: String,
         policy: ILMPolicyDefinition,
     },
     DescribeLifetimePolicy {
-        respond_to: oneshot::Sender<Option<ILMPolicyDefinition>>,
+        respond_to: oneshot::Sender<Result<Option<ILMPolicyDefinition>, ServiceApiError>>,
         name: String,
     },
     CreateTable {
-        respond_to: oneshot::Sender<()>,
+        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
         create_table: CreateTable,
     },
     DescribeTable {
-        respond_to: oneshot::Sender<Option<TableDescription>>,
+        respond_to: oneshot::Sender<Result<Option<TableDescription>, ServiceApiError>>,
         name: String,
     },
     AddAlias {
-        respond_to: oneshot::Sender<()>,
+        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
         table_name: String,
         alias: String,
     },
     RemoveAlias {
-        respond_to: oneshot::Sender<()>,
+        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
         table_name: String,
         alias: String,
     },         
     CreateTableTemplate {
-        respond_to: oneshot::Sender<()>,
+        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
         name: String,
         template: CreateIndexTemplateBody,
     },
     DescribeTableTemplate {
-        respond_to: oneshot::Sender<Option<CreateIndexTemplateBody>>,
+        respond_to: oneshot::Sender<Result<Option<CreateIndexTemplateBody>, ServiceApiError>>,
         name: String,
     },    
     AddCheckpoint {
         respond_to: oneshot::Sender<()>,
         checkpoint: TableMetadataCheckpoint,
     },
-    #[allow(dead_code)]
     IcebergCommit {
-        respond_to: oneshot::Sender<()>,
+        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
         table_name: String,
         iceberg_commit: IcebergCommit,
     },
     SpeedboatCommit {
-        respond_to: oneshot::Sender<()>,
+        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
         speedboat_commit: SpeedboatCommit,
     },
     ExtensionCommit {
-        respond_to: oneshot::Sender<()>,
+        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
         table_name: String,
         extension_commit: ExtensionCommit,        
     },
     CompactionCommit {
-        respond_to: oneshot::Sender<()>,
+        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
         table_name: String,
         compaction_commit: CompactionCommit,        
     },    
     GetLatestCheckpoint {
-        respond_to: oneshot::Sender<Option<String>>,
+        respond_to: oneshot::Sender<Result<Option<String>, ServiceApiError>>,
         table_name: String,
         extensions: Option<String>,
     },
     GetCheckpoint {
-        respond_to: oneshot::Sender<TableMetadataCheckpoint>,
-        snapshot: CheckpointDescriptor,
+        respond_to: oneshot::Sender<Result<Option<TableMetadataCheckpoint>, ServiceApiError>>,
+        checkpoint: CheckpointDescriptor,
     },
     GetExtensionWorkItems {
-        respond_to: oneshot::Sender<Vec<ExtensionWorkItem>>,
+        respond_to: oneshot::Sender<Result<Vec<ExtensionWorkItem>, ServiceApiError>>,
         extension_type: String,
     },
     GetCompactionWorkItems {
-        respond_to: oneshot::Sender<Vec<(String, CompactionWorkItem)>>,
+        respond_to: oneshot::Sender<Result<Vec<(String, CompactionWorkItem)>, ServiceApiError>>,
     },
     GetPeerClients {
         respond_to: oneshot::Sender<Vec<Box<dyn PeerClient>>>,
     },
     GetNextPrefetchCheckpoints {
-        respond_to: oneshot::Sender<Vec<CheckpointDescriptor>>,
+        respond_to: oneshot::Sender<Result<Vec<CheckpointDescriptor>, ServiceApiError>>,
         extensions: Option<String>,
     },
     SetPrefetchCheckpoints {
-        respond_to: oneshot::Sender<()>,
+        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
         checkpoints: Vec<CheckpointDescriptor>,
         extensions: Option<String>,
     },
@@ -512,72 +557,72 @@ impl ApiServiceClientActor {
             },
             ApiServiceClientActorMessage::CreatePipeline { respond_to, name, pipeline } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.create_pipeline(&name, &pipeline).await.expect("nope"));
+                    let _ = respond_to.send(self.test.create_pipeline(&name, &pipeline).await);
                 } else {
-                    let _ = respond_to.send(self.real.create_pipeline(&name, &pipeline).await.expect("nope"));
+                    let _ = respond_to.send(self.real.create_pipeline(&name, &pipeline).await);
                 }                
             }, 
             ApiServiceClientActorMessage::DescribePipeline { respond_to, name } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.describe_pipeline(&name).await.expect("nope"));
+                    let _ = respond_to.send(self.test.describe_pipeline(&name).await);
                 } else {
-                    let _ = respond_to.send(self.real.describe_pipeline(&name).await.expect("nope"));
+                    let _ = respond_to.send(self.real.describe_pipeline(&name).await);
                 }                
             },
             ApiServiceClientActorMessage::CreateLifetimePolicy { respond_to, name, policy } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.create_lifetime_policy(&name, &policy).await.expect("nope"));
+                    let _ = respond_to.send(self.test.create_lifetime_policy(&name, &policy).await);
                 } else {
-                    let _ = respond_to.send(self.real.create_lifetime_policy(&name, &policy).await.expect("nope"));
+                    let _ = respond_to.send(self.real.create_lifetime_policy(&name, &policy).await);
                 }
             },
             ApiServiceClientActorMessage::DescribeLifetimePolicy { respond_to, name } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.describe_lifetime_policy(&name).await.expect("nope"));
+                    let _ = respond_to.send(self.test.describe_lifetime_policy(&name).await);
                 } else {
-                    let _ = respond_to.send(self.real.describe_lifetime_policy(&name).await.expect("nope"));
+                    let _ = respond_to.send(self.real.describe_lifetime_policy(&name).await);
                 }
             },
             ApiServiceClientActorMessage::CreateTable { respond_to, create_table } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.create_table(&create_table).await.expect("nope"));
+                    let _ = respond_to.send(self.test.create_table(&create_table).await);
                 } else {
-                    let _ = respond_to.send(self.real.create_table(&create_table).await.expect("nope"));
+                    let _ = respond_to.send(self.real.create_table(&create_table).await);
                 }                
             },
             ApiServiceClientActorMessage::DescribeTable { respond_to, name } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.describe_table(&name).await.expect("nope"));
+                    let _ = respond_to.send(self.test.describe_table(&name).await);
                 } else {
-                    let _ = respond_to.send(self.real.describe_table(&name).await.expect("nope"));
+                    let _ = respond_to.send(self.real.describe_table(&name).await);
                 }                
             },
             ApiServiceClientActorMessage::AddAlias { respond_to, table_name, alias } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.add_alias(&table_name, &alias).await.expect("nope"));
+                    let _ = respond_to.send(self.test.add_alias(&table_name, &alias).await);
                 } else {
-                    let _ = respond_to.send(self.real.add_alias(&table_name, &alias).await.expect("nope"));
+                    let _ = respond_to.send(self.real.add_alias(&table_name, &alias).await);
                 }  
             },
             ApiServiceClientActorMessage::RemoveAlias { respond_to, table_name, alias } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.remove_alias(&table_name, &alias).await.expect("nope"));
+                    let _ = respond_to.send(self.test.remove_alias(&table_name, &alias).await);
                 } else {
-                    let _ = respond_to.send(self.real.remove_alias(&table_name, &alias).await.expect("nope"));
+                    let _ = respond_to.send(self.real.remove_alias(&table_name, &alias).await);
                 }  
             },            
             ApiServiceClientActorMessage::CreateTableTemplate { respond_to, name, template } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.create_table_template(&name, &template).await.expect("nope"));
+                    let _ = respond_to.send(self.test.create_table_template(&name, &template).await);
                 } else {
-                    let _ = respond_to.send(self.real.create_table_template(&name, &template).await.expect("nope"));
+                    let _ = respond_to.send(self.real.create_table_template(&name, &template).await);
                 }                
             },
             ApiServiceClientActorMessage::DescribeTableTemplate { respond_to, name } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.describe_table_template(&name).await.expect("nope"));
+                    let _ = respond_to.send(self.test.describe_table_template(&name).await);
                 } else {
-                    let _ = respond_to.send(self.real.describe_table_template(&name).await.expect("nope"));
+                    let _ = respond_to.send(self.real.describe_table_template(&name).await);
                 }                
             },                       
             ApiServiceClientActorMessage::AddCheckpoint { checkpoint, respond_to } => {
@@ -586,79 +631,79 @@ impl ApiServiceClientActor {
             },
             ApiServiceClientActorMessage::IcebergCommit { respond_to, table_name, iceberg_commit } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.iceberg_commit(&table_name, &iceberg_commit).await.expect("nope"));
+                    let _ = respond_to.send(self.test.iceberg_commit(&table_name, &iceberg_commit).await);
                 } else {
-                    let _ = respond_to.send(self.real.iceberg_commit(&table_name, &iceberg_commit).await.expect("nope"));
+                    let _ = respond_to.send(self.real.iceberg_commit(&table_name, &iceberg_commit).await);
                 }                
             },            
             ApiServiceClientActorMessage::SpeedboatCommit { respond_to, speedboat_commit } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.speedboat_commit(&speedboat_commit).await.expect("nope"));
+                    let _ = respond_to.send(self.test.speedboat_commit(&speedboat_commit).await);
                 } else {
-                    let _ = respond_to.send(self.real.speedboat_commit(&speedboat_commit).await.expect("nope"));
+                    let _ = respond_to.send(self.real.speedboat_commit(&speedboat_commit).await);
                 }                
             },
             ApiServiceClientActorMessage::ExtensionCommit { respond_to, table_name, extension_commit } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.extension_commit(&table_name, &extension_commit).await.expect("nope"));
+                    let _ = respond_to.send(self.test.extension_commit(&table_name, &extension_commit).await);
                 } else {
-                    let _ = respond_to.send(self.real.extension_commit(&table_name, &extension_commit).await.expect("nope"));
+                    let _ = respond_to.send(self.real.extension_commit(&table_name, &extension_commit).await);
                 }                
             }, 
             ApiServiceClientActorMessage::CompactionCommit { respond_to, table_name, compaction_commit } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.compaction_commit(&table_name, &compaction_commit).await.expect("nope"));
+                    let _ = respond_to.send(self.test.compaction_commit(&table_name, &compaction_commit).await);
                 } else {
-                    let _ = respond_to.send(self.real.compaction_commit(&table_name, &compaction_commit).await.expect("nope"));
+                    let _ = respond_to.send(self.real.compaction_commit(&table_name, &compaction_commit).await);
                 }                
             },                        
             ApiServiceClientActorMessage::GetLatestCheckpoint { table_name, extensions, respond_to } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.get_latest_checkpoint(&table_name, extensions).await.expect("nope"));
+                    let _ = respond_to.send(self.test.get_latest_checkpoint(&table_name, extensions).await);
                 } else {
-                    let _ = respond_to.send(self.real.get_latest_checkpoint(&table_name, extensions).await.expect("nope"));
+                    let _ = respond_to.send(self.real.get_latest_checkpoint(&table_name, extensions).await);
                 }                 
             },
-            ApiServiceClientActorMessage::GetCheckpoint { snapshot, respond_to } => {
+            ApiServiceClientActorMessage::GetCheckpoint { checkpoint, respond_to } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.get_checkpoint(&snapshot).await.expect("nope"));
+                    let _ = respond_to.send(self.test.get_checkpoint(&checkpoint).await);
                 } else {
-                    let _ = respond_to.send(self.real.get_checkpoint(&snapshot).await.expect("nope"));
+                    let _ = respond_to.send(self.real.get_checkpoint(&checkpoint).await);
                 }
             },
             ApiServiceClientActorMessage::GetExtensionWorkItems { extension_type, respond_to } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.get_extension_work_items(&extension_type).await.expect("nope"));
+                    let _ = respond_to.send(self.test.get_extension_work_items(&extension_type).await);
                 } else {
-                    let _ = respond_to.send(self.real.get_extension_work_items(&extension_type).await.expect("nope"));
+                    let _ = respond_to.send(self.real.get_extension_work_items(&extension_type).await);
                 }
             },
             ApiServiceClientActorMessage::GetCompactionWorkItems { respond_to } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.get_compaction_work_items().await.expect("nope"));
+                    let _ = respond_to.send(self.test.get_compaction_work_items().await);
                 } else {
-                    let _ = respond_to.send(self.real.get_compaction_work_items().await.expect("nope"));
+                    let _ = respond_to.send(self.real.get_compaction_work_items().await);
                 }
             },
             ApiServiceClientActorMessage::GetPeerClients { respond_to } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.get_peer_clients().await.expect("nope"));
+                    let _ = respond_to.send(self.test.get_peer_clients().await);
                 } else {
-                    let _ = respond_to.send(self.real.get_peer_clients().await.expect("nope"));
+                    let _ = respond_to.send(self.real.get_peer_clients().await);
                 }
             },
             ApiServiceClientActorMessage::GetNextPrefetchCheckpoints { respond_to, extensions } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.get_next_prefetch_checkpoints(extensions).await.expect("nope"));
+                    let _ = respond_to.send(self.test.get_next_prefetch_checkpoints(extensions).await);
                 } else {
-                    let _ = respond_to.send(self.real.get_next_prefetch_checkpoints(extensions).await.expect("nope"));
+                    let _ = respond_to.send(self.real.get_next_prefetch_checkpoints(extensions).await);
                 }
             },
             ApiServiceClientActorMessage::SetPrefetchCheckpoints { respond_to, checkpoints, extensions } => {
                 if self.test_mode {
-                    let _ = respond_to.send(self.test.set_prefetch_checkpoints(&checkpoints, extensions).await.expect("nope"));
+                    let _ = respond_to.send(self.test.set_prefetch_checkpoints(&checkpoints, extensions).await);
                 } else {
-                    let _ = respond_to.send(self.real.set_prefetch_checkpoints(&checkpoints, extensions).await.expect("nope"));
+                    let _ = respond_to.send(self.real.set_prefetch_checkpoints(&checkpoints, extensions).await);
                 }
             },
         }
@@ -685,6 +730,42 @@ impl RealApiServiceClient {
             client: reqwest::Client::new(),
         }
     }
+
+    async fn handle_response_body<T>(request_result: Result<Response, reqwest::Error>) -> Result<T, ServiceApiError>
+        where T: Sized + DeserializeOwned
+    {
+        match request_result {
+            Ok(success) => {
+                if success.status().is_success() {
+                    let json = success.json::<T>().await;
+                    match json {
+                        Ok(j) => Ok(j),
+                        Err(e) => Err(ServiceApiError { message: format!("Request body failed to parse: {}", e) })
+                    }
+                } else {
+                    Err(ServiceApiError { message: success.text().await.unwrap() })
+                }
+            },
+            Err(e) => {
+                Err(ServiceApiError::from_reqwest(e))
+            }
+        }
+    }
+
+    async fn handle_response(request_result: Result<Response, reqwest::Error>) -> Result<(), ServiceApiError> {
+        match request_result {
+            Ok(success) => {
+                if success.status().is_success() {
+                    Ok(())
+                } else {
+                    Err(ServiceApiError { message: success.text().await.unwrap() })
+                }
+            },
+            Err(e) => {
+                Err(ServiceApiError::from_reqwest(e))
+            }
+        }
+    }
 }
 
 unsafe impl Send for RealApiServiceClient {}
@@ -692,7 +773,7 @@ unsafe impl Sync for RealApiServiceClient {}
 
 #[async_trait]
 impl ApiServiceClient for RealApiServiceClient {
-    async fn get_all_iceberg_tables(&mut self) -> Result<Vec<String>, Box<dyn Error>> {
+    async fn get_all_iceberg_tables(&mut self) -> Result<Vec<String>, ServiceApiError> {
         let base_address = &self.base_address;
         let resp = self.client.get(format!("{base_address}/api/v1/iceberg_tables")).send().await;
         match resp {
@@ -700,196 +781,162 @@ impl ApiServiceClient for RealApiServiceClient {
                 let json = r.json::<Vec<String>>().await;
                 match json {
                     Ok(j) => Ok(j),
-                    Err(e) => Err(Box::new(e)),
+                    Err(e) => Err(ServiceApiError::from_reqwest(e)),
                 }
             },
             Err(e) => {
-                Err(Box::new(e))
+                Err(ServiceApiError::from_reqwest(e))
             }
         }  
     }
 
-    async fn create_pipeline(&mut self, _name: &String, _pipeline: &PipelineDefinition) -> Result<(), Box<dyn Error>> {
-        todo!()
+    async fn create_table(&mut self, create_table: &CreateTable) -> Result<(), ServiceApiError> {
+        Self::handle_response(self.client.post(format!("{}/api/v1/create_table", self.base_address))
+            .body(serde_json::to_string(create_table).unwrap())
+            .send().await
+        ).await
     }
 
-    async fn describe_pipeline(&mut self, _name: &String) -> Result<Option<PipelineDefinition>, Box<dyn Error>> {
-        todo!()
+    async fn describe_table(&mut self, name: &String) -> Result<Option<TableDescription>, ServiceApiError> {
+        Self::handle_response_body(self.client.get(format!("{}/api/v1/describe_table/{}", self.base_address, name))
+            .send().await
+        ).await
     }
 
-    async fn create_lifetime_policy(&mut self, _name: &String, _pipeline: &ILMPolicyDefinition) -> Result<(), Box<dyn Error>> {
-        todo!()
+    async fn add_alias(&mut self, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
+        let payload = AddAlias {
+            table_name: table_name.to_owned(),
+            alias: alias.to_owned(),
+        };
+        Self::handle_response(self.client.post(format!("{}/api/v1/add_alias", self.base_address))
+            .body(serde_json::to_string(&payload).unwrap())
+            .send().await
+        ).await
     }
 
-    async fn describe_lifetime_policy(&mut self, _name: &String) -> Result<Option<ILMPolicyDefinition>, Box<dyn Error>> {
-        todo!()
-    }    
-
-    async fn add_alias(&mut self, _table_name: &String, _alias: &String) -> Result<(), Box<dyn Error>> {
-        todo!()
+    async fn remove_alias(&mut self, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
+        let payload = AddAlias {
+            table_name: table_name.to_owned(),
+            alias: alias.to_owned(),
+        };
+        Self::handle_response(self.client.post(format!("{}/api/v1/remove_alias", self.base_address))
+            .body(serde_json::to_string(&payload).unwrap())
+            .send().await
+        ).await
     }
 
-    async fn remove_alias(&mut self, _table_name: &String, _alias: &String) -> Result<(), Box<dyn Error>> {
-        todo!()
+    async fn create_table_template(&mut self, name: &String, template: &CreateIndexTemplateBody) -> Result<(), ServiceApiError> {
+        Self::handle_response(self.client.post(format!("{}/api/v1/create_table_template/{}", self.base_address, name))
+            .body(serde_json::to_string(&template).unwrap())
+            .send().await
+        ).await
     }
 
-    async fn create_table(&mut self, _create_table: &CreateTable) -> Result<(), Box<dyn Error>> {
-        todo!()
+    async fn describe_table_template(&mut self, name: &String) -> Result<Option<CreateIndexTemplateBody>, ServiceApiError> {
+        Self::handle_response_body(self.client.get(format!("{}/api/v1/describe_table_template/{}", self.base_address, name))
+            .send().await
+        ).await
     }
 
-    async fn describe_table(&mut self, _name: &String) -> Result<Option<TableDescription>, Box<dyn Error>> {
-        todo!()
-    }  
-
-    async fn create_table_template(&mut self, _name: &String, _template: &CreateIndexTemplateBody) -> Result<(), Box<dyn Error>> {
-        todo!()
+    async fn create_pipeline(&mut self, name: &String, pipeline: &PipelineDefinition) -> Result<(), ServiceApiError> {
+        Self::handle_response(self.client.post(format!("{}/api/v1/create_pipeline/{}", self.base_address, name))
+            .body(serde_json::to_string(&pipeline).unwrap())
+            .send().await
+        ).await
     }
 
-    async fn describe_table_template(&mut self, _name: &String) -> Result<Option<CreateIndexTemplateBody>, Box<dyn Error>> {
-        todo!()
+    async fn describe_pipeline(&mut self, name: &String) -> Result<Option<PipelineDefinition>, ServiceApiError> {
+        Self::handle_response_body(self.client.get(format!("{}/api/v1/describe_pipeline/{}", self.base_address, name))
+            .send().await
+        ).await
+    }
+
+    async fn create_lifetime_policy(&mut self, name: &String, pipeline: &ILMPolicyDefinition) -> Result<(), ServiceApiError> {
+        Self::handle_response(self.client.post(format!("{}/api/v1/create_lifetime_policy/{}", self.base_address, name))
+            .body(serde_json::to_string(&pipeline).unwrap())
+            .send().await
+        ).await
+    }
+
+    async fn describe_lifetime_policy(&mut self, name: &String) -> Result<Option<ILMPolicyDefinition>, ServiceApiError> {
+        Self::handle_response_body(self.client.get(format!("{}/api/v1/describe_lifetime_policy/{}", self.base_address, name))
+            .send().await
+        ).await
     }          
 
-    async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), Box<dyn Error>> {
-        let base_address = &self.base_address;
-        let body = serde_json::to_string(commit);
-        match body {
-            Ok(b) => {
-                let resp = self.client.post(format!("{base_address}/api/v1/speedboat_commit"))
-                    .header("Content-Type", "application/json")
-                    .body(b)
-                    .send().await;
-                match resp {
-                    Ok(_r) => Ok(()),
-                    Err(e) => Err(Box::new(e)),
-                }
-            },
-            Err(_e) => {
-                panic!("Unable to serialize SpeedboatCommit to json")
-            }
-        }
+    async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), ServiceApiError> {
+        Self::handle_response(self.client.post(format!("{}/api/v1/speedboat_commit", self.base_address))
+            .body(serde_json::to_string(&commit).unwrap())
+            .send().await
+        ).await
     }
 
-    async fn iceberg_commit(&mut self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), Box<dyn Error>> {
-        let base_address = &self.base_address;
-        let body = serde_json::to_string(iceberg_commit);
-        match body {
-            Ok(b) => {
-                let resp = self.client.post(format!("{base_address}/api/v1/iceberg_commit/{table_name}"))
-                    .header("Content-Type", "application/json")
-                    .body(b)
-                    .send().await;
-                match resp {
-                    Ok(_r) => Ok(()),
-                    Err(e) => Err(Box::new(e)),
-                }
-            },
-            Err(_e) => {
-                panic!("Unable to serialize IcebergMetadata to json")
-            }
-        }   
+    async fn iceberg_commit(&mut self, name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError> {
+        Self::handle_response(self.client.post(format!("{}/api/v1/iceberg_commit/{}", self.base_address, name))
+            .body(serde_json::to_string(&iceberg_commit).unwrap())
+            .send().await
+        ).await
     }
 
-    async fn extension_commit(&mut self, table_name: &String, commit: &ExtensionCommit) -> Result<(), Box<dyn Error>> {
-        let base_address = &self.base_address;
-        let body = serde_json::to_string(commit);
-        match body {
-            Ok(b) => {
-                let resp = self.client.post(format!("{base_address}/api/v1/extension_commit/{table_name}"))
-                    .header("Content-Type", "application/json")
-                    .body(b)
-                    .send().await;
-                match resp {
-                    Ok(_r) => Ok(()),
-                    Err(e) => Err(Box::new(e)),
-                }
-            },
-            Err(_e) => {
-                panic!("Unable to serialize ExtensionCommit to json")
-            }
-        }       
+    async fn extension_commit(&mut self, name: &String, commit: &ExtensionCommit) -> Result<(), ServiceApiError> {
+        Self::handle_response(self.client.post(format!("{}/api/v1/extension_commit/{}", self.base_address, name))
+            .body(serde_json::to_string(&commit).unwrap())
+            .send().await
+        ).await
     }
 
-    async fn compaction_commit(&mut self, table_name: &String, commit: &CompactionCommit) -> Result<(), Box<dyn Error>> {
-        let base_address = &self.base_address;
-        let body = serde_json::to_string(commit);
-        match body {
-            Ok(b) => {
-                let resp = self.client.post(format!("{base_address}/api/v1/compaction_commit/{table_name}"))
-                    .header("Content-Type", "application/json")
-                    .body(b)
-                    .send().await;
-                match resp {
-                    Ok(_r) => Ok(()),
-                    Err(e) => Err(Box::new(e)),
-                }
-            },
-            Err(_e) => {
-                panic!("Unable to serialize CompactionCommit to json")
-            }
-        }          
+    async fn compaction_commit(&mut self, name: &String, commit: &CompactionCommit) -> Result<(), ServiceApiError> {
+        Self::handle_response(self.client.post(format!("{}/api/v1/compaction_commit/{}", self.base_address, name))
+            .body(serde_json::to_string(&commit).unwrap())
+            .send().await
+        ).await
     }
 
-    async fn get_latest_checkpoint(&mut self, table_name: &String, extensions: Option<String>) -> Result<Option<String>, Box<dyn Error>> {
-        let base_address = &self.base_address;        
-        let url = match extensions {
-            Some(e) => format!("{base_address}/api/v1/get_latest/{table_name}/{e}"),
-            None => format!("{base_address}/api/v1/get_latest/{table_name}"),
+    async fn get_latest_checkpoint(&mut self, table_name: &String, extensions: Option<String>) -> Result<Option<String>, ServiceApiError> {
+        let payload = GetLatestCheckpoint {
+            table_name: table_name.to_owned(),
+            extension: extensions,
         };
-        let resp = self.client.get(url).send().await;
-        match resp {
-            Ok(r) => {
-                let text = r.text().await;
-                match text {
-                    Ok(t) => match t.len() {
-                        0 => Ok(None),
-                        _ => Ok(Some(t)),
-                    },
-                    Err(e) => Err(Box::new(e))
-                }
-            },
-            Err(e) => Err(Box::new(e))
-        }                     
+        Self::handle_response_body(self.client.get(format!("{}/api/v1/get_latest_checkpoint", self.base_address))
+            .body(serde_json::to_string(&payload).unwrap())
+            .send().await
+        ).await
     }
 
-    async fn get_checkpoint(&mut self, snapshot: &CheckpointDescriptor) -> Result<TableMetadataCheckpoint, Box<dyn Error>> {
-        let base_address = &self.base_address;     
-        let url = format!("{base_address}/api/v1/get_checkpoint/{}/{}", snapshot.table_name, snapshot.checkpoint_id);
-        let resp = self.client.get(url).send().await;
-        match resp {
-            Ok(r) => {
-                let json = r.json::<TableMetadataCheckpoint>().await;
-                match json {
-                    Ok(j) => Ok(j),
-                    Err(e) => Err(Box::new(e))
-                }
-            },
-            Err(e) => Err(Box::new(e))
-        }        
+    async fn get_checkpoint(&mut self, checkpoint: &CheckpointDescriptor) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
+        Self::handle_response_body(self.client.get(format!("{}/api/v1/get_checkpoint", self.base_address))
+            .body(serde_json::to_string(&checkpoint).unwrap())
+            .send().await
+        ).await
     }
 
-    async fn get_extension_work_items(&mut self, _extension_name: &String) -> Result<Vec<ExtensionWorkItem>, Box<dyn Error>> {
+    async fn get_extension_work_items(&mut self, extension_name: &String) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {
+        Self::handle_response_body(self.client.get(format!("{}/api/v1/get_extension_work_items/{}", self.base_address, extension_name))
+            .send().await
+        ).await
+    }
+
+    async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
+        Self::handle_response_body(self.client.get(format!("{}/api/v1/get_compaction_work_items", self.base_address))
+            .send().await
+        ).await
+    }
+
+    async fn get_peer_clients(&mut self) -> Vec<Box<dyn PeerClient>> {
         todo!("nope")
     }
 
-    async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, Box<dyn Error>> {
-        todo!("nope")
-    }
-
-    async fn get_peer_clients(&mut self) -> Result<Vec<Box<dyn PeerClient>>, Box<dyn Error>> {
-        todo!("nope")
-    }
-
-    async fn get_next_prefetch_checkpoints(&mut self, _extension: Option<String>) -> Result<Vec<CheckpointDescriptor>, Box<dyn Error>> {
+    async fn get_next_prefetch_checkpoints(&mut self, _extension: Option<String>) -> Result<Vec<CheckpointDescriptor>, ServiceApiError> {
         todo!()
     }
 
-    async fn set_prefetch_checkpoints(&mut self, _checkpoints: &Vec<CheckpointDescriptor>, _extension: Option<String>) -> Result<(), Box<dyn Error>> {
+    async fn set_prefetch_checkpoints(&mut self, _checkpoints: &Vec<CheckpointDescriptor>, _extension: Option<String>) -> Result<(), ServiceApiError> {
         todo!()
     }
 }
 
 
-#[derive(Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ExtensionWorkItem {
     pub extension_type: String,
     pub table_name: String,
@@ -1184,7 +1231,7 @@ impl TestApiServiceClient {
         self.latest_fetched_checkpoint_id.insert(key.clone(), checkpoint_id.clone());
     }
 
-    async fn speedboat_commit_type_commit(&mut self, table_info: &SpeedboatCommitTableInfo, compactions: &Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    async fn speedboat_commit_type_commit(&mut self, table_info: &SpeedboatCommitTableInfo, compactions: &Vec<String>) -> Result<(), ServiceApiError> {
         let latest_checkpoint = match self.get_latest_committed_checkpoint_sync(&table_info.table_name, None) {
             Some(checkpoint_id) => {
                 let key = format!("{}_{}", &table_info.table_name, checkpoint_id);
@@ -1290,7 +1337,7 @@ impl TestApiServiceClient {
         Ok(())
     }    
 
-    async fn speedboat_commit_type_delete(&mut self, table_info: &SpeedboatCommitTableInfo, compactions: &Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    async fn speedboat_commit_type_delete(&mut self, table_info: &SpeedboatCommitTableInfo, compactions: &Vec<String>) -> Result<(), ServiceApiError> {
         let latest_checkpoint = match self.get_latest_committed_checkpoint_sync(&table_info.table_name, None) {
             Some(checkpoint_id) => {
                 let key = format!("{}_{}", &table_info.table_name, checkpoint_id);
@@ -1354,14 +1401,14 @@ impl TestApiServiceClient {
         Ok(())
     }    
 
-    async fn create_index(&mut self) -> Result<(), Box<dyn Error>> {
+    async fn create_index(&mut self) -> Result<(), ServiceApiError> {
         let work_items = self.get_extension_work_items(&"es".to_string()).await?;
         for work_item in work_items {
             match create_index(&work_item).await {
                 Ok(_) => (),
                 Err(e) => {
                     tracing::error!("Failed to create index for table {}: {}", work_item.table_name, e);
-                    return Err(Box::new(e));
+                    return Err(ServiceApiError::from_index_error(&e));
                 }
             }
         }
@@ -1398,11 +1445,11 @@ unsafe impl Send for TestApiServiceClient {}
 
 #[async_trait]
 impl ApiServiceClient for TestApiServiceClient {
-    async fn get_all_iceberg_tables(&mut self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    async fn get_all_iceberg_tables(&mut self) -> Result<Vec<String>, ServiceApiError> {
         todo!()
     }
 
-    async fn create_table(&mut self, create_table: &CreateTable) -> Result<(), Box<dyn Error>> {
+    async fn create_table(&mut self, create_table: &CreateTable) -> Result<(), ServiceApiError> {
         match distributed_cache::create_table(&create_table.name) {
             Ok(_) => (),
             Err(e) => panic!("Unable to create table = {}", e),
@@ -1419,7 +1466,7 @@ impl ApiServiceClient for TestApiServiceClient {
         Ok(())
     }
 
-    async fn describe_table(&mut self, name: &String) -> Result<Option<TableDescription>, Box<dyn Error>> {
+    async fn describe_table(&mut self, name: &String) -> Result<Option<TableDescription>, ServiceApiError> {
         let final_name = self.table_aliases.get(name).unwrap_or_else(|| name);
         match self.tables.get(final_name) {
             Some(d) => Ok(Some(d.clone())),
@@ -1427,19 +1474,19 @@ impl ApiServiceClient for TestApiServiceClient {
         }
     }
 
-    async fn add_alias(&mut self, table_name: &String, alias: &String) -> Result<(), Box<dyn Error>> {
+    async fn add_alias(&mut self, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
         // TODO: check if something exists
         self.table_aliases.insert(alias.clone(), table_name.clone());
         Ok(())
     }
 
-    async fn remove_alias(&mut self, _table_name: &String, alias: &String) -> Result<(), Box<dyn Error>> {
+    async fn remove_alias(&mut self, _table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
         // TODO: check if something exists
         self.table_aliases.remove(alias);
         Ok(())
     }
 
-    async fn create_table_template(&mut self, name: &String, template: &CreateIndexTemplateBody) -> Result<(), Box<dyn Error>> {
+    async fn create_table_template(&mut self, name: &String, template: &CreateIndexTemplateBody) -> Result<(), ServiceApiError> {
         match self.table_templates.get(name) {
             Some(_) => {
                 self.table_templates.remove(name);
@@ -1453,14 +1500,14 @@ impl ApiServiceClient for TestApiServiceClient {
         }
     }
 
-    async fn describe_table_template(&mut self, name: &String) -> Result<Option<CreateIndexTemplateBody>, Box<dyn Error>> {
+    async fn describe_table_template(&mut self, name: &String) -> Result<Option<CreateIndexTemplateBody>, ServiceApiError> {
         match self.table_templates.get(name) {
             Some(d) => Ok(Some(d.clone())),
             None => Ok(None)
         }
     }
 
-    async fn create_pipeline(&mut self, name: &String, pipeline: &PipelineDefinition) -> Result<(), Box<dyn std::error::Error>> {
+    async fn create_pipeline(&mut self, name: &String, pipeline: &PipelineDefinition) -> Result<(), ServiceApiError> {
         match self.pipelines.get(name) {
             Some(_) => panic!("Need to do a real error path now"),
             None => {
@@ -1470,14 +1517,14 @@ impl ApiServiceClient for TestApiServiceClient {
         }
     }
 
-    async fn describe_pipeline(&mut self, name: &String) -> Result<Option<PipelineDefinition>, Box<dyn std::error::Error>> {
+    async fn describe_pipeline(&mut self, name: &String) -> Result<Option<PipelineDefinition>, ServiceApiError> {
         match self.pipelines.get(name) {
             Some(p) => Ok(Some(p.clone())),
             None => Ok(None)
         }
     }
 
-    async fn create_lifetime_policy(&mut self, name: &String, policy: &ILMPolicyDefinition) -> Result<(), Box<dyn Error>> {
+    async fn create_lifetime_policy(&mut self, name: &String, policy: &ILMPolicyDefinition) -> Result<(), ServiceApiError> {
         match self.lifetime_policies.get(name) {
             Some(_) => panic!("Need to do a real error path now"),
             None => {
@@ -1487,7 +1534,7 @@ impl ApiServiceClient for TestApiServiceClient {
         }
     }
 
-    async fn describe_lifetime_policy(&mut self, name: &String) -> Result<Option<ILMPolicyDefinition>, Box<dyn Error>> {
+    async fn describe_lifetime_policy(&mut self, name: &String) -> Result<Option<ILMPolicyDefinition>, ServiceApiError> {
         match self.lifetime_policies.get(name) {
             Some(p) => Ok(Some(p.clone())),
             None => Ok(None)
@@ -1495,7 +1542,7 @@ impl ApiServiceClient for TestApiServiceClient {
     }
 
 
-    async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), Box<dyn std::error::Error>> {
+    async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), ServiceApiError> {
         for table_info in commit.type_files.iter() {
             if table_info.commit_type == "commit" || table_info.commit_type == "compact" {
                 self.speedboat_commit_type_commit(table_info, &commit.compactions).await?;
@@ -1508,7 +1555,7 @@ impl ApiServiceClient for TestApiServiceClient {
         Ok(())
     }
 
-    async fn iceberg_commit(&mut self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), Box<dyn std::error::Error>> {
+    async fn iceberg_commit(&mut self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError> {
         let latest_checkpoint = match self.get_latest_committed_checkpoint_sync(table_name, None) {
             Some(checkpoint_id) => {
                 let key = format!("{}_{}", table_name, checkpoint_id);
@@ -1578,7 +1625,7 @@ impl ApiServiceClient for TestApiServiceClient {
         Ok(())
     }
 
-    async fn extension_commit(&mut self, table_name: &String, commit: &ExtensionCommit) -> Result<(), Box<dyn std::error::Error>> {
+    async fn extension_commit(&mut self, table_name: &String, commit: &ExtensionCommit) -> Result<(), ServiceApiError> {
         let waiting_checkpoint_ids = self.checkpoints_needing_extension_work(table_name, &commit.extension).unwrap_or_else(|| vec!());
         assert!(waiting_checkpoint_ids.len() > 0);
 
@@ -1602,14 +1649,14 @@ impl ApiServiceClient for TestApiServiceClient {
         Ok(())
     }
 
-    async fn compaction_commit(&mut self, _table_name: &String, commit: &CompactionCommit) -> Result<(), Box<dyn std::error::Error>> {
+    async fn compaction_commit(&mut self, _table_name: &String, commit: &CompactionCommit) -> Result<(), ServiceApiError> {
         // NOTE: this just notes what the compactor is saying. We don't generate the new checkpoint
         // until we see an iceberg or speedboat commit with the new info.
         self.compactions.insert(commit.compaction_id.clone(), commit.clone());
         Ok(())
     }
 
-    async fn get_latest_checkpoint(&mut self, table_name: &String, extensions: Option<String>) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    async fn get_latest_checkpoint(&mut self, table_name: &String, extensions: Option<String>) -> Result<Option<String>, ServiceApiError> {
         match self.mode.prefetch_mode {
             PrefetchMode::Disabled => {
                 Ok(self.get_latest_committed_checkpoint_sync(table_name, extensions))
@@ -1620,14 +1667,14 @@ impl ApiServiceClient for TestApiServiceClient {
         }
     }
 
-    async fn get_checkpoint(&mut self, snapshot: &CheckpointDescriptor) -> Result<TableMetadataCheckpoint, Box<dyn std::error::Error>> {
+    async fn get_checkpoint(&mut self, snapshot: &CheckpointDescriptor) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
         match self.get_checkpoint_sync(&snapshot.table_name, &snapshot.checkpoint_id) {
-            Some(v) => Ok(v.clone()),
-            None => panic!("Oh no")
+            Some(v) => Ok(Some(v.clone())),
+            None => Ok(None)
         }
     }
 
-    async fn get_extension_work_items(&mut self, extension_type: &String) -> Result<Vec<ExtensionWorkItem>, Box<dyn std::error::Error>> {
+    async fn get_extension_work_items(&mut self, extension_type: &String) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {
         if extension_type == "es" {
             // TODO: priority by index? allow index filtering?
             let mut collected_work_items= vec!();
@@ -1648,7 +1695,7 @@ impl ApiServiceClient for TestApiServiceClient {
         }
     }
 
-    async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, Box<dyn std::error::Error>> {
+    async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
         let mut work_items = vec!();
         for (table_name, compaction) in self.compaction_work_items.iter_mut() {
             tracing::info!("Compaction work item stats: size = {}/{}, files = {}/200",
@@ -1666,11 +1713,11 @@ impl ApiServiceClient for TestApiServiceClient {
         Ok(work_items)
     }
 
-    async fn get_peer_clients(&mut self) -> Result<Vec<Box<dyn PeerClient>>, Box<dyn Error>> {
-        Ok(vec!(Box::new(SelfPeer::new(self.mode.compaction_mode.clone()))))
+    async fn get_peer_clients(&mut self) -> Vec<Box<dyn PeerClient>> {
+        vec!(Box::new(SelfPeer::new(self.mode.compaction_mode.clone())))
     }
 
-    async fn get_next_prefetch_checkpoints(&mut self, extension: Option<String>) -> Result<Vec<CheckpointDescriptor>, Box<dyn Error>> {
+    async fn get_next_prefetch_checkpoints(&mut self, extension: Option<String>) -> Result<Vec<CheckpointDescriptor>, ServiceApiError> {
         match self.mode.prefetch_mode {
             PrefetchMode::Enabled => {
                 let mut checkpoints = vec!();
@@ -1706,7 +1753,7 @@ impl ApiServiceClient for TestApiServiceClient {
         }
     }
 
-    async fn set_prefetch_checkpoints(&mut self, checkpoints: &Vec<CheckpointDescriptor>, extension: Option<String>) -> Result<(), Box<dyn Error>> {
+    async fn set_prefetch_checkpoints(&mut self, checkpoints: &Vec<CheckpointDescriptor>, extension: Option<String>) -> Result<(), ServiceApiError> {
         match self.mode.prefetch_mode {
             PrefetchMode::Enabled => {
                 for checkpoint in checkpoints {
@@ -1745,10 +1792,10 @@ impl ApiServiceClientHandle {
 
         let _ = self.sender.send(msg).await;
         // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")         
+        recv.await.expect("Actor task has been killed")
     }
 
-    pub async fn create_pipeline(&self, name: &String, pipeline: &PipelineDefinition) -> () {
+    pub async fn create_pipeline(&self, name: &String, pipeline: &PipelineDefinition) -> Result<(), ServiceApiError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::CreatePipeline { 
             respond_to: send,
@@ -1758,10 +1805,10 @@ impl ApiServiceClientHandle {
 
         let _ = self.sender.send(msg).await;
         // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")          
+        recv.await.expect("Actor task has been killed")
     }
 
-    pub async fn describe_pipeline(&self, name: &String) -> Option<PipelineDefinition> {
+    pub async fn describe_pipeline(&self, name: &String) -> Result<Option<PipelineDefinition>, ServiceApiError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::DescribePipeline { 
             respond_to: send,
@@ -1770,10 +1817,10 @@ impl ApiServiceClientHandle {
 
         let _ = self.sender.send(msg).await;
         // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")          
+        recv.await.expect("Actor task has been killed")
     }
 
-    pub async fn create_lifetime_policy(&self, name: &String, pipeline: &ILMPolicyDefinition) -> () {
+    pub async fn create_lifetime_policy(&self, name: &String, pipeline: &ILMPolicyDefinition) -> Result<(), ServiceApiError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::CreateLifetimePolicy {
             respond_to: send,
@@ -1786,7 +1833,7 @@ impl ApiServiceClientHandle {
         recv.await.expect("Actor task has been killed")
     }
 
-    pub async fn describe_lifetime_policy(&self, name: &String) -> Option<ILMPolicyDefinition> {
+    pub async fn describe_lifetime_policy(&self, name: &String) -> Result<Option<ILMPolicyDefinition>, ServiceApiError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::DescribeLifetimePolicy {
             respond_to: send,
@@ -1798,7 +1845,7 @@ impl ApiServiceClientHandle {
         recv.await.expect("Actor task has been killed")
     }
 
-    pub async fn create_table(&self, create_table: &CreateTable) -> () {
+    pub async fn create_table(&self, create_table: &CreateTable) -> Result<(), ServiceApiError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::CreateTable { 
             respond_to: send,
@@ -1810,7 +1857,7 @@ impl ApiServiceClientHandle {
         recv.await.expect("Actor task has been killed")        
     }  
 
-    pub async fn describe_table(&self, table_name: &String) -> Option<TableDescription> {
+    pub async fn describe_table(&self, table_name: &String) -> Result<Option<TableDescription>, ServiceApiError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::DescribeTable { 
             respond_to: send,
@@ -1822,7 +1869,7 @@ impl ApiServiceClientHandle {
         recv.await.expect("Actor task has been killed")          
     } 
 
-    pub async fn add_alias(&self, table_name: &String, alias: &String) -> () {
+    pub async fn add_alias(&self, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::AddAlias { 
             respond_to: send,
@@ -1835,7 +1882,7 @@ impl ApiServiceClientHandle {
         recv.await.expect("Actor task has been killed")        
     }  
 
-    pub async fn remove_alias(&self, table_name: &String, alias: &String) -> () {
+    pub async fn remove_alias(&self, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::RemoveAlias { 
             respond_to: send,
@@ -1848,7 +1895,7 @@ impl ApiServiceClientHandle {
         recv.await.expect("Actor task has been killed")        
     }         
 
-    pub async fn create_table_template(&self, name: &String, template: &CreateIndexTemplateBody) -> () {
+    pub async fn create_table_template(&self, name: &String, template: &CreateIndexTemplateBody) -> Result<(), ServiceApiError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::CreateTableTemplate { 
             respond_to: send,
@@ -1861,7 +1908,7 @@ impl ApiServiceClientHandle {
         recv.await.expect("Actor task has been killed")        
     }  
 
-    pub async fn describe_table_template(&self, table_name: &String) -> Option<CreateIndexTemplateBody> {
+    pub async fn describe_table_template(&self, table_name: &String) -> Result<Option<CreateIndexTemplateBody>, ServiceApiError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::DescribeTableTemplate { 
             respond_to: send,
@@ -1885,8 +1932,7 @@ impl ApiServiceClientHandle {
         recv.await.expect("Actor task has been killed")        
     }
 
-    #[allow(dead_code)]
-    pub async fn iceberg_commit(&self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), RecvError> {
+    pub async fn iceberg_commit(&self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::IcebergCommit { 
             respond_to: send,
@@ -1896,10 +1942,10 @@ impl ApiServiceClientHandle {
 
         let _ = self.sender.send(msg).await;
         // TODO: deal with errors
-        recv.await
+        recv.await.expect("Actor task has been killed")
     }    
 
-    pub async fn speedboat_commit(&self, speedboat_commit: &SpeedboatCommit) -> Result<(), RecvError> {
+    pub async fn speedboat_commit(&self, speedboat_commit: &SpeedboatCommit) -> Result<(), ServiceApiError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::SpeedboatCommit { 
             respond_to: send,
@@ -1908,10 +1954,10 @@ impl ApiServiceClientHandle {
 
         let _ = self.sender.send(msg).await;
         // TODO: deal with errors
-        recv.await
+        recv.await.expect("Actor task has been killed")
     }
 
-    pub async fn extension_commit(&self, table_name: &String, extension_commit: &ExtensionCommit) -> Result<(), RecvError> {
+    pub async fn extension_commit(&self, table_name: &String, extension_commit: &ExtensionCommit) -> Result<(), ServiceApiError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::ExtensionCommit { 
             respond_to: send,
@@ -1921,10 +1967,10 @@ impl ApiServiceClientHandle {
 
         let _ = self.sender.send(msg).await;
         // TODO: deal with errors
-        recv.await
+        recv.await.expect("Actor task has been killed")
     }
 
-    pub async fn compaction_commit(&self, table_name: &String, compaction_commit: &CompactionCommit) -> Result<(), RecvError> {
+    pub async fn compaction_commit(&self, table_name: &String, compaction_commit: &CompactionCommit) -> Result<(), ServiceApiError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::CompactionCommit { 
             respond_to: send,
@@ -1934,10 +1980,10 @@ impl ApiServiceClientHandle {
 
         let _ = self.sender.send(msg).await;
         // TODO: deal with errors
-        recv.await
+        recv.await.expect("Actor task has been killed")
     }    
 
-    pub async fn get_latest_checkpoint(&self, table_name: &String, extension: Option<String>) -> Result<Option<String>, RecvError> {
+    pub async fn get_latest_checkpoint(&self, table_name: &String, extension: Option<String>) -> Result<Option<String>, ServiceApiError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::GetLatestCheckpoint { 
             respond_to: send,
@@ -1947,22 +1993,22 @@ impl ApiServiceClientHandle {
 
         let _ = self.sender.send(msg).await;
         // TODO: deal with errors
-        recv.await        
+        recv.await.expect("Actor task has been killed")
     }   
 
-    pub async fn get_checkpoint(&self, snapshot: CheckpointDescriptor) -> Result<TableMetadataCheckpoint, RecvError> {
+    pub async fn get_checkpoint(&self, checkpoint: CheckpointDescriptor) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::GetCheckpoint { 
             respond_to: send,
-            snapshot: snapshot,
+            checkpoint: checkpoint,
         };
 
         let _ = self.sender.send(msg).await;
         // TODO: deal with errors
-        recv.await
+        recv.await.expect("Actor task has been killed")
     }
 
-    pub async fn get_extension_work_items(&self, extension_type: &String) -> Result<Vec<ExtensionWorkItem>, RecvError> {
+    pub async fn get_extension_work_items(&self, extension_type: &String) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::GetExtensionWorkItems {
             respond_to: send,
@@ -1971,10 +2017,10 @@ impl ApiServiceClientHandle {
 
         let _ = self.sender.send(msg).await;
         // TODO: deal with errors
-        recv.await        
+        recv.await.expect("Actor task has been killed")
     }
 
-    pub async fn get_compaction_work_items(&self) -> Result<Vec<(String, CompactionWorkItem)>, RecvError> {
+    pub async fn get_compaction_work_items(&self) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::GetCompactionWorkItems {
             respond_to: send,
@@ -1982,10 +2028,10 @@ impl ApiServiceClientHandle {
 
         let _ = self.sender.send(msg).await;
         // TODO: deal with errors
-        recv.await
+        recv.await.expect("Actor task has been killed")
     }
 
-    pub async fn get_peer_clients(&self) -> Result<Vec<Box<dyn PeerClient>>, RecvError> {
+    pub async fn get_peer_clients(&self) -> Vec<Box<dyn PeerClient>> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::GetPeerClients {
             respond_to: send,
@@ -1993,10 +2039,10 @@ impl ApiServiceClientHandle {
 
         let _ = self.sender.send(msg).await;
         // TODO: deal with errors
-        recv.await
+        recv.await.expect("Actor task has been killed")
     }
     
-    pub async fn get_next_prefetch_checkpoints(&self, extension: Option<String>) -> Result<Vec<CheckpointDescriptor>, RecvError> {
+    pub async fn get_next_prefetch_checkpoints(&self, extension: Option<String>) -> Result<Vec<CheckpointDescriptor>, ServiceApiError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::GetNextPrefetchCheckpoints {
             respond_to: send,
@@ -2005,10 +2051,10 @@ impl ApiServiceClientHandle {
 
         let _ = self.sender.send(msg).await;
         // TODO: deal with errors
-        recv.await
+        recv.await.expect("Actor task has been killed")
     }
 
-    pub async fn set_prefetch_checkpoints(&self, checkpoints: &Vec<CheckpointDescriptor>, extension: Option<String>) -> Result<(), RecvError> {
+    pub async fn set_prefetch_checkpoints(&self, checkpoints: &Vec<CheckpointDescriptor>, extension: Option<String>) -> Result<(), ServiceApiError> {
         let (send, recv) = oneshot::channel();
         let msg = ApiServiceClientActorMessage::SetPrefetchCheckpoints {
             respond_to: send,
@@ -2018,7 +2064,7 @@ impl ApiServiceClientHandle {
 
         let _ = self.sender.send(msg).await;
         // TODO: deal with errors
-        recv.await
+        recv.await.expect("Actor task has been killed")
     }
 }
 

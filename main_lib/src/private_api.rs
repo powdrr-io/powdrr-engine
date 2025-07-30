@@ -89,9 +89,14 @@ async fn determine_required_files(required_extensions: &Vec<String>, checkpoints
         return Err(PrivateApiError{ message: "Only read for one table at a time please.".to_string() })
     }
 
-    let target_snapshot = &checkpoints[0];
-    let table_metadata = match API_SERVICE_CLIENT.get_checkpoint(target_snapshot.clone()).await {
-        Ok(tmc) => tmc,
+    let target_checkpoint = &checkpoints[0];
+    let table_metadata = match API_SERVICE_CLIENT.get_checkpoint(target_checkpoint.clone()).await {
+        Ok(tmc) => {
+            match tmc {
+                Some(tmc) => tmc,
+                None => panic!("The table metadata was not found for a known checkpoint: {}", target_checkpoint)
+            }
+        },
         Err(_e) => return log_err(PrivateApiError{ message: "Error calling get checkpoint".to_string() }),
     };
 
