@@ -158,16 +158,19 @@ pub(crate) async fn do_all_available_extension_work(extensions: &Vec<String>) ->
             Ok(work) => work,
             Err(_) => panic!("oh no"),
         };
-        tracing::info!("Doing indexing work");
 
-        for work_item in index_work.iter() {
-            work_done = true;
-            match create_index(&work_item).await {
-                Ok(_) => (),
-                Err(_) => panic!("Need some real error handling some day"),
+        if index_work.len() > 0 {
+            tracing::info!("Doing indexing work");
+
+            for work_item in index_work.iter() {
+                work_done = true;
+                match create_index(work_item).await {
+                    Ok(_) => (),
+                    Err(_) => panic!("Need some real error handling some day"),
+                }
             }
+            tracing::info!("Done with indexing work");
         }
-        tracing::info!("Done with indexing work");
 
         if !work_done {
             break;

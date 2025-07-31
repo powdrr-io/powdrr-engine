@@ -237,7 +237,7 @@ async fn main() -> Result<(), std::io::Error> {
 
     let main_mode = TestProcessingMode {
         testing_mode: TestingMode::Disabled,
-        indexing_mode: IndexingMode::Disabled,
+        indexing_mode: IndexingMode::Async,
         compaction_mode: CompactionMode::Async,
         prefetch_mode: PrefetchMode::Disabled,
     };
