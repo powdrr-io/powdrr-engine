@@ -338,6 +338,7 @@ pub(crate) struct QueryFailure {
 
 impl QueryFailure {
     pub(crate) fn to_response(&self) -> ElasticSearchResponse {
+        assert!(self.message.len() > 0);
         ElasticSearchResponse {
             status: StatusCode::BAD_REQUEST,
             mime: mime::TEXT_PLAIN,
