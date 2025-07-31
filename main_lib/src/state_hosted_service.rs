@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{distributed_cache, elastic_search_ingest::CreateIndexTemplateBody, pipeline::PipelineDefinition, state_peers::CheckpointDescriptor};
 use crate::compaction::drop_all_tables;
-use crate::elastic_search_index::{create_index, IndexError};
+use crate::elastic_search_index::{create_index_inner, IndexError};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::schema_massager::PowdrrSchema;
 use crate::state_peers::{PeerClient, SelfPeer};
@@ -1322,30 +1322,16 @@ impl TestApiServiceClient {
 
         self.checkpoints.insert(format!("{}_{}", &table_info.table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
 
-        match self.mode.indexing_mode {
-            IndexingMode::Sync => {
-                self.fill_extension_work_item(
-                    &table_info.table_name,
-                    &"es".to_string(),
-                    &new_checkpoint_id,
-                    &merged_schema,
-                    &speedboat_files,
-                    &iceberg_files
-                )
+        self.fill_extension_work_item(
+            &table_info.table_name,
+            &"es".to_string(),
+            &new_checkpoint_id,
+            &merged_schema,
+            &speedboat_files,
+            &iceberg_files
+        );
 
-            },
-            IndexingMode::Async => {
-                self.fill_extension_work_item(
-                    &table_info.table_name,
-                    &"es".to_string(),
-                    &new_checkpoint_id,
-                    &merged_schema,
-                    &speedboat_files,
-                    &iceberg_files
-                )
-            },
-            IndexingMode::Disabled => ()
-        };
+        self.create_index(&table_info.table_name).await?;
 
         self.set_latest_committed_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
 
@@ -1433,20 +1419,6 @@ impl TestApiServiceClient {
         Ok(())
     }    
 
-    async fn create_index(&mut self) -> Result<(), ServiceApiError> {
-        let work_items = self.get_extension_work_items(&"es".to_string()).await?;
-        for work_item in work_items {
-            match create_index(&work_item).await {
-                Ok(_) => (),
-                Err(e) => {
-                    tracing::error!("Failed to create index for table {}: {}", work_item.table_name, e);
-                    return Err(ServiceApiError::from_index_error(&e));
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn get_checkpoint_sync(&self, table_name: &String, checkpoint_id: &String) -> Option<TableMetadataCheckpoint> {
         let key = format!("{}_{}", table_name, checkpoint_id);
         self.checkpoints.get(&key).cloned()
@@ -1468,6 +1440,29 @@ impl TestApiServiceClient {
         } else {
             None
         }
+    }
+
+    async fn create_index(&mut self, table_name: &String) -> Result<(), ServiceApiError> {
+        match self.mode.indexing_mode {
+            IndexingMode::Sync => {
+                let work_items = self.get_extension_work_items(&"es".to_owned()).await?;
+                for work_item in work_items.iter() {
+                    let metadata = create_index_inner(
+                        &work_item.iceberg_files.as_file_tuples(),
+                        &work_item.speedboat_files.as_file_tuples()
+                    ).await.map_err(|e|ServiceApiError::from_index_error(&e))?;
+                    self.extension_commit(
+                        &table_name,
+                        &ExtensionCommit {
+                            extension: "es".to_owned(),
+                            files: metadata,
+                        }
+                    ).await?
+                }
+            },
+            _ => ()
+        }
+        Ok(())
     }
 
 }
@@ -1629,30 +1624,16 @@ impl ApiServiceClient for TestApiServiceClient {
         self.checkpoints.insert(format!("{}_{}", &table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
         self.set_latest_committed_checkpoint(&table_name, None, &new_checkpoint_id);
 
-        match self.mode.indexing_mode {
-            IndexingMode::Sync => {
-                self.fill_extension_work_item(
-                    &table_name,
-                    &"es".to_string(),
-                    &new_checkpoint_id,
-                    &merged_schema,
-                    &speedboat_files,
-                    &iceberg_files
-                );
-                self.create_index().await?;
-            },
-            IndexingMode::Async => {
-                self.fill_extension_work_item(
-                    &table_name,
-                    &"es".to_string(),
-                    &new_checkpoint_id,
-                    &merged_schema,
-                    &speedboat_files,
-                    &iceberg_files
-                );
-            },
-            IndexingMode::Disabled => ()
-        };
+        self.fill_extension_work_item(
+            &table_name,
+            &"es".to_string(),
+            &new_checkpoint_id,
+            &merged_schema,
+            &speedboat_files,
+            &iceberg_files
+        );
+
+        self.create_index(table_name).await?;
 
         Ok(())
     }
