@@ -289,7 +289,11 @@ impl PeerClient for SelfPeer {
             CompactionMode::Async => {
                 match compact_logs(Arc::new(invocation.clone())).await {
                     Ok(success) => {
-                        Ok(Some(serde_json::from_str(success.body.as_str()).unwrap()))
+                        if success.status == 200 {
+                            Ok(Some(serde_json::from_str(success.body.as_str()).unwrap()))
+                        } else {
+                            Err(PeerClientError { message: success.body })
+                        }
                     },
                     Err(e) => Err(PeerClientError { message: e.to_string() })
                 }

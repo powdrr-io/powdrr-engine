@@ -40,22 +40,25 @@ pub fn router(include_test_apis: bool) -> Router {
                 route.post("/create_pipeline/:name")
                     .with_path_extractor::<NamePathExtractor>()
                     .to(v1_handlers::create_pipeline);
-                route.get("/describe_pipeline/:name").to(v1_handlers::describe_pipeline);
+                route.get("/describe_pipeline/:name")
+                    .with_path_extractor::<NamePathExtractor>()
+                    .to(v1_handlers::describe_pipeline);
                 route.post("/create_lifetime_policy/:name")
                     .with_path_extractor::<NamePathExtractor>()
                     .to(v1_handlers::create_lifetime_policy);
                 route.post("/describe_lifetime_policy/:name")
                     .with_path_extractor::<NamePathExtractor>()
                     .to(v1_handlers::describe_lifetime_policy);
-
                 route.post("/speedboat_commit").to(v1_handlers::speedboat_commit);
-                route.post("/iceberg_commit")
+                route.post("/iceberg_commit/:name")
                     .with_path_extractor::<NamePathExtractor>()
                     .to(v1_handlers::iceberg_commit);
                 route.post("/extension_commit/:name")
                     .with_path_extractor::<NamePathExtractor>()
                     .to(v1_handlers::extension_commit);
-                route.post("/compaction_commit").to(v1_handlers::compaction_commit);
+                route.post("/compaction_commit/:name")
+                    .with_path_extractor::<NamePathExtractor>()
+                    .to(v1_handlers::compaction_commit);
                 route.get("/get_latest_checkpoint").to(v1_handlers::get_latest_checkpoint);
                 route.get("/get_checkpoint").to(v1_handlers::get_checkpoint);
                 route.get("/get_extension_work_items/:name")

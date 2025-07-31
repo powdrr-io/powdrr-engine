@@ -406,13 +406,7 @@ impl Command for CompactionCommand {
                 None => {
                     // TODO: After this compaction there is....nothing?
                     // Maybe this should panic since it shouldn't be possible to get here.
-                    let none = CompactionResult::None;
-                    return Ok(ElasticSearchResponse {
-                        status: StatusCode::OK,
-                        mime: mime::APPLICATION_JSON,
-                        body: serde_json::to_string(&none).unwrap(),
-                        headers: vec![],
-                    });
+                    return Err(CommandError{ message: "Nothing to compact".to_string() })
                 }
             };
             let remaining_deletes_data_frame = match execute_sql(&format!("select _dt_id_seq_no as _id_seq_no from {internal_df_table_name} where _id is null and _dt_id_seq_no is not null")).await {
@@ -495,8 +489,6 @@ impl Command for CompactionCommand {
                 compactions,
             };
 
-
-
             Ok(ElasticSearchResponse {
                 status: StatusCode::OK,
                 mime: mime::TEXT_PLAIN,
@@ -533,7 +525,9 @@ pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkIt
             }
         ).await {
             Ok(_) => (),
-            Err(_) => return Err(CompactionError { message: "api call failed".to_string() }),
+            Err(e) => {
+                return Err(CompactionError { message: format!("api call failed: {}", e) })
+            },
         }
 
         let command = CompactionCommand {

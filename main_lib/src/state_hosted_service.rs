@@ -35,16 +35,19 @@ unsafe impl Sync for ServiceApiError {}
 
 
 impl ServiceApiError {
-    fn from_index_error(index_error: &IndexError) -> Self {
+    fn new(message: String) -> Self {
+        assert!(message.len() > 0, "Message must not be empty");
         ServiceApiError {
-            message: format!("{}", index_error),
+            message,
         }
     }
 
+    fn from_index_error(index_error: &IndexError) -> Self {
+        Self::new(format!("Index Error: {}", index_error))
+    }
+
     pub fn from_reqwest(error: reqwest::Error) -> Self {
-        ServiceApiError {
-            message: format!("{}", error),
-        }
+        Self::new(format!("Reqwest: {}", error))
     }
 }
 
@@ -771,7 +774,7 @@ impl RealApiServiceClient {
                 } else if success.status() == StatusCode::NOT_FOUND {
                     Ok(None)
                 } else {
-                    Err(ServiceApiError { message: success.text().await.unwrap() })
+                    Err(ServiceApiError::new(success.text().await.unwrap()))
                 }
             },
             Err(e) => {
@@ -787,7 +790,7 @@ impl RealApiServiceClient {
                 if success.status().is_success() {
                     Ok(())
                 } else {
-                    Err(ServiceApiError { message: success.text().await.unwrap() })
+                    Err(ServiceApiError::new(format!("Request failed: {}", success.status())))
                 }
             },
             Err(e) => {
