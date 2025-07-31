@@ -21,9 +21,10 @@ pub enum TestingMode {
 }
 
 impl TestingMode {
-    pub(crate) fn is_enabled(&self) -> bool {
+    #[allow(dead_code)]
+    pub(crate) fn is_disabled(&self) -> bool {
         match self {
-            TestingMode::Enabled => true,
+            TestingMode::Disabled => true,
             _ => false
         }
     }
