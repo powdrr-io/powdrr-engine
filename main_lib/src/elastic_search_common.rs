@@ -84,7 +84,7 @@ pub type ResultGeneratorFuture = dyn Future<Output = Result<ElasticSearchRespons
 pub(crate) trait Command: Send + Sync {
     async fn get_private_invocation(&self) -> PrivateInvocation;
 
-    fn  result_generator(&self, result_table_name: Option<String>) -> Pin<Box<ResultGeneratorFuture>>;
+    fn result_generator(&self, result_table_name: Option<String>) -> Pin<Box<ResultGeneratorFuture>>;
 }
 
 
