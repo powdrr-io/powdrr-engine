@@ -19,6 +19,7 @@ mod elastic_search_storage_schema;
 mod expression_evaluator;
 mod painless_parser;
 pub mod pipeline;
+mod prefetch;
 mod private_api;
 pub mod router;
 pub mod schema_massager;
@@ -27,4 +28,7 @@ pub mod state_hosted_service;
 pub mod state_peers;
 pub mod test_api;
 mod util;
-mod prefetch;
+mod ephemeral_service_impl;
+mod ephemeral_state_provider;
+mod leaderless_state_provider;
+

@@ -1,25 +1,23 @@
 use std::{collections::HashMap, error::Error};
 use std::fmt::{Display, Formatter};
 use std::hash::{DefaultHasher, Hash, Hasher};
-use async_trait::async_trait;
-use idgenerator::IdInstance;
-use reqwest::{Client, Response, StatusCode};
 use serde::{Deserialize, Serialize};
-use serde::de::DeserializeOwned;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{distributed_cache, elastic_search_ingest::CreateIndexTemplateBody, pipeline::PipelineDefinition, state_peers::CheckpointDescriptor};
-use crate::compaction::drop_all_tables;
-use crate::elastic_search_index::{create_index_inner, IndexError};
+use crate::{elastic_search_ingest::CreateIndexTemplateBody, pipeline::PipelineDefinition, state_peers::CheckpointDescriptor};
+
+use crate::elastic_search_index::IndexError;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
+use crate::ephemeral_state_provider::EphemeralStateProvider;
+use crate::leaderless_state_provider::LeaderlessStateProvider;
 use crate::schema_massager::PowdrrSchema;
-use crate::state_peers::{PeerClient, SelfPeer};
-use crate::test_api::{IndexingMode, PrefetchMode, TestProcessingMode};
+use crate::state_peers::{PeerClient};
+use crate::test_api::{TestProcessingMode};
 
 
 #[derive(Debug, Clone)]
 pub struct ServiceApiError {
-    message: String,
+    pub(crate) message: String,
 }
 
 impl Error for ServiceApiError {}
@@ -35,20 +33,21 @@ unsafe impl Sync for ServiceApiError {}
 
 
 impl ServiceApiError {
-    fn new(message: String) -> Self {
+    pub(crate) fn new(message: String) -> Self {
         assert!(message.len() > 0, "Message must not be empty");
         ServiceApiError {
             message,
         }
     }
 
-    fn from_index_error(index_error: &IndexError) -> Self {
+    pub(crate) fn from_index_error(index_error: &IndexError) -> Self {
         Self::new(format!("Index Error: {}", index_error))
     }
 
     pub fn from_reqwest(error: reqwest::Error) -> Self {
         Self::new(format!("Reqwest: {}", error))
     }
+    
 }
 
 
@@ -62,7 +61,7 @@ pub struct SpeedboatCommitTableInfo {
 }
 
 impl SpeedboatCommitTableInfo {
-    fn as_file_set_payload(&self) -> FileSetPayload {
+    pub(crate) fn as_file_set_payload(&self) -> FileSetPayload {
         FileSetPayload {
             file_paths: self.files.clone(),
             sizes: self.sizes.clone(),
@@ -168,7 +167,7 @@ pub struct TableMetadataCheckpoint {
 
 
 impl TableMetadataCheckpoint {
-    fn fully_covered_for_extension(&self, extension_name: &String) -> bool {
+    pub(crate) fn fully_covered_for_extension(&self, extension_name: &String) -> bool {
         let total_num_files =
             self.speedboat_metadata.as_ref().map_or(0, |x| x.files.file_paths.len()) +
             self.iceberg_metadata.as_ref().map_or(0, |x| x.files.file_paths.len());
@@ -210,7 +209,7 @@ impl TableMetadataCheckpoint {
         true
     }
 
-    fn add_coverage(&mut self, extension_commit: &ExtensionCommit) -> () {
+    pub(crate) fn add_coverage(&mut self, extension_commit: &ExtensionCommit) -> () {
         assert!(!self.fully_covered_for_extension(&extension_commit.extension), "Already fully covered");
 
         let existing_extension_metadata_map = self.extension_metadata.get(&extension_commit.extension).map_or(HashMap::new(), |x| x.clone());
@@ -266,7 +265,7 @@ pub struct TableDescription {
 }
 
 impl TableDescription {
-    fn from_create_table(create_table: &CreateTable) -> Self {
+    pub(crate) fn from_create_table(create_table: &CreateTable) -> Self {
         TableDescription {
             name: create_table.name.clone(),
             tags: create_table.tags.clone(),
@@ -362,7 +361,7 @@ impl FileSetPayload {
         cloned
     }
 
-    fn add(&mut self, file_descriptor: &FileDescriptor) -> () {
+    pub(crate) fn add(&mut self, file_descriptor: &FileDescriptor) -> () {
         if self.file_paths.contains(&file_descriptor.file_path) {
             return;
         }
@@ -375,64 +374,6 @@ impl FileSetPayload {
             self.schemas.push(file_descriptor.schema.clone());
         }
     }
-}
-
-
-
-#[async_trait]
-pub(crate) trait ApiServiceClient : Send + Sync {
-    #[allow(dead_code)]
-    async fn get_all_iceberg_tables(&mut self) -> Result<Vec<String>, ServiceApiError>;
-
-    async fn create_table(&mut self, create_table: &CreateTable) -> Result<(), ServiceApiError>;
-
-    async fn describe_table(&mut self, name: &String) -> Result<Option<TableDescription>, ServiceApiError>;
- 
-    async fn add_alias(&mut self, table_name: &String, alias: &String) -> Result<(), ServiceApiError>;
-
-    async fn remove_alias(&mut self, table_name: &String, alias: &String) -> Result<(), ServiceApiError>;
-
-    async fn create_table_template(&mut self, name: &String, template: &CreateIndexTemplateBody) -> Result<(), ServiceApiError>;
-
-    async fn describe_table_template(&mut self, name: &String) -> Result<Option<CreateIndexTemplateBody>, ServiceApiError>;
-
-    async fn create_pipeline(&mut self, name: &String, pipeline: &PipelineDefinition) -> Result<(), ServiceApiError>;
-
-    async fn describe_pipeline(&mut self, name: &String) -> Result<Option<PipelineDefinition>, ServiceApiError>;
-
-    async fn create_lifetime_policy(&mut self, name: &String, policy: &ILMPolicyDefinition) -> Result<(), ServiceApiError>;
-
-    async fn describe_lifetime_policy(&mut self, name: &String) -> Result<Option<ILMPolicyDefinition>, ServiceApiError>;
-    
-    async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), ServiceApiError>;
-
-    async fn iceberg_commit(&mut self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError>;
-
-    async fn extension_commit(&mut self, table_name: &String, commit: &ExtensionCommit) -> Result<(), ServiceApiError>;
-
-    async fn compaction_commit(&mut self, table_name: &String, commit: &CompactionCommit) -> Result<(), ServiceApiError>;
-
-    async fn get_latest_checkpoint(&mut self, table_name: &String, extensions: Option<String>) -> Result<Option<String>, ServiceApiError>;
-
-    async fn get_checkpoint(&mut self, snapshot: &CheckpointDescriptor) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError>;
-
-    async fn get_extension_work_items(&mut self, extension_name: &String) -> Result<Vec<ExtensionWorkItem>, ServiceApiError>;
-
-    async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError>;
-
-    async fn get_peer_clients(&mut self) -> Vec<Box<dyn PeerClient>>;
-
-    async fn get_next_prefetch_checkpoints(&mut self, extension: Option<String>) -> Result<Vec<CheckpointDescriptor>, ServiceApiError>;
-
-    async fn set_prefetch_checkpoints(&mut self, checkpoints: &Vec<CheckpointDescriptor>, extension: Option<String>) -> Result<(), ServiceApiError>;
-}
-
-
-struct ApiServiceClientActor {
-    real: RealApiServiceClient,
-    test: TestApiServiceClient,
-    test_mode: bool,
-    receiver: mpsc::Receiver<ApiServiceClientActorMessage>,
 }
 
 enum ApiServiceClientActorMessage {
@@ -508,7 +449,12 @@ enum ApiServiceClientActorMessage {
         table_name: String,
         compaction_commit: CompactionCommit,        
     },    
-    GetLatestCheckpoint {
+    GetLatestCommittedCheckpoint {
+        respond_to: oneshot::Sender<Result<Option<String>, ServiceApiError>>,
+        table_name: String,
+        extensions: Option<String>,
+    },
+    GetLatestTargetCheckpoint {
         respond_to: oneshot::Sender<Result<Option<String>, ServiceApiError>>,
         table_name: String,
         extensions: Option<String>,
@@ -541,173 +487,99 @@ enum ApiServiceClientActorMessage {
 unsafe impl Send for ApiServiceClientActorMessage {}
 
 
+struct ApiServiceClientActor {
+    state_provider: StateProvider,
+    receiver: mpsc::Receiver<ApiServiceClientActorMessage>,
+}
+
+
+macro_rules! handle_message_impl {
+    ($self:expr, $respond_to:expr, $func:ident($($args:expr),*)) => {
+        let _ = $respond_to.send($self.state_provider.$func($($args),*).await);
+    };
+}
+
 impl ApiServiceClientActor {
-    fn new(receiver: mpsc::Receiver<ApiServiceClientActorMessage>, base_address: String) -> Self {
+    fn new(receiver: mpsc::Receiver<ApiServiceClientActorMessage>, _base_address: String) -> Self {
         ApiServiceClientActor {
-            real: RealApiServiceClient::new(base_address),
-            test: TestApiServiceClient::new(),
-            test_mode: false,
-            receiver: receiver,
+            state_provider: StateProvider::Ephemeral(EphemeralStateProvider::new()),
+            receiver,
         }
     }
 
-    async fn handle_message(&mut self, msg: ApiServiceClientActorMessage) {
+    async fn handle_message(&mut self, msg: ApiServiceClientActorMessage) -> () {
         match msg {
             ApiServiceClientActorMessage::Testing { respond_to, mode } => {
-                self.test_mode = mode.testing_mode.is_enabled();
-                if self.test_mode {
-                    self.test.clear_and_set(mode).await;
-                } else {
-                    self.real.clear_and_set(mode).await;
-                }
-                let _ = respond_to.send(());
+                handle_message_impl!(self, respond_to, clear_and_set(mode));
             },
             ApiServiceClientActorMessage::CreatePipeline { respond_to, name, pipeline } => {
-                if self.test_mode {
-                    let _ = respond_to.send(self.test.create_pipeline(&name, &pipeline).await);
-                } else {
-                    let _ = respond_to.send(self.real.create_pipeline(&name, &pipeline).await);
-                }                
-            }, 
+                handle_message_impl!(self, respond_to, create_pipeline(&name, &pipeline));
+            },
             ApiServiceClientActorMessage::DescribePipeline { respond_to, name } => {
-                if self.test_mode {
-                    let _ = respond_to.send(self.test.describe_pipeline(&name).await);
-                } else {
-                    let _ = respond_to.send(self.real.describe_pipeline(&name).await);
-                }                
+                handle_message_impl!(self, respond_to, describe_pipeline(&name));
             },
             ApiServiceClientActorMessage::CreateLifetimePolicy { respond_to, name, policy } => {
-                if self.test_mode {
-                    let _ = respond_to.send(self.test.create_lifetime_policy(&name, &policy).await);
-                } else {
-                    let _ = respond_to.send(self.real.create_lifetime_policy(&name, &policy).await);
-                }
+                handle_message_impl!(self, respond_to, create_lifetime_policy(&name, &policy));
             },
             ApiServiceClientActorMessage::DescribeLifetimePolicy { respond_to, name } => {
-                if self.test_mode {
-                    let _ = respond_to.send(self.test.describe_lifetime_policy(&name).await);
-                } else {
-                    let _ = respond_to.send(self.real.describe_lifetime_policy(&name).await);
-                }
+                    handle_message_impl!(self, respond_to, describe_lifetime_policy(&name));
             },
             ApiServiceClientActorMessage::CreateTable { respond_to, create_table } => {
-                if self.test_mode {
-                    let _ = respond_to.send(self.test.create_table(&create_table).await);
-                } else {
-                    let _ = respond_to.send(self.real.create_table(&create_table).await);
-                }                
+                handle_message_impl!(self, respond_to, create_table(&create_table));
             },
             ApiServiceClientActorMessage::DescribeTable { respond_to, name } => {
-                if self.test_mode {
-                    let _ = respond_to.send(self.test.describe_table(&name).await);
-                } else {
-                    let _ = respond_to.send(self.real.describe_table(&name).await);
-                }                
+                handle_message_impl!(self, respond_to, describe_table(&name));
             },
             ApiServiceClientActorMessage::AddAlias { respond_to, table_name, alias } => {
-                if self.test_mode {
-                    let _ = respond_to.send(self.test.add_alias(&table_name, &alias).await);
-                } else {
-                    let _ = respond_to.send(self.real.add_alias(&table_name, &alias).await);
-                }  
+                handle_message_impl!(self, respond_to, add_alias(&table_name, &alias));
             },
             ApiServiceClientActorMessage::RemoveAlias { respond_to, table_name, alias } => {
-                if self.test_mode {
-                    let _ = respond_to.send(self.test.remove_alias(&table_name, &alias).await);
-                } else {
-                    let _ = respond_to.send(self.real.remove_alias(&table_name, &alias).await);
-                }  
+                handle_message_impl!(self, respond_to, remove_alias(&table_name, &alias));
             },            
             ApiServiceClientActorMessage::CreateTableTemplate { respond_to, name, template } => {
-                if self.test_mode {
-                    let _ = respond_to.send(self.test.create_table_template(&name, &template).await);
-                } else {
-                    let _ = respond_to.send(self.real.create_table_template(&name, &template).await);
-                }                
+                handle_message_impl!(self, respond_to, create_table_template(&name, &template));
             },
             ApiServiceClientActorMessage::DescribeTableTemplate { respond_to, name } => {
-                if self.test_mode {
-                    let _ = respond_to.send(self.test.describe_table_template(&name).await);
-                } else {
-                    let _ = respond_to.send(self.real.describe_table_template(&name).await);
-                }                
+                handle_message_impl!(self, respond_to, describe_table_template(&name));
             },                       
             ApiServiceClientActorMessage::AddCheckpoint { checkpoint, respond_to } => {
-                self.test_mode = true;
-                let _ = respond_to.send(self.test.add_checkpoint(&checkpoint));
+                handle_message_impl!(self, respond_to, add_checkpoint(&checkpoint));
             },
             ApiServiceClientActorMessage::IcebergCommit { respond_to, table_name, iceberg_commit } => {
-                if self.test_mode {
-                    let _ = respond_to.send(self.test.iceberg_commit(&table_name, &iceberg_commit).await);
-                } else {
-                    let _ = respond_to.send(self.real.iceberg_commit(&table_name, &iceberg_commit).await);
-                }                
+                handle_message_impl!(self, respond_to, iceberg_commit(&table_name, &iceberg_commit));
             },            
             ApiServiceClientActorMessage::SpeedboatCommit { respond_to, speedboat_commit } => {
-                if self.test_mode {
-                    let _ = respond_to.send(self.test.speedboat_commit(&speedboat_commit).await);
-                } else {
-                    let _ = respond_to.send(self.real.speedboat_commit(&speedboat_commit).await);
-                }                
+                handle_message_impl!(self, respond_to, speedboat_commit(&speedboat_commit));
             },
             ApiServiceClientActorMessage::ExtensionCommit { respond_to, table_name, extension_commit } => {
-                if self.test_mode {
-                    let _ = respond_to.send(self.test.extension_commit(&table_name, &extension_commit).await);
-                } else {
-                    let _ = respond_to.send(self.real.extension_commit(&table_name, &extension_commit).await);
-                }                
+                handle_message_impl!(self, respond_to, extension_commit(&table_name, &extension_commit));
             }, 
             ApiServiceClientActorMessage::CompactionCommit { respond_to, table_name, compaction_commit } => {
-                if self.test_mode {
-                    let _ = respond_to.send(self.test.compaction_commit(&table_name, &compaction_commit).await);
-                } else {
-                    let _ = respond_to.send(self.real.compaction_commit(&table_name, &compaction_commit).await);
-                }                
+                handle_message_impl!(self, respond_to, compaction_commit(&table_name, &compaction_commit));
             },                        
-            ApiServiceClientActorMessage::GetLatestCheckpoint { table_name, extensions, respond_to } => {
-                if self.test_mode {
-                    let _ = respond_to.send(self.test.get_latest_checkpoint(&table_name, extensions).await);
-                } else {
-                    let _ = respond_to.send(self.real.get_latest_checkpoint(&table_name, extensions).await);
-                }                 
+            ApiServiceClientActorMessage::GetLatestCommittedCheckpoint { table_name, extensions, respond_to } => {
+                handle_message_impl!(self, respond_to, get_latest_committed_checkpoint(&table_name, extensions));
+            },
+            ApiServiceClientActorMessage::GetLatestTargetCheckpoint { table_name, extensions, respond_to } => {
+                handle_message_impl!(self, respond_to, get_latest_target_checkpoint(&table_name, extensions));
             },
             ApiServiceClientActorMessage::GetCheckpoint { checkpoint, respond_to } => {
-                if self.test_mode {
-                    let _ = respond_to.send(self.test.get_checkpoint(&checkpoint).await);
-                } else {
-                    let _ = respond_to.send(self.real.get_checkpoint(&checkpoint).await);
-                }
+                handle_message_impl!(self, respond_to, get_checkpoint(&checkpoint));
             },
             ApiServiceClientActorMessage::GetExtensionWorkItems { extension_type, respond_to } => {
-                if self.test_mode {
-                    let _ = respond_to.send(self.test.get_extension_work_items(&extension_type).await);
-                } else {
-                    let _ = respond_to.send(self.real.get_extension_work_items(&extension_type).await);
-                }
+                handle_message_impl!(self, respond_to, get_extension_work_items(&extension_type));
             },
             ApiServiceClientActorMessage::GetCompactionWorkItems { respond_to } => {
-                if self.test_mode {
-                    let _ = respond_to.send(self.test.get_compaction_work_items().await);
-                } else {
-                    let _ = respond_to.send(self.real.get_compaction_work_items().await);
-                }
+                handle_message_impl!(self, respond_to, get_compaction_work_items());
             },
             ApiServiceClientActorMessage::GetPeerClients { respond_to } => {
-                let _ = respond_to.send(self.test.get_peer_clients().await);
+                handle_message_impl!(self, respond_to, get_peer_clients());
             },
             ApiServiceClientActorMessage::GetNextPrefetchCheckpoints { respond_to, extensions } => {
-                if self.test_mode {
-                    let _ = respond_to.send(self.test.get_next_prefetch_checkpoints(extensions).await);
-                } else {
-                    let _ = respond_to.send(self.real.get_next_prefetch_checkpoints(extensions).await);
-                }
+                handle_message_impl!(self, respond_to, get_next_prefetch_checkpoints(extensions));
             },
             ApiServiceClientActorMessage::SetPrefetchCheckpoints { respond_to, checkpoints, extensions } => {
-                if self.test_mode {
-                    let _ = respond_to.send(self.test.set_prefetch_checkpoints(&checkpoints, extensions).await);
-                } else {
-                    let _ = respond_to.send(self.real.set_prefetch_checkpoints(&checkpoints, extensions).await);
-                }
+                handle_message_impl!(self, respond_to, set_prefetch_checkpoints(&checkpoints, extensions));
             },
         }
     }
@@ -721,249 +593,122 @@ async fn run_api_service_client_actor_message_pump(mut actor: ApiServiceClientAc
 }
 
 
-struct RealApiServiceClient {
-    base_address: String,
-    client: Client,
+enum StateProvider {
+    Ephemeral(EphemeralStateProvider),
+    #[allow(dead_code)]
+    Leaderless(LeaderlessStateProvider)
 }
 
-impl RealApiServiceClient {
-    fn new(address: String) -> Self {
-        RealApiServiceClient {
-            base_address: address,
-            client: reqwest::Client::new(),
+macro_rules! state_provider_func_impl {
+    ($self:expr, $func:ident($($args:tt),*)) => {
+        match $self {
+            StateProvider::Ephemeral(eph) => eph.$func($($args),*).await,
+            StateProvider::Leaderless(lead) => lead.$func($($args),*).await,
         }
-    }
-
-    async fn clear_and_set(&mut self, _mode: TestProcessingMode) {
-    }
-
-    async fn handle_response_body<T>(request_result: Result<Response, reqwest::Error>) -> Result<T, ServiceApiError>
-        where T: Sized + DeserializeOwned
-    {
-        match request_result {
-            Ok(success) => {
-                if success.status().is_success() {
-                    let body = success.text().await.unwrap();
-                    let json = serde_json::from_str::<T>(body.as_str());
-                    match json {
-                        Ok(j) => Ok(j),
-                        Err(e) => Err(ServiceApiError { message: format!("Request body failed to parse: {}", e) })
-                    }
-                } else {
-                    Err(ServiceApiError { message: success.text().await.unwrap() })
-                }
-            },
-            Err(e) => {
-                Err(ServiceApiError::from_reqwest(e))
-            }
-        }
-    }
-
-    async fn handle_response_body_option<T>(request_result: Result<Response, reqwest::Error>) -> Result<Option<T>, ServiceApiError>
-    where T: Sized + DeserializeOwned
-    {
-        match request_result {
-            Ok(success) => {
-                if success.status().is_success() {
-                    let body = success.text().await.unwrap();
-                    let json = serde_json::from_str::<T>(body.as_str());
-                    match json {
-                        Ok(j) => Ok(Some(j)),
-                        Err(e) => Err(ServiceApiError { message: format!("Request body failed to parse: {}", e) })
-                    }
-                } else if success.status() == StatusCode::NOT_FOUND {
-                    Ok(None)
-                } else {
-                    Err(ServiceApiError::new(success.text().await.unwrap()))
-                }
-            },
-            Err(e) => {
-                Err(ServiceApiError::from_reqwest(e))
-            }
-        }
-    }
-
-
-    async fn handle_response(request_result: Result<Response, reqwest::Error>) -> Result<(), ServiceApiError> {
-        match request_result {
-            Ok(success) => {
-                if success.status().is_success() {
-                    Ok(())
-                } else {
-                    Err(ServiceApiError::new(format!("Request failed: {}", success.status())))
-                }
-            },
-            Err(e) => {
-                Err(ServiceApiError::from_reqwest(e))
-            }
-        }
-    }
+    };
 }
 
-unsafe impl Send for RealApiServiceClient {}
-unsafe impl Sync for RealApiServiceClient {}
 
-#[async_trait]
-impl ApiServiceClient for RealApiServiceClient {
-    async fn get_all_iceberg_tables(&mut self) -> Result<Vec<String>, ServiceApiError> {
-        let base_address = &self.base_address;
-        let resp = self.client.get(format!("{base_address}/api/v1/iceberg_tables")).send().await;
-        match resp {
-            Ok(r) => {
-                let json = r.json::<Vec<String>>().await;
-                match json {
-                    Ok(j) => Ok(j),
-                    Err(e) => Err(ServiceApiError::from_reqwest(e)),
-                }
-            },
-            Err(e) => {
-                Err(ServiceApiError::from_reqwest(e))
-            }
-        }  
+impl StateProvider {
+    async fn clear_and_set(&mut self, mode: TestProcessingMode) -> () {
+        state_provider_func_impl!(self, clear_and_set(mode))
     }
 
-    async fn create_table(&mut self, create_table: &CreateTable) -> Result<(), ServiceApiError> {
-        Self::handle_response(self.client.post(format!("{}/api/v1/create_table", self.base_address))
-            .body(serde_json::to_string(create_table).unwrap())
-            .send().await
-        ).await
+    pub(crate) async fn set_prefetch_checkpoints(&self, descriptors: &Vec<CheckpointDescriptor>, extension: Option<String>) -> Result<(), ServiceApiError> {
+        state_provider_func_impl!(self, set_prefetch_checkpoints(descriptors, extension))
     }
 
-    async fn describe_table(&mut self, name: &String) -> Result<Option<TableDescription>, ServiceApiError> {
-        Self::handle_response_body_option(self.client.get(format!("{}/api/v1/describe_table/{}", self.base_address, name))
-            .send().await
-        ).await
+    async fn get_latest_target_checkpoint(&self, table_name: &String, extension: Option<String>) -> Result<Option<String>, ServiceApiError> {
+        state_provider_func_impl!(self, get_latest_target_checkpoint(table_name, extension))
     }
 
-    async fn add_alias(&mut self, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
-        let payload = AddAlias {
-            table_name: table_name.to_owned(),
-            alias: alias.to_owned(),
-        };
-        Self::handle_response(self.client.post(format!("{}/api/v1/add_alias", self.base_address))
-            .body(serde_json::to_string(&payload).unwrap())
-            .send().await
-        ).await
+    async fn add_checkpoint(&mut self, checkpoint: &TableMetadataCheckpoint) -> () {
+        state_provider_func_impl!(self, add_checkpoint(checkpoint))
     }
 
-    async fn remove_alias(&mut self, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
-        let payload = AddAlias {
-            table_name: table_name.to_owned(),
-            alias: alias.to_owned(),
-        };
-        Self::handle_response(self.client.post(format!("{}/api/v1/remove_alias", self.base_address))
-            .body(serde_json::to_string(&payload).unwrap())
-            .send().await
-        ).await
+    #[allow(dead_code)]
+    pub async fn get_all_iceberg_tables(&mut self) -> Result<Vec<String>, ServiceApiError> {
+        state_provider_func_impl!(self, get_all_iceberg_tables())
     }
 
-    async fn create_table_template(&mut self, name: &String, template: &CreateIndexTemplateBody) -> Result<(), ServiceApiError> {
-        Self::handle_response(self.client.post(format!("{}/api/v1/create_table_template/{}", self.base_address, name))
-            .body(serde_json::to_string(&template).unwrap())
-            .send().await
-        ).await
+    pub async fn create_table(&mut self, create_table: &CreateTable) -> Result<(), ServiceApiError> {
+        state_provider_func_impl!(self, create_table(create_table))
     }
 
-    async fn describe_table_template(&mut self, name: &String) -> Result<Option<CreateIndexTemplateBody>, ServiceApiError> {
-        Self::handle_response_body_option(self.client.get(format!("{}/api/v1/describe_table_template/{}", self.base_address, name))
-            .send().await
-        ).await
+    pub async fn describe_table(&mut self, name: &String) -> Result<Option<TableDescription>, ServiceApiError> {
+        state_provider_func_impl!(self, describe_table(name))
     }
 
-    async fn create_pipeline(&mut self, name: &String, pipeline: &PipelineDefinition) -> Result<(), ServiceApiError> {
-        Self::handle_response(self.client.post(format!("{}/api/v1/create_pipeline/{}", self.base_address, name))
-            .body(serde_json::to_string(&pipeline).unwrap())
-            .send().await
-        ).await
+    pub async fn add_alias(&mut self, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
+        state_provider_func_impl!(self, add_alias(table_name, alias))
     }
 
-    async fn describe_pipeline(&mut self, name: &String) -> Result<Option<PipelineDefinition>, ServiceApiError> {
-        Self::handle_response_body_option(self.client.get(format!("{}/api/v1/describe_pipeline/{}", self.base_address, name))
-            .send().await
-        ).await
+    pub async fn remove_alias(&mut self, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
+        state_provider_func_impl!(self, remove_alias(table_name, alias))
     }
 
-    async fn create_lifetime_policy(&mut self, name: &String, pipeline: &ILMPolicyDefinition) -> Result<(), ServiceApiError> {
-        Self::handle_response(self.client.post(format!("{}/api/v1/create_lifetime_policy/{}", self.base_address, name))
-            .body(serde_json::to_string(&pipeline).unwrap())
-            .send().await
-        ).await
+    pub async fn create_table_template(&mut self, name: &String, template: &CreateIndexTemplateBody) -> Result<(), ServiceApiError> {
+        state_provider_func_impl!(self, create_table_template(name, template))
     }
 
-    async fn describe_lifetime_policy(&mut self, name: &String) -> Result<Option<ILMPolicyDefinition>, ServiceApiError> {
-        Self::handle_response_body_option(self.client.get(format!("{}/api/v1/describe_lifetime_policy/{}", self.base_address, name))
-            .send().await
-        ).await
-    }          
-
-    async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), ServiceApiError> {
-        Self::handle_response(self.client.post(format!("{}/api/v1/speedboat_commit", self.base_address))
-            .body(serde_json::to_string(&commit).unwrap())
-            .send().await
-        ).await
+    pub async fn describe_table_template(&mut self, name: &String) -> Result<Option<CreateIndexTemplateBody>, ServiceApiError> {
+        state_provider_func_impl!(self, describe_table_template(name))
     }
 
-    async fn iceberg_commit(&mut self, name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError> {
-        Self::handle_response(self.client.post(format!("{}/api/v1/iceberg_commit/{}", self.base_address, name))
-            .body(serde_json::to_string(&iceberg_commit).unwrap())
-            .send().await
-        ).await
+    pub async fn create_pipeline(&mut self, name: &String, pipeline: &PipelineDefinition) -> Result<(), ServiceApiError> {
+        state_provider_func_impl!(self, create_pipeline(name, pipeline))
     }
 
-    async fn extension_commit(&mut self, name: &String, commit: &ExtensionCommit) -> Result<(), ServiceApiError> {
-        Self::handle_response(self.client.post(format!("{}/api/v1/extension_commit/{}", self.base_address, name))
-            .body(serde_json::to_string(&commit).unwrap())
-            .send().await
-        ).await
+    pub async fn describe_pipeline(&mut self, name: &String) -> Result<Option<PipelineDefinition>, ServiceApiError> {
+        state_provider_func_impl!(self, describe_pipeline(name))
     }
 
-    async fn compaction_commit(&mut self, name: &String, commit: &CompactionCommit) -> Result<(), ServiceApiError> {
-        Self::handle_response(self.client.post(format!("{}/api/v1/compaction_commit/{}", self.base_address, name))
-            .body(serde_json::to_string(&commit).unwrap())
-            .send().await
-        ).await
+    pub async fn create_lifetime_policy(&mut self, name: &String, policy: &ILMPolicyDefinition) -> Result<(), ServiceApiError> {
+        state_provider_func_impl!(self, create_lifetime_policy(name, policy))
     }
 
-    async fn get_latest_checkpoint(&mut self, table_name: &String, extensions: Option<String>) -> Result<Option<String>, ServiceApiError> {
-        let payload = GetLatestCheckpoint {
-            table_name: table_name.to_owned(),
-            extension: extensions,
-        };
-        Self::handle_response_body_option(self.client.get(format!("{}/api/v1/get_latest_checkpoint", self.base_address))
-            .body(serde_json::to_string(&payload).unwrap())
-            .send().await
-        ).await
+    pub async fn describe_lifetime_policy(&mut self, name: &String) -> Result<Option<ILMPolicyDefinition>, ServiceApiError> {
+        state_provider_func_impl!(self, describe_lifetime_policy(name))
     }
 
-    async fn get_checkpoint(&mut self, checkpoint: &CheckpointDescriptor) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
-        Self::handle_response_body_option(self.client.get(format!("{}/api/v1/get_checkpoint", self.base_address))
-            .body(serde_json::to_string(&checkpoint).unwrap())
-            .send().await
-        ).await
+    pub async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), ServiceApiError> {
+        state_provider_func_impl!(self, speedboat_commit(commit))
     }
 
-    async fn get_extension_work_items(&mut self, extension_name: &String) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {
-        Self::handle_response_body(self.client.get(format!("{}/api/v1/get_extension_work_items/{}", self.base_address, extension_name))
-            .send().await
-        ).await
+    pub async fn iceberg_commit(&mut self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError> {
+        state_provider_func_impl!(self, iceberg_commit(table_name, iceberg_commit))
     }
 
-    async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
-        Self::handle_response_body(self.client.get(format!("{}/api/v1/get_compaction_work_items", self.base_address))
-            .send().await
-        ).await
+    pub async fn extension_commit(&mut self, table_name: &String, commit: &ExtensionCommit) -> Result<(), ServiceApiError> {
+        state_provider_func_impl!(self, extension_commit(table_name, commit))
     }
 
-    async fn get_peer_clients(&mut self) -> Vec<Box<dyn PeerClient>> {
-        todo!("nope")
+    pub async fn compaction_commit(&mut self, _table_name: &String, commit: &CompactionCommit) -> Result<(), ServiceApiError> {
+        state_provider_func_impl!(self, compaction_commit(_table_name, commit))
     }
 
-    async fn get_next_prefetch_checkpoints(&mut self, _extension: Option<String>) -> Result<Vec<CheckpointDescriptor>, ServiceApiError> {
-        todo!()
+    pub async fn get_latest_committed_checkpoint(&mut self, table_name: &String, extensions: Option<String>) -> Result<Option<String>, ServiceApiError> {
+        state_provider_func_impl!(self, get_latest_committed_checkpoint(table_name, extensions))
     }
 
-    async fn set_prefetch_checkpoints(&mut self, _checkpoints: &Vec<CheckpointDescriptor>, _extension: Option<String>) -> Result<(), ServiceApiError> {
-        todo!()
+    pub async fn get_checkpoint(&mut self, snapshot: &CheckpointDescriptor) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
+        state_provider_func_impl!(self, get_checkpoint(snapshot))
+    }
+
+    pub async fn get_extension_work_items(&mut self, extension_type: &String) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {
+        state_provider_func_impl!(self, get_extension_work_items(extension_type))
+    }
+
+    pub async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
+        state_provider_func_impl!(self, get_compaction_work_items())
+    }
+
+    pub async fn get_peer_clients(&mut self) -> Vec<Box<dyn PeerClient>> {
+        state_provider_func_impl!(self, get_peer_clients())
+    }
+
+    pub async fn get_next_prefetch_checkpoints(&mut self, extensions: Option<String>) -> Result<Vec<CheckpointDescriptor>, ServiceApiError> {
+        state_provider_func_impl!(self, get_next_prefetch_checkpoints(extensions))
     }
 }
 
@@ -978,12 +723,12 @@ pub struct ExtensionWorkItem {
 }
 
 impl ExtensionWorkItem {
-    fn clear(&mut self) -> () {
+    pub(crate) fn clear(&mut self) -> () {
         self.speedboat_files.clear();
         self.iceberg_files.clear();
     }
 
-    fn has_work(&self) -> bool {
+    pub(crate) fn has_work(&self) -> bool {
         self.speedboat_files.len() > 0 || self.iceberg_files.len() > 0
     }
 }
@@ -997,794 +742,51 @@ pub struct CompactionWorkItem {
 }
 
 
-struct TestApiServiceClient {
-    mode: TestProcessingMode,
-    tables: HashMap<String, TableDescription>,
-    // alias name -> table name
-    table_aliases: HashMap<String, String>,
-    table_templates: HashMap<String, CreateIndexTemplateBody>,
-    pipelines: HashMap<String, PipelineDefinition>,
-    lifetime_policies: HashMap<String, ILMPolicyDefinition>,
-    latest_committed_checkpoint_id: HashMap<String, String>,
-    latest_fetched_checkpoint_id: HashMap<String, String>,
-    compaction_work_items: HashMap<String, CompactionWorkItem>,
-    extension_work_items: HashMap<String, HashMap<String, ExtensionWorkItem>>,
-    compactions: HashMap<String, CompactionCommit>,
-    checkpoints: HashMap<String, TableMetadataCheckpoint>,
-    checkpoints_needing_extension_work: HashMap<String, Vec<String>>,
-    recent_file_extension_metadata: HashMap<String, Vec<ExtensionFile>>
-}
-
-impl TestApiServiceClient {
-    fn new() -> Self {
-        TestApiServiceClient{
-            mode: TestProcessingMode::default(),
-            tables: HashMap::new(),
-            table_aliases: HashMap::new(),
-            table_templates: HashMap::new(),
-            pipelines: HashMap::new(),
-            lifetime_policies: HashMap::new(),
-            latest_committed_checkpoint_id: HashMap::new(),
-            latest_fetched_checkpoint_id: HashMap::new(),
-            compaction_work_items: HashMap::new(),
-            compactions: HashMap::new(),
-            checkpoints: HashMap::new(),
-            checkpoints_needing_extension_work: HashMap::new(),
-            extension_work_items: HashMap::from([("es".to_string(), HashMap::new())]),
-            recent_file_extension_metadata: HashMap::new(),
-        }
-    }
-
-    async fn clear_and_set(&mut self, mode: TestProcessingMode) -> () {
-        distributed_cache::clear(&self.tables.keys().into_iter().map(|x|x.clone()).collect()).unwrap();
-        self.mode = mode;
-        self.tables.clear();
-        self.table_aliases.clear();
-        self.table_templates.clear();
-        self.pipelines.clear();
-        self.lifetime_policies.clear();
-        self.latest_committed_checkpoint_id.clear();
-        self.latest_fetched_checkpoint_id.clear();
-        self.compaction_work_items.clear();
-        self.compactions.clear();
-        self.checkpoints.clear();
-        self.checkpoints_needing_extension_work.clear();
-        self.extension_work_items = HashMap::from([("es".to_string(), HashMap::new())]);
-        self.recent_file_extension_metadata.clear();
-        drop_all_tables(&"default".to_string()).await.expect("Failed while dropping all tables");
-    }
-
-    fn checkpoints_needing_extension_work(&self, table_name: &String, extension_name: &String) -> Option<Vec<String>> {
-        self.checkpoints_needing_extension_work.get(&format!("{}_{}", table_name, extension_name)).cloned()
-    }
-
-    fn recent_file_extension_metadata(&self, table_name: &String, extension_name: &String, file_name: &String) -> Option<Vec<ExtensionFile>> {
-        self.recent_file_extension_metadata.get(&format!("{}_{}_{}", table_name, extension_name, file_name)).cloned()
-    }
-
-    fn add_recent_extension_files(&mut self, table_name: &String, commit: &ExtensionCommit) -> () {
-        for (file_name, extension_files) in commit.files.iter() {
-            self.recent_file_extension_metadata.insert(
-                format!("{}_{}_{}", table_name, commit.extension, file_name),
-                extension_files.clone()
-            );
-        }
-    }
-
-    fn try_fill_checkpoint_extension_metadata(&mut self, extension_name: &String, metadata: &mut TableMetadataCheckpoint) -> (FileSetPayload, FileSetPayload) {
-        if !metadata.extension_metadata.contains_key(extension_name) {
-            metadata.extension_metadata.insert(extension_name.clone(), HashMap::new());
-        }
-
-        let extension_metadata = metadata.extension_metadata.get_mut(extension_name).unwrap();
-
-        let mut iceberg_file_set = FileSetPayload::new();
-        match metadata.iceberg_metadata.as_ref() {
-            Some(im) => {
-                for file_desc in im.files.as_file_tuples() {
-                    match self.recent_file_extension_metadata(&metadata.table_name, extension_name, &file_desc.file_path) {
-                        Some(metadata) => {
-                            extension_metadata.insert(file_desc.file_path.clone(), metadata);
-                        },
-                        None => {
-                            iceberg_file_set.add(&file_desc);
-                        }
-                    }
-                }
-            },
-            None => ()
-        };
-
-        let mut speedboat_file_set = FileSetPayload::new();
-        match metadata.speedboat_metadata.as_ref() {
-            Some(im) => {
-                for file_desc in im.files.as_file_tuples() {
-                    match self.recent_file_extension_metadata(&metadata.table_name, extension_name, &file_desc.file_path) {
-                        Some(metadata) => {
-                            extension_metadata.insert(file_desc.file_path.clone(), metadata);
-                        },
-                        None => {
-                            speedboat_file_set.add(&file_desc);
-                        }
-                    }
-                }
-            },
-            None => ()
-        };
-
-        (speedboat_file_set, iceberg_file_set)
-    }
-
-    fn add_checkpoint(&mut self, metadata: &TableMetadataCheckpoint) -> () {
-        // To make testing a little easier, we'll just magic up a table as necessary
-        if !self.tables.contains_key(&metadata.table_name) {
-            self.tables.insert(
-                metadata.table_name.clone(), 
-                TableDescription{ name: metadata.table_name.clone(), tags: Default::default() }
-            );
-        }
-        let key = format!("{}_{}", &metadata.table_name, &metadata.checkpoint_id);
-        if !self.checkpoints.contains_key(&key) {
-            self.checkpoints.insert(key, metadata.clone());
-        }
-        self.latest_committed_checkpoint_id.insert(metadata.table_name.clone(), metadata.checkpoint_id.clone());
-        if metadata.extension_metadata.len() > 0 {
-            for extension in metadata.extension_metadata.keys() {
-                let key = format!("{}_{}", &metadata.table_name, extension);
-                if !self.latest_committed_checkpoint_id.contains_key(&key) {
-                    self.latest_committed_checkpoint_id.insert(key, metadata.checkpoint_id.clone());
-                }
-            }
-        } else {
-            self.fill_extension_work_item(
-                &metadata.table_name,
-                &"es".to_string(),
-                &metadata.checkpoint_id,
-                &metadata.schema,
-                metadata.speedboat_metadata.as_ref().map_or(&FileSetPayload::new(), |m|&m.files),
-                metadata.iceberg_metadata.as_ref().map_or(&FileSetPayload::new(), |m|&m.files)
-            )
-        }
-    }
-
-    fn fill_extension_work_item(
-        &mut self,
-        table_name: &String,
-        extension: &String,
-        checkpoint_id: &String,
-        schema: &PowdrrSchema,
-        speedboat_files: &FileSetPayload,
-        iceberg_files: &FileSetPayload,
-    ) -> () {
-        if speedboat_files.len() == 0 && iceberg_files.len() == 0 {
-            return;
-        }
-
-        let es_work_items = self.extension_work_items.get_mut(&"es".to_string()).unwrap();
-        if !es_work_items.contains_key(table_name) {
-            es_work_items.insert(
-                table_name.clone(),
-                ExtensionWorkItem {
-                    extension_type: extension.clone(),
-                    table_name: table_name.clone(),
-                    table_schema: schema.clone(),
-                    speedboat_files: speedboat_files.clone(),
-                    iceberg_files: iceberg_files.clone()
-                }
-            );
-        } else {
-            let table_work_item = es_work_items.get_mut(table_name).unwrap();
-            table_work_item.table_schema =schema.clone();
-            table_work_item.speedboat_files = table_work_item.speedboat_files.merge(speedboat_files);
-            table_work_item.iceberg_files = table_work_item.iceberg_files.merge(&iceberg_files);
-        }
-        let key = format!("{}_{}", table_name, extension);
-        if !self.checkpoints_needing_extension_work.contains_key(&key) {
-            self.checkpoints_needing_extension_work.insert(key, vec![checkpoint_id.clone()]);
-        } else {
-            self.checkpoints_needing_extension_work.get_mut(&key).unwrap().push(checkpoint_id.clone());
-        }
-    }
-
-    fn handle_compaction(&mut self, compactions: &Vec<String>, checkpoint: &mut TableMetadataCheckpoint) -> () {
-        let (removed_speedboat, removed_deletes) = self.get_removed_files(compactions);
-
-        match checkpoint.speedboat_metadata.as_mut() {
-            Some(speedboat) => {
-                speedboat.files.remove(&removed_speedboat);
-            },
-            None => ()
-        };
-
-        match checkpoint.deletes_metadata.as_mut() {
-            Some(deletes) => {
-                deletes.files.retain(|x|!removed_deletes.contains(x));
-            },
-            None => ()
-        };
-
-        for metadata in checkpoint.extension_metadata.values_mut() {
-            metadata.retain(|key, _|!removed_speedboat.contains(key))
-        }
-
-        // TODO: cleanup compactions
-        // self.compactions.retain(|x, _|!compactions.contains(x));
-    }
-
-    fn get_removed_files(&self, compactions: &Vec<String>) -> (Vec<String>, Vec<String>) {
-        let compactions_data: Vec<&CompactionCommit> = compactions.iter().map(|x| self.compactions.get(x).unwrap()).collect();
-        (
-            compactions_data.iter().map(|x| x.removed_speedboat_files.clone()).flatten().collect(),
-            compactions_data.iter().map(|x| x.removed_delete_files.clone()).flatten().collect(),
-        )
-    } 
-
-    fn get_latest_committed_checkpoint_sync(&mut self, table_name: &String, extensions: Option<String>) -> Option<String> {
-        let real_table_name = self.table_aliases.get(table_name).unwrap_or(table_name);
-        let key = match extensions {
-            Some(e) => &format!("{}_{}", real_table_name, e).to_string(),
-            None => table_name,
-        };
-        match self.latest_committed_checkpoint_id.get(key) {
-            Some(c) => Some(c.to_string()),
-            None => None
-        }
-    }     
-
-    fn set_latest_committed_checkpoint(&mut self, table_name: &String, extensions: Option<String>, checkpoint_id: &String) {
-        let real_table_name = self.table_aliases.get(table_name).unwrap_or(table_name);
-        let key = match extensions {
-            Some(e) => &format!("{}_{}", real_table_name, e).to_string(),
-            None => table_name,
-        };
-        assert!(self.latest_committed_checkpoint_id.get(key).is_none() || self.latest_committed_checkpoint_id.get(key).unwrap() < checkpoint_id);
-        self.latest_committed_checkpoint_id.insert(key.clone(), checkpoint_id.clone());
-    }
-
-    fn get_latest_fetched_checkpoint(&mut self, table_name: &String, extensions: Option<String>) -> Option<String> {
-        let real_table_name = self.table_aliases.get(table_name).unwrap_or(table_name);
-        let key = match extensions {
-            Some(e) => &format!("{}_{}", real_table_name, e).to_string(),
-            None => table_name,
-        };
-        match self.latest_fetched_checkpoint_id.get(key) {
-            Some(c) => Some(c.to_string()),
-            None => None
-        }
-    }
-
-    fn set_latest_fetched_checkpoint(&mut self, table_name: &String, extensions: Option<String>, checkpoint_id: &String) {
-        let real_table_name = self.table_aliases.get(table_name).unwrap_or(table_name);
-        let key = match extensions {
-            Some(e) => &format!("{}_{}", real_table_name, e).to_string(),
-            None => table_name,
-        };
-        assert!(self.latest_fetched_checkpoint_id.get(key).is_none() || self.latest_fetched_checkpoint_id.get(key).unwrap() < checkpoint_id);
-        self.latest_fetched_checkpoint_id.insert(key.clone(), checkpoint_id.clone());
-    }
-
-    async fn speedboat_commit_type_commit(&mut self, table_info: &SpeedboatCommitTableInfo, compactions: &Vec<String>) -> Result<(), ServiceApiError> {
-        let latest_checkpoint = match self.get_latest_committed_checkpoint_sync(&table_info.table_name, None) {
-            Some(checkpoint_id) => {
-                let key = format!("{}_{}", &table_info.table_name, checkpoint_id);
-                match self.checkpoints.get(&key) {
-                    Some(c) => c,
-                    None => panic!("Found latest checkpoint id but checkpoint missing = {}", key)
-                }
-            },
-            None => {
-                &TableMetadataCheckpoint {
-                    table_name: table_info.table_name.clone(),
-                    checkpoint_id: "".to_string(),
-                    iceberg_metadata: None,
-                    speedboat_metadata: None,
-                    deletes_metadata: None,
-                    extension_metadata: HashMap::new(),
-                    schema: table_info.schema.as_ref().unwrap().clone()
-                }
-            },
-        };
-
-        let new_checkpoint_id = IdInstance::next_id().to_string();
-        let new_speedboat_metadata = match &latest_checkpoint.speedboat_metadata {
-            None => SpeedboatMetadata {
-                files: FileSetPayload {
-                    file_paths: table_info.files.clone(),
-                    sizes: table_info.sizes.clone(),
-                    schemas: vec!(table_info.schema.as_ref().unwrap().clone()),
-                    file_schemas: table_info.files.iter().map(|_| 0).collect(),
-                }
-            },
-            Some(existing) => {
-                SpeedboatMetadata {
-                    files: existing.files.merge(&table_info.as_file_set_payload())
-                }
-            },
-        };
-
-        let mut merged_schema = latest_checkpoint.schema.clone();
-        if table_info.schema.is_some() {
-            merged_schema.merge_from(table_info.schema.as_ref().unwrap());
-        }
-
-        let mut new_latest_checkpoint = TableMetadataCheckpoint {
-            table_name: table_info.table_name.clone(),
-            checkpoint_id: new_checkpoint_id.clone(),
-            iceberg_metadata: latest_checkpoint.iceberg_metadata.clone(),
-            speedboat_metadata: Some(new_speedboat_metadata.clone()),
-            deletes_metadata: latest_checkpoint.deletes_metadata.clone(),
-            extension_metadata: latest_checkpoint.extension_metadata.clone(),
-            schema: merged_schema.clone(),
-        };
-
-        self.handle_compaction(compactions, &mut new_latest_checkpoint);
-        let (speedboat_files, iceberg_files) = self.try_fill_checkpoint_extension_metadata(&"es".to_string(), &mut new_latest_checkpoint);
-
-        self.checkpoints.insert(format!("{}_{}", &table_info.table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
-
-        self.fill_extension_work_item(
-            &table_info.table_name,
-            &"es".to_string(),
-            &new_checkpoint_id,
-            &merged_schema,
-            &speedboat_files,
-            &iceberg_files
-        );
-
-        self.create_index(&table_info.table_name).await?;
-
-        self.set_latest_committed_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
-
-        // TODO: apply some policy here based on sizes to split up compaction work items
-        match self.compaction_work_items.get_mut(&table_info.table_name) {
-            Some(compaction) => {
-                compaction.table_schema = new_latest_checkpoint.schema.clone();
-                compaction.speedboat_files = compaction.speedboat_files.merge(&table_info.as_file_set_payload())
-            },
-            None => {
-                self.compaction_work_items.insert(
-                    table_info.table_name.clone(),
-                    CompactionWorkItem {
-                        table_schema: new_latest_checkpoint.schema.clone(),
-                        speedboat_files: table_info.as_file_set_payload(),
-                        delete_files: new_latest_checkpoint.deletes_metadata.as_ref().map_or_else(|| vec!(), |m|m.files.clone()),
-                    }
-                );
-            }
-        }
-        Ok(())
-    }    
-
-    async fn speedboat_commit_type_delete(&mut self, table_info: &SpeedboatCommitTableInfo, compactions: &Vec<String>) -> Result<(), ServiceApiError> {
-        let latest_checkpoint = match self.get_latest_committed_checkpoint_sync(&table_info.table_name, None) {
-            Some(checkpoint_id) => {
-                let key = format!("{}_{}", &table_info.table_name, checkpoint_id);
-                match self.checkpoints.get(&key) {
-                    Some(c) => c,
-                    None => panic!("Found latest checkpoint id but checkpoint missing = {}", key)
-                }
-            },
-            None => {
-                &TableMetadataCheckpoint {
-                    table_name: table_info.table_name.clone(),
-                    checkpoint_id: "".to_string(),
-                    iceberg_metadata: None,
-                    speedboat_metadata: None,
-                    deletes_metadata: None,
-                    extension_metadata: HashMap::new(),
-                    schema: PowdrrSchema{ fields: vec!() },
-                }
-            },
-        };
-
-        let new_checkpoint_id = IdInstance::next_id().to_string();
-        let new_deletes_metadata = match &latest_checkpoint.deletes_metadata {
-            None => DeletesMetadata {
-                files: table_info.files.clone(),
-            },
-            Some(existing) => {
-                let mut files = existing.files.clone();
-                files.extend(table_info.files.clone());
-                DeletesMetadata {
-                    files
-                }
-            }
-        };
-
-        tracing::info!("Delete commit has {} files", new_deletes_metadata.files.len());
-        for file in &new_deletes_metadata.files {
-            tracing::info!("Delete file {}", file)
-        }
-
-        let mut new_latest_checkpoint = TableMetadataCheckpoint {
-            table_name: table_info.table_name.clone(),
-            checkpoint_id: new_checkpoint_id.clone(),
-            iceberg_metadata: latest_checkpoint.iceberg_metadata.clone(),
-            speedboat_metadata: latest_checkpoint.speedboat_metadata.clone(),
-            deletes_metadata: Some(new_deletes_metadata),
-            extension_metadata: latest_checkpoint.extension_metadata.clone(),
-            schema: latest_checkpoint.schema.clone(),
-        };
-        self.handle_compaction(&compactions, &mut new_latest_checkpoint);
-        self.try_fill_checkpoint_extension_metadata(&"es".to_string(), &mut new_latest_checkpoint);
-
-        self.checkpoints.insert(format!("{}_{}", &table_info.table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
-        self.set_latest_committed_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
-        match self.compaction_work_items.get_mut(&table_info.table_name) {
-            Some(work_item) => {
-                work_item.delete_files.extend(table_info.files.clone());
-            },
-            None => {}
-        }
-        Ok(())
-    }    
-
-    fn get_checkpoint_sync(&self, table_name: &String, checkpoint_id: &String) -> Option<TableMetadataCheckpoint> {
-        let key = format!("{}_{}", table_name, checkpoint_id);
-        self.checkpoints.get(&key).cloned()
-    }
-
-    fn add_coverage_for(&mut self, table_name: &String, checkpoint_id: &String, extension_commit: &ExtensionCommit) -> Option<String> {
-        let key = format!("{}_{}", table_name, checkpoint_id);
-
-        let checkpoint = self.checkpoints.get_mut(&key).unwrap();
-
-        checkpoint.add_coverage(extension_commit);
-
-        if checkpoint.fully_covered_for_extension(&extension_commit.extension) {
-            let key = format!("{}_{}", table_name, extension_commit.extension);
-            if self.checkpoints_needing_extension_work.contains_key(&key) {
-                self.checkpoints_needing_extension_work.get_mut(&key).unwrap().retain(|x|x != checkpoint_id);
-            }
-            Some(checkpoint_id.clone())
-        } else {
-            None
-        }
-    }
-
-    async fn create_index(&mut self, table_name: &String) -> Result<(), ServiceApiError> {
-        match self.mode.indexing_mode {
-            IndexingMode::Sync => {
-                let work_items = self.get_extension_work_items(&"es".to_owned()).await?;
-                for work_item in work_items.iter() {
-                    let metadata = create_index_inner(
-                        &work_item.iceberg_files.as_file_tuples(),
-                        &work_item.speedboat_files.as_file_tuples()
-                    ).await.map_err(|e|ServiceApiError::from_index_error(&e))?;
-                    self.extension_commit(
-                        &table_name,
-                        &ExtensionCommit {
-                            extension: "es".to_owned(),
-                            files: metadata,
-                        }
-                    ).await?
-                }
-            },
-            _ => ()
-        }
-        Ok(())
-    }
-
-}
-
-unsafe impl Sync for TestApiServiceClient {}
-unsafe impl Send for TestApiServiceClient {}
-
-#[async_trait]
-impl ApiServiceClient for TestApiServiceClient {
-    async fn get_all_iceberg_tables(&mut self) -> Result<Vec<String>, ServiceApiError> {
-        todo!()
-    }
-
-    async fn create_table(&mut self, create_table: &CreateTable) -> Result<(), ServiceApiError> {
-        match distributed_cache::create_table(&create_table.name) {
-            Ok(_) => (),
-            Err(e) => panic!("Unable to create table = {}", e),
-        };
-        match self.tables.get(&create_table.name) {
-            Some(_) => {
-                self.tables.remove(&create_table.name);
-                self.tables.insert(create_table.name.clone(), TableDescription::from_create_table(create_table));
-            }
-            None => {
-                self.tables.insert(create_table.name.clone(), TableDescription::from_create_table(create_table));
-            }
-        }
-        Ok(())
-    }
-
-    async fn describe_table(&mut self, name: &String) -> Result<Option<TableDescription>, ServiceApiError> {
-        let final_name = self.table_aliases.get(name).unwrap_or_else(|| name);
-        match self.tables.get(final_name) {
-            Some(d) => Ok(Some(d.clone())),
-            None => Ok(None)
-        }
-    }
-
-    async fn add_alias(&mut self, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
-        // TODO: check if something exists
-        self.table_aliases.insert(alias.clone(), table_name.clone());
-        Ok(())
-    }
-
-    async fn remove_alias(&mut self, _table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
-        // TODO: check if something exists
-        self.table_aliases.remove(alias);
-        Ok(())
-    }
-
-    async fn create_table_template(&mut self, name: &String, template: &CreateIndexTemplateBody) -> Result<(), ServiceApiError> {
-        match self.table_templates.get(name) {
-            Some(_) => {
-                self.table_templates.remove(name);
-                self.table_templates.insert(name.clone(), template.clone());
-                Ok(())
-            }
-            None => {
-                self.table_templates.insert(name.clone(), template.clone());
-                Ok(())
-            }
-        }
-    }
-
-    async fn describe_table_template(&mut self, name: &String) -> Result<Option<CreateIndexTemplateBody>, ServiceApiError> {
-        match self.table_templates.get(name) {
-            Some(d) => Ok(Some(d.clone())),
-            None => Ok(None)
-        }
-    }
-
-    async fn create_pipeline(&mut self, name: &String, pipeline: &PipelineDefinition) -> Result<(), ServiceApiError> {
-        match self.pipelines.get(name) {
-            Some(_) => panic!("Need to do a real error path now"),
-            None => {
-                self.pipelines.insert(name.clone(), pipeline.clone());
-                Ok(())
-            }
-        }
-    }
-
-    async fn describe_pipeline(&mut self, name: &String) -> Result<Option<PipelineDefinition>, ServiceApiError> {
-        match self.pipelines.get(name) {
-            Some(p) => Ok(Some(p.clone())),
-            None => Ok(None)
-        }
-    }
-
-    async fn create_lifetime_policy(&mut self, name: &String, policy: &ILMPolicyDefinition) -> Result<(), ServiceApiError> {
-        match self.lifetime_policies.get(name) {
-            Some(_) => panic!("Need to do a real error path now"),
-            None => {
-                self.lifetime_policies.insert(name.clone(), policy.clone());
-                Ok(())
-            }
-        }
-    }
-
-    async fn describe_lifetime_policy(&mut self, name: &String) -> Result<Option<ILMPolicyDefinition>, ServiceApiError> {
-        match self.lifetime_policies.get(name) {
-            Some(p) => Ok(Some(p.clone())),
-            None => Ok(None)
-        }
-    }
-
-
-    async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), ServiceApiError> {
-        for table_info in commit.type_files.iter() {
-            if table_info.commit_type == "commit" || table_info.commit_type == "compact" {
-                self.speedboat_commit_type_commit(table_info, &commit.compactions).await?;
-            } else if table_info.commit_type == "delete" {
-                self.speedboat_commit_type_delete(table_info, &commit.compactions).await?;
-            } else {
-                panic!("Unknown Speedboat commit type")
-            }
-        }
-        Ok(())
-    }
-
-    async fn iceberg_commit(&mut self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError> {
-        let latest_checkpoint = match self.get_latest_committed_checkpoint_sync(table_name, None) {
-            Some(checkpoint_id) => {
-                let key = format!("{}_{}", table_name, checkpoint_id);
-                match self.checkpoints.get(&key) {
-                    Some(c) => c,
-                    None => panic!("Found latest checkpoint id but checkpoint missing = {}", key)
-                }
-            },
-            None => {
-                &TableMetadataCheckpoint {
-                    table_name: table_name.clone(),
-                    checkpoint_id: "".to_string(),
-                    iceberg_metadata: None,
-                    speedboat_metadata: None,
-                    deletes_metadata: None,
-                    extension_metadata: HashMap::new(),
-                    schema: iceberg_commit.metadata.table_schema.clone()
-                }
-            },
-        };
-
-        let new_checkpoint_id = IdInstance::next_id().to_string();
-
-        let mut merged_schema = latest_checkpoint.schema.clone();
-        merged_schema.merge_from(&iceberg_commit.metadata.table_schema);
-
-        let mut new_latest_checkpoint = TableMetadataCheckpoint {
-            table_name: table_name.clone(),
-            checkpoint_id: new_checkpoint_id.clone(),
-            iceberg_metadata: Some(iceberg_commit.metadata.clone()),
-            speedboat_metadata: latest_checkpoint.speedboat_metadata.clone(),
-            deletes_metadata: latest_checkpoint.deletes_metadata.clone(),
-            extension_metadata: latest_checkpoint.extension_metadata.clone(),
-            schema: merged_schema.clone(),
-        };
-        self.handle_compaction(&iceberg_commit.compactions, &mut new_latest_checkpoint);
-        let (speedboat_files, iceberg_files) = self.try_fill_checkpoint_extension_metadata(&"es".to_string(), &mut new_latest_checkpoint);
-
-        self.checkpoints.insert(format!("{}_{}", &table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
-        self.set_latest_committed_checkpoint(&table_name, None, &new_checkpoint_id);
-
-        self.fill_extension_work_item(
-            &table_name,
-            &"es".to_string(),
-            &new_checkpoint_id,
-            &merged_schema,
-            &speedboat_files,
-            &iceberg_files
-        );
-
-        self.create_index(table_name).await?;
-
-        Ok(())
-    }
-
-    async fn extension_commit(&mut self, table_name: &String, commit: &ExtensionCommit) -> Result<(), ServiceApiError> {
-        let waiting_checkpoint_ids = self.checkpoints_needing_extension_work(table_name, &commit.extension).unwrap_or_else(|| vec!());
-        assert!(waiting_checkpoint_ids.len() > 0);
-
-        let removed_checkpoint_ids: Vec<String> = waiting_checkpoint_ids.iter().map(|x|self.add_coverage_for(table_name, x, commit)).flatten().collect();
-        assert!(removed_checkpoint_ids.len() > 0);
-
-        let max_id = removed_checkpoint_ids.iter().max().unwrap();
-
-        self.add_recent_extension_files(table_name, commit);
-
-        match self.get_latest_committed_checkpoint_sync(table_name, Some("es".to_string())) {
-            Some(latest) => {
-                if max_id > &latest {
-                    self.set_latest_committed_checkpoint(table_name, Some("es".to_string()), max_id);
-                }
-            },
-            None => {
-                self.set_latest_committed_checkpoint(table_name, Some("es".to_string()), max_id);
-            },
-        };
-        Ok(())
-    }
-
-    async fn compaction_commit(&mut self, _table_name: &String, commit: &CompactionCommit) -> Result<(), ServiceApiError> {
-        // NOTE: this just notes what the compactor is saying. We don't generate the new checkpoint
-        // until we see an iceberg or speedboat commit with the new info.
-        self.compactions.insert(commit.compaction_id.clone(), commit.clone());
-        Ok(())
-    }
-
-    async fn get_latest_checkpoint(&mut self, table_name: &String, extensions: Option<String>) -> Result<Option<String>, ServiceApiError> {
-        match self.mode.prefetch_mode {
-            PrefetchMode::Disabled => {
-                Ok(self.get_latest_committed_checkpoint_sync(table_name, extensions))
-            },
-            PrefetchMode::Enabled => {
-                Ok(self.get_latest_fetched_checkpoint(table_name, extensions))
-            }
-        }
-    }
-
-    async fn get_checkpoint(&mut self, snapshot: &CheckpointDescriptor) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
-        match self.get_checkpoint_sync(&snapshot.table_name, &snapshot.checkpoint_id) {
-            Some(v) => Ok(Some(v.clone())),
-            None => Ok(None)
-        }
-    }
-
-    async fn get_extension_work_items(&mut self, extension_type: &String) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {
-        if extension_type == "es" {
-            // TODO: priority by index? allow index filtering?
-            let mut collected_work_items= vec!();
-            match self.extension_work_items.get_mut(extension_type) {
-                Some(items) => {
-                    for (_, work_items) in items.iter_mut() {
-                        if work_items.has_work() {
-                            collected_work_items.push(work_items.clone());
-                            work_items.clear();
-                        }
-                    }
-                },
-                None => ()
-            };
-            Ok(collected_work_items)
-        } else {
-            Ok(vec!())
-        }
-    }
-
-    async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
-        let mut work_items = vec!();
-        for (table_name, compaction) in self.compaction_work_items.iter_mut() {
-            tracing::info!("Compaction work item stats: size = {}/{}, files = {}/200",
-                compaction.speedboat_files.sizes.iter().sum::<u64>(),
-                30 * 1024 * 1024,
-                compaction.speedboat_files.sizes.len()
-            );
-            let do_compaction = compaction.speedboat_files.sizes.iter().sum::<u64>() > 30 * 1024 * 1024 || compaction.speedboat_files.sizes.len() > 200;
-            //let do_compaction = true;
-            if do_compaction {
-                work_items.push((table_name.clone(), compaction.clone()));
-                compaction.speedboat_files.clear();
-            }
-        }
-        Ok(work_items)
-    }
-
-    async fn get_peer_clients(&mut self) -> Vec<Box<dyn PeerClient>> {
-        vec!(Box::new(SelfPeer::new(self.mode.compaction_mode.clone())))
-    }
-
-    async fn get_next_prefetch_checkpoints(&mut self, extension: Option<String>) -> Result<Vec<CheckpointDescriptor>, ServiceApiError> {
-        match self.mode.prefetch_mode {
-            PrefetchMode::Enabled => {
-                let mut checkpoints = vec!();
-                let all_table_names: Vec<String> = self.tables.keys().cloned().collect();
-                for table_name in all_table_names.iter() {
-                    let latest_checkpoint = match self.get_latest_committed_checkpoint_sync(table_name, extension.clone()) {
-                        Some(checkpoint_id) => checkpoint_id,
-                        None => continue
-                    };
-                    match self.get_latest_fetched_checkpoint(table_name, extension.clone()) {
-                        Some(latest_fetched_id) => {
-                            assert!(latest_checkpoint >= latest_fetched_id);
-                            if latest_checkpoint != latest_fetched_id {
-                                checkpoints.push(CheckpointDescriptor {
-                                    table_name: table_name.clone(),
-                                    checkpoint_id: latest_checkpoint.clone(),
-                                });
-                            }
-                        },
-                        None => {
-                            checkpoints.push(CheckpointDescriptor {
-                                table_name: table_name.clone(),
-                                checkpoint_id: latest_checkpoint.clone(),
-                            });
-                        }
-                    }
-                }
-                Ok(checkpoints)
-            },
-            PrefetchMode::Disabled => {
-                Ok(vec!())
-            }
-        }
-    }
-
-    async fn set_prefetch_checkpoints(&mut self, checkpoints: &Vec<CheckpointDescriptor>, extension: Option<String>) -> Result<(), ServiceApiError> {
-        match self.mode.prefetch_mode {
-            PrefetchMode::Enabled => {
-                for checkpoint in checkpoints {
-                    self.set_latest_fetched_checkpoint(&checkpoint.table_name, extension.clone(), &checkpoint.checkpoint_id);
-                }
-                Ok(())
-            },
-            PrefetchMode::Disabled => {
-                panic!("Should not be called")
-            }
-        }
-    }
-
-}
-
 #[derive(Clone)]
 pub struct ApiServiceClientHandle {
     sender: mpsc::Sender<ApiServiceClientActorMessage>,
+}
+
+
+macro_rules! send_message {
+    ($self:expr, $message_type:tt) => {
+        {
+            let (send, recv) = oneshot::channel();
+            let msg = ApiServiceClientActorMessage::$message_type {
+                respond_to: send,
+            };
+            let _ = $self.sender.send(msg).await;
+            // TODO: deal with errors
+            recv.await.expect("Actor task has been killed")
+        }
+    };
+
+    ($self:expr, $message_type:tt, $field:ident = $value:expr) => {
+        {
+            let (send, recv) = oneshot::channel();
+            let msg = ApiServiceClientActorMessage::$message_type {
+                respond_to: send,
+                $field: $value
+            };
+            let _ = $self.sender.send(msg).await;
+            // TODO: deal with errors
+            recv.await.expect("Actor task has been killed")
+        }
+    };
+
+    ($self:expr, $message_type:tt, $field1:ident = $value1:expr, $field2:ident = $value2:expr) => {
+        {
+            let (send, recv) = oneshot::channel();
+            let _ = $self.sender.send(ApiServiceClientActorMessage::$message_type {
+                respond_to: send,
+                $field1: $value1,
+                $field2: $value2
+            }).await;
+            // TODO: deal with errors
+            recv.await.expect("Actor task has been killed")
+        }
+    };
+
 }
 
 impl ApiServiceClientHandle {
@@ -1797,287 +799,99 @@ impl ApiServiceClientHandle {
     }
 
     pub async fn set_testing_mode(&self, mode: &TestProcessingMode) -> () {
-        let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::Testing { 
-            respond_to: send,
-            mode: mode.clone(),
-        };
-
-        let _ = self.sender.send(msg).await;
-        // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")
+        send_message!(self, Testing, mode = mode.clone());
     }
 
     pub async fn create_pipeline(&self, name: &String, pipeline: &PipelineDefinition) -> Result<(), ServiceApiError> {
-        let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::CreatePipeline { 
-            respond_to: send,
-            name: name.clone(),
-            pipeline: pipeline.clone(),
-        };
-
-        let _ = self.sender.send(msg).await;
-        // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")
+        send_message!(self, CreatePipeline, name = name.clone(), pipeline = pipeline.clone())
     }
 
     pub async fn describe_pipeline(&self, name: &String) -> Result<Option<PipelineDefinition>, ServiceApiError> {
-        let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::DescribePipeline { 
-            respond_to: send,
-            name: name.clone()
-        };
-
-        let _ = self.sender.send(msg).await;
-        // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")
+        send_message!(self, DescribePipeline, name = name.clone())
     }
 
-    pub async fn create_lifetime_policy(&self, name: &String, pipeline: &ILMPolicyDefinition) -> Result<(), ServiceApiError> {
-        let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::CreateLifetimePolicy {
-            respond_to: send,
-            name: name.clone(),
-            policy: pipeline.clone(),
-        };
-
-        let _ = self.sender.send(msg).await;
-        // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")
+    pub async fn create_lifetime_policy(&self, name: &String, policy: &ILMPolicyDefinition) -> Result<(), ServiceApiError> {
+        send_message!(self, CreateLifetimePolicy, name = name.clone(), policy = policy.clone())
     }
 
     pub async fn describe_lifetime_policy(&self, name: &String) -> Result<Option<ILMPolicyDefinition>, ServiceApiError> {
-        let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::DescribeLifetimePolicy {
-            respond_to: send,
-            name: name.clone()
-        };
-
-        let _ = self.sender.send(msg).await;
-        // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")
+        send_message!(self, DescribeLifetimePolicy, name = name.clone())
     }
 
     pub async fn create_table(&self, create_table: &CreateTable) -> Result<(), ServiceApiError> {
-        let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::CreateTable { 
-            respond_to: send,
-            create_table: create_table.clone()
-        };
-
-        let _ = self.sender.send(msg).await;
-        // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")        
+        send_message!(self, CreateTable, create_table = create_table.clone())
     }  
 
     pub async fn describe_table(&self, table_name: &String) -> Result<Option<TableDescription>, ServiceApiError> {
-        let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::DescribeTable { 
-            respond_to: send,
-            name: table_name.clone()
-        };
-
-        let _ = self.sender.send(msg).await;
-        // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")          
+        send_message!(self, DescribeTable, name = table_name.clone())
     } 
 
     pub async fn add_alias(&self, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
-        let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::AddAlias { 
-            respond_to: send,
-            table_name: table_name.clone(),
-            alias: alias.clone(),
-        };
-
-        let _ = self.sender.send(msg).await;
-        // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")        
+        send_message!(self, AddAlias, table_name = table_name.clone(), alias = alias.clone())
     }  
 
     pub async fn remove_alias(&self, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
-        let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::RemoveAlias { 
-            respond_to: send,
-            table_name: table_name.clone(),
-            alias: alias.clone(),
-        };
-
-        let _ = self.sender.send(msg).await;
-        // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")        
+        send_message!(self, RemoveAlias, table_name = table_name.clone(), alias = alias.clone())
     }         
 
     pub async fn create_table_template(&self, name: &String, template: &CreateIndexTemplateBody) -> Result<(), ServiceApiError> {
-        let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::CreateTableTemplate { 
-            respond_to: send,
-            name: name.clone(),
-            template: template.clone(),
-        };
-
-        let _ = self.sender.send(msg).await;
-        // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")        
+        send_message!(self, CreateTableTemplate, name = name.clone(), template = template.clone())
     }  
 
     pub async fn describe_table_template(&self, table_name: &String) -> Result<Option<CreateIndexTemplateBody>, ServiceApiError> {
-        let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::DescribeTableTemplate { 
-            respond_to: send,
-            name: table_name.clone()
-        };
-
-        let _ = self.sender.send(msg).await;
-        // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")          
+        send_message!(self, DescribeTableTemplate, name = table_name.clone())
     }     
 
     pub async fn add_checkpoint(&self, checkpoint: &TableMetadataCheckpoint) -> () {
-        let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::AddCheckpoint { 
-            respond_to: send,
-            checkpoint: checkpoint.clone(),
-        };
-
-        let _ = self.sender.send(msg).await;
-        // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")        
+        send_message!(self, AddCheckpoint, checkpoint = checkpoint.clone())
     }
 
     pub async fn iceberg_commit(&self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError> {
-        let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::IcebergCommit { 
-            respond_to: send,
-            table_name: table_name.clone(),
-            iceberg_commit: iceberg_commit.clone(),
-        };
-
-        let _ = self.sender.send(msg).await;
-        // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")
-    }    
+        send_message!(self, IcebergCommit, table_name = table_name.clone(), iceberg_commit = iceberg_commit.clone())
+    }
 
     pub async fn speedboat_commit(&self, speedboat_commit: &SpeedboatCommit) -> Result<(), ServiceApiError> {
-        let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::SpeedboatCommit { 
-            respond_to: send,
-            speedboat_commit: speedboat_commit.clone(),
-        };
-
-        let _ = self.sender.send(msg).await;
-        // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")
+        send_message!(self, SpeedboatCommit, speedboat_commit = speedboat_commit.clone())
     }
 
     pub async fn extension_commit(&self, table_name: &String, extension_commit: &ExtensionCommit) -> Result<(), ServiceApiError> {
-        let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::ExtensionCommit { 
-            respond_to: send,
-            table_name: table_name.clone(),
-            extension_commit: extension_commit.clone(),
-        };
-
-        let _ = self.sender.send(msg).await;
-        // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")
+        send_message!(self, ExtensionCommit, table_name = table_name.clone(), extension_commit = extension_commit.clone())
     }
 
     pub async fn compaction_commit(&self, table_name: &String, compaction_commit: &CompactionCommit) -> Result<(), ServiceApiError> {
-        let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::CompactionCommit { 
-            respond_to: send,
-            table_name: table_name.clone(),
-            compaction_commit: compaction_commit.clone(),
-        };
-
-        let _ = self.sender.send(msg).await;
-        // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")
-    }    
+        send_message!(self, CompactionCommit, table_name = table_name.clone(), compaction_commit = compaction_commit.clone())
+    }
 
     pub async fn get_latest_checkpoint(&self, table_name: &String, extension: Option<String>) -> Result<Option<String>, ServiceApiError> {
-        let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::GetLatestCheckpoint { 
-            respond_to: send,
-            table_name: table_name.clone(),
-            extensions: extension.clone(),
-        };
-
-        let _ = self.sender.send(msg).await;
-        // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")
-    }   
+        send_message!(self, GetLatestCommittedCheckpoint, table_name = table_name.clone(), extensions = extension.clone())
+    }
 
     pub async fn get_checkpoint(&self, checkpoint: CheckpointDescriptor) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
-        let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::GetCheckpoint { 
-            respond_to: send,
-            checkpoint: checkpoint,
-        };
-
-        let _ = self.sender.send(msg).await;
-        // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")
+        send_message!(self, GetCheckpoint, checkpoint = checkpoint.clone())
     }
 
     pub async fn get_extension_work_items(&self, extension_type: &String) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {
-        let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::GetExtensionWorkItems {
-            respond_to: send,
-            extension_type: extension_type.clone(),
-        };
-
-        let _ = self.sender.send(msg).await;
-        // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")
+        send_message!(self, GetExtensionWorkItems, extension_type = extension_type.clone())
     }
 
     pub async fn get_compaction_work_items(&self) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
-        let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::GetCompactionWorkItems {
-            respond_to: send,
-        };
-
-        let _ = self.sender.send(msg).await;
-        // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")
+        send_message!(self, GetCompactionWorkItems)
     }
 
     pub async fn get_peer_clients(&self) -> Vec<Box<dyn PeerClient>> {
-        let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::GetPeerClients {
-            respond_to: send,
-        };
-
-        let _ = self.sender.send(msg).await;
-        // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")
+        send_message!(self, GetPeerClients)
     }
-    
-    pub async fn get_next_prefetch_checkpoints(&self, extension: Option<String>) -> Result<Vec<CheckpointDescriptor>, ServiceApiError> {
-        let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::GetNextPrefetchCheckpoints {
-            respond_to: send,
-            extensions: extension.clone(),
-        };
 
-        let _ = self.sender.send(msg).await;
-        // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")
+    pub async fn get_latest_target_checkpoint(&self, table_name: &String, extension: Option<String>) -> Result<Option<String>, ServiceApiError> {
+        send_message!(self, GetLatestTargetCheckpoint, table_name = table_name.clone(), extensions = extension.clone())
+    }
+
+    pub async fn get_next_prefetch_checkpoints(&self, extension: Option<String>) -> Result<Vec<CheckpointDescriptor>, ServiceApiError> {
+        send_message!(self, GetNextPrefetchCheckpoints, extensions = extension.clone())
     }
 
     pub async fn set_prefetch_checkpoints(&self, checkpoints: &Vec<CheckpointDescriptor>, extension: Option<String>) -> Result<(), ServiceApiError> {
-        let (send, recv) = oneshot::channel();
-        let msg = ApiServiceClientActorMessage::SetPrefetchCheckpoints {
-            respond_to: send,
-            checkpoints: checkpoints.clone(),
-            extensions: extension.clone(),
-        };
-
-        let _ = self.sender.send(msg).await;
-        // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")
+        send_message!(self, SetPrefetchCheckpoints, checkpoints = checkpoints.clone(), extensions = extension.clone())
     }
 }
 
