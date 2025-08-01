@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::elastic_search_common::MIME_ES_JSON;
 use crate::elastic_search_endpoints::NamePathExtractor;
 use crate::elastic_search_responses::{ErrorDetails, SingleDocCreateFailedResult};
-use crate::state_hosted_service::API_SERVICE_CLIENT;
+use crate::state_provider::STATE_PROVIDER;
 use crate::util::log_service_err_response;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -77,7 +77,7 @@ pub fn es_get_ilm_policy(state: State) -> Pin<Box<HandlerFuture>> {
         let path_extractor = NamePathExtractor::borrow_from(&state);
         let table = path_extractor.name.to_string();
 
-        match API_SERVICE_CLIENT.describe_lifetime_policy(&table).await {
+        match STATE_PROVIDER.describe_lifetime_policy(&table).await {
             Ok(lp) => match lp {
                 Some(_) => {
                     let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, "{}".to_string());
@@ -123,7 +123,7 @@ pub fn es_post_ilm_policy(mut state: State) -> Pin<Box<HandlerFuture>> {
             Err(_) => panic!("Oh no"),
         };
 
-        match API_SERVICE_CLIENT.create_lifetime_policy(&table, &policy).await {
+        match STATE_PROVIDER.create_lifetime_policy(&table, &policy).await {
             Ok(_) => (),
             Err(e) => return Ok(log_service_err_response(e, state))
         };

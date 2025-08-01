@@ -4,7 +4,7 @@ use chrono::prelude::*;
 use serde::{ser::SerializeMap, Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::{painless_parser, pipeline::{self, AppendProcessorBody, PipelineDefinition, PipelineError, PipelineProcessorBody, ProcessorBodies, RemoveProcessorBody, RenameProcessorBody, SetProcessorBody}, state_hosted_service::API_SERVICE_CLIENT};
+use crate::{painless_parser, pipeline::{self, AppendProcessorBody, PipelineDefinition, PipelineError, PipelineProcessorBody, ProcessorBodies, RemoveProcessorBody, RenameProcessorBody, SetProcessorBody}, state_provider::STATE_PROVIDER};
 use crate::util::log_service_err;
 
 fn is_false(b: &bool) -> bool { !b }
@@ -338,7 +338,7 @@ pub(crate) fn parse_named_definition(value: &String) -> Result<(String, ElasticS
 pub(crate) async fn create_pipeline(name: &String, definition_str: &String) -> Result<CreatePipelineResult, ESPipelineError> {
     let pipeline_definition = serde_json::from_str(definition_str).map_err(|_|ESPipelineError{ message: "dunno".to_string() })?;
 
-    API_SERVICE_CLIENT.create_pipeline(name, &pipeline_definition).await.map_err(|e|ESPipelineError{ message: format!("{}", e) })?;
+    STATE_PROVIDER.create_pipeline(name, &pipeline_definition).await.map_err(|e|ESPipelineError{ message: format!("{}", e) })?;
 
     Ok(CreatePipelineResult::new())
 }
@@ -383,7 +383,7 @@ pub(crate) async fn simulate_pipeline(name: &Option<String>, definition_str: &St
         Some(pipeline) => pipeline.to_pipeline_definition().map_err(|_|ESPipelineError{ message: "dunno".to_string() })?,
         None => {
             match name {
-                Some(name) => match API_SERVICE_CLIENT.describe_pipeline(name).await {
+                Some(name) => match STATE_PROVIDER.describe_pipeline(name).await {
                     Ok(pd) => match pd {
                         Some(pd) => pd,
                         None => return Err(ESPipelineError { message: "No pipeline".to_string() })

@@ -12,8 +12,8 @@ use crate::data_access::{self, load_file_as_table};
 use crate::data_contract::{ExtensionFileMetadata, FileDescriptor, IcebergMetadata, SpeedboatMetadata};
 use crate::elastic_search_index::create_index_inner;
 use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema, SqlQuery};
-use crate::state_peers::{CheckpointDescriptor, PrivateCompactionInvocation, PrivateExtensionInvocation, PrivatePrefetchInvocation, PrivateSqlInvocation};
-use crate::state_hosted_service::*;
+use crate::peers::{CheckpointDescriptor, PrivateCompactionInvocation, PrivateExtensionInvocation, PrivatePrefetchInvocation, PrivateSqlInvocation};
+use crate::state_provider::*;
 use crate::util::{add_file_suffix, log_err};
 
 
@@ -91,7 +91,7 @@ async fn determine_required_files(required_extensions: &Vec<String>, checkpoints
     }
 
     let target_checkpoint = &checkpoints[0];
-    let table_metadata = match API_SERVICE_CLIENT.get_checkpoint(target_checkpoint.clone()).await {
+    let table_metadata = match STATE_PROVIDER.get_checkpoint(target_checkpoint.clone()).await {
         Ok(tmc) => {
             match tmc {
                 Some(tmc) => tmc,

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use crate::elastic_search_common::call_peers;
-use crate::state_hosted_service::API_SERVICE_CLIENT;
-use crate::state_peers::{CheckpointDescriptor, PrivateInvocation, PrivatePrefetchInvocation};
+use crate::state_provider::STATE_PROVIDER;
+use crate::peers::{CheckpointDescriptor, PrivateInvocation, PrivatePrefetchInvocation};
 
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -26,7 +26,7 @@ pub(crate) async fn perform_prefetch(required_extensions: &Vec<String>, checkpoi
         }
     }
     tracing::info!("!!!!!!!!!!!!!!!!!!!! Prefetching End !!!!!!!!!!!!!!!!!!!!!!!");
-    match API_SERVICE_CLIENT.set_prefetch_checkpoints(checkpoints, if required_extensions.len() == 0 { None } else { Some(required_extensions[0].clone()) }).await {
+    match STATE_PROVIDER.set_prefetch_checkpoints(checkpoints, if required_extensions.len() == 0 { None } else { Some(required_extensions[0].clone()) }).await {
         Ok(_) => {}
         Err(e) => {
             tracing::error!("Error during prefetching: {}", e);

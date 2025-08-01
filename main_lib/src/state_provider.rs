@@ -2,13 +2,13 @@ use std::{error::Error};
 use std::fmt::{Display, Formatter};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{elastic_search_ingest::CreateIndexTemplateBody, pipeline::PipelineDefinition, state_peers::CheckpointDescriptor};
+use crate::{elastic_search_ingest::CreateIndexTemplateBody, pipeline::PipelineDefinition, peers::CheckpointDescriptor};
 use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
 use crate::elastic_search_index::IndexError;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::ephemeral_state_provider::EphemeralStateProvider;
 use crate::leaderless_state_provider::LeaderlessStateProvider;
-use crate::state_peers::{PeerClient};
+use crate::peers::{PeerClient};
 use crate::test_api::{TestProcessingMode};
 
 
@@ -48,7 +48,7 @@ impl ServiceApiError {
 }
 
 
-enum ApiServiceClientActorMessage {
+enum StateProviderActorMessage {
     Testing {
         respond_to: oneshot::Sender<()>,
         mode: TestProcessingMode,
@@ -156,12 +156,12 @@ enum ApiServiceClientActorMessage {
     },
 }
 
-unsafe impl Send for ApiServiceClientActorMessage {}
+unsafe impl Send for StateProviderActorMessage {}
 
 
-struct ApiServiceClientActor {
+struct StateProviderActor {
     state_provider: StateProvider,
-    receiver: mpsc::Receiver<ApiServiceClientActorMessage>,
+    receiver: mpsc::Receiver<StateProviderActorMessage>,
 }
 
 
@@ -171,86 +171,86 @@ macro_rules! handle_message_impl {
     };
 }
 
-impl ApiServiceClientActor {
-    fn new(receiver: mpsc::Receiver<ApiServiceClientActorMessage>, _base_address: String) -> Self {
-        ApiServiceClientActor {
+impl StateProviderActor {
+    fn new(receiver: mpsc::Receiver<StateProviderActorMessage>, _base_address: String) -> Self {
+        StateProviderActor {
             state_provider: StateProvider::Ephemeral(EphemeralStateProvider::new()),
             receiver,
         }
     }
 
-    async fn handle_message(&mut self, msg: ApiServiceClientActorMessage) -> () {
+    async fn handle_message(&mut self, msg: StateProviderActorMessage) -> () {
         match msg {
-            ApiServiceClientActorMessage::Testing { respond_to, mode } => {
+            StateProviderActorMessage::Testing { respond_to, mode } => {
                 handle_message_impl!(self, respond_to, clear_and_set(mode));
             },
-            ApiServiceClientActorMessage::CreatePipeline { respond_to, name, pipeline } => {
+            StateProviderActorMessage::CreatePipeline { respond_to, name, pipeline } => {
                 handle_message_impl!(self, respond_to, create_pipeline(&name, &pipeline));
             },
-            ApiServiceClientActorMessage::DescribePipeline { respond_to, name } => {
+            StateProviderActorMessage::DescribePipeline { respond_to, name } => {
                 handle_message_impl!(self, respond_to, describe_pipeline(&name));
             },
-            ApiServiceClientActorMessage::CreateLifetimePolicy { respond_to, name, policy } => {
+            StateProviderActorMessage::CreateLifetimePolicy { respond_to, name, policy } => {
                 handle_message_impl!(self, respond_to, create_lifetime_policy(&name, &policy));
             },
-            ApiServiceClientActorMessage::DescribeLifetimePolicy { respond_to, name } => {
+            StateProviderActorMessage::DescribeLifetimePolicy { respond_to, name } => {
                     handle_message_impl!(self, respond_to, describe_lifetime_policy(&name));
             },
-            ApiServiceClientActorMessage::CreateTable { respond_to, create_table } => {
+            StateProviderActorMessage::CreateTable { respond_to, create_table } => {
                 handle_message_impl!(self, respond_to, create_table(&create_table));
             },
-            ApiServiceClientActorMessage::DescribeTable { respond_to, name } => {
+            StateProviderActorMessage::DescribeTable { respond_to, name } => {
                 handle_message_impl!(self, respond_to, describe_table(&name));
             },
-            ApiServiceClientActorMessage::AddAlias { respond_to, table_name, alias } => {
+            StateProviderActorMessage::AddAlias { respond_to, table_name, alias } => {
                 handle_message_impl!(self, respond_to, add_alias(&table_name, &alias));
             },
-            ApiServiceClientActorMessage::RemoveAlias { respond_to, table_name, alias } => {
+            StateProviderActorMessage::RemoveAlias { respond_to, table_name, alias } => {
                 handle_message_impl!(self, respond_to, remove_alias(&table_name, &alias));
             },            
-            ApiServiceClientActorMessage::CreateTableTemplate { respond_to, name, template } => {
+            StateProviderActorMessage::CreateTableTemplate { respond_to, name, template } => {
                 handle_message_impl!(self, respond_to, create_table_template(&name, &template));
             },
-            ApiServiceClientActorMessage::DescribeTableTemplate { respond_to, name } => {
+            StateProviderActorMessage::DescribeTableTemplate { respond_to, name } => {
                 handle_message_impl!(self, respond_to, describe_table_template(&name));
             },                       
-            ApiServiceClientActorMessage::AddCheckpoint { checkpoint, respond_to } => {
+            StateProviderActorMessage::AddCheckpoint { checkpoint, respond_to } => {
                 handle_message_impl!(self, respond_to, add_checkpoint(&checkpoint));
             },
-            ApiServiceClientActorMessage::IcebergCommit { respond_to, table_name, iceberg_commit } => {
+            StateProviderActorMessage::IcebergCommit { respond_to, table_name, iceberg_commit } => {
                 handle_message_impl!(self, respond_to, iceberg_commit(&table_name, &iceberg_commit));
             },            
-            ApiServiceClientActorMessage::SpeedboatCommit { respond_to, speedboat_commit } => {
+            StateProviderActorMessage::SpeedboatCommit { respond_to, speedboat_commit } => {
                 handle_message_impl!(self, respond_to, speedboat_commit(&speedboat_commit));
             },
-            ApiServiceClientActorMessage::ExtensionCommit { respond_to, table_name, extension_commit } => {
+            StateProviderActorMessage::ExtensionCommit { respond_to, table_name, extension_commit } => {
                 handle_message_impl!(self, respond_to, extension_commit(&table_name, &extension_commit));
             }, 
-            ApiServiceClientActorMessage::CompactionCommit { respond_to, table_name, compaction_commit } => {
+            StateProviderActorMessage::CompactionCommit { respond_to, table_name, compaction_commit } => {
                 handle_message_impl!(self, respond_to, compaction_commit(&table_name, &compaction_commit));
             },                        
-            ApiServiceClientActorMessage::GetLatestCommittedCheckpoint { table_name, extensions, respond_to } => {
+            StateProviderActorMessage::GetLatestCommittedCheckpoint { table_name, extensions, respond_to } => {
                 handle_message_impl!(self, respond_to, get_latest_committed_checkpoint(&table_name, extensions));
             },
-            ApiServiceClientActorMessage::GetLatestTargetCheckpoint { table_name, extensions, respond_to } => {
+            StateProviderActorMessage::GetLatestTargetCheckpoint { table_name, extensions, respond_to } => {
                 handle_message_impl!(self, respond_to, get_latest_target_checkpoint(&table_name, extensions));
             },
-            ApiServiceClientActorMessage::GetCheckpoint { checkpoint, respond_to } => {
+            StateProviderActorMessage::GetCheckpoint { checkpoint, respond_to } => {
                 handle_message_impl!(self, respond_to, get_checkpoint(&checkpoint));
             },
-            ApiServiceClientActorMessage::GetExtensionWorkItems { extension_type, respond_to } => {
+            StateProviderActorMessage::GetExtensionWorkItems { extension_type, respond_to } => {
                 handle_message_impl!(self, respond_to, get_extension_work_items(&extension_type));
             },
-            ApiServiceClientActorMessage::GetCompactionWorkItems { respond_to } => {
+            StateProviderActorMessage::GetCompactionWorkItems { respond_to } => {
                 handle_message_impl!(self, respond_to, get_compaction_work_items());
             },
-            ApiServiceClientActorMessage::GetPeerClients { respond_to } => {
+            StateProviderActorMessage::GetPeerClients { respond_to } => {
                 handle_message_impl!(self, respond_to, get_peer_clients());
             },
-            ApiServiceClientActorMessage::GetNextPrefetchCheckpoints { respond_to, extensions } => {
+            StateProviderActorMessage::GetNextPrefetchCheckpoints { respond_to, extensions } => {
                 handle_message_impl!(self, respond_to, get_next_prefetch_checkpoints(extensions));
             },
-            ApiServiceClientActorMessage::SetPrefetchCheckpoints { respond_to, checkpoints, extensions } => {
+            StateProviderActorMessage::SetPrefetchCheckpoints { respond_to, checkpoints, extensions } => {
                 handle_message_impl!(self, respond_to, set_prefetch_checkpoints(&checkpoints, extensions));
             },
         }
@@ -258,7 +258,7 @@ impl ApiServiceClientActor {
 }
 
 
-async fn run_api_service_client_actor_message_pump(mut actor: ApiServiceClientActor) {
+async fn run_state_provider_actor_message_pump(mut actor: StateProviderActor) {
     while let Some(msg) = actor.receiver.recv().await {
         actor.handle_message(msg).await;
     }
@@ -386,8 +386,8 @@ impl StateProvider {
 
 
 #[derive(Clone)]
-pub struct ApiServiceClientHandle {
-    sender: mpsc::Sender<ApiServiceClientActorMessage>,
+pub struct StateProviderHandle {
+    sender: mpsc::Sender<StateProviderActorMessage>,
 }
 
 
@@ -395,7 +395,7 @@ macro_rules! send_message {
     ($self:expr, $message_type:tt) => {
         {
             let (send, recv) = oneshot::channel();
-            let msg = ApiServiceClientActorMessage::$message_type {
+            let msg = StateProviderActorMessage::$message_type {
                 respond_to: send,
             };
             let _ = $self.sender.send(msg).await;
@@ -407,7 +407,7 @@ macro_rules! send_message {
     ($self:expr, $message_type:tt, $field:ident = $value:expr) => {
         {
             let (send, recv) = oneshot::channel();
-            let msg = ApiServiceClientActorMessage::$message_type {
+            let msg = StateProviderActorMessage::$message_type {
                 respond_to: send,
                 $field: $value
             };
@@ -420,7 +420,7 @@ macro_rules! send_message {
     ($self:expr, $message_type:tt, $field1:ident = $value1:expr, $field2:ident = $value2:expr) => {
         {
             let (send, recv) = oneshot::channel();
-            let _ = $self.sender.send(ApiServiceClientActorMessage::$message_type {
+            let _ = $self.sender.send(StateProviderActorMessage::$message_type {
                 respond_to: send,
                 $field1: $value1,
                 $field2: $value2
@@ -432,11 +432,11 @@ macro_rules! send_message {
 
 }
 
-impl ApiServiceClientHandle {
+impl StateProviderHandle {
     pub fn new(address: String) -> Self {
         let (sender, receiver) = mpsc::channel(1);
-        let actor = ApiServiceClientActor::new(receiver, address);
-        tokio::spawn(run_api_service_client_actor_message_pump(actor));
+        let actor = StateProviderActor::new(receiver, address);
+        tokio::spawn(run_state_provider_actor_message_pump(actor));
 
         Self { sender }
     }
@@ -538,4 +538,4 @@ impl ApiServiceClientHandle {
     }
 }
 
-pub static API_SERVICE_CLIENT: std::sync::LazyLock<ApiServiceClientHandle> = std::sync::LazyLock::new(|| ApiServiceClientHandle::new("http://localhost:7784".to_string()));
+pub static STATE_PROVIDER: std::sync::LazyLock<StateProviderHandle> = std::sync::LazyLock::new(|| StateProviderHandle::new("http://localhost:7784".to_string()));

@@ -25,15 +25,15 @@ use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
 
-use crate::{state_hosted_service::{API_SERVICE_CLIENT}};
+use crate::{state_provider::{STATE_PROVIDER}};
 use crate::data_access::execute_sql;
 use crate::elastic_search_commands::df_to_serde_value;
 use crate::elastic_search_common::{execute_command, Command, CommandContext, CommandError, ElasticSearchResponse, ResultGeneratorFuture};
 use crate::elastic_search_ingest::{write_to_file, WriteBuffer};
 use crate::schema_massager::{PowdrrSchema, SqlBuilder};
 use crate::data_contract::{CompactionCommit, CompactionWorkItem, FileSetPayload, IcebergCommit, IcebergMetadata, SpeedboatCommit, SpeedboatCommitTableInfo};
-use crate::state_hosted_service::ServiceApiError;
-use crate::state_peers::{PrivateCompactionInvocation, PrivateInvocation};
+use crate::state_provider::ServiceApiError;
+use crate::peers::{PrivateCompactionInvocation, PrivateInvocation};
 
 
 const REST_CATALOG_IP: &str = "localhost";
@@ -348,7 +348,7 @@ impl CompactionCommand {
     }
 
     async fn do_iceberg_commit(compaction_response: &CompactionResponse) -> Result<i64, ServiceApiError> {
-        API_SERVICE_CLIENT.iceberg_commit(
+        STATE_PROVIDER.iceberg_commit(
             &compaction_response.table_name,
             &IcebergCommit {
                 metadata: IcebergMetadata {
@@ -374,7 +374,7 @@ impl CompactionCommand {
         // files and once again tries to compact them.
 
         if compaction_response.deletes_table_info.is_some() {
-            API_SERVICE_CLIENT.speedboat_commit(&SpeedboatCommit {
+            STATE_PROVIDER.speedboat_commit(&SpeedboatCommit {
                 type_files: vec!(compaction_response.deletes_table_info.as_ref().unwrap().clone()),
                 compactions: compaction_response.compactions.clone(),
             }).await?
@@ -517,7 +517,7 @@ pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkIt
         // NOTE: the api commit must happen before the iceberg commit. The main_lib is designed to understand that
         // a compaction commit might get committed to it but fail afterwards. If we commit to Iceberg and fail to
         // record that in the main_lib then that leads to correctness errors that aren't really possible to fix.
-        match API_SERVICE_CLIENT.compaction_commit(
+        match STATE_PROVIDER.compaction_commit(
             table_name,
             &CompactionCommit {
                 removed_speedboat_files: work_item.speedboat_files.file_paths.clone(),
@@ -538,7 +538,7 @@ pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkIt
             last_snapshot_id,
         };
 
-        let peers = API_SERVICE_CLIENT.get_peer_clients().await;
+        let peers = STATE_PROVIDER.get_peer_clients().await;
         assert!(peers.len() > 0);
         let response_maybe = match peers[0].private_compaction_leader(&command).await {
             Ok(success) => success,

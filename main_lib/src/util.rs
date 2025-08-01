@@ -4,7 +4,7 @@ use gotham::state::State;
 use http::StatusCode;
 use crate::data_contract::TableDescription;
 use crate::elastic_search_common::ElasticSearchResponse;
-use crate::state_hosted_service::{ServiceApiError, API_SERVICE_CLIENT};
+use crate::state_provider::{ServiceApiError, STATE_PROVIDER};
 
 pub(crate) fn add_file_suffix(base_file_path: &String, suffix: &String, extension: Option<&String>) -> String {
     if !base_file_path.ends_with(".json") && !base_file_path.ends_with(".arrow") && !base_file_path.ends_with(".parquet") {
@@ -58,7 +58,7 @@ pub(crate) fn log_service_err_response(error: ServiceApiError, state: State) -> 
 }
 
 pub(crate) async fn describe_table_log_error_then_none(table_name: &String) -> Option<TableDescription> {
-    API_SERVICE_CLIENT.describe_table(table_name).await.unwrap_or_else(|e|{
+    STATE_PROVIDER.describe_table(table_name).await.unwrap_or_else(|e|{
         log_service_err(e);
         None
     })
