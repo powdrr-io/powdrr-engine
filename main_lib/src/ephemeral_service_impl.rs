@@ -7,7 +7,8 @@ use crate::elastic_search_ingest::CreateIndexTemplateBody;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::pipeline::PipelineDefinition;
 use crate::schema_massager::PowdrrSchema;
-use crate::state_hosted_service::{CompactionCommit, CompactionWorkItem, CreateTable, DeletesMetadata, ExtensionCommit, ExtensionFile, ExtensionWorkItem, FileSetPayload, IcebergCommit, ServiceApiError, SpeedboatCommit, SpeedboatCommitTableInfo, SpeedboatMetadata, TableDescription, TableMetadataCheckpoint};
+use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateTable, DeletesMetadata, ExtensionCommit, ExtensionFile, ExtensionWorkItem, FileSetPayload, IcebergCommit, SpeedboatCommit, SpeedboatCommitTableInfo, SpeedboatMetadata, TableDescription, TableMetadataCheckpoint};
+use crate::state_hosted_service::ServiceApiError;
 use crate::state_peers::{CheckpointDescriptor, PeerClient, SelfPeer};
 use crate::test_api::{IndexingMode, TestProcessingMode};
 
@@ -50,7 +51,7 @@ impl EphemeralServiceImpl {
         }
     }
 
-    pub async fn clear_and_set(&mut self, mode: TestProcessingMode) -> () {
+    pub async fn clear_and_set(&mut self, mode: TestProcessingMode) -> Result<(), ServiceApiError> {
         distributed_cache::clear(&self.tables.keys().into_iter().map(|x|x.clone()).collect()).unwrap();
         self.mode = mode;
         self.tables.clear();
@@ -66,6 +67,7 @@ impl EphemeralServiceImpl {
         self.extension_work_items = HashMap::from([("es".to_string(), HashMap::new())]);
         self.recent_file_extension_metadata.clear();
         drop_all_tables(&"default".to_string()).await.expect("Failed while dropping all tables");
+        Ok(())
     }
 
     fn checkpoints_needing_extension_work(&self, table_name: &String, extension_name: &String) -> Option<Vec<String>> {
@@ -137,7 +139,7 @@ impl EphemeralServiceImpl {
         self.latest_committed_checkpoint_id.get_mut(&extension).unwrap().insert(table_name.clone(), checkpoint_id.clone());
     }
 
-    pub(crate) async fn add_checkpoint(&mut self, metadata: &TableMetadataCheckpoint) -> () {
+    pub async fn add_checkpoint(&mut self, metadata: &TableMetadataCheckpoint) -> Result<(), ServiceApiError> {
         // To make testing a little easier, we'll just magic up a table as necessary
         if !self.tables.contains_key(&metadata.table_name) {
             self.tables.insert(
@@ -164,6 +166,7 @@ impl EphemeralServiceImpl {
                 metadata.iceberg_metadata.as_ref().map_or(&FileSetPayload::new(), |m|&m.files)
             )
         }
+        Ok(())
     }
 
     fn fill_extension_work_item(

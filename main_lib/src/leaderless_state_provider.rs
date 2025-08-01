@@ -3,7 +3,8 @@ use serde::de::DeserializeOwned;
 use crate::elastic_search_ingest::CreateIndexTemplateBody;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::pipeline::PipelineDefinition;
-use crate::state_hosted_service::{AddAlias, CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem, GetLatestCheckpoint, IcebergCommit, ServiceApiError, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
+use crate::data_contract::{AddAlias, CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem, GetLatestCheckpoint, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
+use crate::state_hosted_service::ServiceApiError;
 use crate::state_peers::{CheckpointDescriptor, PeerClient};
 use crate::test_api::TestProcessingMode;
 

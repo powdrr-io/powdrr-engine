@@ -2,8 +2,9 @@ use std::error::Error;
 use gotham::mime;
 use gotham::state::State;
 use http::StatusCode;
+use crate::data_contract::TableDescription;
 use crate::elastic_search_common::ElasticSearchResponse;
-use crate::state_hosted_service::{ServiceApiError, TableDescription, API_SERVICE_CLIENT};
+use crate::state_hosted_service::{ServiceApiError, API_SERVICE_CLIENT};
 
 pub(crate) fn add_file_suffix(base_file_path: &String, suffix: &String, extension: Option<&String>) -> String {
     if !base_file_path.ends_with(".json") && !base_file_path.ends_with(".arrow") && !base_file_path.ends_with(".parquet") {

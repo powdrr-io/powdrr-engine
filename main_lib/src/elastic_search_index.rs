@@ -2,12 +2,14 @@ use std::error::Error;
 use std::fmt::Display;
 use datafusion::{arrow::datatypes::DataType, dataframe::DataFrameWriteOptions};
 use datafusion::error::DataFusionError;
-use crate::{data_access, data_access::{execute_sql, exists}, state_hosted_service::{ExtensionCommit, ExtensionFile, API_SERVICE_CLIENT}, util::add_file_suffix};
+use crate::{data_access, data_access::{execute_sql, exists}, data_contract::{ExtensionCommit, ExtensionFile}, util::add_file_suffix};
 use crate::data_access::load_file_as_table;
 use crate::elastic_search_common::call_peers;
 use crate::schema_massager::PowdrrSchema;
-use crate::state_hosted_service::{ExtensionFileMetadata, ExtensionWorkItem, FileDescriptor};
+use crate::data_contract::{ExtensionFileMetadata, ExtensionWorkItem, FileDescriptor};
 use crate::state_peers::{PrivateExtensionInvocation, PrivateInvocation, PrivateInvocationResult};
+use crate::state_hosted_service::API_SERVICE_CLIENT;
+
 
 #[derive(Debug)]
 pub(crate) struct IndexError {

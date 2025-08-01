@@ -2,7 +2,8 @@ use crate::elastic_search_ingest::CreateIndexTemplateBody;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::ephemeral_service_impl::EphemeralServiceImpl;
 use crate::pipeline::PipelineDefinition;
-use crate::state_hosted_service::{CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, ServiceApiError, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
+use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
+use crate::state_hosted_service::ServiceApiError;
 use crate::state_peers::{CheckpointDescriptor, PeerClient};
 use crate::test_api::{TestProcessingMode};
 
@@ -18,11 +19,11 @@ impl EphemeralStateProvider {
     }
 
     pub async fn clear_and_set(&mut self, mode: TestProcessingMode) -> () {
-        self.service_impl.clear_and_set(mode).await;
+        self.service_impl.clear_and_set(mode).await.unwrap();
     }
 
     pub(crate) async fn add_checkpoint(&mut self, checkpoint: &TableMetadataCheckpoint) -> () {
-        self.service_impl.add_checkpoint(checkpoint).await;
+        self.service_impl.add_checkpoint(checkpoint).await.unwrap();
     }
 
     pub(crate) async fn get_latest_target_checkpoint(&self, _table_name: &String, _extension: Option<String>) -> Result<Option<String>, ServiceApiError>{

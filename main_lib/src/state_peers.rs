@@ -10,7 +10,7 @@ use crate::compaction::{compact_logs, CompactionCommand, CompactionResponse};
 use crate::elastic_search_common::result_to_record_batch;
 use crate::private_api::{compaction_query, extension_query, prefetch_query};
 use crate::schema_massager::{PowdrrSchema, SqlQuery};
-use crate::state_hosted_service::{ExtensionFileMetadata, FileSetPayload};
+use crate::data_contract::{ExtensionFileMetadata, FileSetPayload};
 use crate::test_api::CompactionMode;
 
 #[derive(Serialize, Deserialize)]

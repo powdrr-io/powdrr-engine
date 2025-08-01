@@ -25,13 +25,14 @@ use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
 
-use crate::{state_hosted_service::{CompactionCommit, API_SERVICE_CLIENT}};
+use crate::{state_hosted_service::{API_SERVICE_CLIENT}};
 use crate::data_access::execute_sql;
 use crate::elastic_search_commands::df_to_serde_value;
 use crate::elastic_search_common::{execute_command, Command, CommandContext, CommandError, ElasticSearchResponse, ResultGeneratorFuture};
 use crate::elastic_search_ingest::{write_to_file, WriteBuffer};
 use crate::schema_massager::{PowdrrSchema, SqlBuilder};
-use crate::state_hosted_service::{CompactionWorkItem, FileSetPayload, IcebergCommit, IcebergMetadata, ServiceApiError, SpeedboatCommit, SpeedboatCommitTableInfo};
+use crate::data_contract::{CompactionCommit, CompactionWorkItem, FileSetPayload, IcebergCommit, IcebergMetadata, SpeedboatCommit, SpeedboatCommitTableInfo};
+use crate::state_hosted_service::ServiceApiError;
 use crate::state_peers::{PrivateCompactionInvocation, PrivateInvocation};
 
 

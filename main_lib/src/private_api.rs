@@ -9,6 +9,7 @@ use idgenerator::IdInstance;
 use prost::Message;
 
 use crate::data_access::{self, load_file_as_table};
+use crate::data_contract::{ExtensionFileMetadata, FileDescriptor, IcebergMetadata, SpeedboatMetadata};
 use crate::elastic_search_index::create_index_inner;
 use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema, SqlQuery};
 use crate::state_peers::{CheckpointDescriptor, PrivateCompactionInvocation, PrivateExtensionInvocation, PrivatePrefetchInvocation, PrivateSqlInvocation};
