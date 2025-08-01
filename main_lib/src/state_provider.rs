@@ -149,7 +149,7 @@ enum StateProviderActorMessage {
         respond_to: oneshot::Sender<Result<Vec<CheckpointDescriptor>, ServiceApiError>>,
         extensions: Option<String>,
     },
-    SetPrefetchCheckpoints {
+    SetTargetCheckpoints {
         respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
         checkpoints: Vec<CheckpointDescriptor>,
         extensions: Option<String>,
@@ -250,8 +250,8 @@ impl StateProviderActor {
             StateProviderActorMessage::GetNextPrefetchCheckpoints { respond_to, extensions } => {
                 handle_message_impl!(self, respond_to, get_next_prefetch_checkpoints(extensions));
             },
-            StateProviderActorMessage::SetPrefetchCheckpoints { respond_to, checkpoints, extensions } => {
-                handle_message_impl!(self, respond_to, set_prefetch_checkpoints(&checkpoints, extensions));
+            StateProviderActorMessage::SetTargetCheckpoints { respond_to, checkpoints, extensions } => {
+                handle_message_impl!(self, respond_to, set_target_checkpoints(&checkpoints, extensions));
             },
         }
     }
@@ -286,11 +286,11 @@ impl StateProvider {
         state_provider_func_impl!(self, clear_and_set(mode))
     }
 
-    pub(crate) async fn set_prefetch_checkpoints(&self, descriptors: &Vec<CheckpointDescriptor>, extension: Option<String>) -> Result<(), ServiceApiError> {
-        state_provider_func_impl!(self, set_prefetch_checkpoints(descriptors, extension))
+    pub(crate) async fn set_target_checkpoints(&mut self, descriptors: &Vec<CheckpointDescriptor>, extension: Option<String>) -> Result<(), ServiceApiError> {
+        state_provider_func_impl!(self, set_target_checkpoints(descriptors, extension))
     }
 
-    async fn get_latest_target_checkpoint(&self, table_name: &String, extension: Option<String>) -> Result<Option<String>, ServiceApiError> {
+    async fn get_latest_target_checkpoint(&mut self, table_name: &String, extension: Option<String>) -> Result<Option<String>, ServiceApiError> {
         state_provider_func_impl!(self, get_latest_target_checkpoint(table_name, extension))
     }
 
@@ -534,7 +534,7 @@ impl StateProviderHandle {
     }
 
     pub async fn set_prefetch_checkpoints(&self, checkpoints: &Vec<CheckpointDescriptor>, extension: Option<String>) -> Result<(), ServiceApiError> {
-        send_message!(self, SetPrefetchCheckpoints, checkpoints = checkpoints.clone(), extensions = extension.clone())
+        send_message!(self, SetTargetCheckpoints, checkpoints = checkpoints.clone(), extensions = extension.clone())
     }
 }
 
