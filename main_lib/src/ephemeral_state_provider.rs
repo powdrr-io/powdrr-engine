@@ -5,24 +5,20 @@ use crate::pipeline::PipelineDefinition;
 use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
 use crate::ephemeral_fetch_tracker::EphemeralFetchTracker;
 use crate::state_provider::ServiceApiError;
-use crate::peers::{CheckpointDescriptor, PeerClient};
-use crate::test_api::{TestProcessingMode};
+use crate::peers::{CheckpointDescriptor, PeerClient, SelfPeer};
+use crate::test_api::{CompactionMode};
 
 pub struct EphemeralStateProvider {
     service_impl: EphemeralServiceImpl,
-    fetch_tracker: EphemeralFetchTracker
+    fetch_tracker: EphemeralFetchTracker,
 }
 
 impl EphemeralStateProvider {
     pub fn new() -> Self {
         EphemeralStateProvider{
             service_impl: EphemeralServiceImpl::new(),
-            fetch_tracker: EphemeralFetchTracker::new()
+            fetch_tracker: EphemeralFetchTracker::new(),
         }
-    }
-
-    pub async fn clear_and_set(&mut self, mode: TestProcessingMode) -> () {
-        self.service_impl.clear_and_set(mode).await.unwrap();
     }
 
     pub(crate) async fn add_checkpoint(&mut self, checkpoint: &TableMetadataCheckpoint) -> () {
@@ -137,7 +133,7 @@ impl EphemeralStateProvider {
     }
 
     pub async fn get_peer_clients(&mut self) -> Vec<Box<dyn PeerClient>> {
-        self.service_impl.get_peer_clients().await
+        vec!(Box::new(SelfPeer::new(CompactionMode::Async)))
     }
 
     pub(crate) async fn get_latest_target_checkpoint(&mut self, table_name: &String, extension: Option<String>) -> Result<Option<String>, ServiceApiError>{

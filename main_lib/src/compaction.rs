@@ -89,7 +89,7 @@ async fn drop_table(namespace: &String, name: &String) -> Result<(), iceberg::Er
     catalog.drop_table(&table_ident).await
 }
 
-pub(crate) async fn drop_all_tables(namespace: &String) -> Result<(), iceberg::Error> {
+pub async fn drop_all_tables(namespace: &String) -> Result<(), iceberg::Error> {
     let catalog = REST_CATALOG.clone();
     let namespace_ident = NamespaceIdent::new(namespace.clone());
     let all_tables: Vec<TableIdent> = match catalog.get_namespace(&namespace_ident).await {

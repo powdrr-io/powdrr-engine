@@ -1,10 +1,10 @@
 use std::{future::Future, pin::Pin, time::Duration};
-
 use futures::FutureExt;
 use gotham::{handler::HandlerFuture, helpers::http::response::create_response, hyper::{body, Body, StatusCode}, mime, state::{FromState, State}};
 use serde::{Deserialize, Serialize};
 
 use crate::{compaction::perform_compaction, elastic_search_index::{self, create_index}, state_provider::{STATE_PROVIDER}};
+use crate::compaction::drop_all_tables;
 use crate::data_contract::TableMetadataCheckpoint;
 use crate::prefetch::perform_prefetch;
 
@@ -16,21 +16,20 @@ pub(crate) struct TestCreateIndex {
 
 
 #[derive(Serialize, Deserialize, Clone)]
-pub enum TestingMode {
-    Enabled,
-    Disabled
+pub enum StateMode {
+    Testing,
+    Ephemeral,
+    Leaderless(String)
 }
 
-impl TestingMode {
-    #[allow(dead_code)]
-    pub(crate) fn is_disabled(&self) -> bool {
+impl StateMode {
+    fn is_testing(&self) -> bool {
         match self {
-            TestingMode::Disabled => true,
+            StateMode::Testing => true,
             _ => false
         }
     }
 }
-
 
 #[derive(Serialize, Deserialize, Clone)]
 pub enum IndexingMode {
@@ -82,7 +81,7 @@ impl PrefetchMode {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TestProcessingMode {
-    pub testing_mode: TestingMode,
+    pub state_mode: StateMode,
     pub indexing_mode: IndexingMode,
     pub compaction_mode: CompactionMode,
     pub prefetch_mode: PrefetchMode,
@@ -91,7 +90,7 @@ pub struct TestProcessingMode {
 impl TestProcessingMode {
     pub fn default() -> Self {
         Self {
-            testing_mode: TestingMode::Enabled,
+            state_mode: StateMode::Ephemeral,
             indexing_mode: IndexingMode::Sync,
             compaction_mode: CompactionMode::Async,
             prefetch_mode: PrefetchMode::Disabled,
@@ -278,6 +277,9 @@ pub fn test_v1_set_testing_processing_mode(mut state: State) -> Pin<Box<HandlerF
         };
 
         STATE_PROVIDER.set_testing_mode(&mode).await;
+        if mode.state_mode.is_testing() {
+            drop_all_tables(&"default".to_string()).await.unwrap();
+        }
         if !mode.indexing_mode.is_disabled() {
             tokio::spawn(do_extension_work_for_forever(vec!("es".to_string()), 1000));
         }

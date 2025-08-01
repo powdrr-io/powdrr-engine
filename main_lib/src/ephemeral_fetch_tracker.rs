@@ -48,7 +48,20 @@ impl EphemeralFetchTracker {
             None => return Ok(vec!())
         };
 
-        Ok(target_map.iter().map(|(key, value)| CheckpointDescriptor{ table_name: key.clone(), checkpoint_id: value.clone()}).collect())
+        let mut next_prefetch_checkpoints = vec![];
+        for (key, value) in target_map.iter() {
+            match self.get_latest_target_checkpoint(key, extensions.clone()).await? {
+                Some(latest) => {
+                    if &latest < value {
+                        next_prefetch_checkpoints.push(CheckpointDescriptor{ table_name: key.clone(), checkpoint_id: value.clone()})
+                    }
+                },
+                None => {
+                    next_prefetch_checkpoints.push(CheckpointDescriptor{ table_name: key.clone(), checkpoint_id: value.clone()})
+                }
+            }
+        }
+        Ok(next_prefetch_checkpoints)
     }
 
     pub async fn set_next_prefetch_checkpoints(&mut self, table_name: &String, extension: Option<String>, checkpoint_id: &String) -> Result<(), ServiceApiError> {
