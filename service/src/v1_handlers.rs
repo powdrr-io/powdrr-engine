@@ -8,7 +8,7 @@ use std::pin::Pin;
 use gotham::mime;
 use serde::Serialize;
 use powdrr_lib::data_contract::{AddAlias, CompactionCommit, CreateTable, ExtensionCommit, GetLatestCheckpoint, IcebergCommit, SpeedboatCommit};
-use powdrr_lib::elastic_search_ingest::CreateIndexTemplateBody;
+use powdrr_lib::data_contract::CreateIndexTemplateBody;
 use powdrr_lib::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use powdrr_lib::pipeline::PipelineDefinition;
 use powdrr_lib::peers::CheckpointDescriptor;

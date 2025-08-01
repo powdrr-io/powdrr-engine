@@ -25,7 +25,7 @@ use crate::data_access;
 use crate::elastic_search_parser::UpdateBody;
 use crate::elastic_search_storage_schema::{FullRecord, RecordDelete, RecordInput, SpeedboatCommitBuilder};
 use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
-use crate::data_contract::{CreateTable, SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription};
+use crate::data_contract::{CreateIndexBody, CreateIndexResult, CreateIndexTemplateBody, CreateTable, SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription};
 use crate::state_provider::{ServiceApiError, STATE_PROVIDER};
 use crate::util::{describe_table_log_error_then_none, log_err, log_service_err};
 
@@ -221,113 +221,10 @@ enum IngestCommand {
 }
 
 
-#[derive(Serialize, Deserialize, Clone)]
-struct CreateIndexSettings {
-    index: IndexSettings
-}
 
 
-#[derive(Serialize, Deserialize, Clone)]
-struct IndexMappingSettings {
-    total_fields: IndexMappingFieldSettings,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct IndexMappingFieldSettings {
-    limit: Option<u32>
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct IndexSettings {
-    number_of_shards: Option<u32>,
-    number_of_replicas: Option<u32>,
-    auto_expand_replicas: Option<String>,
-    refresh_interval: Option<String>,
-    priority: Option<u32>,
-    mapping: Option<IndexMappingSettings>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct AliasInfo {
-    is_hidden: bool
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct MetaInfo {
-    #[serde(rename = "migrationMappingPropertyHashes")]
-    migration_mapping_property_hashes: HashMap<String, String>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(untagged)]
-enum StringOrBool {
-    Bool(bool),
-    String(String),
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct PropertyInfo {
-    #[serde(rename = "type")]
-    type_name: Option<String>,
-    #[serde(default)]
-    enabled: bool,
-    dynamic: Option<StringOrBool>,
-    properties: Option<HashMap<String, PropertyInfo>>,
-    fields: Option<HashMap<String, PropertyInfo>>,
-    #[serde(default)]
-    ignore_above: u32,
-    scaling_factor: Option<u32>,
-}
 
 
-#[derive(Serialize, Deserialize, Clone)]
-struct Mappings {
-    dynamic: StringOrBool,
-    _meta: Option<MetaInfo>,
-    properties: HashMap<String, PropertyInfo>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct CreateIndexBody {
-    aliases: Option<HashMap<String, AliasInfo>>,
-    mappings: Option<Mappings>,
-    settings: Option<CreateIndexSettingsOption>,
-}
-
-impl CreateIndexBody {
-    fn parse(content: &String) -> Result<Self, serde_json::Error> {
-        if content.len() == 0 {
-            Ok(CreateIndexBody{ aliases: None, mappings: None, settings: None })
-        } else {
-            serde_json::from_str(content)
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(untagged)]
-enum CreateIndexSettingsOption {
-    Indirect(CreateIndexSettings),
-    Direct(IndexSettings),
-}
-
-
-#[derive(Serialize)]
-pub struct CreateIndexResult {
-    acknowledged: bool,
-    shards_acknowledged: bool,
-    index: String,
-}
-
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct CreateIndexTemplateBody {
-    #[serde(default)]
-    index_patterns: Vec<String>,
-    priority: Option<u32>,
-    version: Option<u32>,
-    template: CreateIndexBody,
-}
 
 pub(crate) async fn create_index(table: &String, body: &String) -> Result<CreateIndexResult, IngestError> {
     let parsed_body = if body.len() == 0 {
@@ -1066,10 +963,10 @@ pub(crate) static INGEST_HANDLE: std::sync::LazyLock<IngestHandle> = std::sync::
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, fs};
+    use crate::data_contract::{CreateIndexTemplateBody, PropertyInfo};
+    use crate::elastic_search_ingest::{IngestCommand};
 
-    use crate::elastic_search_ingest::{IngestCommand, PropertyInfo};
-
-    use super::{CreateIndexBody, CreateIndexTemplateBody};
+    use super::CreateIndexBody;
 
     #[test]
     fn test_create_deser() {

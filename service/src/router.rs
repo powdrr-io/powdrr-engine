@@ -1,8 +1,18 @@
+use std::pin::Pin;
+use futures_util::FutureExt;
+use gotham::handler::HandlerFuture;
+use gotham::helpers::http::response::create_response;
+use gotham::hyper::{body, Body, StatusCode};
+use gotham::mime;
 use gotham::pipeline::{new_pipeline, single_pipeline};
-use gotham::prelude::{DefineSingleRoute, DrawRoutes, StateData, StaticResponseExtender};
+use gotham::prelude::{DefineSingleRoute, DrawRoutes, FromState, StateData, StaticResponseExtender};
 use gotham::router::{build_router, Router};
-use serde::Deserialize;
+use gotham::state::State;
+use serde::{Deserialize};
+use powdrr_lib::data_contract::ServiceMode;
+use crate::service_impl_provider::SERVICE_IMPL;
 use crate::v1_handlers;
+
 
 
 #[derive(Deserialize, StateData, StaticResponseExtender)]
@@ -69,11 +79,33 @@ pub fn router(include_test_apis: bool) -> Router {
 
         if include_test_apis {
             route.scope("/_test", |route| {
-                route.scope("/v1", |_route| {
-                    //route.put("/_testing_and_processing_mode").to(test_v1_set_testing_processing_mode);
+                route.scope("/v1", |route| {
+                    route.put("/_set_mode").to(set_mode);
                 })
             });
         }
 
     })
+}
+
+pub fn set_mode(mut state: State) -> Pin<Box<HandlerFuture>> {
+    async move {
+        let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
+            Ok(vb) => vb,
+            Err(_) => panic!("Oh no"),
+        };
+        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+        let invocation_obj: ServiceMode = match serde_json::from_str(&body_content) {
+            Ok(io) => io,
+            Err(_) => panic!("This should not happen"),
+        };
+
+        match SERVICE_IMPL.set_mode(invocation_obj).await {
+            Ok(_) => {
+                let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "OK");
+                Ok((state, res))
+            }
+            Err(_) => panic!("Oh no"),
+        }
+    }.boxed()
 }

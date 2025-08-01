@@ -1,6 +1,6 @@
 use std::{error::Error};
 use std::fmt::{Display, Formatter};
-use powdrr_lib::elastic_search_ingest::CreateIndexTemplateBody;
+use powdrr_lib::data_contract::{CreateIndexTemplateBody, ServiceImplType, ServiceMode};
 use powdrr_lib::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use powdrr_lib::ephemeral_service_impl::EphemeralServiceImpl;
 use powdrr_lib::pipeline::PipelineDefinition;
@@ -8,6 +8,7 @@ use powdrr_lib::data_contract::{CompactionCommit, CompactionWorkItem, CreateTabl
 use powdrr_lib::peers::CheckpointDescriptor;
 use tokio::sync::{mpsc, oneshot};
 use powdrr_lib::state_provider::ServiceApiError;
+use crate::dynamodb_service_impl::DynamoDBServiceImpl;
 
 #[derive(Debug, Clone)]
 pub struct ServiceImplError {
@@ -39,12 +40,18 @@ impl ServiceImplError {
     }
 }
 
+
 enum ServiceImpl {
     Ephemeral(EphemeralServiceImpl),
+    DynamoDb(DynamoDBServiceImpl),
 }
 
 
 enum ServiceImplProviderActorMessage {
+    SetMode {
+        respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
+        mode: ServiceMode,
+    },
     CreatePipeline {
         respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
         name: String,
@@ -156,6 +163,13 @@ impl ServiceImplProviderActor {
 
     async fn handle_message(&mut self, msg: ServiceImplProviderActorMessage) -> () {
         match msg {
+            ServiceImplProviderActorMessage::SetMode { respond_to, mode } => {
+                self.service_impl = match mode.impl_type {
+                    ServiceImplType::Ephemeral => ServiceImpl::Ephemeral(EphemeralServiceImpl::new()),
+                    ServiceImplType::DynamoDb => ServiceImpl::DynamoDb(DynamoDBServiceImpl::new()),
+                };
+                respond_to.send(Ok(())).unwrap();
+            }
             ServiceImplProviderActorMessage::CreatePipeline { respond_to, name, pipeline } => {
                 handle_message_impl!(self, respond_to, create_pipeline(&name, &pipeline));
             },
@@ -229,6 +243,7 @@ macro_rules! state_provider_func_impl {
     ($self:expr, $func:ident($($args:tt),*)) => {
         match $self {
             ServiceImpl::Ephemeral(eph) => eph.$func($($args),*).await.map_err(|e|ServiceImplError::from(e)),
+            ServiceImpl::DynamoDb(dynamo) => dynamo.$func($($args),*).await.map_err(|e|ServiceImplError::from(e)),
         }
     };
 }
@@ -372,6 +387,11 @@ impl ServiceImplHandle {
 
         Self { sender }
     }
+
+    pub async fn set_mode(&self, mode: ServiceMode) -> Result<(), ServiceImplError> {
+        send_message!(self, SetMode, mode = mode)
+    }
+
 
     pub async fn create_pipeline(&self, name: &String, pipeline: &PipelineDefinition) -> Result<(), ServiceImplError> {
         send_message!(self, CreatePipeline, name = name.clone(), pipeline = pipeline.clone())
