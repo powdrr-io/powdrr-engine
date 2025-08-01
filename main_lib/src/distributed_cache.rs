@@ -110,10 +110,3 @@ pub(crate) fn report_table_changes(table: &String, num_inserts: usize, num_updat
     assert_eq!(values.len(), delta as usize);
     Ok(values)
 }
-
-pub(crate) fn clear(tables: &Vec<String>) -> Result<(), CacheError> {
-    for table in tables.into_iter() {
-        create_table(&table)?;
-    }
-    Ok(())
-}

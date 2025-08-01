@@ -5,7 +5,8 @@ use futures::future::join_all;
 use idgenerator::{IdGeneratorOptions, IdInstance};
 use rand::TryRngCore;
 use rand::rngs::OsRng;
-use powdrr_lib::test_api::{CompactionMode, IndexingMode, PrefetchMode, TestProcessingMode, TestingMode};
+use powdrr_lib::compaction;
+use powdrr_lib::test_api::{CompactionMode, IndexingMode, PrefetchMode, TestProcessingMode, StateMode};
 
 const LINE_LIMIT: u64 = 1000000;
 
@@ -215,10 +216,14 @@ async fn main() -> Result<(), std::io::Error> {
         Err(_) => panic!("What happened?")
     }
 
+    println!("Drop All Iceberg Tables");
+
+    compaction::drop_all_tables(&"default".to_string()).await.unwrap();
+
     println!("Setting Modes");
 
     let client = reqwest::Client::new();
-
+/*
     let coordinator_mode = TestProcessingMode {
         testing_mode: TestingMode::Enabled,
         indexing_mode: IndexingMode::Disabled,
@@ -234,12 +239,12 @@ async fn main() -> Result<(), std::io::Error> {
     };
 
     println!("Coordinator mode set");
-
+*/
     let main_mode = TestProcessingMode {
-        testing_mode: TestingMode::Disabled,
-        indexing_mode: IndexingMode::Async,
+        state_mode: StateMode::Leaderless("http://localhost:7784".to_string()),
+        indexing_mode: IndexingMode::Disabled,
         compaction_mode: CompactionMode::Async,
-        prefetch_mode: PrefetchMode::Disabled,
+        prefetch_mode: PrefetchMode::Enabled,
     };
     
     let _res = match client.put("http://localhost:9200/_test/v1/_testing_and_processing_mode")
@@ -252,8 +257,6 @@ async fn main() -> Result<(), std::io::Error> {
     };
 
     println!("Engine mode set");
-
-
 
     println!("Starting Benchmark!!!!!!!!!!!!!!!!!!!!!!!!!!");
 

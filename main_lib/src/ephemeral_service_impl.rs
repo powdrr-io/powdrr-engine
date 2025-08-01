@@ -1,22 +1,18 @@
 use std::collections::HashMap;
 use idgenerator::IdInstance;
-use crate::compaction::drop_all_tables;
 use crate::distributed_cache;
-use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_ingest::CreateIndexTemplateBody;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::pipeline::PipelineDefinition;
 use crate::schema_massager::PowdrrSchema;
 use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateTable, DeletesMetadata, ExtensionCommit, ExtensionFile, ExtensionWorkItem, FileSetPayload, IcebergCommit, SpeedboatCommit, SpeedboatCommitTableInfo, SpeedboatMetadata, TableDescription, TableMetadataCheckpoint};
 use crate::state_provider::ServiceApiError;
-use crate::peers::{CheckpointDescriptor, PeerClient, SelfPeer};
-use crate::test_api::{IndexingMode, TestProcessingMode};
+use crate::peers::{CheckpointDescriptor};
 
 type CommittedCheckpoints = HashMap<String, String>;
 
 
 pub struct EphemeralServiceImpl {
-    mode: TestProcessingMode,
     tables: HashMap<String, TableDescription>,
     // alias name -> table name
     table_aliases: HashMap<String, String>,
@@ -35,7 +31,6 @@ pub struct EphemeralServiceImpl {
 impl EphemeralServiceImpl {
     pub fn new() -> Self {
         EphemeralServiceImpl{
-            mode: TestProcessingMode::default(),
             tables: HashMap::new(),
             table_aliases: HashMap::new(),
             table_templates: HashMap::new(),
@@ -49,25 +44,6 @@ impl EphemeralServiceImpl {
             extension_work_items: HashMap::from([("es".to_string(), HashMap::new())]),
             recent_file_extension_metadata: HashMap::new(),
         }
-    }
-
-    pub async fn clear_and_set(&mut self, mode: TestProcessingMode) -> Result<(), ServiceApiError> {
-        distributed_cache::clear(&self.tables.keys().into_iter().map(|x|x.clone()).collect()).unwrap();
-        self.mode = mode;
-        self.tables.clear();
-        self.table_aliases.clear();
-        self.table_templates.clear();
-        self.pipelines.clear();
-        self.lifetime_policies.clear();
-        self.latest_committed_checkpoint_id.clear();
-        self.compaction_work_items.clear();
-        self.compactions.clear();
-        self.checkpoints.clear();
-        self.checkpoints_needing_extension_work.clear();
-        self.extension_work_items = HashMap::from([("es".to_string(), HashMap::new())]);
-        self.recent_file_extension_metadata.clear();
-        drop_all_tables(&"default".to_string()).await.expect("Failed while dropping all tables");
-        Ok(())
     }
 
     fn checkpoints_needing_extension_work(&self, table_name: &String, extension_name: &String) -> Option<Vec<String>> {
@@ -322,8 +298,6 @@ impl EphemeralServiceImpl {
             &iceberg_files
         );
 
-        self.create_index(&table_info.table_name).await?;
-
         self.set_latest_committed_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
 
         // TODO: apply some policy here based on sizes to split up compaction work items
@@ -431,29 +405,6 @@ impl EphemeralServiceImpl {
         } else {
             None
         }
-    }
-
-    async fn create_index(&mut self, table_name: &String) -> Result<(), ServiceApiError> {
-        match self.mode.indexing_mode {
-            IndexingMode::Sync => {
-                let work_items = self.get_extension_work_items(&"es".to_owned()).await?;
-                for work_item in work_items.iter() {
-                    let metadata = create_index_inner(
-                        &work_item.iceberg_files.as_file_tuples(),
-                        &work_item.speedboat_files.as_file_tuples()
-                    ).await.map_err(|e|ServiceApiError::from_index_error(&e))?;
-                    self.extension_commit(
-                        &table_name,
-                        &ExtensionCommit {
-                            extension: "es".to_owned(),
-                            files: metadata,
-                        }
-                    ).await?
-                }
-            },
-            _ => ()
-        }
-        Ok(())
     }
 
     pub async fn get_all_iceberg_tables(&mut self) -> Result<Vec<String>, ServiceApiError> {
@@ -617,8 +568,6 @@ impl EphemeralServiceImpl {
             &iceberg_files
         );
 
-        self.create_index(table_name).await?;
-
         Ok(())
     }
 
@@ -701,9 +650,5 @@ impl EphemeralServiceImpl {
             }
         }
         Ok(work_items)
-    }
-
-    pub async fn get_peer_clients(&mut self) -> Vec<Box<dyn PeerClient>> {
-        vec!(Box::new(SelfPeer::new(self.mode.compaction_mode.clone())))
     }
 }

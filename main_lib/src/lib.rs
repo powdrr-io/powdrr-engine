@@ -1,6 +1,6 @@
 extern crate core;
 
-mod compaction;
+pub mod compaction;
 mod data_access;
 pub mod data_contract;
 mod data_fusion_functions;

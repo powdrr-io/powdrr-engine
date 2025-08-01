@@ -6,7 +6,6 @@ use powdrr_lib::ephemeral_service_impl::EphemeralServiceImpl;
 use powdrr_lib::pipeline::PipelineDefinition;
 use powdrr_lib::data_contract::{CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
 use powdrr_lib::peers::CheckpointDescriptor;
-use powdrr_lib::test_api::TestProcessingMode;
 use tokio::sync::{mpsc, oneshot};
 use powdrr_lib::state_provider::ServiceApiError;
 
@@ -46,10 +45,6 @@ enum ServiceImpl {
 
 
 enum ServiceImplProviderActorMessage {
-    Testing {
-        respond_to: oneshot::Sender<()>,
-        mode: TestProcessingMode,
-    },
     CreatePipeline {
         respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
         name: String,
@@ -161,9 +156,6 @@ impl ServiceImplProviderActor {
 
     async fn handle_message(&mut self, msg: ServiceImplProviderActorMessage) -> () {
         match msg {
-            ServiceImplProviderActorMessage::Testing { respond_to, mode } => {
-                handle_message_impl!(self, respond_to, clear_and_set(mode));
-            },
             ServiceImplProviderActorMessage::CreatePipeline { respond_to, name, pipeline } => {
                 handle_message_impl!(self, respond_to, create_pipeline(&name, &pipeline));
             },
@@ -243,10 +235,6 @@ macro_rules! state_provider_func_impl {
 
 
 impl ServiceImpl {
-    async fn clear_and_set(&mut self, mode: TestProcessingMode) -> () {
-        state_provider_func_impl!(self, clear_and_set(mode)).unwrap()
-    }
-
     async fn add_checkpoint(&mut self, checkpoint: &TableMetadataCheckpoint) -> () {
         state_provider_func_impl!(self, add_checkpoint(checkpoint)).unwrap()
     }
@@ -383,11 +371,6 @@ impl ServiceImplHandle {
         tokio::spawn(run_api_service_client_actor_message_pump(actor));
 
         Self { sender }
-    }
-
-    #[allow(dead_code)]
-    pub async fn set_testing_mode(&self, mode: &TestProcessingMode) -> () {
-        send_message!(self, Testing, mode = mode.clone());
     }
 
     pub async fn create_pipeline(&self, name: &String, pipeline: &PipelineDefinition) -> Result<(), ServiceImplError> {

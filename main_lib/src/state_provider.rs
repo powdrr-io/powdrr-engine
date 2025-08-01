@@ -1,15 +1,14 @@
 use std::{error::Error};
 use std::fmt::{Display, Formatter};
 use tokio::sync::{mpsc, oneshot};
-
 use crate::{elastic_search_ingest::CreateIndexTemplateBody, pipeline::PipelineDefinition, peers::CheckpointDescriptor};
 use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
-use crate::elastic_search_index::IndexError;
+use crate::elastic_search_index::{create_index_inner};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::ephemeral_state_provider::EphemeralStateProvider;
 use crate::leaderless_state_provider::LeaderlessStateProvider;
 use crate::peers::{PeerClient};
-use crate::test_api::{TestProcessingMode};
+use crate::test_api::{CompactionMode, IndexingMode, StateMode, TestProcessingMode};
 
 
 #[derive(Debug, Clone)]
@@ -37,10 +36,6 @@ impl ServiceApiError {
         }
     }
 
-    pub(crate) fn from_index_error(index_error: &IndexError) -> Self {
-        Self::new(format!("Index Error: {}", index_error))
-    }
-
     pub fn from_reqwest(error: reqwest::Error) -> Self {
         Self::new(format!("Reqwest: {}", error))
     }
@@ -49,7 +44,7 @@ impl ServiceApiError {
 
 
 enum StateProviderActorMessage {
-    Testing {
+    SetMode {
         respond_to: oneshot::Sender<()>,
         mode: TestProcessingMode,
     },
@@ -162,6 +157,9 @@ unsafe impl Send for StateProviderActorMessage {}
 struct StateProviderActor {
     state_provider: StateProvider,
     receiver: mpsc::Receiver<StateProviderActorMessage>,
+    indexing_mode: IndexingMode,
+    #[allow(dead_code)]
+    compaction_mode: CompactionMode,
 }
 
 
@@ -172,17 +170,63 @@ macro_rules! handle_message_impl {
 }
 
 impl StateProviderActor {
-    fn new(receiver: mpsc::Receiver<StateProviderActorMessage>, _base_address: String) -> Self {
+    fn new(receiver: mpsc::Receiver<StateProviderActorMessage>) -> Self {
         StateProviderActor {
             state_provider: StateProvider::Ephemeral(EphemeralStateProvider::new()),
             receiver,
+            indexing_mode: IndexingMode::Disabled,
+            compaction_mode: CompactionMode::Disabled,
+        }
+    }
+
+    async fn create_index(&mut self, table_name: &String) -> () {
+        match self.indexing_mode {
+            IndexingMode::Sync => {
+                let work_items = match self.state_provider.get_extension_work_items(&"es".to_owned()).await {
+                    Ok(work_items) => work_items,
+                    Err(e) => {
+                        tracing::error!("Failed to get extension work items: {}", e);
+                        return;
+                    }
+                };
+                for work_item in work_items.iter() {
+                    let metadata = match create_index_inner(
+                        &work_item.iceberg_files.as_file_tuples(),
+                        &work_item.speedboat_files.as_file_tuples()
+                    ).await {
+                        Ok(metadata) => metadata,
+                        Err(e) => {
+                            tracing::error!("Failed to create index: {}", e);
+                            continue;
+                        }
+                    };
+                    match self.state_provider.extension_commit(
+                        &table_name,
+                        &ExtensionCommit {
+                            extension: "es".to_owned(),
+                            files: metadata,
+                        }
+                    ).await {
+                        Ok(_) => (),
+                        Err(e) => {
+                            tracing::error!("Failed to commit extension: {}", e);
+                        }
+                    }
+                }
+            },
+            _ => ()
         }
     }
 
     async fn handle_message(&mut self, msg: StateProviderActorMessage) -> () {
         match msg {
-            StateProviderActorMessage::Testing { respond_to, mode } => {
-                handle_message_impl!(self, respond_to, clear_and_set(mode));
+            StateProviderActorMessage::SetMode { respond_to, mode } => {
+                match mode.state_mode {
+                    StateMode::Testing => self.state_provider = StateProvider::Ephemeral(EphemeralStateProvider::new()),
+                    StateMode::Ephemeral => self.state_provider = StateProvider::Ephemeral(EphemeralStateProvider::new()),
+                    StateMode::Leaderless(address) => self.state_provider = StateProvider::Leaderless(LeaderlessStateProvider::new(address)),
+                }
+                respond_to.send(()).unwrap();
             },
             StateProviderActorMessage::CreatePipeline { respond_to, name, pipeline } => {
                 handle_message_impl!(self, respond_to, create_pipeline(&name, &pipeline));
@@ -219,6 +263,7 @@ impl StateProviderActor {
             },
             StateProviderActorMessage::IcebergCommit { respond_to, table_name, iceberg_commit } => {
                 handle_message_impl!(self, respond_to, iceberg_commit(&table_name, &iceberg_commit));
+                self.create_index(&table_name).await;
             },            
             StateProviderActorMessage::SpeedboatCommit { respond_to, speedboat_commit } => {
                 handle_message_impl!(self, respond_to, speedboat_commit(&speedboat_commit));
@@ -282,10 +327,6 @@ macro_rules! state_provider_func_impl {
 
 
 impl StateProvider {
-    async fn clear_and_set(&mut self, mode: TestProcessingMode) -> () {
-        state_provider_func_impl!(self, clear_and_set(mode))
-    }
-
     pub(crate) async fn set_target_checkpoints(&mut self, descriptors: &Vec<CheckpointDescriptor>, extension: Option<String>) -> Result<(), ServiceApiError> {
         state_provider_func_impl!(self, set_target_checkpoints(descriptors, extension))
     }
@@ -433,16 +474,16 @@ macro_rules! send_message {
 }
 
 impl StateProviderHandle {
-    pub fn new(address: String) -> Self {
+    pub fn new() -> Self {
         let (sender, receiver) = mpsc::channel(1);
-        let actor = StateProviderActor::new(receiver, address);
+        let actor = StateProviderActor::new(receiver);
         tokio::spawn(run_state_provider_actor_message_pump(actor));
 
         Self { sender }
     }
 
     pub async fn set_testing_mode(&self, mode: &TestProcessingMode) -> () {
-        send_message!(self, Testing, mode = mode.clone());
+        send_message!(self, SetMode, mode = mode.clone());
     }
 
     pub async fn create_pipeline(&self, name: &String, pipeline: &PipelineDefinition) -> Result<(), ServiceApiError> {
@@ -538,4 +579,4 @@ impl StateProviderHandle {
     }
 }
 
-pub static STATE_PROVIDER: std::sync::LazyLock<StateProviderHandle> = std::sync::LazyLock::new(|| StateProviderHandle::new("http://localhost:7784".to_string()));
+pub static STATE_PROVIDER: std::sync::LazyLock<StateProviderHandle> = std::sync::LazyLock::new(|| StateProviderHandle::new());

@@ -6,8 +6,8 @@ use crate::pipeline::PipelineDefinition;
 use crate::data_contract::{AddAlias, CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem, GetLatestCheckpoint, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
 use crate::ephemeral_fetch_tracker::EphemeralFetchTracker;
 use crate::state_provider::ServiceApiError;
-use crate::peers::{CheckpointDescriptor, PeerClient};
-use crate::test_api::TestProcessingMode;
+use crate::peers::{CheckpointDescriptor, PeerClient, SelfPeer};
+use crate::test_api::{CompactionMode};
 
 
 pub struct LeaderlessStateProvider {
@@ -18,15 +18,12 @@ pub struct LeaderlessStateProvider {
 
 impl LeaderlessStateProvider {
     #[allow(dead_code)]
-    fn new(address: String) -> Self {
+    pub(crate) fn new(address: String) -> Self {
         LeaderlessStateProvider {
             base_address: address,
             client: reqwest::Client::new(),
             fetch_tracker: EphemeralFetchTracker::new(),
         }
-    }
-
-    pub async fn clear_and_set(&mut self, _mode: TestProcessingMode) {
     }
 
     pub(crate) async fn add_checkpoint(&mut self, _checkpoint: &TableMetadataCheckpoint) -> () {
@@ -273,7 +270,7 @@ impl LeaderlessStateProvider {
     }
 
     pub(crate) async fn get_peer_clients(&mut self) -> Vec<Box<dyn PeerClient>> {
-        todo!("nope")
+        vec!(Box::new(SelfPeer::new(CompactionMode::Async)))
     }
 
     pub(crate) async fn get_next_prefetch_checkpoints(&mut self, extensions: Option<String>) -> Result<Vec<CheckpointDescriptor>, ServiceApiError> {
