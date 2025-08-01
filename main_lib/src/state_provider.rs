@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use tokio::sync::{mpsc, oneshot};
-use crate::{peers::CheckpointDescriptor, pipeline::PipelineDefinition};
+use crate::{distributed_cache, peers::CheckpointDescriptor, pipeline::PipelineDefinition};
 use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
 use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
@@ -241,6 +241,10 @@ impl StateProviderActor {
                     handle_message_impl!(self, respond_to, describe_lifetime_policy(&name));
             },
             StateProviderActorMessage::CreateTable { respond_to, create_table } => {
+                match distributed_cache::create_table(&create_table.name) {
+                    Ok(_) => (),
+                    Err(e) => panic!("Unable to create table = {}", e),
+                };
                 handle_message_impl!(self, respond_to, create_table(&create_table));
             },
             StateProviderActorMessage::DescribeTable { respond_to, name } => {

@@ -13,7 +13,7 @@ pub struct SpeedboatCommitTableInfo {
 }
 
 impl SpeedboatCommitTableInfo {
-    pub(crate) fn as_file_set_payload(&self) -> FileSetPayload {
+    pub fn as_file_set_payload(&self) -> FileSetPayload {
         FileSetPayload {
             file_paths: self.files.clone(),
             sizes: self.sizes.clone(),
@@ -119,7 +119,7 @@ pub struct TableMetadataCheckpoint {
 
 
 impl TableMetadataCheckpoint {
-    pub(crate) fn fully_covered_for_extension(&self, extension_name: &String) -> bool {
+    pub fn fully_covered_for_extension(&self, extension_name: &String) -> bool {
         let total_num_files =
             self.speedboat_metadata.as_ref().map_or(0, |x| x.files.file_paths.len()) +
                 self.iceberg_metadata.as_ref().map_or(0, |x| x.files.file_paths.len());
@@ -161,7 +161,7 @@ impl TableMetadataCheckpoint {
         true
     }
 
-    pub(crate) fn add_coverage(&mut self, extension_commit: &ExtensionCommit) -> () {
+    pub fn add_coverage(&mut self, extension_commit: &ExtensionCommit) -> () {
         assert!(!self.fully_covered_for_extension(&extension_commit.extension), "Already fully covered");
 
         let existing_extension_metadata_map = self.extension_metadata.get(&extension_commit.extension).map_or(HashMap::new(), |x| x.clone());
@@ -217,7 +217,7 @@ pub struct TableDescription {
 }
 
 impl TableDescription {
-    pub(crate) fn from_create_table(create_table: &CreateTable) -> Self {
+    pub fn from_create_table(create_table: &CreateTable) -> Self {
         TableDescription {
             name: create_table.name.clone(),
             tags: create_table.tags.clone(),
@@ -313,7 +313,7 @@ impl FileSetPayload {
         cloned
     }
 
-    pub(crate) fn add(&mut self, file_descriptor: &FileDescriptor) -> () {
+    pub fn add(&mut self, file_descriptor: &FileDescriptor) -> () {
         if self.file_paths.contains(&file_descriptor.file_path) {
             return;
         }
@@ -339,12 +339,12 @@ pub struct ExtensionWorkItem {
 }
 
 impl ExtensionWorkItem {
-    pub(crate) fn clear(&mut self) -> () {
+    pub fn clear(&mut self) -> () {
         self.speedboat_files.clear();
         self.iceberg_files.clear();
     }
 
-    pub(crate) fn has_work(&self) -> bool {
+    pub fn has_work(&self) -> bool {
         self.speedboat_files.len() > 0 || self.iceberg_files.len() > 0
     }
 }
@@ -358,77 +358,85 @@ pub struct CompactionWorkItem {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct AliasInfo {
-    is_hidden: bool
+pub struct AliasInfo {
+    pub is_hidden: bool,
 }
 
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(untagged)]
-enum StringOrBool {
+pub enum StringOrBool {
     Bool(bool),
     String(String),
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct MetaInfo {
+pub struct MetaInfo {
     #[serde(rename = "migrationMappingPropertyHashes")]
     migration_mapping_property_hashes: HashMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct PropertyInfo {
+pub struct PropertyInfo {
     #[serde(rename = "type")]
-    type_name: Option<String>,
+    pub type_name: Option<String>,
     #[serde(default)]
-    enabled: bool,
-    dynamic: Option<StringOrBool>,
-    properties: Option<HashMap<String, PropertyInfo>>,
-    fields: Option<HashMap<String, PropertyInfo>>,
+    pub enabled: bool,
+    pub dynamic: Option<StringOrBool>,
+    pub properties: Option<HashMap<String, PropertyInfo>>,
+    pub fields: Option<HashMap<String, PropertyInfo>>,
     #[serde(default)]
-    ignore_above: u32,
-    scaling_factor: Option<u32>,
+    pub ignore_above: u32,
+    pub scaling_factor: Option<u32>,
 }
 
 
 
 #[derive(Serialize, Deserialize, Clone)]
-struct Mappings {
-    dynamic: StringOrBool,
-    _meta: Option<MetaInfo>,
-    properties: HashMap<String, PropertyInfo>,
+pub struct Mappings {
+    pub dynamic: StringOrBool,
+    pub _meta: Option<MetaInfo>,
+    pub properties: HashMap<String, PropertyInfo>,
 }
 
 
 #[derive(Serialize, Deserialize, Clone)]
-struct IndexMappingSettings {
-    total_fields: IndexMappingFieldSettings,
+pub struct IndexMappingSettings {
+    pub total_fields: IndexMappingFieldSettings,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct IndexMappingFieldSettings {
-    limit: Option<u32>
+pub struct IndexMappingFieldSettings {
+    pub limit: Option<u32>
 }
 
 
 #[derive(Serialize, Deserialize, Clone)]
-struct IndexSettings {
-    number_of_shards: Option<u32>,
-    number_of_replicas: Option<u32>,
-    auto_expand_replicas: Option<String>,
-    refresh_interval: Option<String>,
-    priority: Option<u32>,
-    mapping: Option<IndexMappingSettings>,
+pub struct IndexSettings {
+    pub number_of_shards: Option<u32>,
+    pub number_of_replicas: Option<u32>,
+    pub auto_expand_replicas: Option<String>,
+    pub refresh_interval: Option<String>,
+    pub priority: Option<u32>,
+    pub mapping: Option<IndexMappingSettings>,
 }
 
+#[derive(Serialize)]
+pub struct CreateIndexResult {
+    pub acknowledged: bool,
+    pub shards_acknowledged: bool,
+    pub index: String,
+}
+
+
 #[derive(Serialize, Deserialize, Clone)]
-struct CreateIndexSettings {
-    index: IndexSettings
+pub struct CreateIndexSettings {
+    pub index: IndexSettings
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(untagged)]
-enum CreateIndexSettingsOption {
+pub enum CreateIndexSettingsOption {
     Indirect(CreateIndexSettings),
     Direct(IndexSettings),
 }
@@ -436,13 +444,13 @@ enum CreateIndexSettingsOption {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CreateIndexBody {
-    aliases: Option<HashMap<String, AliasInfo>>,
-    mappings: Option<Mappings>,
-    settings: Option<CreateIndexSettingsOption>,
+    pub aliases: Option<HashMap<String, AliasInfo>>,
+    pub mappings: Option<Mappings>,
+    pub settings: Option<CreateIndexSettingsOption>,
 }
 
 impl CreateIndexBody {
-    fn parse(content: &String) -> Result<Self, serde_json::Error> {
+    pub(crate) fn parse(content: &String) -> Result<Self, serde_json::Error> {
         if content.len() == 0 {
             Ok(CreateIndexBody{ aliases: None, mappings: None, settings: None })
         } else {
@@ -454,8 +462,19 @@ impl CreateIndexBody {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CreateIndexTemplateBody {
     #[serde(default)]
-    index_patterns: Vec<String>,
-    priority: Option<u32>,
-    version: Option<u32>,
-    template: CreateIndexBody,
+    pub index_patterns: Vec<String>,
+    pub priority: Option<u32>,
+    pub version: Option<u32>,
+    pub template: CreateIndexBody,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum ServiceImplType {
+    Ephemeral,
+    DynamoDb,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ServiceMode {
+    pub impl_type: ServiceImplType,
 }

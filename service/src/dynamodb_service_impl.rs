@@ -1,19 +1,16 @@
 use std::collections::HashMap;
 use idgenerator::IdInstance;
-use powdrr_lib::data_contract::TableDescription;
-use crate::distributed_cache;
-use crate::elastic_search_ingest::CreateIndexTemplateBody;
-use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
-use crate::pipeline::PipelineDefinition;
-use crate::schema_massager::PowdrrSchema;
-use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateTable, DeletesMetadata, ExtensionCommit, ExtensionFile, ExtensionWorkItem, FileSetPayload, IcebergCommit, SpeedboatCommit, SpeedboatCommitTableInfo, SpeedboatMetadata, TableDescription, TableMetadataCheckpoint};
-use crate::state_provider::ServiceApiError;
-use crate::peers::{CheckpointDescriptor};
+use powdrr_lib::data_contract::{TableDescription, CreateIndexTemplateBody, CompactionWorkItem, ExtensionWorkItem, CompactionCommit, TableMetadataCheckpoint, ExtensionFile, ExtensionCommit, FileSetPayload, SpeedboatCommitTableInfo, SpeedboatMetadata, DeletesMetadata, CreateTable, SpeedboatCommit, IcebergCommit};
+use powdrr_lib::elastic_search_lifetime_policy::ILMPolicyDefinition;
+use powdrr_lib::peers::CheckpointDescriptor;
+use powdrr_lib::pipeline::PipelineDefinition;
+use powdrr_lib::schema_massager::PowdrrSchema;
+use powdrr_lib::state_provider::ServiceApiError;
 
 type CommittedCheckpoints = HashMap<String, String>;
 
 
-pub struct EphemeralServiceImpl {
+pub struct DynamoDBServiceImpl {
     tables: HashMap<String, TableDescription>,
     // alias name -> table name
     table_aliases: HashMap<String, String>,
@@ -29,9 +26,9 @@ pub struct EphemeralServiceImpl {
     recent_file_extension_metadata: HashMap<String, Vec<ExtensionFile>>,
 }
 
-impl EphemeralServiceImpl {
+impl DynamoDBServiceImpl {
     pub fn new() -> Self {
-        EphemeralServiceImpl{
+        DynamoDBServiceImpl{
             tables: HashMap::new(),
             table_aliases: HashMap::new(),
             table_templates: HashMap::new(),
@@ -413,10 +410,6 @@ impl EphemeralServiceImpl {
     }
 
     pub async fn create_table(&mut self, create_table: &CreateTable) -> Result<(), ServiceApiError> {
-        match distributed_cache::create_table(&create_table.name) {
-            Ok(_) => (),
-            Err(e) => panic!("Unable to create table = {}", e),
-        };
         match self.tables.get(&create_table.name) {
             Some(_) => {
                 self.tables.remove(&create_table.name);

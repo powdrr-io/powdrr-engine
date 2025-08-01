@@ -6,6 +6,7 @@ use idgenerator::{IdGeneratorOptions, IdInstance};
 use rand::TryRngCore;
 use rand::rngs::OsRng;
 use powdrr_lib::compaction;
+use powdrr_lib::data_contract::{ServiceImplType, ServiceMode};
 use powdrr_lib::test_api::{CompactionMode, IndexingMode, PrefetchMode, TestProcessingMode, StateMode};
 
 const LINE_LIMIT: u64 = 1000000;
@@ -223,15 +224,12 @@ async fn main() -> Result<(), std::io::Error> {
     println!("Setting Modes");
 
     let client = reqwest::Client::new();
-/*
-    let coordinator_mode = TestProcessingMode {
-        testing_mode: TestingMode::Enabled,
-        indexing_mode: IndexingMode::Disabled,
-        compaction_mode: CompactionMode::Disabled,
-        prefetch_mode: PrefetchMode::Disabled,
+
+    let coordinator_mode = ServiceMode {
+        impl_type: ServiceImplType::DynamoDb
     };
 
-    let _res = match client.put("http://localhost:7784/_test/v1/_testing_and_processing_mode")
+    let _res = match client.put("http://localhost:7784/_test/v1/_set_mode")
         .body(serde_json::to_string(&coordinator_mode)?)
         .send().await {
         Ok(res) => res,
@@ -239,7 +237,7 @@ async fn main() -> Result<(), std::io::Error> {
     };
 
     println!("Coordinator mode set");
-*/
+
     let main_mode = TestProcessingMode {
         state_mode: StateMode::Leaderless("http://localhost:7784".to_string()),
         indexing_mode: IndexingMode::Disabled,

@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use idgenerator::IdInstance;
-use crate::distributed_cache;
 use crate::data_contract::CreateIndexTemplateBody;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::pipeline::PipelineDefinition;
@@ -412,10 +411,6 @@ impl EphemeralServiceImpl {
     }
 
     pub async fn create_table(&mut self, create_table: &CreateTable) -> Result<(), ServiceApiError> {
-        match distributed_cache::create_table(&create_table.name) {
-            Ok(_) => (),
-            Err(e) => panic!("Unable to create table = {}", e),
-        };
         match self.tables.get(&create_table.name) {
             Some(_) => {
                 self.tables.remove(&create_table.name);

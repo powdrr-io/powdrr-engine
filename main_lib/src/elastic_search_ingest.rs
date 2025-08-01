@@ -25,7 +25,7 @@ use crate::data_access;
 use crate::elastic_search_parser::UpdateBody;
 use crate::elastic_search_storage_schema::{FullRecord, RecordDelete, RecordInput, SpeedboatCommitBuilder};
 use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
-use crate::data_contract::{CreateIndexTemplateBody, CreateTable, SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription};
+use crate::data_contract::{CreateIndexBody, CreateIndexResult, CreateIndexTemplateBody, CreateTable, SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription};
 use crate::state_provider::{ServiceApiError, STATE_PROVIDER};
 use crate::util::{describe_table_log_error_then_none, log_err, log_service_err};
 
@@ -963,8 +963,8 @@ pub(crate) static INGEST_HANDLE: std::sync::LazyLock<IngestHandle> = std::sync::
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, fs};
-    use crate::data_contract::CreateIndexTemplateBody;
-    use crate::elastic_search_ingest::{IngestCommand, PropertyInfo};
+    use crate::data_contract::{CreateIndexTemplateBody, PropertyInfo};
+    use crate::elastic_search_ingest::{IngestCommand};
 
     use super::CreateIndexBody;
 
