@@ -4,7 +4,7 @@ use futures::FutureExt;
 use gotham::{handler::HandlerFuture, helpers::http::response::create_response, hyper::{body, Body, StatusCode}, mime, state::{FromState, State}};
 use serde::{Deserialize, Serialize};
 
-use crate::{compaction::perform_compaction, elastic_search_index::{self, create_index}, state_hosted_service::{API_SERVICE_CLIENT}};
+use crate::{compaction::perform_compaction, elastic_search_index::{self, create_index}, state_provider::{STATE_PROVIDER}};
 use crate::data_contract::TableMetadataCheckpoint;
 use crate::prefetch::perform_prefetch;
 
@@ -133,7 +133,7 @@ pub fn test_v1_add_checkpoint(mut state: State) -> Pin<Box<HandlerFuture>> {
             Err(_) => panic!("This should not happen"),
         };
 
-        API_SERVICE_CLIENT.add_checkpoint(&invocation_obj).await;
+        STATE_PROVIDER.add_checkpoint(&invocation_obj).await;
         let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "Ok");
         Ok((state, res))        
     }.boxed()
@@ -141,7 +141,7 @@ pub fn test_v1_add_checkpoint(mut state: State) -> Pin<Box<HandlerFuture>> {
 
 pub fn test_v1_set_testing_mode(state: State) -> Pin<Box<HandlerFuture>> {
     async {
-        API_SERVICE_CLIENT.set_testing_mode(&TestProcessingMode::default()).await;
+        STATE_PROVIDER.set_testing_mode(&TestProcessingMode::default()).await;
         let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "Ok");
         Ok((state, res))        
     }.boxed()
@@ -156,7 +156,7 @@ pub(crate) async fn do_all_available_extension_work(extensions: &Vec<String>) ->
         let mut last_iceberg_snapshot_id: i64 = 0;
 
         tracing::info!("Checking for indexing work");
-        let index_work = match API_SERVICE_CLIENT.get_extension_work_items(&"es".to_string()).await {
+        let index_work = match STATE_PROVIDER.get_extension_work_items(&"es".to_string()).await {
             Ok(work) => work,
             Err(_) => panic!("oh no"),
         };
@@ -187,7 +187,7 @@ pub(crate) async fn do_all_available_compaction_work(start_snapshot_id: i64) -> 
     loop {
         let mut work_done = false;
 
-        let compact_work = match API_SERVICE_CLIENT.get_compaction_work_items().await {
+        let compact_work = match STATE_PROVIDER.get_compaction_work_items().await {
             Ok(work) => work,
             Err(_e) => {
                 panic!("oh no")
@@ -214,7 +214,7 @@ pub(crate) async fn do_all_available_compaction_work(start_snapshot_id: i64) -> 
 }
 
 pub(crate) async fn do_next_prefetch() -> usize {
-    let prefetch_work = match API_SERVICE_CLIENT.get_next_prefetch_checkpoints(None).await {
+    let prefetch_work = match STATE_PROVIDER.get_next_prefetch_checkpoints(None).await {
         Ok(work) => work,
         Err(_) => panic!("oh no"),
     };
@@ -277,7 +277,7 @@ pub fn test_v1_set_testing_processing_mode(mut state: State) -> Pin<Box<HandlerF
             Err(_) => TestProcessingMode::default()
         };
 
-        API_SERVICE_CLIENT.set_testing_mode(&mode).await;
+        STATE_PROVIDER.set_testing_mode(&mode).await;
         if !mode.indexing_mode.is_disabled() {
             tokio::spawn(do_extension_work_for_forever(vec!("es".to_string()), 1000));
         }

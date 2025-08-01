@@ -3,8 +3,8 @@ use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::ephemeral_service_impl::EphemeralServiceImpl;
 use crate::pipeline::PipelineDefinition;
 use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
-use crate::state_hosted_service::ServiceApiError;
-use crate::state_peers::{CheckpointDescriptor, PeerClient};
+use crate::state_provider::ServiceApiError;
+use crate::peers::{CheckpointDescriptor, PeerClient};
 use crate::test_api::{TestProcessingMode};
 
 pub struct EphemeralStateProvider {

@@ -8,8 +8,8 @@ use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::pipeline::PipelineDefinition;
 use crate::schema_massager::PowdrrSchema;
 use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateTable, DeletesMetadata, ExtensionCommit, ExtensionFile, ExtensionWorkItem, FileSetPayload, IcebergCommit, SpeedboatCommit, SpeedboatCommitTableInfo, SpeedboatMetadata, TableDescription, TableMetadataCheckpoint};
-use crate::state_hosted_service::ServiceApiError;
-use crate::state_peers::{CheckpointDescriptor, PeerClient, SelfPeer};
+use crate::state_provider::ServiceApiError;
+use crate::peers::{CheckpointDescriptor, PeerClient, SelfPeer};
 use crate::test_api::{IndexingMode, TestProcessingMode};
 
 type CommittedCheckpoints = HashMap<String, String>;

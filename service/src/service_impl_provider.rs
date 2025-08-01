@@ -5,10 +5,10 @@ use powdrr_lib::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use powdrr_lib::ephemeral_service_impl::EphemeralServiceImpl;
 use powdrr_lib::pipeline::PipelineDefinition;
 use powdrr_lib::data_contract::{CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
-use powdrr_lib::state_peers::CheckpointDescriptor;
+use powdrr_lib::peers::CheckpointDescriptor;
 use powdrr_lib::test_api::TestProcessingMode;
 use tokio::sync::{mpsc, oneshot};
-use powdrr_lib::state_hosted_service::ServiceApiError;
+use powdrr_lib::state_provider::ServiceApiError;
 
 #[derive(Debug, Clone)]
 pub struct ServiceImplError {

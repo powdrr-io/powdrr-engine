@@ -11,7 +11,7 @@ use powdrr_lib::data_contract::{AddAlias, CompactionCommit, CreateTable, Extensi
 use powdrr_lib::elastic_search_ingest::CreateIndexTemplateBody;
 use powdrr_lib::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use powdrr_lib::pipeline::PipelineDefinition;
-use powdrr_lib::state_peers::CheckpointDescriptor;
+use powdrr_lib::peers::CheckpointDescriptor;
 use crate::response::GenericResponse;
 use crate::router::NamePathExtractor;
 use crate::service_impl_provider::{ServiceImplError, SERVICE_IMPL};

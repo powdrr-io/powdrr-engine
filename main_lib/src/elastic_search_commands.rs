@@ -10,7 +10,7 @@ use gotham::mime;
 use http::StatusCode;
 use serde_json::Value;
 
-use crate::{data_access::{self, execute_sql}, distributed_cache, elastic_search_common::{Command, ResultGeneratorFuture}, elastic_search_parser::ScriptBlock, elastic_search_responses::{QueryResultHit, QueryResults}, expression_evaluator, painless_parser, state_hosted_service::API_SERVICE_CLIENT, state_peers::CheckpointDescriptor};
+use crate::{data_access::{self, execute_sql}, distributed_cache, elastic_search_common::{Command, ResultGeneratorFuture}, elastic_search_parser::ScriptBlock, elastic_search_responses::{QueryResultHit, QueryResults}, expression_evaluator, painless_parser, state_provider::STATE_PROVIDER, peers::CheckpointDescriptor};
 use crate::data_access::execute_sql_async;
 use crate::elastic_search_common::{CommandError, ElasticSearchResponse};
 use crate::elastic_search_endpoints::QueryStringSearch;
@@ -19,7 +19,7 @@ use crate::elastic_search_parser::{process_aggregations, Aggregation};
 use crate::elastic_search_responses::{transient_error, AggregationResult, QueryResultsNotFound, UpdateByQueryResults, UpdateByQueryResultsRetries, UpdateByQuerySuccess};
 use crate::elastic_search_storage_schema::{FullRecord, RecordDelete, RecordInput, SpeedboatCommitBuilder};
 use crate::schema_massager::{to_powdrr_schema, PowdrrSchema, SqlBuilder, SqlExpression, SqlQuery};
-use crate::state_peers::{PrivateInvocation, PrivateSqlInvocation};
+use crate::peers::{PrivateInvocation, PrivateSqlInvocation};
 
 async fn empty_result(aggs: Option<Vec<Aggregation>>, total_hits_complex: bool) -> ElasticSearchResponse {
     // TODO: need to record and feed through the requested number of shards from index creation
@@ -116,7 +116,7 @@ impl LookupById {
     }
 
     async fn current_target_snapshots(&self) -> Vec<CheckpointDescriptor> {
-        let checkpoint_id = API_SERVICE_CLIENT.get_latest_checkpoint(&self.table, None).await.unwrap();
+        let checkpoint_id = STATE_PROVIDER.get_latest_checkpoint(&self.table, None).await.unwrap();
         match checkpoint_id {
             Some(c) => vec!(CheckpointDescriptor { table_name: self.table.clone(), checkpoint_id: c }),
             None => vec!(),
@@ -246,7 +246,7 @@ impl SqlCommand {
             true => Some("es".to_string()),
             false => None
         };
-        let checkpoint_id = match API_SERVICE_CLIENT.get_latest_checkpoint(&self.table, extension).await {
+        let checkpoint_id = match STATE_PROVIDER.get_latest_checkpoint(&self.table, extension).await {
             Ok(c) => match c {
                 Some(c) => vec!(CheckpointDescriptor { table_name: self.table.clone(), checkpoint_id: c }),
                 None => vec!(),

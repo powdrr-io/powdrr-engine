@@ -7,8 +7,8 @@ use crate::data_access::load_file_as_table;
 use crate::elastic_search_common::call_peers;
 use crate::schema_massager::PowdrrSchema;
 use crate::data_contract::{ExtensionFileMetadata, ExtensionWorkItem, FileDescriptor};
-use crate::state_peers::{PrivateExtensionInvocation, PrivateInvocation, PrivateInvocationResult};
-use crate::state_hosted_service::API_SERVICE_CLIENT;
+use crate::peers::{PrivateExtensionInvocation, PrivateInvocation, PrivateInvocationResult};
+use crate::state_provider::STATE_PROVIDER;
 
 
 #[derive(Debug)]
@@ -250,7 +250,7 @@ pub(crate) async fn create_index(work_item: &ExtensionWorkItem) -> Result<(), In
         final_result.extend(result);
     }
 
-    match API_SERVICE_CLIENT.extension_commit(
+    match STATE_PROVIDER.extension_commit(
         &work_item.table_name,
         &ExtensionCommit {
             extension: "es".to_string(),
