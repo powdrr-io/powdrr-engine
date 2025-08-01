@@ -318,7 +318,7 @@ pub(crate) mod tests {
     use crate::elastic_search_responses::{QueryResultTotal, QueryResults};
     use crate::router::router;
     use crate::schema_massager::{extract_powdrr_schema_str, PowdrrDataType, PowdrrField, PowdrrSchema};
-    use crate::state_hosted_service::{FileSetPayload, IcebergMetadata, SpeedboatMetadata, TableMetadataCheckpoint};
+    use crate::data_contract::{FileSetPayload, IcebergMetadata, SpeedboatMetadata, TableMetadataCheckpoint};
 
     pub(crate) static TEST_SERVER: LazyLock<TestServer> = LazyLock::new(|| TestServer::with_timeout(router(true), 1000).unwrap());
 

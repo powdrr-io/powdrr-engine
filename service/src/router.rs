@@ -1,7 +1,6 @@
 use gotham::pipeline::{new_pipeline, single_pipeline};
 use gotham::prelude::{DefineSingleRoute, DrawRoutes, StateData, StaticResponseExtender};
 use gotham::router::{build_router, Router};
-use powdrr_lib::test_api;
 use serde::Deserialize;
 use crate::v1_handlers;
 
@@ -70,12 +69,8 @@ pub fn router(include_test_apis: bool) -> Router {
 
         if include_test_apis {
             route.scope("/_test", |route| {
-                route.scope("/v1", |route| {
-                    route.post("/_create_index").to(test_api::test_v1_create_index);
-                    route.post("/_add_checkpoint").to(test_api::test_v1_add_checkpoint);
-                    route.put("/_testing_mode").to(test_api::test_v1_set_testing_mode);
-                    route.put("/_testing_and_processing_mode").to(test_api::test_v1_set_testing_processing_mode);
-                    route.put("/_process_work").to(test_api::test_v1_process_work);
+                route.scope("/v1", |_route| {
+                    //route.put("/_testing_and_processing_mode").to(test_v1_set_testing_processing_mode);
                 })
             });
         }

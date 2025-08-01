@@ -2,6 +2,7 @@ extern crate core;
 
 mod compaction;
 mod data_access;
+pub mod data_contract;
 mod data_fusion_functions;
 mod distributed_cache;
 mod elastic_search_cluster_info;
@@ -16,7 +17,10 @@ mod elastic_search_parser;
 pub mod elastic_search_pipeline;
 mod elastic_search_responses;
 mod elastic_search_storage_schema;
+pub mod ephemeral_service_impl;
+mod ephemeral_state_provider;
 mod expression_evaluator;
+mod leaderless_state_provider;
 mod painless_parser;
 pub mod pipeline;
 mod prefetch;
@@ -28,7 +32,3 @@ pub mod state_hosted_service;
 pub mod state_peers;
 pub mod test_api;
 mod util;
-mod ephemeral_service_impl;
-mod ephemeral_state_provider;
-mod leaderless_state_provider;
-

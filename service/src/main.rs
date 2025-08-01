@@ -4,7 +4,7 @@ use idgenerator::{IdGeneratorOptions, IdInstance};
 mod response;
 mod router;
 mod v1_handlers;
-
+mod service_impl_provider;
 
 fn run_server(port: &String) -> () {
     tracing_subscriber::fmt().init();

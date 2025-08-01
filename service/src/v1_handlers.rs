@@ -4,17 +4,17 @@ use gotham::hyper::StatusCode;
 use gotham::state::State;
 use gotham::state::FromState;
 use gotham::hyper::{body, Body};
-use powdrr_lib::state_hosted_service::{AddAlias, CompactionCommit, CreateTable, ExtensionCommit, GetLatestCheckpoint, IcebergCommit, ServiceApiError, SpeedboatCommit, API_SERVICE_CLIENT};
 use std::pin::Pin;
 use gotham::mime;
 use serde::Serialize;
+use powdrr_lib::data_contract::{AddAlias, CompactionCommit, CreateTable, ExtensionCommit, GetLatestCheckpoint, IcebergCommit, SpeedboatCommit};
 use powdrr_lib::elastic_search_ingest::CreateIndexTemplateBody;
 use powdrr_lib::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use powdrr_lib::pipeline::PipelineDefinition;
 use powdrr_lib::state_peers::CheckpointDescriptor;
 use crate::response::GenericResponse;
 use crate::router::NamePathExtractor;
-
+use crate::service_impl_provider::{ServiceImplError, SERVICE_IMPL};
 
 macro_rules! nothing_handler {
     ($fn_name:ident() -> $ret_type:ty $body:block) => {
@@ -90,7 +90,7 @@ macro_rules! name_handler {
 }
 
 
-fn handle_result_none(value: Result<(), ServiceApiError>) -> GenericResponse {
+fn handle_result_none(value: Result<(), ServiceImplError>) -> GenericResponse {
     match value {
         Ok(_) => {
             GenericResponse {
@@ -107,7 +107,7 @@ fn handle_result_none(value: Result<(), ServiceApiError>) -> GenericResponse {
 }
 
 
-fn handle_result<T>(value: Result<T, ServiceApiError>) -> GenericResponse
+fn handle_result<T>(value: Result<T, ServiceImplError>) -> GenericResponse
     where T: Sized + Serialize,
 {
     match value {
@@ -125,7 +125,7 @@ fn handle_result<T>(value: Result<T, ServiceApiError>) -> GenericResponse
     }
 }
 
-fn handle_result_option<T>(value: Result<Option<T>, ServiceApiError>) -> GenericResponse
+fn handle_result_option<T>(value: Result<Option<T>, ServiceImplError>) -> GenericResponse
     where T: Sized + Serialize,
 {
     match value {
@@ -158,83 +158,83 @@ fn handle_result_option<T>(value: Result<Option<T>, ServiceApiError>) -> Generic
 
 
 body_handler! { create_table(input: CreateTable) -> GenericResponse {
-    handle_result_none(API_SERVICE_CLIENT.create_table(&input).await)
+    handle_result_none(SERVICE_IMPL.create_table(&input).await)
 }}
 
 name_handler! { describe_table(name: String) -> GenericResponse {
-    handle_result_option(API_SERVICE_CLIENT.describe_table(&name).await)
+    handle_result_option(SERVICE_IMPL.describe_table(&name).await)
 }}
 
 
 body_handler! { add_alias(input: AddAlias) -> GenericResponse {
-    handle_result_none(API_SERVICE_CLIENT.add_alias(&input.table_name, &input.alias).await)
+    handle_result_none(SERVICE_IMPL.add_alias(&input.table_name, &input.alias).await)
 }}
 
 body_handler! { remove_alias(input: AddAlias) -> GenericResponse {
-    handle_result_none(API_SERVICE_CLIENT.remove_alias(&input.table_name, &input.alias).await)
+    handle_result_none(SERVICE_IMPL.remove_alias(&input.table_name, &input.alias).await)
 }}
 
 body_with_name_handler! { create_table_template(name: String, input: CreateIndexTemplateBody) -> GenericResponse {
-    handle_result_none(API_SERVICE_CLIENT.create_table_template(&name, &input).await)
+    handle_result_none(SERVICE_IMPL.create_table_template(&name, &input).await)
 }}
 
 
 name_handler! { describe_table_template(name: String) -> GenericResponse {
-    handle_result_option(API_SERVICE_CLIENT.describe_table_template(&name).await)
+    handle_result_option(SERVICE_IMPL.describe_table_template(&name).await)
 }}
 
 
 body_with_name_handler! { create_pipeline(name: String, input: PipelineDefinition) -> GenericResponse {
-    handle_result_none(API_SERVICE_CLIENT.create_pipeline(&name, &input).await)
+    handle_result_none(SERVICE_IMPL.create_pipeline(&name, &input).await)
 }}
 
 
 name_handler! { describe_pipeline(name: String) -> GenericResponse {
-    handle_result_option(API_SERVICE_CLIENT.describe_pipeline(&name).await)
+    handle_result_option(SERVICE_IMPL.describe_pipeline(&name).await)
 }}
 
 
 body_with_name_handler! { create_lifetime_policy(name: String, input: ILMPolicyDefinition) -> GenericResponse {
-    handle_result_none(API_SERVICE_CLIENT.create_lifetime_policy(&name, &input).await)
+    handle_result_none(SERVICE_IMPL.create_lifetime_policy(&name, &input).await)
 }}
 
 
 name_handler! { describe_lifetime_policy(name: String) -> GenericResponse {
-    handle_result_option(API_SERVICE_CLIENT.describe_lifetime_policy(&name).await)
+    handle_result_option(SERVICE_IMPL.describe_lifetime_policy(&name).await)
 }}
 
 
 body_handler! { speedboat_commit(input: SpeedboatCommit) -> GenericResponse {
-    handle_result_none(API_SERVICE_CLIENT.speedboat_commit(&input).await)
+    handle_result_none(SERVICE_IMPL.speedboat_commit(&input).await)
 }}
 
 body_with_name_handler! { iceberg_commit(name: String, input: IcebergCommit) -> GenericResponse {
-    handle_result_none(API_SERVICE_CLIENT.iceberg_commit(&name, &input).await)
+    handle_result_none(SERVICE_IMPL.iceberg_commit(&name, &input).await)
 }}
 
 body_with_name_handler! { extension_commit(name: String, input: ExtensionCommit) -> GenericResponse {
-    handle_result_none(API_SERVICE_CLIENT.extension_commit(&name, &input).await)
+    handle_result_none(SERVICE_IMPL.extension_commit(&name, &input).await)
 }}
 
 body_with_name_handler! { compaction_commit(name: String, input: CompactionCommit) -> GenericResponse {
-    handle_result_none(API_SERVICE_CLIENT.compaction_commit(&name, &input).await)
+    handle_result_none(SERVICE_IMPL.compaction_commit(&name, &input).await)
 }}
 
 body_handler! { get_latest_checkpoint(input: GetLatestCheckpoint) -> GenericResponse {
-    handle_result_option(API_SERVICE_CLIENT.get_latest_checkpoint(&input.table_name, input.extension).await)
+    handle_result_option(SERVICE_IMPL.get_latest_checkpoint(&input.table_name, input.extension).await)
 }}
 
 body_handler! { get_checkpoint(input: CheckpointDescriptor) -> GenericResponse {
-    handle_result_option(API_SERVICE_CLIENT.get_checkpoint(input).await)
+    handle_result_option(SERVICE_IMPL.get_checkpoint(input).await)
 }}
 
 name_handler! { get_extension_work_items(name: String) -> GenericResponse {
-    handle_result(API_SERVICE_CLIENT.get_extension_work_items(&name).await)
+    handle_result(SERVICE_IMPL.get_extension_work_items(&name).await)
 }}
 
 
 nothing_handler! { get_compaction_work_items() -> GenericResponse {
-    handle_result(API_SERVICE_CLIENT.get_compaction_work_items().await)
+    handle_result(SERVICE_IMPL.get_compaction_work_items().await)
 }}
 
 #[cfg(test)]
@@ -243,7 +243,7 @@ mod tests {
     use gotham::hyper::StatusCode;
     use gotham::mime;
     use gotham::test::TestServer;
-    use powdrr_lib::state_hosted_service::{AddAlias, CreateTable, TableDescription};
+    use powdrr_lib::data_contract::{AddAlias, CreateTable, TableDescription};
     use crate::router::router;
 
     pub(crate) static TEST_SERVER: LazyLock<TestServer> = LazyLock::new(|| TestServer::with_timeout(router(true), 1000).unwrap());

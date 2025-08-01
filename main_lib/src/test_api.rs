@@ -4,7 +4,8 @@ use futures::FutureExt;
 use gotham::{handler::HandlerFuture, helpers::http::response::create_response, hyper::{body, Body, StatusCode}, mime, state::{FromState, State}};
 use serde::{Deserialize, Serialize};
 
-use crate::{compaction::perform_compaction, elastic_search_index::{self, create_index}, state_hosted_service::{TableMetadataCheckpoint, API_SERVICE_CLIENT}};
+use crate::{compaction::perform_compaction, elastic_search_index::{self, create_index}, state_hosted_service::{API_SERVICE_CLIENT}};
+use crate::data_contract::TableMetadataCheckpoint;
 use crate::prefetch::perform_prefetch;
 
 #[derive(Serialize, Deserialize)]

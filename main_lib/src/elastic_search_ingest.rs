@@ -25,7 +25,8 @@ use crate::data_access;
 use crate::elastic_search_parser::UpdateBody;
 use crate::elastic_search_storage_schema::{FullRecord, RecordDelete, RecordInput, SpeedboatCommitBuilder};
 use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
-use crate::state_hosted_service::{CreateTable, ServiceApiError, SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription, API_SERVICE_CLIENT};
+use crate::data_contract::{CreateTable, SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription};
+use crate::state_hosted_service::{ServiceApiError, API_SERVICE_CLIENT};
 use crate::util::{describe_table_log_error_then_none, log_err, log_service_err};
 
 
