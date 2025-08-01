@@ -706,28 +706,4 @@ impl EphemeralServiceImpl {
     pub async fn get_peer_clients(&mut self) -> Vec<Box<dyn PeerClient>> {
         vec!(Box::new(SelfPeer::new(self.mode.compaction_mode.clone())))
     }
-
-    pub async fn get_next_prefetch_checkpoints(&mut self, extensions: Option<String>) -> Result<Vec<CheckpointDescriptor>, ServiceApiError> {
-        let _current_committed = match self.latest_committed_checkpoint_id.get(&extensions) {
-            Some(checkpoints) => checkpoints,
-            None => return Ok(vec!())
-        };
-        //let current_fetched = self.get_current_prefetch_checkpoints(extensions).await.map_err(|e|ServiceApiError::from_leader_error(&e))?;
-
-        let new_checkpoints = vec!();
-        /*
-        for fetched in current_fetched.iter() {
-            assert!(current_committed.contains_key(&fetched.table_name));
-            let current_committed_id = current_committed.get(&fetched.table_name).unwrap();
-            if current_committed_id > &fetched.checkpoint_id {
-                new_checkpoints.push(CheckpointDescriptor {
-                    table_name: fetched.table_name.clone(),
-                    checkpoint_id: current_committed_id.clone(),
-                })
-            }
-        }
-
-         */
-        Ok(new_checkpoints)
-    }
 }

@@ -3,18 +3,21 @@ use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::ephemeral_service_impl::EphemeralServiceImpl;
 use crate::pipeline::PipelineDefinition;
 use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
+use crate::ephemeral_fetch_tracker::EphemeralFetchTracker;
 use crate::state_provider::ServiceApiError;
 use crate::peers::{CheckpointDescriptor, PeerClient};
 use crate::test_api::{TestProcessingMode};
 
 pub struct EphemeralStateProvider {
-    service_impl: EphemeralServiceImpl
+    service_impl: EphemeralServiceImpl,
+    fetch_tracker: EphemeralFetchTracker
 }
 
 impl EphemeralStateProvider {
     pub fn new() -> Self {
         EphemeralStateProvider{
-            service_impl: EphemeralServiceImpl::new()
+            service_impl: EphemeralServiceImpl::new(),
+            fetch_tracker: EphemeralFetchTracker::new()
         }
     }
 
@@ -24,14 +27,6 @@ impl EphemeralStateProvider {
 
     pub(crate) async fn add_checkpoint(&mut self, checkpoint: &TableMetadataCheckpoint) -> () {
         self.service_impl.add_checkpoint(checkpoint).await.unwrap();
-    }
-
-    pub(crate) async fn get_latest_target_checkpoint(&self, _table_name: &String, _extension: Option<String>) -> Result<Option<String>, ServiceApiError>{
-        todo!()
-    }
-
-    pub(crate) async fn set_prefetch_checkpoints(&self, _descriptors: &Vec<CheckpointDescriptor>, _extension: Option<String>) -> Result<(), ServiceApiError> {
-        todo!()
     }
 
     #[allow(dead_code)]
@@ -78,22 +73,51 @@ impl EphemeralStateProvider {
     pub async fn describe_lifetime_policy(&mut self, name: &String) -> Result<Option<ILMPolicyDefinition>, ServiceApiError> {
         self.service_impl.describe_lifetime_policy(name).await
     }
-
-
+    
     pub async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), ServiceApiError> {
-        self.service_impl.speedboat_commit(commit).await
+        match self.service_impl.speedboat_commit(commit).await {
+            Ok(_) => {
+                for table_info in commit.type_files.iter() {
+                    let checkpoint_id = self.get_latest_committed_checkpoint(&table_info.table_name, None).await?;
+                    self.fetch_tracker.set_next_prefetch_checkpoints(&table_info.table_name, None, &checkpoint_id.unwrap()).await?;
+                }
+                Ok(())
+            },
+            Err(e) => Err(e)
+        }
     }
 
     pub async fn iceberg_commit(&mut self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError> {
-        self.service_impl.iceberg_commit(table_name, iceberg_commit).await
+        match self.service_impl.iceberg_commit(table_name, iceberg_commit).await {
+            Ok(_) => {
+                let checkpoint_id = self.get_latest_committed_checkpoint(table_name, None).await?;
+                self.fetch_tracker.set_next_prefetch_checkpoints(table_name, None, &checkpoint_id.unwrap()).await?;
+                Ok(())
+            },
+            Err(e) => Err(e)
+        }
     }
 
     pub async fn extension_commit(&mut self, table_name: &String, commit: &ExtensionCommit) -> Result<(), ServiceApiError> {
-        self.service_impl.extension_commit(table_name, commit).await
+        match self.service_impl.extension_commit(table_name, commit).await {
+            Ok(_) => {
+                let checkpoint_id = self.get_latest_committed_checkpoint(table_name, None).await?;
+                self.fetch_tracker.set_next_prefetch_checkpoints(table_name, Some(commit.extension.clone()), &checkpoint_id.unwrap()).await?;
+                Ok(())
+            },
+            Err(e) => Err(e)
+        }
     }
 
-    pub async fn compaction_commit(&mut self, _table_name: &String, commit: &CompactionCommit) -> Result<(), ServiceApiError> {
-        self.service_impl.compaction_commit(_table_name, commit).await
+    pub async fn compaction_commit(&mut self, table_name: &String, commit: &CompactionCommit) -> Result<(), ServiceApiError> {
+        match self.service_impl.compaction_commit(table_name, commit).await {
+            Ok(_) => {
+                let checkpoint_id = self.get_latest_committed_checkpoint(table_name, None).await?;
+                self.fetch_tracker.set_next_prefetch_checkpoints(table_name, None, &checkpoint_id.unwrap()).await?;
+                Ok(())
+            },
+            Err(e) => Err(e)
+        }
     }
 
     pub async fn get_latest_committed_checkpoint(&mut self, table_name: &String, extensions: Option<String>) -> Result<Option<String>, ServiceApiError> {
@@ -116,7 +140,15 @@ impl EphemeralStateProvider {
         self.service_impl.get_peer_clients().await
     }
 
+    pub(crate) async fn get_latest_target_checkpoint(&mut self, table_name: &String, extension: Option<String>) -> Result<Option<String>, ServiceApiError>{
+        self.fetch_tracker.get_latest_target_checkpoint(table_name, extension).await
+    }
+
+    pub(crate) async fn set_target_checkpoints(&mut self, descriptors: &Vec<CheckpointDescriptor>, extension: Option<String>) -> Result<(), ServiceApiError> {
+        self.fetch_tracker.set_target_checkpoints(descriptors, extension).await
+    }
+
     pub async fn get_next_prefetch_checkpoints(&mut self, extensions: Option<String>) -> Result<Vec<CheckpointDescriptor>, ServiceApiError> {
-        self.service_impl.get_next_prefetch_checkpoints(extensions).await
+        self.fetch_tracker.get_next_prefetch_checkpoints(extensions).await
     }
 }

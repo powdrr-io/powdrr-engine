@@ -4,6 +4,7 @@ use crate::elastic_search_ingest::CreateIndexTemplateBody;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::pipeline::PipelineDefinition;
 use crate::data_contract::{AddAlias, CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem, GetLatestCheckpoint, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
+use crate::ephemeral_fetch_tracker::EphemeralFetchTracker;
 use crate::state_provider::ServiceApiError;
 use crate::peers::{CheckpointDescriptor, PeerClient};
 use crate::test_api::TestProcessingMode;
@@ -12,6 +13,7 @@ use crate::test_api::TestProcessingMode;
 pub struct LeaderlessStateProvider {
     base_address: String,
     client: Client,
+    fetch_tracker: EphemeralFetchTracker,
 }
 
 impl LeaderlessStateProvider {
@@ -20,6 +22,7 @@ impl LeaderlessStateProvider {
         LeaderlessStateProvider {
             base_address: address,
             client: reqwest::Client::new(),
+            fetch_tracker: EphemeralFetchTracker::new(),
         }
     }
 
@@ -29,15 +32,6 @@ impl LeaderlessStateProvider {
     pub(crate) async fn add_checkpoint(&mut self, _checkpoint: &TableMetadataCheckpoint) -> () {
         todo!()
     }
-
-    pub(crate) async fn get_latest_target_checkpoint(&self, _table_name: &String, _extension: Option<String>) -> Result<Option<String>, ServiceApiError> {
-        todo!()
-    }
-
-    pub(crate) async fn set_prefetch_checkpoints(&self, _descriptors: &Vec<CheckpointDescriptor>, _extension: Option<String>) -> Result<(), ServiceApiError> {
-        todo!()
-    }
-
 
     async fn handle_response_body<T>(request_result: Result<Response, reqwest::Error>) -> Result<T, ServiceApiError>
     where T: Sized + DeserializeOwned
@@ -84,7 +78,6 @@ impl LeaderlessStateProvider {
             }
         }
     }
-
 
     async fn handle_response(request_result: Result<Response, reqwest::Error>) -> Result<(), ServiceApiError> {
         match request_result {
@@ -192,31 +185,60 @@ impl LeaderlessStateProvider {
         ).await
     }
 
+    async fn update_prefetch_checkpoints(&mut self, result: Result<(), ServiceApiError>, table_names: &Vec<String>, extensions: Option<String>) -> Result<(), ServiceApiError> {
+        match result {
+            Ok(_) => {
+                for table_name in table_names {
+                    let checkpoint_id = self.get_latest_committed_checkpoint(table_name, extensions.clone()).await?;
+                    self.fetch_tracker.set_next_prefetch_checkpoints(table_name, extensions.clone(), &checkpoint_id.unwrap()).await?;
+                }
+                Ok(())
+            },
+            Err(e) => Err(e)
+        }
+    }
+
     pub(crate) async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), ServiceApiError> {
-        Self::handle_response(self.client.post(format!("{}/api/v1/speedboat_commit", self.base_address))
-            .body(serde_json::to_string(&commit).unwrap())
-            .send().await
+        self.update_prefetch_checkpoints(
+            Self::handle_response(self.client.post(format!("{}/api/v1/speedboat_commit", self.base_address))
+                .body(serde_json::to_string(&commit).unwrap())
+                .send().await
+            ).await,
+            &commit.type_files.iter().map(|t| t.table_name.clone()).collect(),
+            None
         ).await
     }
 
     pub(crate) async fn iceberg_commit(&mut self, name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError> {
-        Self::handle_response(self.client.post(format!("{}/api/v1/iceberg_commit/{}", self.base_address, name))
-            .body(serde_json::to_string(&iceberg_commit).unwrap())
-            .send().await
+        self.update_prefetch_checkpoints(
+            Self::handle_response(self.client.post(format!("{}/api/v1/iceberg_commit/{}", self.base_address, name))
+                .body(serde_json::to_string(&iceberg_commit).unwrap())
+                .send().await
+            ).await,
+            &vec!(name.clone()),
+            None
         ).await
     }
 
     pub(crate) async fn extension_commit(&mut self, name: &String, commit: &ExtensionCommit) -> Result<(), ServiceApiError> {
-        Self::handle_response(self.client.post(format!("{}/api/v1/extension_commit/{}", self.base_address, name))
-            .body(serde_json::to_string(&commit).unwrap())
-            .send().await
+        self.update_prefetch_checkpoints(
+            Self::handle_response(self.client.post(format!("{}/api/v1/extension_commit/{}", self.base_address, name))
+                .body(serde_json::to_string(&commit).unwrap())
+                .send().await
+            ).await,
+            &vec!(name.clone()),
+            None
         ).await
     }
 
     pub(crate) async fn compaction_commit(&mut self, name: &String, commit: &CompactionCommit) -> Result<(), ServiceApiError> {
-        Self::handle_response(self.client.post(format!("{}/api/v1/compaction_commit/{}", self.base_address, name))
-            .body(serde_json::to_string(&commit).unwrap())
-            .send().await
+        self.update_prefetch_checkpoints(
+            Self::handle_response(self.client.post(format!("{}/api/v1/compaction_commit/{}", self.base_address, name))
+                .body(serde_json::to_string(&commit).unwrap())
+                .send().await
+            ).await,
+            &vec!(name.clone()),
+            None
         ).await
     }
 
@@ -254,8 +276,17 @@ impl LeaderlessStateProvider {
         todo!("nope")
     }
 
-    pub(crate) async fn get_next_prefetch_checkpoints(&mut self, _extensions: Option<String>) -> Result<Vec<CheckpointDescriptor>, ServiceApiError> {
-        Ok(vec!())
+    pub(crate) async fn get_next_prefetch_checkpoints(&mut self, extensions: Option<String>) -> Result<Vec<CheckpointDescriptor>, ServiceApiError> {
+        self.fetch_tracker.get_next_prefetch_checkpoints(extensions).await
     }
+
+    pub(crate) async fn get_latest_target_checkpoint(&mut self, table_name: &String, extension: Option<String>) -> Result<Option<String>, ServiceApiError> {
+        self.fetch_tracker.get_latest_target_checkpoint(table_name, extension).await
+    }
+
+    pub(crate) async fn set_target_checkpoints(&mut self, descriptors: &Vec<CheckpointDescriptor>, extension: Option<String>) -> Result<(), ServiceApiError> {
+        self.fetch_tracker.set_target_checkpoints(descriptors, extension).await
+    }
+
 
 }
