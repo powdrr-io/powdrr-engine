@@ -356,3 +356,106 @@ pub struct CompactionWorkItem {
     pub speedboat_files: FileSetPayload,
     pub delete_files: Vec<String>,
 }
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AliasInfo {
+    is_hidden: bool
+}
+
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+enum StringOrBool {
+    Bool(bool),
+    String(String),
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct MetaInfo {
+    #[serde(rename = "migrationMappingPropertyHashes")]
+    migration_mapping_property_hashes: HashMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct PropertyInfo {
+    #[serde(rename = "type")]
+    type_name: Option<String>,
+    #[serde(default)]
+    enabled: bool,
+    dynamic: Option<StringOrBool>,
+    properties: Option<HashMap<String, PropertyInfo>>,
+    fields: Option<HashMap<String, PropertyInfo>>,
+    #[serde(default)]
+    ignore_above: u32,
+    scaling_factor: Option<u32>,
+}
+
+
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Mappings {
+    dynamic: StringOrBool,
+    _meta: Option<MetaInfo>,
+    properties: HashMap<String, PropertyInfo>,
+}
+
+
+#[derive(Serialize, Deserialize, Clone)]
+struct IndexMappingSettings {
+    total_fields: IndexMappingFieldSettings,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct IndexMappingFieldSettings {
+    limit: Option<u32>
+}
+
+
+#[derive(Serialize, Deserialize, Clone)]
+struct IndexSettings {
+    number_of_shards: Option<u32>,
+    number_of_replicas: Option<u32>,
+    auto_expand_replicas: Option<String>,
+    refresh_interval: Option<String>,
+    priority: Option<u32>,
+    mapping: Option<IndexMappingSettings>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct CreateIndexSettings {
+    index: IndexSettings
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+enum CreateIndexSettingsOption {
+    Indirect(CreateIndexSettings),
+    Direct(IndexSettings),
+}
+
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct CreateIndexBody {
+    aliases: Option<HashMap<String, AliasInfo>>,
+    mappings: Option<Mappings>,
+    settings: Option<CreateIndexSettingsOption>,
+}
+
+impl CreateIndexBody {
+    fn parse(content: &String) -> Result<Self, serde_json::Error> {
+        if content.len() == 0 {
+            Ok(CreateIndexBody{ aliases: None, mappings: None, settings: None })
+        } else {
+            serde_json::from_str(content)
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct CreateIndexTemplateBody {
+    #[serde(default)]
+    index_patterns: Vec<String>,
+    priority: Option<u32>,
+    version: Option<u32>,
+    template: CreateIndexBody,
+}

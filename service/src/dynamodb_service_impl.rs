@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use idgenerator::IdInstance;
+use powdrr_lib::data_contract::TableDescription;
 use crate::distributed_cache;
-use crate::data_contract::CreateIndexTemplateBody;
+use crate::elastic_search_ingest::CreateIndexTemplateBody;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::pipeline::PipelineDefinition;
 use crate::schema_massager::PowdrrSchema;

@@ -1,6 +1,6 @@
 use std::{error::Error};
 use std::fmt::{Display, Formatter};
-use powdrr_lib::elastic_search_ingest::CreateIndexTemplateBody;
+use powdrr_lib::data_contract::CreateIndexTemplateBody;
 use powdrr_lib::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use powdrr_lib::ephemeral_service_impl::EphemeralServiceImpl;
 use powdrr_lib::pipeline::PipelineDefinition;

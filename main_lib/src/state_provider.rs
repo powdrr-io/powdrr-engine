@@ -1,13 +1,13 @@
-use std::{error::Error};
+use std::error::Error;
 use std::fmt::{Display, Formatter};
 use tokio::sync::{mpsc, oneshot};
-use crate::{elastic_search_ingest::CreateIndexTemplateBody, pipeline::PipelineDefinition, peers::CheckpointDescriptor};
-use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
-use crate::elastic_search_index::{create_index_inner};
+use crate::{peers::CheckpointDescriptor, pipeline::PipelineDefinition};
+use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
+use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::ephemeral_state_provider::EphemeralStateProvider;
 use crate::leaderless_state_provider::LeaderlessStateProvider;
-use crate::peers::{PeerClient};
+use crate::peers::PeerClient;
 use crate::test_api::{CompactionMode, IndexingMode, StateMode, TestProcessingMode};
 
 

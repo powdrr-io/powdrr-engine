@@ -1,6 +1,6 @@
 use reqwest::{Client, Response, StatusCode};
 use serde::de::DeserializeOwned;
-use crate::elastic_search_ingest::CreateIndexTemplateBody;
+use crate::data_contract::CreateIndexTemplateBody;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::pipeline::PipelineDefinition;
 use crate::data_contract::{AddAlias, CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem, GetLatestCheckpoint, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};

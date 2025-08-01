@@ -1,4 +1,4 @@
-use crate::elastic_search_ingest::CreateIndexTemplateBody;
+use crate::data_contract::CreateIndexTemplateBody;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::ephemeral_service_impl::EphemeralServiceImpl;
 use crate::pipeline::PipelineDefinition;
