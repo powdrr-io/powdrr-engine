@@ -29,7 +29,7 @@ unsafe impl Sync for ServiceApiError {}
 
 
 impl ServiceApiError {
-    pub(crate) fn new(message: String) -> Self {
+    pub fn new(message: String) -> Self {
         assert!(message.len() > 0, "Message must not be empty");
         ServiceApiError {
             message,

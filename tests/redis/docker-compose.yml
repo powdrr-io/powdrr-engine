@@ -61,6 +61,23 @@ services:
       AWS_ACCESS_KEY_ID: admin
       AWS_SECRET_ACCESS_KEY: password
 
+  localstack:
+    image: localstack/localstack@sha256:91271bdd1a2c3e59cd43c97483c1394672c1e4d2e13e883cfac3f832b23b3876 # 3.3.0
+    networks:
+      iceberg_net:
+    volumes:
+      - "~/code/dynamodb-data:/var/lib/localstack"
+      # - "./localstack:/docker-entrypoint-initaws.d"
+      # - "./localstack:/etc/localstack/init/ready.d" # for intel chip Mac
+    healthcheck:
+      test: awslocal dynamodb list-tables
+      interval: 60s
+      timeout: 10s
+    environment:
+      - SERVICES=dynamodb
+      - EAGER_SERVICE_LOADING=1
+    ports:
+      - "4566:4566"
+
 networks:
   iceberg_net:
-

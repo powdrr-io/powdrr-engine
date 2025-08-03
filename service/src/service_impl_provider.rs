@@ -46,7 +46,6 @@ enum ServiceImpl {
     DynamoDb(DynamoDBServiceImpl),
 }
 
-
 enum ServiceImplProviderActorMessage {
     SetMode {
         respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
@@ -135,6 +134,10 @@ enum ServiceImplProviderActorMessage {
     },
     GetCompactionWorkItems {
         respond_to: oneshot::Sender<Result<Vec<(String, CompactionWorkItem)>, ServiceImplError>>,
+    },
+    UpdateCheckpoint {
+        respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
+        table_name: String
     },
 }
 
@@ -226,6 +229,9 @@ impl ServiceImplProviderActor {
             },
             ServiceImplProviderActorMessage::GetCompactionWorkItems { respond_to } => {
                 handle_message_impl!(self, respond_to, get_compaction_work_items());
+            },
+            ServiceImplProviderActorMessage::UpdateCheckpoint { respond_to, table_name } => {
+                handle_message_impl!(self, respond_to, update_checkpoint(&table_name));
             },
         }
     }
@@ -329,6 +335,10 @@ impl ServiceImpl {
 
     pub async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, ServiceImplError> {
         state_provider_func_impl!(self, get_compaction_work_items())
+    }
+
+    pub async fn update_checkpoint(&mut self, table_name: &String) -> Result<(), ServiceImplError> {
+        state_provider_func_impl!(self, update_checkpoint(table_name))
     }
 }
 
@@ -468,6 +478,10 @@ impl ServiceImplHandle {
 
     pub async fn get_compaction_work_items(&self) -> Result<Vec<(String, CompactionWorkItem)>, ServiceImplError> {
         send_message!(self, GetCompactionWorkItems)
+    }
+
+    pub async fn update_checkpoint(&self, table_name: &String) -> Result<(), ServiceImplError> {
+        send_message!(self, UpdateCheckpoint, table_name = table_name.clone())
     }
 
 }
