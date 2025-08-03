@@ -24,7 +24,7 @@ impl Display for PipelineError {
 impl Error for PipelineError {}
 
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SetProcessorBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -87,7 +87,7 @@ impl SetProcessorBody {
     }    
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AppendProcessorBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -120,7 +120,7 @@ impl AppendProcessorBody {
 }
 
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RemoveProcessorBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -147,7 +147,7 @@ impl RemoveProcessorBody {
 }
 
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PipelineProcessorBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -174,7 +174,7 @@ impl PipelineProcessorBody {
 }
 
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RenameProcessorBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -203,7 +203,7 @@ impl RenameProcessorBody {
 }
 
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum ProcessorBodies {
     Set(SetProcessorBody),
     Remove(RemoveProcessorBody),
@@ -306,7 +306,7 @@ fn apply_processor(processor: &ProcessorBodies, value: &mut Value) -> Result<(),
 }
 
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct PipelineDefinition {
     pub description: Option<String>,
     pub processors: Vec<ProcessorBodies>,

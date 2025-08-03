@@ -31,6 +31,12 @@ pub struct CheckpointDescriptor {
     pub checkpoint_id: String,
 }
 
+impl CheckpointDescriptor {
+    pub fn full_name(&self) -> String {
+        format!("{}:{}", self.table_name, self.checkpoint_id)
+    }
+}
+
 impl Display for CheckpointDescriptor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.table_name, self.checkpoint_id)

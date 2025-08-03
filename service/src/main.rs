@@ -1,3 +1,5 @@
+extern crate core;
+
 use std::env;
 use idgenerator::{IdGeneratorOptions, IdInstance};
 
@@ -6,6 +8,7 @@ mod router;
 mod v1_handlers;
 mod service_impl_provider;
 mod dynamodb_service_impl;
+mod dynamodb;
 
 fn run_server(port: &String) -> () {
     tracing_subscriber::fmt().init();

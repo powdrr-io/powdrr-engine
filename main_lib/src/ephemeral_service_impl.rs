@@ -646,4 +646,8 @@ impl EphemeralServiceImpl {
         }
         Ok(work_items)
     }
+
+    pub async fn update_checkpoint(&mut self, _table_name: &String) -> Result<(), ServiceApiError> {
+        unimplemented!()
+    }
 }

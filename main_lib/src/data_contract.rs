@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
 use crate::schema_massager::PowdrrSchema;
 
@@ -30,7 +31,7 @@ pub struct GetLatestCheckpoint {
 }
 
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SpeedboatCommit {
     pub type_files: Vec<SpeedboatCommitTableInfo>,
     pub compactions: Vec<String>,
@@ -52,7 +53,7 @@ pub struct FileDescriptor {
 }
 
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IcebergMetadata {
     pub table_schema: PowdrrSchema,
     pub snapshot_id: String,
@@ -64,25 +65,25 @@ pub struct IcebergMetadata {
 }
 
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IcebergCommit {
     pub metadata: IcebergMetadata,
     pub compactions: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SpeedboatMetadata {
     pub files: FileSetPayload
 }
 
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DeletesMetadata {
     pub files: Vec<String>,
 }
 
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ExtensionFile {
     pub suffix: String,
     pub location: String,
@@ -92,21 +93,21 @@ pub struct ExtensionFile {
 pub type ExtensionFileMetadata = HashMap<String, Vec<ExtensionFile>>;
 
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ExtensionCommit {
     pub extension: String,
     pub files: ExtensionFileMetadata
 }
 
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CompactionCommit {
     pub removed_speedboat_files: Vec<String>,
     pub removed_delete_files: Vec<String>,
     pub compaction_id: String
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TableMetadataCheckpoint {
     pub table_name: String,
     pub checkpoint_id: String,
@@ -119,6 +120,93 @@ pub struct TableMetadataCheckpoint {
 
 
 impl TableMetadataCheckpoint {
+    pub fn new(table_name: String, checkpoint_id: String, schema: PowdrrSchema) -> Self {
+        TableMetadataCheckpoint {
+            table_name,
+            checkpoint_id,
+            iceberg_metadata: None,
+            speedboat_metadata: None,
+            deletes_metadata: None,
+            extension_metadata: HashMap::new(),
+            schema,
+        }
+    }
+
+    pub fn clone_and_apply(&self, speedboat_commits: &Vec<SpeedboatCommit>, iceberg_commits: &Vec<IcebergCommit>, extension_commits: &Vec<ExtensionCommit>, compactions_lookup: &HashMap<String, CompactionCommit>) -> Self {
+        let mut new_table_metadata_checkpoint = self.clone();
+        new_table_metadata_checkpoint.checkpoint_id = IdInstance::next_id().to_string();
+
+        for speedboat_commit in speedboat_commits {
+            new_table_metadata_checkpoint.apply_speedboat(speedboat_commit, compactions_lookup);
+        }
+        for iceberg_commit in iceberg_commits {
+            new_table_metadata_checkpoint.apply_iceberg(iceberg_commit, compactions_lookup);
+        }
+        for extension_commit in extension_commits {
+            new_table_metadata_checkpoint.add_coverage(extension_commit);
+        }
+
+        new_table_metadata_checkpoint
+    }
+
+    pub fn apply_speedboat(&mut self, speedboat_commit: &SpeedboatCommit, compactions_lookup: &HashMap<String, CompactionCommit>) -> () {
+        if self.speedboat_metadata.is_none() {
+            self.speedboat_metadata = Some(SpeedboatMetadata{ files: FileSetPayload::new() });
+        }
+        if self.deletes_metadata.is_none() {
+            self.deletes_metadata = Some(DeletesMetadata{ files: vec!() });
+        }
+        for speedboat_commit_table_info in speedboat_commit.type_files.iter() {
+            if speedboat_commit_table_info.commit_type == "delete" {
+                self.deletes_metadata.as_mut().unwrap().files.extend(speedboat_commit_table_info.files.clone());
+            } else if speedboat_commit_table_info.commit_type == "commit" || speedboat_commit_table_info.commit_type == "compaction" {
+                self.speedboat_metadata.as_mut().unwrap().files.merge_inplace(&speedboat_commit_table_info.as_file_set_payload());
+                if speedboat_commit_table_info.schema.is_some() {
+                    self.schema.merge_from(speedboat_commit_table_info.schema.as_ref().unwrap());
+                }
+            } else {
+                panic!("Unknown commit type");
+            }
+        }
+        self.apply_compactions(&speedboat_commit.compactions, compactions_lookup);
+    }
+
+    pub fn apply_iceberg(&mut self, iceberg_commit: &IcebergCommit, compactions_lookup: &HashMap<String, CompactionCommit>) -> () {
+        self.iceberg_metadata = Some(iceberg_commit.metadata.clone());
+        self.schema.merge_from(&self.iceberg_metadata.as_mut().unwrap().table_schema);
+        self.apply_compactions(&iceberg_commit.compactions, compactions_lookup);
+    }
+
+    fn apply_compactions(&mut self, compactions: &Vec<String>, compactions_lookup: &HashMap<String, CompactionCommit>) -> () {
+        let (removed_speedboat, removed_deletes) = Self::get_removed_files(compactions, compactions_lookup);
+
+        match self.speedboat_metadata.as_mut() {
+            Some(speedboat) => {
+                speedboat.files.remove(&removed_speedboat);
+            },
+            None => ()
+        };
+
+        match self.deletes_metadata.as_mut() {
+            Some(deletes) => {
+                deletes.files.retain(|x|!removed_deletes.contains(x));
+            },
+            None => ()
+        };
+
+        for metadata in self.extension_metadata.values_mut() {
+            metadata.retain(|key, _|!removed_speedboat.contains(key))
+        }
+    }
+
+    fn get_removed_files(compactions: &Vec<String>, compactions_lookup: &HashMap<String, CompactionCommit>) -> (Vec<String>, Vec<String>) {
+        let compactions_data: Vec<&CompactionCommit> = compactions.iter().map(|x| compactions_lookup.get(x).unwrap()).collect();
+        (
+            compactions_data.iter().map(|x| x.removed_speedboat_files.clone()).flatten().collect(),
+            compactions_data.iter().map(|x| x.removed_delete_files.clone()).flatten().collect(),
+        )
+    }
+
     pub fn fully_covered_for_extension(&self, extension_name: &String) -> bool {
         let total_num_files =
             self.speedboat_metadata.as_ref().map_or(0, |x| x.files.file_paths.len()) +
@@ -210,7 +298,7 @@ pub struct CreateTable {
     pub tags: HashMap<String, String>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TableDescription {
     pub name: String,
     pub tags: HashMap<String, String>
@@ -306,11 +394,14 @@ impl FileSetPayload {
             (other.clone(), self)
         };
 
-        for file_desc in to_merge.as_file_tuples().iter() {
-            cloned.add(file_desc);
-        }
-
+        cloned.merge_inplace(to_merge);
         cloned
+    }
+
+    pub fn merge_inplace(&mut self, other: &FileSetPayload) -> () {
+        for file_desc in other.as_file_tuples().iter() {
+            self.add(file_desc);
+        }
     }
 
     pub fn add(&mut self, file_descriptor: &FileDescriptor) -> () {
@@ -329,7 +420,7 @@ impl FileSetPayload {
 }
 
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ExtensionWorkItem {
     pub extension_type: String,
     pub table_name: String,
@@ -357,26 +448,26 @@ pub struct CompactionWorkItem {
     pub delete_files: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AliasInfo {
     pub is_hidden: bool,
 }
 
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(untagged)]
 pub enum StringOrBool {
     Bool(bool),
     String(String),
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MetaInfo {
     #[serde(rename = "migrationMappingPropertyHashes")]
     migration_mapping_property_hashes: HashMap<String, String>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PropertyInfo {
     #[serde(rename = "type")]
     pub type_name: Option<String>,
@@ -392,7 +483,7 @@ pub struct PropertyInfo {
 
 
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Mappings {
     pub dynamic: StringOrBool,
     pub _meta: Option<MetaInfo>,
@@ -400,18 +491,18 @@ pub struct Mappings {
 }
 
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IndexMappingSettings {
     pub total_fields: IndexMappingFieldSettings,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IndexMappingFieldSettings {
     pub limit: Option<u32>
 }
 
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IndexSettings {
     pub number_of_shards: Option<u32>,
     pub number_of_replicas: Option<u32>,
@@ -421,7 +512,7 @@ pub struct IndexSettings {
     pub mapping: Option<IndexMappingSettings>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct CreateIndexResult {
     pub acknowledged: bool,
     pub shards_acknowledged: bool,
@@ -429,12 +520,12 @@ pub struct CreateIndexResult {
 }
 
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CreateIndexSettings {
     pub index: IndexSettings
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(untagged)]
 pub enum CreateIndexSettingsOption {
     Indirect(CreateIndexSettings),
@@ -442,7 +533,7 @@ pub enum CreateIndexSettingsOption {
 }
 
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CreateIndexBody {
     pub aliases: Option<HashMap<String, AliasInfo>>,
     pub mappings: Option<Mappings>,
@@ -459,7 +550,7 @@ impl CreateIndexBody {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CreateIndexTemplateBody {
     #[serde(default)]
     pub index_patterns: Vec<String>,
