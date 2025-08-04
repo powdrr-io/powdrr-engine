@@ -91,7 +91,7 @@ pub struct TestProcessingMode {
 impl TestProcessingMode {
     pub fn default() -> Self {
         Self {
-            state_mode: StateMode::TestingDynamoDb,
+            state_mode: StateMode::Ephemeral,
             indexing_mode: IndexingMode::Sync,
             compaction_mode: CompactionMode::Async,
             prefetch_mode: PrefetchMode::Disabled,

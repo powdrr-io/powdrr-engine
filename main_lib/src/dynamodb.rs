@@ -163,7 +163,7 @@ impl Entity for PowdrrTracker {
 
     fn primary_key(input: Self::KeyInput<'_>) -> keys::Primary {
         let common = format!("{}_TRACKER#{}#{}", input.entity_name, input.org_id, input.parent_entity);
-            keys::Primary {
+        keys::Primary {
             hash: common.clone(),
             range: input.name.clone(),
         }
@@ -171,7 +171,7 @@ impl Entity for PowdrrTracker {
 
     fn full_key(&self) -> keys::FullKey<keys::Primary, Self::IndexKeys> {
         Self::primary_key(OrgIdEntityNameInput{
-            entity_name: &self.parent_entity,
+            entity_name: &self.entity_name,
             org_id: &self.org_id,
             parent_entity: &self.parent_entity,
             name: &self.name,
@@ -190,7 +190,8 @@ impl QueryInput for PowdrrTrackerQuery {
     type Aggregate = PowdrrTrackerQueryResults;
 
     fn key_condition(&self) -> expr::KeyCondition<Self::Index> {
-        expr::KeyCondition::in_partition(format!("{}_TRACKER#{}#{}", self.entity_name, self.org_id, self.parent_entity))
+        let key = format!("{}_TRACKER#{}#{}", self.entity_name, self.org_id, self.parent_entity);
+        expr::KeyCondition::in_partition(key)
     }
 }
 
@@ -416,7 +417,7 @@ macro_rules! powdrr_tracker {
                 }
 
                 pub async fn [< oldest_available_ $entity_name >](&self, org_id: &String, parent_entity: &String, limit: Option<u32>) -> Result<Vec<PowdrrTracker>, Error> {
-                    let query_input = PowdrrTrackerQuery { org_id: org_id.clone(), parent_entity: parent_entity.clone(), entity_name: stringify!($entity_name).to_string() };
+                    let query_input = PowdrrTrackerQuery { entity_name: stringify!($entity_name).to_string(), org_id: org_id.clone(), parent_entity: parent_entity.clone() };
 
                     let mut trackers = PowdrrTrackerQueryResults::default();
 
@@ -736,6 +737,7 @@ mod tests {
             },
         };
 
+        connector.create_speedboat_commit_checkpointed(&"fake_org".to_string(), &"fake_table".to_string(), &"fake_id".to_string()).await.unwrap();
         let trackers = connector.oldest_available_speedboat_commit_checkpointed(&"fake_org".to_string(), &"fake_table".to_string(), None).await.unwrap();
         assert_eq!(trackers.len(), 1);
 
@@ -787,6 +789,7 @@ mod tests {
         connector.create_latest(&"fake_org".to_string(), &first_checkpoint.table_name, &EntityVersionInfo { version: 0, entity_id: first_checkpoint.checkpoint_id.clone() }).await.unwrap();
         connector.create_checkpoint(&mut checkpoint_cache, &"fake_org".to_string(), &first_checkpoint.checkpoint_id, &first_checkpoint).await.unwrap();
         connector.create_speedboat_commit(&mut speedboat_cache, &"fake_org".to_string(), &"fake_id".to_string(), &speedboat_commit).await.unwrap();
+        connector.create_speedboat_commit_checkpointed(&"fake_org".to_string(), &"fake_table".to_string(), &"fake_id".to_string()).await.unwrap();
 
         let latest_speedboat_trackers = connector.oldest_available_speedboat_commit_checkpointed(&"fake_org".to_string(), &"fake_table".to_string(), None).await.unwrap();
         assert_eq!(latest_speedboat_trackers.len(), 1);
