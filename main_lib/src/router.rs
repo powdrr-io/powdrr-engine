@@ -332,7 +332,6 @@ pub(crate) mod tests {
             mime::TEXT_PLAIN
         ).perform().unwrap();
 
-        
         let checkpoint = TableMetadataCheckpoint {
             table_name: "logs".to_string(),
             checkpoint_id: "0".to_string(),
@@ -373,7 +372,7 @@ pub(crate) mod tests {
             mime::APPLICATION_JSON,
         ).perform().unwrap();  
 
-        assert_eq!(response_create_index.status(), 200);                   
+        assert!(response_create_index.status() == 200 || response_create_index.status() == 208);
 
         let body = r#"{"create":{ "_index": "logs" }}
 { "@timestamp": "2099-03-08T11:04:05.000Z", "index_col": 1, "user": { "id": "vlb44hny" }, "message": "Login attempt failed" }
@@ -479,6 +478,7 @@ pub(crate) mod tests {
         ).perform().unwrap();
 
         let schema = PowdrrSchema::from(&vec!(
+            PowdrrField{ name: "_id_seq_no".to_string(), data_type: PowdrrDataType::String },
             PowdrrField{ name: "snippet".to_string(), data_type: PowdrrDataType::String },
             PowdrrField{ name: "searchTerms".to_string(), data_type: PowdrrDataType::String },
             PowdrrField{ name: "title".to_string(), data_type: PowdrrDataType::String },

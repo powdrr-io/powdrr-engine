@@ -1,8 +1,12 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use aws_config::{BehaviorVersion, Region};
+use aws_sdk_dynamodb::Client;
+use modyne::TestTableExt;
 use tokio::sync::{mpsc, oneshot};
 use crate::{distributed_cache, peers::CheckpointDescriptor, pipeline::PipelineDefinition};
 use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
+use crate::dynamodb_state_provider::DynamoDbStateProvider;
 use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::ephemeral_state_provider::EphemeralStateProvider;
@@ -224,6 +228,28 @@ impl StateProviderActor {
                 match mode.state_mode {
                     StateMode::Testing => self.state_provider = StateProvider::Ephemeral(EphemeralStateProvider::new()),
                     StateMode::Ephemeral => self.state_provider = StateProvider::Ephemeral(EphemeralStateProvider::new()),
+                    StateMode::TestingDynamoDb => {
+                        let config = aws_config::defaults(BehaviorVersion::latest())
+                            .region(Region::new("us-east-1")) // Region doesn't matter for local, but required
+                            .endpoint_url("http://localhost:4566")
+                            .credentials_provider(aws_credential_types::Credentials::new(
+                                "test", "test", None, None, "static",
+                            ))
+                            .load()
+                            .await;
+
+                        let client = Client::new(&config);
+                        let provider = DynamoDbStateProvider::with_client(client);
+
+                        let _ = provider.service_impl.connector.delete_table().send().await;
+                        let _create_table = match provider.service_impl.connector.create_table().send().await {
+                            Ok(_) => (),
+                            Err(e) => {
+                                panic!("{:?}", e)
+                            },
+                        };
+                        self.state_provider = StateProvider::DynamoDb(provider);
+                    },
                     StateMode::Leaderless(address) => self.state_provider = StateProvider::Leaderless(LeaderlessStateProvider::new(address)),
                 }
                 respond_to.send(()).unwrap();
@@ -316,6 +342,7 @@ async fn run_state_provider_actor_message_pump(mut actor: StateProviderActor) {
 
 enum StateProvider {
     Ephemeral(EphemeralStateProvider),
+    DynamoDb(DynamoDbStateProvider),
     #[allow(dead_code)]
     Leaderless(LeaderlessStateProvider)
 }
@@ -324,6 +351,7 @@ macro_rules! state_provider_func_impl {
     ($self:expr, $func:ident($($args:tt),*)) => {
         match $self {
             StateProvider::Ephemeral(eph) => eph.$func($($args),*).await,
+            StateProvider::DynamoDb(dynamo) => dynamo.$func($($args),*).await,
             StateProvider::Leaderless(lead) => lead.$func($($args),*).await,
         }
     };

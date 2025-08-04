@@ -19,6 +19,7 @@ pub(crate) struct TestCreateIndex {
 pub enum StateMode {
     Testing,
     Ephemeral,
+    TestingDynamoDb,
     Leaderless(String)
 }
 
@@ -90,7 +91,7 @@ pub struct TestProcessingMode {
 impl TestProcessingMode {
     pub fn default() -> Self {
         Self {
-            state_mode: StateMode::Ephemeral,
+            state_mode: StateMode::TestingDynamoDb,
             indexing_mode: IndexingMode::Sync,
             compaction_mode: CompactionMode::Async,
             prefetch_mode: PrefetchMode::Disabled,
@@ -157,7 +158,10 @@ pub(crate) async fn do_all_available_extension_work(extensions: &Vec<String>) ->
         tracing::info!("Checking for indexing work");
         let index_work = match STATE_PROVIDER.get_extension_work_items(&"es".to_string()).await {
             Ok(work) => work,
-            Err(_) => panic!("oh no"),
+            Err(e) => {
+                let error = format!("{}", e);
+                panic!("oh no");
+            },
         };
 
         if index_work.len() > 0 {

@@ -8,7 +8,7 @@ use powdrr_lib::data_contract::{CompactionCommit, CompactionWorkItem, CreateTabl
 use powdrr_lib::peers::CheckpointDescriptor;
 use tokio::sync::{mpsc, oneshot};
 use powdrr_lib::state_provider::ServiceApiError;
-use crate::dynamodb_service_impl::DynamoDBServiceImpl;
+use powdrr_lib::dynamodb_service_impl::DynamoDBServiceImpl;
 
 #[derive(Debug, Clone)]
 pub struct ServiceImplError {
