@@ -19,6 +19,7 @@ pub(crate) struct TestCreateIndex {
 pub enum StateMode {
     Testing,
     Ephemeral,
+    TestingDynamoDb,
     Leaderless(String)
 }
 
@@ -157,7 +158,10 @@ pub(crate) async fn do_all_available_extension_work(extensions: &Vec<String>) ->
         tracing::info!("Checking for indexing work");
         let index_work = match STATE_PROVIDER.get_extension_work_items(&"es".to_string()).await {
             Ok(work) => work,
-            Err(_) => panic!("oh no"),
+            Err(e) => {
+                let error = format!("{}", e);
+                panic!("oh no");
+            },
         };
 
         if index_work.len() > 0 {

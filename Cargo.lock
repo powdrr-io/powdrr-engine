@@ -3973,9 +3973,9 @@ checksum = "784462f20dddd9dfdb45de963fa4ad4a288cb10a7889ac5d2c34fb6481c6b213"
 
 [[package]]
 name = "marrow"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3641f6a55539a8b6e5349b3bdfb5b315714fbceda3253815838f49e40e3ea757"
+checksum = "64369333feea08a4c974cc5d7bad82197999624d0c9508bec4b97ea9fc0e3f63"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4761,6 +4761,9 @@ dependencies = [
  "arrow-flight",
  "arrow-json",
  "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-dynamodb",
  "chrono",
  "datafusion",
  "flamegraph",
@@ -4774,7 +4777,10 @@ dependencies = [
  "liquid-cache-parquet",
  "lru-mem",
  "minijinja",
+ "modyne",
+ "modyne-derive",
  "object_store",
+ "paste",
  "prost",
  "redis",
  "reqwest 0.12.22",
@@ -5797,9 +5803,9 @@ dependencies = [
 
 [[package]]
 name = "serde_arrow"
-version = "0.13.4"
+version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "221bea57dc6cb0aec429ab73af67b4a46cfdef464082e391cd609f7c5b50be4f"
+checksum = "55af245b3a27a1fed12634542d4e193b98b40aa69a7956c23cd9f8902c408463"
 dependencies = [
  "arrow-array",
  "arrow-schema",

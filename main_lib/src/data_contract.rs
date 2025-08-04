@@ -438,6 +438,18 @@ impl ExtensionWorkItem {
     pub fn has_work(&self) -> bool {
         self.speedboat_files.len() > 0 || self.iceberg_files.len() > 0
     }
+
+    pub fn merge_speedboat(&mut self, commit: &SpeedboatCommit) -> () {
+        for speedboat_commit_table_info in commit.type_files.iter() {
+            if speedboat_commit_table_info.commit_type == "commit" || speedboat_commit_table_info.commit_type == "compaction" {
+                self.speedboat_files.merge_inplace(&speedboat_commit_table_info.as_file_set_payload());
+            }
+        }
+    }
+
+    pub fn merge_iceberg(&mut self, commit: &IcebergCommit) -> () {
+        self.iceberg_files.merge_inplace(&commit.metadata.files);
+    }
 }
 
 

@@ -5,6 +5,9 @@ mod data_access;
 pub mod data_contract;
 mod data_fusion_functions;
 mod distributed_cache;
+mod dynamodb;
+pub mod dynamodb_service_impl;
+mod dynamodb_state_provider;
 mod elastic_search_cluster_info;
 mod elastic_search_commands;
 mod elastic_search_common;
@@ -33,3 +36,5 @@ pub mod peers;
 pub mod test_api;
 mod util;
 mod ephemeral_fetch_tracker;
+
+

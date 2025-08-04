@@ -687,7 +687,10 @@ pub(crate) async fn execute_sql_async(sql: &String) -> Result<Vec<RecordBatch>, 
         // Plan / execute the query
         let results = match execute_sql(&sql_owned).await {
             Ok(r) => r,
-            Err(e) => return Err(e)
+            Err(e) => {
+                tx.send(log_err(e)).await.unwrap();
+                return;
+            }
         };
 
         let batches = match results.collect().await {
@@ -696,8 +699,6 @@ pub(crate) async fn execute_sql_async(sql: &String) -> Result<Vec<RecordBatch>, 
         };
 
         tx.send(batches).await.unwrap();
-
-        Ok(())
     };
 
     let mut join_set = JoinSet::new();
