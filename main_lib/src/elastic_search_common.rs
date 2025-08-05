@@ -169,7 +169,7 @@ pub async fn load_command_raw_result(_context: CommandContext, command: Arc<dyn 
 pub async fn execute_command(_context: CommandContext, command: Arc<dyn Command>) -> ElasticSearchResponse {
     let result_table_name = match load_command_raw_result(_context, command.clone()).await {
         Ok(t) => t,
-        Err(_) => return QueryFailure{ message: "Failed".to_string() }.to_response(),
+        Err(e) => return QueryFailure{ message: format!("{:?}", e) }.to_response(),
     };         
     let response = command.result_generator(result_table_name.clone()).await.unwrap_or_else(|_e| {
         QueryFailure { message: "Failed".to_string() }.to_response()

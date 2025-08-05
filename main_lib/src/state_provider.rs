@@ -134,6 +134,9 @@ enum StateProviderActorMessage {
         respond_to: oneshot::Sender<Result<Option<TableMetadataCheckpoint>, ServiceApiError>>,
         checkpoint: CheckpointDescriptor,
     },
+    UpdateAllCheckpoints {
+        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
+    },
     GetExtensionWorkItems {
         respond_to: oneshot::Sender<Result<Vec<ExtensionWorkItem>, ServiceApiError>>,
         extension_type: String,
@@ -245,7 +248,7 @@ impl StateProviderActor {
                         let _create_table = match provider.service_impl.connector.create_table().send().await {
                             Ok(_) => (),
                             Err(e) => {
-                                panic!("{:?}", e)
+                                panic!("Failed during initialization, is Docker running?: {:?}", e)
                             },
                         };
                         self.state_provider = StateProvider::DynamoDb(provider);
@@ -309,6 +312,9 @@ impl StateProviderActor {
             },
             StateProviderActorMessage::GetLatestTargetCheckpoint { table_name, extensions, respond_to } => {
                 handle_message_impl!(self, respond_to, get_latest_target_checkpoint(&table_name, extensions));
+            },
+            StateProviderActorMessage::UpdateAllCheckpoints { respond_to } => {
+                handle_message_impl!(self, respond_to, update_all_checkpoints());
             },
             StateProviderActorMessage::GetCheckpoint { checkpoint, respond_to } => {
                 handle_message_impl!(self, respond_to, get_checkpoint(&checkpoint));
@@ -438,6 +444,10 @@ impl StateProvider {
 
     pub async fn get_checkpoint(&mut self, snapshot: &CheckpointDescriptor) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
         state_provider_func_impl!(self, get_checkpoint(snapshot))
+    }
+
+    pub async fn update_all_checkpoints(&mut self) -> Result<(), ServiceApiError> {
+        state_provider_func_impl!(self, update_all_checkpoints())
     }
 
     pub async fn get_extension_work_items(&mut self, extension_type: &String) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {
@@ -584,6 +594,10 @@ impl StateProviderHandle {
 
     pub async fn get_checkpoint(&self, checkpoint: CheckpointDescriptor) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
         send_message!(self, GetCheckpoint, checkpoint = checkpoint.clone())
+    }
+
+    pub async fn update_all_checkpoints(&self) -> Result<(), ServiceApiError> {
+        send_message!(self, UpdateAllCheckpoints)
     }
 
     pub async fn get_extension_work_items(&self, extension_type: &String) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {

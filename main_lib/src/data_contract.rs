@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
+use crate::peers::CheckpointDescriptor;
 use crate::schema_massager::PowdrrSchema;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -129,6 +130,13 @@ impl TableMetadataCheckpoint {
             deletes_metadata: None,
             extension_metadata: HashMap::new(),
             schema,
+        }
+    }
+
+    pub fn get_descriptor(&self) -> CheckpointDescriptor {
+        CheckpointDescriptor {
+            table_name: self.table_name.to_string(),
+            checkpoint_id: self.checkpoint_id.to_string(),
         }
     }
 
@@ -458,6 +466,18 @@ pub struct CompactionWorkItem {
     pub table_schema: PowdrrSchema,
     pub speedboat_files: FileSetPayload,
     pub delete_files: Vec<String>,
+}
+
+impl CompactionWorkItem {
+    pub fn merge_speedboat(&mut self, commit: &SpeedboatCommit) -> () {
+        for speedboat_commit_table_info in commit.type_files.iter() {
+            if speedboat_commit_table_info.commit_type == "commit" || speedboat_commit_table_info.commit_type == "compaction" {
+                self.speedboat_files.merge_inplace(&speedboat_commit_table_info.as_file_set_payload());
+            } else if speedboat_commit_table_info.commit_type == "delete" {
+                self.delete_files.extend(speedboat_commit_table_info.files.clone());
+            }
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

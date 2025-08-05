@@ -147,6 +147,7 @@ pub fn test_v1_set_testing_mode(state: State) -> Pin<Box<HandlerFuture>> {
     }.boxed()
 }
 
+
 #[allow(warnings)]
 pub(crate) async fn do_all_available_extension_work(extensions: &Vec<String>) -> () {
     loop {
@@ -301,6 +302,12 @@ pub fn test_v1_set_testing_processing_mode(mut state: State) -> Pin<Box<HandlerF
 
 pub fn test_v1_process_work(state: State) -> Pin<Box<HandlerFuture>> {
     async {
+        match STATE_PROVIDER.update_all_checkpoints().await {
+            Ok(_) => (),
+            Err(e) => {
+                tracing::error!("Error updating checkpoints: {}", e);
+            }
+        };
         do_all_available_extension_work(&vec!("es".to_string())).await;
         do_all_available_compaction_work(-1).await;
         let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "Ok");

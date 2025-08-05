@@ -1,10 +1,13 @@
 use std::collections::HashMap;
+use idgenerator::IdInstance;
 use modyne::{expr, keys, model::TransactWrite, projections, read_projection, Aggregate, Entity, EntityExt, Error, Item, ProjectionExt, QueryInput, QueryInputExt, Table};
 use modyne::expr::Filter;
 use modyne::model::ConditionalUpdate;
 use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableMetadataCheckpoint};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
+use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
+use crate::schema_massager::PowdrrSchema;
 
 pub struct DynamoDbConnector {
     table_name: std::sync::Arc<str>,
@@ -252,7 +255,7 @@ macro_rules! powdrr_named_entity_core {
             }
 
             impl DynamoDbConnector {
-                fn [< private_create_ $entity_name _core >](&self, org_id: &String, name: &String, template: &$type_name) -> TransactWrite {
+                fn [< private_create_ $entity_name _core >](&self, transaction: TransactWrite, org_id: &String, name: &String, template: &$type_name) -> TransactWrite {
                     let entity = PowdrrEntity {
                         org_id: org_id.clone(),
                         type_name: stringify!($entity_name).to_string(),
@@ -265,14 +268,14 @@ macro_rules! powdrr_named_entity_core {
                         entity: template.clone(),
                     };
 
-                    TransactWrite::new()
+                    transaction
                         .operation(entity.create())
                         .operation(named_entity.create())
                 }
 
 
                 async fn [< private_create_ $entity_name >](&self, org_id: &String, name: &String, template: &$type_name) -> Result<(), Error> {
-                    self.[< private_create_ $entity_name _core >](org_id, name, template)
+                    self.[< private_create_ $entity_name _core >](TransactWrite::new(), org_id, name, template)
                         .execute(self)
                         .await?;
 
@@ -287,8 +290,14 @@ macro_rules! powdrr_named_entity_core {
                     }
                 }
 
+                fn [< private_delete_ $entity_name _core >](&self, transaction: TransactWrite, org_id: &String, name: &String) -> TransactWrite {
+                    transaction.operation([< PowdrrNamed $type_name >]::delete(OrgIdNameInput{ org_id: org_id, name: name }))
+                }
+
                 async fn [< private_delete_ $entity_name >](&self, org_id: &String, name: &String) -> Result<(), Error> {
-                    [< PowdrrNamed $type_name >]::delete(OrgIdNameInput{ org_id: org_id, name: name }).execute(self).await?;
+                    self.[< private_delete_ $entity_name _core >](TransactWrite::new(), org_id, name)
+                        .execute(self)
+                        .await?;
                     Ok(())
                 }
             }
@@ -357,10 +366,15 @@ macro_rules! powdrr_named_cached_entity_core {
 
             #[allow(dead_code)]
             impl DynamoDbConnector {
-                async fn [< cached_create_ $entity_name >](&self, cache: &mut [< PowdrrNamed $type_name Cache >], org_id: &String, name: &String, template: &$type_name) -> Result<(), Error> {
+                fn [< cached_create_ $entity_name _core >](&self, transaction: TransactWrite, cache: &mut [< PowdrrNamed $type_name Cache >], org_id: &String, name: &String, template: &$type_name) -> TransactWrite {
                     let key = CacheKey{ org_id: org_id.clone(), name: name.clone() };
                     cache.cache.insert(key.clone(), template.clone());
-                    self.[< private_create_ $entity_name >](org_id, name, template).await
+                    self.[< private_create_ $entity_name _core >](transaction, org_id, name, template)
+                }
+
+                async fn [< cached_create_ $entity_name >](&self, cache: &mut [< PowdrrNamed $type_name Cache >], org_id: &String, name: &String, template: &$type_name) -> Result<(), Error> {
+                    self.[< cached_create_ $entity_name _core >](TransactWrite::new(), cache, org_id, name, template).execute(self).await?;
+                    Ok(())
                 }
 
                 async fn [< cached_describe_ $entity_name >](&self, cache: &mut [< PowdrrNamed $type_name Cache >], org_id: &String, name: &String) -> Result<Option<$type_name>, Error> {
@@ -435,7 +449,11 @@ macro_rules! powdrr_tracker {
                     Ok(trackers.trackers)
                 }
 
-                pub fn [< mark_done_ $entity_name >](transaction: TransactWrite, org_id: &String, parent_entity: &String, name: &String, expected: Option<u64>) -> TransactWrite {
+                fn [< mark_done_ $entity_name >](transaction: TransactWrite, tracker: &PowdrrTracker) -> TransactWrite {
+                    Self::[< mark_done_ $entity_name _core >](transaction, &tracker.org_id, &tracker.parent_entity, &tracker.name, Some(tracker.version))
+                }
+
+                fn [< mark_done_ $entity_name _core >](transaction: TransactWrite, org_id: &String, parent_entity: &String, name: &String, expected: Option<u64>) -> TransactWrite {
                     let key = OrgIdEntityNameInput {
                         entity_name: &stringify!($entity_name).to_string(),
                         org_id,
@@ -477,15 +495,26 @@ impl TableBody {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EntityVersionInfo {
+    pub org_id: String,
+    pub key: String,
     pub version: u64,
     pub entity_id: String,
 }
 
 impl EntityVersionInfo {
-    pub(crate) fn new(entity_id: &String) -> Self {
+    pub(crate) fn new(org_id: &String, key: &String, entity_id: &String) -> Self {
         Self {
+            org_id: org_id.clone(),
+            key: key.clone(),
             version: 0,
             entity_id: entity_id.clone()
+        }
+    }
+
+    pub fn get_query(&self) -> OrgIdNameInput {
+        OrgIdNameInput {
+            name: &self.key,
+            org_id: &self.org_id,
         }
     }
 }
@@ -514,49 +543,81 @@ powdrr_tracker!(extension_commit_checkpointed);
 
 
 impl DynamoDbConnector {
-    fn bump_version(key: OrgIdNameInput, old: &EntityVersionInfo, new_entity_id: &String) -> ConditionalUpdate {
+    fn latest_checkpoint_key(table_name: &String, extension: &Option<String>) -> String {
+        match extension {
+            Some(x) => format!("checkpoint#{}#{}", table_name, x),
+            None => format!("checkpoint#{}", table_name)
+        }
+    }
+
+    fn latest_extension_work_item_key(table_name: &String, extension: &String) -> String {
+        format!("extension_work_item#{}#{}", table_name, extension)
+    }
+
+    fn latest_compaction_work_item_key(table_name: &String) -> String {
+        format!("compaction_work_item#{}", table_name)
+    }
+
+    const NO_WORK_ITEM: &'static str = "-1";
+
+    fn bump_version(old: &EntityVersionInfo, new_entity_id: &String) -> ConditionalUpdate {
         let expression = expr::Update::new("SET entity.version = :plus_one, entity.entity_id = :new_id")
             .value(":new_id", new_entity_id.clone())
             .value(":plus_one", old.version + 1);
         let condition = expr::Condition::new("entity.version = :old")
             .value(":old", old.version);
 
-        PowdrrNamedEntityVersionInfo::update(key).expression(expression).condition(condition)
+        PowdrrNamedEntityVersionInfo::update(old.get_query()).expression(expression).condition(condition)
+    }
+
+    pub fn create_latest_core(&self, transaction: TransactWrite, entity: &EntityVersionInfo) -> TransactWrite {
+        self.private_create_latest_core(transaction, &entity.org_id, &entity.key, entity)
+    }
+
+    pub async fn create_table(&mut self, org_id: &String, table_name: &String, table_body: &TableBody) -> Result<(), Error> {
+        let checkpoint = TableMetadataCheckpoint::new(
+            table_name.clone(),
+            IdInstance::next_id().to_string(),
+            PowdrrSchema{ fields: vec![] }
+        );
+
+        tracing::info!("Created checkpoint for table {}: {}", table_name, checkpoint.checkpoint_id);
+
+        let mut transaction = TransactWrite::new();
+        transaction = self.private_create_powdrr_table_core(transaction, org_id, table_name, table_body);
+        transaction = self.private_create_checkpoint_core(transaction, org_id, &checkpoint.get_descriptor().full_name(), &checkpoint);
+        transaction = self.create_latest_core(transaction, &EntityVersionInfo::new(org_id, &Self::latest_checkpoint_key(table_name, &None), &checkpoint.get_descriptor().full_name()));
+        transaction = self.create_latest_core(transaction, &EntityVersionInfo::new(org_id, &Self::latest_checkpoint_key(table_name, &Some("es".to_string())), &checkpoint.get_descriptor().full_name()));
+        transaction = self.create_latest_core(transaction, &EntityVersionInfo::new(org_id, &Self::latest_extension_work_item_key(table_name, &"es".to_string()), &Self::NO_WORK_ITEM.to_owned()));
+        transaction = self.create_latest_core(transaction, &EntityVersionInfo::new(org_id, &Self::latest_compaction_work_item_key(table_name), &Self::NO_WORK_ITEM.to_owned()));
+        transaction.execute(self).await?;
+
+        Ok(())
     }
 
     pub async fn commit_checkpoint(
         &self,
-        org_id: &String,
         input_latest: &EntityVersionInfo,
         input_speedboat_trackers: &Vec<PowdrrTracker>,
         new_checkpoint: &TableMetadataCheckpoint,
     ) -> Result<bool, Error> {
         let mut transaction = TransactWrite::new();
 
-        let key = OrgIdNameInput {
-            name: &new_checkpoint.table_name,
-            org_id,
-        };
-
         transaction = transaction.operation(Self::bump_version(
-            key,
             input_latest,
-            &new_checkpoint.checkpoint_id
+            &new_checkpoint.get_descriptor().full_name()
         ));
 
         for input_tracker in input_speedboat_trackers.iter() {
             transaction = DynamoDbConnector::mark_done_speedboat_commit_checkpointed(
                 transaction,
-                &input_tracker.org_id,
-                &input_tracker.parent_entity,
-                &input_tracker.name,
-                Some(0)
+                input_tracker
             );
         }
 
         let checkpoint_obj = PowdrrNamedTableMetadataCheckpoint {
-            name: new_checkpoint.checkpoint_id.clone(),
-            org_id: org_id.clone(),
+            name: new_checkpoint.get_descriptor().full_name(),
+            org_id: input_latest.org_id.clone(),
             entity: new_checkpoint.clone(),
         };
         transaction = transaction.operation(checkpoint_obj.create());
@@ -573,20 +634,15 @@ impl DynamoDbConnector {
         }
     }
 
-    pub async fn commit_work_item_taken(&self, org_id: &String, old_entity_infos: &Vec<(String, EntityVersionInfo)>, new_entity_id: &String) -> Result<bool, Error> {
+    pub async fn commit_work_item_taken(&self, old_entity_infos: &Vec<EntityVersionInfo>, new_entity_id: &String) -> Result<bool, Error> {
         if old_entity_infos.len() == 0 {
             return Ok(true);
         }
 
         let mut transaction = TransactWrite::new();
 
-        for (key, entity_info) in old_entity_infos.iter() {
-            let key = OrgIdNameInput {
-                name: key,
-                org_id,
-            };
+        for entity_info in old_entity_infos.iter() {
             transaction = transaction.operation(Self::bump_version(
-                key,
                 entity_info,
                 new_entity_id
             ));
@@ -604,15 +660,10 @@ impl DynamoDbConnector {
         }
     }
 
-    pub async fn commit_extension_work_item(&self, org_id: &String, key: &String, old: &EntityVersionInfo, new_entity_id: &String) -> Result<bool, Error> {
+    pub async fn commit_work_item(&self, old: &EntityVersionInfo, new_entity_id: &String) -> Result<bool, Error> {
         let mut transaction = TransactWrite::new();
 
-        let key_obj = OrgIdNameInput {
-            name: key,
-            org_id,
-        };
         transaction = transaction.operation(Self::bump_version(
-            key_obj,
             old,
             new_entity_id
         ));
@@ -685,7 +736,7 @@ mod tests {
             },
         }
 
-        match connector.create_latest(&"dude".to_string(), &"fake_table#es".to_string(), &EntityVersionInfo::new(&"-1".to_string())).await {
+        match connector.create_latest(&"dude".to_string(), &"fake_table#es".to_string(), &EntityVersionInfo::new(&"dude".to_string(), &"fake_table#es".to_string(), &"-1".to_string())).await {
             Ok(_) => (),
             Err(e) => {
                 panic!("{:?}", e)
@@ -702,6 +753,36 @@ mod tests {
                 panic!("Not found");
             },
         }
+
+        let checkpoint = TableMetadataCheckpoint {
+            table_name: "".to_string(),
+            checkpoint_id: "".to_string(),
+            iceberg_metadata: None,
+            speedboat_metadata: None,
+            deletes_metadata: None,
+            extension_metadata: Default::default(),
+            schema: PowdrrSchema { fields: vec![] },
+        };
+
+        let mut cache = PowdrrNamedTableMetadataCheckpointCache::new();
+
+        match connector.create_checkpoint(&mut cache, &"dude".to_string(), &"fresh".to_string(), &checkpoint).await {
+            Ok(_) => (),
+            Err(e) => {
+                panic!("{:?}", e)
+            },
+        }
+
+        let result = connector.describe_checkpoint(&mut cache, &"dude".to_string(), &"fresh".to_string()).await.unwrap();
+        match result {
+            Some(_table) => {
+                ()
+            },
+            None => {
+                panic!("Table not found");
+            },
+        }
+
     }
 
     #[tokio::test]
@@ -742,14 +823,14 @@ mod tests {
         assert_eq!(trackers.len(), 1);
 
         let _ =
-            DynamoDbConnector::mark_done_speedboat_commit_checkpointed(TransactWrite::new(), &"fake_org".to_string(), &"fake_table".to_string(), &"fake_id".to_string(), Some(0))
+            DynamoDbConnector::mark_done_speedboat_commit_checkpointed(TransactWrite::new(), &trackers[0])
             .execute(&connector)
             .await.unwrap();
 
-        let trackers = connector.oldest_available_speedboat_commit_checkpointed(&"fake_org".to_string(), &"fake_table".to_string(), None).await.unwrap();
-        assert_eq!(trackers.len(), 0);
+        let trackers_again = connector.oldest_available_speedboat_commit_checkpointed(&"fake_org".to_string(), &"fake_table".to_string(), None).await.unwrap();
+        assert_eq!(trackers_again.len(), 0);
 
-        match DynamoDbConnector::mark_done_speedboat_commit_checkpointed(TransactWrite::new(), &"fake_org".to_string(), &"fake_table".to_string(), &"fake_id".to_string(), Some(0))
+        match DynamoDbConnector::mark_done_speedboat_commit_checkpointed(TransactWrite::new(), &trackers[0])
             .execute(&connector)
             .await {
             Ok(_) => panic!("Should have failed"),
@@ -786,7 +867,7 @@ mod tests {
             compactions: vec![],
         };
 
-        connector.create_latest(&"fake_org".to_string(), &first_checkpoint.table_name, &EntityVersionInfo { version: 0, entity_id: first_checkpoint.checkpoint_id.clone() }).await.unwrap();
+        connector.create_latest(&"fake_org".to_string(), &first_checkpoint.table_name, &EntityVersionInfo::new(&"fake_org".to_string(), &first_checkpoint.table_name, &first_checkpoint.checkpoint_id)).await.unwrap();
         connector.create_checkpoint(&mut checkpoint_cache, &"fake_org".to_string(), &first_checkpoint.checkpoint_id, &first_checkpoint).await.unwrap();
         connector.create_speedboat_commit(&mut speedboat_cache, &"fake_org".to_string(), &"fake_id".to_string(), &speedboat_commit).await.unwrap();
         connector.create_speedboat_commit_checkpointed(&"fake_org".to_string(), &"fake_table".to_string(), &"fake_id".to_string()).await.unwrap();
@@ -810,7 +891,6 @@ mod tests {
         );
 
         match connector.commit_checkpoint(
-            &"fake_org".to_string(),
             &latest_checkpoint_info,
             &latest_speedboat_trackers,
             &new_checkpoint,
@@ -825,6 +905,6 @@ mod tests {
 
         let new_latest = connector.describe_latest(&"fake_org".to_string(), &"fake_table".to_string()).await.unwrap().unwrap();
         assert_ne!(new_latest.version, latest_checkpoint_info.version);
-        assert_eq!(new_latest.entity_id, new_checkpoint.checkpoint_id);
+        assert_eq!(CheckpointDescriptor::from_full_name(&new_latest.entity_id).checkpoint_id, new_checkpoint.checkpoint_id);
     }
 }
