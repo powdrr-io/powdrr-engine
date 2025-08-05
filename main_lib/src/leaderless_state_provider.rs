@@ -257,6 +257,11 @@ impl LeaderlessStateProvider {
         ).await
     }
 
+    pub(crate) async fn update_all_checkpoints(&mut self) -> Result<(), ServiceApiError> {
+        // Do nothing. This happens on automatically on remote services.
+        Ok(())
+    }
+
     pub(crate) async fn get_extension_work_items(&mut self, extension_name: &String) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {
         Self::handle_response_body(self.client.get(format!("{}/api/v1/get_extension_work_items/{}", self.base_address, extension_name))
             .send().await

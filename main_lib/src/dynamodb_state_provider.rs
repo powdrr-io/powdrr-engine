@@ -84,7 +84,9 @@ impl DynamoDbStateProvider {
             Ok(_) => {
                 for table_info in commit.type_files.iter() {
                     let checkpoint_id = self.get_latest_committed_checkpoint(&table_info.table_name, None).await?;
-                    self.fetch_tracker.set_next_prefetch_checkpoints(&table_info.table_name, None, &checkpoint_id.unwrap()).await?;
+                    if checkpoint_id.is_some() {
+                        self.fetch_tracker.set_next_prefetch_checkpoints(&table_info.table_name, None, &checkpoint_id.unwrap()).await?;
+                    }
                 }
                 Ok(())
             },
@@ -155,5 +157,9 @@ impl DynamoDbStateProvider {
 
     pub async fn get_next_prefetch_checkpoints(&mut self, extensions: Option<String>) -> Result<Vec<CheckpointDescriptor>, ServiceApiError> {
         self.fetch_tracker.get_next_prefetch_checkpoints(extensions).await
+    }
+
+    pub async fn update_all_checkpoints(&mut self) -> Result<(), ServiceApiError> {
+        self.service_impl.update_all_checkpoints().await
     }
 }

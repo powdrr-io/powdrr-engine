@@ -124,6 +124,11 @@ impl EphemeralStateProvider {
         self.service_impl.get_checkpoint(snapshot).await
     }
 
+    pub(crate) async fn update_all_checkpoints(&mut self) -> Result<(), ServiceApiError> {
+        // Do nothing. This happens on commit.
+        Ok(())
+    }
+
     pub async fn get_extension_work_items(&mut self, extension_type: &String) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {
         self.service_impl.get_extension_work_items(extension_type).await
     }

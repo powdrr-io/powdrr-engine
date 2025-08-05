@@ -32,6 +32,14 @@ pub struct CheckpointDescriptor {
 }
 
 impl CheckpointDescriptor {
+    pub fn from_full_name(full_name: &str) -> Self {
+        let parts: Vec<&str> = full_name.split(':').collect();
+        CheckpointDescriptor {
+            table_name: parts[0].to_string(),
+            checkpoint_id: parts[1].to_string(),
+        }
+    }
+
     pub fn full_name(&self) -> String {
         format!("{}:{}", self.table_name, self.checkpoint_id)
     }

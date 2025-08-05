@@ -1232,6 +1232,14 @@ pub(crate) mod tests {
             }
         }
 
+        let process_work_response = test_server.client().put(
+            "http://localhost/_test/v1/_process_work",
+            "",
+            mime::TEXT_PLAIN,
+        ).perform().unwrap();
+
+        assert_eq!(process_work_response.status(), 200);
+
         let create_response = test_server.client().post(
             "http://localhost/logs/_create/my_id",
             test_val,
@@ -1296,10 +1304,19 @@ pub(crate) mod tests {
             }
         }
 
+        let process_work_response = test_server.client().put(
+            "http://localhost/_test/v1/_process_work",
+            "",
+            mime::TEXT_PLAIN,
+        ).perform().unwrap();
+
+        assert_eq!(process_work_response.status(), 200);
+
         let get_response = test_server.client().get(
             "http://localhost/logs/_doc/my_id"
-        ).perform();    
+        ).perform();
 
+        
         match get_response {
             Ok(response) => {
                 assert_eq!(response.status(), 200);
@@ -1324,6 +1341,14 @@ pub(crate) mod tests {
                 panic!("Failed {}", e)
             }
         }
+
+        let process_work_response = test_server.client().put(
+            "http://localhost/_test/v1/_process_work",
+            "",
+            mime::TEXT_PLAIN,
+        ).perform().unwrap();
+
+        assert_eq!(process_work_response.status(), 200);
 
         let get_response = test_server.client().get(
             "http://localhost/logs/_doc/my_id"
