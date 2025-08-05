@@ -241,6 +241,7 @@ impl EphemeralServiceImpl {
             None => {
                 &TableMetadataCheckpoint {
                     table_name: table_info.table_name.clone(),
+                    original_checkpoint_id: None,
                     checkpoint_id: "".to_string(),
                     iceberg_metadata: None,
                     speedboat_metadata: None,
@@ -275,6 +276,7 @@ impl EphemeralServiceImpl {
 
         let mut new_latest_checkpoint = TableMetadataCheckpoint {
             table_name: table_info.table_name.clone(),
+            original_checkpoint_id: None,            
             checkpoint_id: new_checkpoint_id.clone(),
             iceberg_metadata: latest_checkpoint.iceberg_metadata.clone(),
             speedboat_metadata: Some(new_speedboat_metadata.clone()),
@@ -331,6 +333,7 @@ impl EphemeralServiceImpl {
             None => {
                 &TableMetadataCheckpoint {
                     table_name: table_info.table_name.clone(),
+                    original_checkpoint_id: None,
                     checkpoint_id: "".to_string(),
                     iceberg_metadata: None,
                     speedboat_metadata: None,
@@ -362,6 +365,7 @@ impl EphemeralServiceImpl {
 
         let mut new_latest_checkpoint = TableMetadataCheckpoint {
             table_name: table_info.table_name.clone(),
+            original_checkpoint_id: None,
             checkpoint_id: new_checkpoint_id.clone(),
             iceberg_metadata: latest_checkpoint.iceberg_metadata.clone(),
             speedboat_metadata: latest_checkpoint.speedboat_metadata.clone(),
@@ -524,6 +528,7 @@ impl EphemeralServiceImpl {
             None => {
                 &TableMetadataCheckpoint {
                     table_name: table_name.clone(),
+                    original_checkpoint_id: None,
                     checkpoint_id: "".to_string(),
                     iceberg_metadata: None,
                     speedboat_metadata: None,
@@ -541,6 +546,7 @@ impl EphemeralServiceImpl {
 
         let mut new_latest_checkpoint = TableMetadataCheckpoint {
             table_name: table_name.clone(),
+            original_checkpoint_id: None,
             checkpoint_id: new_checkpoint_id.clone(),
             iceberg_metadata: Some(iceberg_commit.metadata.clone()),
             speedboat_metadata: latest_checkpoint.speedboat_metadata.clone(),
@@ -647,7 +653,4 @@ impl EphemeralServiceImpl {
         Ok(work_items)
     }
 
-    pub async fn update_checkpoint(&mut self, _table_name: &String) -> Result<(), ServiceApiError> {
-        unimplemented!()
-    }
 }

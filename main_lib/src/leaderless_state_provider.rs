@@ -257,9 +257,9 @@ impl LeaderlessStateProvider {
         ).await
     }
 
-    pub(crate) async fn update_all_checkpoints(&mut self) -> Result<(), ServiceApiError> {
+    pub(crate) async fn update_all_checkpoints(&mut self) -> Result<bool, ServiceApiError> {
         // Do nothing. This happens on automatically on remote services.
-        Ok(())
+        Ok(false)
     }
 
     pub(crate) async fn get_extension_work_items(&mut self, extension_name: &String) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {

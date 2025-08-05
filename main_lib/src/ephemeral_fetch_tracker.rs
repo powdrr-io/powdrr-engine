@@ -53,11 +53,11 @@ impl EphemeralFetchTracker {
             match self.get_latest_target_checkpoint(key, extensions.clone()).await? {
                 Some(latest) => {
                     if &latest < value {
-                        next_prefetch_checkpoints.push(CheckpointDescriptor{ table_name: key.clone(), checkpoint_id: value.clone()})
+                        next_prefetch_checkpoints.push(CheckpointDescriptor::new(key.clone(), value.clone()))
                     }
                 },
                 None => {
-                    next_prefetch_checkpoints.push(CheckpointDescriptor{ table_name: key.clone(), checkpoint_id: value.clone()})
+                    next_prefetch_checkpoints.push(CheckpointDescriptor::new(key.clone(), value.clone()))
                 }
             }
         }

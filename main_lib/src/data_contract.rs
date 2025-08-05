@@ -111,6 +111,7 @@ pub struct CompactionCommit {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TableMetadataCheckpoint {
     pub table_name: String,
+    pub original_checkpoint_id: Option<String>,
     pub checkpoint_id: String,
     pub iceberg_metadata: Option<IcebergMetadata>,
     pub speedboat_metadata: Option<SpeedboatMetadata>,
@@ -124,6 +125,7 @@ impl TableMetadataCheckpoint {
     pub fn new(table_name: String, checkpoint_id: String, schema: PowdrrSchema) -> Self {
         TableMetadataCheckpoint {
             table_name,
+            original_checkpoint_id: None,
             checkpoint_id,
             iceberg_metadata: None,
             speedboat_metadata: None,
@@ -137,27 +139,35 @@ impl TableMetadataCheckpoint {
         CheckpointDescriptor {
             table_name: self.table_name.to_string(),
             checkpoint_id: self.checkpoint_id.to_string(),
+            original_checkpoint_id: self.original_checkpoint_id.clone(),
         }
     }
 
-    pub fn clone_and_apply(&self, speedboat_commits: &Vec<SpeedboatCommit>, iceberg_commits: &Vec<IcebergCommit>, extension_commits: &Vec<ExtensionCommit>, compactions_lookup: &HashMap<String, CompactionCommit>) -> Self {
+    pub fn clone_and_apply(
+        &self,
+        speedboat_commits: &Vec<SpeedboatCommit>,
+        iceberg_commits: &Vec<IcebergCommit>,
+        extension_commits: &Vec<ExtensionCommit>,
+        compactions_lookup: &HashMap<String, CompactionCommit>
+    ) -> (Self, bool) {
         let mut new_table_metadata_checkpoint = self.clone();
         new_table_metadata_checkpoint.checkpoint_id = IdInstance::next_id().to_string();
 
+        let mut changed = false;
         for speedboat_commit in speedboat_commits {
-            new_table_metadata_checkpoint.apply_speedboat(speedboat_commit, compactions_lookup);
+            changed = changed | new_table_metadata_checkpoint.apply_speedboat(speedboat_commit, compactions_lookup);
         }
         for iceberg_commit in iceberg_commits {
-            new_table_metadata_checkpoint.apply_iceberg(iceberg_commit, compactions_lookup);
+            changed = changed | new_table_metadata_checkpoint.apply_iceberg(iceberg_commit, compactions_lookup);
         }
         for extension_commit in extension_commits {
-            new_table_metadata_checkpoint.add_coverage(extension_commit);
+            changed = changed | new_table_metadata_checkpoint.add_coverage(extension_commit);
         }
 
-        new_table_metadata_checkpoint
+        (new_table_metadata_checkpoint, changed)
     }
 
-    pub fn apply_speedboat(&mut self, speedboat_commit: &SpeedboatCommit, compactions_lookup: &HashMap<String, CompactionCommit>) -> () {
+    pub fn apply_speedboat(&mut self, speedboat_commit: &SpeedboatCommit, compactions_lookup: &HashMap<String, CompactionCommit>) -> bool {
         if self.speedboat_metadata.is_none() {
             self.speedboat_metadata = Some(SpeedboatMetadata{ files: FileSetPayload::new() });
         }
@@ -177,12 +187,16 @@ impl TableMetadataCheckpoint {
             }
         }
         self.apply_compactions(&speedboat_commit.compactions, compactions_lookup);
+
+        true
     }
 
-    pub fn apply_iceberg(&mut self, iceberg_commit: &IcebergCommit, compactions_lookup: &HashMap<String, CompactionCommit>) -> () {
+    pub fn apply_iceberg(&mut self, iceberg_commit: &IcebergCommit, compactions_lookup: &HashMap<String, CompactionCommit>) -> bool {
         self.iceberg_metadata = Some(iceberg_commit.metadata.clone());
         self.schema.merge_from(&self.iceberg_metadata.as_mut().unwrap().table_schema);
         self.apply_compactions(&iceberg_commit.compactions, compactions_lookup);
+
+        true
     }
 
     fn apply_compactions(&mut self, compactions: &Vec<String>, compactions_lookup: &HashMap<String, CompactionCommit>) -> () {
@@ -257,20 +271,20 @@ impl TableMetadataCheckpoint {
         true
     }
 
-    pub fn add_coverage(&mut self, extension_commit: &ExtensionCommit) -> () {
-        assert!(!self.fully_covered_for_extension(&extension_commit.extension), "Already fully covered");
-
+    pub fn add_coverage(&mut self, extension_commit: &ExtensionCommit) -> bool {
         let existing_extension_metadata_map = self.extension_metadata.get(&extension_commit.extension).map_or(HashMap::new(), |x| x.clone());
 
         if !self.extension_metadata.contains_key(&extension_commit.extension) {
             self.extension_metadata.insert(extension_commit.extension.clone(), HashMap::new());
         }
 
+        let mut changed = false;
         match &self.iceberg_metadata {
             Some(im) => {
                 for file_path in im.files.file_paths.iter() {
                     if extension_commit.files.contains_key(file_path) && !existing_extension_metadata_map.contains_key(file_path) {
                         self.extension_metadata.get_mut(&extension_commit.extension).unwrap().insert(file_path.clone(), extension_commit.files[file_path].clone());
+                        changed = true;
                     }
                 }
             },
@@ -282,12 +296,14 @@ impl TableMetadataCheckpoint {
                 for file_path in im.files.file_paths.iter() {
                     if extension_commit.files.contains_key(file_path) && !existing_extension_metadata_map.contains_key(file_path) {
                         self.extension_metadata.get_mut(&extension_commit.extension).unwrap().insert(file_path.clone(), extension_commit.files[file_path].clone());
-
+                        changed = true;
                     }
                 }
             },
             None => {}
         };
+
+        changed
     }
 }
 
