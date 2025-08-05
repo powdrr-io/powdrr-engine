@@ -346,7 +346,7 @@ pub(crate) mod tests {
             }),
             deletes_metadata: None,
             extension_metadata: HashMap::new(),
-            schema: PowdrrSchema{ fields: vec!() },
+            schema: PowdrrSchema::minimal(),
         };
 
         let checkpoint_response = test_server.client().post(

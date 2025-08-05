@@ -26,7 +26,7 @@ pub enum StateMode {
 impl StateMode {
     fn is_testing(&self) -> bool {
         match self {
-            StateMode::Testing => true,
+            StateMode::Testing | StateMode::TestingDynamoDb => true,
             _ => false
         }
     }
@@ -225,9 +225,28 @@ pub(crate) async fn do_next_prefetch() -> usize {
 }
 
 
+fn do_update_checkpoint_work_for_forever(wait_time_ms: u64) -> impl Future<Output = ()> {
+    async move {
+        let mut work_done;
+        loop {
+            match STATE_PROVIDER.update_all_checkpoints().await {
+                Ok(checkpoint_work_done) => work_done = checkpoint_work_done,
+                Err(e) => {
+                    tracing::error!("Error updating checkpoints: {}", e);
+                    work_done = false;
+                }
+            };
+            if !work_done {
+                tokio::time::sleep(Duration::from_millis(wait_time_ms)).await;
+            }
+        }
+    }
+}
+
+
 fn do_extension_work_for_forever(extensions: Vec<String>, wait_time_ms: u64) -> impl Future<Output = ()> {
     async move {
-        let mut work_done = false;
+        let mut work_done;
         loop {
             work_done = do_available_extension_work(&extensions).await;
             if !work_done {
@@ -241,7 +260,7 @@ fn do_extension_work_for_forever(extensions: Vec<String>, wait_time_ms: u64) -> 
 fn do_compaction_work_for_forever(wait_time_ms: u64) -> impl Future<Output = ()> {
     async move {
         let mut last_iceberg_snapshot_id: i64 = -1;
-        let mut work_done = false;
+        let mut work_done;
         loop {
             (last_iceberg_snapshot_id, work_done) = do_available_compaction_work(last_iceberg_snapshot_id).await;
             if !work_done {
@@ -281,6 +300,7 @@ pub fn test_v1_set_testing_processing_mode(mut state: State) -> Pin<Box<HandlerF
         if mode.state_mode.is_testing() {
             drop_all_tables(&"default".to_string()).await.unwrap();
         }
+        tokio::spawn(do_update_checkpoint_work_for_forever(100));
         if !mode.indexing_mode.is_disabled() {
             tokio::spawn(do_extension_work_for_forever(vec!("es".to_string()), 1000));
         }

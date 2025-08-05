@@ -339,7 +339,7 @@ impl EphemeralServiceImpl {
                     speedboat_metadata: None,
                     deletes_metadata: None,
                     extension_metadata: HashMap::new(),
-                    schema: PowdrrSchema{ fields: vec!() },
+                    schema: PowdrrSchema::minimal(),
                 }
             },
         };

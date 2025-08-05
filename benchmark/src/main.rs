@@ -6,7 +6,6 @@ use idgenerator::{IdGeneratorOptions, IdInstance};
 use rand::TryRngCore;
 use rand::rngs::OsRng;
 use powdrr_lib::compaction;
-use powdrr_lib::data_contract::{ServiceImplType, ServiceMode};
 use powdrr_lib::test_api::{CompactionMode, IndexingMode, PrefetchMode, TestProcessingMode, StateMode};
 
 const LINE_LIMIT: u64 = 1000000;
@@ -179,8 +178,8 @@ async fn search() -> Result<(), std::io::Error> {
         println!("Search - average response time: {} ms", all_response_times.iter().sum::<u64>() / all_response_times.len() as u64);
         println!("Search - longest response times: {} ms", longest_response_times.iter().map(|x: &u64|x.to_string()).collect::<Vec<String>>().join(", "));
 
-        if latest_response_time < 100 {
-            tokio::time::sleep(Duration::from_millis(100 - latest_response_time)).await;
+        if latest_response_time < 1000 {
+            tokio::time::sleep(Duration::from_millis(1000 - latest_response_time)).await;
         }
 
         if longest_response_times.len() < 10 {
@@ -224,7 +223,7 @@ async fn main() -> Result<(), std::io::Error> {
     println!("Setting Modes");
 
     let client = reqwest::Client::new();
-
+/*
     let coordinator_mode = ServiceMode {
         impl_type: ServiceImplType::DynamoDb
     };
@@ -240,6 +239,13 @@ async fn main() -> Result<(), std::io::Error> {
 
     let main_mode = TestProcessingMode {
         state_mode: StateMode::Leaderless("http://localhost:7784".to_string()),
+        indexing_mode: IndexingMode::Disabled,
+        compaction_mode: CompactionMode::Async,
+        prefetch_mode: PrefetchMode::Enabled,
+    };
+*/
+    let main_mode = TestProcessingMode {
+        state_mode: StateMode::TestingDynamoDb,
         indexing_mode: IndexingMode::Disabled,
         compaction_mode: CompactionMode::Async,
         prefetch_mode: PrefetchMode::Enabled,

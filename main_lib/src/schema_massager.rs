@@ -119,16 +119,41 @@ impl PowdrrField {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
 pub struct PowdrrSchema {
-    pub fields: Vec<PowdrrField>
+    fields: Vec<PowdrrField>
 }
 
 impl PowdrrSchema {
+    pub fn minimal() -> Self {
+        PowdrrSchema{
+            fields: vec!(
+                //PowdrrField { name: "_id".to_string(), data_type: PowdrrDataType::String },
+                //PowdrrField { name: "_id_seq_no".to_string(), data_type: PowdrrDataType::String },
+                //PowdrrField { name: "_seq_no".to_string(), data_type: PowdrrDataType::Integer },
+            )
+        }
+    }
+
+    pub fn deletes() -> Self {
+        PowdrrSchema {
+            fields: vec![
+                PowdrrField {
+                    name: "_id_seq_no".to_string(),
+                    data_type: PowdrrDataType::String
+                }
+            ],
+        }
+    }
+
     pub fn from(fields: &Vec<PowdrrField>) -> Self {
         let mut fields_clone = fields.clone();
         fields_clone.sort_by(|a, b| a.name.partial_cmp(&b.name).unwrap());
         PowdrrSchema{
             fields: fields_clone
         }
+    }
+
+    pub fn fields(&self) -> &Vec<PowdrrField> {
+        &self.fields
     }
 
     pub fn to_map(&self) -> HashMap<String, PowdrrField> {
@@ -971,7 +996,7 @@ pub(crate) fn extract_powdrr_schema_str(value: &str) -> PowdrrSchema {
 
 pub(crate) fn extract_powdrr_schema_option(value: &Option<Value>) -> PowdrrSchema {
     if value.is_none() {
-        PowdrrSchema{ fields: vec!() }
+        PowdrrSchema::minimal()
     } else {
         extract_powdrr_schema(value.as_ref().unwrap())
     }
