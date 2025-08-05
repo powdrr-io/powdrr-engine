@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use idgenerator::IdInstance;
-use crate::data_contract::{TableDescription, CreateIndexTemplateBody, CompactionWorkItem, ExtensionWorkItem, CompactionCommit, TableMetadataCheckpoint, ExtensionCommit, CreateTable, SpeedboatCommit, IcebergCommit, FileSetPayload};
+use crate::data_contract::{TableDescription, CreateIndexTemplateBody, CompactionWorkItem, ExtensionWorkItem, CompactionCommit, TableMetadataCheckpoint, ExtensionCommit, CreateTable, SpeedboatCommit, IcebergCommit, FileSetPayload, SpeedboatCommitTableInfo};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
@@ -70,47 +70,31 @@ impl DynamoDBServiceImpl {
 
     pub async fn add_checkpoint(&mut self, metadata: &TableMetadataCheckpoint) -> Result<(), ServiceApiError> {
         self.connector.create_table(&ORG_ID.to_string(), &metadata.table_name, &TableBody{ tags: Default::default() }).await.map_err(from_modyne)?;
-        let latest_checkpoint_info = self.connector.describe_latest(&ORG_ID.to_string(), &Self::latest_checkpoint_key(&metadata.table_name, &None)).await.map_err(from_modyne)?;
-        assert!(latest_checkpoint_info.is_some());
-        match self.connector.commit_checkpoint(
-            latest_checkpoint_info.as_ref().unwrap(),
-            &vec!(),
-            &metadata,
-        ).await.map_err(from_modyne) {
-            Ok(val) => {
-                if !val {
-                    tracing::info!("Contention detected, not committing checkpoint");
-                }
-            },
-            Err(e) => {
-                tracing::error!("Error committing checkpoint: {}", e);
-            }
+        if metadata.speedboat_metadata.is_some() {
+            self.speedboat_commit(&SpeedboatCommit {
+                type_files: vec!(SpeedboatCommitTableInfo {
+                    commit_type: "commit".to_string(),
+                    table_name: metadata.table_name.clone(),
+                    files: metadata.speedboat_metadata.as_ref().unwrap().files.file_paths.clone(),
+                    sizes: metadata.speedboat_metadata.as_ref().unwrap().files.sizes.clone(),
+                    schema: Some(metadata.schema.clone()),
+                }),
+                compactions: vec![],
+            }).await?
+        }
+        if metadata.iceberg_metadata.is_some() {
+            self.iceberg_commit(
+                &metadata.table_name,
+                &IcebergCommit {
+                    metadata: metadata.iceberg_metadata.as_ref().unwrap().clone(),
+                    compactions: vec![],
+                },
+            ).await?
+        }
+        if metadata.deletes_metadata.is_some() {
+            todo!("Need to implement this now")
         }
 
-            /*
-        match ,
-            connector.describe_powdrr_table(&ORG_ID.to_string(), &metadata.table_name).await.map_err(from_modyne)? {
-            Some(_) => (),
-            None => self.connector.create_powdrr_table(&ORG_ID.to_string(), &metadata.table_name, &TableBody::new()).await.map_err(from_modyne)?
-        }
-
-        let descriptor = CheckpointDescriptor{ table_name: metadata.table_name.clone(), checkpoint_id: metadata.checkpoint_id.to_string() };
-        self.connector.create_checkpoint(&mut self.checkpoints_cache, &ORG_ID.to_string(), &descriptor.full_name(), &metadata).await.map_err(from_modyne)?;
-        // TODO: change create to return a bool for collision on create?
-        self.connector.create_latest(&ORG_ID.to_string(), &Self::latest_checkpoint_key(&metadata.table_name, &None), &EntityVersionInfo::new(&metadata.checkpoint_id)).await.map_err(from_modyne)?;
-        self.connector.create_latest(&ORG_ID.to_string(), &Self::latest_checkpoint_key(&metadata.table_name, &Some("es".to_string())), &EntityVersionInfo::new(&metadata.checkpoint_id)).await.map_err(from_modyne)?;
-        self.connector.create_latest(&ORG_ID.to_string(), &Self::latest_compaction_work_item_key(&metadata.table_name), &EntityVersionInfo::new(&Self::NO_WORK_ITEM.to_owned())).await.map_err(from_modyne)?;
-        let extension_work_item = ExtensionWorkItem {
-            extension_type: "es".to_string(),
-            table_name: metadata.table_name.clone(),
-            table_schema: metadata.schema.clone(),
-            speedboat_files: metadata.speedboat_metadata.as_ref().map_or(FileSetPayload::new(), |x| x.files.clone()),
-            iceberg_files: metadata.iceberg_metadata.as_ref().map_or(FileSetPayload::new(), |x| x.files.clone())
-        };
-        let new_id = IdInstance::next_id().to_string();
-        self.connector.create_extension_work_item(&mut self.extension_work_item_cache, &ORG_ID.to_string(), &new_id, &extension_work_item).await.map_err(from_modyne)?;
-        self.connector.create_latest(&ORG_ID.to_string(), &Self::latest_extension_work_item_key(&metadata.table_name, &"es".to_string()), &EntityVersionInfo::new(&new_id)).await.map_err(from_modyne)?;
-        */
         Ok(())
     }
 
@@ -214,15 +198,49 @@ impl DynamoDBServiceImpl {
             }
         }
 
-
         Ok(())
     }
 
     pub async fn iceberg_commit(&mut self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError> {
         let id = &IdInstance::next_id().to_string();
         self.connector.create_iceberg_commit(&mut self.iceberg_cache, &ORG_ID.to_string(), id, iceberg_commit).await.map_err(from_modyne)?;
-        self.connector.create_iceberg_commit_checkpointed(&ORG_ID.to_string(), table_name, id).await.map_err(from_modyne)?;
-        // TODO: fill extension work item
+        let latest_info = self.connector.describe_latest(&ORG_ID.to_string(), &Self::latest_checkpoint_key(table_name, &None)).await.map_err(from_modyne)?.unwrap();
+        let latest_obj = self.connector.describe_checkpoint(&mut self.checkpoints_cache, &ORG_ID.to_string(), &latest_info.entity_id).await.map_err(from_modyne)?.unwrap();
+
+        let (new_checkpoint, _) = latest_obj.clone_and_apply(
+            &vec!(),
+            &vec!(iceberg_commit.clone()),
+            &vec!(),
+            &HashMap::new()
+        );
+
+        self.connector.commit_checkpoint(&latest_info, &vec!(), &new_checkpoint).await.map_err(from_modyne)?;
+
+        // Everything in this loop just to create an ES work item. Yikes.
+        loop {
+            let latest_key = &Self::latest_extension_work_item_key(table_name, &"es".to_string());
+            let latest_es = self.connector.describe_latest(&ORG_ID.to_string(), latest_key).await.map_err(from_modyne)?;
+            assert!(latest_es.is_some());
+            let mut work_item = if latest_es.as_ref().unwrap().entity_id == Self::NO_WORK_ITEM {
+                ExtensionWorkItem {
+                    extension_type: "es".to_string(),
+                    table_name: table_name.clone(),
+                    table_schema: PowdrrSchema{ fields: vec![] },
+                    speedboat_files: FileSetPayload::new(),
+                    iceberg_files: FileSetPayload::new()
+                }
+            } else {
+                self.connector.describe_extension_work_item(&mut self.extension_work_item_cache, &ORG_ID.to_string(), &latest_es.as_ref().unwrap().entity_id).await.map_err(from_modyne)?.unwrap()
+            };
+            work_item.merge_iceberg(iceberg_commit);
+            let new_id = &IdInstance::next_id().to_string();
+            self.connector.create_extension_work_item(&mut self.extension_work_item_cache, &ORG_ID.to_string(),new_id, &work_item).await.map_err(from_modyne)?;
+            match self.connector.commit_work_item(latest_es.as_ref().unwrap(), new_id).await.map_err(from_modyne)? {
+                true => break,
+                false => ()
+            }
+        }
+
         Ok(())
     }
 
@@ -230,7 +248,6 @@ impl DynamoDBServiceImpl {
         let id = &IdInstance::next_id().to_string();
         self.connector.create_extension_commit(&mut self.extension_cache, &ORG_ID.to_string(), id, commit).await.map_err(from_modyne)?;
         self.connector.create_extension_commit_checkpointed(&ORG_ID.to_string(), table_name, id).await.map_err(from_modyne)?;
-        // TODO: extension updates will be a little different
         Ok(())
     }
 
@@ -245,7 +262,7 @@ impl DynamoDBServiceImpl {
         match value {
             Some(val) => {
                 tracing::info!("Latest checkpoint for {}: {}", table_name, val.entity_id);
-                Ok(Some(CheckpointDescriptor::from_full_name(&val.entity_id).checkpoint_id))
+                Ok(Some(CheckpointDescriptor::from_full_name(&val.entity_id).full_checkpoint_id()))
             },
             None => Ok(None)
         }
@@ -324,22 +341,24 @@ impl DynamoDBServiceImpl {
         }
     }
 
-    pub async fn update_all_checkpoints(&mut self) -> Result<(), ServiceApiError> {
+    pub async fn update_all_checkpoints(&mut self) -> Result<bool, ServiceApiError> {
         let all_tables = self.connector.fetch_entities(&ORG_ID.to_string(), &"powdrr_table".to_string(), None).await.map_err(from_modyne)?;
+        let mut work_done = false;
         for table_entity in all_tables.entities {
-            self.update_checkpoint(&table_entity.entity_id).await?
+            work_done = work_done | self.update_standard_checkpoint(&table_entity.entity_id).await?;
+            work_done = work_done | self.update_extension_checkpoint(&table_entity.entity_id).await?;
         }
-        Ok(())
+        Ok(work_done)
     }
 
-    pub async fn update_checkpoint(&mut self, table_name: &String) -> Result<(), ServiceApiError> {
+    async fn update_standard_checkpoint(&mut self, table_name: &String) -> Result<bool, ServiceApiError> {
         // TODO: need a bulk fetcher
 
         println!("Updating checkpoint for table {}", table_name);
 
         let latest_speedboat_trackers = self.connector.oldest_available_speedboat_commit_checkpointed(&ORG_ID.to_string(), table_name, None).await.map_err(from_modyne)?;
         if latest_speedboat_trackers.len() == 0 {
-            return Ok(());
+            return Ok(false);
         }
 
         let latest_checkpoint_info = self.connector.describe_latest(&ORG_ID.to_string(), &Self::latest_checkpoint_key(table_name, &None)).await.map_err(from_modyne)?.unwrap();
@@ -350,12 +369,14 @@ impl DynamoDBServiceImpl {
             latest_speedboats.push(self.connector.describe_speedboat_commit(&mut self.speedboat_cache, &ORG_ID.to_string(), &speedboat_tracker.name).await.map_err(from_modyne)?.unwrap());
         }
 
-        let new_checkpoint = latest_checkpoint.clone_and_apply(
+        let (new_checkpoint, changed) = latest_checkpoint.clone_and_apply(
             &latest_speedboats,
             &vec!(),
             &vec!(),
             &HashMap::new()
         );
+
+        assert!(changed);
 
         match self.connector.commit_checkpoint(
             &latest_checkpoint_info,
@@ -372,7 +393,57 @@ impl DynamoDBServiceImpl {
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 
-}
+    async fn update_extension_checkpoint(&mut self, table_name: &String) -> Result<bool, ServiceApiError> {
+        let latest_extension_trackers = self.connector.oldest_available_extension_commit_checkpointed(&ORG_ID.to_string(), table_name, None).await.map_err(from_modyne)?;
+        if latest_extension_trackers.len() == 0 {
+            return Ok(false);
+        }
+
+        let mut extension_commits = vec!();
+        for tracker in latest_extension_trackers.iter() {
+            extension_commits.push(self.connector.describe_extension_commit(&mut self.extension_cache, &ORG_ID.to_string(), &tracker.name).await.map_err(from_modyne)?.unwrap());
+        }
+
+        let waiting_checkpoints = self.connector.oldest_available_checkpoint_waiting_for_extension(&ORG_ID.to_string(), table_name, None).await.map_err(from_modyne)?;
+        let mut work_done = false;
+        for checkpoint_tracker in waiting_checkpoints.iter() {
+            // TODO: all commits per loop should be in a transaction
+            work_done = true;
+
+            let old_checkpoint = self.connector.describe_checkpoint(&mut self.checkpoints_cache, &ORG_ID.to_string(), &checkpoint_tracker.name).await.map_err(from_modyne)?.unwrap();
+            let (mut new_checkpoint, changed) = old_checkpoint.clone_and_apply(
+                &vec!(),
+                &vec!(),
+                &extension_commits,
+                &HashMap::new()
+            );
+            new_checkpoint.original_checkpoint_id = Some(match old_checkpoint.original_checkpoint_id {
+                Some(original_checkpoint_id) => original_checkpoint_id.clone(),
+                None => old_checkpoint.checkpoint_id.clone()
+            });
+
+            if new_checkpoint.fully_covered_for_extension(&"es".to_string()) {
+                let latest_checkpoint = self.connector.describe_latest(&ORG_ID.to_string(), &Self::latest_checkpoint_key(table_name, &Some("es".to_string()))).await.map_err(from_modyne)?.unwrap();
+                let commit = latest_checkpoint.entity_id < new_checkpoint.get_descriptor().full_name();
+                //let commit = true;
+                if commit {
+                    let retval = self.connector.commit_checkpoint(&latest_checkpoint, &vec!(), &new_checkpoint).await.map_err(from_modyne)?;
+                    assert!(retval);
+                }
+            }
+
+            if changed {
+                self.connector.mark_done_checkpoint_waiting_for_extension(checkpoint_tracker).await.map_err(from_modyne)?;
+            }
+        }
+
+        // TODO: need to figure out protocol on when to mark an extension commit as done
+
+        Ok(work_done)
+    }
+
+
+    }

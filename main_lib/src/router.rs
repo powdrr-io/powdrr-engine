@@ -334,6 +334,7 @@ pub(crate) mod tests {
 
         let checkpoint = TableMetadataCheckpoint {
             table_name: "logs".to_string(),
+            original_checkpoint_id: None,
             checkpoint_id: "0".to_string(),
             iceberg_metadata: None,
             speedboat_metadata: Some(SpeedboatMetadata{ 
@@ -488,6 +489,7 @@ pub(crate) mod tests {
 
         let checkpoint = TableMetadataCheckpoint {
             table_name: "flights".to_string(),
+            original_checkpoint_id: None,
             checkpoint_id: "0".to_string(),
             iceberg_metadata: Some(IcebergMetadata {
                 table_schema: schema.clone(),
@@ -569,6 +571,7 @@ pub(crate) mod tests {
 
         let checkpoint = TableMetadataCheckpoint {
             table_name: "logs".to_string(),
+            original_checkpoint_id: None,
             checkpoint_id: "fake_id".to_string(),
             iceberg_metadata: None,
             speedboat_metadata: Some(SpeedboatMetadata{ 
@@ -655,7 +658,7 @@ pub(crate) mod tests {
             mime::APPLICATION_JSON,
         ).perform().unwrap();  
 
-        assert_eq!(response_create_index.status(), 200);           
+        assert_eq!(response_create_index.status(), 200);
 
         let body = r#"{"create":{ "_index": "logs" }}
 { "@timestamp": "2099-03-08T11:04:05.000Z", "index_col": 1, "user": { "id": "vlb44hny" }, "message": "Login attempt failed" }
@@ -1316,7 +1319,6 @@ pub(crate) mod tests {
             "http://localhost/logs/_doc/my_id"
         ).perform();
 
-        
         match get_response {
             Ok(response) => {
                 assert_eq!(response.status(), 200);
@@ -2180,6 +2182,14 @@ pub(crate) mod tests {
                 panic!("Failed {}", e)
             }
         }
+
+        let process_work_response = test_server.client().put(
+            "http://localhost/_test/v1/_process_work",
+            "",
+            mime::TEXT_PLAIN,
+        ).perform().unwrap();
+
+        assert_eq!(process_work_response.status(), 200);
 
         let get_response_result = test_server.client().get(
             "http://localhost/.kibana_task_manager_8.7.1/_doc/task%3AAlerts-alerts_invalidate_api_keys",

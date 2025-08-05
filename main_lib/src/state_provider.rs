@@ -135,7 +135,7 @@ enum StateProviderActorMessage {
         checkpoint: CheckpointDescriptor,
     },
     UpdateAllCheckpoints {
-        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
+        respond_to: oneshot::Sender<Result<bool, ServiceApiError>>,
     },
     GetExtensionWorkItems {
         respond_to: oneshot::Sender<Result<Vec<ExtensionWorkItem>, ServiceApiError>>,
@@ -446,7 +446,7 @@ impl StateProvider {
         state_provider_func_impl!(self, get_checkpoint(snapshot))
     }
 
-    pub async fn update_all_checkpoints(&mut self) -> Result<(), ServiceApiError> {
+    pub async fn update_all_checkpoints(&mut self) -> Result<bool, ServiceApiError> {
         state_provider_func_impl!(self, update_all_checkpoints())
     }
 
@@ -596,7 +596,7 @@ impl StateProviderHandle {
         send_message!(self, GetCheckpoint, checkpoint = checkpoint.clone())
     }
 
-    pub async fn update_all_checkpoints(&self) -> Result<(), ServiceApiError> {
+    pub async fn update_all_checkpoints(&self) -> Result<bool, ServiceApiError> {
         send_message!(self, UpdateAllCheckpoints)
     }
 

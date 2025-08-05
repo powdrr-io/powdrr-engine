@@ -118,7 +118,7 @@ impl LookupById {
     async fn current_target_snapshots(&self) -> Vec<CheckpointDescriptor> {
         let checkpoint_id = STATE_PROVIDER.get_latest_checkpoint(&self.table, None).await.unwrap();
         match checkpoint_id {
-            Some(c) => vec!(CheckpointDescriptor { table_name: self.table.clone(), checkpoint_id: c }),
+            Some(c) => vec!(CheckpointDescriptor::new(self.table.clone(), c)),
             None => vec!(),
         }
     }
@@ -248,7 +248,7 @@ impl SqlCommand {
         };
         let checkpoint_id = match STATE_PROVIDER.get_latest_checkpoint(&self.table, extension).await {
             Ok(c) => match c {
-                Some(c) => vec!(CheckpointDescriptor { table_name: self.table.clone(), checkpoint_id: c }),
+                Some(c) => vec!(CheckpointDescriptor::new(self.table.clone(), c)),
                 None => vec!(),
             },
             Err(e) => {

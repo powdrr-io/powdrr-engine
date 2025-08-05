@@ -159,7 +159,7 @@ impl DynamoDbStateProvider {
         self.fetch_tracker.get_next_prefetch_checkpoints(extensions).await
     }
 
-    pub async fn update_all_checkpoints(&mut self) -> Result<(), ServiceApiError> {
+    pub async fn update_all_checkpoints(&mut self) -> Result<bool, ServiceApiError> {
         self.service_impl.update_all_checkpoints().await
     }
 }

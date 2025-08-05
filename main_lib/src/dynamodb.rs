@@ -2,10 +2,8 @@ use std::collections::HashMap;
 use idgenerator::IdInstance;
 use modyne::{expr, keys, model::TransactWrite, projections, read_projection, Aggregate, Entity, EntityExt, Error, Item, ProjectionExt, QueryInput, QueryInputExt, Table};
 use modyne::expr::Filter;
-use modyne::model::ConditionalUpdate;
 use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableMetadataCheckpoint};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
-use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
 use crate::schema_massager::PowdrrSchema;
 
@@ -409,7 +407,7 @@ macro_rules! powdrr_tracker {
         paste::item! {
             #[allow(dead_code)]
             impl DynamoDbConnector {
-                pub async fn [< create_ $entity_name >](&self, org_id: &String, parent_entity: &String, name: &String) -> Result<(), Error> {
+                pub fn [< create_ $entity_name _core >](transaction: TransactWrite, org_id: &String, parent_entity: &String, name: &String) -> TransactWrite {
                     let tracker = PowdrrTracker {
                         entity_name: stringify!($entity_name).to_string(),
                         org_id: org_id.clone(),
@@ -417,8 +415,11 @@ macro_rules! powdrr_tracker {
                         name: name.clone(),
                         version: 0
                     };
-                    TransactWrite::new()
-                        .operation(tracker.create())
+                    transaction.operation(tracker.create())
+                }
+
+                pub async fn [< create_ $entity_name >](&self, org_id: &String, parent_entity: &String, name: &String) -> Result<(), Error> {
+                    Self::[< create_ $entity_name _core >](TransactWrite::new(), org_id, parent_entity, name)
                         .execute(self)
                         .await?;
 
@@ -437,8 +438,8 @@ macro_rules! powdrr_tracker {
 
                     let result = query_input
                         .query()
-                        .filter(Filter::new("version = :zero")
-                            .value(":zero", 0)
+                        .filter(Filter::new("version <> :negative_one")
+                            .value(":negative_one", -1)
                         )
                         .set_limit(limit)
                         .execute(self)
@@ -449,11 +450,16 @@ macro_rules! powdrr_tracker {
                     Ok(trackers.trackers)
                 }
 
-                fn [< mark_done_ $entity_name >](transaction: TransactWrite, tracker: &PowdrrTracker) -> TransactWrite {
-                    Self::[< mark_done_ $entity_name _core >](transaction, &tracker.org_id, &tracker.parent_entity, &tracker.name, Some(tracker.version))
+                pub async fn [< mark_done_ $entity_name >](&self, tracker: &PowdrrTracker) -> Result<(), Error> {
+                    Self::[< mark_done_ $entity_name _core >](TransactWrite::new(), &tracker).execute(self).await?;
+                    Ok(())
                 }
 
-                fn [< mark_done_ $entity_name _core >](transaction: TransactWrite, org_id: &String, parent_entity: &String, name: &String, expected: Option<u64>) -> TransactWrite {
+                fn [< mark_done_ $entity_name _core >](transaction: TransactWrite, tracker: &PowdrrTracker) -> TransactWrite {
+                    Self::[< mark_done_ $entity_name _inner >](transaction, &tracker.org_id, &tracker.parent_entity, &tracker.name, Some(tracker.version))
+                }
+
+                fn [< mark_done_ $entity_name _inner >](transaction: TransactWrite, org_id: &String, parent_entity: &String, name: &String, expected: Option<u64>) -> TransactWrite {
                     let key = OrgIdEntityNameInput {
                         entity_name: &stringify!($entity_name).to_string(),
                         org_id,
@@ -538,8 +544,8 @@ powdrr_named_cached_entity!(extension_work_item, ExtensionWorkItem);
 
 
 powdrr_tracker!(speedboat_commit_checkpointed);
-powdrr_tracker!(iceberg_commit_checkpointed);
 powdrr_tracker!(extension_commit_checkpointed);
+powdrr_tracker!(checkpoint_waiting_for_extension);
 
 
 impl DynamoDbConnector {
@@ -560,14 +566,14 @@ impl DynamoDbConnector {
 
     const NO_WORK_ITEM: &'static str = "-1";
 
-    fn bump_version(old: &EntityVersionInfo, new_entity_id: &String) -> ConditionalUpdate {
+    fn bump_version(transaction: TransactWrite, old: &EntityVersionInfo, new_entity_id: &String) -> TransactWrite {
         let expression = expr::Update::new("SET entity.version = :plus_one, entity.entity_id = :new_id")
             .value(":new_id", new_entity_id.clone())
             .value(":plus_one", old.version + 1);
         let condition = expr::Condition::new("entity.version = :old")
             .value(":old", old.version);
 
-        PowdrrNamedEntityVersionInfo::update(old.get_query()).expression(expression).condition(condition)
+        transaction.operation(PowdrrNamedEntityVersionInfo::update(old.get_query()).expression(expression).condition(condition))
     }
 
     pub fn create_latest_core(&self, transaction: TransactWrite, entity: &EntityVersionInfo) -> TransactWrite {
@@ -603,24 +609,28 @@ impl DynamoDbConnector {
     ) -> Result<bool, Error> {
         let mut transaction = TransactWrite::new();
 
-        transaction = transaction.operation(Self::bump_version(
+        transaction = Self::bump_version(
+            transaction,
             input_latest,
             &new_checkpoint.get_descriptor().full_name()
-        ));
+        );
 
         for input_tracker in input_speedboat_trackers.iter() {
-            transaction = DynamoDbConnector::mark_done_speedboat_commit_checkpointed(
+            transaction = DynamoDbConnector::mark_done_speedboat_commit_checkpointed_core(
                 transaction,
                 input_tracker
             );
         }
-
         let checkpoint_obj = PowdrrNamedTableMetadataCheckpoint {
             name: new_checkpoint.get_descriptor().full_name(),
             org_id: input_latest.org_id.clone(),
             entity: new_checkpoint.clone(),
         };
         transaction = transaction.operation(checkpoint_obj.create());
+
+        if !new_checkpoint.fully_covered_for_extension(&"es".to_string()) {
+            transaction = Self::create_checkpoint_waiting_for_extension_core(transaction, &input_latest.org_id, &new_checkpoint.table_name, &new_checkpoint.get_descriptor().full_name())
+        }
 
         match transaction.execute(self).await {
             Ok(_) => Ok(true),
@@ -642,10 +652,11 @@ impl DynamoDbConnector {
         let mut transaction = TransactWrite::new();
 
         for entity_info in old_entity_infos.iter() {
-            transaction = transaction.operation(Self::bump_version(
+            transaction = Self::bump_version(
+                transaction,
                 entity_info,
                 new_entity_id
-            ));
+            );
         }
 
         match transaction.execute(self).await {
@@ -663,10 +674,11 @@ impl DynamoDbConnector {
     pub async fn commit_work_item(&self, old: &EntityVersionInfo, new_entity_id: &String) -> Result<bool, Error> {
         let mut transaction = TransactWrite::new();
 
-        transaction = transaction.operation(Self::bump_version(
+        transaction = Self::bump_version(
+            transaction,
             old,
             new_entity_id
-        ));
+        );
 
         match transaction.execute(self).await {
             Ok(_) => Ok(true),
@@ -690,6 +702,7 @@ mod tests {
     use crate::schema_massager::PowdrrSchema;
     use super::*;
     use modyne::TestTableExt;
+    use crate::peers::CheckpointDescriptor;
 
     async fn create_connector() -> DynamoDbConnector {
         let config = aws_config::defaults(BehaviorVersion::latest())
@@ -756,6 +769,7 @@ mod tests {
 
         let checkpoint = TableMetadataCheckpoint {
             table_name: "".to_string(),
+            original_checkpoint_id: None,
             checkpoint_id: "".to_string(),
             iceberg_metadata: None,
             speedboat_metadata: None,
@@ -823,14 +837,14 @@ mod tests {
         assert_eq!(trackers.len(), 1);
 
         let _ =
-            DynamoDbConnector::mark_done_speedboat_commit_checkpointed(TransactWrite::new(), &trackers[0])
+            DynamoDbConnector::mark_done_speedboat_commit_checkpointed_core(TransactWrite::new(), &trackers[0])
             .execute(&connector)
             .await.unwrap();
 
         let trackers_again = connector.oldest_available_speedboat_commit_checkpointed(&"fake_org".to_string(), &"fake_table".to_string(), None).await.unwrap();
         assert_eq!(trackers_again.len(), 0);
 
-        match DynamoDbConnector::mark_done_speedboat_commit_checkpointed(TransactWrite::new(), &trackers[0])
+        match DynamoDbConnector::mark_done_speedboat_commit_checkpointed_core(TransactWrite::new(), &trackers[0])
             .execute(&connector)
             .await {
             Ok(_) => panic!("Should have failed"),
@@ -848,6 +862,7 @@ mod tests {
 
         let first_checkpoint = TableMetadataCheckpoint {
             table_name: "fake_table".to_string(),
+            original_checkpoint_id: None,
             checkpoint_id: "1".to_string(),
             iceberg_metadata: None,
             speedboat_metadata: None,
@@ -883,17 +898,18 @@ mod tests {
             latest_speedboats.push(connector.describe_speedboat_commit(&mut speedboat_cache, &"fake_org".to_string(), &speedboat_tracker.name).await.unwrap().unwrap());
         }
 
-        let new_checkpoint = latest_checkpoint.clone_and_apply(
+        let (new_checkpoint, changed) = latest_checkpoint.clone_and_apply(
             &latest_speedboats,
             &vec!(),
             &vec!(),
             &HashMap::new()
         );
+        assert!(changed);
 
         match connector.commit_checkpoint(
             &latest_checkpoint_info,
             &latest_speedboat_trackers,
-            &new_checkpoint,
+            &new_checkpoint
         ).await {
             Ok(val) => {
                 assert!(val);

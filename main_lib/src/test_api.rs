@@ -91,7 +91,7 @@ pub struct TestProcessingMode {
 impl TestProcessingMode {
     pub fn default() -> Self {
         Self {
-            state_mode: StateMode::Ephemeral,
+            state_mode: StateMode::TestingDynamoDb,
             indexing_mode: IndexingMode::Sync,
             compaction_mode: CompactionMode::Async,
             prefetch_mode: PrefetchMode::Disabled,
@@ -149,72 +149,62 @@ pub fn test_v1_set_testing_mode(state: State) -> Pin<Box<HandlerFuture>> {
 
 
 #[allow(warnings)]
-pub(crate) async fn do_all_available_extension_work(extensions: &Vec<String>) -> () {
-    loop {
-        let mut work_done = false;
-        // We keep track of this to see what all iceberg snapshots we should look through to
-        // see what types of compactions have happened.
-        let mut last_iceberg_snapshot_id: i64 = 0;
+pub(crate) async fn do_available_extension_work(extensions: &Vec<String>) -> bool {
+    let mut work_done = false;
+    // We keep track of this to see what all iceberg snapshots we should look through to
+    // see what types of compactions have happened.
+    let mut last_iceberg_snapshot_id: i64 = 0;
 
-        tracing::info!("Checking for indexing work");
-        let index_work = match STATE_PROVIDER.get_extension_work_items(&"es".to_string()).await {
-            Ok(work) => work,
-            Err(e) => {
-                let error = format!("{}", e);
-                panic!("oh no");
-            },
-        };
+    tracing::info!("Checking for indexing work");
+    let index_work = match STATE_PROVIDER.get_extension_work_items(&"es".to_string()).await {
+        Ok(work) => work,
+        Err(e) => {
+            let error = format!("{}", e);
+            panic!("oh no");
+        },
+    };
 
-        if index_work.len() > 0 {
-            tracing::info!("Doing indexing work");
+    if index_work.len() > 0 {
+        tracing::info!("Doing indexing work");
 
-            for work_item in index_work.iter() {
-                work_done = true;
-                match create_index(work_item).await {
-                    Ok(_) => (),
-                    Err(_) => panic!("Need some real error handling some day"),
-                }
+        for work_item in index_work.iter() {
+            work_done = true;
+            match create_index(work_item).await {
+                Ok(_) => (),
+                Err(_) => panic!("Need some real error handling some day"),
             }
-            tracing::info!("Done with indexing work");
         }
+        tracing::info!("Done with indexing work");
+    }
 
-        if !work_done {
-            break;
-        }            
-    }    
+    work_done
 }
 
-pub(crate) async fn do_all_available_compaction_work(start_snapshot_id: i64) -> i64 {
+pub(crate) async fn do_available_compaction_work(start_snapshot_id: i64) -> (i64, bool) {
     // We keep track of snapshot id to see what all iceberg snapshots we should look through to
     // see what types of compactions have happened.
     let mut last_iceberg_snapshot_id: i64 = start_snapshot_id;
-    loop {
-        let mut work_done = false;
+    let mut work_done = false;
 
-        let compact_work = match STATE_PROVIDER.get_compaction_work_items().await {
-            Ok(work) => work,
-            Err(_e) => {
-                panic!("oh no")
+    let compact_work = match STATE_PROVIDER.get_compaction_work_items().await {
+        Ok(work) => work,
+        Err(_e) => {
+            panic!("oh no")
+        },
+    };
+    if compact_work.len() > 0 {
+        tracing::info!("Doing compaction work");
+        work_done = true;
+        match perform_compaction(compact_work, last_iceberg_snapshot_id).await {
+            Ok(id) => { last_iceberg_snapshot_id = id; },
+            Err(e) => {
+                tracing::error!("!!!!!!!!!!!!!!!!!!!!!!!!!  Error performing compaction: {:?}", e);
+                // TODO: do something to trigger a retry of this compaction
             },
-        };
-        if compact_work.len() > 0 {
-            tracing::info!("Doing compaction work");
-            work_done = true;
-            match perform_compaction(compact_work, last_iceberg_snapshot_id).await {
-                Ok(id) => { last_iceberg_snapshot_id = id; },
-                Err(e) => {
-                    tracing::error!("!!!!!!!!!!!!!!!!!!!!!!!!!  Error performing compaction: {:?}", e);
-                    // TODO: do something to trigger a retry of this compaction
-                },
-            }
-            tracing::info!("Done with compaction work");
         }
-
-        if !work_done {
-            break;
-        }
+        tracing::info!("Done with compaction work");
     }
-    last_iceberg_snapshot_id
+    (last_iceberg_snapshot_id, work_done)
 }
 
 pub(crate) async fn do_next_prefetch() -> usize {
@@ -237,9 +227,12 @@ pub(crate) async fn do_next_prefetch() -> usize {
 
 fn do_extension_work_for_forever(extensions: Vec<String>, wait_time_ms: u64) -> impl Future<Output = ()> {
     async move {
+        let mut work_done = false;
         loop {
-            do_all_available_extension_work(&extensions).await;
-            tokio::time::sleep(Duration::from_millis(wait_time_ms)).await;
+            work_done = do_available_extension_work(&extensions).await;
+            if !work_done {
+                tokio::time::sleep(Duration::from_millis(wait_time_ms)).await;
+            }
         }
     }
 }
@@ -248,9 +241,12 @@ fn do_extension_work_for_forever(extensions: Vec<String>, wait_time_ms: u64) -> 
 fn do_compaction_work_for_forever(wait_time_ms: u64) -> impl Future<Output = ()> {
     async move {
         let mut last_iceberg_snapshot_id: i64 = -1;
+        let mut work_done = false;
         loop {
-            last_iceberg_snapshot_id = do_all_available_compaction_work(last_iceberg_snapshot_id).await;
-            tokio::time::sleep(Duration::from_millis(wait_time_ms)).await;
+            (last_iceberg_snapshot_id, work_done) = do_available_compaction_work(last_iceberg_snapshot_id).await;
+            if !work_done {
+                tokio::time::sleep(Duration::from_millis(wait_time_ms)).await;
+            }
         }
     }
 }
@@ -302,14 +298,22 @@ pub fn test_v1_set_testing_processing_mode(mut state: State) -> Pin<Box<HandlerF
 
 pub fn test_v1_process_work(state: State) -> Pin<Box<HandlerFuture>> {
     async {
-        match STATE_PROVIDER.update_all_checkpoints().await {
-            Ok(_) => (),
-            Err(e) => {
-                tracing::error!("Error updating checkpoints: {}", e);
+        let mut work_done: bool;
+        loop {
+            work_done = do_available_extension_work(&vec!("es".to_string())).await;
+            let (_, compaction_work_done) = do_available_compaction_work(-1).await;
+            work_done = work_done | compaction_work_done;
+            match STATE_PROVIDER.update_all_checkpoints().await {
+                Ok(checkpoint_work_done) => work_done = work_done | checkpoint_work_done,
+                Err(e) => {
+                    tracing::error!("Error updating checkpoints: {}", e);
+                }
+            };
+            if !work_done {
+                break
             }
-        };
-        do_all_available_extension_work(&vec!("es".to_string())).await;
-        do_all_available_compaction_work(-1).await;
+        }
+
         let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "Ok");
         Ok((state, res))        
     }.boxed()
