@@ -5,7 +5,7 @@ use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
 use crate::state_provider::ServiceApiError;
-use crate::dynamodb::{DynamoDbConnector, EntityVersionInfo, PowdrrNamedCompactionCommitCache, PowdrrNamedCompactionWorkItemCache, PowdrrNamedExtensionCommitCache, PowdrrNamedExtensionWorkItemCache, PowdrrNamedIcebergCommitCache, PowdrrNamedSpeedboatCommitCache, PowdrrNamedTableMetadataCheckpointCache, TableBody};
+use crate::dynamodb::{DynamoDbConnector, PowdrrNamedCompactionCommitCache, PowdrrNamedCompactionWorkItemCache, PowdrrNamedExtensionCommitCache, PowdrrNamedExtensionWorkItemCache, PowdrrNamedIcebergCommitCache, PowdrrNamedSpeedboatCommitCache, PowdrrNamedTableMetadataCheckpointCache, TableBody};
 use crate::schema_massager::PowdrrSchema;
 
 fn from_modyne(e: modyne::Error) -> ServiceApiError {
@@ -159,7 +159,7 @@ impl DynamoDBServiceImpl {
                 ExtensionWorkItem {
                     extension_type: "es".to_string(),
                     table_name: tables[0].to_string(),
-                    table_schema: PowdrrSchema{ fields: vec![] },
+                    table_schema: PowdrrSchema::minimal(),
                     speedboat_files: FileSetPayload::new(),
                     iceberg_files: FileSetPayload::new()
                 }
@@ -182,7 +182,7 @@ impl DynamoDBServiceImpl {
             assert!(latest_es.is_some());
             let mut work_item = if latest_es.as_ref().unwrap().entity_id == Self::NO_WORK_ITEM {
                 CompactionWorkItem {
-                    table_schema: PowdrrSchema { fields: vec![] },
+                    table_schema: PowdrrSchema::minimal(),
                     speedboat_files: FileSetPayload::new(),
                     delete_files: vec![],
                 }
@@ -201,18 +201,56 @@ impl DynamoDBServiceImpl {
         Ok(())
     }
 
+    async fn clone_and_apply(
+        &mut self,
+        metadata: &TableMetadataCheckpoint,
+        speedboat_commits: &Vec<SpeedboatCommit>,
+        iceberg_commits: &Vec<IcebergCommit>,
+        extension_commits: &Vec<ExtensionCommit>,
+    ) -> (TableMetadataCheckpoint, bool) {
+        let compactions = self.gather_compactions(speedboat_commits, iceberg_commits).await.unwrap();
+        metadata.clone_and_apply(
+            speedboat_commits,
+            iceberg_commits,
+            extension_commits,
+            &compactions
+        )
+    }
+
+    async fn gather_compactions(&mut self, speedboat_commits: &Vec<SpeedboatCommit>, iceberg_commits: &Vec<IcebergCommit>) -> Result<HashMap<String, CompactionCommit>, ServiceApiError> {
+        let mut compactions = vec!();
+        for speedboat_commit in speedboat_commits {
+            compactions.extend(speedboat_commit.compactions.iter());
+        }
+
+        for iceberg_commit in iceberg_commits {
+            compactions.extend(iceberg_commit.compactions.iter());
+        }
+
+        // TODO: Need bulk loading!
+        let mut compaction_commits = HashMap::new();
+        for compaction in compactions {
+            compaction_commits.insert(
+                compaction.clone(),
+                self.connector.describe_compaction(&mut self.compactions_cache, &ORG_ID.to_string(), compaction).await.map_err(from_modyne)?.unwrap()
+            );
+        }
+
+        Ok(compaction_commits)
+    }
+
     pub async fn iceberg_commit(&mut self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError> {
         let id = &IdInstance::next_id().to_string();
         self.connector.create_iceberg_commit(&mut self.iceberg_cache, &ORG_ID.to_string(), id, iceberg_commit).await.map_err(from_modyne)?;
         let latest_info = self.connector.describe_latest(&ORG_ID.to_string(), &Self::latest_checkpoint_key(table_name, &None)).await.map_err(from_modyne)?.unwrap();
         let latest_obj = self.connector.describe_checkpoint(&mut self.checkpoints_cache, &ORG_ID.to_string(), &latest_info.entity_id).await.map_err(from_modyne)?.unwrap();
 
-        let (new_checkpoint, _) = latest_obj.clone_and_apply(
+        let (new_checkpoint, _) = self.clone_and_apply(
+            &latest_obj,
             &vec!(),
             &vec!(iceberg_commit.clone()),
             &vec!(),
-            &HashMap::new()
-        );
+        ).await;
 
         self.connector.commit_checkpoint(&latest_info, &vec!(), &new_checkpoint).await.map_err(from_modyne)?;
 
@@ -225,7 +263,7 @@ impl DynamoDBServiceImpl {
                 ExtensionWorkItem {
                     extension_type: "es".to_string(),
                     table_name: table_name.clone(),
-                    table_schema: PowdrrSchema{ fields: vec![] },
+                    table_schema: PowdrrSchema::minimal(),
                     speedboat_files: FileSetPayload::new(),
                     iceberg_files: FileSetPayload::new()
                 }
@@ -323,7 +361,8 @@ impl DynamoDBServiceImpl {
                             30 * 1024 * 1024,
                             compaction.speedboat_files.sizes.len()
                         );
-                        let do_compaction = compaction.speedboat_files.sizes.iter().sum::<u64>() > 30 * 1024 * 1024 || compaction.speedboat_files.sizes.len() > 200;
+                        //let do_compaction = compaction.speedboat_files.sizes.iter().sum::<u64>() > 30 * 1024 * 1024 || compaction.speedboat_files.sizes.len() > 200;
+                        let do_compaction = compaction.speedboat_files.file_paths.len() > 1;
                         if do_compaction {
                             work_items.push((table_entity.entity_id.clone(), compaction));
                             used_latest.push(latest_entity_info);
@@ -369,12 +408,12 @@ impl DynamoDBServiceImpl {
             latest_speedboats.push(self.connector.describe_speedboat_commit(&mut self.speedboat_cache, &ORG_ID.to_string(), &speedboat_tracker.name).await.map_err(from_modyne)?.unwrap());
         }
 
-        let (new_checkpoint, changed) = latest_checkpoint.clone_and_apply(
+        let (new_checkpoint, changed) = self.clone_and_apply(
+            &latest_checkpoint,
             &latest_speedboats,
             &vec!(),
             &vec!(),
-            &HashMap::new()
-        );
+        ).await;
 
         assert!(changed);
 
@@ -414,12 +453,12 @@ impl DynamoDBServiceImpl {
             work_done = true;
 
             let old_checkpoint = self.connector.describe_checkpoint(&mut self.checkpoints_cache, &ORG_ID.to_string(), &checkpoint_tracker.name).await.map_err(from_modyne)?.unwrap();
-            let (mut new_checkpoint, changed) = old_checkpoint.clone_and_apply(
+            let (mut new_checkpoint, changed) = self.clone_and_apply(
+                &old_checkpoint,
                 &vec!(),
                 &vec!(),
                 &extension_commits,
-                &HashMap::new()
-            );
+            ).await;
             new_checkpoint.original_checkpoint_id = Some(match old_checkpoint.original_checkpoint_id {
                 Some(original_checkpoint_id) => original_checkpoint_id.clone(),
                 None => old_checkpoint.checkpoint_id.clone()

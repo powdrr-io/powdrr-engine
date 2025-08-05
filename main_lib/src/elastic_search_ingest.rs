@@ -24,7 +24,7 @@ use crate::elastic_search_responses::{BulkResult, ErrorDetails, OperationResult,
 use crate::data_access;
 use crate::elastic_search_parser::UpdateBody;
 use crate::elastic_search_storage_schema::{FullRecord, RecordDelete, RecordInput, SpeedboatCommitBuilder};
-use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
+use crate::schema_massager::{PowdrrSchema};
 use crate::data_contract::{CreateIndexBody, CreateIndexResult, CreateIndexTemplateBody, CreateTable, SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription};
 use crate::state_provider::{ServiceApiError, STATE_PROVIDER};
 use crate::util::{describe_table_log_error_then_none, log_err, log_service_err};
@@ -87,13 +87,7 @@ impl WriteBuffer {
     pub fn delete(lines: Vec<Value>) -> Self {
         WriteBuffer {
             lines,
-            schema: Some(PowdrrSchema {
-                fields: vec![
-                    PowdrrField {
-                        name: "_id_seq_no".to_string(), data_type: PowdrrDataType::String
-                    }
-                ],
-            })
+            schema: Some(PowdrrSchema::deletes())
         }
     }
 

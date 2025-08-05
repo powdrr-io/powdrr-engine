@@ -489,6 +489,9 @@ impl CompactionWorkItem {
         for speedboat_commit_table_info in commit.type_files.iter() {
             if speedboat_commit_table_info.commit_type == "commit" || speedboat_commit_table_info.commit_type == "compaction" {
                 self.speedboat_files.merge_inplace(&speedboat_commit_table_info.as_file_set_payload());
+                if speedboat_commit_table_info.schema.is_some() {
+                    self.table_schema.merge_from(&speedboat_commit_table_info.schema.as_ref().unwrap());
+                }
             } else if speedboat_commit_table_info.commit_type == "delete" {
                 self.delete_files.extend(speedboat_commit_table_info.files.clone());
             }

@@ -69,6 +69,7 @@ impl ElasticSearchResponse {
     }
 }
 
+#[derive(Debug)]
 pub struct CommandError {
     pub message: String,
 }
@@ -169,10 +170,13 @@ pub async fn load_command_raw_result(_context: CommandContext, command: Arc<dyn 
 pub async fn execute_command(_context: CommandContext, command: Arc<dyn Command>) -> ElasticSearchResponse {
     let result_table_name = match load_command_raw_result(_context, command.clone()).await {
         Ok(t) => t,
-        Err(e) => return QueryFailure{ message: format!("{:?}", e) }.to_response(),
+        Err(e) => {
+            let msg = format!("{:?}", e);
+            return QueryFailure{ message: msg }.to_response()
+        },
     };         
-    let response = command.result_generator(result_table_name.clone()).await.unwrap_or_else(|_e| {
-        QueryFailure { message: "Failed".to_string() }.to_response()
+    let response = command.result_generator(result_table_name.clone()).await.unwrap_or_else(|e| {
+        QueryFailure { message: format!("{:?}", e) }.to_response()
     });
     if result_table_name.is_some() {
         data_access::drop(result_table_name.as_ref().unwrap()).await;

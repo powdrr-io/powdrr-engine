@@ -5,7 +5,7 @@ use modyne::expr::Filter;
 use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableMetadataCheckpoint};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::pipeline::PipelineDefinition;
-use crate::schema_massager::PowdrrSchema;
+use crate::schema_massager::{PowdrrSchema};
 
 pub struct DynamoDbConnector {
     table_name: std::sync::Arc<str>,
@@ -252,6 +252,7 @@ macro_rules! powdrr_named_entity_core {
                 }
             }
 
+            #[allow(dead_code)]
             impl DynamoDbConnector {
                 fn [< private_create_ $entity_name _core >](&self, transaction: TransactWrite, org_id: &String, name: &String, template: &$type_name) -> TransactWrite {
                     let entity = PowdrrEntity {
@@ -492,6 +493,7 @@ pub struct TableBody {
 }
 
 impl TableBody {
+    #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self {
             tags: HashMap::new(),
@@ -584,7 +586,7 @@ impl DynamoDbConnector {
         let checkpoint = TableMetadataCheckpoint::new(
             table_name.clone(),
             IdInstance::next_id().to_string(),
-            PowdrrSchema{ fields: vec![] }
+            PowdrrSchema::minimal(),
         );
 
         tracing::info!("Created checkpoint for table {}: {}", table_name, checkpoint.checkpoint_id);
@@ -775,7 +777,7 @@ mod tests {
             speedboat_metadata: None,
             deletes_metadata: None,
             extension_metadata: Default::default(),
-            schema: PowdrrSchema { fields: vec![] },
+            schema: PowdrrSchema::minimal()
         };
 
         let mut cache = PowdrrNamedTableMetadataCheckpointCache::new();
@@ -868,7 +870,7 @@ mod tests {
             speedboat_metadata: None,
             deletes_metadata: None,
             extension_metadata: Default::default(),
-            schema: PowdrrSchema { fields: vec![] },
+            schema: PowdrrSchema::minimal()
         };
 
         let speedboat_commit = SpeedboatCommit {
@@ -877,7 +879,7 @@ mod tests {
                 table_name: "fake_table".to_string(),
                 files: vec!["fake_file".to_string()],
                 sizes: vec![100],
-                schema: Some(PowdrrSchema { fields: vec![] }),
+                schema: Some(PowdrrSchema::minimal()),
             }],
             compactions: vec![],
         };

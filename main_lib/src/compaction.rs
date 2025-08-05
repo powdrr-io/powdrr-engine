@@ -348,7 +348,7 @@ impl CompactionCommand {
     }
 
     async fn do_iceberg_commit(compaction_response: &CompactionResponse) -> Result<i64, ServiceApiError> {
-        STATE_PROVIDER.iceberg_commit(
+        match STATE_PROVIDER.iceberg_commit(
             &compaction_response.table_name,
             &IcebergCommit {
                 metadata: IcebergMetadata {
@@ -365,7 +365,12 @@ impl CompactionCommand {
                 },
                 compactions: compaction_response.lib_metadata.compactions.clone(),
             }
-        ).await?;
+        ).await {
+            Ok(_) => (),
+            Err(e) => {
+                return Err(e)
+            }
+        };
 
         // Note: the Iceberg and Speedboat commits are done separately here and are
         // therefore NOT ATOMIC. The Speedboat commit here is just deletions where
@@ -374,10 +379,15 @@ impl CompactionCommand {
         // files and once again tries to compact them.
 
         if compaction_response.deletes_table_info.is_some() {
-            STATE_PROVIDER.speedboat_commit(&SpeedboatCommit {
+            match STATE_PROVIDER.speedboat_commit(&SpeedboatCommit {
                 type_files: vec!(compaction_response.deletes_table_info.as_ref().unwrap().clone()),
                 compactions: compaction_response.compactions.clone(),
-            }).await?
+            }).await{
+                Ok(_) => (),
+                Err(e) => {
+                    return Err(e)
+                }
+            };
         }
 
         Ok(compaction_response.lib_metadata.snapshot_id)
@@ -445,11 +455,18 @@ impl Command for CompactionCommand {
             };
 
             assert_eq!(compactions.len(), 1);
-            Self::update_iceberg(
+            match Self::update_iceberg(
                 &data,
                 &public_table_name,
                 &compactions[0]
-            ).await.unwrap();
+            ).await {
+                Ok(_) => (),
+                Err(e) => {
+                    let error = format!("{}", e);
+                    tracing::info!("Iceberg Update failed: {}", error);
+                    return Err(CommandError{ message: e.to_string() })
+                }
+            }
 
             let lib_metadata = match load_table_metadata(
                 &"default".to_string(),
