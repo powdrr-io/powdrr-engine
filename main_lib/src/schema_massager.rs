@@ -126,9 +126,9 @@ impl PowdrrSchema {
     pub fn minimal() -> Self {
         PowdrrSchema{
             fields: vec!(
-                PowdrrField { name: "_id".to_string(), data_type: PowdrrDataType::String },
-                PowdrrField { name: "_id_seq_no".to_string(), data_type: PowdrrDataType::String },
-                PowdrrField { name: "_seq_no".to_string(), data_type: PowdrrDataType::Integer },
+                //PowdrrField { name: "_id".to_string(), data_type: PowdrrDataType::String },
+                //PowdrrField { name: "_id_seq_no".to_string(), data_type: PowdrrDataType::String },
+                //PowdrrField { name: "_seq_no".to_string(), data_type: PowdrrDataType::Integer },
             )
         }
     }
