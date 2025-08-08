@@ -449,6 +449,24 @@ impl FileSetPayload {
             self.schemas.push(file_descriptor.schema.clone());
         }
     }
+
+    pub(crate) fn select(&self, file_name: &String) -> FileSetPayload {
+        // Note: the file name is not the full path of the file
+
+        for (i, file_path) in self.file_paths.iter().enumerate() {
+            if file_path.contains(file_name) {
+                return FileSetPayload {
+                    file_paths: vec!(file_path.clone()),
+                    sizes: vec!(self.sizes[i]),
+                    file_schemas: vec!(self.file_schemas[i]),
+                    schemas: vec!(self.schemas[self.file_schemas[i] as usize].clone()),
+                }
+            }
+        }
+        assert!(false, "File not found");
+        // Not reached
+        FileSetPayload::new()
+    }
 }
 
 
