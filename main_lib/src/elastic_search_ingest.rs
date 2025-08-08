@@ -416,7 +416,7 @@ pub(crate) fn write_to_file(buffer: &WriteBuffer, index: &String, label: &String
 }
 
 
-pub(crate) async fn commit_speedboat(table: &String, inserts_and_updates: &WriteBuffer, deletes: &WriteBuffer, compactions: &Vec<String>, commit_type: &String) -> Result<(), IngestError> {
+pub(crate) async fn commit_speedboat(table: &String, inserts_and_updates: &WriteBuffer, deletes: &WriteBuffer, compaction: Option<String>, commit_type: &String) -> Result<(), IngestError> {
     let mut table_infos = vec!();
     if inserts_and_updates.lines.len() != 0 {
         let (insert_update_path, size) = write_to_file(inserts_and_updates, table, commit_type)?;
@@ -440,7 +440,7 @@ pub(crate) async fn commit_speedboat(table: &String, inserts_and_updates: &Write
     }
     match STATE_PROVIDER.speedboat_commit(&SpeedboatCommit {
         type_files: table_infos,
-        compactions: compactions.clone(),
+        compaction: compaction.clone()
     }).await {
         Ok(_) => (),
         Err(_) => panic!("nope")

@@ -1,13 +1,13 @@
 use reqwest::{Client, Response, StatusCode};
 use serde::de::DeserializeOwned;
-use crate::data_contract::CreateIndexTemplateBody;
+use crate::data_contract::{CleanupWorkItem, CreateIndexTemplateBody};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::pipeline::PipelineDefinition;
 use crate::data_contract::{AddAlias, CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem, GetLatestCheckpoint, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
 use crate::ephemeral_fetch_tracker::EphemeralFetchTracker;
 use crate::state_provider::ServiceApiError;
 use crate::peers::{CheckpointDescriptor, PeerClient, SelfPeer};
-use crate::test_api::{CompactionMode};
+use crate::test_api::{CompactionMode, TestProcessingMode};
 
 
 pub struct LeaderlessStateProvider {
@@ -18,11 +18,11 @@ pub struct LeaderlessStateProvider {
 
 impl LeaderlessStateProvider {
     #[allow(dead_code)]
-    pub(crate) fn new(address: String) -> Self {
+    pub(crate) fn new(mode: TestProcessingMode, address: String) -> Self {
         LeaderlessStateProvider {
             base_address: address,
             client: reqwest::Client::new(),
-            fetch_tracker: EphemeralFetchTracker::new(),
+            fetch_tracker: EphemeralFetchTracker::new(mode),
         }
     }
 
@@ -274,8 +274,14 @@ impl LeaderlessStateProvider {
         ).await
     }
 
+    pub(crate) async fn get_cleanup_work_items(&mut self) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
+        Self::handle_response_body(self.client.get(format!("{}/api/v1/get_cleanup_work_items", self.base_address))
+            .send().await
+        ).await
+    }
+
     pub(crate) async fn get_peer_clients(&mut self) -> Vec<Box<dyn PeerClient>> {
-        vec!(Box::new(SelfPeer::new(CompactionMode::Async)))
+        vec!(Box::new(SelfPeer::new(CompactionMode::Async(None))))
     }
 
     pub(crate) async fn get_next_prefetch_checkpoints(&mut self, extensions: Option<String>) -> Result<Vec<CheckpointDescriptor>, ServiceApiError> {

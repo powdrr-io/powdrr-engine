@@ -331,7 +331,7 @@ impl PeerClient for SelfPeer {
 
     async fn private_compaction_leader(&self, invocation: &CompactionCommand) -> Result<Option<CompactionResponse>, PeerClientError> {
         match &self.compaction_mode {
-            CompactionMode::Async => {
+            CompactionMode::Async(_num_files_threshold) => {
                 match compact_logs(Arc::new(invocation.clone())).await {
                     Ok(success) => {
                         if success.status == 200 {

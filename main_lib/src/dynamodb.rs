@@ -815,7 +815,7 @@ mod tests {
                 sizes: vec![100],
                 schema: None,
             }],
-            compactions: vec!["fake_compaction".to_string()],
+            compaction: Some("fake_compaction".to_string()),
         };
 
         connector.create_speedboat_commit(&mut cache, &"fake_org".to_string(), &"fake_id".to_string(), &commit).await.unwrap();
@@ -881,7 +881,7 @@ mod tests {
                 sizes: vec![100],
                 schema: Some(PowdrrSchema::minimal()),
             }],
-            compactions: vec![],
+            compaction: None
         };
 
         connector.create_latest(&"fake_org".to_string(), &first_checkpoint.table_name, &EntityVersionInfo::new(&"fake_org".to_string(), &first_checkpoint.table_name, &first_checkpoint.checkpoint_id)).await.unwrap();

@@ -1,4 +1,4 @@
-use crate::data_contract::CreateIndexTemplateBody;
+use crate::data_contract::{CleanupWorkItem, CreateIndexTemplateBody};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::ephemeral_service_impl::EphemeralServiceImpl;
 use crate::pipeline::PipelineDefinition;
@@ -6,7 +6,7 @@ use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateTable, Ex
 use crate::ephemeral_fetch_tracker::EphemeralFetchTracker;
 use crate::state_provider::ServiceApiError;
 use crate::peers::{CheckpointDescriptor, PeerClient, SelfPeer};
-use crate::test_api::{CompactionMode};
+use crate::test_api::{CompactionMode, TestProcessingMode};
 
 pub struct EphemeralStateProvider {
     service_impl: EphemeralServiceImpl,
@@ -14,10 +14,10 @@ pub struct EphemeralStateProvider {
 }
 
 impl EphemeralStateProvider {
-    pub fn new() -> Self {
+    pub fn new(mode: TestProcessingMode) -> Self {
         EphemeralStateProvider{
-            service_impl: EphemeralServiceImpl::new(),
-            fetch_tracker: EphemeralFetchTracker::new(),
+            service_impl: EphemeralServiceImpl::new(mode.clone()),
+            fetch_tracker: EphemeralFetchTracker::new(mode),
         }
     }
 
@@ -137,8 +137,12 @@ impl EphemeralStateProvider {
         self.service_impl.get_compaction_work_items().await
     }
 
+    pub async fn get_cleanup_work_items(&mut self) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
+        self.service_impl.get_cleanup_work_items().await
+    }
+
     pub async fn get_peer_clients(&mut self) -> Vec<Box<dyn PeerClient>> {
-        vec!(Box::new(SelfPeer::new(CompactionMode::Async)))
+        vec!(Box::new(SelfPeer::new(CompactionMode::Async(None))))
     }
 
     pub(crate) async fn get_latest_target_checkpoint(&mut self, table_name: &String, extension: Option<String>) -> Result<Option<String>, ServiceApiError>{

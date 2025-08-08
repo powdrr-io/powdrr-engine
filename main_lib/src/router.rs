@@ -319,6 +319,7 @@ pub(crate) mod tests {
     use crate::router::router;
     use crate::schema_massager::{extract_powdrr_schema_str, PowdrrDataType, PowdrrField, PowdrrSchema};
     use crate::data_contract::{FileSetPayload, IcebergMetadata, SpeedboatMetadata, TableMetadataCheckpoint};
+    use crate::test_api::{CompactionMode, IndexingMode, PrefetchMode, StateMode, TestProcessingMode};
 
     pub(crate) static TEST_SERVER: LazyLock<TestServer> = LazyLock::new(|| TestServer::with_timeout(router(true), 1000).unwrap());
 
@@ -493,7 +494,7 @@ pub(crate) mod tests {
             checkpoint_id: "0".to_string(),
             iceberg_metadata: Some(IcebergMetadata {
                 table_schema: schema.clone(),
-                snapshot_id: "fake_iceberg_snapshot".to_string(),
+                snapshot_id: Some("fake_iceberg_snapshot".to_string()),
                 files: FileSetPayload::single(file_path, 1, schema.clone()),
                 column_names: vec!(),
                 column_stats: vec!(),
@@ -1003,9 +1004,16 @@ pub(crate) mod tests {
     fn test_es_ingest_search_ingest_compact_then_search_table() {
         let test_server = &*TEST_SERVER;
 
+        let mode = TestProcessingMode {
+            state_mode: StateMode::Testing,
+            indexing_mode: IndexingMode::Async,
+            compaction_mode: CompactionMode::Async(Some(1)),
+            prefetch_mode: PrefetchMode::Disabled,
+        };
+
         test_server.client().put(
-            "http://localhost/_test/v1/_testing_mode",
-            "",
+            "http://localhost/_test/v1/_testing_and_processing_mode",
+            serde_json::to_string(&mode).unwrap(),
             mime::TEXT_PLAIN
         ).perform().unwrap();
 
