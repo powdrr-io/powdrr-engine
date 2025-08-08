@@ -245,7 +245,7 @@ async fn main() -> Result<(), std::io::Error> {
     };
 */
     let main_mode = TestProcessingMode {
-        state_mode: StateMode::TestingDynamoDb,
+        state_mode: StateMode::Testing,
         indexing_mode: IndexingMode::Disabled,
         compaction_mode: CompactionMode::Async(None),
         prefetch_mode: PrefetchMode::Enabled,

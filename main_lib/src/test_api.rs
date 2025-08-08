@@ -3,9 +3,9 @@ use futures::FutureExt;
 use gotham::{handler::HandlerFuture, helpers::http::response::create_response, hyper::{body, Body, StatusCode}, mime, state::{FromState, State}};
 use serde::{Deserialize, Serialize};
 
-use crate::{compaction::perform_compaction, elastic_search_index::{self, create_index}, state_provider::{STATE_PROVIDER}};
+use crate::{compaction::perform_compaction, data_access, elastic_search_index::{self, create_index}, state_provider::{STATE_PROVIDER}};
 use crate::compaction::drop_all_tables;
-use crate::data_contract::TableMetadataCheckpoint;
+use crate::data_contract::{CleanupWorkItem, TableMetadataCheckpoint};
 use crate::prefetch::perform_prefetch;
 
 #[derive(Serialize, Deserialize)]
@@ -234,6 +234,41 @@ pub(crate) async fn do_next_prefetch() -> usize {
     prefetch_work.len()
 }
 
+pub(crate) async fn do_next_cleanup() -> usize {
+    let cleanup_work = match STATE_PROVIDER.get_cleanup_work_items().await {
+        Ok(work) => work,
+        Err(_) => panic!("oh no"),
+    };
+    if cleanup_work.len() > 0 {
+        for work_item in cleanup_work.iter() {
+            perform_cleanup_work(work_item).await;
+        }
+    }
+    cleanup_work.len()
+}
+
+pub(crate) async fn perform_cleanup_work(cleanup_work_item: &CleanupWorkItem) -> () {
+    assert!(cleanup_work_item.files_to_delete.len() > 0);
+    if cleanup_work_item.files_to_delete[0].starts_with("s3://") {
+        data_access::delete_s3_files(&cleanup_work_item.files_to_delete).await;
+    } else {
+        for file_to_delete in cleanup_work_item.files_to_delete.iter() {
+            if file_to_delete.ends_with(".json") || file_to_delete.ends_with(".arrow") {
+                std::fs::remove_file(file_to_delete).unwrap();
+            } else {
+                match std::fs::remove_file(format!("{}.arrow", file_to_delete)) {
+                    Ok(_) => (),
+                    Err(e) => {
+                        let error = format!("{}", e);
+                        panic!("oh no");
+                    }
+                }
+            }
+        }
+    }
+}
+
+
 
 fn do_update_checkpoint_work_for_forever(wait_time_ms: u64) -> impl Future<Output = ()> {
     async move {
@@ -293,6 +328,16 @@ fn do_prefetch_work_for_forever(wait_time_ms: u64) -> impl Future<Output = ()> {
 }
 
 
+fn do_cleanup_work_for_forever() -> impl Future<Output = ()> {
+    async move {
+        loop {
+            do_next_cleanup().await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+}
+
+
 pub fn test_v1_set_testing_processing_mode(mut state: State) -> Pin<Box<HandlerFuture>> {
     async {
         let mode = match body::to_bytes(Body::take_from(&mut state)).await {
@@ -320,18 +365,33 @@ pub fn test_v1_set_testing_processing_mode(mut state: State) -> Pin<Box<HandlerF
         if !mode.prefetch_mode.is_disabled() {
             tokio::spawn(do_prefetch_work_for_forever(1000));
         }
+        tokio::spawn(do_cleanup_work_for_forever());
         let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "Ok");
         Ok((state, res))        
     }.boxed()
 }
 
 
-pub fn test_v1_process_work(state: State) -> Pin<Box<HandlerFuture>> {
+pub fn test_v1_process_work(mut state: State) -> Pin<Box<HandlerFuture>> {
     async {
         let mut work_done: bool;
+        let mut snapshot_id = match body::to_bytes(Body::take_from(&mut state)).await {
+            Ok(vb) => {
+                let body_content = String::from_utf8(vb.to_vec()).unwrap();
+                if body_content.len() == 0 {
+                    -1
+                } else {
+                    body_content.parse::<i64>().unwrap()
+                }
+            },
+            Err(_) => {
+                panic!("Oh no");
+            },
+        };
         loop {
             work_done = do_available_extension_work(&vec!("es".to_string())).await;
-            let (_, compaction_work_done) = do_available_compaction_work(-1).await;
+            let (new_snapshot_id, compaction_work_done) = do_available_compaction_work(snapshot_id).await;
+            snapshot_id = new_snapshot_id;
             work_done = work_done | compaction_work_done;
             match STATE_PROVIDER.update_all_checkpoints().await {
                 Ok(checkpoint_work_done) => work_done = work_done | checkpoint_work_done,
@@ -339,12 +399,14 @@ pub fn test_v1_process_work(state: State) -> Pin<Box<HandlerFuture>> {
                     tracing::error!("Error updating checkpoints: {}", e);
                 }
             };
+            let num_deletes = do_next_cleanup().await;
+            work_done = work_done | (num_deletes > 0);
             if !work_done {
                 break
             }
         }
 
-        let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "Ok");
+        let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, snapshot_id.to_string());
         Ok((state, res))        
     }.boxed()
 }
