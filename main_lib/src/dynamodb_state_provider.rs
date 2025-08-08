@@ -1,5 +1,5 @@
 use aws_sdk_dynamodb::Client;
-use crate::data_contract::CreateIndexTemplateBody;
+use crate::data_contract::{CleanupWorkItem, CreateIndexTemplateBody};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::pipeline::PipelineDefinition;
 use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
@@ -7,7 +7,7 @@ use crate::dynamodb_service_impl::DynamoDBServiceImpl;
 use crate::ephemeral_fetch_tracker::EphemeralFetchTracker;
 use crate::state_provider::ServiceApiError;
 use crate::peers::{CheckpointDescriptor, PeerClient, SelfPeer};
-use crate::test_api::{CompactionMode};
+use crate::test_api::{CompactionMode, TestProcessingMode};
 
 pub struct DynamoDbStateProvider {
     pub service_impl: DynamoDBServiceImpl,
@@ -16,17 +16,17 @@ pub struct DynamoDbStateProvider {
 
 impl DynamoDbStateProvider {
     #[allow(dead_code)]
-    pub fn new() -> Self {
+    pub fn new(mode: TestProcessingMode) -> Self {
         DynamoDbStateProvider{
-            service_impl: DynamoDBServiceImpl::new(),
-            fetch_tracker: EphemeralFetchTracker::new(),
+            service_impl: DynamoDBServiceImpl::new(mode.clone()),
+            fetch_tracker: EphemeralFetchTracker::new(mode),
         }
     }
 
-    pub fn with_client(client: Client) -> Self {
+    pub fn with_client(client: Client, mode: TestProcessingMode) -> Self {
         DynamoDbStateProvider{
-            service_impl: DynamoDBServiceImpl::with_client(client),
-            fetch_tracker: EphemeralFetchTracker::new(),
+            service_impl: DynamoDBServiceImpl::with_client(client, mode.clone()),
+            fetch_tracker: EphemeralFetchTracker::new(mode),
         }
     }
 
@@ -143,8 +143,12 @@ impl DynamoDbStateProvider {
         self.service_impl.get_compaction_work_items().await
     }
 
+    pub async fn get_cleanup_work_items(&mut self) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
+        self.service_impl.get_cleanup_work_items().await
+    }
+
     pub async fn get_peer_clients(&mut self) -> Vec<Box<dyn PeerClient>> {
-        vec!(Box::new(SelfPeer::new(CompactionMode::Async)))
+        vec!(Box::new(SelfPeer::new(CompactionMode::Async(None))))
     }
 
     pub(crate) async fn get_latest_target_checkpoint(&mut self, table_name: &String, extension: Option<String>) -> Result<Option<String>, ServiceApiError>{

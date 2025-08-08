@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use crate::peers::CheckpointDescriptor;
 use crate::state_provider::ServiceApiError;
+use crate::test_api::TestProcessingMode;
 
 pub(crate) struct EphemeralFetchTracker {
     next_target: HashMap<Option<String>, HashMap<String, String>>,
@@ -8,7 +9,7 @@ pub(crate) struct EphemeralFetchTracker {
 }
 
 impl EphemeralFetchTracker {
-    pub fn new() -> Self {
+    pub fn new(_mode: TestProcessingMode) -> Self {
         EphemeralFetchTracker{
             next_target: Default::default(),
             current_target: Default::default(),

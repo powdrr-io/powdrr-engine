@@ -1,17 +1,19 @@
 use std::collections::HashMap;
 use idgenerator::IdInstance;
-use crate::data_contract::CreateIndexTemplateBody;
+use crate::data_contract::{CleanupWorkItem, CreateIndexTemplateBody};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::pipeline::PipelineDefinition;
 use crate::schema_massager::PowdrrSchema;
 use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateTable, DeletesMetadata, ExtensionCommit, ExtensionFile, ExtensionWorkItem, FileSetPayload, IcebergCommit, SpeedboatCommit, SpeedboatCommitTableInfo, SpeedboatMetadata, TableDescription, TableMetadataCheckpoint};
 use crate::state_provider::ServiceApiError;
 use crate::peers::{CheckpointDescriptor};
+use crate::test_api::TestProcessingMode;
 
 type CommittedCheckpoints = HashMap<String, String>;
 
 
 pub struct EphemeralServiceImpl {
+    mode: TestProcessingMode,
     tables: HashMap<String, TableDescription>,
     // alias name -> table name
     table_aliases: HashMap<String, String>,
@@ -20,7 +22,9 @@ pub struct EphemeralServiceImpl {
     lifetime_policies: HashMap<String, ILMPolicyDefinition>,
     latest_committed_checkpoint_id: HashMap<Option<String>, CommittedCheckpoints>,
     compaction_work_items: HashMap<String, CompactionWorkItem>,
+    not_compacted_checkpoint_ids: HashMap<String, Vec<String>>,
     extension_work_items: HashMap<String, HashMap<String, ExtensionWorkItem>>,
+    cleanup_work_items: Vec<CleanupWorkItem>,
     compactions: HashMap<String, CompactionCommit>,
     checkpoints: HashMap<String, TableMetadataCheckpoint>,
     checkpoints_needing_extension_work: HashMap<String, Vec<String>>,
@@ -28,8 +32,9 @@ pub struct EphemeralServiceImpl {
 }
 
 impl EphemeralServiceImpl {
-    pub fn new() -> Self {
+    pub fn new(mode: TestProcessingMode) -> Self {
         EphemeralServiceImpl{
+            mode: mode,
             tables: HashMap::new(),
             table_aliases: HashMap::new(),
             table_templates: HashMap::new(),
@@ -37,7 +42,9 @@ impl EphemeralServiceImpl {
             lifetime_policies: HashMap::new(),
             latest_committed_checkpoint_id: HashMap::new(),
             compaction_work_items: HashMap::new(),
+            not_compacted_checkpoint_ids: HashMap::new(),
             compactions: HashMap::new(),
+            cleanup_work_items: Vec::new(),
             checkpoints: HashMap::new(),
             checkpoints_needing_extension_work: HashMap::new(),
             extension_work_items: HashMap::from([("es".to_string(), HashMap::new())]),
@@ -183,29 +190,38 @@ impl EphemeralServiceImpl {
         }
     }
 
-    fn handle_compaction(&mut self, compactions: &Vec<String>, checkpoint: &mut TableMetadataCheckpoint) -> () {
-        let (removed_speedboat, removed_deletes) = self.get_removed_files(compactions);
+    fn handle_compactions(&mut self, compactions: &Vec<String>, checkpoint: &mut TableMetadataCheckpoint) -> () {
+        // TODO: remove this method and use the one on TableMetadataCheckpoint
+        for compaction in compactions {
+            self.handle_compaction(&Some(compaction.clone()), checkpoint);
+        }
+    }
+
+    fn handle_compaction(&mut self, compaction: &Option<String>, checkpoint: &mut TableMetadataCheckpoint) -> () {
+        // TODO: remove this method and use the one on TableMetadataCheckpoint
+        if compaction.is_none() {
+            return;
+        }
+
+        let compaction_obj = self.compactions.get(compaction.as_ref().unwrap()).unwrap();
 
         match checkpoint.speedboat_metadata.as_mut() {
             Some(speedboat) => {
-                speedboat.files.remove(&removed_speedboat);
+                speedboat.files.remove(&compaction_obj.removed_speedboat_files);
             },
             None => ()
         };
 
         match checkpoint.deletes_metadata.as_mut() {
             Some(deletes) => {
-                deletes.files.retain(|x|!removed_deletes.contains(x));
+                deletes.files.retain(|x|!compaction_obj.removed_delete_files.contains(x));
             },
             None => ()
         };
 
         for metadata in checkpoint.extension_metadata.values_mut() {
-            metadata.retain(|key, _|!removed_speedboat.contains(key))
+            metadata.retain(|key, _|!compaction_obj.removed_speedboat_files.contains(key));
         }
-
-        // TODO: cleanup compactions
-        // self.compactions.retain(|x, _|!compactions.contains(x));
     }
 
     fn get_removed_files(&self, compactions: &Vec<String>) -> (Vec<String>, Vec<String>) {
@@ -229,7 +245,7 @@ impl EphemeralServiceImpl {
         self.latest_committed_checkpoint_id.get_mut(&extensions).unwrap().insert(real_table_name.clone(), checkpoint_id.clone());
     }
 
-    async fn speedboat_commit_type_commit(&mut self, table_info: &SpeedboatCommitTableInfo, compactions: &Vec<String>) -> Result<(), ServiceApiError> {
+    async fn speedboat_commit_type_commit(&mut self, table_info: &SpeedboatCommitTableInfo, compaction: &Option<String>) -> Result<(), ServiceApiError> {
         let latest_checkpoint = match self.get_latest_committed_checkpoint_sync(&table_info.table_name, None) {
             Some(checkpoint_id) => {
                 let key = format!("{}_{}", &table_info.table_name, checkpoint_id);
@@ -285,7 +301,7 @@ impl EphemeralServiceImpl {
             schema: merged_schema.clone(),
         };
 
-        self.handle_compaction(compactions, &mut new_latest_checkpoint);
+        self.handle_compaction(compaction, &mut new_latest_checkpoint);
         let (speedboat_files, iceberg_files) = self.try_fill_checkpoint_extension_metadata(&"es".to_string(), &mut new_latest_checkpoint);
 
         self.checkpoints.insert(format!("{}_{}", &table_info.table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
@@ -301,27 +317,43 @@ impl EphemeralServiceImpl {
 
         self.set_latest_committed_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
 
-        // TODO: apply some policy here based on sizes to split up compaction work items
-        match self.compaction_work_items.get_mut(&table_info.table_name) {
-            Some(compaction) => {
-                compaction.table_schema = new_latest_checkpoint.schema.clone();
-                compaction.speedboat_files = compaction.speedboat_files.merge(&table_info.as_file_set_payload())
-            },
-            None => {
-                self.compaction_work_items.insert(
-                    table_info.table_name.clone(),
-                    CompactionWorkItem {
-                        table_schema: new_latest_checkpoint.schema.clone(),
-                        speedboat_files: table_info.as_file_set_payload(),
-                        delete_files: new_latest_checkpoint.deletes_metadata.as_ref().map_or_else(|| vec!(), |m|m.files.clone()),
-                    }
-                );
-            }
-        }
+        self.maybe_create_compaction_work_item(&new_latest_checkpoint);
         Ok(())
     }
 
-    async fn speedboat_commit_type_delete(&mut self, table_info: &SpeedboatCommitTableInfo, compactions: &Vec<String>) -> Result<(), ServiceApiError> {
+    fn maybe_create_compaction_work_item(&mut self, checkpoint: &TableMetadataCheckpoint) -> () {
+        // If we have a work item waiting, then we just wait for that to happen before creating a new one.
+        if self.compaction_work_items.contains_key(&checkpoint.table_name) {
+            self.not_compacted_checkpoint_ids.get_mut(&checkpoint.table_name).unwrap().push(checkpoint.checkpoint_id.clone());
+            return;
+        }
+
+        // We only compact speedboat so new speedboat metadata means no work item
+        if checkpoint.speedboat_metadata.is_none() {
+            self.not_compacted_checkpoint_ids.get_mut(&checkpoint.table_name).unwrap().push(checkpoint.checkpoint_id.clone());
+            return;
+        }
+
+        // If the files in the speedboat metadata surpass the compaction threshold then make a work item
+        let speedboat_files = &checkpoint.speedboat_metadata.as_ref().unwrap().files;
+        let num_files_threshold = self.mode.compaction_mode.threshold();
+        let compact = speedboat_files.file_paths.len() as u64 >= num_files_threshold || speedboat_files.sizes.iter().sum::<u64>() > 30 * 1024 * 1024;
+        if compact {
+            self.compaction_work_items.insert(
+                checkpoint.table_name.clone(),
+                CompactionWorkItem {
+                    table_schema: checkpoint.schema.clone(),
+                    speedboat_files: speedboat_files.clone(),
+                    delete_files: checkpoint.deletes_metadata.as_ref().map_or(vec![], |x| x.files.clone()),
+                    checkpoint_id_to_replace: checkpoint.checkpoint_id.clone(),
+                    checkpoints_to_delete: self.not_compacted_checkpoint_ids.get(&checkpoint.table_name).unwrap().clone(),
+                }
+            );
+            self.not_compacted_checkpoint_ids.get_mut(&checkpoint.table_name).unwrap().clear();
+        }
+    }
+
+    async fn speedboat_commit_type_delete(&mut self, table_info: &SpeedboatCommitTableInfo, compaction: &Option<String>) -> Result<(), ServiceApiError> {
         let latest_checkpoint = match self.get_latest_committed_checkpoint_sync(&table_info.table_name, None) {
             Some(checkpoint_id) => {
                 let key = format!("{}_{}", &table_info.table_name, checkpoint_id);
@@ -373,17 +405,11 @@ impl EphemeralServiceImpl {
             extension_metadata: latest_checkpoint.extension_metadata.clone(),
             schema: latest_checkpoint.schema.clone(),
         };
-        self.handle_compaction(&compactions, &mut new_latest_checkpoint);
+        self.handle_compaction(&compaction, &mut new_latest_checkpoint);
         self.try_fill_checkpoint_extension_metadata(&"es".to_string(), &mut new_latest_checkpoint);
 
         self.checkpoints.insert(format!("{}_{}", &table_info.table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
         self.set_latest_committed_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
-        match self.compaction_work_items.get_mut(&table_info.table_name) {
-            Some(work_item) => {
-                work_item.delete_files.extend(table_info.files.clone());
-            },
-            None => {}
-        }
         Ok(())
     }
 
@@ -419,9 +445,11 @@ impl EphemeralServiceImpl {
             Some(_) => {
                 self.tables.remove(&create_table.name);
                 self.tables.insert(create_table.name.clone(), TableDescription::from_create_table(create_table));
+                self.not_compacted_checkpoint_ids.insert(create_table.name.clone(), Vec::new());
             }
             None => {
                 self.tables.insert(create_table.name.clone(), TableDescription::from_create_table(create_table));
+                self.not_compacted_checkpoint_ids.insert(create_table.name.clone(), Vec::new());
             }
         }
         Ok(())
@@ -506,9 +534,9 @@ impl EphemeralServiceImpl {
     pub async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), ServiceApiError> {
         for table_info in commit.type_files.iter() {
             if table_info.commit_type == "commit" || table_info.commit_type == "compact" {
-                self.speedboat_commit_type_commit(table_info, &commit.compactions).await?;
+                self.speedboat_commit_type_commit(table_info, &commit.compaction).await?;
             } else if table_info.commit_type == "delete" {
-                self.speedboat_commit_type_delete(table_info, &commit.compactions).await?;
+                self.speedboat_commit_type_delete(table_info, &commit.compaction).await?;
             } else {
                 panic!("Unknown Speedboat commit type")
             }
@@ -554,7 +582,7 @@ impl EphemeralServiceImpl {
             extension_metadata: latest_checkpoint.extension_metadata.clone(),
             schema: merged_schema.clone(),
         };
-        self.handle_compaction(&iceberg_commit.compactions, &mut new_latest_checkpoint);
+        self.handle_compactions(&iceberg_commit.compactions, &mut new_latest_checkpoint);
         let (speedboat_files, iceberg_files) = self.try_fill_checkpoint_extension_metadata(&"es".to_string(), &mut new_latest_checkpoint);
 
         self.checkpoints.insert(format!("{}_{}", &table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
@@ -638,19 +666,13 @@ impl EphemeralServiceImpl {
     pub async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
         let mut work_items = vec!();
         for (table_name, compaction) in self.compaction_work_items.iter_mut() {
-            tracing::info!("Compaction work item stats: size = {}/{}, files = {}/200",
-                compaction.speedboat_files.sizes.iter().sum::<u64>(),
-                30 * 1024 * 1024,
-                compaction.speedboat_files.sizes.len()
-            );
-            let do_compaction = compaction.speedboat_files.sizes.iter().sum::<u64>() > 30 * 1024 * 1024 || compaction.speedboat_files.sizes.len() > 200;
-            //let do_compaction = true;
-            if do_compaction {
-                work_items.push((table_name.clone(), compaction.clone()));
-                compaction.speedboat_files.clear();
-            }
+            work_items.push((table_name.clone(), compaction.clone()));
         }
+        self.compaction_work_items.clear();
         Ok(work_items)
     }
 
+    pub async fn get_cleanup_work_items(&mut self) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
+        Ok(vec!())
+    }
 }

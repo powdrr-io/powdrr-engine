@@ -4,6 +4,7 @@ use std::{error::Error, fmt};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::DataType;
@@ -18,7 +19,7 @@ use iceberg::{NamespaceIdent, TableCreation, TableIdent};
 use iceberg::table::Table;
 use iceberg::transaction::ApplyTransactionAction;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-use iceberg::writer::file_writer::location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator};
+use iceberg::writer::file_writer::location_generator::{DefaultLocationGenerator, FileNameGenerator};
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
@@ -31,7 +32,7 @@ use crate::elastic_search_commands::df_to_serde_value;
 use crate::elastic_search_common::{execute_command, Command, CommandContext, CommandError, ElasticSearchResponse, ResultGeneratorFuture};
 use crate::elastic_search_ingest::{write_to_file, WriteBuffer};
 use crate::schema_massager::{PowdrrSchema, SqlBuilder};
-use crate::data_contract::{CompactionCommit, CompactionWorkItem, FileSetPayload, IcebergCommit, IcebergMetadata, SpeedboatCommit, SpeedboatCommitTableInfo};
+use crate::data_contract::{CompactionCommit, CompactionWorkItem, FileSetPayload, IcebergCommit, IcebergMetadata, SpeedboatCommitTableInfo};
 use crate::state_provider::ServiceApiError;
 use crate::peers::{PrivateCompactionInvocation, PrivateInvocation};
 
@@ -277,6 +278,34 @@ pub struct CompactionCommand {
     work_item: CompactionWorkItem,
     compaction_id: String,
     last_snapshot_id: i64,
+    parquet_file_name: String
+}
+
+#[derive(Clone, Debug)]
+struct PowdrrFileNameGenerator {
+    file_name: String,
+    count: Arc<AtomicU64>,
+}
+
+impl PowdrrFileNameGenerator {
+    fn new(file_name: &String) -> Self {
+        Self {
+            file_name: file_name.clone(),
+            count: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn create_file_name() -> String {
+        format!("{}-00000.parquet", IdInstance::next_id())
+    }
+}
+
+impl FileNameGenerator for PowdrrFileNameGenerator {
+    fn generate_file_name(&self) -> String {
+        let count = self.count.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(count, 0);
+        self.file_name.clone()
+    }
 }
 
 impl CompactionCommand {
@@ -285,22 +314,18 @@ impl CompactionCommand {
         name: &String,
         iceberg_schema: iceberg::spec::Schema,
         compaction_id: &String,
-        data: &Vec<RecordBatch>
+        data: &Vec<RecordBatch>,
+        parquet_file_name: &String,
     ) -> Result<(), iceberg::Error> {
         let table = ensure_table(namespace, name, &iceberg_schema).await?;
         let location_generator = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
-        let file_name_generator = DefaultFileNameGenerator::new(
-            IdInstance::next_id().to_string(),
-            None,
-            iceberg::spec::DataFileFormat::Parquet,
-        );
 
         let parquet_writer_builder = ParquetWriterBuilder::new(
             WriterProperties::default(),
             Arc::new(iceberg_schema),
             table.file_io().clone(),
             location_generator.clone(),
-            file_name_generator.clone(),
+            PowdrrFileNameGenerator::new(parquet_file_name),
         );
         let data_file_writer_builder = DataFileWriterBuilder::new(parquet_writer_builder, None, 0);
         let mut data_file_writer = data_file_writer_builder.build().await.unwrap();
@@ -325,12 +350,17 @@ impl CompactionCommand {
         action = action.set_snapshot_properties(HashMap::from([("compaction".to_string(), compaction_id.clone())]));
         action = action.add_data_files(data_files.clone());
         let catalog = REST_CATALOG.clone();
-        action.apply(tx)?.commit(catalog.as_ref()).await?;
+        match action.apply(tx)?.commit(catalog.as_ref()).await {
+            Ok(_) => (),
+            Err(e) => {
+                return Err(e)
+            }
+        }
 
         Ok(())
     }
 
-    async fn update_iceberg(data: &Vec<RecordBatch>, table_name: &String, compaction_id: &String) -> Result<(), iceberg::Error> {
+    async fn update_iceberg(data: &Vec<RecordBatch>, table_name: &String, compaction_id: &String, parquet_file_name: &String) -> Result<(), iceberg::Error> {
         let converted_schema = match arrow_schema_to_schema(&data[0].schema()) {
             Ok(s) => s,
             Err(e) => {
@@ -344,6 +374,7 @@ impl CompactionCommand {
             converted_schema,
             compaction_id,
             &data,
+            parquet_file_name,
         ).await
     }
 
@@ -353,7 +384,7 @@ impl CompactionCommand {
             &IcebergCommit {
                 metadata: IcebergMetadata {
                     table_schema: compaction_response.schema.clone(),
-                    snapshot_id: compaction_response.lib_metadata.snapshot_id.to_string(),
+                    snapshot_id: Some(compaction_response.lib_metadata.snapshot_id.to_string()),
                     files: FileSetPayload {
                         file_paths: compaction_response.lib_metadata.files.clone(),
                         schemas: vec!(compaction_response.schema.clone()),
@@ -364,6 +395,7 @@ impl CompactionCommand {
                     column_stats: compaction_response.lib_metadata.column_stats.clone(),
                 },
                 compactions: compaction_response.lib_metadata.compactions.clone(),
+                deletes_table_info: compaction_response.deletes_table_info.clone(),
             }
         ).await {
             Ok(_) => (),
@@ -371,24 +403,6 @@ impl CompactionCommand {
                 return Err(e)
             }
         };
-
-        // Note: the Iceberg and Speedboat commits are done separately here and are
-        // therefore NOT ATOMIC. The Speedboat commit here is just deletions where
-        // the new file contains a subset of deletes from the existing files. If this update is lost the
-        // worst case is that the next compaction sees all the same deletes in the same
-        // files and once again tries to compact them.
-
-        if compaction_response.deletes_table_info.is_some() {
-            match STATE_PROVIDER.speedboat_commit(&SpeedboatCommit {
-                type_files: vec!(compaction_response.deletes_table_info.as_ref().unwrap().clone()),
-                compactions: compaction_response.compactions.clone(),
-            }).await{
-                Ok(_) => (),
-                Err(e) => {
-                    return Err(e)
-                }
-            };
-        }
 
         Ok(compaction_response.lib_metadata.snapshot_id)
     }
@@ -411,6 +425,7 @@ impl Command for CompactionCommand {
         let compactions = vec!(self.compaction_id.clone());
         let schema = self.work_item.table_schema.clone();
         let old_snapshot_id = self.last_snapshot_id;
+        let parquet_file_name = self.parquet_file_name.clone();
         async move {
             let internal_df_table_name = match result_table_name {
                 Some(t) => t,
@@ -458,7 +473,8 @@ impl Command for CompactionCommand {
             match Self::update_iceberg(
                 &data,
                 &public_table_name,
-                &compactions[0]
+                &compactions[0],
+                &parquet_file_name,
             ).await {
                 Ok(_) => (),
                 Err(e) => {
@@ -534,12 +550,16 @@ pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkIt
         // NOTE: the api commit must happen before the iceberg commit. The main_lib is designed to understand that
         // a compaction commit might get committed to it but fail afterwards. If we commit to Iceberg and fail to
         // record that in the main_lib then that leads to correctness errors that aren't really possible to fix.
+        let parquet_file_name = PowdrrFileNameGenerator::create_file_name();
         match STATE_PROVIDER.compaction_commit(
             table_name,
             &CompactionCommit {
                 removed_speedboat_files: work_item.speedboat_files.file_paths.clone(),
                 compaction_id: compaction_id.clone(),
+                checkpoint_id_to_replace: work_item.checkpoint_id_to_replace.clone(),
                 removed_delete_files: work_item.delete_files.clone(),
+                checkpoints_to_delete: work_item.checkpoints_to_delete.clone(),
+                parquet_file_name: parquet_file_name.clone(),
             }
         ).await {
             Ok(_) => (),
@@ -553,6 +573,7 @@ pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkIt
             work_item: work_item.clone(),
             compaction_id: compaction_id.clone(),
             last_snapshot_id,
+            parquet_file_name
         };
 
         let peers = STATE_PROVIDER.get_peer_clients().await;
@@ -587,7 +608,7 @@ mod tests {
     use gotham::test::Server;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
-    use super::{drop_table, ensure_table, load_table_metadata, CompactionCommand};
+    use super::{drop_table, ensure_table, load_table_metadata, CompactionCommand, PowdrrFileNameGenerator};
     use iceberg::io::{
         FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY,
     };
@@ -679,7 +700,8 @@ mod tests {
         match CompactionCommand::update_iceberg(
             &batch,
             &"simple".to_string(),
-            &"thing1".to_string()
+            &"thing1".to_string(),
+            &PowdrrFileNameGenerator::create_file_name()
         ).await {
             Ok(_) => (),
             Err(e) => {
@@ -744,7 +766,8 @@ mod tests {
         match CompactionCommand::update_iceberg(
             &batch,
             &"okta".to_string(),
-            &"thing1".to_string()
+            &"thing1".to_string(),
+            &PowdrrFileNameGenerator::create_file_name()
         ).await {
             Ok(_) => (),
             Err(e) => {

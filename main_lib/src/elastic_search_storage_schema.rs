@@ -288,7 +288,7 @@ impl SpeedboatCommitBuilder {
             &self.table_name,
             &insert_update_write_buffer,
             &delete_write_buffer,
-            &vec!(),
+            None,
             &"commit".to_string()
         ).await?;
 

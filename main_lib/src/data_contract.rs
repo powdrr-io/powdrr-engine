@@ -4,6 +4,7 @@ use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
 use crate::peers::CheckpointDescriptor;
 use crate::schema_massager::PowdrrSchema;
+use crate::test_api::TestProcessingMode;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SpeedboatCommitTableInfo {
@@ -35,7 +36,7 @@ pub struct GetLatestCheckpoint {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SpeedboatCommit {
     pub type_files: Vec<SpeedboatCommitTableInfo>,
-    pub compactions: Vec<String>,
+    pub compaction: Option<String,>
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -57,7 +58,7 @@ pub struct FileDescriptor {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IcebergMetadata {
     pub table_schema: PowdrrSchema,
-    pub snapshot_id: String,
+    pub snapshot_id: Option<String>,
     pub files: FileSetPayload,
     pub column_names: Vec<String>,
     // per file, per column lower and upper bounds
@@ -69,6 +70,7 @@ pub struct IcebergMetadata {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IcebergCommit {
     pub metadata: IcebergMetadata,
+    pub deletes_table_info: Option<SpeedboatCommitTableInfo>,
     pub compactions: Vec<String>,
 }
 
@@ -105,8 +107,12 @@ pub struct ExtensionCommit {
 pub struct CompactionCommit {
     pub removed_speedboat_files: Vec<String>,
     pub removed_delete_files: Vec<String>,
-    pub compaction_id: String
+    pub parquet_file_name: String,
+    pub compaction_id: String,
+    pub checkpoint_id_to_replace: String,
+    pub checkpoints_to_delete: Vec<String>,
 }
+
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TableMetadataCheckpoint {
@@ -186,7 +192,9 @@ impl TableMetadataCheckpoint {
                 panic!("Unknown commit type");
             }
         }
-        self.apply_compactions(&speedboat_commit.compactions, compactions_lookup);
+        if speedboat_commit.compaction.is_some() {
+            self.apply_compactions(&vec!(speedboat_commit.compaction.as_ref().unwrap().clone()), compactions_lookup);
+        }
 
         true
     }
@@ -482,7 +490,10 @@ pub struct CompactionWorkItem {
     pub table_schema: PowdrrSchema,
     pub speedboat_files: FileSetPayload,
     pub delete_files: Vec<String>,
+    pub checkpoint_id_to_replace: String,
+    pub checkpoints_to_delete: Vec<String>,
 }
+
 
 impl CompactionWorkItem {
     pub fn merge_speedboat(&mut self, commit: &SpeedboatCommit) -> () {
@@ -498,6 +509,13 @@ impl CompactionWorkItem {
         }
     }
 }
+
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CleanupWorkItem {
+    pub files_to_delete: Vec<String>,
+}
+
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AliasInfo {
@@ -619,4 +637,12 @@ pub enum ServiceImplType {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ServiceMode {
     pub impl_type: ServiceImplType,
+}
+
+
+impl ServiceMode {
+    pub fn as_testing_mode(&self) -> TestProcessingMode {
+        // TODO: does this need to be configurable?
+        TestProcessingMode::default()
+    }
 }

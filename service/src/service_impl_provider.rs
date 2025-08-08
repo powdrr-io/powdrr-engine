@@ -9,6 +9,7 @@ use powdrr_lib::peers::CheckpointDescriptor;
 use tokio::sync::{mpsc, oneshot};
 use powdrr_lib::state_provider::ServiceApiError;
 use powdrr_lib::dynamodb_service_impl::DynamoDBServiceImpl;
+use powdrr_lib::test_api::TestProcessingMode;
 
 #[derive(Debug, Clone)]
 pub struct ServiceImplError {
@@ -155,7 +156,7 @@ macro_rules! handle_message_impl {
 impl ServiceImplProviderActor {
     fn new(receiver: mpsc::Receiver<ServiceImplProviderActorMessage>) -> Self {
         ServiceImplProviderActor {
-            service_impl: ServiceImpl::Ephemeral(EphemeralServiceImpl::new()),
+            service_impl: ServiceImpl::Ephemeral(EphemeralServiceImpl::new(TestProcessingMode::default())),
             receiver,
         }
     }
@@ -164,8 +165,8 @@ impl ServiceImplProviderActor {
         match msg {
             ServiceImplProviderActorMessage::SetMode { respond_to, mode } => {
                 self.service_impl = match mode.impl_type {
-                    ServiceImplType::Ephemeral => ServiceImpl::Ephemeral(EphemeralServiceImpl::new()),
-                    ServiceImplType::DynamoDb => ServiceImpl::DynamoDb(DynamoDBServiceImpl::new()),
+                    ServiceImplType::Ephemeral => ServiceImpl::Ephemeral(EphemeralServiceImpl::new(mode.as_testing_mode())),
+                    ServiceImplType::DynamoDb => ServiceImpl::DynamoDb(DynamoDBServiceImpl::new(mode.as_testing_mode())),
                 };
                 respond_to.send(Ok(())).unwrap();
             }

@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use idgenerator::IdInstance;
-use crate::data_contract::{TableDescription, CreateIndexTemplateBody, CompactionWorkItem, ExtensionWorkItem, CompactionCommit, TableMetadataCheckpoint, ExtensionCommit, CreateTable, SpeedboatCommit, IcebergCommit, FileSetPayload, SpeedboatCommitTableInfo};
+use crate::data_contract::{TableDescription, CreateIndexTemplateBody, CompactionWorkItem, ExtensionWorkItem, CompactionCommit, TableMetadataCheckpoint, ExtensionCommit, CreateTable, SpeedboatCommit, IcebergCommit, FileSetPayload, SpeedboatCommitTableInfo, CleanupWorkItem};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
 use crate::state_provider::ServiceApiError;
 use crate::dynamodb::{DynamoDbConnector, PowdrrNamedCompactionCommitCache, PowdrrNamedCompactionWorkItemCache, PowdrrNamedExtensionCommitCache, PowdrrNamedExtensionWorkItemCache, PowdrrNamedIcebergCommitCache, PowdrrNamedSpeedboatCommitCache, PowdrrNamedTableMetadataCheckpointCache, TableBody};
 use crate::schema_massager::PowdrrSchema;
+use crate::test_api::TestProcessingMode;
 
 fn from_modyne(e: modyne::Error) -> ServiceApiError {
     ServiceApiError::new(e.to_string())
@@ -14,6 +15,7 @@ fn from_modyne(e: modyne::Error) -> ServiceApiError {
 
 
 pub struct DynamoDBServiceImpl {
+    mode: TestProcessingMode,
     pub(crate) connector: DynamoDbConnector,
 
     compactions_cache: PowdrrNamedCompactionCommitCache,
@@ -29,13 +31,14 @@ pub struct DynamoDBServiceImpl {
 static ORG_ID: &'static str = "fake_org_id";
 
 impl DynamoDBServiceImpl {
-    pub fn new() -> Self {
+    pub fn new(mode: TestProcessingMode) -> Self {
         let aws_config = aws_sdk_dynamodb::Config::builder().build();
-        Self::with_client(aws_sdk_dynamodb::Client::from_conf(aws_config))
+        Self::with_client(aws_sdk_dynamodb::Client::from_conf(aws_config), mode)
     }
 
-    pub fn with_client(client: aws_sdk_dynamodb::Client) -> Self {
+    pub fn with_client(client: aws_sdk_dynamodb::Client, mode: TestProcessingMode) -> Self {
         DynamoDBServiceImpl{
+            mode: mode,
             connector: DynamoDbConnector::new(client),
             compactions_cache: PowdrrNamedCompactionCommitCache::new(),
             checkpoints_cache: PowdrrNamedTableMetadataCheckpointCache::new(),
@@ -79,7 +82,7 @@ impl DynamoDBServiceImpl {
                     sizes: metadata.speedboat_metadata.as_ref().unwrap().files.sizes.clone(),
                     schema: Some(metadata.schema.clone()),
                 }),
-                compactions: vec![],
+                compaction: None
             }).await?
         }
         if metadata.iceberg_metadata.is_some() {
@@ -87,6 +90,7 @@ impl DynamoDBServiceImpl {
                 &metadata.table_name,
                 &IcebergCommit {
                     metadata: metadata.iceberg_metadata.as_ref().unwrap().clone(),
+                    deletes_table_info: None,
                     compactions: vec![],
                 },
             ).await?
@@ -175,6 +179,7 @@ impl DynamoDBServiceImpl {
             }
         }
 
+        /* TODO: Need to redo this
         // Everything in this loop just to create a compaction work item. Yikes.
         loop {
             let latest_key = &Self::latest_compaction_work_item_key(&tables[0]);
@@ -197,7 +202,7 @@ impl DynamoDBServiceImpl {
                 false => ()
             }
         }
-
+        */
         Ok(())
     }
 
@@ -220,11 +225,13 @@ impl DynamoDBServiceImpl {
     async fn gather_compactions(&mut self, speedboat_commits: &Vec<SpeedboatCommit>, iceberg_commits: &Vec<IcebergCommit>) -> Result<HashMap<String, CompactionCommit>, ServiceApiError> {
         let mut compactions = vec!();
         for speedboat_commit in speedboat_commits {
-            compactions.extend(speedboat_commit.compactions.iter());
+            if speedboat_commit.compaction.is_some() {
+                compactions.push(speedboat_commit.compaction.as_ref().unwrap().clone());
+            }
         }
 
         for iceberg_commit in iceberg_commits {
-            compactions.extend(iceberg_commit.compactions.iter());
+            compactions.extend(iceberg_commit.compactions.iter().map(|x| x.clone()));
         }
 
         // TODO: Need bulk loading!
@@ -232,7 +239,7 @@ impl DynamoDBServiceImpl {
         for compaction in compactions {
             compaction_commits.insert(
                 compaction.clone(),
-                self.connector.describe_compaction(&mut self.compactions_cache, &ORG_ID.to_string(), compaction).await.map_err(from_modyne)?.unwrap()
+                self.connector.describe_compaction(&mut self.compactions_cache, &ORG_ID.to_string(), &compaction).await.map_err(from_modyne)?.unwrap()
             );
         }
 
@@ -379,6 +386,11 @@ impl DynamoDBServiceImpl {
             true => Ok(work_items),
             false => Ok(vec!())
         }
+    }
+
+    pub async fn get_cleanup_work_items(&mut self) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
+        // TODO
+        Ok(vec!())
     }
 
     pub async fn update_all_checkpoints(&mut self) -> Result<bool, ServiceApiError> {

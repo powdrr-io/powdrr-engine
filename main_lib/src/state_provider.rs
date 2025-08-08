@@ -5,7 +5,7 @@ use aws_sdk_dynamodb::Client;
 use modyne::TestTableExt;
 use tokio::sync::{mpsc, oneshot};
 use crate::{distributed_cache, peers::CheckpointDescriptor, pipeline::PipelineDefinition};
-use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
+use crate::data_contract::{CleanupWorkItem, CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
 use crate::dynamodb_state_provider::DynamoDbStateProvider;
 use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
@@ -144,6 +144,9 @@ enum StateProviderActorMessage {
     GetCompactionWorkItems {
         respond_to: oneshot::Sender<Result<Vec<(String, CompactionWorkItem)>, ServiceApiError>>,
     },
+    GetCleanupWorkItems {
+        respond_to: oneshot::Sender<Result<Vec<CleanupWorkItem>, ServiceApiError>>,
+    },
     GetPeerClients {
         respond_to: oneshot::Sender<Vec<Box<dyn PeerClient>>>,
     },
@@ -179,7 +182,7 @@ macro_rules! handle_message_impl {
 impl StateProviderActor {
     fn new(receiver: mpsc::Receiver<StateProviderActorMessage>) -> Self {
         StateProviderActor {
-            state_provider: StateProvider::Ephemeral(EphemeralStateProvider::new()),
+            state_provider: StateProvider::Ephemeral(EphemeralStateProvider::new(TestProcessingMode::default())),
             receiver,
             indexing_mode: IndexingMode::Disabled,
             compaction_mode: CompactionMode::Disabled,
@@ -228,9 +231,9 @@ impl StateProviderActor {
     async fn handle_message(&mut self, msg: StateProviderActorMessage) -> () {
         match msg {
             StateProviderActorMessage::SetMode { respond_to, mode } => {
-                match mode.state_mode {
-                    StateMode::Testing => self.state_provider = StateProvider::Ephemeral(EphemeralStateProvider::new()),
-                    StateMode::Ephemeral => self.state_provider = StateProvider::Ephemeral(EphemeralStateProvider::new()),
+                match &mode.state_mode {
+                    StateMode::Testing => self.state_provider = StateProvider::Ephemeral(EphemeralStateProvider::new(mode)),
+                    StateMode::Ephemeral => self.state_provider = StateProvider::Ephemeral(EphemeralStateProvider::new(mode)),
                     StateMode::TestingDynamoDb => {
                         let config = aws_config::defaults(BehaviorVersion::latest())
                             .region(Region::new("us-east-1")) // Region doesn't matter for local, but required
@@ -242,7 +245,7 @@ impl StateProviderActor {
                             .await;
 
                         let client = Client::new(&config);
-                        let provider = DynamoDbStateProvider::with_client(client);
+                        let provider = DynamoDbStateProvider::with_client(client, mode);
 
                         let _ = provider.service_impl.connector.delete_table().send().await;
                         let _create_table = match provider.service_impl.connector.create_table().send().await {
@@ -253,7 +256,7 @@ impl StateProviderActor {
                         };
                         self.state_provider = StateProvider::DynamoDb(provider);
                     },
-                    StateMode::Leaderless(address) => self.state_provider = StateProvider::Leaderless(LeaderlessStateProvider::new(address)),
+                    StateMode::Leaderless(address) => self.state_provider = StateProvider::Leaderless(LeaderlessStateProvider::new(mode.clone(), address.clone())),
                 }
                 respond_to.send(()).unwrap();
             },
@@ -324,6 +327,9 @@ impl StateProviderActor {
             },
             StateProviderActorMessage::GetCompactionWorkItems { respond_to } => {
                 handle_message_impl!(self, respond_to, get_compaction_work_items());
+            },
+            StateProviderActorMessage::GetCleanupWorkItems { respond_to } => {
+                handle_message_impl!(self, respond_to, get_cleanup_work_items());
             },
             StateProviderActorMessage::GetPeerClients { respond_to } => {
                 handle_message_impl!(self, respond_to, get_peer_clients());
@@ -456,6 +462,10 @@ impl StateProvider {
 
     pub async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
         state_provider_func_impl!(self, get_compaction_work_items())
+    }
+
+    pub async fn get_cleanup_work_items(&mut self) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
+        state_provider_func_impl!(self, get_cleanup_work_items())
     }
 
     pub async fn get_peer_clients(&mut self) -> Vec<Box<dyn PeerClient>> {
@@ -606,6 +616,10 @@ impl StateProviderHandle {
 
     pub async fn get_compaction_work_items(&self) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
         send_message!(self, GetCompactionWorkItems)
+    }
+
+    pub async fn get_cleanup_work_items(&self) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
+        send_message!(self, GetCleanupWorkItems)
     }
 
     pub async fn get_peer_clients(&self) -> Vec<Box<dyn PeerClient>> {

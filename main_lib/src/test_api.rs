@@ -50,9 +50,19 @@ impl IndexingMode {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub enum CompactionMode {
-    Async,
+    Async(Option<u64>),
     External(String),
     Disabled
+}
+
+impl CompactionMode {
+    const DEFAULT_NUM_FILES_THRESHOLD: u64 = 100;
+    pub(crate) fn threshold(&self) -> u64 {
+        match self {
+            CompactionMode::Async(threshold) => threshold.unwrap_or(Self::DEFAULT_NUM_FILES_THRESHOLD),
+            _ => Self::DEFAULT_NUM_FILES_THRESHOLD,
+        }
+    }
 }
 
 impl CompactionMode {
@@ -91,9 +101,9 @@ pub struct TestProcessingMode {
 impl TestProcessingMode {
     pub fn default() -> Self {
         Self {
-            state_mode: StateMode::TestingDynamoDb,
+            state_mode: StateMode::Testing,
             indexing_mode: IndexingMode::Sync,
-            compaction_mode: CompactionMode::Async,
+            compaction_mode: CompactionMode::Async(None),
             prefetch_mode: PrefetchMode::Disabled,
         }
     }
