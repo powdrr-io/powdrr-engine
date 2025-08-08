@@ -354,7 +354,6 @@ impl EphemeralServiceImpl {
 
         match self.compaction_work_items.get(table_name) {
             Some(tracker) => {
-                println!("Deleting Compaction work item");
                 assert!(tracker.in_progress);
                 assert_eq!(tracker.work_item.checkpoint_id_to_replace, compaction_obj.checkpoint_id_to_replace);
                 self.compaction_work_items.remove(table_name);
@@ -648,7 +647,6 @@ impl EphemeralServiceImpl {
             &iceberg_files
         );
 
-        println!("Iceberg commit has compactions: {}", iceberg_commit.compactions.join(", "));
         for compaction in iceberg_commit.compactions.iter() {
             let cleanup_work_item = self.replace_and_delete_checkpoints(compaction, &iceberg_commit.metadata);
             self.cleanup_work_items.push(cleanup_work_item);
