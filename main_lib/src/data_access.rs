@@ -789,3 +789,13 @@ pub(crate) async fn print_datafusion_tables() -> () {
 
     table_df.show().await.unwrap();
 }
+
+pub(crate) async fn delete_s3_files(file_paths: &Vec<String>) -> () {
+    for file_path in file_paths {
+        let path = object_store::path::Path::parse(file_path).unwrap();
+        match S3_FILE_STORE.as_ref().delete(&path).await {
+            Ok(_) => (),
+            Err(e) => panic!("Failed to delete file {}: {}", file_path, e)
+        }
+    }
+}

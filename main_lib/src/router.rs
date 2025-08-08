@@ -1054,6 +1054,9 @@ pub(crate) mod tests {
         ).perform().unwrap();
 
         assert_eq!(process_work_response.status(), 200);
+        let body = process_work_response.read_body().unwrap();
+        let str_body = str::from_utf8(&body).unwrap();
+        let snapshot_id = str_body.parse::<u64>().unwrap();
 
         let body_obj  = r#"
         {
@@ -1103,7 +1106,7 @@ pub(crate) mod tests {
 
         let process_work_response = test_server.client().put(
             "http://localhost/_test/v1/_process_work",
-            "",
+            snapshot_id.to_string(),
             mime::TEXT_PLAIN,
         ).perform().unwrap();
 

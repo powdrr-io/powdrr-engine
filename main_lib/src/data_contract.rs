@@ -512,6 +512,12 @@ pub struct CompactionWorkItem {
     pub checkpoints_to_delete: Vec<String>,
 }
 
+#[derive(Clone)]
+pub(crate) struct CompactionWorkItemTracker {
+    pub(crate) in_progress: bool,
+    pub(crate) work_item: CompactionWorkItem
+}
+
 
 impl CompactionWorkItem {
     pub fn merge_speedboat(&mut self, commit: &SpeedboatCommit) -> () {

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use idgenerator::IdInstance;
-use crate::data_contract::{CleanupWorkItem, CreateIndexTemplateBody, IcebergMetadata};
+use crate::data_contract::{CleanupWorkItem, CompactionWorkItemTracker, CreateIndexTemplateBody, IcebergMetadata};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::pipeline::PipelineDefinition;
 use crate::schema_massager::PowdrrSchema;
@@ -21,7 +21,7 @@ pub struct EphemeralServiceImpl {
     pipelines: HashMap<String, PipelineDefinition>,
     lifetime_policies: HashMap<String, ILMPolicyDefinition>,
     latest_committed_checkpoint_id: HashMap<Option<String>, CommittedCheckpoints>,
-    compaction_work_items: HashMap<String, CompactionWorkItem>,
+    compaction_work_items: HashMap<String, CompactionWorkItemTracker>,
     not_compacted_checkpoint_ids: HashMap<String, Vec<String>>,
     extension_work_items: HashMap<String, HashMap<String, ExtensionWorkItem>>,
     cleanup_work_items: Vec<CleanupWorkItem>,
@@ -321,7 +321,7 @@ impl EphemeralServiceImpl {
         Ok(())
     }
 
-    fn replace_and_delete_checkpoints(&mut self, compaction: &String, iceberg_metadata: &IcebergMetadata) -> () {
+    fn replace_and_delete_checkpoints(&mut self, compaction: &String, iceberg_metadata: &IcebergMetadata) -> CleanupWorkItem {
         let (table_name, compaction_obj) = self.compactions.get(compaction).unwrap();
 
         let checkpoint_key = format!("{}_{}", table_name, compaction_obj.checkpoint_id_to_replace);
@@ -351,6 +351,22 @@ impl EphemeralServiceImpl {
             assert!(self.checkpoints.contains_key(&checkpoint_key));
             self.checkpoints.remove(&checkpoint_key);
         }
+
+        match self.compaction_work_items.get(table_name) {
+            Some(tracker) => {
+                println!("Deleting Compaction work item");
+                assert!(tracker.in_progress);
+                assert_eq!(tracker.work_item.checkpoint_id_to_replace, compaction_obj.checkpoint_id_to_replace);
+                self.compaction_work_items.remove(table_name);
+            },
+            None => {
+                panic!("Compaction work item missing = {}", table_name);
+            }
+        }
+
+        CleanupWorkItem {
+            files_to_delete: compaction_obj.removed_speedboat_files.iter().chain(compaction_obj.removed_delete_files.iter()).map(|x|x.clone()).collect(),
+        }
     }
 
     fn maybe_create_compaction_work_item(&mut self, checkpoint: &TableMetadataCheckpoint) -> () {
@@ -360,9 +376,8 @@ impl EphemeralServiceImpl {
             return;
         }
 
-        // We only compact speedboat so new speedboat metadata means no work item
+        // We only compact speedboat so no speedboat metadata means no work item
         if checkpoint.speedboat_metadata.is_none() {
-            self.not_compacted_checkpoint_ids.get_mut(&checkpoint.table_name).unwrap().push(checkpoint.checkpoint_id.clone());
             return;
         }
 
@@ -373,12 +388,15 @@ impl EphemeralServiceImpl {
         if compact {
             self.compaction_work_items.insert(
                 checkpoint.table_name.clone(),
-                CompactionWorkItem {
-                    table_schema: checkpoint.schema.clone(),
-                    speedboat_files: speedboat_files.clone(),
-                    delete_files: checkpoint.deletes_metadata.as_ref().map_or(vec![], |x| x.files.clone()),
-                    checkpoint_id_to_replace: checkpoint.checkpoint_id.clone(),
-                    checkpoints_to_delete: self.not_compacted_checkpoint_ids.get(&checkpoint.table_name).unwrap().clone(),
+                CompactionWorkItemTracker {
+                    work_item: CompactionWorkItem {
+                        table_schema: checkpoint.schema.clone(),
+                        speedboat_files: speedboat_files.clone(),
+                        delete_files: checkpoint.deletes_metadata.as_ref().map_or(vec![], |x| x.files.clone()),
+                        checkpoint_id_to_replace: checkpoint.checkpoint_id.clone(),
+                        checkpoints_to_delete: self.not_compacted_checkpoint_ids.get(&checkpoint.table_name).unwrap().clone(),
+                    },
+                    in_progress: false
                 }
             );
             self.not_compacted_checkpoint_ids.get_mut(&checkpoint.table_name).unwrap().clear();
@@ -630,8 +648,10 @@ impl EphemeralServiceImpl {
             &iceberg_files
         );
 
+        println!("Iceberg commit has compactions: {}", iceberg_commit.compactions.join(", "));
         for compaction in iceberg_commit.compactions.iter() {
-            self.replace_and_delete_checkpoints(compaction, &iceberg_commit.metadata);
+            let cleanup_work_item = self.replace_and_delete_checkpoints(compaction, &iceberg_commit.metadata);
+            self.cleanup_work_items.push(cleanup_work_item);
         }
 
         Ok(())
@@ -702,14 +722,20 @@ impl EphemeralServiceImpl {
 
     pub async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
         let mut work_items = vec!();
-        for (table_name, compaction) in self.compaction_work_items.iter_mut() {
-            work_items.push((table_name.clone(), compaction.clone()));
+        for (table_name, compaction_tracker) in self.compaction_work_items.iter_mut() {
+            if !compaction_tracker.in_progress {
+                tracing::info!("Returning compaction work item for {}", table_name);
+                work_items.push((table_name.clone(), compaction_tracker.work_item.clone()));
+                compaction_tracker.in_progress = true;
+            }
         }
-        self.compaction_work_items.clear();
         Ok(work_items)
     }
 
     pub async fn get_cleanup_work_items(&mut self) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
-        Ok(vec!())
+        let work_items = self.cleanup_work_items.clone();
+        tracing::info!("Returning {} cleanup work items", work_items.len());
+        self.cleanup_work_items.clear();
+        Ok(work_items)
     }
 }
