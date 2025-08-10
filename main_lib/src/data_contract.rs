@@ -473,6 +473,7 @@ impl FileSetPayload {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ExtensionWorkItem {
+    pub id: String,
     pub extension_type: String,
     pub table_name: String,
     pub table_schema: PowdrrSchema,

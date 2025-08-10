@@ -253,6 +253,7 @@ pub(crate) async fn create_index(work_item: &ExtensionWorkItem) -> Result<(), In
     match STATE_PROVIDER.extension_commit(
         &work_item.table_name,
         &ExtensionCommit {
+            id: work_item.id.clone(),
             extension: "es".to_string(),
             files: final_result.clone()
         }

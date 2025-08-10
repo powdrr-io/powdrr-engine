@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use idgenerator::IdInstance;
 use modyne::{expr, keys, model::TransactWrite, projections, read_projection, Aggregate, Entity, EntityExt, Error, Item, ProjectionExt, QueryInput, QueryInputExt, Table};
 use modyne::expr::Filter;
-use crate::data_contract::{CleanupWorkItem, CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableMetadataCheckpoint};
+use crate::data_contract::{CleanupWorkItem, CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody, ExtensionCommit, ExtensionWorkItem, FileSetPayload, IcebergCommit, SpeedboatCommit, TableMetadataCheckpoint};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::pipeline::PipelineDefinition;
 use crate::schema_massager::{PowdrrSchema};
@@ -369,14 +369,14 @@ macro_rules! powdrr_named_cached_entity_core {
 
             #[allow(dead_code)]
             impl DynamoDbConnector {
-                fn [< cached_create_ $entity_name _core >](transaction: TransactWrite, cache: &mut [< PowdrrNamed $type_name Cache >], org_id: &String, name: &String, template: &$type_name) -> TransactWrite {
+                fn [< cached_create_ $entity_name _core >](&self, transaction: TransactWrite, cache: &mut [< PowdrrNamed $type_name Cache >], org_id: &String, name: &String, template: &$type_name) -> TransactWrite {
                     let key = CacheKey{ org_id: org_id.clone(), name: name.clone() };
                     cache.cache.insert(key.clone(), template.clone());
                     self.[< private_create_ $entity_name _core >](transaction, org_id, name, template)
                 }
 
                 async fn [< cached_create_ $entity_name >](&self, cache: &mut [< PowdrrNamed $type_name Cache >], org_id: &String, name: &String, template: &$type_name) -> Result<(), Error> {
-                    Self::[< cached_create_ $entity_name _core >](TransactWrite::new(), cache, org_id, name, template).execute(self).await?;
+                    self.[< cached_create_ $entity_name _core >](TransactWrite::new(), cache, org_id, name, template).execute(self).await?;
                     Ok(())
                 }
 
@@ -765,6 +765,65 @@ impl DynamoDbConnector {
         }
     }
 
+    pub async fn commit_speedboat(&self, org_id: &String, table_name: &String, commit: &SpeedboatCommit) -> Result<bool, Error> {
+        let mut transaction = TransactWrite::new();
+
+        let speedboat_commit_id = &IdInstance::next_id().to_string();
+        transaction = self.private_create_speedboat_commit_core(transaction, org_id, speedboat_commit_id, commit);
+        transaction = Self::create_speedboat_commit_checkpointed_core(transaction, org_id, table_name, speedboat_commit_id, None);
+
+        let latest_es_key = &Self::latest_extension_work_item_key(&table_name, &"es".to_string());
+        let latest_es = self.describe_latest(org_id, latest_es_key).await?;
+        assert!(latest_es.is_some());
+        let new_es_id = IdInstance::next_id().to_string();
+        let mut work_item = if latest_es.as_ref().unwrap().entity_id == Self::NO_WORK_ITEM {
+            ExtensionWorkItem {
+                id: new_es_id.clone(),
+                extension_type: "es".to_string(),
+                table_name: table_name.to_string(),
+                table_schema: PowdrrSchema::minimal(),
+                speedboat_files: FileSetPayload::new(),
+                iceberg_files: FileSetPayload::new()
+            }
+        } else {
+            self.describe_extension_work_item(&mut PowdrrNamedExtensionWorkItemCache::new(), org_id, &latest_es.as_ref().unwrap().entity_id).await?.unwrap()
+        };
+        work_item.merge_speedboat(commit);
+        transaction = self.cached_create_extension_work_item_core(transaction, &mut PowdrrNamedExtensionWorkItemCache::new(), org_id, &work_item.id, &work_item);
+        transaction = Self::bump_version(transaction, latest_es.as_ref().unwrap(), &Self::NO_WORK_ITEM.to_string());
+
+        let latest_compaction_key = &Self::latest_compaction_work_item_key(table_name);
+        let latest_compaction = self.describe_latest(org_id, latest_compaction_key).await?;
+        assert!(latest_compaction.is_some());
+        let mut work_item = if latest_compaction.as_ref().unwrap().entity_id == Self::NO_WORK_ITEM {
+            CompactionWorkItem {
+                table_schema: PowdrrSchema::minimal(),
+                speedboat_files: FileSetPayload::new(),
+                delete_files: vec![],
+                checkpoint_id_to_replace: "".to_string(),
+                checkpoints_to_delete: vec![],
+            }
+        } else {
+            self.describe_compaction_work_item(&mut PowdrrNamedCompactionWorkItemCache::new(), org_id, &latest_compaction.as_ref().unwrap().entity_id).await?.unwrap()
+        };
+        work_item.merge_speedboat(commit);
+        let compaction_new_id = &IdInstance::next_id().to_string();
+        transaction = self.private_create_compaction_work_item_core(transaction, org_id, compaction_new_id, &work_item);
+        transaction = Self::bump_version(transaction, latest_compaction.as_ref().unwrap(), &Self::NO_WORK_ITEM.to_string());
+
+        match transaction.execute(self).await {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                if e.as_service_error().unwrap().is_transaction_canceled_exception() {
+                    Ok(false)
+                } else {
+                    Err(e.into())
+                }
+            }
+        }
+
+    }
+
     pub async fn commit_extension_work_item_completed(&self, org_id: &String, table_name: &String, commit: &ExtensionCommit) -> Result<bool, Error> {
         let mut transaction = TransactWrite::new();
 
@@ -772,6 +831,16 @@ impl DynamoDbConnector {
         transaction = self.private_create_extension_commit_core(transaction, org_id, &commit.id, &commit);
         transaction = Self::create_extension_commit_checkpointed_core(transaction, org_id, table_name, &commit.id, None);
 
+        match transaction.execute(self).await {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                if e.as_service_error().unwrap().is_transaction_canceled_exception() {
+                    Ok(false)
+                } else {
+                    Err(e.into())
+                }
+            }
+        }
     }
 }
 

@@ -169,6 +169,7 @@ impl EphemeralServiceImpl {
             es_work_items.insert(
                 table_name.clone(),
                 ExtensionWorkItem {
+                    id: IdInstance::next_id().to_string(),
                     extension_type: extension.clone(),
                     table_name: table_name.clone(),
                     table_schema: schema.clone(),

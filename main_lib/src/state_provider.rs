@@ -213,6 +213,7 @@ impl StateProviderActor {
                     match self.state_provider.extension_commit(
                         &table_name,
                         &ExtensionCommit {
+                            id: work_item.id.clone(),
                             extension: "es".to_owned(),
                             files: metadata,
                         }

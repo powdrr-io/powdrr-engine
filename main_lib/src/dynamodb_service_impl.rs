@@ -148,9 +148,10 @@ impl DynamoDBServiceImpl {
         self.connector.describe_lifetime_policy(&ORG_ID.to_string(), name).await.map_err(from_modyne)
     }
 
-    pub async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), ServiceApiError> {
+    pub async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<bool, ServiceApiError> {
         let tables: Vec<String> = commit.type_files.iter().map(|x|x.table_name.clone()).collect();
-        let id = &IdInstance::next_id().to_string();
+        assert_eq!(tables.len(), 1, "Only really support single table commits right now");
+        let speedboat_commit_id = &IdInstance::next_id().to_string();
         self.connector.create_speedboat_commit(&mut self.speedboat_cache, &ORG_ID.to_string(), id, commit).await.map_err(from_modyne)?;
         self.connector.create_speedboat_commit_checkpointed(&ORG_ID.to_string(), &tables[0], id).await.map_err(from_modyne)?;
 
@@ -159,8 +160,10 @@ impl DynamoDBServiceImpl {
             let latest_key = &Self::latest_extension_work_item_key(&tables[0], &"es".to_string());
             let latest_es = self.connector.describe_latest(&ORG_ID.to_string(), latest_key).await.map_err(from_modyne)?;
             assert!(latest_es.is_some());
+            let new_id = IdInstance::next_id().to_string();
             let mut work_item = if latest_es.as_ref().unwrap().entity_id == Self::NO_WORK_ITEM {
                 ExtensionWorkItem {
+                    id: new_id.clone(),
                     extension_type: "es".to_string(),
                     table_name: tables[0].to_string(),
                     table_schema: PowdrrSchema::minimal(),
@@ -171,9 +174,8 @@ impl DynamoDBServiceImpl {
                 self.connector.describe_extension_work_item(&mut self.extension_work_item_cache, &ORG_ID.to_string(), &latest_es.as_ref().unwrap().entity_id).await.map_err(from_modyne)?.unwrap()
             };
             work_item.merge_speedboat(commit);
-            let new_id = &IdInstance::next_id().to_string();
-            self.connector.create_extension_work_item(&mut self.extension_work_item_cache, &ORG_ID.to_string(),new_id, &work_item).await.map_err(from_modyne)?;
-            match self.connector.commit_work_item(latest_es.as_ref().unwrap(), new_id).await.map_err(from_modyne)? {
+            self.connector.create_extension_work_item(&mut self.extension_work_item_cache, &ORG_ID.to_string(), &work_item.id, &work_item).await.map_err(from_modyne)?;
+            match self.connector.commit_work_item(latest_es.as_ref().unwrap(), &work_item.id).await.map_err(from_modyne)? {
                 true => break,
                 false => ()
             }
@@ -266,8 +268,10 @@ impl DynamoDBServiceImpl {
             let latest_key = &Self::latest_extension_work_item_key(table_name, &"es".to_string());
             let latest_es = self.connector.describe_latest(&ORG_ID.to_string(), latest_key).await.map_err(from_modyne)?;
             assert!(latest_es.is_some());
+            let new_id = IdInstance::next_id().to_string();
             let mut work_item = if latest_es.as_ref().unwrap().entity_id == Self::NO_WORK_ITEM {
                 ExtensionWorkItem {
+                    id: new_id.clone(),
                     extension_type: "es".to_string(),
                     table_name: table_name.clone(),
                     table_schema: PowdrrSchema::minimal(),
@@ -278,9 +282,8 @@ impl DynamoDBServiceImpl {
                 self.connector.describe_extension_work_item(&mut self.extension_work_item_cache, &ORG_ID.to_string(), &latest_es.as_ref().unwrap().entity_id).await.map_err(from_modyne)?.unwrap()
             };
             work_item.merge_iceberg(iceberg_commit);
-            let new_id = &IdInstance::next_id().to_string();
-            self.connector.create_extension_work_item(&mut self.extension_work_item_cache, &ORG_ID.to_string(),new_id, &work_item).await.map_err(from_modyne)?;
-            match self.connector.commit_work_item(latest_es.as_ref().unwrap(), new_id).await.map_err(from_modyne)? {
+            self.connector.create_extension_work_item(&mut self.extension_work_item_cache, &ORG_ID.to_string(), &work_item.id, &work_item).await.map_err(from_modyne)?;
+            match self.connector.commit_work_item(latest_es.as_ref().unwrap(), &work_item.id).await.map_err(from_modyne)? {
                 true => break,
                 false => ()
             }
@@ -290,10 +293,10 @@ impl DynamoDBServiceImpl {
     }
 
     pub async fn extension_commit(&mut self, table_name: &String, commit: &ExtensionCommit) -> Result<(), ServiceApiError> {
-        self.connector.create_extension_commit(&mut self.extension_cache, &ORG_ID.to_string(), &commit.id, commit).await.map_err(from_modyne)?;
-        self.connector.create_extension_commit_checkpointed(&ORG_ID.to_string(), table_name, &commit.id).await.map_err(from_modyne)?;
-        DynamoDbConnector::mark_done_extension_work_item_lease_inner(&ORG_ID.to_string(), table_name, &commit.id, Some(0)).await.map_err(from_modyne)?;
-        Ok(())
+        match self.connector.commit_extension_work_item_completed(&ORG_ID.to_string(), table_name, &commit).await.map_err(from_modyne)? {
+            true => Ok(()),
+            false => Err(ServiceApiError{ message: "Unable to commit, conflict detected".to_string() })
+        }
     }
 
     pub async fn compaction_commit(&mut self, _table_name: &String, commit: &CompactionCommit) -> Result<(), ServiceApiError> {
