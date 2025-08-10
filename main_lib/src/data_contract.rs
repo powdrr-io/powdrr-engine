@@ -98,6 +98,7 @@ pub type ExtensionFileMetadata = HashMap<String, Vec<ExtensionFile>>;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ExtensionCommit {
+    pub id: String,
     pub extension: String,
     pub files: ExtensionFileMetadata
 }

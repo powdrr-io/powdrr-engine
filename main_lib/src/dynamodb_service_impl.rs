@@ -5,7 +5,7 @@ use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
 use crate::state_provider::ServiceApiError;
-use crate::dynamodb::{DynamoDbConnector, PowdrrNamedCompactionCommitCache, PowdrrNamedCompactionWorkItemCache, PowdrrNamedExtensionCommitCache, PowdrrNamedExtensionWorkItemCache, PowdrrNamedIcebergCommitCache, PowdrrNamedSpeedboatCommitCache, PowdrrNamedTableMetadataCheckpointCache, TableBody};
+use crate::dynamodb::{DynamoDbConnector, PowdrrNamedCompactionCommitCache, PowdrrNamedCompactionWorkItemCache, PowdrrNamedExtensionCommitCache, PowdrrNamedExtensionWorkItemCache, PowdrrNamedIcebergCommitCache, PowdrrNamedSpeedboatCommitCache, PowdrrNamedTableMetadataCheckpointCache, PowdrrTracker, TableBody};
 use crate::schema_massager::PowdrrSchema;
 use crate::test_api::TestProcessingMode;
 
@@ -290,9 +290,9 @@ impl DynamoDBServiceImpl {
     }
 
     pub async fn extension_commit(&mut self, table_name: &String, commit: &ExtensionCommit) -> Result<(), ServiceApiError> {
-        let id = &IdInstance::next_id().to_string();
-        self.connector.create_extension_commit(&mut self.extension_cache, &ORG_ID.to_string(), id, commit).await.map_err(from_modyne)?;
-        self.connector.create_extension_commit_checkpointed(&ORG_ID.to_string(), table_name, id).await.map_err(from_modyne)?;
+        self.connector.create_extension_commit(&mut self.extension_cache, &ORG_ID.to_string(), &commit.id, commit).await.map_err(from_modyne)?;
+        self.connector.create_extension_commit_checkpointed(&ORG_ID.to_string(), table_name, &commit.id).await.map_err(from_modyne)?;
+        DynamoDbConnector::mark_done_extension_work_item_lease_inner(&ORG_ID.to_string(), table_name, &commit.id, Some(0)).await.map_err(from_modyne)?;
         Ok(())
     }
 
@@ -346,7 +346,7 @@ impl DynamoDBServiceImpl {
                 }
             }
         }
-        match self.connector.commit_work_item_taken(&used_latest, &Self::NO_WORK_ITEM.to_string()).await.map_err(from_modyne)? {
+        match self.connector.commit_extension_work_item_taken(&used_latest, &Self::NO_WORK_ITEM.to_string()).await.map_err(from_modyne)? {
             true => Ok(work_items),
             false => Ok(vec!())
         }
@@ -382,7 +382,7 @@ impl DynamoDBServiceImpl {
                 }
             }
         }
-        match self.connector.commit_work_item_taken(&used_latest, &Self::NO_WORK_ITEM.to_string()).await.map_err(from_modyne)? {
+        match self.connector.commit_compaction_work_item_taken(&used_latest, &Self::NO_WORK_ITEM.to_string()).await.map_err(from_modyne)? {
             true => Ok(work_items),
             false => Ok(vec!())
         }
@@ -408,7 +408,7 @@ impl DynamoDBServiceImpl {
 
         println!("Updating checkpoint for table {}", table_name);
 
-        let latest_speedboat_trackers = self.connector.oldest_available_speedboat_commit_checkpointed(&ORG_ID.to_string(), table_name, None).await.map_err(from_modyne)?;
+        let latest_speedboat_trackers = self.connector.oldest_available_speedboat_commit_checkpointed(&ORG_ID.to_string(), table_name, None, None).await.map_err(from_modyne)?;
         if latest_speedboat_trackers.len() == 0 {
             return Ok(false);
         }
@@ -449,7 +449,7 @@ impl DynamoDBServiceImpl {
     }
 
     async fn update_extension_checkpoint(&mut self, table_name: &String) -> Result<bool, ServiceApiError> {
-        let latest_extension_trackers = self.connector.oldest_available_extension_commit_checkpointed(&ORG_ID.to_string(), table_name, None).await.map_err(from_modyne)?;
+        let latest_extension_trackers = self.connector.oldest_available_extension_commit_checkpointed(&ORG_ID.to_string(), table_name, None, None).await.map_err(from_modyne)?;
         if latest_extension_trackers.len() == 0 {
             return Ok(false);
         }
@@ -459,7 +459,7 @@ impl DynamoDBServiceImpl {
             extension_commits.push(self.connector.describe_extension_commit(&mut self.extension_cache, &ORG_ID.to_string(), &tracker.name).await.map_err(from_modyne)?.unwrap());
         }
 
-        let waiting_checkpoints = self.connector.oldest_available_checkpoint_waiting_for_extension(&ORG_ID.to_string(), table_name, None).await.map_err(from_modyne)?;
+        let waiting_checkpoints = self.connector.oldest_available_checkpoint_waiting_for_extension(&ORG_ID.to_string(), table_name, None, None).await.map_err(from_modyne)?;
         let mut work_done = false;
         for checkpoint_tracker in waiting_checkpoints.iter() {
             // TODO: all commits per loop should be in a transaction
