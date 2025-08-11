@@ -344,7 +344,7 @@ impl DynamoDBServiceImpl {
         if new_checkpoint.speedboat_metadata.is_some() {
             let speedboat_files = &new_checkpoint.speedboat_metadata.as_ref().unwrap().files;
             // TODO: do the real policy here
-            let compact = speedboat_files.file_paths.len() as u64 >= 1 || speedboat_files.sizes.iter().sum::<u64>() > 30 * 1024 * 1024;
+            let compact = speedboat_files.file_paths.len() as u64 >= 10 || speedboat_files.sizes.iter().sum::<u64>() > 30 * 1024 * 1024;
             if compact {
                 let latest_compaction = self.connector.describe_latest(&ORG_ID.to_string(), &Self::latest_compaction_work_item_key(table_name)).await.map_err(from_modyne)?.unwrap();
                 if latest_compaction.entity_id == Self::NO_WORK_ITEM.to_owned() {

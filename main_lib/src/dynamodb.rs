@@ -685,6 +685,7 @@ impl DynamoDbConnector {
         }
 
         if compaction_work_item.is_some() {
+            assert!(compaction_latest.is_some());
             let compaction_work_item_id = IdInstance::next_id().to_string();
             transaction = self.private_create_compaction_work_item_core(transaction, &input_latest.org_id, &compaction_work_item_id, compaction_work_item.as_ref().unwrap());
             transaction = Self::bump_version(transaction, compaction_latest.as_ref().unwrap(), &compaction_work_item_id);
@@ -927,6 +928,7 @@ impl DynamoDbConnector {
             assert!(checkpoint_to_replace.original_checkpoint_id.is_none());
             checkpoint_to_replace.original_checkpoint_id = Some(compaction_commit.checkpoint_id_to_replace.clone());
 
+            // TODO: actually commit the checkpoint
             // TODO: delete the listed checkpoints
             // TODO: create cleanup work items
         }
