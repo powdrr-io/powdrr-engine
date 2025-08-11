@@ -6,7 +6,9 @@ use std::ops::Deref;
 use std::sync::Arc;
 use arrow_json::reader::infer_json_schema;
 use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema};
+use datafusion::logical_expr::UserDefinedLogicalNode;
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use iceberg::spec::{PrimitiveType, Type};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -141,6 +143,70 @@ impl PowdrrSchema {
                     data_type: PowdrrDataType::String
                 }
             ],
+        }
+    }
+
+    pub fn from_iceberg(iceberg_schema: &Arc<iceberg::spec::Schema>) -> Self {
+        let mut fields = vec!();
+        for field in iceberg_schema.as_struct().fields().iter() {
+            match *field.field_type.clone() {
+                Type::Primitive(primitive_type) => {
+                    match primitive_type {
+                        PrimitiveType::Boolean => {
+                            fields.push(PowdrrField {
+                                name: field.name.clone(),
+                                data_type: PowdrrDataType::Boolean
+                            });
+                        }
+                        PrimitiveType::Int => {
+                            fields.push(PowdrrField {
+                                name: field.name.clone(),
+                                data_type: PowdrrDataType::Integer
+                            });
+                        },
+                        PrimitiveType::Long => {
+                            fields.push(PowdrrField {
+                                name: field.name.clone(),
+                                data_type: PowdrrDataType::Integer
+                            });
+                        },
+                        PrimitiveType::Float => {
+                            fields.push(PowdrrField {
+                                name: field.name.clone(),
+                                data_type: PowdrrDataType::Float
+                            });
+                        },
+                        PrimitiveType::Double => {
+                            fields.push(PowdrrField {
+                                name: field.name.clone(),
+                                data_type: PowdrrDataType::Float
+                            });
+                        },
+                        PrimitiveType::Decimal { .. } => todo!(),
+                        PrimitiveType::Date => todo!(),
+                        PrimitiveType::Time => todo!(),
+                        PrimitiveType::Timestamp => todo!(),
+                        PrimitiveType::Timestamptz => todo!(),
+                        PrimitiveType::TimestampNs => todo!(),
+                        PrimitiveType::TimestamptzNs => todo!(),
+                        PrimitiveType::String =>  {
+                            fields.push(PowdrrField {
+                                name: field.name.clone(),
+                                data_type: PowdrrDataType::String
+                            });
+                        },
+                        PrimitiveType::Uuid => todo!(),
+                        PrimitiveType::Fixed(_) => todo!(),
+                        PrimitiveType::Binary => todo!(),
+                    }
+                }
+                Type::Struct(_) => todo!(),
+                Type::List(_) => todo!(),
+                Type::Map(_) => todo!(),
+            }
+        }
+        PowdrrSchema {
+            fields
         }
     }
 

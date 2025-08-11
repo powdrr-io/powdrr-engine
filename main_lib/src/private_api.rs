@@ -225,10 +225,11 @@ async fn process_iceberg_file(
     deletes_table_name: &String,
     use_cpu_threadpool: bool,
 ) -> Result<Vec<RecordBatch>, PrivateApiError> {
-    let local_name = match ensure_loaded(&iceberg_file.file_path, iceberg_file_extensions,1,true, None).await {
+    let local_name = match ensure_loaded(&iceberg_file.file_path, iceberg_file_extensions,1,true, Some(table_schema.clone())).await {
         Ok(ln) => ln,
         Err(e) => return Err(PrivateApiError::from(e)),
     };
+
     let local_results = match execute_sql(&sql.build(table_schema, &iceberg_file.schema), &local_name, deletes_table_name, use_cpu_threadpool).await {
         Ok(vrb) => vrb,
         Err(e) => {
