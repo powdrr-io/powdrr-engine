@@ -1,12 +1,10 @@
 use std::collections::HashMap;
-use idgenerator::IdInstance;
-use crate::data_contract::{TableDescription, CreateIndexTemplateBody, CompactionWorkItem, ExtensionWorkItem, CompactionCommit, TableMetadataCheckpoint, ExtensionCommit, CreateTable, SpeedboatCommit, IcebergCommit, FileSetPayload, SpeedboatCommitTableInfo, CleanupWorkItem};
+use crate::data_contract::{TableDescription, CreateIndexTemplateBody, CompactionWorkItem, ExtensionWorkItem, CompactionCommit, TableMetadataCheckpoint, ExtensionCommit, CreateTable, SpeedboatCommit, IcebergCommit, SpeedboatCommitTableInfo, CleanupWorkItem};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
 use crate::state_provider::ServiceApiError;
 use crate::dynamodb::{DynamoDbConnector, PowdrrNamedCompactionCommitCache, PowdrrNamedCompactionWorkItemCache, PowdrrNamedExtensionCommitCache, PowdrrNamedExtensionWorkItemCache, PowdrrNamedIcebergCommitCache, PowdrrNamedSpeedboatCommitCache, PowdrrNamedTableMetadataCheckpointCache, TableBody};
-use crate::schema_massager::PowdrrSchema;
 use crate::test_api::TestProcessingMode;
 
 fn from_modyne(e: modyne::Error) -> ServiceApiError {
@@ -83,7 +81,7 @@ impl DynamoDBServiceImpl {
                     schema: Some(metadata.schema.clone()),
                 }),
                 compaction: None
-            }).await?
+            }).await?;
         }
         if metadata.iceberg_metadata.is_some() {
             self.iceberg_commit(
@@ -93,7 +91,7 @@ impl DynamoDBServiceImpl {
                     deletes_table_info: None,
                     compactions: vec![],
                 },
-            ).await?
+            ).await?;
         }
         if metadata.deletes_metadata.is_some() {
             todo!("Need to implement this now")
@@ -150,59 +148,9 @@ impl DynamoDBServiceImpl {
 
     pub async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), ServiceApiError> {
         let tables: Vec<String> = commit.type_files.iter().map(|x|x.table_name.clone()).collect();
-        let id = &IdInstance::next_id().to_string();
-        self.connector.create_speedboat_commit(&mut self.speedboat_cache, &ORG_ID.to_string(), id, commit).await.map_err(from_modyne)?;
-        self.connector.create_speedboat_commit_checkpointed(&ORG_ID.to_string(), &tables[0], id).await.map_err(from_modyne)?;
-
-        // Everything in this loop just to create an ES work item. Yikes.
-        loop {
-            let latest_key = &Self::latest_extension_work_item_key(&tables[0], &"es".to_string());
-            let latest_es = self.connector.describe_latest(&ORG_ID.to_string(), latest_key).await.map_err(from_modyne)?;
-            assert!(latest_es.is_some());
-            let mut work_item = if latest_es.as_ref().unwrap().entity_id == Self::NO_WORK_ITEM {
-                ExtensionWorkItem {
-                    extension_type: "es".to_string(),
-                    table_name: tables[0].to_string(),
-                    table_schema: PowdrrSchema::minimal(),
-                    speedboat_files: FileSetPayload::new(),
-                    iceberg_files: FileSetPayload::new()
-                }
-            } else {
-                self.connector.describe_extension_work_item(&mut self.extension_work_item_cache, &ORG_ID.to_string(), &latest_es.as_ref().unwrap().entity_id).await.map_err(from_modyne)?.unwrap()
-            };
-            work_item.merge_speedboat(commit);
-            let new_id = &IdInstance::next_id().to_string();
-            self.connector.create_extension_work_item(&mut self.extension_work_item_cache, &ORG_ID.to_string(),new_id, &work_item).await.map_err(from_modyne)?;
-            match self.connector.commit_work_item(latest_es.as_ref().unwrap(), new_id).await.map_err(from_modyne)? {
-                true => break,
-                false => ()
-            }
-        }
-
-        /* TODO: Need to redo this
-        // Everything in this loop just to create a compaction work item. Yikes.
-        loop {
-            let latest_key = &Self::latest_compaction_work_item_key(&tables[0]);
-            let latest_es = self.connector.describe_latest(&ORG_ID.to_string(), latest_key).await.map_err(from_modyne)?;
-            assert!(latest_es.is_some());
-            let mut work_item = if latest_es.as_ref().unwrap().entity_id == Self::NO_WORK_ITEM {
-                CompactionWorkItem {
-                    table_schema: PowdrrSchema::minimal(),
-                    speedboat_files: FileSetPayload::new(),
-                    delete_files: vec![],
-                }
-            } else {
-                self.connector.describe_compaction_work_item(&mut self.compaction_work_item_cache, &ORG_ID.to_string(), &latest_es.as_ref().unwrap().entity_id).await.map_err(from_modyne)?.unwrap()
-            };
-            work_item.merge_speedboat(commit);
-            let new_id = &IdInstance::next_id().to_string();
-            self.connector.create_compaction_work_item(&mut self.compaction_work_item_cache, &ORG_ID.to_string(),new_id, &work_item).await.map_err(from_modyne)?;
-            match self.connector.commit_work_item(latest_es.as_ref().unwrap(), new_id).await.map_err(from_modyne)? {
-                true => break,
-                false => ()
-            }
-        }
-        */
+        //assert_eq!(tables.len(), 1, "Only really support single table commits right now");
+        // TODO: change to return result bool
+        self.connector.commit_speedboat(&ORG_ID.to_string(), &tables[0], commit).await.map_err(from_modyne)?;
         Ok(())
     }
 
@@ -247,53 +195,19 @@ impl DynamoDBServiceImpl {
     }
 
     pub async fn iceberg_commit(&mut self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError> {
-        let id = &IdInstance::next_id().to_string();
-        self.connector.create_iceberg_commit(&mut self.iceberg_cache, &ORG_ID.to_string(), id, iceberg_commit).await.map_err(from_modyne)?;
-        let latest_info = self.connector.describe_latest(&ORG_ID.to_string(), &Self::latest_checkpoint_key(table_name, &None)).await.map_err(from_modyne)?.unwrap();
-        let latest_obj = self.connector.describe_checkpoint(&mut self.checkpoints_cache, &ORG_ID.to_string(), &latest_info.entity_id).await.map_err(from_modyne)?.unwrap();
-
-        let (new_checkpoint, _) = self.clone_and_apply(
-            &latest_obj,
-            &vec!(),
-            &vec!(iceberg_commit.clone()),
-            &vec!(),
-        ).await;
-
-        self.connector.commit_checkpoint(&latest_info, &vec!(), &new_checkpoint).await.map_err(from_modyne)?;
-
-        // Everything in this loop just to create an ES work item. Yikes.
-        loop {
-            let latest_key = &Self::latest_extension_work_item_key(table_name, &"es".to_string());
-            let latest_es = self.connector.describe_latest(&ORG_ID.to_string(), latest_key).await.map_err(from_modyne)?;
-            assert!(latest_es.is_some());
-            let mut work_item = if latest_es.as_ref().unwrap().entity_id == Self::NO_WORK_ITEM {
-                ExtensionWorkItem {
-                    extension_type: "es".to_string(),
-                    table_name: table_name.clone(),
-                    table_schema: PowdrrSchema::minimal(),
-                    speedboat_files: FileSetPayload::new(),
-                    iceberg_files: FileSetPayload::new()
-                }
-            } else {
-                self.connector.describe_extension_work_item(&mut self.extension_work_item_cache, &ORG_ID.to_string(), &latest_es.as_ref().unwrap().entity_id).await.map_err(from_modyne)?.unwrap()
-            };
-            work_item.merge_iceberg(iceberg_commit);
-            let new_id = &IdInstance::next_id().to_string();
-            self.connector.create_extension_work_item(&mut self.extension_work_item_cache, &ORG_ID.to_string(),new_id, &work_item).await.map_err(from_modyne)?;
-            match self.connector.commit_work_item(latest_es.as_ref().unwrap(), new_id).await.map_err(from_modyne)? {
-                true => break,
-                false => ()
-            }
-        }
-
+        // TODO: change to return result bool
+        self.connector.commit_iceberg(&ORG_ID.to_string(), table_name, iceberg_commit).await.map_err(from_modyne)?;
         Ok(())
     }
 
     pub async fn extension_commit(&mut self, table_name: &String, commit: &ExtensionCommit) -> Result<(), ServiceApiError> {
-        let id = &IdInstance::next_id().to_string();
-        self.connector.create_extension_commit(&mut self.extension_cache, &ORG_ID.to_string(), id, commit).await.map_err(from_modyne)?;
-        self.connector.create_extension_commit_checkpointed(&ORG_ID.to_string(), table_name, id).await.map_err(from_modyne)?;
-        Ok(())
+        match self.connector.commit_extension_work_item_completed(&ORG_ID.to_string(), table_name, &commit).await.map_err(from_modyne)? {
+            true => Ok(()),
+            false => {
+                let all_items = self.connector.fetch_all().await.map_err(from_modyne)?;
+                Err(ServiceApiError{ message: "Unable to commit, conflict detected".to_string() })
+            }
+        }
     }
 
     pub async fn compaction_commit(&mut self, _table_name: &String, commit: &CompactionCommit) -> Result<(), ServiceApiError> {
@@ -346,7 +260,7 @@ impl DynamoDBServiceImpl {
                 }
             }
         }
-        match self.connector.commit_work_item_taken(&used_latest, &Self::NO_WORK_ITEM.to_string()).await.map_err(from_modyne)? {
+        match self.connector.commit_extension_work_item_taken(&used_latest, &Self::NO_WORK_ITEM.to_string()).await.map_err(from_modyne)? {
             true => Ok(work_items),
             false => Ok(vec!())
         }
@@ -361,17 +275,12 @@ impl DynamoDBServiceImpl {
             match latest_entity_info {
                 Some(latest_entity_info) => {
                     if latest_entity_info.entity_id != Self::NO_WORK_ITEM.to_owned() {
-                        let work_item = self.connector.describe_compaction_work_item(&mut self.compaction_work_item_cache, &ORG_ID.to_string(), &latest_entity_info.entity_id).await.map_err(from_modyne)?;
-                        assert!(work_item.is_some());
-                        let compaction = work_item.unwrap();
-                        tracing::info!("Compaction work item stats: size = {}/{}, files = {}/200",
-                            compaction.speedboat_files.sizes.iter().sum::<u64>(),
-                            30 * 1024 * 1024,
-                            compaction.speedboat_files.sizes.len()
-                        );
-                        //let do_compaction = compaction.speedboat_files.sizes.iter().sum::<u64>() > 30 * 1024 * 1024 || compaction.speedboat_files.sizes.len() > 200;
-                        let do_compaction = compaction.speedboat_files.file_paths.len() > 1;
-                        if do_compaction {
+                        // TODO: for now leases never expire
+                        let leases = self.connector.oldest_available_compaction_work_item_lease(&ORG_ID.to_string(), &latest_entity_info.entity_id, None, Some(0)).await.map_err(from_modyne)?;
+                        if leases.len() == 0 {
+                            let work_item = self.connector.describe_compaction_work_item(&mut self.compaction_work_item_cache, &ORG_ID.to_string(), &latest_entity_info.entity_id).await.map_err(from_modyne)?;
+                            assert!(work_item.is_some());
+                            let compaction = work_item.unwrap();
                             work_items.push((table_entity.entity_id.clone(), compaction));
                             used_latest.push(latest_entity_info);
                         }
@@ -382,7 +291,7 @@ impl DynamoDBServiceImpl {
                 }
             }
         }
-        match self.connector.commit_work_item_taken(&used_latest, &Self::NO_WORK_ITEM.to_string()).await.map_err(from_modyne)? {
+        match self.connector.commit_compaction_work_item_taken(&used_latest, &Self::NO_WORK_ITEM.to_string()).await.map_err(from_modyne)? {
             true => Ok(work_items),
             false => Ok(vec!())
         }
@@ -408,7 +317,7 @@ impl DynamoDBServiceImpl {
 
         println!("Updating checkpoint for table {}", table_name);
 
-        let latest_speedboat_trackers = self.connector.oldest_available_speedboat_commit_checkpointed(&ORG_ID.to_string(), table_name, None).await.map_err(from_modyne)?;
+        let latest_speedboat_trackers = self.connector.oldest_available_speedboat_commit_checkpointed(&ORG_ID.to_string(), table_name, None, None).await.map_err(from_modyne)?;
         if latest_speedboat_trackers.len() == 0 {
             return Ok(false);
         }
@@ -430,10 +339,27 @@ impl DynamoDBServiceImpl {
 
         assert!(changed);
 
+        let mut compaction_latest = None;
+        let mut compaction_work_item = None;
+        if new_checkpoint.speedboat_metadata.is_some() {
+            let speedboat_files = &new_checkpoint.speedboat_metadata.as_ref().unwrap().files;
+            // TODO: do the real policy here
+            let compact = speedboat_files.file_paths.len() as u64 >= 10 || speedboat_files.sizes.iter().sum::<u64>() > 30 * 1024 * 1024;
+            if compact {
+                let latest_compaction = self.connector.describe_latest(&ORG_ID.to_string(), &Self::latest_compaction_work_item_key(table_name)).await.map_err(from_modyne)?.unwrap();
+                if latest_compaction.entity_id == Self::NO_WORK_ITEM.to_owned() {
+                    compaction_latest = Some(latest_compaction);
+                    compaction_work_item = Some(CompactionWorkItem::from_checkpoint(&new_checkpoint, &vec!()));
+                }
+            }
+        }
+
         match self.connector.commit_checkpoint(
             &latest_checkpoint_info,
             &latest_speedboat_trackers,
             &new_checkpoint,
+            &compaction_latest,
+            &compaction_work_item
         ).await.map_err(from_modyne) {
             Ok(val) => {
                 if !val {
@@ -449,7 +375,7 @@ impl DynamoDBServiceImpl {
     }
 
     async fn update_extension_checkpoint(&mut self, table_name: &String) -> Result<bool, ServiceApiError> {
-        let latest_extension_trackers = self.connector.oldest_available_extension_commit_checkpointed(&ORG_ID.to_string(), table_name, None).await.map_err(from_modyne)?;
+        let latest_extension_trackers = self.connector.oldest_available_extension_commit_checkpointed(&ORG_ID.to_string(), table_name, None, None).await.map_err(from_modyne)?;
         if latest_extension_trackers.len() == 0 {
             return Ok(false);
         }
@@ -459,7 +385,7 @@ impl DynamoDBServiceImpl {
             extension_commits.push(self.connector.describe_extension_commit(&mut self.extension_cache, &ORG_ID.to_string(), &tracker.name).await.map_err(from_modyne)?.unwrap());
         }
 
-        let waiting_checkpoints = self.connector.oldest_available_checkpoint_waiting_for_extension(&ORG_ID.to_string(), table_name, None).await.map_err(from_modyne)?;
+        let waiting_checkpoints = self.connector.oldest_available_checkpoint_waiting_for_extension(&ORG_ID.to_string(), table_name, None, None).await.map_err(from_modyne)?;
         let mut work_done = false;
         for checkpoint_tracker in waiting_checkpoints.iter() {
             // TODO: all commits per loop should be in a transaction
@@ -482,7 +408,7 @@ impl DynamoDBServiceImpl {
                 let commit = latest_checkpoint.entity_id < new_checkpoint.get_descriptor().full_name();
                 //let commit = true;
                 if commit {
-                    let retval = self.connector.commit_checkpoint(&latest_checkpoint, &vec!(), &new_checkpoint).await.map_err(from_modyne)?;
+                    let retval = self.connector.commit_checkpoint(&latest_checkpoint, &vec!(), &new_checkpoint, &None, &None).await.map_err(from_modyne)?;
                     assert!(retval);
                 }
             }
@@ -498,4 +424,4 @@ impl DynamoDBServiceImpl {
     }
 
 
-    }
+}

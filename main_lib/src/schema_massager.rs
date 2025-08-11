@@ -466,11 +466,20 @@ impl SqlExpression {
                 )
             },
             SqlExpression::Comparison(left, op, right) => {
-                SqlExpression::Comparison(
-                    Box::new(left.finalize(original_schema, target_schema)),
-                    op.clone(),
-                    Box::new(right.finalize(original_schema, target_schema))
-                )
+                let final_left = left.finalize(original_schema, target_schema);
+                let final_right = right.finalize(original_schema, target_schema);
+                if final_left.stringize() == "null" {
+                    // TODO: There seems to be a bug in datafusion where in some cases a "null = 'literal'"
+                    // condition is lost. It only repro'd against a parquet file and then only when
+                    // run in the test. I'm not sure why. Turning it into an unambiguous "false" for now.
+                    SqlExpression::LiteralNonString("false".to_string())
+                } else {
+                    SqlExpression::Comparison(
+                        Box::new(final_left),
+                        op.clone(),
+                        Box::new(final_right)
+                    )
+                }
             },
             SqlExpression::Count => self.clone(),
             SqlExpression::CountDistinct(value) => {

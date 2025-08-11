@@ -98,6 +98,7 @@ pub type ExtensionFileMetadata = HashMap<String, Vec<ExtensionFile>>;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ExtensionCommit {
+    pub id: String,
     pub extension: String,
     pub files: ExtensionFileMetadata
 }
@@ -226,6 +227,27 @@ impl TableMetadataCheckpoint {
 
         for metadata in self.extension_metadata.values_mut() {
             metadata.retain(|key, _|!removed_speedboat.contains(key))
+        }
+    }
+
+    pub(crate) fn apply_compaction_for_replacement(&mut self, compaction: &CompactionCommit, iceberg_metadata: &IcebergMetadata) -> () {
+        assert!(self.speedboat_metadata.is_some());
+        self.speedboat_metadata.as_mut().unwrap().files.remove(&compaction.removed_speedboat_files);
+        if self.deletes_metadata.is_some() {
+            self.deletes_metadata.as_mut().unwrap().files.retain(|x| !compaction.removed_delete_files.contains(x));
+        }
+        self.extension_metadata.retain(|key, _|!compaction.removed_speedboat_files.contains(key));
+        let file_payload = iceberg_metadata.files.select(&compaction.parquet_file_name);
+        if self.iceberg_metadata.is_none() {
+            self.iceberg_metadata = Some(IcebergMetadata {
+                table_schema: iceberg_metadata.table_schema.clone(),
+                snapshot_id: None,
+                files: file_payload,
+                column_names: vec![],
+                column_stats: vec![],
+            });
+        } else {
+            self.iceberg_metadata.as_mut().unwrap().files.merge(&file_payload);
         }
     }
 
@@ -472,6 +494,7 @@ impl FileSetPayload {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ExtensionWorkItem {
+    pub id: String,
     pub extension_type: String,
     pub table_name: String,
     pub table_schema: PowdrrSchema,
@@ -520,16 +543,14 @@ pub(crate) struct CompactionWorkItemTracker {
 
 
 impl CompactionWorkItem {
-    pub fn merge_speedboat(&mut self, commit: &SpeedboatCommit) -> () {
-        for speedboat_commit_table_info in commit.type_files.iter() {
-            if speedboat_commit_table_info.commit_type == "commit" || speedboat_commit_table_info.commit_type == "compaction" {
-                self.speedboat_files.merge_inplace(&speedboat_commit_table_info.as_file_set_payload());
-                if speedboat_commit_table_info.schema.is_some() {
-                    self.table_schema.merge_from(&speedboat_commit_table_info.schema.as_ref().unwrap());
-                }
-            } else if speedboat_commit_table_info.commit_type == "delete" {
-                self.delete_files.extend(speedboat_commit_table_info.files.clone());
-            }
+    pub fn from_checkpoint(checkpoint: &TableMetadataCheckpoint, checkpoints_to_delete: &Vec<String>) -> Self {
+        assert!(checkpoint.speedboat_metadata.is_some());
+        CompactionWorkItem {
+            table_schema: checkpoint.schema.clone(),
+            speedboat_files: checkpoint.speedboat_metadata.as_ref().unwrap().files.clone(),
+            delete_files: checkpoint.deletes_metadata.as_ref().map_or(vec![], |x| x.files.clone()),
+            checkpoint_id_to_replace: checkpoint.checkpoint_id.clone(),
+            checkpoints_to_delete: checkpoints_to_delete.clone(),
         }
     }
 }

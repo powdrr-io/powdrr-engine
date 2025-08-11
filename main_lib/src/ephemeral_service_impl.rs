@@ -169,6 +169,7 @@ impl EphemeralServiceImpl {
             es_work_items.insert(
                 table_name.clone(),
                 ExtensionWorkItem {
+                    id: IdInstance::next_id().to_string(),
                     extension_type: extension.clone(),
                     table_name: table_name.clone(),
                     table_schema: schema.clone(),
@@ -328,23 +329,7 @@ impl EphemeralServiceImpl {
         assert!(self.checkpoints.contains_key(&checkpoint_key));
         let checkpoint_to_replace = self.checkpoints.get_mut(&checkpoint_key).unwrap();
         assert!(checkpoint_to_replace.speedboat_metadata.is_some());
-        checkpoint_to_replace.speedboat_metadata.as_mut().unwrap().files.remove(&compaction_obj.removed_speedboat_files);
-        if checkpoint_to_replace.deletes_metadata.is_some() {
-            checkpoint_to_replace.deletes_metadata.as_mut().unwrap().files.retain(|x| !compaction_obj.removed_delete_files.contains(x));
-        }
-        checkpoint_to_replace.extension_metadata.retain(|key, _|!compaction_obj.removed_speedboat_files.contains(key));
-        let file_payload = iceberg_metadata.files.select(&compaction_obj.parquet_file_name);
-        if checkpoint_to_replace.iceberg_metadata.is_none() {
-            checkpoint_to_replace.iceberg_metadata = Some(IcebergMetadata {
-                table_schema: iceberg_metadata.table_schema.clone(),
-                snapshot_id: None,
-                files: file_payload,
-                column_names: vec![],
-                column_stats: vec![],
-            });
-        } else {
-            checkpoint_to_replace.iceberg_metadata.as_mut().unwrap().files.merge(&file_payload);
-        }
+        checkpoint_to_replace.apply_compaction_for_replacement(compaction_obj, iceberg_metadata);
 
         for checkpoint_id in &compaction_obj.checkpoints_to_delete {
             let checkpoint_key = format!("{}_{}", table_name, checkpoint_id);
@@ -388,13 +373,10 @@ impl EphemeralServiceImpl {
             self.compaction_work_items.insert(
                 checkpoint.table_name.clone(),
                 CompactionWorkItemTracker {
-                    work_item: CompactionWorkItem {
-                        table_schema: checkpoint.schema.clone(),
-                        speedboat_files: speedboat_files.clone(),
-                        delete_files: checkpoint.deletes_metadata.as_ref().map_or(vec![], |x| x.files.clone()),
-                        checkpoint_id_to_replace: checkpoint.checkpoint_id.clone(),
-                        checkpoints_to_delete: self.not_compacted_checkpoint_ids.get(&checkpoint.table_name).unwrap().clone(),
-                    },
+                    work_item: CompactionWorkItem::from_checkpoint(
+                        checkpoint,
+                        self.not_compacted_checkpoint_ids.get(&checkpoint.table_name).as_ref().unwrap()
+                    ),
                     in_progress: false
                 }
             );
