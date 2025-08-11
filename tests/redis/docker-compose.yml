@@ -41,8 +41,11 @@ services:
       /bin/sh -c "
       until (/usr/bin/mc alias set myminio http://minio:9000 admin password) do echo '...waiting...' && sleep 1; done;
       /usr/bin/mc rm -r --force myminio/warehouse;
+      /usr/bin/mc rm -r --force myminio/default;
       /usr/bin/mc mb myminio/warehouse;
+      /usr/bin/mc mb myminio/default;
       /usr/bin/mc policy set public myminio/warehouse;
+      /usr/bin/mc policy set public myminio/default;
       tail -f /dev/null
       "      
 

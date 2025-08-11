@@ -101,7 +101,7 @@ pub struct TestProcessingMode {
 impl TestProcessingMode {
     pub fn default() -> Self {
         Self {
-            state_mode: StateMode::Testing,
+            state_mode: StateMode::TestingDynamoDb,
             indexing_mode: IndexingMode::Sync,
             compaction_mode: CompactionMode::Async(None),
             prefetch_mode: PrefetchMode::Disabled,
@@ -152,6 +152,7 @@ pub fn test_v1_add_checkpoint(mut state: State) -> Pin<Box<HandlerFuture>> {
 pub fn test_v1_set_testing_mode(state: State) -> Pin<Box<HandlerFuture>> {
     async {
         STATE_PROVIDER.set_testing_mode(&TestProcessingMode::default()).await;
+        drop_all_tables(&"default".to_string()).await.unwrap();
         let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "Ok");
         Ok((state, res))        
     }.boxed()
@@ -181,7 +182,10 @@ pub(crate) async fn do_available_extension_work(extensions: &Vec<String>) -> boo
             work_done = true;
             match create_index(work_item).await {
                 Ok(_) => (),
-                Err(_) => panic!("Need some real error handling some day"),
+                Err(e) => {
+                    let _error = format!("{}", e);
+                    tracing::error!("Error occurred while indexing: {}", e);
+                },
             }
         }
         tracing::info!("Done with indexing work");
@@ -259,7 +263,7 @@ pub(crate) async fn perform_cleanup_work(cleanup_work_item: &CleanupWorkItem) ->
                 match std::fs::remove_file(format!("{}.arrow", file_to_delete)) {
                     Ok(_) => (),
                     Err(e) => {
-                        let error = format!("{}", e);
+                        let _error = format!("{}", e);
                         panic!("oh no");
                     }
                 }

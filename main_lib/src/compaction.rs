@@ -608,7 +608,7 @@ mod tests {
     use gotham::test::Server;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
-    use super::{drop_table, ensure_table, load_table_metadata, CompactionCommand, PowdrrFileNameGenerator};
+    use super::{drop_all_tables, drop_table, ensure_table, load_table_metadata, CompactionCommand, PowdrrFileNameGenerator};
     use iceberg::io::{
         FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY,
     };
@@ -624,6 +624,8 @@ mod tests {
     }
 
     async fn test_iceberg_catalog_list_all_tables_worker() {
+        drop_all_tables(&"default".to_string()).await.unwrap();
+
         let iceberg_schema = Schema::builder()
             .with_schema_id(1)
             .with_identifier_field_ids(vec![2])
@@ -667,11 +669,7 @@ mod tests {
     }
 
     async fn test_iceberg_compact_simple_worker() {
-        match drop_table(&"default".to_string(), &"simple".to_string()).await {
-            Ok(_) => (),
-            Err(_) => {
-            }
-        }
+        drop_all_tables(&"default".to_string()).await.unwrap();
 
         let file_content = include_str!("../tests/data/logs.json");
         let mut values = vec!();
@@ -736,11 +734,7 @@ mod tests {
     }
 
     async fn test_iceberg_compact_okta_worker() {
-        match drop_table(&"default".to_string(), &"okta".to_string()).await {
-            Ok(_) => (),
-            Err(_) => {
-            }
-        }
+        drop_all_tables(&"default".to_string()).await.unwrap();
 
         let okta_1 = include_str!("../tests/data/okta_system_log_1.json").replace("\n", "");
         let okta_2 = include_str!("../tests/data/okta_system_log_2.json").replace("\n", "");
@@ -795,6 +789,8 @@ mod tests {
     }
 
     async fn test_s3_file_io_worker() {
+        drop_all_tables(&"default".to_string()).await.unwrap();
+
         let file_io = FileIOBuilder::new("s3")
             .with_props(vec![
                 (S3_ENDPOINT, "http://localhost:9000".to_string()),
