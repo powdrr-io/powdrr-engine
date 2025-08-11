@@ -866,17 +866,19 @@ impl DynamoDbConnector {
 
     pub async fn commit_iceberg(&self, org_id: &String, table_name: &String, commit: &IcebergCommit) -> Result<bool, Error> {
         // 1. Save the commit itself
-        // 2. Save an updated checkpoint
+        // 2. Save an updated checkpoint and bump the latest
         // 3. Create either a new ES work item or update the existing one
         // 4. Update the latest ES tracker to the new/updated one
         // 5. If the commit references compactions then:
-        //     a. create new checkpoints for those
+        //     a. create the replacement checkpoint
         //     b. removed the deleted checkpoints
         //     c. free up the compaction work item lease
+        //     d. create a cleanup work item
 
         let mut transaction = TransactWrite::new();
 
         let iceberg_commit_id = &IdInstance::next_id().to_string();
+        // Step 1
         transaction = self.private_create_iceberg_commit_core(transaction, org_id, iceberg_commit_id, commit);
 
         let latest_info = self.describe_latest(org_id, &Self::latest_checkpoint_key(table_name, &None)).await?.unwrap();
@@ -891,6 +893,7 @@ impl DynamoDbConnector {
             &compactions
         );
 
+        // Step 2
         transaction = Self::bump_version(transaction, &latest_info, &new_checkpoint.get_descriptor().full_name());
         let checkpoint_obj = PowdrrNamedTableMetadataCheckpoint {
             name: new_checkpoint.get_descriptor().full_name(),
@@ -899,6 +902,7 @@ impl DynamoDbConnector {
         };
         transaction = transaction.operation(checkpoint_obj.create());
 
+        // Step 3
         let latest_es_key = &Self::latest_extension_work_item_key(&table_name, &"es".to_string());
         let latest_es = self.describe_latest(org_id, latest_es_key).await?;
         assert!(latest_es.is_some());
@@ -917,19 +921,39 @@ impl DynamoDbConnector {
         };
         work_item.merge_iceberg(commit);
         transaction = self.cached_create_extension_work_item_core(transaction, &mut PowdrrNamedExtensionWorkItemCache::new(), org_id, &work_item.id, &work_item);
+
+        // Step 4
         transaction = Self::bump_version(transaction, latest_es.as_ref().unwrap(), &new_es_id);
         // TODO: delete old id?
 
-        for (_compaction_id, compaction_commit) in compactions.iter() {
+        // Step 5
+        for (compaction_id, compaction_commit) in compactions.iter() {
+            // Step 5a
             let checkpoint_descriptor = CheckpointDescriptor::new(table_name.clone(), compaction_commit.checkpoint_id_to_replace.clone());
-            let mut checkpoint_to_replace = self.describe_checkpoint(&mut PowdrrNamedTableMetadataCheckpointCache::new(), &org_id, &checkpoint_descriptor.full_name()).await?.unwrap().clone();
-            checkpoint_to_replace.checkpoint_id = IdInstance::next_id().to_string();
-            checkpoint_to_replace.apply_compaction_for_replacement(compaction_commit, &commit.metadata);
-            assert!(checkpoint_to_replace.original_checkpoint_id.is_none());
-            checkpoint_to_replace.original_checkpoint_id = Some(compaction_commit.checkpoint_id_to_replace.clone());
+            let mut cloned_checkpoint_to_replace = self.describe_checkpoint(&mut PowdrrNamedTableMetadataCheckpointCache::new(), &org_id, &checkpoint_descriptor.full_name()).await?.unwrap().clone();
+            cloned_checkpoint_to_replace.checkpoint_id = IdInstance::next_id().to_string();
+            cloned_checkpoint_to_replace.apply_compaction_for_replacement(compaction_commit, &commit.metadata);
+            assert!(cloned_checkpoint_to_replace.original_checkpoint_id.is_none());
+            cloned_checkpoint_to_replace.original_checkpoint_id = Some(compaction_commit.checkpoint_id_to_replace.clone());
 
-            // TODO: actually commit the checkpoint
+            let checkpoint_obj = PowdrrNamedTableMetadataCheckpoint {
+                name: new_checkpoint.get_descriptor().full_name(),
+                org_id: org_id.clone(),
+                entity: new_checkpoint.clone(),
+            };
+            transaction = transaction.operation(checkpoint_obj.create());
+
+            if !new_checkpoint.fully_covered_for_extension(&"es".to_string()) {
+                transaction = Self::create_checkpoint_waiting_for_extension_core(transaction, org_id, &new_checkpoint.table_name, &new_checkpoint.get_descriptor().full_name(), None)
+            }
+
+            // Step 5b
             // TODO: delete the listed checkpoints
+
+            // Step 5c
+            transaction = Self::mark_done_compaction_work_item_lease_inner(transaction, org_id, &new_checkpoint.table_name, compaction_id, Some(0));
+
+            // Step 5d
             // TODO: create cleanup work items
         }
 
