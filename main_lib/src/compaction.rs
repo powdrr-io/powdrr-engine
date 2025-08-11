@@ -364,6 +364,10 @@ impl CompactionCommand {
     }
 
     async fn update_iceberg(data: &Vec<RecordBatch>, table_name: &String, compaction_id: &String, parquet_file_name: &String) -> Result<(), iceberg::Error> {
+        if data.len() == 0 {
+            return Ok(())
+        }
+
         let converted_schema = match arrow_schema_to_schema(&data[0].schema()) {
             Ok(s) => s,
             Err(e) => {
