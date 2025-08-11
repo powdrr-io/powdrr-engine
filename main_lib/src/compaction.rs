@@ -171,6 +171,7 @@ pub struct IcebergLibMetadata {
     pub snapshot_id: i64,
     pub files: Vec<String>,
     pub sizes: Vec<u64>,
+    pub schemas: Vec<Arc<iceberg::spec::Schema>>,
     pub compactions: Vec<String>,
     pub column_names: Vec<String>,
     // per file, per column lower and upper bounds
@@ -237,16 +238,17 @@ pub async fn load_table_metadata(namespace: &String, name: &String, last_snapsho
         }
     };
 
-    let files_result = plan_files.map_ok(|f| (f.data_file_path, f.length))
+    let files_result = plan_files.map_ok(|f| (f.data_file_path, f.length, f.schema))
         .map_err(|err| iceberg::Error::new(iceberg::ErrorKind::Unexpected, format!("file scan task generate failed, {}", err)).with_source(err))
         .try_collect::<Vec<_>>()
         .await;
 
-    let (files, sizes) = match files_result {
+    let (files, sizes, schemas) = match files_result {
         Ok(r) => {
             (
-                r.iter().map(|(f, _)| f.clone()).collect(),
-                r.iter().map(|(_, s)| *s).collect(),
+                r.iter().map(|(f, _, _)| f.clone()).collect(),
+                r.iter().map(|(_, s, _)| *s).collect(),
+                r.iter().map(|(_, _, s)| s.clone()).collect()
             )
         },
         Err(e) => return Err(e),
@@ -256,6 +258,7 @@ pub async fn load_table_metadata(namespace: &String, name: &String, last_snapsho
         snapshot_id: current_snapshot.snapshot_id(),
         files: files,
         sizes: sizes,
+        schemas: schemas,
         compactions: compactions,
         column_names: vec!(),
         column_stats: vec!(),
@@ -387,8 +390,8 @@ impl CompactionCommand {
                     snapshot_id: Some(compaction_response.lib_metadata.snapshot_id.to_string()),
                     files: FileSetPayload {
                         file_paths: compaction_response.lib_metadata.files.clone(),
-                        schemas: vec!(compaction_response.schema.clone()),
-                        file_schemas: compaction_response.lib_metadata.files.iter().map(|_|0).collect(),
+                        schemas: compaction_response.lib_metadata.schemas.iter().map(|s|PowdrrSchema::from_iceberg(s)).collect(),
+                        file_schemas: compaction_response.lib_metadata.files.iter().enumerate().map(|(x, _)|x as u64).collect(),
                         sizes: compaction_response.lib_metadata.sizes.clone()
                     },
                     column_names: compaction_response.lib_metadata.column_names.clone(),

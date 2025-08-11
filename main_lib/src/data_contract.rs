@@ -202,6 +202,12 @@ impl TableMetadataCheckpoint {
 
     pub fn apply_iceberg(&mut self, iceberg_commit: &IcebergCommit, compactions_lookup: &HashMap<String, CompactionCommit>) -> bool {
         self.iceberg_metadata = Some(iceberg_commit.metadata.clone());
+        if iceberg_commit.deletes_table_info.is_some() {
+            if self.deletes_metadata.is_none() {
+                self.deletes_metadata = Some(DeletesMetadata{ files: vec!() });
+            }
+            self.deletes_metadata.as_mut().unwrap().files.extend(iceberg_commit.deletes_table_info.as_ref().unwrap().files.clone());
+        }
         self.schema.merge_from(&self.iceberg_metadata.as_mut().unwrap().table_schema);
         self.apply_compactions(&iceberg_commit.compactions, compactions_lookup);
 

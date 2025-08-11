@@ -1,7 +1,7 @@
 use std::{path::Path, sync::Arc};
 use std::time::Duration;
 use datafusion::{arrow::array::RecordBatch, error::DataFusionError, prelude::{DataFrame, NdJsonReadOptions, ParquetReadOptions, SessionContext}};
-use datafusion::arrow::datatypes::Schema;
+use datafusion::arrow::datatypes::{DataType, Schema};
 use datafusion::common::HashMap;
 use datafusion::config::ConfigOptions;
 use datafusion::execution::options::ArrowReadOptions;
@@ -559,6 +559,7 @@ async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> 
     if file_path.starts_with("s3:") {
         let file_path_var = file_path;
         let local_name_var = local_name;
+
         let query_str = format!(r#"CREATE EXTERNAL TABLE {local_name_var}
         STORED AS PARQUET
         LOCATION '{file_path_var}';"#);
@@ -571,6 +572,8 @@ async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> 
                 _ => return Ok(())
             }
         }
+
+
     } else {
         let result = DATA_FUSION_CONTEXT.register_parquet(local_name, file_path, ParquetReadOptions::new()).await;
         match result {
@@ -694,9 +697,12 @@ pub(crate) async fn execute_sql_async(sql: &String) -> Result<Vec<RecordBatch>, 
         };
 
         let batches = match results.collect().await {
-            Ok(r) => Ok(r),
+            Ok(r) => {
+                Ok(r)
+            },
             Err(e) => log_err(e)
         };
+
 
         tx.send(batches).await.unwrap();
     };
