@@ -7,7 +7,7 @@ use gotham::hyper::{body, Body};
 use std::pin::Pin;
 use gotham::mime;
 use serde::Serialize;
-use powdrr_lib::data_contract::{AddAlias, CompactionCommit, CreateTable, ExtensionCommit, GetLatestCheckpoint, IcebergCommit, SpeedboatCommit};
+use powdrr_lib::data_contract::{AddAlias, CleanupCommit, CompactionCommit, CreateTable, ExtensionCommit, GetLatestCheckpoint, IcebergCommit, SpeedboatCommit};
 use powdrr_lib::data_contract::CreateIndexTemplateBody;
 use powdrr_lib::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use powdrr_lib::pipeline::PipelineDefinition;
@@ -219,6 +219,11 @@ body_with_name_handler! { extension_commit(name: String, input: ExtensionCommit)
 body_with_name_handler! { compaction_commit(name: String, input: CompactionCommit) -> GenericResponse {
     handle_result_none(SERVICE_IMPL.compaction_commit(&name, &input).await)
 }}
+
+body_handler! { cleanup_commit(input: CleanupCommit) -> GenericResponse {
+    handle_result_none(SERVICE_IMPL.cleanup_commit(&input).await)
+}}
+
 
 body_handler! { get_latest_checkpoint(input: GetLatestCheckpoint) -> GenericResponse {
     handle_result_option(SERVICE_IMPL.get_latest_checkpoint(&input.table_name, input.extension).await)

@@ -68,6 +68,8 @@ pub fn router(include_test_apis: bool) -> Router {
                 route.post("/compaction_commit/:name")
                     .with_path_extractor::<NamePathExtractor>()
                     .to(v1_handlers::compaction_commit);
+                route.post("/cleanup_commit")
+                    .to(v1_handlers::cleanup_commit);
                 route.get("/get_latest_checkpoint").to(v1_handlers::get_latest_checkpoint);
                 route.get("/get_checkpoint").to(v1_handlers::get_checkpoint);
                 route.get("/get_extension_work_items/:name")

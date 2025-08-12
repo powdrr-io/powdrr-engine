@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use idgenerator::IdInstance;
-use crate::data_contract::{CleanupWorkItem, CompactionWorkItemTracker, CreateIndexTemplateBody, IcebergMetadata};
+use crate::data_contract::{CleanupCommit, CleanupWorkItem, CompactionWorkItemTracker, CreateIndexTemplateBody, IcebergMetadata};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::pipeline::PipelineDefinition;
 use crate::schema_massager::PowdrrSchema;
@@ -342,6 +342,7 @@ impl EphemeralServiceImpl {
 
         CleanupWorkItem {
             id: IdInstance::next_id().to_string(),
+            table_name: table_name.clone(),
             files_to_delete: compaction_obj.removed_speedboat_files.iter().chain(compaction_obj.removed_delete_files.iter()).map(|x|x.clone()).collect(),
         }
     }
@@ -658,6 +659,10 @@ impl EphemeralServiceImpl {
         // NOTE: this just notes what the compactor is saying. We don't generate the new checkpoint
         // until we see an iceberg or speedboat commit with the new info.
         self.compactions.insert(commit.compaction_id.clone(), (table_name.clone(), commit.clone()));
+        Ok(())
+    }
+
+    pub async fn cleanup_commit(&mut self, commit: &CleanupCommit) -> Result<(), ServiceApiError> {
         Ok(())
     }
 

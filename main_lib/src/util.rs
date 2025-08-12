@@ -64,6 +64,3 @@ pub(crate) async fn describe_table_log_error_then_none(table_name: &String) -> O
     })
 }
 
-pub(crate) fn current_time_millis() -> i64 {
-    chrono::Utc::now().timestamp_millis()
-}

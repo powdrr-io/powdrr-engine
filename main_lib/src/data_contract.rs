@@ -114,6 +114,12 @@ pub struct CompactionCommit {
     pub checkpoints_to_delete: Vec<String>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CleanupCommit {
+    pub id: String,
+    pub table_name: String,
+}
+
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TableMetadataCheckpoint {
@@ -574,6 +580,7 @@ impl CompactionWorkItem {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CleanupWorkItem {
     pub id: String,
+    pub table_name: String,
     pub files_to_delete: Vec<String>,
 }
 
