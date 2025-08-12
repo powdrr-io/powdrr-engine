@@ -285,7 +285,7 @@ fn do_update_checkpoint_work_for_forever(wait_time_ms: u64) -> impl Future<Outpu
                     work_done = false;
                 }
             };
-            /*if !work_done*/ {
+            if !work_done {
                 tokio::time::sleep(Duration::from_millis(wait_time_ms)).await;
             }
         }

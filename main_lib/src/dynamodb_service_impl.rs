@@ -344,8 +344,6 @@ impl DynamoDBServiceImpl {
         if latest_speedboat_trackers.len() == 0 {
             return Ok(false);
         }
-        println!("Updating checkpoint for table {}", table_name);
-        println!("Latest speedboat commits: {:?}", latest_speedboat_trackers.iter().map(|x| x.name.clone()).collect::<Vec<String>>());
 
         let latest_checkpoint_info = self.connector.describe_latest(&ORG_ID.to_string(), &Self::latest_checkpoint_key(table_name, &None)).await.map_err(from_modyne)?.unwrap();
         let latest_checkpoint = self.connector.describe_checkpoint(&mut self.checkpoints_cache, &ORG_ID.to_string(), &latest_checkpoint_info.entity_id).await.map_err(from_modyne)?.unwrap();
