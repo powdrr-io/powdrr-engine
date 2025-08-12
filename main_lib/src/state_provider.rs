@@ -5,7 +5,7 @@ use aws_sdk_dynamodb::Client;
 use modyne::TestTableExt;
 use tokio::sync::{mpsc, oneshot};
 use crate::{distributed_cache, peers::CheckpointDescriptor, pipeline::PipelineDefinition};
-use crate::data_contract::{CleanupWorkItem, CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
+use crate::data_contract::{CleanupCommit, CleanupWorkItem, CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
 use crate::dynamodb_state_provider::DynamoDbStateProvider;
 use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
@@ -119,7 +119,11 @@ enum StateProviderActorMessage {
         respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
         table_name: String,
         compaction_commit: CompactionCommit,        
-    },    
+    },
+    CleanupCommit {
+        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
+        cleanup_commit: CleanupCommit,
+    },
     GetLatestCommittedCheckpoint {
         respond_to: oneshot::Sender<Result<Option<String>, ServiceApiError>>,
         table_name: String,
@@ -310,7 +314,10 @@ impl StateProviderActor {
             }, 
             StateProviderActorMessage::CompactionCommit { respond_to, table_name, compaction_commit } => {
                 handle_message_impl!(self, respond_to, compaction_commit(&table_name, &compaction_commit));
-            },                        
+            },
+            StateProviderActorMessage::CleanupCommit { respond_to, cleanup_commit } => {
+                handle_message_impl!(self, respond_to, cleanup_commit(&cleanup_commit));
+            },
             StateProviderActorMessage::GetLatestCommittedCheckpoint { table_name, extensions, respond_to } => {
                 handle_message_impl!(self, respond_to, get_latest_committed_checkpoint(&table_name, extensions));
             },
@@ -443,6 +450,10 @@ impl StateProvider {
 
     pub async fn compaction_commit(&mut self, _table_name: &String, commit: &CompactionCommit) -> Result<(), ServiceApiError> {
         state_provider_func_impl!(self, compaction_commit(_table_name, commit))
+    }
+
+    pub async fn cleanup_commit(&mut self, commit: &CleanupCommit) -> Result<(), ServiceApiError> {
+        state_provider_func_impl!(self, cleanup_commit(commit))
     }
 
     pub async fn get_latest_committed_checkpoint(&mut self, table_name: &String, extensions: Option<String>) -> Result<Option<String>, ServiceApiError> {
@@ -597,6 +608,10 @@ impl StateProviderHandle {
 
     pub async fn compaction_commit(&self, table_name: &String, compaction_commit: &CompactionCommit) -> Result<(), ServiceApiError> {
         send_message!(self, CompactionCommit, table_name = table_name.clone(), compaction_commit = compaction_commit.clone())
+    }
+
+    pub async fn cleanup_commit(&self, cleanup_commit: &CleanupCommit) -> Result<(), ServiceApiError> {
+        send_message!(self, CleanupCommit, cleanup_commit = cleanup_commit.clone())
     }
 
     pub async fn get_latest_checkpoint(&self, table_name: &String, extension: Option<String>) -> Result<Option<String>, ServiceApiError> {

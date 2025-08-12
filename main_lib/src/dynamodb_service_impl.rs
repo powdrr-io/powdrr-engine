@@ -1,13 +1,16 @@
 use std::collections::HashMap;
-use futures_util::TryFutureExt;
 use modyne::model::TransactWrite;
-use crate::data_contract::{TableDescription, CreateIndexTemplateBody, CompactionWorkItem, ExtensionWorkItem, CompactionCommit, TableMetadataCheckpoint, ExtensionCommit, CreateTable, SpeedboatCommit, IcebergCommit, SpeedboatCommitTableInfo, CleanupWorkItem};
+use crate::data_contract::{TableDescription, CreateIndexTemplateBody, CompactionWorkItem, ExtensionWorkItem, CompactionCommit, TableMetadataCheckpoint, ExtensionCommit, CreateTable, SpeedboatCommit, IcebergCommit, SpeedboatCommitTableInfo, CleanupWorkItem, CleanupCommit};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
 use crate::state_provider::ServiceApiError;
 use crate::dynamodb::{DynamoDbConnector, PowdrrNamedCleanupWorkItemCache, PowdrrNamedCompactionCommitCache, PowdrrNamedCompactionWorkItemCache, PowdrrNamedExtensionCommitCache, PowdrrNamedExtensionWorkItemCache, PowdrrNamedIcebergCommitCache, PowdrrNamedSpeedboatCommitCache, PowdrrNamedTableMetadataCheckpointCache, TableBody};
 use crate::test_api::TestProcessingMode;
+
+
+const LEASE_LENGTH_MS: i64 = 60 * 1000; // 1 minute
+
 
 fn from_modyne(e: modyne::Error) -> ServiceApiError {
     ServiceApiError::new(e.to_string())
@@ -208,7 +211,6 @@ impl DynamoDBServiceImpl {
         match self.connector.commit_extension_work_item_completed(&ORG_ID.to_string(), table_name, &commit).await.map_err(from_modyne)? {
             true => Ok(()),
             false => {
-                let all_items = self.connector.fetch_all().await.map_err(from_modyne)?;
                 Err(ServiceApiError{ message: "Unable to commit, conflict detected".to_string() })
             }
         }
@@ -219,6 +221,13 @@ impl DynamoDBServiceImpl {
         // until we see an iceberg or speedboat commit with the new info.
         assert!(commit.compaction_id.len() > 0);
         self.connector.create_compaction(&mut self.compactions_cache, &ORG_ID.to_string(), &commit.compaction_id, commit).await.map_err(from_modyne)
+    }
+
+    pub async fn cleanup_commit(&mut self, commit: &CleanupCommit) -> Result<(), ServiceApiError> {
+        let mut transaction = TransactWrite::new();
+        transaction = DynamoDbConnector::mark_done_cleanup_work_item_lease_inner(transaction, &ORG_ID.to_string(), &commit.table_name, &commit.id, None);
+        self.connector.commit_conditional_transaction(transaction).await.map_err(from_modyne)?;
+        Ok(())
     }
 
     pub async fn get_latest_committed_checkpoint(&mut self, table_name: &String, extensions: Option<String>) -> Result<Option<String>, ServiceApiError> {
@@ -306,14 +315,12 @@ impl DynamoDBServiceImpl {
         let mut work_items = vec!();
         let mut transaction = TransactWrite::new();
         for table_entity in all_tables.entities {
-            let available_infos = self.connector.oldest_available_cleanup_work_item_lease(&ORG_ID.to_string(), &table_entity.entity_id, None, None).await.map_err(from_modyne)?;
+            let available_infos = self.connector.oldest_available_cleanup_work_item_lease(&ORG_ID.to_string(), &table_entity.entity_id, None, Some(LEASE_LENGTH_MS)).await.map_err(from_modyne)?;
             for available_info in available_infos.iter() {
                 let work_item = self.connector.describe_cleanup_work_item(&mut PowdrrNamedCleanupWorkItemCache::new(), &ORG_ID.to_string(), &available_info.name).await.map_err(from_modyne)?;
                 assert!(work_item.is_some());
                 work_items.push(work_item.unwrap());
-                // TODO: make leases happen
-                // transaction = self.connector.claim_cleanup_work_item_lease(transaction, available_info);
-                transaction = DynamoDbConnector::mark_done_cleanup_work_item_lease_core(transaction, available_info);
+                transaction = self.connector.claim_cleanup_work_item_lease(transaction, available_info);
             }
         }
 

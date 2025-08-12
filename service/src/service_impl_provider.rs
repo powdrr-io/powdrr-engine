@@ -1,6 +1,6 @@
 use std::{error::Error};
 use std::fmt::{Display, Formatter};
-use powdrr_lib::data_contract::{CreateIndexTemplateBody, ServiceImplType, ServiceMode};
+use powdrr_lib::data_contract::{CleanupCommit, CreateIndexTemplateBody, ServiceImplType, ServiceMode};
 use powdrr_lib::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use powdrr_lib::ephemeral_service_impl::EphemeralServiceImpl;
 use powdrr_lib::pipeline::PipelineDefinition;
@@ -120,6 +120,10 @@ enum ServiceImplProviderActorMessage {
         table_name: String,
         compaction_commit: CompactionCommit,
     },
+    CleanupCommit {
+        respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
+        cleanup_commit: CleanupCommit,
+    },
     GetLatestCommittedCheckpoint {
         respond_to: oneshot::Sender<Result<Option<String>, ServiceImplError>>,
         table_name: String,
@@ -214,6 +218,9 @@ impl ServiceImplProviderActor {
             },
             ServiceImplProviderActorMessage::CompactionCommit { respond_to, table_name, compaction_commit } => {
                 handle_message_impl!(self, respond_to, compaction_commit(&table_name, &compaction_commit));
+            },
+            ServiceImplProviderActorMessage::CleanupCommit { respond_to, cleanup_commit } => {
+                handle_message_impl!(self, respond_to, cleanup_commit(&cleanup_commit));
             },
             ServiceImplProviderActorMessage::GetLatestCommittedCheckpoint { table_name, extensions, respond_to } => {
                 handle_message_impl!(self, respond_to, get_latest_committed_checkpoint(&table_name, extensions));
@@ -314,6 +321,10 @@ impl ServiceImpl {
     pub async fn compaction_commit(&mut self, _table_name: &String, commit: &CompactionCommit) -> Result<(), ServiceImplError> {
         state_provider_func_impl!(self, compaction_commit(_table_name, commit))
     }
+
+    pub async fn cleanup_commit(&mut self,commit: &CleanupCommit) -> Result<(), ServiceImplError> {
+        state_provider_func_impl!(self, cleanup_commit(commit))
+    }    
 
     pub async fn get_latest_committed_checkpoint(&mut self, table_name: &String, extensions: Option<String>) -> Result<Option<String>, ServiceImplError> {
         state_provider_func_impl!(self, get_latest_committed_checkpoint(table_name, extensions))
@@ -452,6 +463,10 @@ impl ServiceImplHandle {
 
     pub async fn compaction_commit(&self, table_name: &String, compaction_commit: &CompactionCommit) -> Result<(), ServiceImplError> {
         send_message!(self, CompactionCommit, table_name = table_name.clone(), compaction_commit = compaction_commit.clone())
+    }
+
+    pub async fn cleanup_commit(&self, cleanup_commit: &CleanupCommit) -> Result<(), ServiceImplError> {
+        send_message!(self, CleanupCommit, cleanup_commit = cleanup_commit.clone())
     }
 
     pub async fn get_latest_checkpoint(&self, table_name: &String, extension: Option<String>) -> Result<Option<String>, ServiceImplError> {

@@ -1,9 +1,7 @@
 use std::collections::HashMap;
-use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
-use aws_sdk_dynamodb::types::{AttributeValue, CancellationReason};
 use idgenerator::IdInstance;
-use modyne::{expr, keys, model::TransactWrite, projections, read_projection, Aggregate, Entity, EntityExt, Error, Item, ProjectionExt, QueryInput, QueryInputExt, ScanInput, ScanInputExt, Table};
+use modyne::{expr, keys, model::TransactWrite, projections, read_projection, Aggregate, Entity, EntityExt, Error, Item, ProjectionExt, QueryInput, QueryInputExt, Table};
 use modyne::expr::Filter;
 use crate::data_contract::{CleanupWorkItem, CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody, ExtensionCommit, ExtensionWorkItem, FileSetPayload, IcebergCommit, SpeedboatCommit, TableMetadataCheckpoint};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
@@ -115,13 +113,6 @@ impl Aggregate for PowdrrEntities {
     }
 }
 
-struct ScanAll {
-}
-
-impl ScanInput for ScanAll {
-    type Index = keys::Primary;
-}
-
 impl DynamoDbConnector {
     pub async fn fetch_entities(&self, org_id: &String, entity_type: &String, limit: Option<u32>) -> Result<PowdrrEntities, Error> {
         let query = PowdrrEntityQuery{ entity_type, org_id };
@@ -136,17 +127,6 @@ impl DynamoDbConnector {
 
         entities.reduce(result.items.unwrap_or_default())?;
         Ok(entities)
-    }
-
-    fn make_list(item: &HashMap<String, AttributeValue>) -> Vec<(String, AttributeValue)> {
-        item.iter().map(|(k, v)|(k.clone(), v.clone())).collect()
-    }
-
-    pub async fn fetch_all(&self) -> Result<Vec<Vec<(String, AttributeValue)>>, Error> {
-        let scan_all = ScanAll{};
-
-        let output = scan_all.scan().execute(self).await?;
-        Ok(output.items.unwrap_or_default().iter().map(|x|Self::make_list(x)).collect())
     }
 }
 
@@ -170,7 +150,7 @@ pub struct OrgIdEntityNameInput<'a> {
 }
 
 
-const UNCLAIMED_TIME: i64 = 100; // Some time way in the future
+const UNCLAIMED_TIME: i64 = 9999999999999; // Some time way in the future
 
 
 #[derive(Debug, modyne_derive::EntityDef, serde::Serialize, serde::Deserialize, Clone)]
@@ -459,20 +439,34 @@ macro_rules! powdrr_tracker {
                     Ok(())
                 }
 
-                pub async fn [< oldest_available_ $entity_name >](&self, org_id: &String, parent_entity: &String, limit: Option<u32>, earliest_claimed_at: Option<i64>) -> Result<Vec<PowdrrTracker>, Error> {
+                pub async fn [< oldest_available_ $entity_name >](&self, org_id: &String, parent_entity: &String, limit: Option<u32>, earliest_claimed_at_delta: Option<i64>) -> Result<Vec<PowdrrTracker>, Error> {
                     let query_input = PowdrrTrackerQuery { entity_name: stringify!($entity_name).to_string(), org_id: org_id.clone(), parent_entity: parent_entity.clone() };
 
                     let mut trackers = PowdrrTrackerQueryResults::default();
 
-                    let result = query_input
-                        .query()
-                        .filter(Filter::new("version <> :negative_one AND claimed_at > :earliest_claimed_at")
-                            .value(":negative_one", -1)
-                            .value(":earliest_claimed_at", earliest_claimed_at.unwrap_or(0))
-                        )
-                        .set_limit(limit)
-                        .execute(self)
-                        .await?;
+                    let result = match earliest_claimed_at_delta {
+                        Some(delta) => {
+                            query_input
+                                .query()
+                                .filter(Filter::new("version <> :negative_one AND claimed_at > :earliest_claimed_at")
+                                    .value(":negative_one", -1)
+                                    .value(":earliest_claimed_at", chrono::Utc::now().timestamp_millis() - delta)
+                                )
+                                .set_limit(limit)
+                                .execute(self)
+                                .await?
+                        },
+                        None => {
+                            query_input
+                                .query()
+                                .filter(Filter::new("version <> :negative_one")
+                                    .value(":negative_one", -1)
+                                )
+                                .set_limit(limit)
+                                .execute(self)
+                                .await?
+                        }
+                    };
 
                     trackers.reduce(result.items.unwrap_or_default())?;
 
@@ -505,7 +499,7 @@ macro_rules! powdrr_tracker {
                     Self::[< mark_done_ $entity_name _inner >](transaction, &tracker.org_id, &tracker.parent_entity, &tracker.name, Some(tracker.version))
                 }
 
-                fn [< mark_done_ $entity_name _inner >](transaction: TransactWrite, org_id: &String, parent_entity: &String, name: &String, expected_version: Option<i64>) -> TransactWrite {
+                pub fn [< mark_done_ $entity_name _inner >](transaction: TransactWrite, org_id: &String, parent_entity: &String, name: &String, expected_version: Option<i64>) -> TransactWrite {
                     let key = OrgIdEntityNameInput {
                         entity_name: &stringify!($entity_name).to_string(),
                         org_id,
@@ -954,6 +948,7 @@ impl DynamoDbConnector {
             // Step 5d
             let cleanup_work_item = CleanupWorkItem {
                 id: IdInstance::next_id().to_string(),
+                table_name: cloned_checkpoint_to_replace.table_name.clone(),
                 files_to_delete: compaction_commit.removed_speedboat_files.iter().chain(compaction_commit.removed_delete_files.iter()).map(|x|x.clone()).collect(),
             };
             let cleanup_work_item_id = cleanup_work_item.id.clone();

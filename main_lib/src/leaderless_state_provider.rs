@@ -1,6 +1,6 @@
 use reqwest::{Client, Response, StatusCode};
 use serde::de::DeserializeOwned;
-use crate::data_contract::{CleanupWorkItem, CreateIndexTemplateBody};
+use crate::data_contract::{CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::pipeline::PipelineDefinition;
 use crate::data_contract::{AddAlias, CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem, GetLatestCheckpoint, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
@@ -236,6 +236,13 @@ impl LeaderlessStateProvider {
             ).await,
             &vec!(name.clone()),
             None
+        ).await
+    }
+
+    pub(crate) async fn cleanup_commit(&mut self, commit: &CleanupCommit) -> Result<(), ServiceApiError> {
+        Self::handle_response(self.client.post(format!("{}/api/v1/cleanup_commit", self.base_address))
+            .body(serde_json::to_string(&commit).unwrap())
+            .send().await
         ).await
     }
 

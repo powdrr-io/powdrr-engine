@@ -1,5 +1,5 @@
 use aws_sdk_dynamodb::Client;
-use crate::data_contract::{CleanupWorkItem, CreateIndexTemplateBody};
+use crate::data_contract::{CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::pipeline::PipelineDefinition;
 use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
@@ -125,6 +125,10 @@ impl DynamoDbStateProvider {
             },
             Err(e) => Err(e)
         }
+    }
+
+    pub async fn cleanup_commit(&mut self, commit: &CleanupCommit) -> Result<(), ServiceApiError> {
+        self.service_impl.cleanup_commit(commit).await
     }
 
     pub async fn get_latest_committed_checkpoint(&mut self, table_name: &String, extensions: Option<String>) -> Result<Option<String>, ServiceApiError> {

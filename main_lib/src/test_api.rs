@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{compaction::perform_compaction, data_access, elastic_search_index::{self, create_index}, state_provider::{STATE_PROVIDER}};
 use crate::compaction::drop_all_tables;
-use crate::data_contract::{CleanupWorkItem, TableMetadataCheckpoint};
+use crate::data_contract::{CleanupCommit, CleanupWorkItem, TableMetadataCheckpoint};
 use crate::prefetch::perform_prefetch;
 
 #[derive(Serialize, Deserialize)]
@@ -246,6 +246,10 @@ pub(crate) async fn do_next_cleanup() -> usize {
     if cleanup_work.len() > 0 {
         for work_item in cleanup_work.iter() {
             perform_cleanup_work(work_item).await;
+            match STATE_PROVIDER.cleanup_commit(&CleanupCommit{ id: work_item.id.clone(), table_name: work_item.table_name.clone() }).await {
+                Ok(_) => (),
+                Err(_) => panic!("oh no"),
+            }
         }
     }
     cleanup_work.len()
