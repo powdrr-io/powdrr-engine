@@ -662,7 +662,7 @@ impl EphemeralServiceImpl {
         Ok(())
     }
 
-    pub async fn cleanup_commit(&mut self, commit: &CleanupCommit) -> Result<(), ServiceApiError> {
+    pub async fn cleanup_commit(&mut self, _commit: &CleanupCommit) -> Result<(), ServiceApiError> {
         Ok(())
     }
 

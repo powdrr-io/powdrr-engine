@@ -150,7 +150,7 @@ pub struct OrgIdEntityNameInput<'a> {
 }
 
 
-const UNCLAIMED_TIME: i64 = 9999999999999; // Some time way in the future
+const UNCLAIMED_TIME: i64 = 0; // The beginning of time
 
 
 #[derive(Debug, modyne_derive::EntityDef, serde::Serialize, serde::Deserialize, Clone)]
@@ -448,6 +448,40 @@ macro_rules! powdrr_tracker {
                         Some(delta) => {
                             query_input
                                 .query()
+                                .filter(Filter::new("version <> :negative_one AND claimed_at < :earliest_claimed_at")
+                                    .value(":negative_one", -1)
+                                    .value(":earliest_claimed_at", chrono::Utc::now().timestamp_millis() - delta)
+                                )
+                                .set_limit(limit)
+                                .execute(self)
+                                .await?
+                        },
+                        None => {
+                            query_input
+                                .query()
+                                .filter(Filter::new("version <> :negative_one")
+                                    .value(":negative_one", -1)
+                                )
+                                .set_limit(limit)
+                                .execute(self)
+                                .await?
+                        }
+                    };
+
+                    trackers.reduce(result.items.unwrap_or_default())?;
+
+                    Ok(trackers.trackers)
+                }
+
+                pub async fn [< valid_leases_ $entity_name >](&self, org_id: &String, parent_entity: &String, limit: Option<u32>, earliest_claimed_at_delta: Option<i64>) -> Result<Vec<PowdrrTracker>, Error> {
+                    let query_input = PowdrrTrackerQuery { entity_name: stringify!($entity_name).to_string(), org_id: org_id.clone(), parent_entity: parent_entity.clone() };
+
+                    let mut trackers = PowdrrTrackerQueryResults::default();
+
+                    let result = match earliest_claimed_at_delta {
+                        Some(delta) => {
+                            query_input
+                                .query()
                                 .filter(Filter::new("version <> :negative_one AND claimed_at > :earliest_claimed_at")
                                     .value(":negative_one", -1)
                                     .value(":earliest_claimed_at", chrono::Utc::now().timestamp_millis() - delta)
@@ -472,6 +506,7 @@ macro_rules! powdrr_tracker {
 
                     Ok(trackers.trackers)
                 }
+
 
                 pub fn [< claim_ $entity_name >](&self, transaction: TransactWrite, tracker: &PowdrrTracker) -> TransactWrite {
                     let key = OrgIdEntityNameInput {

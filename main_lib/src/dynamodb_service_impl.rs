@@ -17,6 +17,7 @@ fn from_modyne(e: modyne::Error) -> ServiceApiError {
 }
 
 
+#[allow(dead_code)]
 pub struct DynamoDBServiceImpl {
     mode: TestProcessingMode,
     pub(crate) connector: DynamoDbConnector,
@@ -262,10 +263,13 @@ impl DynamoDBServiceImpl {
             match latest_entity_info {
                 Some(latest_entity_info) => {
                     if latest_entity_info.entity_id != Self::NO_WORK_ITEM.to_owned() {
-                        let work_item = self.connector.describe_extension_work_item(&mut self.extension_work_item_cache, &ORG_ID.to_string(), &latest_entity_info.entity_id).await.map_err(from_modyne)?;
-                        assert!(work_item.is_some());
-                        work_items.push(work_item.unwrap());
-                        used_latest.push(latest_entity_info);
+                        let lease = self.connector.valid_leases_extension_work_item_lease(&ORG_ID.to_string(), &latest_entity_info.entity_id, None, Some(LEASE_LENGTH_MS)).await.map_err(from_modyne)?;
+                        if lease.len() == 0 {
+                            let work_item = self.connector.describe_extension_work_item(&mut self.extension_work_item_cache, &ORG_ID.to_string(), &latest_entity_info.entity_id).await.map_err(from_modyne)?;
+                            assert!(work_item.is_some());
+                            work_items.push(work_item.unwrap());
+                            used_latest.push(latest_entity_info);
+                        }
                     }
                 },
                 None => {
@@ -288,8 +292,7 @@ impl DynamoDBServiceImpl {
             match latest_entity_info {
                 Some(latest_entity_info) => {
                     if latest_entity_info.entity_id != Self::NO_WORK_ITEM.to_owned() {
-                        // TODO: for now leases never expire
-                        let leases = self.connector.oldest_available_compaction_work_item_lease(&ORG_ID.to_string(), &latest_entity_info.entity_id, None, Some(0)).await.map_err(from_modyne)?;
+                        let leases = self.connector.valid_leases_compaction_work_item_lease(&ORG_ID.to_string(), &latest_entity_info.entity_id, None, Some(LEASE_LENGTH_MS)).await.map_err(from_modyne)?;
                         if leases.len() == 0 {
                             let work_item = self.connector.describe_compaction_work_item(&mut self.compaction_work_item_cache, &ORG_ID.to_string(), &latest_entity_info.entity_id).await.map_err(from_modyne)?;
                             assert!(work_item.is_some());
