@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use futures_util::TryFutureExt;
+use modyne::model::TransactWrite;
 use crate::data_contract::{TableDescription, CreateIndexTemplateBody, CompactionWorkItem, ExtensionWorkItem, CompactionCommit, TableMetadataCheckpoint, ExtensionCommit, CreateTable, SpeedboatCommit, IcebergCommit, SpeedboatCommitTableInfo, CleanupWorkItem};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
 use crate::state_provider::ServiceApiError;
-use crate::dynamodb::{DynamoDbConnector, PowdrrNamedCompactionCommitCache, PowdrrNamedCompactionWorkItemCache, PowdrrNamedExtensionCommitCache, PowdrrNamedExtensionWorkItemCache, PowdrrNamedIcebergCommitCache, PowdrrNamedSpeedboatCommitCache, PowdrrNamedTableMetadataCheckpointCache, TableBody};
+use crate::dynamodb::{DynamoDbConnector, PowdrrNamedCleanupWorkItemCache, PowdrrNamedCompactionCommitCache, PowdrrNamedCompactionWorkItemCache, PowdrrNamedExtensionCommitCache, PowdrrNamedExtensionWorkItemCache, PowdrrNamedIcebergCommitCache, PowdrrNamedSpeedboatCommitCache, PowdrrNamedTableMetadataCheckpointCache, TableBody};
 use crate::test_api::TestProcessingMode;
 
 fn from_modyne(e: modyne::Error) -> ServiceApiError {
@@ -150,7 +152,8 @@ impl DynamoDBServiceImpl {
         let tables: Vec<String> = commit.type_files.iter().map(|x|x.table_name.clone()).collect();
         //assert_eq!(tables.len(), 1, "Only really support single table commits right now");
         // TODO: change to return result bool
-        self.connector.commit_speedboat(&ORG_ID.to_string(), &tables[0], commit).await.map_err(from_modyne)?;
+        let retval = self.connector.commit_speedboat(&ORG_ID.to_string(), &tables[0], commit).await.map_err(from_modyne)?;
+        assert!(retval);
         Ok(())
     }
 
@@ -196,7 +199,8 @@ impl DynamoDBServiceImpl {
 
     pub async fn iceberg_commit(&mut self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError> {
         // TODO: change to return result bool
-        self.connector.commit_iceberg(&ORG_ID.to_string(), table_name, iceberg_commit).await.map_err(from_modyne)?;
+        let retval = self.connector.commit_iceberg(&ORG_ID.to_string(), table_name, iceberg_commit).await.map_err(from_modyne)?;
+        assert!(retval);
         Ok(())
     }
 
@@ -298,8 +302,29 @@ impl DynamoDBServiceImpl {
     }
 
     pub async fn get_cleanup_work_items(&mut self) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
-        // TODO
-        Ok(vec!())
+        let all_tables = self.connector.fetch_entities(&ORG_ID.to_string(), &"powdrr_table".to_string(), None).await.map_err(from_modyne)?;
+        let mut work_items = vec!();
+        let mut transaction = TransactWrite::new();
+        for table_entity in all_tables.entities {
+            let available_infos = self.connector.oldest_available_cleanup_work_item_lease(&ORG_ID.to_string(), &table_entity.entity_id, None, None).await.map_err(from_modyne)?;
+            for available_info in available_infos.iter() {
+                let work_item = self.connector.describe_cleanup_work_item(&mut PowdrrNamedCleanupWorkItemCache::new(), &ORG_ID.to_string(), &available_info.name).await.map_err(from_modyne)?;
+                assert!(work_item.is_some());
+                work_items.push(work_item.unwrap());
+                // TODO: make leases happen
+                // transaction = self.connector.claim_cleanup_work_item_lease(transaction, available_info);
+                transaction = DynamoDbConnector::mark_done_cleanup_work_item_lease_core(transaction, available_info);
+            }
+        }
+
+        if work_items.len() > 0 {
+            match self.connector.commit_conditional_transaction(transaction).await.map_err(from_modyne)? {
+                true => Ok(work_items),
+                false => Ok(vec!())
+            }
+        } else {
+            Ok(vec!())
+        }
     }
 
     pub async fn update_all_checkpoints(&mut self) -> Result<bool, ServiceApiError> {
@@ -315,12 +340,12 @@ impl DynamoDBServiceImpl {
     async fn update_standard_checkpoint(&mut self, table_name: &String) -> Result<bool, ServiceApiError> {
         // TODO: need a bulk fetcher
 
-        println!("Updating checkpoint for table {}", table_name);
-
         let latest_speedboat_trackers = self.connector.oldest_available_speedboat_commit_checkpointed(&ORG_ID.to_string(), table_name, None, None).await.map_err(from_modyne)?;
         if latest_speedboat_trackers.len() == 0 {
             return Ok(false);
         }
+        println!("Updating checkpoint for table {}", table_name);
+        println!("Latest speedboat commits: {:?}", latest_speedboat_trackers.iter().map(|x| x.name.clone()).collect::<Vec<String>>());
 
         let latest_checkpoint_info = self.connector.describe_latest(&ORG_ID.to_string(), &Self::latest_checkpoint_key(table_name, &None)).await.map_err(from_modyne)?.unwrap();
         let latest_checkpoint = self.connector.describe_checkpoint(&mut self.checkpoints_cache, &ORG_ID.to_string(), &latest_checkpoint_info.entity_id).await.map_err(from_modyne)?.unwrap();
@@ -344,7 +369,7 @@ impl DynamoDBServiceImpl {
         if new_checkpoint.speedboat_metadata.is_some() {
             let speedboat_files = &new_checkpoint.speedboat_metadata.as_ref().unwrap().files;
             // TODO: do the real policy here
-            let compact = speedboat_files.file_paths.len() as u64 >= 1 || speedboat_files.sizes.iter().sum::<u64>() > 30 * 1024 * 1024;
+            let compact = speedboat_files.file_paths.len() as u64 >= 2 || speedboat_files.sizes.iter().sum::<u64>() > 30 * 1024 * 1024;
             if compact {
                 let latest_compaction = self.connector.describe_latest(&ORG_ID.to_string(), &Self::latest_compaction_work_item_key(table_name)).await.map_err(from_modyne)?.unwrap();
                 if latest_compaction.entity_id == Self::NO_WORK_ITEM.to_owned() {

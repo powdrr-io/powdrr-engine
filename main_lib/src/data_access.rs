@@ -1,7 +1,7 @@
 use std::{path::Path, sync::Arc};
 use std::time::Duration;
 use datafusion::{arrow::array::RecordBatch, error::DataFusionError, prelude::{DataFrame, NdJsonReadOptions, ParquetReadOptions, SessionContext}};
-use datafusion::arrow::datatypes::{DataType, Schema};
+use datafusion::arrow::datatypes::{Schema};
 use datafusion::common::HashMap;
 use datafusion::config::ConfigOptions;
 use datafusion::execution::options::ArrowReadOptions;

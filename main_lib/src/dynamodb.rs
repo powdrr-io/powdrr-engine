@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use aws_sdk_dynamodb::types::AttributeValue;
-use gotham::hyper::body::HttpBody;
+use aws_sdk_dynamodb::error::SdkError;
+use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
+use aws_sdk_dynamodb::types::{AttributeValue, CancellationReason};
 use idgenerator::IdInstance;
 use modyne::{expr, keys, model::TransactWrite, projections, read_projection, Aggregate, Entity, EntityExt, Error, Item, ProjectionExt, QueryInput, QueryInputExt, ScanInput, ScanInputExt, Table};
 use modyne::expr::Filter;
@@ -169,7 +170,7 @@ pub struct OrgIdEntityNameInput<'a> {
 }
 
 
-const UNCLAIMED_TIME: i64 = 10000000000000; // Some time way in the future
+const UNCLAIMED_TIME: i64 = 100; // Some time way in the future
 
 
 #[derive(Debug, modyne_derive::EntityDef, serde::Serialize, serde::Deserialize, Clone)]
@@ -178,7 +179,7 @@ pub struct PowdrrTracker {
     pub org_id: String,
     pub parent_entity: String,
     pub name: String,
-    pub version: u64,
+    pub version: i64,
     pub claimed_at: i64
 }
 
@@ -478,7 +479,7 @@ macro_rules! powdrr_tracker {
                     Ok(trackers.trackers)
                 }
 
-                pub async fn [< claim_ $entity_name >](&self, transaction: TransactWrite, tracker: &PowdrrTracker) -> TransactWrite {
+                pub fn [< claim_ $entity_name >](&self, transaction: TransactWrite, tracker: &PowdrrTracker) -> TransactWrite {
                     let key = OrgIdEntityNameInput {
                         entity_name: &stringify!($entity_name).to_string(),
                         org_id: &tracker.org_id,
@@ -490,7 +491,7 @@ macro_rules! powdrr_tracker {
                         .value(":now", chrono::Utc::now().timestamp_millis())
                         .value(":expected_plus_one", tracker.version + 1);
                     let condition = expr::Condition::new("version = :expected")
-                        .value(":expected", tracker);
+                        .value(":expected", tracker.version);
 
                     transaction.operation(PowdrrTracker::update(key).expression(expression).condition(condition))
                 }
@@ -500,11 +501,11 @@ macro_rules! powdrr_tracker {
                     Ok(())
                 }
 
-                fn [< mark_done_ $entity_name _core >](transaction: TransactWrite, tracker: &PowdrrTracker) -> TransactWrite {
+                pub fn [< mark_done_ $entity_name _core >](transaction: TransactWrite, tracker: &PowdrrTracker) -> TransactWrite {
                     Self::[< mark_done_ $entity_name _inner >](transaction, &tracker.org_id, &tracker.parent_entity, &tracker.name, Some(tracker.version))
                 }
 
-                fn [< mark_done_ $entity_name _inner >](transaction: TransactWrite, org_id: &String, parent_entity: &String, name: &String, expected_version: Option<u64>) -> TransactWrite {
+                fn [< mark_done_ $entity_name _inner >](transaction: TransactWrite, org_id: &String, parent_entity: &String, name: &String, expected_version: Option<i64>) -> TransactWrite {
                     let key = OrgIdEntityNameInput {
                         entity_name: &stringify!($entity_name).to_string(),
                         org_id,
@@ -592,6 +593,7 @@ powdrr_named_cached_entity!(cleanup_work_item, CleanupWorkItem);
 
 powdrr_tracker!(extension_work_item_lease);
 powdrr_tracker!(compaction_work_item_lease);
+powdrr_tracker!(cleanup_work_item_lease);
 powdrr_tracker!(speedboat_commit_checkpointed);
 powdrr_tracker!(extension_commit_checkpointed);
 powdrr_tracker!(checkpoint_waiting_for_extension);
@@ -686,15 +688,31 @@ impl DynamoDbConnector {
 
         if compaction_work_item.is_some() {
             assert!(compaction_latest.is_some());
-            let compaction_work_item_id = IdInstance::next_id().to_string();
+            let compaction_work_item_id = compaction_work_item.as_ref().unwrap().id.clone();
             transaction = self.private_create_compaction_work_item_core(transaction, &input_latest.org_id, &compaction_work_item_id, compaction_work_item.as_ref().unwrap());
             transaction = Self::bump_version(transaction, compaction_latest.as_ref().unwrap(), &compaction_work_item_id);
         }
 
+        self.commit_conditional_transaction(transaction).await
+    }
+
+    pub async fn commit_conditional_transaction(&self, transaction: TransactWrite) -> Result<bool, Error> {
         match transaction.execute(self).await {
             Ok(_) => Ok(true),
             Err(e) => {
-                if e.as_service_error().unwrap().is_transaction_canceled_exception() {
+                let service_error = e.as_service_error().unwrap();
+                if service_error.is_transaction_canceled_exception() {
+                    match service_error {
+                        TransactWriteItemsError::TransactionCanceledException(inner) => {
+                            if inner.cancellation_reasons.is_some() {
+                                let cancellation_reasons = inner.cancellation_reasons.as_ref().unwrap();
+                                let reasons = format!("{:?}", cancellation_reasons);
+                                println!("Transaction canceled: {}", reasons);
+                                panic!("Transaction canceled: {}", reasons);
+                            }
+                        }
+                        _ => ()
+                    }
                     Ok(false)
                 } else {
                     Err(e.into())
@@ -726,16 +744,7 @@ impl DynamoDbConnector {
 
         }
 
-        match transaction.execute(self).await {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                if e.as_service_error().unwrap().is_transaction_canceled_exception() {
-                    Ok(false)
-                } else {
-                    Err(e.into())
-                }
-            }
-        }
+        self.commit_conditional_transaction(transaction).await
     }
 
     pub async fn commit_compaction_work_item_taken(&self, old_entity_infos: &Vec<EntityVersionInfo>, new_entity_id: &String) -> Result<bool, Error> {
@@ -761,16 +770,7 @@ impl DynamoDbConnector {
 
         }
 
-        match transaction.execute(self).await {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                if e.as_service_error().unwrap().is_transaction_canceled_exception() {
-                    Ok(false)
-                } else {
-                    Err(e.into())
-                }
-            }
-        }
+        self.commit_conditional_transaction(transaction).await
     }
 
 /*
@@ -804,7 +804,9 @@ impl DynamoDbConnector {
         let mut transaction = TransactWrite::new();
 
         let speedboat_commit_id = &IdInstance::next_id().to_string();
+        // Step 1
         transaction = self.private_create_speedboat_commit_core(transaction, org_id, speedboat_commit_id, commit);
+        // Step 2
         transaction = Self::create_speedboat_commit_checkpointed_core(transaction, org_id, table_name, speedboat_commit_id, None);
 
         let latest_es_key = &Self::latest_extension_work_item_key(&table_name, &"es".to_string());
@@ -813,7 +815,7 @@ impl DynamoDbConnector {
         let new_es_id = IdInstance::next_id().to_string();
         let mut work_item = if latest_es.as_ref().unwrap().entity_id == Self::NO_WORK_ITEM {
             ExtensionWorkItem {
-                id: new_es_id.clone(),
+                id: "".to_string(),
                 extension_type: "es".to_string(),
                 table_name: table_name.to_string(),
                 table_schema: PowdrrSchema::minimal(),
@@ -823,21 +825,15 @@ impl DynamoDbConnector {
         } else {
             self.describe_extension_work_item(&mut PowdrrNamedExtensionWorkItemCache::new(), org_id, &latest_es.as_ref().unwrap().entity_id).await?.unwrap()
         };
+        work_item.id = new_es_id.clone();
         work_item.merge_speedboat(commit);
-        transaction = self.cached_create_extension_work_item_core(transaction, &mut PowdrrNamedExtensionWorkItemCache::new(), org_id, &work_item.id, &work_item);
+        // Step 3
+        transaction = self.cached_create_extension_work_item_core(transaction, &mut PowdrrNamedExtensionWorkItemCache::new(), org_id, &new_es_id, &work_item);
+        // Step 4
         transaction = Self::bump_version(transaction, latest_es.as_ref().unwrap(), &new_es_id);
         // TODO: delete old id?
 
-        match transaction.execute(self).await {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                if e.as_service_error().unwrap().is_transaction_canceled_exception() {
-                    Ok(false)
-                } else {
-                    Err(e.into())
-                }
-            }
-        }
+        self.commit_conditional_transaction(transaction).await
     }
 
     async fn gather_compactions(&self, org_id: &String, speedboat_commits: &Vec<SpeedboatCommit>, iceberg_commits: &Vec<IcebergCommit>) -> Result<HashMap<String, CompactionCommit>, Error> {
@@ -909,7 +905,7 @@ impl DynamoDbConnector {
         let new_es_id = IdInstance::next_id().to_string();
         let mut work_item = if latest_es.as_ref().unwrap().entity_id == Self::NO_WORK_ITEM {
             ExtensionWorkItem {
-                id: new_es_id.clone(),
+                id: "".to_string(),
                 extension_type: "es".to_string(),
                 table_name: table_name.to_string(),
                 table_schema: PowdrrSchema::minimal(),
@@ -919,8 +915,9 @@ impl DynamoDbConnector {
         } else {
             self.describe_extension_work_item(&mut PowdrrNamedExtensionWorkItemCache::new(), org_id, &latest_es.as_ref().unwrap().entity_id).await?.unwrap()
         };
+        work_item.id = new_es_id.clone();
         work_item.merge_iceberg(commit);
-        transaction = self.cached_create_extension_work_item_core(transaction, &mut PowdrrNamedExtensionWorkItemCache::new(), org_id, &work_item.id, &work_item);
+        transaction = self.cached_create_extension_work_item_core(transaction, &mut PowdrrNamedExtensionWorkItemCache::new(), org_id, &new_es_id, &work_item);
 
         // Step 4
         transaction = Self::bump_version(transaction, latest_es.as_ref().unwrap(), &new_es_id);
@@ -937,36 +934,34 @@ impl DynamoDbConnector {
             cloned_checkpoint_to_replace.original_checkpoint_id = Some(compaction_commit.checkpoint_id_to_replace.clone());
 
             let checkpoint_obj = PowdrrNamedTableMetadataCheckpoint {
-                name: new_checkpoint.get_descriptor().full_name(),
+                name: cloned_checkpoint_to_replace.get_descriptor().full_name(),
                 org_id: org_id.clone(),
                 entity: new_checkpoint.clone(),
             };
             transaction = transaction.operation(checkpoint_obj.create());
 
             if !new_checkpoint.fully_covered_for_extension(&"es".to_string()) {
-                transaction = Self::create_checkpoint_waiting_for_extension_core(transaction, org_id, &new_checkpoint.table_name, &new_checkpoint.get_descriptor().full_name(), None)
+                transaction = Self::create_checkpoint_waiting_for_extension_core(transaction, org_id, &cloned_checkpoint_to_replace.table_name, &cloned_checkpoint_to_replace.get_descriptor().full_name(), None)
             }
 
             // Step 5b
             // TODO: delete the listed checkpoints
 
             // Step 5c
-            transaction = Self::mark_done_compaction_work_item_lease_inner(transaction, org_id, &new_checkpoint.table_name, compaction_id, Some(0));
+            let key = Self::latest_compaction_work_item_key(&cloned_checkpoint_to_replace.table_name);
+            transaction = Self::mark_done_compaction_work_item_lease_inner(transaction, org_id, &key, compaction_id, None);
 
             // Step 5d
-            // TODO: create cleanup work items
+            let cleanup_work_item = CleanupWorkItem {
+                id: IdInstance::next_id().to_string(),
+                files_to_delete: compaction_commit.removed_speedboat_files.iter().chain(compaction_commit.removed_delete_files.iter()).map(|x|x.clone()).collect(),
+            };
+            let cleanup_work_item_id = cleanup_work_item.id.clone();
+            transaction = self.cached_create_cleanup_work_item_core(transaction, &mut PowdrrNamedCleanupWorkItemCache::new(), org_id, &cleanup_work_item_id, &cleanup_work_item);
+            transaction = Self::create_cleanup_work_item_lease_core(transaction, org_id, &cloned_checkpoint_to_replace.table_name, &cleanup_work_item_id, None);
         }
 
-        match transaction.execute(self).await {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                if e.as_service_error().unwrap().is_transaction_canceled_exception() {
-                    Ok(false)
-                } else {
-                    Err(e.into())
-                }
-            }
-        }
+        self.commit_conditional_transaction(transaction).await
     }
 
     pub async fn commit_extension_work_item_completed(&self, org_id: &String, table_name: &String, commit: &ExtensionCommit) -> Result<bool, Error> {
@@ -977,16 +972,7 @@ impl DynamoDbConnector {
         transaction = self.private_create_extension_commit_core(transaction, org_id, &commit.id, &commit);
         transaction = Self::create_extension_commit_checkpointed_core(transaction, org_id, table_name, &commit.id, None);
 
-        match transaction.execute(self).await {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                if e.as_service_error().unwrap().is_transaction_canceled_exception() {
-                    Ok(false)
-                } else {
-                    Err(e.into())
-                }
-            }
-        }
+        self.commit_conditional_transaction(transaction).await
     }
 }
 

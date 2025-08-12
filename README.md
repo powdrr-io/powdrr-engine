@@ -25,7 +25,7 @@ Run the benchmark
 ```
 cargo run --package powdrr-io-engine --release 9200
 cargo run --package powdrr-io-engine --release 9201
-cargo run --package benchmark
+cargo run --package powdrr-benchmark
 ```
 
 Run test script

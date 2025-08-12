@@ -390,6 +390,13 @@ impl FileSetPayload {
         }
     }
 
+    pub fn validate(&self) -> () {
+        let max_index = self.schemas.len() as u64;
+        for index in self.file_schemas.iter() {
+            assert!(index < &max_index);
+        }
+    }
+
     #[cfg(test)]
     pub fn single(file_path: String, size: u64, schema: PowdrrSchema) -> Self {
         FileSetPayload {
@@ -486,7 +493,7 @@ impl FileSetPayload {
                 return FileSetPayload {
                     file_paths: vec!(file_path.clone()),
                     sizes: vec!(self.sizes[i]),
-                    file_schemas: vec!(self.file_schemas[i]),
+                    file_schemas: vec!(0),
                     schemas: vec!(self.schemas[self.file_schemas[i] as usize].clone()),
                 }
             }
@@ -534,6 +541,7 @@ impl ExtensionWorkItem {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CompactionWorkItem {
+    pub id: String,
     pub table_schema: PowdrrSchema,
     pub speedboat_files: FileSetPayload,
     pub delete_files: Vec<String>,
@@ -552,6 +560,7 @@ impl CompactionWorkItem {
     pub fn from_checkpoint(checkpoint: &TableMetadataCheckpoint, checkpoints_to_delete: &Vec<String>) -> Self {
         assert!(checkpoint.speedboat_metadata.is_some());
         CompactionWorkItem {
+            id: IdInstance::next_id().to_string(),
             table_schema: checkpoint.schema.clone(),
             speedboat_files: checkpoint.speedboat_metadata.as_ref().unwrap().files.clone(),
             delete_files: checkpoint.deletes_metadata.as_ref().map_or(vec![], |x| x.files.clone()),
@@ -564,6 +573,7 @@ impl CompactionWorkItem {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CleanupWorkItem {
+    pub id: String,
     pub files_to_delete: Vec<String>,
 }
 

@@ -225,14 +225,6 @@ impl EphemeralServiceImpl {
         }
     }
 
-    fn get_removed_files(&self, compactions: &Vec<String>) -> (Vec<String>, Vec<String>) {
-        let compactions_data: Vec<&CompactionCommit> = compactions.iter().map(|x| &self.compactions.get(x).unwrap().1).collect();
-        (
-            compactions_data.iter().map(|x| x.removed_speedboat_files.clone()).flatten().collect(),
-            compactions_data.iter().map(|x| x.removed_delete_files.clone()).flatten().collect(),
-        )
-    }
-
     fn get_latest_committed_checkpoint_sync(&mut self, table_name: &String, extensions: Option<String>) -> Option<String> {
         let real_table_name = self.table_aliases.get(table_name).unwrap_or(table_name);
         self.latest_committed_checkpoint_id.get(&extensions).map_or(None, |c| c.get(real_table_name).cloned())
@@ -349,6 +341,7 @@ impl EphemeralServiceImpl {
         }
 
         CleanupWorkItem {
+            id: IdInstance::next_id().to_string(),
             files_to_delete: compaction_obj.removed_speedboat_files.iter().chain(compaction_obj.removed_delete_files.iter()).map(|x|x.clone()).collect(),
         }
     }
