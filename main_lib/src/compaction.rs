@@ -386,21 +386,24 @@ impl CompactionCommand {
     }
 
     async fn do_iceberg_commit(compaction_response: &CompactionResponse) -> Result<i64, ServiceApiError> {
+        let metadata = IcebergMetadata {
+            table_schema: compaction_response.schema.clone(),
+            snapshot_id: Some(compaction_response.lib_metadata.snapshot_id.to_string()),
+            files: FileSetPayload {
+                file_paths: compaction_response.lib_metadata.files.clone(),
+                schemas: compaction_response.lib_metadata.schemas.iter().map(|s|PowdrrSchema::from_iceberg(s)).collect(),
+                file_schemas: compaction_response.lib_metadata.files.iter().enumerate().map(|(x, _)|x as u64).collect(),
+                sizes: compaction_response.lib_metadata.sizes.clone()
+            },
+            column_names: compaction_response.lib_metadata.column_names.clone(),
+            column_stats: compaction_response.lib_metadata.column_stats.clone(),
+        };
+        metadata.files.validate();
+
         match STATE_PROVIDER.iceberg_commit(
             &compaction_response.table_name,
             &IcebergCommit {
-                metadata: IcebergMetadata {
-                    table_schema: compaction_response.schema.clone(),
-                    snapshot_id: Some(compaction_response.lib_metadata.snapshot_id.to_string()),
-                    files: FileSetPayload {
-                        file_paths: compaction_response.lib_metadata.files.clone(),
-                        schemas: compaction_response.lib_metadata.schemas.iter().map(|s|PowdrrSchema::from_iceberg(s)).collect(),
-                        file_schemas: compaction_response.lib_metadata.files.iter().enumerate().map(|(x, _)|x as u64).collect(),
-                        sizes: compaction_response.lib_metadata.sizes.clone()
-                    },
-                    column_names: compaction_response.lib_metadata.column_names.clone(),
-                    column_stats: compaction_response.lib_metadata.column_stats.clone(),
-                },
+                metadata,
                 compactions: compaction_response.lib_metadata.compactions.clone(),
                 deletes_table_info: compaction_response.deletes_table_info.clone(),
             }
@@ -552,7 +555,7 @@ pub(crate) async fn compact_logs(command: Arc<dyn Command>) -> Result<ElasticSea
 pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkItem)>, last_snapshot_id: i64) -> Result<i64, CompactionError> {
     let mut new_last_snapshot_id = last_snapshot_id;
     for (table_name, work_item) in work_items.iter() {
-        let compaction_id = IdInstance::next_id().to_string();
+        let compaction_id = work_item.id.clone();
 
         // NOTE: the api commit must happen before the iceberg commit. The main_lib is designed to understand that
         // a compaction commit might get committed to it but fail afterwards. If we commit to Iceberg and fail to

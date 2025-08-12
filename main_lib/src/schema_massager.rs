@@ -6,7 +6,6 @@ use std::ops::Deref;
 use std::sync::Arc;
 use arrow_json::reader::infer_json_schema;
 use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema};
-use datafusion::logical_expr::UserDefinedLogicalNode;
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use iceberg::spec::{PrimitiveType, Type};
 use serde::{Deserialize, Serialize};

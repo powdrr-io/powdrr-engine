@@ -264,7 +264,7 @@ pub(crate) async fn perform_cleanup_work(cleanup_work_item: &CleanupWorkItem) ->
                     Ok(_) => (),
                     Err(e) => {
                         let _error = format!("{}", e);
-                        panic!("oh no");
+                        tracing::error!("Error occurred while deleting file {}: {}", file_to_delete, e);
                     }
                 }
             }
@@ -359,7 +359,7 @@ pub fn test_v1_set_testing_processing_mode(mut state: State) -> Pin<Box<HandlerF
         if mode.state_mode.is_testing() {
             drop_all_tables(&"default".to_string()).await.unwrap();
         }
-        tokio::spawn(do_update_checkpoint_work_for_forever(100));
+        tokio::spawn(do_update_checkpoint_work_for_forever(1000));
         if !mode.indexing_mode.is_disabled() {
             tokio::spawn(do_extension_work_for_forever(vec!("es".to_string()), 1000));
         }
