@@ -700,6 +700,7 @@ pub struct CreateIndexTemplateBody {
 pub enum ServiceImplType {
     Ephemeral,
     DynamoDb,
+    TestingDynamoDb,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -713,4 +714,59 @@ impl ServiceMode {
         // TODO: does this need to be configurable?
         TestProcessingMode::default()
     }
+}
+
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum LicenseType {
+    Free,
+    Pro,
+}
+
+
+pub const ACCESS_KEY_HEADER_KEY: &str = "ACCESS_KEY";
+pub const SECRET_KEY_HEADER_KEY: &str = "SECRET_KEY";
+
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OrgCreds {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub nickname: Option<String>,
+}
+
+
+impl OrgCreds {
+    #[allow(dead_code)]
+    fn new(nickname: Option<String>) -> Self {
+        // TODO: Make these cryptographic random
+        OrgCreds {
+            access_key_id: IdInstance::next_id().to_string(),
+            secret_access_key: IdInstance::next_id().to_string(),
+            nickname,
+        }
+    }
+}
+
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OrgSettings {
+    pub org_id: String,
+    pub license_type: LicenseType,
+    pub creds: Vec<OrgCreds>,
+}
+
+impl OrgSettings {
+    pub(crate) fn to_org_info(&self) -> OrgInfo {
+        OrgInfo {
+            org_id: self.org_id.clone(),
+            license_type: self.license_type.clone(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OrgInfo {
+    pub org_id: String,
+    pub license_type: LicenseType,
 }

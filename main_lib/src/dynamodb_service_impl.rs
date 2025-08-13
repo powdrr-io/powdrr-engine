@@ -1,11 +1,14 @@
 use std::collections::HashMap;
+use aws_config::{BehaviorVersion, Region};
+use aws_sdk_dynamodb::Client;
 use modyne::model::TransactWrite;
-use crate::data_contract::{TableDescription, CreateIndexTemplateBody, CompactionWorkItem, ExtensionWorkItem, CompactionCommit, TableMetadataCheckpoint, ExtensionCommit, CreateTable, SpeedboatCommit, IcebergCommit, SpeedboatCommitTableInfo, CleanupWorkItem, CleanupCommit};
+use modyne::TestTableExt;
+use crate::data_contract::{TableDescription, CreateIndexTemplateBody, CompactionWorkItem, ExtensionWorkItem, CompactionCommit, TableMetadataCheckpoint, ExtensionCommit, CreateTable, SpeedboatCommit, IcebergCommit, SpeedboatCommitTableInfo, CleanupWorkItem, CleanupCommit, OrgSettings, OrgInfo};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
 use crate::state_provider::ServiceApiError;
-use crate::dynamodb::{DynamoDbConnector, PowdrrNamedCleanupWorkItemCache, PowdrrNamedCompactionCommitCache, PowdrrNamedCompactionWorkItemCache, PowdrrNamedExtensionCommitCache, PowdrrNamedExtensionWorkItemCache, PowdrrNamedIcebergCommitCache, PowdrrNamedSpeedboatCommitCache, PowdrrNamedTableMetadataCheckpointCache, TableBody};
+use crate::dynamodb::{DynamoDbConnector, PowdrrNamedCleanupWorkItemCache, PowdrrNamedCompactionCommitCache, PowdrrNamedCompactionWorkItemCache, PowdrrNamedExtensionCommitCache, PowdrrNamedExtensionWorkItemCache, PowdrrNamedIcebergCommitCache, PowdrrNamedOrgInfoCache, PowdrrNamedSpeedboatCommitCache, PowdrrNamedTableMetadataCheckpointCache, TableBody};
 use crate::test_api::TestProcessingMode;
 
 
@@ -29,10 +32,12 @@ pub struct DynamoDBServiceImpl {
     extension_cache: PowdrrNamedExtensionCommitCache,
     extension_work_item_cache: PowdrrNamedExtensionWorkItemCache,
     compaction_work_item_cache: PowdrrNamedCompactionWorkItemCache,
+    org_cache: PowdrrNamedOrgInfoCache,
 }
 
 
-static ORG_ID: &'static str = "fake_org_id";
+static MANAGEMENT_ORG_ID: &'static str = "MANAGEMENT_ORG";
+
 
 impl DynamoDBServiceImpl {
     pub fn new(mode: TestProcessingMode) -> Self {
@@ -40,9 +45,33 @@ impl DynamoDBServiceImpl {
         Self::with_client(aws_sdk_dynamodb::Client::from_conf(aws_config), mode)
     }
 
-    pub fn with_client(client: aws_sdk_dynamodb::Client, mode: TestProcessingMode) -> Self {
-        DynamoDBServiceImpl{
-            mode: mode,
+    pub async fn test(mode: TestProcessingMode) -> Self {
+        let config = aws_config::defaults(BehaviorVersion::latest())
+            .region(Region::new("us-east-1")) // Region doesn't matter for local, but required
+            .endpoint_url("http://localhost:4566")
+            .credentials_provider(aws_credential_types::Credentials::new(
+                "test", "test", None, None, "static",
+            ))
+            .load()
+            .await;
+
+
+        let client = Client::new(&config);
+        let impl_obj = Self::with_client(client, mode);
+
+        let _ = impl_obj.connector.delete_table().send().await;
+        let _create_table = match impl_obj.connector.create_table().send().await {
+            Ok(_) => (),
+            Err(e) => {
+                panic!("Failed during initialization, is Docker running?: {:?}", e)
+            },
+        };
+        impl_obj
+    }
+
+    fn with_client(client: Client, mode: TestProcessingMode) -> Self {
+        DynamoDBServiceImpl {
+            mode,
             connector: DynamoDbConnector::new(client),
             compactions_cache: PowdrrNamedCompactionCommitCache::new(),
             checkpoints_cache: PowdrrNamedTableMetadataCheckpointCache::new(),
@@ -51,6 +80,7 @@ impl DynamoDBServiceImpl {
             extension_cache: PowdrrNamedExtensionCommitCache::new(),
             extension_work_item_cache: PowdrrNamedExtensionWorkItemCache::new(),
             compaction_work_item_cache: PowdrrNamedCompactionWorkItemCache::new(),
+            org_cache: PowdrrNamedOrgInfoCache::new(),
         }
     }
 
@@ -75,10 +105,12 @@ impl DynamoDBServiceImpl {
 
     const NO_WORK_ITEM: &'static str = "-1";
 
-    pub async fn add_checkpoint(&mut self, metadata: &TableMetadataCheckpoint) -> Result<(), ServiceApiError> {
-        self.connector.create_table(&ORG_ID.to_string(), &metadata.table_name, &TableBody{ tags: Default::default() }).await.map_err(from_modyne)?;
+    pub async fn add_checkpoint(&mut self, org_info: &OrgInfo, metadata: &TableMetadataCheckpoint) -> Result<(), ServiceApiError> {
+        self.connector.create_powdrr_table(&org_info.org_id.clone(), &metadata.table_name, &TableBody { tags: Default::default() }).await.map_err(from_modyne)?;
         if metadata.speedboat_metadata.is_some() {
-            self.speedboat_commit(&SpeedboatCommit {
+            self.speedboat_commit(
+                org_info,
+                &SpeedboatCommit {
                 type_files: vec!(SpeedboatCommitTableInfo {
                     commit_type: "commit".to_string(),
                     table_name: metadata.table_name.clone(),
@@ -91,6 +123,7 @@ impl DynamoDBServiceImpl {
         }
         if metadata.iceberg_metadata.is_some() {
             self.iceberg_commit(
+                org_info,
                 &metadata.table_name,
                 &IcebergCommit {
                     metadata: metadata.iceberg_metadata.as_ref().unwrap().clone(),
@@ -110,65 +143,66 @@ impl DynamoDBServiceImpl {
         todo!()
     }
 
-    pub async fn create_table(&mut self, create_table: &CreateTable) -> Result<(), ServiceApiError> {
-        self.connector.create_table(&ORG_ID.to_string(), &create_table.name, &TableBody{ tags: create_table.tags.clone() }).await.map_err(from_modyne)
+    pub async fn create_table(&mut self, org_info: &OrgInfo, create_table: &CreateTable) -> Result<(), ServiceApiError> {
+        self.connector.create_table_helper(&org_info.org_id.to_string(), &create_table.name, &TableBody { tags: create_table.tags.clone() }).await.map_err(from_modyne)
     }
 
-    pub async fn describe_table(&mut self, name: &String) -> Result<Option<TableDescription>, ServiceApiError> {
-        self.connector.describe_powdrr_table(&ORG_ID.to_string(), name).await
-            .map(|x| x.map(|x| TableDescription{ name: name.clone(), tags: x.tags.clone() }))
+    pub async fn describe_table(&mut self, org_info: &OrgInfo, name: &String) -> Result<Option<TableDescription>, ServiceApiError> {
+        self.connector.describe_powdrr_table(&org_info.org_id.to_string(), name).await
+            .map(|x| x.map(|x| TableDescription { name: name.clone(), tags: x.tags.clone() }))
             .map_err(from_modyne)
     }
 
-    pub async fn add_alias(&mut self, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
-        self.connector.create_alias(&ORG_ID.to_string(), alias, table_name).await.map_err(from_modyne)
+    pub async fn add_alias(&mut self, org_info: &OrgInfo, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
+        self.connector.create_alias(&org_info.org_id.to_string(), alias, table_name).await.map_err(from_modyne)
     }
 
-    pub async fn remove_alias(&mut self, _table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
-        self.connector.delete_alias(&ORG_ID.to_string(), alias).await.map_err(from_modyne)
+    pub async fn remove_alias(&mut self, org_info: &OrgInfo, _table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
+        self.connector.delete_alias(&org_info.org_id.to_string(), alias).await.map_err(from_modyne)
     }
 
-    pub async fn create_table_template(&mut self, name: &String, template: &CreateIndexTemplateBody) -> Result<(), ServiceApiError> {
-        self.connector.create_table_template(&ORG_ID.to_string(), name, template).await.map_err(from_modyne)
+    pub async fn create_table_template(&mut self, org_info: &OrgInfo, name: &String, template: &CreateIndexTemplateBody) -> Result<(), ServiceApiError> {
+        self.connector.create_table_template(&org_info.org_id.to_string(), name, template).await.map_err(from_modyne)
     }
 
-    pub async fn describe_table_template(&mut self, name: &String) -> Result<Option<CreateIndexTemplateBody>, ServiceApiError> {
-        self.connector.describe_table_template(&ORG_ID.to_string(), name).await.map_err(from_modyne)
+    pub async fn describe_table_template(&mut self, org_info: &OrgInfo, name: &String) -> Result<Option<CreateIndexTemplateBody>, ServiceApiError> {
+        self.connector.describe_table_template(&org_info.org_id.clone(), name).await.map_err(from_modyne)
     }
 
-    pub async fn create_pipeline(&mut self, name: &String, pipeline: &PipelineDefinition) -> Result<(), ServiceApiError> {
-        self.connector.create_pipeline(&ORG_ID.to_string(), name, pipeline).await.map_err(from_modyne)
+    pub async fn create_pipeline(&mut self, org_info: &OrgInfo, name: &String, pipeline: &PipelineDefinition) -> Result<(), ServiceApiError> {
+        self.connector.create_pipeline(&org_info.org_id.clone(), name, pipeline).await.map_err(from_modyne)
     }
 
-    pub async fn describe_pipeline(&mut self, name: &String) -> Result<Option<PipelineDefinition>, ServiceApiError> {
-        self.connector.describe_pipeline(&ORG_ID.to_string(), name).await.map_err(from_modyne)
+    pub async fn describe_pipeline(&mut self, org_info: &OrgInfo, name: &String) -> Result<Option<PipelineDefinition>, ServiceApiError> {
+        self.connector.describe_pipeline(&org_info.org_id.clone(), name).await.map_err(from_modyne)
     }
 
-    pub async fn create_lifetime_policy(&mut self, name: &String, policy: &ILMPolicyDefinition) -> Result<(), ServiceApiError> {
-        self.connector.create_lifetime_policy(&ORG_ID.to_string(), name, policy).await.map_err(from_modyne)
+    pub async fn create_lifetime_policy(&mut self, org_info: &OrgInfo, name: &String, policy: &ILMPolicyDefinition) -> Result<(), ServiceApiError> {
+        self.connector.create_lifetime_policy(&org_info.org_id.clone(), name, policy).await.map_err(from_modyne)
     }
 
-    pub async fn describe_lifetime_policy(&mut self, name: &String) -> Result<Option<ILMPolicyDefinition>, ServiceApiError> {
-        self.connector.describe_lifetime_policy(&ORG_ID.to_string(), name).await.map_err(from_modyne)
+    pub async fn describe_lifetime_policy(&mut self, org_info: &OrgInfo, name: &String) -> Result<Option<ILMPolicyDefinition>, ServiceApiError> {
+        self.connector.describe_lifetime_policy(&org_info.org_id.clone(), name).await.map_err(from_modyne)
     }
 
-    pub async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), ServiceApiError> {
-        let tables: Vec<String> = commit.type_files.iter().map(|x|x.table_name.clone()).collect();
+    pub async fn speedboat_commit(&mut self, org_info: &OrgInfo, commit: &SpeedboatCommit) -> Result<(), ServiceApiError> {
+        let tables: Vec<String> = commit.type_files.iter().map(|x| x.table_name.clone()).collect();
         //assert_eq!(tables.len(), 1, "Only really support single table commits right now");
         // TODO: change to return result bool
-        let retval = self.connector.commit_speedboat(&ORG_ID.to_string(), &tables[0], commit).await.map_err(from_modyne)?;
+        let retval = self.connector.commit_speedboat(&org_info.org_id.clone(), &tables[0], commit).await.map_err(from_modyne)?;
         assert!(retval);
         Ok(())
     }
 
     async fn clone_and_apply(
         &mut self,
+        org_info: &OrgInfo,
         metadata: &TableMetadataCheckpoint,
         speedboat_commits: &Vec<SpeedboatCommit>,
         iceberg_commits: &Vec<IcebergCommit>,
         extension_commits: &Vec<ExtensionCommit>,
     ) -> (TableMetadataCheckpoint, bool) {
-        let compactions = self.gather_compactions(speedboat_commits, iceberg_commits).await.unwrap();
+        let compactions = self.gather_compactions(org_info, speedboat_commits, iceberg_commits).await.unwrap();
         metadata.clone_and_apply(
             speedboat_commits,
             iceberg_commits,
@@ -177,7 +211,7 @@ impl DynamoDBServiceImpl {
         )
     }
 
-    async fn gather_compactions(&mut self, speedboat_commits: &Vec<SpeedboatCommit>, iceberg_commits: &Vec<IcebergCommit>) -> Result<HashMap<String, CompactionCommit>, ServiceApiError> {
+    async fn gather_compactions(&mut self, org_info: &OrgInfo, speedboat_commits: &Vec<SpeedboatCommit>, iceberg_commits: &Vec<IcebergCommit>) -> Result<HashMap<String, CompactionCommit>, ServiceApiError> {
         let mut compactions = vec!();
         for speedboat_commit in speedboat_commits {
             if speedboat_commit.compaction.is_some() {
@@ -194,45 +228,45 @@ impl DynamoDBServiceImpl {
         for compaction in compactions {
             compaction_commits.insert(
                 compaction.clone(),
-                self.connector.describe_compaction(&mut self.compactions_cache, &ORG_ID.to_string(), &compaction).await.map_err(from_modyne)?.unwrap()
+                self.connector.describe_compaction(&mut self.compactions_cache, &org_info.org_id, &compaction).await.map_err(from_modyne)?.unwrap()
             );
         }
 
         Ok(compaction_commits)
     }
 
-    pub async fn iceberg_commit(&mut self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError> {
+    pub async fn iceberg_commit(&mut self, org_info: &OrgInfo, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError> {
         // TODO: change to return result bool
-        let retval = self.connector.commit_iceberg(&ORG_ID.to_string(), table_name, iceberg_commit).await.map_err(from_modyne)?;
+        let retval = self.connector.commit_iceberg(&org_info.org_id.clone(), table_name, iceberg_commit).await.map_err(from_modyne)?;
         assert!(retval);
         Ok(())
     }
 
-    pub async fn extension_commit(&mut self, table_name: &String, commit: &ExtensionCommit) -> Result<(), ServiceApiError> {
-        match self.connector.commit_extension_work_item_completed(&ORG_ID.to_string(), table_name, &commit).await.map_err(from_modyne)? {
+    pub async fn extension_commit(&mut self, org_info: &OrgInfo, table_name: &String, commit: &ExtensionCommit) -> Result<(), ServiceApiError> {
+        match self.connector.commit_extension_work_item_completed(&org_info.org_id, table_name, &commit).await.map_err(from_modyne)? {
             true => Ok(()),
             false => {
-                Err(ServiceApiError{ message: "Unable to commit, conflict detected".to_string() })
+                Err(ServiceApiError { message: "Unable to commit, conflict detected".to_string() })
             }
         }
     }
 
-    pub async fn compaction_commit(&mut self, _table_name: &String, commit: &CompactionCommit) -> Result<(), ServiceApiError> {
+    pub async fn compaction_commit(&mut self, org_info: &OrgInfo, _table_name: &String, commit: &CompactionCommit) -> Result<(), ServiceApiError> {
         // NOTE: this just notes what the compactor is saying. We don't generate the new checkpoint
         // until we see an iceberg or speedboat commit with the new info.
         assert!(commit.compaction_id.len() > 0);
-        self.connector.create_compaction(&mut self.compactions_cache, &ORG_ID.to_string(), &commit.compaction_id, commit).await.map_err(from_modyne)
+        self.connector.create_compaction(&mut self.compactions_cache, &org_info.org_id, &commit.compaction_id, commit).await.map_err(from_modyne)
     }
 
-    pub async fn cleanup_commit(&mut self, commit: &CleanupCommit) -> Result<(), ServiceApiError> {
+    pub async fn cleanup_commit(&mut self, org_info: &OrgInfo, commit: &CleanupCommit) -> Result<(), ServiceApiError> {
         let mut transaction = TransactWrite::new();
-        transaction = DynamoDbConnector::mark_done_cleanup_work_item_lease_inner(transaction, &ORG_ID.to_string(), &commit.table_name, &commit.id, None);
+        transaction = DynamoDbConnector::mark_done_cleanup_work_item_lease_inner(transaction, &org_info.org_id, &commit.table_name, &commit.id, None);
         self.connector.commit_conditional_transaction(transaction).await.map_err(from_modyne)?;
         Ok(())
     }
 
-    pub async fn get_latest_committed_checkpoint(&mut self, table_name: &String, extensions: Option<String>) -> Result<Option<String>, ServiceApiError> {
-        let value = self.connector.describe_latest(&ORG_ID.to_string(), &Self::latest_checkpoint_key(table_name, &extensions)).await.map_err(from_modyne)?;
+    pub async fn get_latest_committed_checkpoint(&mut self, org_info: &OrgInfo, table_name: &String, extensions: Option<String>) -> Result<Option<String>, ServiceApiError> {
+        let value = self.connector.describe_latest(&org_info.org_id, &Self::latest_checkpoint_key(table_name, &extensions)).await.map_err(from_modyne)?;
         match value {
             Some(val) => {
                 tracing::info!("Latest checkpoint for {}: {}", table_name, val.entity_id);
@@ -242,9 +276,9 @@ impl DynamoDBServiceImpl {
         }
     }
 
-    pub async fn get_checkpoint(&mut self, checkpoint: &CheckpointDescriptor) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
+    pub async fn get_checkpoint(&mut self, org_info: &OrgInfo, checkpoint: &CheckpointDescriptor) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
         tracing::info!("Getting checkpoint for {}", checkpoint.full_name());
-        match self.connector.describe_checkpoint(&mut self.checkpoints_cache, &ORG_ID.to_string(), &checkpoint.full_name()).await.map_err(from_modyne) {
+        match self.connector.describe_checkpoint(&mut self.checkpoints_cache, &org_info.org_id, &checkpoint.full_name()).await.map_err(from_modyne) {
             Ok(val) => {
                 tracing::info!("Got checkpoint for {}: {}", checkpoint.full_name(), val.is_some());
                 Ok(val)
@@ -253,19 +287,19 @@ impl DynamoDBServiceImpl {
         }
     }
 
-    pub async fn get_extension_work_items(&mut self, extension_type: &String) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {
-        let all_tables = self.connector.fetch_entities(&ORG_ID.to_string(), &"powdrr_table".to_string(), None).await.map_err(from_modyne)?;
+    pub async fn get_extension_work_items(&mut self, org_info: &OrgInfo, extension_type: &String) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {
+        let all_tables = self.connector.fetch_entities(&org_info.org_id, &"powdrr_table".to_string(), None).await.map_err(from_modyne)?;
         let mut work_items = vec!();
         let mut used_latest = vec!();
         for table_entity in all_tables.entities {
             let latest_es_key = &Self::latest_extension_work_item_key(&table_entity.entity_id, extension_type);
-            let latest_entity_info = self.connector.describe_latest(&ORG_ID.to_string(), latest_es_key).await.map_err(from_modyne)?;
+            let latest_entity_info = self.connector.describe_latest(&org_info.org_id, latest_es_key).await.map_err(from_modyne)?;
             match latest_entity_info {
                 Some(latest_entity_info) => {
                     if latest_entity_info.entity_id != Self::NO_WORK_ITEM.to_owned() {
-                        let lease = self.connector.valid_leases_extension_work_item_lease(&ORG_ID.to_string(), &latest_entity_info.entity_id, None, Some(LEASE_LENGTH_MS)).await.map_err(from_modyne)?;
+                        let lease = self.connector.valid_leases_extension_work_item_lease(&org_info.org_id, &latest_entity_info.entity_id, None, Some(LEASE_LENGTH_MS)).await.map_err(from_modyne)?;
                         if lease.len() == 0 {
-                            let work_item = self.connector.describe_extension_work_item(&mut self.extension_work_item_cache, &ORG_ID.to_string(), &latest_entity_info.entity_id).await.map_err(from_modyne)?;
+                            let work_item = self.connector.describe_extension_work_item(&mut self.extension_work_item_cache, &org_info.org_id, &latest_entity_info.entity_id).await.map_err(from_modyne)?;
                             assert!(work_item.is_some());
                             work_items.push(work_item.unwrap());
                             used_latest.push(latest_entity_info);
@@ -283,18 +317,18 @@ impl DynamoDBServiceImpl {
         }
     }
 
-    pub async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
-        let all_tables = self.connector.fetch_entities(&ORG_ID.to_string(), &"powdrr_table".to_string(), None).await.map_err(from_modyne)?;
+    pub async fn get_compaction_work_items(&mut self, org_info: &OrgInfo, ) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
+        let all_tables = self.connector.fetch_entities(&org_info.org_id, &"powdrr_table".to_string(), None).await.map_err(from_modyne)?;
         let mut work_items = vec!();
         let mut used_latest = vec!();
         for table_entity in all_tables.entities {
-            let latest_entity_info = self.connector.describe_latest(&ORG_ID.to_string(), &Self::latest_compaction_work_item_key(&table_entity.entity_id)).await.map_err(from_modyne)?;
+            let latest_entity_info = self.connector.describe_latest(&org_info.org_id, &Self::latest_compaction_work_item_key(&table_entity.entity_id)).await.map_err(from_modyne)?;
             match latest_entity_info {
                 Some(latest_entity_info) => {
                     if latest_entity_info.entity_id != Self::NO_WORK_ITEM.to_owned() {
-                        let leases = self.connector.valid_leases_compaction_work_item_lease(&ORG_ID.to_string(), &latest_entity_info.entity_id, None, Some(LEASE_LENGTH_MS)).await.map_err(from_modyne)?;
+                        let leases = self.connector.valid_leases_compaction_work_item_lease(&org_info.org_id, &latest_entity_info.entity_id, None, Some(LEASE_LENGTH_MS)).await.map_err(from_modyne)?;
                         if leases.len() == 0 {
-                            let work_item = self.connector.describe_compaction_work_item(&mut self.compaction_work_item_cache, &ORG_ID.to_string(), &latest_entity_info.entity_id).await.map_err(from_modyne)?;
+                            let work_item = self.connector.describe_compaction_work_item(&mut self.compaction_work_item_cache, &org_info.org_id, &latest_entity_info.entity_id).await.map_err(from_modyne)?;
                             assert!(work_item.is_some());
                             let compaction = work_item.unwrap();
                             work_items.push((table_entity.entity_id.clone(), compaction));
@@ -313,14 +347,14 @@ impl DynamoDBServiceImpl {
         }
     }
 
-    pub async fn get_cleanup_work_items(&mut self) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
-        let all_tables = self.connector.fetch_entities(&ORG_ID.to_string(), &"powdrr_table".to_string(), None).await.map_err(from_modyne)?;
+    pub async fn get_cleanup_work_items(&mut self, org_info: &OrgInfo) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
+        let all_tables = self.connector.fetch_entities(&org_info.org_id, &"powdrr_table".to_string(), None).await.map_err(from_modyne)?;
         let mut work_items = vec!();
         let mut transaction = TransactWrite::new();
         for table_entity in all_tables.entities {
-            let available_infos = self.connector.oldest_available_cleanup_work_item_lease(&ORG_ID.to_string(), &table_entity.entity_id, None, Some(LEASE_LENGTH_MS)).await.map_err(from_modyne)?;
+            let available_infos = self.connector.oldest_available_cleanup_work_item_lease(&org_info.org_id, &table_entity.entity_id, None, Some(LEASE_LENGTH_MS)).await.map_err(from_modyne)?;
             for available_info in available_infos.iter() {
-                let work_item = self.connector.describe_cleanup_work_item(&mut PowdrrNamedCleanupWorkItemCache::new(), &ORG_ID.to_string(), &available_info.name).await.map_err(from_modyne)?;
+                let work_item = self.connector.describe_cleanup_work_item(&mut PowdrrNamedCleanupWorkItemCache::new(), &org_info.org_id, &available_info.name).await.map_err(from_modyne)?;
                 assert!(work_item.is_some());
                 work_items.push(work_item.unwrap());
                 transaction = self.connector.claim_cleanup_work_item_lease(transaction, available_info);
@@ -337,33 +371,34 @@ impl DynamoDBServiceImpl {
         }
     }
 
-    pub async fn update_all_checkpoints(&mut self) -> Result<bool, ServiceApiError> {
-        let all_tables = self.connector.fetch_entities(&ORG_ID.to_string(), &"powdrr_table".to_string(), None).await.map_err(from_modyne)?;
+    pub async fn update_all_checkpoints(&mut self, org_info: &OrgInfo) -> Result<bool, ServiceApiError> {
+        let all_tables = self.connector.fetch_entities(&org_info.org_id, &"powdrr_table".to_string(), None).await.map_err(from_modyne)?;
         let mut work_done = false;
         for table_entity in all_tables.entities {
-            work_done = work_done | self.update_standard_checkpoint(&table_entity.entity_id).await?;
-            work_done = work_done | self.update_extension_checkpoint(&table_entity.entity_id).await?;
+            work_done = work_done | self.update_standard_checkpoint(org_info, &table_entity.entity_id).await?;
+            work_done = work_done | self.update_extension_checkpoint(org_info, &table_entity.entity_id).await?;
         }
         Ok(work_done)
     }
 
-    async fn update_standard_checkpoint(&mut self, table_name: &String) -> Result<bool, ServiceApiError> {
+    async fn update_standard_checkpoint(&mut self, org_info: &OrgInfo, table_name: &String) -> Result<bool, ServiceApiError> {
         // TODO: need a bulk fetcher
 
-        let latest_speedboat_trackers = self.connector.oldest_available_speedboat_commit_checkpointed(&ORG_ID.to_string(), table_name, None, None).await.map_err(from_modyne)?;
+        let latest_speedboat_trackers = self.connector.oldest_available_speedboat_commit_checkpointed(&org_info.org_id, table_name, None, None).await.map_err(from_modyne)?;
         if latest_speedboat_trackers.len() == 0 {
             return Ok(false);
         }
 
-        let latest_checkpoint_info = self.connector.describe_latest(&ORG_ID.to_string(), &Self::latest_checkpoint_key(table_name, &None)).await.map_err(from_modyne)?.unwrap();
-        let latest_checkpoint = self.connector.describe_checkpoint(&mut self.checkpoints_cache, &ORG_ID.to_string(), &latest_checkpoint_info.entity_id).await.map_err(from_modyne)?.unwrap();
+        let latest_checkpoint_info = self.connector.describe_latest(&org_info.org_id, &Self::latest_checkpoint_key(table_name, &None)).await.map_err(from_modyne)?.unwrap();
+        let latest_checkpoint = self.connector.describe_checkpoint(&mut self.checkpoints_cache, &org_info.org_id, &latest_checkpoint_info.entity_id).await.map_err(from_modyne)?.unwrap();
 
         let mut latest_speedboats = vec!();
         for speedboat_tracker in latest_speedboat_trackers.iter() {
-            latest_speedboats.push(self.connector.describe_speedboat_commit(&mut self.speedboat_cache, &ORG_ID.to_string(), &speedboat_tracker.name).await.map_err(from_modyne)?.unwrap());
+            latest_speedboats.push(self.connector.describe_speedboat_commit(&mut self.speedboat_cache, &org_info.org_id, &speedboat_tracker.name).await.map_err(from_modyne)?.unwrap());
         }
 
         let (new_checkpoint, changed) = self.clone_and_apply(
+            org_info,
             &latest_checkpoint,
             &latest_speedboats,
             &vec!(),
@@ -379,7 +414,7 @@ impl DynamoDBServiceImpl {
             // TODO: do the real policy here
             let compact = speedboat_files.file_paths.len() as u64 >= 2 || speedboat_files.sizes.iter().sum::<u64>() > 30 * 1024 * 1024;
             if compact {
-                let latest_compaction = self.connector.describe_latest(&ORG_ID.to_string(), &Self::latest_compaction_work_item_key(table_name)).await.map_err(from_modyne)?.unwrap();
+                let latest_compaction = self.connector.describe_latest(&org_info.org_id, &Self::latest_compaction_work_item_key(table_name)).await.map_err(from_modyne)?.unwrap();
                 if latest_compaction.entity_id == Self::NO_WORK_ITEM.to_owned() {
                     compaction_latest = Some(latest_compaction);
                     compaction_work_item = Some(CompactionWorkItem::from_checkpoint(&new_checkpoint, &vec!()));
@@ -407,25 +442,26 @@ impl DynamoDBServiceImpl {
         Ok(true)
     }
 
-    async fn update_extension_checkpoint(&mut self, table_name: &String) -> Result<bool, ServiceApiError> {
-        let latest_extension_trackers = self.connector.oldest_available_extension_commit_checkpointed(&ORG_ID.to_string(), table_name, None, None).await.map_err(from_modyne)?;
+    async fn update_extension_checkpoint(&mut self, org_info: &OrgInfo, table_name: &String) -> Result<bool, ServiceApiError> {
+        let latest_extension_trackers = self.connector.oldest_available_extension_commit_checkpointed(&org_info.org_id, table_name, None, None).await.map_err(from_modyne)?;
         if latest_extension_trackers.len() == 0 {
             return Ok(false);
         }
 
         let mut extension_commits = vec!();
         for tracker in latest_extension_trackers.iter() {
-            extension_commits.push(self.connector.describe_extension_commit(&mut self.extension_cache, &ORG_ID.to_string(), &tracker.name).await.map_err(from_modyne)?.unwrap());
+            extension_commits.push(self.connector.describe_extension_commit(&mut self.extension_cache, &org_info.org_id, &tracker.name).await.map_err(from_modyne)?.unwrap());
         }
 
-        let waiting_checkpoints = self.connector.oldest_available_checkpoint_waiting_for_extension(&ORG_ID.to_string(), table_name, None, None).await.map_err(from_modyne)?;
+        let waiting_checkpoints = self.connector.oldest_available_checkpoint_waiting_for_extension(&org_info.org_id, table_name, None, None).await.map_err(from_modyne)?;
         let mut work_done = false;
         for checkpoint_tracker in waiting_checkpoints.iter() {
             // TODO: all commits per loop should be in a transaction
             work_done = true;
 
-            let old_checkpoint = self.connector.describe_checkpoint(&mut self.checkpoints_cache, &ORG_ID.to_string(), &checkpoint_tracker.name).await.map_err(from_modyne)?.unwrap();
+            let old_checkpoint = self.connector.describe_checkpoint(&mut self.checkpoints_cache, &org_info.org_id, &checkpoint_tracker.name).await.map_err(from_modyne)?.unwrap();
             let (mut new_checkpoint, changed) = self.clone_and_apply(
+                org_info,
                 &old_checkpoint,
                 &vec!(),
                 &vec!(),
@@ -437,7 +473,7 @@ impl DynamoDBServiceImpl {
             });
 
             if new_checkpoint.fully_covered_for_extension(&"es".to_string()) {
-                let latest_checkpoint = self.connector.describe_latest(&ORG_ID.to_string(), &Self::latest_checkpoint_key(table_name, &Some("es".to_string()))).await.map_err(from_modyne)?.unwrap();
+                let latest_checkpoint = self.connector.describe_latest(&org_info.org_id, &Self::latest_checkpoint_key(table_name, &Some("es".to_string()))).await.map_err(from_modyne)?.unwrap();
                 let commit = latest_checkpoint.entity_id < new_checkpoint.get_descriptor().full_name();
                 //let commit = true;
                 if commit {
@@ -456,5 +492,24 @@ impl DynamoDBServiceImpl {
         Ok(work_done)
     }
 
+    fn org_info_key(access_key_id: &String, secret_access_key: &String) -> String {
+        format!("{}:{}", access_key_id, secret_access_key)
+    }
 
+    pub async fn create_org(&mut self, settings: &OrgSettings) -> Result<(), ServiceApiError> {
+        // Org settings are stored as-is.
+        // An OrgInfo is created using the credentials as a key for fast lookups.
+        let mut transaction = TransactWrite::new();
+        transaction = self.connector.private_create_org_settings_core(transaction, &MANAGEMENT_ORG_ID.to_string(), &settings.org_id, settings);
+        for creds in settings.creds.iter() {
+            transaction = self.connector.cached_create_org_creds_core(transaction, &mut self.org_cache, &MANAGEMENT_ORG_ID.to_string(), &Self::org_info_key(&creds.access_key_id, &creds.secret_access_key), &settings.to_org_info());
+        }
+        let result = self.connector.commit_conditional_transaction(transaction).await.map_err(from_modyne)?;
+        assert!(result);
+        Ok(())
+    }
+
+    pub async fn lookup_org(&mut self, access_key_id: &String, secret_access_key: &String) -> Result<Option<OrgInfo>, ServiceApiError> {
+        self.connector.describe_org_creds(&mut self.org_cache, &MANAGEMENT_ORG_ID.to_string(), &Self::org_info_key(access_key_id, secret_access_key)).await.map_err(from_modyne)
+    }
 }

@@ -1,8 +1,5 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use aws_config::{BehaviorVersion, Region};
-use aws_sdk_dynamodb::Client;
-use modyne::TestTableExt;
 use tokio::sync::{mpsc, oneshot};
 use crate::{distributed_cache, peers::CheckpointDescriptor, pipeline::PipelineDefinition};
 use crate::data_contract::{CleanupCommit, CleanupWorkItem, CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
@@ -240,28 +237,18 @@ impl StateProviderActor {
                     StateMode::Testing => self.state_provider = StateProvider::Ephemeral(EphemeralStateProvider::new(mode)),
                     StateMode::Ephemeral => self.state_provider = StateProvider::Ephemeral(EphemeralStateProvider::new(mode)),
                     StateMode::TestingDynamoDb => {
-                        let config = aws_config::defaults(BehaviorVersion::latest())
-                            .region(Region::new("us-east-1")) // Region doesn't matter for local, but required
-                            .endpoint_url("http://localhost:4566")
-                            .credentials_provider(aws_credential_types::Credentials::new(
-                                "test", "test", None, None, "static",
-                            ))
-                            .load()
-                            .await;
-
-                        let client = Client::new(&config);
-                        let provider = DynamoDbStateProvider::with_client(client, mode);
-
-                        let _ = provider.service_impl.connector.delete_table().send().await;
-                        let _create_table = match provider.service_impl.connector.create_table().send().await {
-                            Ok(_) => (),
-                            Err(e) => {
-                                panic!("Failed during initialization, is Docker running?: {:?}", e)
-                            },
-                        };
+                        let provider = DynamoDbStateProvider::test(mode).await;
                         self.state_provider = StateProvider::DynamoDb(provider);
                     },
-                    StateMode::Leaderless(address) => self.state_provider = StateProvider::Leaderless(LeaderlessStateProvider::new(mode.clone(), address.clone())),
+                    StateMode::Leaderless(address, access_key, secret_key) => {
+                        self.state_provider = StateProvider::Leaderless(
+                            LeaderlessStateProvider::new(
+                                mode.clone(),
+                                address.clone(),
+                                access_key.clone(),
+                                secret_key.clone()
+                            ))
+                    },
                 }
                 respond_to.send(()).unwrap();
             },

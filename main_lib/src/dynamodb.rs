@@ -3,7 +3,7 @@ use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use idgenerator::IdInstance;
 use modyne::{expr, keys, model::TransactWrite, projections, read_projection, Aggregate, Entity, EntityExt, Error, Item, ProjectionExt, QueryInput, QueryInputExt, Table};
 use modyne::expr::Filter;
-use crate::data_contract::{CleanupWorkItem, CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody, ExtensionCommit, ExtensionWorkItem, FileSetPayload, IcebergCommit, SpeedboatCommit, TableMetadataCheckpoint};
+use crate::data_contract::{CleanupWorkItem, CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody, ExtensionCommit, ExtensionWorkItem, FileSetPayload, IcebergCommit, OrgInfo, OrgSettings, SpeedboatCommit, TableMetadataCheckpoint};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
@@ -260,7 +260,7 @@ macro_rules! powdrr_named_entity_core {
 
             #[allow(dead_code)]
             impl DynamoDbConnector {
-                fn [< private_create_ $entity_name _core >](&self, transaction: TransactWrite, org_id: &String, name: &String, template: &$type_name) -> TransactWrite {
+                pub fn [< private_create_ $entity_name _core >](&self, transaction: TransactWrite, org_id: &String, name: &String, template: &$type_name) -> TransactWrite {
                     let entity = PowdrrEntity {
                         org_id: org_id.clone(),
                         type_name: stringify!($entity_name).to_string(),
@@ -371,7 +371,7 @@ macro_rules! powdrr_named_cached_entity_core {
 
             #[allow(dead_code)]
             impl DynamoDbConnector {
-                fn [< cached_create_ $entity_name _core >](&self, transaction: TransactWrite, cache: &mut [< PowdrrNamed $type_name Cache >], org_id: &String, name: &String, template: &$type_name) -> TransactWrite {
+                pub fn [< cached_create_ $entity_name _core >](&self, transaction: TransactWrite, cache: &mut [< PowdrrNamed $type_name Cache >], org_id: &String, name: &String, template: &$type_name) -> TransactWrite {
                     let key = CacheKey{ org_id: org_id.clone(), name: name.clone() };
                     cache.cache.insert(key.clone(), template.clone());
                     self.[< private_create_ $entity_name _core >](transaction, org_id, name, template)
@@ -608,6 +608,7 @@ powdrr_named_entity!(table_template, CreateIndexTemplateBody);
 powdrr_named_entity!(pipeline, PipelineDefinition);
 powdrr_named_entity!(lifetime_policy, ILMPolicyDefinition);
 powdrr_named_entity!(latest, EntityVersionInfo);
+powdrr_named_entity!(org_settings, OrgSettings);
 
 // Note: only things where a given key can only ever have one value are cacheable
 powdrr_named_cached_entity!(compaction, CompactionCommit);
@@ -618,7 +619,7 @@ powdrr_named_cached_entity!(extension_commit, ExtensionCommit);
 powdrr_named_cached_entity!(compaction_work_item, CompactionWorkItem);
 powdrr_named_cached_entity!(extension_work_item, ExtensionWorkItem);
 powdrr_named_cached_entity!(cleanup_work_item, CleanupWorkItem);
-
+powdrr_named_cached_entity!(org_creds, OrgInfo);
 
 powdrr_tracker!(extension_work_item_lease);
 powdrr_tracker!(compaction_work_item_lease);
@@ -661,7 +662,7 @@ impl DynamoDbConnector {
         self.private_create_latest_core(transaction, &entity.org_id, &entity.key, entity)
     }
 
-    pub async fn create_table(&mut self, org_id: &String, table_name: &String, table_body: &TableBody) -> Result<(), Error> {
+    pub async fn create_table_helper(&mut self, org_id: &String, table_name: &String, table_body: &TableBody) -> Result<(), Error> {
         let checkpoint = TableMetadataCheckpoint::new(
             table_name.clone(),
             IdInstance::next_id().to_string(),
@@ -802,28 +803,6 @@ impl DynamoDbConnector {
         self.commit_conditional_transaction(transaction).await
     }
 
-/*
-    pub async fn commit_work_item(&self, old: &EntityVersionInfo, new_entity_id: &String) -> Result<bool, Error> {
-        let mut transaction = TransactWrite::new();
-
-        transaction = Self::bump_version(
-            transaction,
-            old,
-            new_entity_id
-        );
-
-        match transaction.execute(self).await {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                if e.as_service_error().unwrap().is_transaction_canceled_exception() {
-                    Ok(false)
-                } else {
-                    Err(e.into())
-                }
-            }
-        }
-    }
-*/
     pub async fn commit_speedboat(&self, org_id: &String, table_name: &String, commit: &SpeedboatCommit) -> Result<bool, Error> {
         // 1. Save the commit itself
         // 2. Save a tracker for creating a new checkpoint based on this commit
