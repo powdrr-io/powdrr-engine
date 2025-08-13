@@ -717,6 +717,10 @@ impl EphemeralServiceImpl {
         Ok(work_items)
     }
 
+    pub async fn update_all_checkpoints(&mut self) -> Result<bool, ServiceApiError> {
+        Ok(false)
+    }
+
     pub async fn create_org(&mut self, _settings: &OrgSettings) -> Result<(), ServiceApiError> {
         // Ephemeral service doesn't track orgs
         Ok(())

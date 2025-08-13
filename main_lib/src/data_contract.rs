@@ -715,6 +715,7 @@ impl ServiceMode {
             impl_type: ServiceImplType::TestingDynamoDb,
         }
     }
+
     pub fn as_testing_mode(&self) -> TestProcessingMode {
         // TODO: does this need to be configurable?
         TestProcessingMode::default()
@@ -775,3 +776,7 @@ pub struct OrgInfo {
     pub org_id: String,
     pub license_type: LicenseType,
 }
+
+
+pub const TEST_ACCESS_KEY: &str = "access_key";
+pub const TEST_SECRET_KEY: &str = "secret_key";

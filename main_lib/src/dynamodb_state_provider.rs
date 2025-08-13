@@ -176,6 +176,6 @@ impl DynamoDbStateProvider {
     }
 
     pub async fn update_all_checkpoints(&mut self) -> Result<bool, ServiceApiError> {
-        self.service_impl.update_all_checkpoints(&self.fake_org_info).await
+        self.service_impl.update_all_checkpoints().await
     }
 }

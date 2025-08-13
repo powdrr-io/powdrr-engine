@@ -281,7 +281,7 @@ impl LeaderlessStateProvider {
     }
 
     pub(crate) async fn update_all_checkpoints(&mut self) -> Result<bool, ServiceApiError> {
-        // Do nothing. This happens on automatically on remote services.
+        // Do nothing. This happens automatically on remote services.
         Ok(false)
     }
 
