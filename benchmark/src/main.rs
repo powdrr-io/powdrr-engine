@@ -5,8 +5,8 @@ use futures::future::join_all;
 use idgenerator::{IdGeneratorOptions, IdInstance};
 use rand::TryRngCore;
 use rand::rngs::OsRng;
-use powdrr_lib::{compaction, dynamodb_service_impl};
-use powdrr_lib::data_contract::{LicenseType, OrgCreds, OrgSettings, ServiceImplType, ServiceMode};
+use powdrr_lib::compaction;
+use powdrr_lib::data_contract::{ServiceImplType, ServiceMode, TEST_ACCESS_KEY, TEST_SECRET_KEY};
 use powdrr_lib::test_api::{CompactionMode, IndexingMode, PrefetchMode, TestProcessingMode, StateMode};
 
 const LINE_LIMIT: u64 = 1000000;
@@ -165,10 +165,7 @@ async fn search() -> Result<(), std::io::Error> {
             .body(body_obj)
             .send().await {
             Ok(res) => res,
-            Err(e) => {
-                let error = format!("Error: {}", e);
-                panic!("{}", error);
-            },
+            Err(e) => panic!("Error: {}", e),
         };
         let time_after = current_time();
         let latest_response_time = (time_after - time_before).as_millis() as u64;
@@ -226,9 +223,6 @@ async fn main() -> Result<(), std::io::Error> {
 
     println!("Setting Modes");
 
-    // This will delete and recreate the dynamo tables
-    let _ = dynamodb_service_impl::DynamoDBServiceImpl::test(TestProcessingMode::default()).await;
-
     let client = reqwest::Client::new();
 
     let coordinator_mode = ServiceMode {
@@ -243,46 +237,27 @@ async fn main() -> Result<(), std::io::Error> {
     };
 
     println!("Coordinator mode set");
-
-    let access_key = IdInstance::next_id().to_string();
-    let secret_key = IdInstance::next_id().to_string();
-
+/*
     let main_mode = TestProcessingMode {
-        state_mode: StateMode::Leaderless("http://localhost:7784".to_string(), access_key.clone(), secret_key.clone()),
+        state_mode: StateMode::Leaderless("http://localhost:7784".to_string()),
+        indexing_mode: IndexingMode::Disabled,
+        compaction_mode: CompactionMode::Async,
+        prefetch_mode: PrefetchMode::Enabled,
+    };
+    */
+    let main_mode = TestProcessingMode {
+        state_mode: StateMode::Leaderless("http://localhost:7784".to_string(), TEST_ACCESS_KEY.parse().unwrap(), TEST_SECRET_KEY.parse().unwrap()),
         indexing_mode: IndexingMode::Disabled,
         compaction_mode: CompactionMode::Async(None),
         prefetch_mode: PrefetchMode::Enabled,
     };
-    
+
     let _res = match client.put("http://localhost:9200/_test/v1/_testing_and_processing_mode")
         .body(serde_json::to_string(&main_mode)?)
         .send().await {
         Ok(res) => res,
         Err(e) => {
             panic!("Error: {}", e)
-        },
-    };
-
-
-    let org_settings = OrgSettings {
-        org_id: IdInstance::next_id().to_string(),
-        license_type: LicenseType::Free,
-        creds: vec![
-            OrgCreds {
-                access_key_id: access_key.clone(),
-                secret_access_key: secret_key.clone(),
-                nickname: None,
-            }
-        ],
-    };
-
-    let _res = match client.post("http://localhost:7784/management/v1/create_org")
-        .body(serde_json::to_string(&org_settings)?)
-        .send().await {
-        Ok(res) => res,
-        Err(e) => {
-            let error = format!("Error: {}", e);
-            panic!("{}", error)
         },
     };
 
@@ -299,6 +274,7 @@ async fn main() -> Result<(), std::io::Error> {
                 "number_of_replicas" : 1
             } } }"#;
 
+
     let _res = match client.put("http://localhost:9200/logs")
         .body(body_create_index)
         .send().await {
@@ -309,6 +285,7 @@ async fn main() -> Result<(), std::io::Error> {
 
     tokio::spawn(load_data());
     tokio::spawn(search());
+    tokio::time::sleep(Duration::from_secs(1000)).await;
 
     Ok(())
 }

@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::time::Duration;
 use futures_util::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
@@ -96,6 +97,26 @@ pub fn router(include_test_apis: bool) -> Router {
     })
 }
 
+
+fn do_update_checkpoint_work_for_forever(wait_time_ms: u64) -> impl Future<Output = ()> {
+    async move {
+        let mut work_done;
+        loop {
+            match SERVICE_IMPL.update_all_checkpoints().await {
+                Ok(checkpoint_work_done) => work_done = checkpoint_work_done,
+                Err(e) => {
+                    tracing::error!("Error updating checkpoints: {}", e);
+                    work_done = false;
+                }
+            };
+            if !work_done {
+                tokio::time::sleep(Duration::from_millis(wait_time_ms)).await;
+            }
+        }
+    }
+}
+
+
 pub fn set_mode(mut state: State) -> Pin<Box<HandlerFuture>> {
     async move {
         let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
@@ -108,6 +129,7 @@ pub fn set_mode(mut state: State) -> Pin<Box<HandlerFuture>> {
             Err(_) => panic!("This should not happen"),
         };
 
+        tokio::spawn(do_update_checkpoint_work_for_forever(1000));
         match SERVICE_IMPL.set_mode(invocation_obj).await {
             Ok(_) => {
                 let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "OK");
@@ -115,5 +137,6 @@ pub fn set_mode(mut state: State) -> Pin<Box<HandlerFuture>> {
             }
             Err(_) => panic!("Oh no"),
         }
+
     }.boxed()
 }

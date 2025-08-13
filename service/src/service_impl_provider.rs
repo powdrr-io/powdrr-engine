@@ -1,6 +1,6 @@
 use std::{error::Error};
 use std::fmt::{Display, Formatter};
-use powdrr_lib::data_contract::{CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody, LicenseType, OrgCreds, OrgInfo, OrgSettings, ServiceImplType, ServiceMode};
+use powdrr_lib::data_contract::{CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody, LicenseType, OrgCreds, OrgInfo, OrgSettings, ServiceImplType, ServiceMode, TEST_ACCESS_KEY, TEST_SECRET_KEY};
 use powdrr_lib::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use powdrr_lib::ephemeral_service_impl::EphemeralServiceImpl;
 use powdrr_lib::pipeline::PipelineDefinition;
@@ -10,10 +10,6 @@ use tokio::sync::{mpsc, oneshot};
 use powdrr_lib::state_provider::ServiceApiError;
 use powdrr_lib::dynamodb_service_impl::DynamoDBServiceImpl;
 use powdrr_lib::test_api::TestProcessingMode;
-
-
-pub(crate) const ACCESS_KEY: &str = "access_key";
-pub(crate) const SECRET_KEY: &str = "secret_key";
 
 
 #[derive(Debug, Clone)]
@@ -169,6 +165,9 @@ enum ServiceImplProviderActorMessage {
         respond_to: oneshot::Sender<Result<Vec<CleanupWorkItem>, ServiceImplError>>,
         org_info: OrgInfo,
     },
+    UpdateAllCheckpoints {
+        respond_to: oneshot::Sender<Result<bool, ServiceImplError>>,
+    },
     CreateOrg {
         respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
         settings: OrgSettings,
@@ -216,8 +215,8 @@ impl ServiceImplProviderActor {
                             license_type: LicenseType::Free,
                             creds: vec![
                                 OrgCreds {
-                                    access_key_id: ACCESS_KEY.to_string(),
-                                    secret_access_key: SECRET_KEY.to_string(),
+                                    access_key_id: TEST_ACCESS_KEY.to_string(),
+                                    secret_access_key: TEST_SECRET_KEY.to_string(),
                                     nickname: None,
                                 }
                             ],
@@ -289,6 +288,9 @@ impl ServiceImplProviderActor {
             },
             ServiceImplProviderActorMessage::GetCleanupWorkItems { respond_to, org_info } => {
                 handle_message_impl!(self, respond_to, get_cleanup_work_items(&org_info));
+            },
+            ServiceImplProviderActorMessage::UpdateAllCheckpoints { respond_to } => {
+                handle_message_impl!(self, respond_to, update_all_checkpoints());
             },
             ServiceImplProviderActorMessage::CreateOrg { respond_to, settings } => {
                 handle_message_impl!(self, respond_to, create_org(&settings));
@@ -406,7 +408,11 @@ impl ServiceImpl {
 
     pub async fn get_cleanup_work_items(&mut self, org_info: &OrgInfo) -> Result<Vec<CleanupWorkItem>, ServiceImplError> {
         state_provider_func_impl!(self, get_cleanup_work_items(org_info))
-    }    
+    }
+
+    pub async fn update_all_checkpoints(&mut self) -> Result<bool, ServiceImplError> {
+        state_provider_func_impl!(self, update_all_checkpoints())
+    }
 
     pub async fn create_org(&mut self, settings: &OrgSettings) -> Result<(), ServiceImplError> {
         state_provider_func_impl!(self, create_org(settings))
@@ -575,6 +581,10 @@ impl ServiceImplHandle {
 
     pub async fn get_cleanup_work_items(&self, org_info: &OrgInfo) -> Result<Vec<CleanupWorkItem>, ServiceImplError> {
         send_message!(self, GetCleanupWorkItems, org_info = org_info.clone())
+    }
+
+    pub async fn update_all_checkpoints(&self) -> Result<bool, ServiceImplError> {
+        send_message!(self, UpdateAllCheckpoints)
     }
 
     pub async fn create_org(&self, settings: &OrgSettings) -> Result<(), ServiceImplError> {

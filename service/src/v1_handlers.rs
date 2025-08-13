@@ -330,9 +330,8 @@ mod tests {
     use gotham::hyper::{StatusCode};
     use gotham::mime;
     use gotham::test::TestServer;
-    use powdrr_lib::data_contract::{AddAlias, CreateTable, ServiceMode, TableDescription, ACCESS_KEY_HEADER_KEY, SECRET_KEY_HEADER_KEY};
+    use powdrr_lib::data_contract::{AddAlias, CreateTable, ServiceMode, TableDescription, ACCESS_KEY_HEADER_KEY, SECRET_KEY_HEADER_KEY, TEST_ACCESS_KEY, TEST_SECRET_KEY};
     use crate::router::router;
-    use crate::service_impl_provider::{ACCESS_KEY, SECRET_KEY};
 
     pub(crate) static TEST_SERVER: LazyLock<TestServer> = LazyLock::new(|| TestServer::with_timeout(router(true), 1000).unwrap());
 
@@ -360,8 +359,8 @@ mod tests {
             serde_json::to_string(&body).unwrap(),
             mime::APPLICATION_JSON,
         );
-        create_table.headers_mut().insert(ACCESS_KEY_HEADER_KEY, ACCESS_KEY.parse().unwrap());
-        create_table.headers_mut().insert(SECRET_KEY_HEADER_KEY, SECRET_KEY.parse().unwrap());
+        create_table.headers_mut().insert(ACCESS_KEY_HEADER_KEY, TEST_ACCESS_KEY.parse().unwrap());
+        create_table.headers_mut().insert(SECRET_KEY_HEADER_KEY, TEST_SECRET_KEY.parse().unwrap());
 
         let create_response = create_table.perform().unwrap();
 
@@ -370,8 +369,8 @@ mod tests {
         let mut describe_request = client.get(
             "http://localhost/api/v1/describe_table/the_name",
         );
-        describe_request.headers_mut().insert(ACCESS_KEY_HEADER_KEY, ACCESS_KEY.parse().unwrap());
-        describe_request.headers_mut().insert(SECRET_KEY_HEADER_KEY, SECRET_KEY.parse().unwrap());
+        describe_request.headers_mut().insert(ACCESS_KEY_HEADER_KEY, TEST_ACCESS_KEY.parse().unwrap());
+        describe_request.headers_mut().insert(SECRET_KEY_HEADER_KEY, TEST_SECRET_KEY.parse().unwrap());
 
         let describe_response = describe_request.perform().unwrap();
 
@@ -390,8 +389,8 @@ mod tests {
             serde_json::to_string(&add_alias_body).unwrap(),
             mime::APPLICATION_JSON,
         );
-        add_alias_request.headers_mut().insert(ACCESS_KEY_HEADER_KEY, ACCESS_KEY.parse().unwrap());
-        add_alias_request.headers_mut().insert(SECRET_KEY_HEADER_KEY, SECRET_KEY.parse().unwrap());
+        add_alias_request.headers_mut().insert(ACCESS_KEY_HEADER_KEY, TEST_ACCESS_KEY.parse().unwrap());
+        add_alias_request.headers_mut().insert(SECRET_KEY_HEADER_KEY, TEST_SECRET_KEY.parse().unwrap());
 
         let add_alias_response = add_alias_request.perform().unwrap();
 
@@ -400,8 +399,8 @@ mod tests {
         let mut alias_describe_request = client.get(
             "http://localhost/api/v1/describe_table/the_alias",
         );
-        alias_describe_request.headers_mut().insert(ACCESS_KEY_HEADER_KEY, ACCESS_KEY.parse().unwrap());
-        alias_describe_request.headers_mut().insert(SECRET_KEY_HEADER_KEY, SECRET_KEY.parse().unwrap());
+        alias_describe_request.headers_mut().insert(ACCESS_KEY_HEADER_KEY, TEST_ACCESS_KEY.parse().unwrap());
+        alias_describe_request.headers_mut().insert(SECRET_KEY_HEADER_KEY, TEST_SECRET_KEY.parse().unwrap());
 
         let alias_describe_response = alias_describe_request.perform().unwrap();
 
@@ -415,8 +414,8 @@ mod tests {
             serde_json::to_string(&add_alias_body).unwrap(),
             mime::APPLICATION_JSON,
         );
-        remove_alias_request.headers_mut().insert(ACCESS_KEY_HEADER_KEY, ACCESS_KEY.parse().unwrap());
-        remove_alias_request.headers_mut().insert(SECRET_KEY_HEADER_KEY, SECRET_KEY.parse().unwrap());
+        remove_alias_request.headers_mut().insert(ACCESS_KEY_HEADER_KEY, TEST_ACCESS_KEY.parse().unwrap());
+        remove_alias_request.headers_mut().insert(SECRET_KEY_HEADER_KEY, TEST_SECRET_KEY.parse().unwrap());
 
         let remove_alias_response = remove_alias_request.perform().unwrap();
 
@@ -425,8 +424,8 @@ mod tests {
         let mut no_alias_describe_request = client.get(
             "http://localhost/api/v1/describe_table/the_alias",
         );
-        no_alias_describe_request.headers_mut().insert(ACCESS_KEY_HEADER_KEY, ACCESS_KEY.parse().unwrap());
-        no_alias_describe_request.headers_mut().insert(SECRET_KEY_HEADER_KEY, SECRET_KEY.parse().unwrap());
+        no_alias_describe_request.headers_mut().insert(ACCESS_KEY_HEADER_KEY, TEST_ACCESS_KEY.parse().unwrap());
+        no_alias_describe_request.headers_mut().insert(SECRET_KEY_HEADER_KEY, TEST_SECRET_KEY.parse().unwrap());
 
         let no_alias_describe_response = no_alias_describe_request.perform().unwrap();
 
