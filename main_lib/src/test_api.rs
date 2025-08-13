@@ -20,7 +20,7 @@ pub enum StateMode {
     Testing,
     Ephemeral,
     TestingDynamoDb,
-    Leaderless(String)
+    Leaderless(String, String, String)
 }
 
 impl StateMode {

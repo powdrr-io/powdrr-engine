@@ -76,6 +76,12 @@ pub fn router(include_test_apis: bool) -> Router {
                     .with_path_extractor::<NamePathExtractor>()
                     .to(v1_handlers::get_extension_work_items);
                 route.get("/get_compaction_work_items").to(v1_handlers::get_compaction_work_items);
+                route.get("/get_cleanup_work_items").to(v1_handlers::get_cleanup_work_items);
+            })
+        });
+        route.scope("/management", |route| {
+            route.scope("/v1", |route| {
+                route.post("/create_org").to(v1_handlers::create_org);
             })
         });
 

@@ -1,4 +1,4 @@
-use crate::data_contract::{CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody};
+use crate::data_contract::{CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody, LicenseType, OrgInfo};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::ephemeral_service_impl::EphemeralServiceImpl;
 use crate::pipeline::PipelineDefinition;
@@ -11,6 +11,7 @@ use crate::test_api::{CompactionMode, TestProcessingMode};
 pub struct EphemeralStateProvider {
     service_impl: EphemeralServiceImpl,
     fetch_tracker: EphemeralFetchTracker,
+    fake_org_info: OrgInfo,
 }
 
 impl EphemeralStateProvider {
@@ -18,11 +19,15 @@ impl EphemeralStateProvider {
         EphemeralStateProvider{
             service_impl: EphemeralServiceImpl::new(mode.clone()),
             fetch_tracker: EphemeralFetchTracker::new(mode),
+            fake_org_info: OrgInfo {
+                org_id: "fake_org_id".to_string(),
+                license_type: LicenseType::Free,
+            }
         }
     }
 
     pub(crate) async fn add_checkpoint(&mut self, checkpoint: &TableMetadataCheckpoint) -> () {
-        self.service_impl.add_checkpoint(checkpoint).await.unwrap();
+        self.service_impl.add_checkpoint(&self.fake_org_info, checkpoint).await.unwrap();
     }
 
     #[allow(dead_code)]
@@ -31,47 +36,47 @@ impl EphemeralStateProvider {
     }
 
     pub async fn create_table(&mut self, create_table: &CreateTable) -> Result<(), ServiceApiError> {
-        self.service_impl.create_table(create_table).await
+        self.service_impl.create_table(&self.fake_org_info, create_table).await
     }
 
     pub async fn describe_table(&mut self, name: &String) -> Result<Option<TableDescription>, ServiceApiError> {
-        self.service_impl.describe_table(name).await
+        self.service_impl.describe_table(&self.fake_org_info, name).await
     }
 
     pub async fn add_alias(&mut self, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
-        self.service_impl.add_alias(table_name, alias).await
+        self.service_impl.add_alias(&self.fake_org_info, table_name, alias).await
     }
 
     pub async fn remove_alias(&mut self, _table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
-        self.service_impl.remove_alias(_table_name, alias).await
+        self.service_impl.remove_alias(&self.fake_org_info, _table_name, alias).await
     }
 
     pub async fn create_table_template(&mut self, name: &String, template: &CreateIndexTemplateBody) -> Result<(), ServiceApiError> {
-        self.service_impl.create_table_template(name, template).await
+        self.service_impl.create_table_template(&self.fake_org_info, name, template).await
     }
 
     pub async fn describe_table_template(&mut self, name: &String) -> Result<Option<CreateIndexTemplateBody>, ServiceApiError> {
-        self.service_impl.describe_table_template(name).await
+        self.service_impl.describe_table_template(&self.fake_org_info, name).await
     }
 
     pub async fn create_pipeline(&mut self, name: &String, pipeline: &PipelineDefinition) -> Result<(), ServiceApiError> {
-        self.service_impl.create_pipeline(name, pipeline).await
+        self.service_impl.create_pipeline(&self.fake_org_info, name, pipeline).await
     }
 
     pub async fn describe_pipeline(&mut self, name: &String) -> Result<Option<PipelineDefinition>, ServiceApiError> {
-        self.service_impl.describe_pipeline(name).await
+        self.service_impl.describe_pipeline(&self.fake_org_info, name).await
     }
 
     pub async fn create_lifetime_policy(&mut self, name: &String, policy: &ILMPolicyDefinition) -> Result<(), ServiceApiError> {
-        self.service_impl.create_lifetime_policy(name, policy).await
+        self.service_impl.create_lifetime_policy(&self.fake_org_info, name, policy).await
     }
 
     pub async fn describe_lifetime_policy(&mut self, name: &String) -> Result<Option<ILMPolicyDefinition>, ServiceApiError> {
-        self.service_impl.describe_lifetime_policy(name).await
+        self.service_impl.describe_lifetime_policy(&self.fake_org_info, name).await
     }
     
     pub async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), ServiceApiError> {
-        match self.service_impl.speedboat_commit(commit).await {
+        match self.service_impl.speedboat_commit(&self.fake_org_info, commit).await {
             Ok(_) => {
                 for table_info in commit.type_files.iter() {
                     let checkpoint_id = self.get_latest_committed_checkpoint(&table_info.table_name, None).await?;
@@ -84,7 +89,7 @@ impl EphemeralStateProvider {
     }
 
     pub async fn iceberg_commit(&mut self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError> {
-        match self.service_impl.iceberg_commit(table_name, iceberg_commit).await {
+        match self.service_impl.iceberg_commit(&self.fake_org_info, table_name, iceberg_commit).await {
             Ok(_) => {
                 let checkpoint_id = self.get_latest_committed_checkpoint(table_name, None).await?;
                 self.fetch_tracker.set_next_prefetch_checkpoints(table_name, None, &checkpoint_id.unwrap()).await?;
@@ -95,7 +100,7 @@ impl EphemeralStateProvider {
     }
 
     pub async fn extension_commit(&mut self, table_name: &String, commit: &ExtensionCommit) -> Result<(), ServiceApiError> {
-        match self.service_impl.extension_commit(table_name, commit).await {
+        match self.service_impl.extension_commit(&self.fake_org_info, table_name, commit).await {
             Ok(_) => {
                 let checkpoint_id = self.get_latest_committed_checkpoint(table_name, None).await?;
                 self.fetch_tracker.set_next_prefetch_checkpoints(table_name, Some(commit.extension.clone()), &checkpoint_id.unwrap()).await?;
@@ -106,7 +111,7 @@ impl EphemeralStateProvider {
     }
 
     pub async fn compaction_commit(&mut self, table_name: &String, commit: &CompactionCommit) -> Result<(), ServiceApiError> {
-        match self.service_impl.compaction_commit(table_name, commit).await {
+        match self.service_impl.compaction_commit(&self.fake_org_info, table_name, commit).await {
             Ok(_) => {
                 let checkpoint_id = self.get_latest_committed_checkpoint(table_name, None).await?;
                 self.fetch_tracker.set_next_prefetch_checkpoints(table_name, None, &checkpoint_id.unwrap()).await?;
@@ -117,15 +122,15 @@ impl EphemeralStateProvider {
     }
 
     pub async fn cleanup_commit(&mut self, commit: &CleanupCommit) -> Result<(), ServiceApiError> {
-        self.service_impl.cleanup_commit(commit).await
+        self.service_impl.cleanup_commit(&self.fake_org_info, commit).await
     }
 
     pub async fn get_latest_committed_checkpoint(&mut self, table_name: &String, extensions: Option<String>) -> Result<Option<String>, ServiceApiError> {
-        self.service_impl.get_latest_committed_checkpoint(table_name, extensions).await
+        self.service_impl.get_latest_committed_checkpoint(&self.fake_org_info, table_name, extensions).await
     }
 
     pub async fn get_checkpoint(&mut self, snapshot: &CheckpointDescriptor) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
-        self.service_impl.get_checkpoint(snapshot).await
+        self.service_impl.get_checkpoint(&self.fake_org_info, snapshot).await
     }
 
     pub(crate) async fn update_all_checkpoints(&mut self) -> Result<bool, ServiceApiError> {
@@ -134,15 +139,15 @@ impl EphemeralStateProvider {
     }
 
     pub async fn get_extension_work_items(&mut self, extension_type: &String) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {
-        self.service_impl.get_extension_work_items(extension_type).await
+        self.service_impl.get_extension_work_items(&self.fake_org_info, extension_type).await
     }
 
     pub async fn get_compaction_work_items(&mut self) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
-        self.service_impl.get_compaction_work_items().await
+        self.service_impl.get_compaction_work_items(&self.fake_org_info).await
     }
 
     pub async fn get_cleanup_work_items(&mut self) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
-        self.service_impl.get_cleanup_work_items().await
+        self.service_impl.get_cleanup_work_items(&self.fake_org_info).await
     }
 
     pub async fn get_peer_clients(&mut self) -> Vec<Box<dyn PeerClient>> {
