@@ -1,6 +1,6 @@
 use std::{error::Error};
 use std::fmt::{Display, Formatter};
-use powdrr_lib::data_contract::{CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody, OrgInfo, OrgSettings, ServiceImplType, ServiceMode};
+use powdrr_lib::data_contract::{CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody, LicenseType, OrgCreds, OrgInfo, OrgSettings, ServiceImplType, ServiceMode};
 use powdrr_lib::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use powdrr_lib::ephemeral_service_impl::EphemeralServiceImpl;
 use powdrr_lib::pipeline::PipelineDefinition;
@@ -10,6 +10,11 @@ use tokio::sync::{mpsc, oneshot};
 use powdrr_lib::state_provider::ServiceApiError;
 use powdrr_lib::dynamodb_service_impl::DynamoDBServiceImpl;
 use powdrr_lib::test_api::TestProcessingMode;
+
+
+pub(crate) const ACCESS_KEY: &str = "access_key";
+pub(crate) const SECRET_KEY: &str = "secret_key";
+
 
 #[derive(Debug, Clone)]
 pub struct ServiceImplError {
@@ -205,7 +210,19 @@ impl ServiceImplProviderActor {
                     ServiceImplType::Ephemeral => ServiceImpl::Ephemeral(EphemeralServiceImpl::new(mode.as_testing_mode())),
                     ServiceImplType::DynamoDb => ServiceImpl::DynamoDb(DynamoDBServiceImpl::new(mode.as_testing_mode())),
                     ServiceImplType::TestingDynamoDb => {
-                        ServiceImpl::DynamoDb(DynamoDBServiceImpl::test(mode.as_testing_mode()).await)
+                        let mut service_impl = DynamoDBServiceImpl::test(mode.as_testing_mode()).await;
+                        service_impl.create_org(&OrgSettings {
+                            org_id: "fake_test_org".to_string(),
+                            license_type: LicenseType::Free,
+                            creds: vec![
+                                OrgCreds {
+                                    access_key_id: ACCESS_KEY.to_string(),
+                                    secret_access_key: SECRET_KEY.to_string(),
+                                    nickname: None,
+                                }
+                            ],
+                        }).await.unwrap();
+                        ServiceImpl::DynamoDb(service_impl)
                     }
                 };
                 respond_to.send(Ok(())).unwrap();

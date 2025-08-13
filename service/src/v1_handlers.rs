@@ -235,7 +235,7 @@ body_handler_org_info! { create_table(org_info: OrgInfo, input: CreateTable) -> 
     handle_result_none(SERVICE_IMPL.create_table(&org_info, &input).await)
 }}
 
-body_handler_org_info! { describe_table(org_info: OrgInfo, name: String) -> GenericResponse {
+name_handler! { describe_table(org_info: OrgInfo, name: String) -> GenericResponse {
     handle_result_option(SERVICE_IMPL.describe_table(&org_info, &name).await)
 }}
 
@@ -327,11 +327,12 @@ body_handler! { create_org(input: OrgSettings) -> GenericResponse {
 #[cfg(test)]
 mod tests {
     use std::sync::LazyLock;
-    use gotham::hyper::StatusCode;
+    use gotham::hyper::{StatusCode};
     use gotham::mime;
     use gotham::test::TestServer;
-    use powdrr_lib::data_contract::{AddAlias, CreateTable, TableDescription};
+    use powdrr_lib::data_contract::{AddAlias, CreateTable, ServiceMode, TableDescription, ACCESS_KEY_HEADER_KEY, SECRET_KEY_HEADER_KEY};
     use crate::router::router;
+    use crate::service_impl_provider::{ACCESS_KEY, SECRET_KEY};
 
     pub(crate) static TEST_SERVER: LazyLock<TestServer> = LazyLock::new(|| TestServer::with_timeout(router(true), 1000).unwrap());
 
@@ -339,28 +340,40 @@ mod tests {
     fn test_create_and_describe_table() {
         let test_server = &*TEST_SERVER;
 
-        test_server.client().put(
-            "http://localhost/_test/v1/_testing_mode",
-            "",
+        let test_mode_response = test_server.client().put(
+            "http://localhost/_test/v1/_set_mode",
+            serde_json::to_string(&ServiceMode::test()).unwrap(),
             mime::TEXT_PLAIN
         ).perform().unwrap();
+
+        assert_eq!(test_mode_response.status(), StatusCode::OK);
 
         let body = CreateTable {
             name: "the_name".to_string(),
             tags: Default::default(),
         };
 
-        let create_response = test_server.client().post(
+        let client = test_server.client();
+
+        let mut create_table = client.post(
             "http://localhost/api/v1/create_table",
             serde_json::to_string(&body).unwrap(),
             mime::APPLICATION_JSON,
-        ).perform().unwrap();
+        );
+        create_table.headers_mut().insert(ACCESS_KEY_HEADER_KEY, ACCESS_KEY.parse().unwrap());
+        create_table.headers_mut().insert(SECRET_KEY_HEADER_KEY, SECRET_KEY.parse().unwrap());
+
+        let create_response = create_table.perform().unwrap();
 
         assert_eq!(create_response.status(), 200);
 
-        let describe_response = test_server.client().get(
+        let mut describe_request = client.get(
             "http://localhost/api/v1/describe_table/the_name",
-        ).perform().unwrap();
+        );
+        describe_request.headers_mut().insert(ACCESS_KEY_HEADER_KEY, ACCESS_KEY.parse().unwrap());
+        describe_request.headers_mut().insert(SECRET_KEY_HEADER_KEY, SECRET_KEY.parse().unwrap());
+
+        let describe_response = describe_request.perform().unwrap();
 
         assert_eq!(describe_response.status(), 200);
 
@@ -372,34 +385,50 @@ mod tests {
             alias: "the_alias".to_string(),
         };
 
-        let add_alias_response = test_server.client().post(
+        let mut add_alias_request =  client.post(
             "http://localhost/api/v1/add_alias",
             serde_json::to_string(&add_alias_body).unwrap(),
             mime::APPLICATION_JSON,
-        ).perform().unwrap();
+        );
+        add_alias_request.headers_mut().insert(ACCESS_KEY_HEADER_KEY, ACCESS_KEY.parse().unwrap());
+        add_alias_request.headers_mut().insert(SECRET_KEY_HEADER_KEY, SECRET_KEY.parse().unwrap());
+
+        let add_alias_response = add_alias_request.perform().unwrap();
 
         assert_eq!(add_alias_response.status(), 200);
 
-        let alias_describe_response = test_server.client().get(
+        let mut alias_describe_request = client.get(
             "http://localhost/api/v1/describe_table/the_alias",
-        ).perform().unwrap();
+        );
+        alias_describe_request.headers_mut().insert(ACCESS_KEY_HEADER_KEY, ACCESS_KEY.parse().unwrap());
+        alias_describe_request.headers_mut().insert(SECRET_KEY_HEADER_KEY, SECRET_KEY.parse().unwrap());
+
+        let alias_describe_response = alias_describe_request.perform().unwrap();
 
         assert_eq!(alias_describe_response.status(), 200);
 
         let describe_obj: TableDescription = serde_json::from_str(&*alias_describe_response.read_utf8_body().unwrap()).unwrap();
         assert_eq!(describe_obj.name, "the_name");
 
-        let remove_alias_response = test_server.client().post(
+        let mut remove_alias_request = client.post(
             "http://localhost/api/v1/remove_alias",
             serde_json::to_string(&add_alias_body).unwrap(),
             mime::APPLICATION_JSON,
-        ).perform().unwrap();
+        );
+        remove_alias_request.headers_mut().insert(ACCESS_KEY_HEADER_KEY, ACCESS_KEY.parse().unwrap());
+        remove_alias_request.headers_mut().insert(SECRET_KEY_HEADER_KEY, SECRET_KEY.parse().unwrap());
+
+        let remove_alias_response = remove_alias_request.perform().unwrap();
 
         assert_eq!(remove_alias_response.status(), 200);
 
-        let no_alias_describe_response = test_server.client().get(
+        let mut no_alias_describe_request = client.get(
             "http://localhost/api/v1/describe_table/the_alias",
-        ).perform().unwrap();
+        );
+        no_alias_describe_request.headers_mut().insert(ACCESS_KEY_HEADER_KEY, ACCESS_KEY.parse().unwrap());
+        no_alias_describe_request.headers_mut().insert(SECRET_KEY_HEADER_KEY, SECRET_KEY.parse().unwrap());
+
+        let no_alias_describe_response = no_alias_describe_request.perform().unwrap();
 
         assert_eq!(no_alias_describe_response.status(), StatusCode::NOT_FOUND);
 

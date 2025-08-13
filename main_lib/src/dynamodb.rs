@@ -662,7 +662,7 @@ impl DynamoDbConnector {
         self.private_create_latest_core(transaction, &entity.org_id, &entity.key, entity)
     }
 
-    pub async fn create_table_helper(&mut self, org_id: &String, table_name: &String, table_body: &TableBody) -> Result<(), Error> {
+    pub async fn create_table_helper(&mut self, org_id: &String, table_name: &String, table_body: &TableBody) -> Result<bool, Error> {
         let checkpoint = TableMetadataCheckpoint::new(
             table_name.clone(),
             IdInstance::next_id().to_string(),
@@ -678,9 +678,7 @@ impl DynamoDbConnector {
         transaction = self.create_latest_core(transaction, &EntityVersionInfo::new(org_id, &Self::latest_checkpoint_key(table_name, &Some("es".to_string())), &checkpoint.get_descriptor().full_name()));
         transaction = self.create_latest_core(transaction, &EntityVersionInfo::new(org_id, &Self::latest_extension_work_item_key(table_name, &"es".to_string()), &Self::NO_WORK_ITEM.to_owned()));
         transaction = self.create_latest_core(transaction, &EntityVersionInfo::new(org_id, &Self::latest_compaction_work_item_key(table_name), &Self::NO_WORK_ITEM.to_owned()));
-        transaction.execute(self).await?;
-
-        Ok(())
+        self.commit_conditional_transaction(transaction).await
     }
 
     pub async fn commit_checkpoint(
@@ -738,7 +736,7 @@ impl DynamoDbConnector {
                                 let cancellation_reasons = inner.cancellation_reasons.as_ref().unwrap();
                                 let reasons = format!("{:?}", cancellation_reasons);
                                 println!("Transaction canceled: {}", reasons);
-                                panic!("Transaction canceled: {}", reasons);
+                                //panic!("Transaction canceled: {}", reasons);
                             }
                         }
                         _ => ()

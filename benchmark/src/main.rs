@@ -165,7 +165,10 @@ async fn search() -> Result<(), std::io::Error> {
             .body(body_obj)
             .send().await {
             Ok(res) => res,
-            Err(e) => panic!("Error: {}", e),
+            Err(e) => {
+                let error = format!("Error: {}", e);
+                panic!("{}", error);
+            },
         };
         let time_after = current_time();
         let latest_response_time = (time_after - time_before).as_millis() as u64;

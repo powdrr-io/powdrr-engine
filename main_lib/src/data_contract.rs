@@ -710,6 +710,11 @@ pub struct ServiceMode {
 
 
 impl ServiceMode {
+    pub fn test() -> Self {
+        ServiceMode {
+            impl_type: ServiceImplType::TestingDynamoDb,
+        }
+    }
     pub fn as_testing_mode(&self) -> TestProcessingMode {
         // TODO: does this need to be configurable?
         TestProcessingMode::default()
