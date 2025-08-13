@@ -54,7 +54,7 @@ enum ServiceImplProviderActorMessage {
         mode: ServiceMode,
     },
     CreatePipeline {
-        respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
+        respond_to: oneshot::Sender<Result<bool, ServiceImplError>>,
         org_info: OrgInfo,
         name: String,
         pipeline: PipelineDefinition,
@@ -65,7 +65,7 @@ enum ServiceImplProviderActorMessage {
         name: String,
     },
     CreateLifetimePolicy {
-        respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
+        respond_to: oneshot::Sender<Result<bool, ServiceImplError>>,
         org_info: OrgInfo,
         name: String,
         policy: ILMPolicyDefinition,
@@ -76,7 +76,7 @@ enum ServiceImplProviderActorMessage {
         name: String,
     },
     CreateTable {
-        respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
+        respond_to: oneshot::Sender<Result<bool, ServiceImplError>>,
         org_info: OrgInfo,
         create_table: CreateTable,
     },
@@ -86,19 +86,19 @@ enum ServiceImplProviderActorMessage {
         name: String,
     },
     AddAlias {
-        respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
+        respond_to: oneshot::Sender<Result<bool, ServiceImplError>>,
         org_info: OrgInfo,
         table_name: String,
         alias: String,
     },
     RemoveAlias {
-        respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
+        respond_to: oneshot::Sender<Result<bool, ServiceImplError>>,
         org_info: OrgInfo,
         table_name: String,
         alias: String,
     },
     CreateTableTemplate {
-        respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
+        respond_to: oneshot::Sender<Result<bool, ServiceImplError>>,
         org_info: OrgInfo,
         name: String,
         template: CreateIndexTemplateBody,
@@ -114,30 +114,30 @@ enum ServiceImplProviderActorMessage {
         checkpoint: TableMetadataCheckpoint,
     },
     IcebergCommit {
-        respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
+        respond_to: oneshot::Sender<Result<bool, ServiceImplError>>,
         org_info: OrgInfo,
         table_name: String,
         iceberg_commit: IcebergCommit,
     },
     SpeedboatCommit {
-        respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
+        respond_to: oneshot::Sender<Result<bool, ServiceImplError>>,
         org_info: OrgInfo,
         speedboat_commit: SpeedboatCommit,
     },
     ExtensionCommit {
-        respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
+        respond_to: oneshot::Sender<Result<bool, ServiceImplError>>,
         org_info: OrgInfo,
         table_name: String,
         extension_commit: ExtensionCommit,
     },
     CompactionCommit {
-        respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
+        respond_to: oneshot::Sender<Result<bool, ServiceImplError>>,
         org_info: OrgInfo,
         table_name: String,
         compaction_commit: CompactionCommit,
     },
     CleanupCommit {
-        respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
+        respond_to: oneshot::Sender<Result<bool, ServiceImplError>>,
         org_info: OrgInfo,
         cleanup_commit: CleanupCommit,
     },
@@ -330,7 +330,7 @@ impl ServiceImpl {
         state_provider_func_impl!(self, get_all_iceberg_tables())
     }
 
-    pub async fn create_table(&mut self, org_info: &OrgInfo, create_table: &CreateTable) -> Result<(), ServiceImplError> {
+    pub async fn create_table(&mut self, org_info: &OrgInfo, create_table: &CreateTable) -> Result<bool, ServiceImplError> {
         state_provider_func_impl!(self, create_table(org_info, create_table))
     }
 
@@ -338,15 +338,15 @@ impl ServiceImpl {
         state_provider_func_impl!(self, describe_table(org_info, name))
     }
 
-    pub async fn add_alias(&mut self, org_info: &OrgInfo, table_name: &String, alias: &String) -> Result<(), ServiceImplError> {
+    pub async fn add_alias(&mut self, org_info: &OrgInfo, table_name: &String, alias: &String) -> Result<bool, ServiceImplError> {
         state_provider_func_impl!(self, add_alias(org_info, table_name, alias))
     }
 
-    pub async fn remove_alias(&mut self, org_info: &OrgInfo, table_name: &String, alias: &String) -> Result<(), ServiceImplError> {
+    pub async fn remove_alias(&mut self, org_info: &OrgInfo, table_name: &String, alias: &String) -> Result<bool, ServiceImplError> {
         state_provider_func_impl!(self, remove_alias(org_info, table_name, alias))
     }
 
-    pub async fn create_table_template(&mut self, org_info: &OrgInfo, name: &String, template: &CreateIndexTemplateBody) -> Result<(), ServiceImplError> {
+    pub async fn create_table_template(&mut self, org_info: &OrgInfo, name: &String, template: &CreateIndexTemplateBody) -> Result<bool, ServiceImplError> {
         state_provider_func_impl!(self, create_table_template(org_info, name, template))
     }
 
@@ -354,7 +354,7 @@ impl ServiceImpl {
         state_provider_func_impl!(self, describe_table_template(org_info, name))
     }
 
-    pub async fn create_pipeline(&mut self, org_info: &OrgInfo, name: &String, pipeline: &PipelineDefinition) -> Result<(), ServiceImplError> {
+    pub async fn create_pipeline(&mut self, org_info: &OrgInfo, name: &String, pipeline: &PipelineDefinition) -> Result<bool, ServiceImplError> {
         state_provider_func_impl!(self, create_pipeline(org_info, name, pipeline))
     }
 
@@ -362,7 +362,7 @@ impl ServiceImpl {
         state_provider_func_impl!(self, describe_pipeline(org_info, name))
     }
 
-    pub async fn create_lifetime_policy(&mut self, org_info: &OrgInfo, name: &String, policy: &ILMPolicyDefinition) -> Result<(), ServiceImplError> {
+    pub async fn create_lifetime_policy(&mut self, org_info: &OrgInfo, name: &String, policy: &ILMPolicyDefinition) -> Result<bool, ServiceImplError> {
         state_provider_func_impl!(self, create_lifetime_policy(org_info, name, policy))
     }
 
@@ -370,23 +370,23 @@ impl ServiceImpl {
         state_provider_func_impl!(self, describe_lifetime_policy(org_info, name))
     }
 
-    pub async fn speedboat_commit(&mut self, org_info: &OrgInfo, commit: &SpeedboatCommit) -> Result<(), ServiceImplError> {
+    pub async fn speedboat_commit(&mut self, org_info: &OrgInfo, commit: &SpeedboatCommit) -> Result<bool, ServiceImplError> {
         state_provider_func_impl!(self, speedboat_commit(org_info, commit))
     }
 
-    pub async fn iceberg_commit(&mut self, org_info: &OrgInfo, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceImplError> {
+    pub async fn iceberg_commit(&mut self, org_info: &OrgInfo, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<bool, ServiceImplError> {
         state_provider_func_impl!(self, iceberg_commit(org_info, table_name, iceberg_commit))
     }
 
-    pub async fn extension_commit(&mut self, org_info: &OrgInfo, table_name: &String, commit: &ExtensionCommit) -> Result<(), ServiceImplError> {
+    pub async fn extension_commit(&mut self, org_info: &OrgInfo, table_name: &String, commit: &ExtensionCommit) -> Result<bool, ServiceImplError> {
         state_provider_func_impl!(self, extension_commit(org_info, table_name, commit))
     }
 
-    pub async fn compaction_commit(&mut self, org_info: &OrgInfo, _table_name: &String, commit: &CompactionCommit) -> Result<(), ServiceImplError> {
+    pub async fn compaction_commit(&mut self, org_info: &OrgInfo, _table_name: &String, commit: &CompactionCommit) -> Result<bool, ServiceImplError> {
         state_provider_func_impl!(self, compaction_commit(org_info, _table_name, commit))
     }
 
-    pub async fn cleanup_commit(&mut self, org_info: &OrgInfo, commit: &CleanupCommit) -> Result<(), ServiceImplError> {
+    pub async fn cleanup_commit(&mut self, org_info: &OrgInfo, commit: &CleanupCommit) -> Result<bool, ServiceImplError> {
         state_provider_func_impl!(self, cleanup_commit(org_info, commit))
     }    
 
@@ -498,7 +498,7 @@ impl ServiceImplHandle {
     }
 
 
-    pub async fn create_pipeline(&self, org_info: &OrgInfo, name: &String, pipeline: &PipelineDefinition) -> Result<(), ServiceImplError> {
+    pub async fn create_pipeline(&self, org_info: &OrgInfo, name: &String, pipeline: &PipelineDefinition) -> Result<bool, ServiceImplError> {
         send_message!(self, CreatePipeline, org_info = org_info.clone(), name = name.clone(), pipeline = pipeline.clone())
     }
 
@@ -506,7 +506,7 @@ impl ServiceImplHandle {
         send_message!(self, DescribePipeline, org_info = org_info.clone(), name = name.clone())
     }
 
-    pub async fn create_lifetime_policy(&self, org_info: &OrgInfo, name: &String, policy: &ILMPolicyDefinition) -> Result<(), ServiceImplError> {
+    pub async fn create_lifetime_policy(&self, org_info: &OrgInfo, name: &String, policy: &ILMPolicyDefinition) -> Result<bool, ServiceImplError> {
         send_message!(self, CreateLifetimePolicy, org_info = org_info.clone(), name = name.clone(), policy = policy.clone())
     }
 
@@ -514,7 +514,7 @@ impl ServiceImplHandle {
         send_message!(self, DescribeLifetimePolicy, org_info = org_info.clone(), name = name.clone())
     }
 
-    pub async fn create_table(&self, org_info: &OrgInfo, create_table: &CreateTable) -> Result<(), ServiceImplError> {
+    pub async fn create_table(&self, org_info: &OrgInfo, create_table: &CreateTable) -> Result<bool, ServiceImplError> {
         send_message!(self, CreateTable, org_info = org_info.clone(), create_table = create_table.clone())
     }
 
@@ -522,15 +522,15 @@ impl ServiceImplHandle {
         send_message!(self, DescribeTable, org_info = org_info.clone(), name = table_name.clone())
     }
 
-    pub async fn add_alias(&self, org_info: &OrgInfo, table_name: &String, alias: &String) -> Result<(), ServiceImplError> {
+    pub async fn add_alias(&self, org_info: &OrgInfo, table_name: &String, alias: &String) -> Result<bool, ServiceImplError> {
         send_message!(self, AddAlias, org_info = org_info.clone(), table_name = table_name.clone(), alias = alias.clone())
     }
 
-    pub async fn remove_alias(&self, org_info: &OrgInfo, table_name: &String, alias: &String) -> Result<(), ServiceImplError> {
+    pub async fn remove_alias(&self, org_info: &OrgInfo, table_name: &String, alias: &String) -> Result<bool, ServiceImplError> {
         send_message!(self, RemoveAlias, org_info = org_info.clone(), table_name = table_name.clone(), alias = alias.clone())
     }
 
-    pub async fn create_table_template(&self, org_info: &OrgInfo, name: &String, template: &CreateIndexTemplateBody) -> Result<(), ServiceImplError> {
+    pub async fn create_table_template(&self, org_info: &OrgInfo, name: &String, template: &CreateIndexTemplateBody) -> Result<bool, ServiceImplError> {
         send_message!(self, CreateTableTemplate, org_info = org_info.clone(), name = name.clone(), template = template.clone())
     }
 
@@ -543,23 +543,23 @@ impl ServiceImplHandle {
         send_message!(self, AddCheckpoint, org_info = org_info.clone(), checkpoint = checkpoint.clone())
     }
 
-    pub async fn iceberg_commit(&self, org_info: &OrgInfo, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceImplError> {
+    pub async fn iceberg_commit(&self, org_info: &OrgInfo, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<bool, ServiceImplError> {
         send_message!(self, IcebergCommit, org_info = org_info.clone(), table_name = table_name.clone(), iceberg_commit = iceberg_commit.clone())
     }
 
-    pub async fn speedboat_commit(&self, org_info: &OrgInfo, speedboat_commit: &SpeedboatCommit) -> Result<(), ServiceImplError> {
+    pub async fn speedboat_commit(&self, org_info: &OrgInfo, speedboat_commit: &SpeedboatCommit) -> Result<bool, ServiceImplError> {
         send_message!(self, SpeedboatCommit, org_info = org_info.clone(), speedboat_commit = speedboat_commit.clone())
     }
 
-    pub async fn extension_commit(&self, org_info: &OrgInfo, table_name: &String, extension_commit: &ExtensionCommit) -> Result<(), ServiceImplError> {
+    pub async fn extension_commit(&self, org_info: &OrgInfo, table_name: &String, extension_commit: &ExtensionCommit) -> Result<bool, ServiceImplError> {
         send_message!(self, ExtensionCommit, org_info = org_info.clone(), table_name = table_name.clone(), extension_commit = extension_commit.clone())
     }
 
-    pub async fn compaction_commit(&self, org_info: &OrgInfo, table_name: &String, compaction_commit: &CompactionCommit) -> Result<(), ServiceImplError> {
+    pub async fn compaction_commit(&self, org_info: &OrgInfo, table_name: &String, compaction_commit: &CompactionCommit) -> Result<bool, ServiceImplError> {
         send_message!(self, CompactionCommit, org_info = org_info.clone(), table_name = table_name.clone(), compaction_commit = compaction_commit.clone())
     }
 
-    pub async fn cleanup_commit(&self, org_info: &OrgInfo, cleanup_commit: &CleanupCommit) -> Result<(), ServiceImplError> {
+    pub async fn cleanup_commit(&self, org_info: &OrgInfo, cleanup_commit: &CleanupCommit) -> Result<bool, ServiceImplError> {
         send_message!(self, CleanupCommit, org_info = org_info.clone(), cleanup_commit = cleanup_commit.clone())
     }
 

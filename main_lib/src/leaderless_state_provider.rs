@@ -92,6 +92,7 @@ impl LeaderlessStateProvider {
         }
     }
 
+    #[allow(dead_code)]
     async fn handle_response(request_result: Result<Response, reqwest::Error>) -> Result<(), ServiceApiError> {
         match request_result {
             Ok(success) => {
@@ -124,8 +125,8 @@ impl LeaderlessStateProvider {
         }
     }
 
-    pub(crate) async fn create_table(&mut self, create_table: &CreateTable) -> Result<(), ServiceApiError> {
-        Self::handle_response(self.post(format!("{}/api/v1/create_table", self.base_address))
+    pub(crate) async fn create_table(&mut self, create_table: &CreateTable) -> Result<bool, ServiceApiError> {
+        Self::handle_response_body(self.post(format!("{}/api/v1/create_table", self.base_address))
             .body(serde_json::to_string(create_table).unwrap())
             .send().await
         ).await
@@ -137,30 +138,30 @@ impl LeaderlessStateProvider {
         ).await
     }
 
-    pub(crate) async fn add_alias(&mut self, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
+    pub(crate) async fn add_alias(&mut self, table_name: &String, alias: &String) -> Result<bool, ServiceApiError> {
         let payload = AddAlias {
             table_name: table_name.to_owned(),
             alias: alias.to_owned(),
         };
-        Self::handle_response(self.post(format!("{}/api/v1/add_alias", self.base_address))
+        Self::handle_response_body(self.post(format!("{}/api/v1/add_alias", self.base_address))
             .body(serde_json::to_string(&payload).unwrap())
             .send().await
         ).await
     }
 
-    pub(crate) async fn remove_alias(&mut self, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
+    pub(crate) async fn remove_alias(&mut self, table_name: &String, alias: &String) -> Result<bool, ServiceApiError> {
         let payload = AddAlias {
             table_name: table_name.to_owned(),
             alias: alias.to_owned(),
         };
-        Self::handle_response(self.post(format!("{}/api/v1/remove_alias", self.base_address))
+        Self::handle_response_body(self.post(format!("{}/api/v1/remove_alias", self.base_address))
             .body(serde_json::to_string(&payload).unwrap())
             .send().await
         ).await
     }
 
-    pub(crate) async fn create_table_template(&mut self, name: &String, template: &CreateIndexTemplateBody) -> Result<(), ServiceApiError> {
-        Self::handle_response(self.post(format!("{}/api/v1/create_table_template/{}", self.base_address, name))
+    pub(crate) async fn create_table_template(&mut self, name: &String, template: &CreateIndexTemplateBody) -> Result<bool, ServiceApiError> {
+        Self::handle_response_body(self.post(format!("{}/api/v1/create_table_template/{}", self.base_address, name))
             .body(serde_json::to_string(&template).unwrap())
             .send().await
         ).await
@@ -172,8 +173,8 @@ impl LeaderlessStateProvider {
         ).await
     }
 
-    pub(crate) async fn create_pipeline(&mut self, name: &String, pipeline: &PipelineDefinition) -> Result<(), ServiceApiError> {
-        Self::handle_response(self.post(format!("{}/api/v1/create_pipeline/{}", self.base_address, name))
+    pub(crate) async fn create_pipeline(&mut self, name: &String, pipeline: &PipelineDefinition) -> Result<bool, ServiceApiError> {
+        Self::handle_response_body(self.post(format!("{}/api/v1/create_pipeline/{}", self.base_address, name))
             .body(serde_json::to_string(&pipeline).unwrap())
             .send().await
         ).await
@@ -185,8 +186,8 @@ impl LeaderlessStateProvider {
         ).await
     }
 
-    pub(crate) async fn create_lifetime_policy(&mut self, name: &String, pipeline: &ILMPolicyDefinition) -> Result<(), ServiceApiError> {
-        Self::handle_response(self.post(format!("{}/api/v1/create_lifetime_policy/{}", self.base_address, name))
+    pub(crate) async fn create_lifetime_policy(&mut self, name: &String, pipeline: &ILMPolicyDefinition) -> Result<bool, ServiceApiError> {
+        Self::handle_response_body(self.post(format!("{}/api/v1/create_lifetime_policy/{}", self.base_address, name))
             .body(serde_json::to_string(&pipeline).unwrap())
             .send().await
         ).await
@@ -198,22 +199,24 @@ impl LeaderlessStateProvider {
         ).await
     }
 
-    async fn update_prefetch_checkpoints(&mut self, result: Result<(), ServiceApiError>, table_names: &Vec<String>, extensions: Option<String>) -> Result<(), ServiceApiError> {
+    async fn update_prefetch_checkpoints(&mut self, result: Result<bool, ServiceApiError>, table_names: &Vec<String>, extensions: Option<String>) -> Result<bool, ServiceApiError> {
         match result {
-            Ok(_) => {
-                for table_name in table_names {
-                    let checkpoint_id = self.get_latest_committed_checkpoint(table_name, extensions.clone()).await?;
-                    self.fetch_tracker.set_next_prefetch_checkpoints(table_name, extensions.clone(), &checkpoint_id.unwrap()).await?;
+            Ok(val) => {
+                if val {
+                    for table_name in table_names {
+                        let checkpoint_id = self.get_latest_committed_checkpoint(table_name, extensions.clone()).await?;
+                        self.fetch_tracker.set_next_prefetch_checkpoints(table_name, extensions.clone(), &checkpoint_id.unwrap()).await?;
+                    }
                 }
-                Ok(())
+                Ok(val)
             },
             Err(e) => Err(e)
         }
     }
 
-    pub(crate) async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), ServiceApiError> {
+    pub(crate) async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<bool, ServiceApiError> {
         self.update_prefetch_checkpoints(
-            Self::handle_response(self.post(format!("{}/api/v1/speedboat_commit", self.base_address))
+            Self::handle_response_body(self.post(format!("{}/api/v1/speedboat_commit", self.base_address))
                 .body(serde_json::to_string(&commit).unwrap())
                 .send().await
             ).await,
@@ -222,9 +225,9 @@ impl LeaderlessStateProvider {
         ).await
     }
 
-    pub(crate) async fn iceberg_commit(&mut self, name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError> {
+    pub(crate) async fn iceberg_commit(&mut self, name: &String, iceberg_commit: &IcebergCommit) -> Result<bool, ServiceApiError> {
         self.update_prefetch_checkpoints(
-            Self::handle_response(self.post(format!("{}/api/v1/iceberg_commit/{}", self.base_address, name))
+            Self::handle_response_body(self.post(format!("{}/api/v1/iceberg_commit/{}", self.base_address, name))
                 .body(serde_json::to_string(&iceberg_commit).unwrap())
                 .send().await
             ).await,
@@ -233,9 +236,9 @@ impl LeaderlessStateProvider {
         ).await
     }
 
-    pub(crate) async fn extension_commit(&mut self, name: &String, commit: &ExtensionCommit) -> Result<(), ServiceApiError> {
+    pub(crate) async fn extension_commit(&mut self, name: &String, commit: &ExtensionCommit) -> Result<bool, ServiceApiError> {
         self.update_prefetch_checkpoints(
-            Self::handle_response(self.post(format!("{}/api/v1/extension_commit/{}", self.base_address, name))
+            Self::handle_response_body(self.post(format!("{}/api/v1/extension_commit/{}", self.base_address, name))
                 .body(serde_json::to_string(&commit).unwrap())
                 .send().await
             ).await,
@@ -244,9 +247,9 @@ impl LeaderlessStateProvider {
         ).await
     }
 
-    pub(crate) async fn compaction_commit(&mut self, name: &String, commit: &CompactionCommit) -> Result<(), ServiceApiError> {
+    pub(crate) async fn compaction_commit(&mut self, name: &String, commit: &CompactionCommit) -> Result<bool, ServiceApiError> {
         self.update_prefetch_checkpoints(
-            Self::handle_response(self.post(format!("{}/api/v1/compaction_commit/{}", self.base_address, name))
+            Self::handle_response_body(self.post(format!("{}/api/v1/compaction_commit/{}", self.base_address, name))
                 .body(serde_json::to_string(&commit).unwrap())
                 .send().await
             ).await,
@@ -255,8 +258,8 @@ impl LeaderlessStateProvider {
         ).await
     }
 
-    pub(crate) async fn cleanup_commit(&mut self, commit: &CleanupCommit) -> Result<(), ServiceApiError> {
-        Self::handle_response(self.post(format!("{}/api/v1/cleanup_commit", self.base_address))
+    pub(crate) async fn cleanup_commit(&mut self, commit: &CleanupCommit) -> Result<bool, ServiceApiError> {
+        Self::handle_response_body(self.post(format!("{}/api/v1/cleanup_commit", self.base_address))
             .body(serde_json::to_string(&commit).unwrap())
             .send().await
         ).await

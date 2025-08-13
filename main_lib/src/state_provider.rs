@@ -50,7 +50,7 @@ enum StateProviderActorMessage {
         mode: TestProcessingMode,
     },
     CreatePipeline {
-        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
+        respond_to: oneshot::Sender<Result<bool, ServiceApiError>>,
         name: String,
         pipeline: PipelineDefinition,
     },
@@ -59,7 +59,7 @@ enum StateProviderActorMessage {
         name: String,
     },
     CreateLifetimePolicy {
-        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
+        respond_to: oneshot::Sender<Result<bool, ServiceApiError>>,
         name: String,
         policy: ILMPolicyDefinition,
     },
@@ -68,7 +68,7 @@ enum StateProviderActorMessage {
         name: String,
     },
     CreateTable {
-        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
+        respond_to: oneshot::Sender<Result<bool, ServiceApiError>>,
         create_table: CreateTable,
     },
     DescribeTable {
@@ -76,17 +76,17 @@ enum StateProviderActorMessage {
         name: String,
     },
     AddAlias {
-        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
+        respond_to: oneshot::Sender<Result<bool, ServiceApiError>>,
         table_name: String,
         alias: String,
     },
     RemoveAlias {
-        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
+        respond_to: oneshot::Sender<Result<bool, ServiceApiError>>,
         table_name: String,
         alias: String,
     },         
     CreateTableTemplate {
-        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
+        respond_to: oneshot::Sender<Result<bool, ServiceApiError>>,
         name: String,
         template: CreateIndexTemplateBody,
     },
@@ -99,26 +99,26 @@ enum StateProviderActorMessage {
         checkpoint: TableMetadataCheckpoint,
     },
     IcebergCommit {
-        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
+        respond_to: oneshot::Sender<Result<bool, ServiceApiError>>,
         table_name: String,
         iceberg_commit: IcebergCommit,
     },
     SpeedboatCommit {
-        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
+        respond_to: oneshot::Sender<Result<bool, ServiceApiError>>,
         speedboat_commit: SpeedboatCommit,
     },
     ExtensionCommit {
-        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
+        respond_to: oneshot::Sender<Result<bool, ServiceApiError>>,
         table_name: String,
         extension_commit: ExtensionCommit,        
     },
     CompactionCommit {
-        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
+        respond_to: oneshot::Sender<Result<bool, ServiceApiError>>,
         table_name: String,
         compaction_commit: CompactionCommit,        
     },
     CleanupCommit {
-        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
+        respond_to: oneshot::Sender<Result<bool, ServiceApiError>>,
         cleanup_commit: CleanupCommit,
     },
     GetLatestCommittedCheckpoint {
@@ -383,7 +383,7 @@ impl StateProvider {
         state_provider_func_impl!(self, get_all_iceberg_tables())
     }
 
-    pub async fn create_table(&mut self, create_table: &CreateTable) -> Result<(), ServiceApiError> {
+    pub async fn create_table(&mut self, create_table: &CreateTable) -> Result<bool, ServiceApiError> {
         state_provider_func_impl!(self, create_table(create_table))
     }
 
@@ -391,15 +391,15 @@ impl StateProvider {
         state_provider_func_impl!(self, describe_table(name))
     }
 
-    pub async fn add_alias(&mut self, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
+    pub async fn add_alias(&mut self, table_name: &String, alias: &String) -> Result<bool, ServiceApiError> {
         state_provider_func_impl!(self, add_alias(table_name, alias))
     }
 
-    pub async fn remove_alias(&mut self, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
+    pub async fn remove_alias(&mut self, table_name: &String, alias: &String) -> Result<bool, ServiceApiError> {
         state_provider_func_impl!(self, remove_alias(table_name, alias))
     }
 
-    pub async fn create_table_template(&mut self, name: &String, template: &CreateIndexTemplateBody) -> Result<(), ServiceApiError> {
+    pub async fn create_table_template(&mut self, name: &String, template: &CreateIndexTemplateBody) -> Result<bool, ServiceApiError> {
         state_provider_func_impl!(self, create_table_template(name, template))
     }
 
@@ -407,7 +407,7 @@ impl StateProvider {
         state_provider_func_impl!(self, describe_table_template(name))
     }
 
-    pub async fn create_pipeline(&mut self, name: &String, pipeline: &PipelineDefinition) -> Result<(), ServiceApiError> {
+    pub async fn create_pipeline(&mut self, name: &String, pipeline: &PipelineDefinition) -> Result<bool, ServiceApiError> {
         state_provider_func_impl!(self, create_pipeline(name, pipeline))
     }
 
@@ -415,7 +415,7 @@ impl StateProvider {
         state_provider_func_impl!(self, describe_pipeline(name))
     }
 
-    pub async fn create_lifetime_policy(&mut self, name: &String, policy: &ILMPolicyDefinition) -> Result<(), ServiceApiError> {
+    pub async fn create_lifetime_policy(&mut self, name: &String, policy: &ILMPolicyDefinition) -> Result<bool, ServiceApiError> {
         state_provider_func_impl!(self, create_lifetime_policy(name, policy))
     }
 
@@ -423,23 +423,23 @@ impl StateProvider {
         state_provider_func_impl!(self, describe_lifetime_policy(name))
     }
 
-    pub async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), ServiceApiError> {
+    pub async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<bool, ServiceApiError> {
         state_provider_func_impl!(self, speedboat_commit(commit))
     }
 
-    pub async fn iceberg_commit(&mut self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError> {
+    pub async fn iceberg_commit(&mut self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<bool, ServiceApiError> {
         state_provider_func_impl!(self, iceberg_commit(table_name, iceberg_commit))
     }
 
-    pub async fn extension_commit(&mut self, table_name: &String, commit: &ExtensionCommit) -> Result<(), ServiceApiError> {
+    pub async fn extension_commit(&mut self, table_name: &String, commit: &ExtensionCommit) -> Result<bool, ServiceApiError> {
         state_provider_func_impl!(self, extension_commit(table_name, commit))
     }
 
-    pub async fn compaction_commit(&mut self, _table_name: &String, commit: &CompactionCommit) -> Result<(), ServiceApiError> {
+    pub async fn compaction_commit(&mut self, _table_name: &String, commit: &CompactionCommit) -> Result<bool, ServiceApiError> {
         state_provider_func_impl!(self, compaction_commit(_table_name, commit))
     }
 
-    pub async fn cleanup_commit(&mut self, commit: &CleanupCommit) -> Result<(), ServiceApiError> {
+    pub async fn cleanup_commit(&mut self, commit: &CleanupCommit) -> Result<bool, ServiceApiError> {
         state_provider_func_impl!(self, cleanup_commit(commit))
     }
 
@@ -537,7 +537,7 @@ impl StateProviderHandle {
         send_message!(self, SetMode, mode = mode.clone());
     }
 
-    pub async fn create_pipeline(&self, name: &String, pipeline: &PipelineDefinition) -> Result<(), ServiceApiError> {
+    pub async fn create_pipeline(&self, name: &String, pipeline: &PipelineDefinition) -> Result<bool, ServiceApiError> {
         send_message!(self, CreatePipeline, name = name.clone(), pipeline = pipeline.clone())
     }
 
@@ -545,7 +545,7 @@ impl StateProviderHandle {
         send_message!(self, DescribePipeline, name = name.clone())
     }
 
-    pub async fn create_lifetime_policy(&self, name: &String, policy: &ILMPolicyDefinition) -> Result<(), ServiceApiError> {
+    pub async fn create_lifetime_policy(&self, name: &String, policy: &ILMPolicyDefinition) -> Result<bool, ServiceApiError> {
         send_message!(self, CreateLifetimePolicy, name = name.clone(), policy = policy.clone())
     }
 
@@ -553,7 +553,7 @@ impl StateProviderHandle {
         send_message!(self, DescribeLifetimePolicy, name = name.clone())
     }
 
-    pub async fn create_table(&self, create_table: &CreateTable) -> Result<(), ServiceApiError> {
+    pub async fn create_table(&self, create_table: &CreateTable) -> Result<bool, ServiceApiError> {
         send_message!(self, CreateTable, create_table = create_table.clone())
     }  
 
@@ -561,15 +561,15 @@ impl StateProviderHandle {
         send_message!(self, DescribeTable, name = table_name.clone())
     } 
 
-    pub async fn add_alias(&self, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
+    pub async fn add_alias(&self, table_name: &String, alias: &String) -> Result<bool, ServiceApiError> {
         send_message!(self, AddAlias, table_name = table_name.clone(), alias = alias.clone())
     }  
 
-    pub async fn remove_alias(&self, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
+    pub async fn remove_alias(&self, table_name: &String, alias: &String) -> Result<bool, ServiceApiError> {
         send_message!(self, RemoveAlias, table_name = table_name.clone(), alias = alias.clone())
     }         
 
-    pub async fn create_table_template(&self, name: &String, template: &CreateIndexTemplateBody) -> Result<(), ServiceApiError> {
+    pub async fn create_table_template(&self, name: &String, template: &CreateIndexTemplateBody) -> Result<bool, ServiceApiError> {
         send_message!(self, CreateTableTemplate, name = name.clone(), template = template.clone())
     }  
 
@@ -581,23 +581,23 @@ impl StateProviderHandle {
         send_message!(self, AddCheckpoint, checkpoint = checkpoint.clone())
     }
 
-    pub async fn iceberg_commit(&self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError> {
+    pub async fn iceberg_commit(&self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<bool, ServiceApiError> {
         send_message!(self, IcebergCommit, table_name = table_name.clone(), iceberg_commit = iceberg_commit.clone())
     }
 
-    pub async fn speedboat_commit(&self, speedboat_commit: &SpeedboatCommit) -> Result<(), ServiceApiError> {
+    pub async fn speedboat_commit(&self, speedboat_commit: &SpeedboatCommit) -> Result<bool, ServiceApiError> {
         send_message!(self, SpeedboatCommit, speedboat_commit = speedboat_commit.clone())
     }
 
-    pub async fn extension_commit(&self, table_name: &String, extension_commit: &ExtensionCommit) -> Result<(), ServiceApiError> {
+    pub async fn extension_commit(&self, table_name: &String, extension_commit: &ExtensionCommit) -> Result<bool, ServiceApiError> {
         send_message!(self, ExtensionCommit, table_name = table_name.clone(), extension_commit = extension_commit.clone())
     }
 
-    pub async fn compaction_commit(&self, table_name: &String, compaction_commit: &CompactionCommit) -> Result<(), ServiceApiError> {
+    pub async fn compaction_commit(&self, table_name: &String, compaction_commit: &CompactionCommit) -> Result<bool, ServiceApiError> {
         send_message!(self, CompactionCommit, table_name = table_name.clone(), compaction_commit = compaction_commit.clone())
     }
 
-    pub async fn cleanup_commit(&self, cleanup_commit: &CleanupCommit) -> Result<(), ServiceApiError> {
+    pub async fn cleanup_commit(&self, cleanup_commit: &CleanupCommit) -> Result<bool, ServiceApiError> {
         send_message!(self, CleanupCommit, cleanup_commit = cleanup_commit.clone())
     }
 

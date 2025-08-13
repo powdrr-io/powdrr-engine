@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_dynamodb::Client;
 use modyne::model::TransactWrite;
@@ -145,12 +145,8 @@ impl DynamoDBServiceImpl {
         todo!()
     }
 
-    pub async fn create_table(&mut self, org_info: &OrgInfo, create_table: &CreateTable) -> Result<(), ServiceApiError> {
-        let result = self.connector.create_table_helper(&org_info.org_id.to_string(), &create_table.name, &TableBody { tags: create_table.tags.clone() }).await.map_err(from_modyne)?;
-        match result {
-            true => Ok(()),
-            false => Err(ServiceApiError{ message: "Unable to create table, conflict detected".to_string() })
-        }
+    pub async fn create_table(&mut self, org_info: &OrgInfo, create_table: &CreateTable) -> Result<bool, ServiceApiError> {
+        self.connector.create_table_helper(&org_info.org_id.to_string(), &create_table.name, &TableBody { tags: create_table.tags.clone() }).await.map_err(from_modyne)
     }
 
     pub async fn describe_table(&mut self, org_info: &OrgInfo, name: &String) -> Result<Option<TableDescription>, ServiceApiError> {
@@ -173,15 +169,15 @@ impl DynamoDBServiceImpl {
         }
     }
 
-    pub async fn add_alias(&mut self, org_info: &OrgInfo, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
+    pub async fn add_alias(&mut self, org_info: &OrgInfo, table_name: &String, alias: &String) -> Result<bool, ServiceApiError> {
         self.connector.create_alias(&org_info.org_id.to_string(), alias, table_name).await.map_err(from_modyne)
     }
 
-    pub async fn remove_alias(&mut self, org_info: &OrgInfo, _table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
+    pub async fn remove_alias(&mut self, org_info: &OrgInfo, _table_name: &String, alias: &String) -> Result<bool, ServiceApiError> {
         self.connector.delete_alias(&org_info.org_id.to_string(), alias).await.map_err(from_modyne)
     }
 
-    pub async fn create_table_template(&mut self, org_info: &OrgInfo, name: &String, template: &CreateIndexTemplateBody) -> Result<(), ServiceApiError> {
+    pub async fn create_table_template(&mut self, org_info: &OrgInfo, name: &String, template: &CreateIndexTemplateBody) -> Result<bool, ServiceApiError> {
         self.connector.create_table_template(&org_info.org_id.to_string(), name, template).await.map_err(from_modyne)
     }
 
@@ -189,7 +185,7 @@ impl DynamoDBServiceImpl {
         self.connector.describe_table_template(&org_info.org_id.clone(), name).await.map_err(from_modyne)
     }
 
-    pub async fn create_pipeline(&mut self, org_info: &OrgInfo, name: &String, pipeline: &PipelineDefinition) -> Result<(), ServiceApiError> {
+    pub async fn create_pipeline(&mut self, org_info: &OrgInfo, name: &String, pipeline: &PipelineDefinition) -> Result<bool, ServiceApiError> {
         self.connector.create_pipeline(&org_info.org_id.clone(), name, pipeline).await.map_err(from_modyne)
     }
 
@@ -197,7 +193,7 @@ impl DynamoDBServiceImpl {
         self.connector.describe_pipeline(&org_info.org_id.clone(), name).await.map_err(from_modyne)
     }
 
-    pub async fn create_lifetime_policy(&mut self, org_info: &OrgInfo, name: &String, policy: &ILMPolicyDefinition) -> Result<(), ServiceApiError> {
+    pub async fn create_lifetime_policy(&mut self, org_info: &OrgInfo, name: &String, policy: &ILMPolicyDefinition) -> Result<bool, ServiceApiError> {
         self.connector.create_lifetime_policy(&org_info.org_id.clone(), name, policy).await.map_err(from_modyne)
     }
 
@@ -205,14 +201,14 @@ impl DynamoDBServiceImpl {
         self.connector.describe_lifetime_policy(&org_info.org_id.clone(), name).await.map_err(from_modyne)
     }
 
-    pub async fn speedboat_commit(&mut self, org_info: &OrgInfo, commit: &SpeedboatCommit) -> Result<(), ServiceApiError> {
-        let tables: Vec<String> = commit.type_files.iter().map(|x| x.table_name.clone()).collect();
-        //assert_eq!(tables.len(), 1, "Only really support single table commits right now");
-        // TODO: change to return result bool
-        let retval = self.connector.commit_speedboat(&org_info.org_id.clone(), &tables[0], commit).await.map_err(from_modyne)?;
-        assert!(retval);
-        self.update_cache.push((org_info.org_id.clone(), tables[0].clone()));
-        Ok(())
+    pub async fn speedboat_commit(&mut self, org_info: &OrgInfo, commit: &SpeedboatCommit) -> Result<bool, ServiceApiError> {
+        let tables: HashSet<String> = commit.type_files.iter().map(|x| x.table_name.clone()).collect();
+        assert_eq!(tables.len(), 1, "Only really support single table commits right now");
+        let retval = self.connector.commit_speedboat(&org_info.org_id.clone(), &commit.type_files[0].table_name, commit).await.map_err(from_modyne)?;
+        if retval {
+            self.update_cache.push((org_info.org_id.clone(), commit.type_files[0].table_name.clone()));
+        }
+        Ok(retval)
     }
 
     async fn clone_and_apply(
@@ -256,34 +252,25 @@ impl DynamoDBServiceImpl {
         Ok(compaction_commits)
     }
 
-    pub async fn iceberg_commit(&mut self, org_info: &OrgInfo, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError> {
-        // TODO: change to return result bool
-        let retval = self.connector.commit_iceberg(&org_info.org_id.clone(), table_name, iceberg_commit).await.map_err(from_modyne)?;
-        assert!(retval);
-        Ok(())
+    pub async fn iceberg_commit(&mut self, org_info: &OrgInfo, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<bool, ServiceApiError> {
+        self.connector.commit_iceberg(&org_info.org_id.clone(), table_name, iceberg_commit).await.map_err(from_modyne)
     }
 
-    pub async fn extension_commit(&mut self, org_info: &OrgInfo, table_name: &String, commit: &ExtensionCommit) -> Result<(), ServiceApiError> {
-        match self.connector.commit_extension_work_item_completed(&org_info.org_id, table_name, &commit).await.map_err(from_modyne)? {
-            true => Ok(()),
-            false => {
-                Err(ServiceApiError { message: "Unable to commit, conflict detected".to_string() })
-            }
-        }
+    pub async fn extension_commit(&mut self, org_info: &OrgInfo, table_name: &String, commit: &ExtensionCommit) -> Result<bool, ServiceApiError> {
+        self.connector.commit_extension_work_item_completed(&org_info.org_id, table_name, &commit).await.map_err(from_modyne)
     }
 
-    pub async fn compaction_commit(&mut self, org_info: &OrgInfo, _table_name: &String, commit: &CompactionCommit) -> Result<(), ServiceApiError> {
+    pub async fn compaction_commit(&mut self, org_info: &OrgInfo, _table_name: &String, commit: &CompactionCommit) -> Result<bool, ServiceApiError> {
         // NOTE: this just notes what the compactor is saying. We don't generate the new checkpoint
         // until we see an iceberg or speedboat commit with the new info.
         assert!(commit.compaction_id.len() > 0);
         self.connector.create_compaction(&mut self.compactions_cache, &org_info.org_id, &commit.compaction_id, commit).await.map_err(from_modyne)
     }
 
-    pub async fn cleanup_commit(&mut self, org_info: &OrgInfo, commit: &CleanupCommit) -> Result<(), ServiceApiError> {
+    pub async fn cleanup_commit(&mut self, org_info: &OrgInfo, commit: &CleanupCommit) -> Result<bool, ServiceApiError> {
         let mut transaction = TransactWrite::new();
         transaction = DynamoDbConnector::mark_done_cleanup_work_item_lease_inner(transaction, &org_info.org_id, &commit.table_name, &commit.id, None);
-        self.connector.commit_conditional_transaction(transaction).await.map_err(from_modyne)?;
-        Ok(())
+        self.connector.commit_conditional_transaction(transaction).await.map_err(from_modyne)
     }
 
     pub async fn get_latest_committed_checkpoint(&mut self, org_info: &OrgInfo, table_name: &String, extensions: Option<String>) -> Result<Option<String>, ServiceApiError> {

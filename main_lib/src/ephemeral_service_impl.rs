@@ -465,7 +465,7 @@ impl EphemeralServiceImpl {
         todo!()
     }
 
-    pub async fn create_table(&mut self, _org_info: &OrgInfo, create_table: &CreateTable) -> Result<(), ServiceApiError> {
+    pub async fn create_table(&mut self, _org_info: &OrgInfo, create_table: &CreateTable) -> Result<bool, ServiceApiError> {
         match self.tables.get(&create_table.name) {
             Some(_) => {
                 self.tables.remove(&create_table.name);
@@ -477,7 +477,7 @@ impl EphemeralServiceImpl {
                 self.not_compacted_checkpoint_ids.insert(create_table.name.clone(), Vec::new());
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     pub async fn describe_table(&mut self, _org_info: &OrgInfo, name: &String) -> Result<Option<TableDescription>, ServiceApiError> {
@@ -488,28 +488,28 @@ impl EphemeralServiceImpl {
         }
     }
 
-    pub async fn add_alias(&mut self, _org_info: &OrgInfo, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
+    pub async fn add_alias(&mut self, _org_info: &OrgInfo, table_name: &String, alias: &String) -> Result<bool, ServiceApiError> {
         // TODO: check if something exists
         self.table_aliases.insert(alias.clone(), table_name.clone());
-        Ok(())
+        Ok(true)
     }
 
-    pub async fn remove_alias(&mut self, _org_info: &OrgInfo, _table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
+    pub async fn remove_alias(&mut self, _org_info: &OrgInfo, _table_name: &String, alias: &String) -> Result<bool, ServiceApiError> {
         // TODO: check if something exists
         self.table_aliases.remove(alias);
-        Ok(())
+        Ok(true)
     }
 
-    pub async fn create_table_template(&mut self, _org_info: &OrgInfo, name: &String, template: &CreateIndexTemplateBody) -> Result<(), ServiceApiError> {
+    pub async fn create_table_template(&mut self, _org_info: &OrgInfo, name: &String, template: &CreateIndexTemplateBody) -> Result<bool, ServiceApiError> {
         match self.table_templates.get(name) {
             Some(_) => {
                 self.table_templates.remove(name);
                 self.table_templates.insert(name.clone(), template.clone());
-                Ok(())
+                Ok(true)
             }
             None => {
                 self.table_templates.insert(name.clone(), template.clone());
-                Ok(())
+                Ok(true)
             }
         }
     }
@@ -521,12 +521,12 @@ impl EphemeralServiceImpl {
         }
     }
 
-    pub async fn create_pipeline(&mut self, _org_info: &OrgInfo, name: &String, pipeline: &PipelineDefinition) -> Result<(), ServiceApiError> {
+    pub async fn create_pipeline(&mut self, _org_info: &OrgInfo, name: &String, pipeline: &PipelineDefinition) -> Result<bool, ServiceApiError> {
         match self.pipelines.get(name) {
             Some(_) => panic!("Need to do a real error path now"),
             None => {
                 self.pipelines.insert(name.clone(), pipeline.clone());
-                Ok(())
+                Ok(true)
             }
         }
     }
@@ -538,12 +538,12 @@ impl EphemeralServiceImpl {
         }
     }
 
-    pub async fn create_lifetime_policy(&mut self, _org_info: &OrgInfo, name: &String, policy: &ILMPolicyDefinition) -> Result<(), ServiceApiError> {
+    pub async fn create_lifetime_policy(&mut self, _org_info: &OrgInfo, name: &String, policy: &ILMPolicyDefinition) -> Result<bool, ServiceApiError> {
         match self.lifetime_policies.get(name) {
             Some(_) => panic!("Need to do a real error path now"),
             None => {
                 self.lifetime_policies.insert(name.clone(), policy.clone());
-                Ok(())
+                Ok(true)
             }
         }
     }
@@ -556,7 +556,7 @@ impl EphemeralServiceImpl {
     }
 
 
-    pub async fn speedboat_commit(&mut self, _org_info: &OrgInfo, commit: &SpeedboatCommit) -> Result<(), ServiceApiError> {
+    pub async fn speedboat_commit(&mut self, _org_info: &OrgInfo, commit: &SpeedboatCommit) -> Result<bool, ServiceApiError> {
         assert!(commit.compaction.is_none(), "Speedboat commits do not yet support compactions");
         for table_info in commit.type_files.iter() {
             if table_info.commit_type == "commit" || table_info.commit_type == "compact" {
@@ -567,10 +567,10 @@ impl EphemeralServiceImpl {
                 panic!("Unknown Speedboat commit type")
             }
         }
-        Ok(())
+        Ok(true)
     }
 
-    pub async fn iceberg_commit(&mut self, _org_info: &OrgInfo, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError> {
+    pub async fn iceberg_commit(&mut self, _org_info: &OrgInfo, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<bool, ServiceApiError> {
         let latest_checkpoint = match self.get_latest_committed_checkpoint_sync(table_name, None) {
             Some(checkpoint_id) => {
                 let key = format!("{}_{}", table_name, checkpoint_id);
@@ -628,10 +628,10 @@ impl EphemeralServiceImpl {
             self.cleanup_work_items.push(cleanup_work_item);
         }
 
-        Ok(())
+        Ok(true)
     }
 
-    pub async fn extension_commit(&mut self, _org_info: &OrgInfo, table_name: &String, commit: &ExtensionCommit) -> Result<(), ServiceApiError> {
+    pub async fn extension_commit(&mut self, _org_info: &OrgInfo, table_name: &String, commit: &ExtensionCommit) -> Result<bool, ServiceApiError> {
         let waiting_checkpoint_ids = self.checkpoints_needing_extension_work(table_name, &commit.extension).unwrap_or_else(|| vec!());
         assert!(waiting_checkpoint_ids.len() > 0);
 
@@ -652,18 +652,18 @@ impl EphemeralServiceImpl {
                 self.set_latest_committed_checkpoint(table_name, Some("es".to_string()), max_id);
             },
         };
-        Ok(())
+        Ok(true)
     }
 
-    pub async fn compaction_commit(&mut self, _org_info: &OrgInfo, table_name: &String, commit: &CompactionCommit) -> Result<(), ServiceApiError> {
+    pub async fn compaction_commit(&mut self, _org_info: &OrgInfo, table_name: &String, commit: &CompactionCommit) -> Result<bool, ServiceApiError> {
         // NOTE: this just notes what the compactor is saying. We don't generate the new checkpoint
         // until we see an iceberg or speedboat commit with the new info.
         self.compactions.insert(commit.compaction_id.clone(), (table_name.clone(), commit.clone()));
-        Ok(())
+        Ok(true)
     }
 
-    pub async fn cleanup_commit(&mut self, _org_info: &OrgInfo, _commit: &CleanupCommit) -> Result<(), ServiceApiError> {
-        Ok(())
+    pub async fn cleanup_commit(&mut self, _org_info: &OrgInfo, _commit: &CleanupCommit) -> Result<bool, ServiceApiError> {
+        Ok(true)
     }
 
     pub async fn get_latest_committed_checkpoint(&mut self, _org_info: &OrgInfo, table_name: &String, extensions: Option<String>) -> Result<Option<String>, ServiceApiError> {

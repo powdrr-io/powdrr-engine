@@ -47,7 +47,7 @@ impl DynamoDbStateProvider {
         self.service_impl.get_all_iceberg_tables().await
     }
 
-    pub async fn create_table(&mut self, create_table: &CreateTable) -> Result<(), ServiceApiError> {
+    pub async fn create_table(&mut self, create_table: &CreateTable) -> Result<bool, ServiceApiError> {
         self.service_impl.create_table(&self.fake_org_info, create_table).await
     }
 
@@ -55,15 +55,15 @@ impl DynamoDbStateProvider {
         self.service_impl.describe_table(&self.fake_org_info, name).await
     }
 
-    pub async fn add_alias(&mut self, table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
+    pub async fn add_alias(&mut self, table_name: &String, alias: &String) -> Result<bool, ServiceApiError> {
         self.service_impl.add_alias(&self.fake_org_info, table_name, alias).await
     }
 
-    pub async fn remove_alias(&mut self, _table_name: &String, alias: &String) -> Result<(), ServiceApiError> {
+    pub async fn remove_alias(&mut self, _table_name: &String, alias: &String) -> Result<bool, ServiceApiError> {
         self.service_impl.remove_alias(&self.fake_org_info, _table_name, alias).await
     }
 
-    pub async fn create_table_template(&mut self, name: &String, template: &CreateIndexTemplateBody) -> Result<(), ServiceApiError> {
+    pub async fn create_table_template(&mut self, name: &String, template: &CreateIndexTemplateBody) -> Result<bool, ServiceApiError> {
         self.service_impl.create_table_template(&self.fake_org_info, name, template).await
     }
 
@@ -71,7 +71,7 @@ impl DynamoDbStateProvider {
         self.service_impl.describe_table_template(&self.fake_org_info, name).await
     }
 
-    pub async fn create_pipeline(&mut self, name: &String, pipeline: &PipelineDefinition) -> Result<(), ServiceApiError> {
+    pub async fn create_pipeline(&mut self, name: &String, pipeline: &PipelineDefinition) -> Result<bool, ServiceApiError> {
         self.service_impl.create_pipeline(&self.fake_org_info, name, pipeline).await
     }
 
@@ -79,7 +79,7 @@ impl DynamoDbStateProvider {
         self.service_impl.describe_pipeline(&self.fake_org_info, name).await
     }
 
-    pub async fn create_lifetime_policy(&mut self, name: &String, policy: &ILMPolicyDefinition) -> Result<(), ServiceApiError> {
+    pub async fn create_lifetime_policy(&mut self, name: &String, policy: &ILMPolicyDefinition) -> Result<bool, ServiceApiError> {
         self.service_impl.create_lifetime_policy(&self.fake_org_info, name, policy).await
     }
 
@@ -87,55 +87,63 @@ impl DynamoDbStateProvider {
         self.service_impl.describe_lifetime_policy(&self.fake_org_info, name).await
     }
 
-    pub async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<(), ServiceApiError> {
+    pub async fn speedboat_commit(&mut self, commit: &SpeedboatCommit) -> Result<bool, ServiceApiError> {
         match self.service_impl.speedboat_commit(&self.fake_org_info, commit).await {
-            Ok(_) => {
-                for table_info in commit.type_files.iter() {
-                    let checkpoint_id = self.get_latest_committed_checkpoint(&table_info.table_name, None).await?;
-                    if checkpoint_id.is_some() {
-                        self.fetch_tracker.set_next_prefetch_checkpoints(&table_info.table_name, None, &checkpoint_id.unwrap()).await?;
+            Ok(val) => {
+                if val {
+                    for table_info in commit.type_files.iter() {
+                        let checkpoint_id = self.get_latest_committed_checkpoint(&table_info.table_name, None).await?;
+                        if checkpoint_id.is_some() {
+                            self.fetch_tracker.set_next_prefetch_checkpoints(&table_info.table_name, None, &checkpoint_id.unwrap()).await?;
+                        }
                     }
                 }
-                Ok(())
+                Ok(val)
             },
             Err(e) => Err(e)
         }
     }
 
-    pub async fn iceberg_commit(&mut self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<(), ServiceApiError> {
+    pub async fn iceberg_commit(&mut self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<bool, ServiceApiError> {
         match self.service_impl.iceberg_commit(&self.fake_org_info, table_name, iceberg_commit).await {
-            Ok(_) => {
-                let checkpoint_id = self.get_latest_committed_checkpoint(table_name, None).await?;
-                self.fetch_tracker.set_next_prefetch_checkpoints(table_name, None, &checkpoint_id.unwrap()).await?;
-                Ok(())
+            Ok(val) => {
+                if val {
+                    let checkpoint_id = self.get_latest_committed_checkpoint(table_name, None).await?;
+                    self.fetch_tracker.set_next_prefetch_checkpoints(table_name, None, &checkpoint_id.unwrap()).await?;
+                }
+                Ok(val)
             },
             Err(e) => Err(e)
         }
     }
 
-    pub async fn extension_commit(&mut self, table_name: &String, commit: &ExtensionCommit) -> Result<(), ServiceApiError> {
+    pub async fn extension_commit(&mut self, table_name: &String, commit: &ExtensionCommit) -> Result<bool, ServiceApiError> {
         match self.service_impl.extension_commit(&self.fake_org_info, table_name, commit).await {
-            Ok(_) => {
-                let checkpoint_id = self.get_latest_committed_checkpoint(table_name, None).await?;
-                self.fetch_tracker.set_next_prefetch_checkpoints(table_name, Some(commit.extension.clone()), &checkpoint_id.unwrap()).await?;
-                Ok(())
+            Ok(val) => {
+                if val {
+                    let checkpoint_id = self.get_latest_committed_checkpoint(table_name, None).await?;
+                    self.fetch_tracker.set_next_prefetch_checkpoints(table_name, Some(commit.extension.clone()), &checkpoint_id.unwrap()).await?;
+                }
+                Ok(val)
             },
             Err(e) => Err(e)
         }
     }
 
-    pub async fn compaction_commit(&mut self, table_name: &String, commit: &CompactionCommit) -> Result<(), ServiceApiError> {
+    pub async fn compaction_commit(&mut self, table_name: &String, commit: &CompactionCommit) -> Result<bool, ServiceApiError> {
         match self.service_impl.compaction_commit(&self.fake_org_info, table_name, commit).await {
-            Ok(_) => {
-                let checkpoint_id = self.get_latest_committed_checkpoint(table_name, None).await?;
-                self.fetch_tracker.set_next_prefetch_checkpoints(table_name, None, &checkpoint_id.unwrap()).await?;
-                Ok(())
+            Ok(val) => {
+                if val {
+                    let checkpoint_id = self.get_latest_committed_checkpoint(table_name, None).await?;
+                    self.fetch_tracker.set_next_prefetch_checkpoints(table_name, None, &checkpoint_id.unwrap()).await?;
+                }
+                Ok(val)
             },
             Err(e) => Err(e)
         }
     }
 
-    pub async fn cleanup_commit(&mut self, commit: &CleanupCommit) -> Result<(), ServiceApiError> {
+    pub async fn cleanup_commit(&mut self, commit: &CleanupCommit) -> Result<bool, ServiceApiError> {
         self.service_impl.cleanup_commit(&self.fake_org_info, commit).await
     }
 
