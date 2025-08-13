@@ -232,7 +232,7 @@ fn handle_result_option<T>(value: Result<Option<T>, ServiceImplError>) -> Generi
 
 
 body_handler_org_info! { create_table(org_info: OrgInfo, input: CreateTable) -> GenericResponse {
-    handle_result_none(SERVICE_IMPL.create_table(&org_info, &input).await)
+    handle_result(SERVICE_IMPL.create_table(&org_info, &input).await)
 }}
 
 name_handler! { describe_table(org_info: OrgInfo, name: String) -> GenericResponse {
@@ -241,15 +241,15 @@ name_handler! { describe_table(org_info: OrgInfo, name: String) -> GenericRespon
 
 
 body_handler_org_info! { add_alias(org_info: OrgInfo, input: AddAlias) -> GenericResponse {
-    handle_result_none(SERVICE_IMPL.add_alias(&org_info, &input.table_name, &input.alias).await)
+    handle_result(SERVICE_IMPL.add_alias(&org_info, &input.table_name, &input.alias).await)
 }}
 
 body_handler_org_info! { remove_alias(org_info: OrgInfo, input: AddAlias) -> GenericResponse {
-    handle_result_none(SERVICE_IMPL.remove_alias(&org_info, &input.table_name, &input.alias).await)
+    handle_result(SERVICE_IMPL.remove_alias(&org_info, &input.table_name, &input.alias).await)
 }}
 
 body_with_name_handler! { create_table_template(org_info: OrgInfo, name: String, input: CreateIndexTemplateBody) -> GenericResponse {
-    handle_result_none(SERVICE_IMPL.create_table_template(&org_info, &name, &input).await)
+    handle_result(SERVICE_IMPL.create_table_template(&org_info, &name, &input).await)
 }}
 
 
@@ -259,7 +259,7 @@ name_handler! { describe_table_template(org_info: OrgInfo, name: String) -> Gene
 
 
 body_with_name_handler! { create_pipeline(org_info: OrgInfo, name: String, input: PipelineDefinition) -> GenericResponse {
-    handle_result_none(SERVICE_IMPL.create_pipeline(&org_info, &name, &input).await)
+    handle_result(SERVICE_IMPL.create_pipeline(&org_info, &name, &input).await)
 }}
 
 
@@ -269,7 +269,7 @@ name_handler! { describe_pipeline(org_info: OrgInfo, name: String) -> GenericRes
 
 
 body_with_name_handler! { create_lifetime_policy(org_info: OrgInfo, name: String, input: ILMPolicyDefinition) -> GenericResponse {
-    handle_result_none(SERVICE_IMPL.create_lifetime_policy(&org_info, &name, &input).await)
+    handle_result(SERVICE_IMPL.create_lifetime_policy(&org_info, &name, &input).await)
 }}
 
 
@@ -279,23 +279,23 @@ name_handler! { describe_lifetime_policy(org_info: OrgInfo, name: String) -> Gen
 
 
 body_handler_org_info! { speedboat_commit(org_info: OrgInfo, input: SpeedboatCommit) -> GenericResponse {
-    handle_result_none(SERVICE_IMPL.speedboat_commit(&org_info, &input).await)
+    handle_result(SERVICE_IMPL.speedboat_commit(&org_info, &input).await)
 }}
 
 body_with_name_handler! { iceberg_commit(org_info: OrgInfo, name: String, input: IcebergCommit) -> GenericResponse {
-    handle_result_none(SERVICE_IMPL.iceberg_commit(&org_info, &name, &input).await)
+    handle_result(SERVICE_IMPL.iceberg_commit(&org_info, &name, &input).await)
 }}
 
 body_with_name_handler! { extension_commit(org_info: OrgInfo, name: String, input: ExtensionCommit) -> GenericResponse {
-    handle_result_none(SERVICE_IMPL.extension_commit(&org_info, &name, &input).await)
+    handle_result(SERVICE_IMPL.extension_commit(&org_info, &name, &input).await)
 }}
 
 body_with_name_handler! { compaction_commit(org_info: OrgInfo, name: String, input: CompactionCommit) -> GenericResponse {
-    handle_result_none(SERVICE_IMPL.compaction_commit(&org_info, &name, &input).await)
+    handle_result(SERVICE_IMPL.compaction_commit(&org_info, &name, &input).await)
 }}
 
 body_handler_org_info! { cleanup_commit(org_info: OrgInfo, input: CleanupCommit) -> GenericResponse {
-    handle_result_none(SERVICE_IMPL.cleanup_commit(&org_info, &input).await)
+    handle_result(SERVICE_IMPL.cleanup_commit(&org_info, &input).await)
 }}
 
 

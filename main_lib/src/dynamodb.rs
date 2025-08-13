@@ -279,12 +279,9 @@ macro_rules! powdrr_named_entity_core {
                 }
 
 
-                async fn [< private_create_ $entity_name >](&self, org_id: &String, name: &String, template: &$type_name) -> Result<(), Error> {
-                    self.[< private_create_ $entity_name _core >](TransactWrite::new(), org_id, name, template)
-                        .execute(self)
-                        .await?;
-
-                    Ok(())
+                async fn [< private_create_ $entity_name >](&self, org_id: &String, name: &String, template: &$type_name) -> Result<bool, Error> {
+                    let transaction = self.[< private_create_ $entity_name _core >](TransactWrite::new(), org_id, name, template);
+                    self.commit_conditional_transaction(transaction).await
                 }
 
                 async fn [< private_describe_ $entity_name >](&self, org_id: &String, name: &String) -> Result<Option<$type_name>, Error> {
@@ -299,11 +296,9 @@ macro_rules! powdrr_named_entity_core {
                     transaction.operation([< PowdrrNamed $type_name >]::delete(OrgIdNameInput{ org_id: org_id, name: name }))
                 }
 
-                async fn [< private_delete_ $entity_name >](&self, org_id: &String, name: &String) -> Result<(), Error> {
-                    self.[< private_delete_ $entity_name _core >](TransactWrite::new(), org_id, name)
-                        .execute(self)
-                        .await?;
-                    Ok(())
+                async fn [< private_delete_ $entity_name >](&self, org_id: &String, name: &String) -> Result<bool, Error> {
+                    let transaction = self.[< private_delete_ $entity_name _core >](TransactWrite::new(), org_id, name);
+                    self.commit_conditional_transaction(transaction).await
                 }
             }
         }
@@ -316,7 +311,7 @@ macro_rules! powdrr_named_entity {
         paste::item! {
             #[allow(dead_code)]
             impl DynamoDbConnector {
-                pub async fn [< create_ $entity_name >](&self, org_id: &String, name: &String, template: &$type_name) -> Result<(), Error> {
+                pub async fn [< create_ $entity_name >](&self, org_id: &String, name: &String, template: &$type_name) -> Result<bool, Error> {
                     self.[< private_create_ $entity_name >](org_id, name, template).await
                 }
 
@@ -324,7 +319,7 @@ macro_rules! powdrr_named_entity {
                     self.[< private_describe_ $entity_name >](org_id, name).await
                 }
 
-                pub async fn [< delete_ $entity_name >](&self, org_id: &String, name: &String) -> Result<(), Error> {
+                pub async fn [< delete_ $entity_name >](&self, org_id: &String, name: &String) -> Result<bool, Error> {
                     self.[< private_delete_ $entity_name >](org_id, name).await
                 }
             }
@@ -338,7 +333,7 @@ macro_rules! powdrr_named_cached_entity {
         paste::item! {
             #[allow(dead_code)]
             impl DynamoDbConnector {
-                pub async fn [< create_ $entity_name >](&self, cache: &mut [< PowdrrNamed $type_name Cache >], org_id: &String, name: &String, template: &$type_name) -> Result<(), Error> {
+                pub async fn [< create_ $entity_name >](&self, cache: &mut [< PowdrrNamed $type_name Cache >], org_id: &String, name: &String, template: &$type_name) -> Result<bool, Error> {
                     self.[< cached_create_ $entity_name >](cache, org_id, name, template).await
                 }
 
@@ -346,7 +341,7 @@ macro_rules! powdrr_named_cached_entity {
                     self.[< cached_describe_ $entity_name >](cache, org_id, name).await
                 }
 
-                pub async fn [< delete_ $entity_name >](&self, cache: &mut [< PowdrrNamed $type_name Cache >], org_id: &String, name: &String) -> Result<(), Error> {
+                pub async fn [< delete_ $entity_name >](&self, cache: &mut [< PowdrrNamed $type_name Cache >], org_id: &String, name: &String) -> Result<bool, Error> {
                     self.[< cached_delete_ $entity_name >](cache, org_id, name).await
                 }
             }
@@ -377,9 +372,9 @@ macro_rules! powdrr_named_cached_entity_core {
                     self.[< private_create_ $entity_name _core >](transaction, org_id, name, template)
                 }
 
-                async fn [< cached_create_ $entity_name >](&self, cache: &mut [< PowdrrNamed $type_name Cache >], org_id: &String, name: &String, template: &$type_name) -> Result<(), Error> {
-                    self.[< cached_create_ $entity_name _core >](TransactWrite::new(), cache, org_id, name, template).execute(self).await?;
-                    Ok(())
+                async fn [< cached_create_ $entity_name >](&self, cache: &mut [< PowdrrNamed $type_name Cache >], org_id: &String, name: &String, template: &$type_name) -> Result<bool, Error> {
+                    let transaction = self.[< cached_create_ $entity_name _core >](TransactWrite::new(), cache, org_id, name, template);
+                    self.commit_conditional_transaction(transaction).await
                 }
 
                 async fn [< cached_describe_ $entity_name >](&self, cache: &mut [< PowdrrNamed $type_name Cache >], org_id: &String, name: &String) -> Result<Option<$type_name>, Error> {
@@ -399,7 +394,7 @@ macro_rules! powdrr_named_cached_entity_core {
                     }
                 }
 
-                async fn [< cached_delete_ $entity_name >](&self, cache: &mut [< PowdrrNamed $type_name Cache >], org_id: &String, name: &String) -> Result<(), Error> {
+                async fn [< cached_delete_ $entity_name >](&self, cache: &mut [< PowdrrNamed $type_name Cache >], org_id: &String, name: &String) -> Result<bool, Error> {
                     cache.cache.remove(&CacheKey{ org_id: org_id.clone(), name: name.clone() });
                     self.[< private_delete_ $entity_name >](org_id, name).await
                 }
