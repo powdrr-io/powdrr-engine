@@ -8,8 +8,8 @@ arrow-array = "55.2.0"
 arrow-json = "55.2.0"
 arrow-schema = "55.2.0"
 futures = "0.3.31"
-iceberg = { path = "../../iceberg-rust/crates/iceberg" }
-iceberg-catalog-rest = { path = "../../iceberg-rust/crates/catalog/rest" }
+iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "145afdf4b553e0f1b79d27b6cbf9b3af04f87e4e" }
+iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "145afdf4b553e0f1b79d27b6cbf9b3af04f87e4e" }
 # iceberg = "0.6.0"
 # iceberg-catalog-rest = "0.6.0"
 idgenerator = "2.0.0"
