@@ -20,7 +20,11 @@ pub enum StateMode {
     Testing,
     Ephemeral,
     TestingDynamoDb(Option<String>),
-    Leaderless(String, String, String)
+    Leaderless {
+        server_address: String,
+        access_key: String,
+        secret_key: String
+    }
 }
 
 impl StateMode {
@@ -30,6 +34,13 @@ impl StateMode {
             _ => false
         }
     }
+}
+
+
+#[derive(Serialize, Deserialize, Clone)]
+pub enum CacheMode {
+    Redis(Option<String>),
+    Native,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -93,6 +104,7 @@ impl PrefetchMode {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TestProcessingMode {
     pub state_mode: StateMode,
+    pub cache_mode: CacheMode,
     pub indexing_mode: IndexingMode,
     pub compaction_mode: CompactionMode,
     pub prefetch_mode: PrefetchMode,
@@ -102,6 +114,7 @@ impl TestProcessingMode {
     pub fn default() -> Self {
         Self {
             state_mode: StateMode::TestingDynamoDb(None),
+            cache_mode: CacheMode::Redis(None),
             indexing_mode: IndexingMode::Sync,
             compaction_mode: CompactionMode::Async(None),
             prefetch_mode: PrefetchMode::Disabled,
@@ -111,6 +124,7 @@ impl TestProcessingMode {
     pub fn dynamo_testing(address: Option<String>) -> Self {
         Self {
             state_mode: StateMode::TestingDynamoDb(address),
+            cache_mode: CacheMode::Redis(None),
             indexing_mode: IndexingMode::Sync,
             compaction_mode: CompactionMode::Async(None),
             prefetch_mode: PrefetchMode::Disabled,

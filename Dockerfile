@@ -8,9 +8,7 @@
 # Create a stage for building the application.
 
 ARG RUST_VERSION=1.89.0
-ARG APP_NAME=monolith
 FROM rust:${RUST_VERSION}-slim-bullseye AS build
-ARG APP_NAME
 
 # RUN rustup target add x86_64-unknown-linux-musl
 RUN apt update && apt install -y libssl-dev pkg-config
@@ -38,19 +36,24 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 
 COPY . .
-#RUN cargo build --target x86_64-unknown-linux-musl --release
-#RUN cargo build --release
+
+ARG TARGET
+
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
     cargo build --release && \
-    mv /app/target/release/powdrr-io-service /app
+    mv /app/target/release/${TARGET} /app
 
 
 FROM rust:${RUST_VERSION}-slim-bullseye
-COPY --from=build /app/powdrr-io-service ./
-CMD [ "./powdrr-io-service" ]
-LABEL service=service
+ARG PORT
+ARG TARGET
+COPY --from=build /app/${TARGET} ./
+ENV TARGET_ENV=$TARGET
+CMD [ "sh", "-c", "./$TARGET_ENV" ]
+
+EXPOSE ${PORT}
 
 
 
