@@ -19,14 +19,14 @@ pub(crate) struct TestCreateIndex {
 pub enum StateMode {
     Testing,
     Ephemeral,
-    TestingDynamoDb,
+    TestingDynamoDb(Option<String>),
     Leaderless(String, String, String)
 }
 
 impl StateMode {
-    fn is_testing(&self) -> bool {
+    pub fn is_testing(&self) -> bool {
         match self {
-            StateMode::Testing | StateMode::TestingDynamoDb => true,
+            StateMode::Testing | StateMode::TestingDynamoDb(_) => true,
             _ => false
         }
     }
@@ -101,7 +101,16 @@ pub struct TestProcessingMode {
 impl TestProcessingMode {
     pub fn default() -> Self {
         Self {
-            state_mode: StateMode::TestingDynamoDb,
+            state_mode: StateMode::TestingDynamoDb(None),
+            indexing_mode: IndexingMode::Sync,
+            compaction_mode: CompactionMode::Async(None),
+            prefetch_mode: PrefetchMode::Disabled,
+        }
+    }
+
+    pub fn dynamo_testing(address: Option<String>) -> Self {
+        Self {
+            state_mode: StateMode::TestingDynamoDb(address),
             indexing_mode: IndexingMode::Sync,
             compaction_mode: CompactionMode::Async(None),
             prefetch_mode: PrefetchMode::Disabled,

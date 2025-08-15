@@ -4,6 +4,13 @@ volumes:
     driver: local
 
 services:
+  powdrr-service:
+    image: service:latest
+    ports:
+      - "7784:7784"
+    networks:
+      iceberg_net:
+
   redis:
     image: redis:latest
     ports:

@@ -9,7 +9,7 @@ use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
 use crate::state_provider::ServiceApiError;
 use crate::dynamodb::{DynamoDbConnector, PowdrrNamedCleanupWorkItemCache, PowdrrNamedCompactionCommitCache, PowdrrNamedCompactionWorkItemCache, PowdrrNamedExtensionCommitCache, PowdrrNamedExtensionWorkItemCache, PowdrrNamedIcebergCommitCache, PowdrrNamedOrgInfoCache, PowdrrNamedSpeedboatCommitCache, PowdrrNamedTableMetadataCheckpointCache, TableBody};
-use crate::test_api::TestProcessingMode;
+use crate::test_api::{StateMode, TestProcessingMode};
 
 
 const LEASE_LENGTH_MS: i64 = 60 * 1000; // 1 minute
@@ -47,15 +47,21 @@ impl DynamoDBServiceImpl {
     }
 
     pub async fn test(mode: TestProcessingMode) -> Self {
+        assert!(mode.state_mode.is_testing());
+        let address_option = match &mode.state_mode {
+            StateMode::TestingDynamoDb(address) => address,
+            _ => panic!("Invalid state mode for testing")
+        };
+        let address = address_option.as_ref().unwrap_or(&"http://localhost:4566".to_owned()).clone();
+        tracing::info!("Testing with DynamoDB at {}", address);
         let config = aws_config::defaults(BehaviorVersion::latest())
             .region(Region::new("us-east-1")) // Region doesn't matter for local, but required
-            .endpoint_url("http://localhost:4566")
+            .endpoint_url(address)
             .credentials_provider(aws_credential_types::Credentials::new(
                 "test", "test", None, None, "static",
             ))
             .load()
             .await;
-
 
         let client = Client::new(&config);
         let impl_obj = Self::with_client(client, mode);

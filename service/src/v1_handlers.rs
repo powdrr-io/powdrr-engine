@@ -163,7 +163,7 @@ macro_rules! name_handler {
     };
 }
 
-
+#[allow(dead_code)]
 fn handle_result_none(value: Result<(), ServiceImplError>) -> GenericResponse {
     match value {
         Ok(_) => {
