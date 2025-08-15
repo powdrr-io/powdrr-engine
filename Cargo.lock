@@ -4787,6 +4787,7 @@ dependencies = [
  "iceberg",
  "iceberg-catalog-rest",
  "idgenerator",
+ "lazy_static",
  "liquid-cache-parquet",
  "lru-mem",
  "minijinja",

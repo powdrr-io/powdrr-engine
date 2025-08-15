@@ -1,6 +1,7 @@
 use std::{error::Error, fmt::Display};
-
+use std::sync::Mutex;
 use redis::{Commands, FromRedisValue, ToRedisArgs};
+use lazy_static::lazy_static;
 
 #[derive(Debug)]
 pub(crate) struct CacheError {}
@@ -14,11 +15,22 @@ impl Display for CacheError {
 impl Error for CacheError {}
 
 
-const REDIS_URL: &str = "redis://127.0.0.1:6379/";
+const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379/";
+
+lazy_static! {
+    static ref REDIS_ADDRESS: Mutex<String> = Mutex::new(DEFAULT_REDIS_URL.to_string());
+}
+
+
+pub fn set_redis_address(address: &Option<String>) -> () {
+    let mut my_lock = REDIS_ADDRESS.lock().unwrap();
+    *my_lock = address.as_ref().map_or_else(|| DEFAULT_REDIS_URL.to_string(), |s| s.clone());
+}
 
 
 fn get_connection() -> Result<redis::Connection, CacheError> {
-    let client = match redis::Client::open(REDIS_URL) {
+    let redis_address = REDIS_ADDRESS.lock().unwrap();
+    let client = match redis::Client::open(redis_address.clone()) {
         Ok(c) => c,
         Err(_) => return Err(CacheError { }),
     };

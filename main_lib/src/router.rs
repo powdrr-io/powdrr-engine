@@ -319,7 +319,7 @@ pub(crate) mod tests {
     use crate::router::router;
     use crate::schema_massager::{extract_powdrr_schema_str, PowdrrDataType, PowdrrField, PowdrrSchema};
     use crate::data_contract::{FileSetPayload, IcebergMetadata, SpeedboatMetadata, TableMetadataCheckpoint};
-    use crate::test_api::{CompactionMode, IndexingMode, PrefetchMode, StateMode, TestProcessingMode};
+    use crate::test_api::{CacheMode, CompactionMode, IndexingMode, PrefetchMode, StateMode, TestProcessingMode};
 
     pub(crate) static TEST_SERVER: LazyLock<TestServer> = LazyLock::new(|| TestServer::with_timeout(router(true), 1000).unwrap());
 
@@ -1006,6 +1006,7 @@ pub(crate) mod tests {
 
         let mode = TestProcessingMode {
             state_mode: StateMode::Testing,
+            cache_mode: CacheMode::Redis(None),
             indexing_mode: IndexingMode::Async,
             compaction_mode: CompactionMode::Async(Some(1)),
             prefetch_mode: PrefetchMode::Disabled,

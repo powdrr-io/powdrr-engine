@@ -5,9 +5,16 @@ volumes:
 
 services:
   powdrr-service:
-    image: service:latest
+    image: powdrr/service:latest
     ports:
       - "7784:7784"
+    networks:
+      iceberg_net:
+
+  powdrr-engine:
+    image: powdrr/engine:latest
+    ports:
+      - "9200:9200"
     networks:
       iceberg_net:
 

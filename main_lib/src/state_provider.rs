@@ -3,13 +3,14 @@ use std::fmt::{Display, Formatter};
 use tokio::sync::{mpsc, oneshot};
 use crate::{distributed_cache, peers::CheckpointDescriptor, pipeline::PipelineDefinition};
 use crate::data_contract::{CleanupCommit, CleanupWorkItem, CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
+use crate::distributed_cache::set_redis_address;
 use crate::dynamodb_state_provider::DynamoDbStateProvider;
 use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::ephemeral_state_provider::EphemeralStateProvider;
 use crate::leaderless_state_provider::LeaderlessStateProvider;
 use crate::peers::PeerClient;
-use crate::test_api::{CompactionMode, IndexingMode, StateMode, TestProcessingMode};
+use crate::test_api::{CacheMode, CompactionMode, IndexingMode, StateMode, TestProcessingMode};
 
 
 #[derive(Debug, Clone)]
@@ -233,6 +234,14 @@ impl StateProviderActor {
     async fn handle_message(&mut self, msg: StateProviderActorMessage) -> () {
         match msg {
             StateProviderActorMessage::SetMode { respond_to, mode } => {
+                match &mode.cache_mode {
+                    CacheMode::Redis(address) => {
+                        set_redis_address(address);
+                    },
+                    CacheMode::Native => {
+                        panic!("Native cache mode is not supported");
+                    }
+                }
                 match &mode.state_mode {
                     StateMode::Testing => self.state_provider = StateProvider::Ephemeral(EphemeralStateProvider::new(mode)),
                     StateMode::Ephemeral => self.state_provider = StateProvider::Ephemeral(EphemeralStateProvider::new(mode)),
@@ -240,11 +249,11 @@ impl StateProviderActor {
                         let provider = DynamoDbStateProvider::test(mode).await;
                         self.state_provider = StateProvider::DynamoDb(provider);
                     },
-                    StateMode::Leaderless(address, access_key, secret_key) => {
+                    StateMode::Leaderless { server_address, access_key, secret_key} => {
                         self.state_provider = StateProvider::Leaderless(
                             LeaderlessStateProvider::new(
                                 mode.clone(),
-                                address.clone(),
+                                server_address.clone(),
                                 access_key.clone(),
                                 secret_key.clone()
                             ))

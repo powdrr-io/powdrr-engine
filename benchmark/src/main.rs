@@ -7,7 +7,7 @@ use rand::TryRngCore;
 use rand::rngs::OsRng;
 use powdrr_lib::compaction;
 use powdrr_lib::data_contract::{ServiceImplType, ServiceMode, TEST_ACCESS_KEY, TEST_SECRET_KEY};
-use powdrr_lib::test_api::{CompactionMode, IndexingMode, PrefetchMode, TestProcessingMode, StateMode};
+use powdrr_lib::test_api::{CompactionMode, IndexingMode, PrefetchMode, TestProcessingMode, StateMode, CacheMode};
 
 const LINE_LIMIT: u64 = 1000000;
 
@@ -246,7 +246,12 @@ async fn main() -> Result<(), std::io::Error> {
     };
     */
     let main_mode = TestProcessingMode {
-        state_mode: StateMode::Leaderless("http://localhost:7784".to_string(), TEST_ACCESS_KEY.parse().unwrap(), TEST_SECRET_KEY.parse().unwrap()),
+        state_mode: StateMode::Leaderless {
+            server_address: "http://powdrr-service:7784".to_string(),
+            access_key: TEST_ACCESS_KEY.to_string(),
+            secret_key: TEST_SECRET_KEY.to_string()
+        },
+        cache_mode: CacheMode::Redis(Some("redis://redis:6379".to_string())),
         indexing_mode: IndexingMode::Disabled,
         compaction_mode: CompactionMode::Async(None),
         prefetch_mode: PrefetchMode::Enabled,
