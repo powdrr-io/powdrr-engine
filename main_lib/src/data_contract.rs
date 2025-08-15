@@ -699,8 +699,8 @@ pub struct CreateIndexTemplateBody {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ServiceImplType {
     Ephemeral,
-    DynamoDb,
-    TestingDynamoDb,
+    DynamoDb(Option<String>),
+    TestingDynamoDb(Option<String>),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -712,13 +712,15 @@ pub struct ServiceMode {
 impl ServiceMode {
     pub fn test() -> Self {
         ServiceMode {
-            impl_type: ServiceImplType::TestingDynamoDb,
+            impl_type: ServiceImplType::TestingDynamoDb(None),
         }
     }
 
     pub fn as_testing_mode(&self) -> TestProcessingMode {
-        // TODO: does this need to be configurable?
-        TestProcessingMode::default()
+        match &self.impl_type {
+            ServiceImplType::TestingDynamoDb(address) => TestProcessingMode::dynamo_testing(address.clone()),
+            _ => TestProcessingMode::default()
+        }
     }
 }
 

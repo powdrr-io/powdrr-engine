@@ -226,7 +226,7 @@ async fn main() -> Result<(), std::io::Error> {
     let client = reqwest::Client::new();
 
     let coordinator_mode = ServiceMode {
-        impl_type: ServiceImplType::TestingDynamoDb
+        impl_type: ServiceImplType::TestingDynamoDb(Some("http://localstack:4566".to_string()))
     };
 
     let _res = match client.put("http://localhost:7784/_test/v1/_set_mode")

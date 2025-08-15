@@ -11,35 +11,47 @@ ARG RUST_VERSION=1.89.0
 ARG APP_NAME=monolith
 FROM rust:${RUST_VERSION}-slim-bullseye AS build
 ARG APP_NAME
-WORKDIR /app
 
 # RUN rustup target add x86_64-unknown-linux-musl
-RUN apt update && apt install -y musl-tools musl-dev libssl-dev pkg-config
+RUN apt update && apt install -y libssl-dev pkg-config
 RUN update-ca-certificates
 
+COPY Cargo.toml Cargo.lock /app/
+
+RUN cargo new /app/benchmark
+COPY benchmark/Cargo.toml /app/benchmark/
+RUN cargo new /app/cli
+COPY cli/Cargo.toml /app/cli/
+RUN cargo new /app/engine
+COPY engine/Cargo.toml /app/engine/
+RUN cargo new /app/service
+COPY service/Cargo.toml /app/service/
+
+RUN cargo new --lib /app/main_lib
+COPY main_lib/Cargo.toml /app/main_lib/
+
+WORKDIR /app
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo build --release
 
 
-# Build the application.
-# Leverage a cache mount to /usr/local/cargo/registry/
-# for downloaded dependencies and a cache mount to /app/target/ for
-# compiled dependencies which will speed up subsequent builds.
-# Leverage a bind mount to the src directory to avoid having to copy the
-# source code into the container. Once built, copy the executable to an
-# output directory before the cache mounted /app/target is unmounted.
-#RUN --mount=type=bind,source=service/src,target=app/service/src \
-#    --mount=type=bind,source=service/Cargo.toml,target=app/service/Cargo.toml \
-#    --mount=type=bind,source=benchmark/src,target=app/benchmark/src \
-#    --mount=type=bind,source=benchmark/Cargo.toml,target=app/benchmark/Cargo.toml \
-#    --mount=type=bind,source=cli/src,target=cli/src \
-#    --mount=type=bind,source=cli/Cargo.toml,target=cli/Cargo.toml \
-#    --mount=type=bind,source=engine/src,target=engine/src \
-#    --mount=type=bind,source=engine/Cargo.toml,target=engine/Cargo.toml \
-#    --mount=type=bind,source=main_lib/src,target=main_lib/src \
-#    --mount=type=bind,source=main_lib/Cargo.toml,target=main_lib/Cargo.toml \
-#    --mount=type=bind,source=Cargo.toml,target=Cargo.toml \
-#    --mount=type=bind,source=Cargo.lock,target=Cargo.lock \
-#    --mount=type=cache,target=/app/build/target/ \
-#    --mount=type=cache,target=/usr/local/cargo/registry/ \
-#    <<EOF
 COPY . .
-RUN cargo build
+#RUN cargo build --target x86_64-unknown-linux-musl --release
+#RUN cargo build --release
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --release && \
+    mv /app/target/release/powdrr-io-service /app
+
+
+FROM rust:${RUST_VERSION}-slim-bullseye
+COPY --from=build /app/powdrr-io-service ./
+CMD [ "./powdrr-io-service" ]
+LABEL service=service
+
+
+
+

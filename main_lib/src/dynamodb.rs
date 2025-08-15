@@ -588,7 +588,7 @@ impl EntityVersionInfo {
         }
     }
 
-    pub fn get_query(&self) -> OrgIdNameInput {
+    pub fn get_query(&self) -> OrgIdNameInput<'_> {
         OrgIdNameInput {
             name: &self.key,
             org_id: &self.org_id,

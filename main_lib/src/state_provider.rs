@@ -236,7 +236,7 @@ impl StateProviderActor {
                 match &mode.state_mode {
                     StateMode::Testing => self.state_provider = StateProvider::Ephemeral(EphemeralStateProvider::new(mode)),
                     StateMode::Ephemeral => self.state_provider = StateProvider::Ephemeral(EphemeralStateProvider::new(mode)),
-                    StateMode::TestingDynamoDb => {
+                    StateMode::TestingDynamoDb(_) => {
                         let provider = DynamoDbStateProvider::test(mode).await;
                         self.state_provider = StateProvider::DynamoDb(provider);
                     },

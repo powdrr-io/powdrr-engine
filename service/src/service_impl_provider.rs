@@ -207,8 +207,8 @@ impl ServiceImplProviderActor {
             ServiceImplProviderActorMessage::SetMode { respond_to, mode } => {
                 self.service_impl = match mode.impl_type {
                     ServiceImplType::Ephemeral => ServiceImpl::Ephemeral(EphemeralServiceImpl::new(mode.as_testing_mode())),
-                    ServiceImplType::DynamoDb => ServiceImpl::DynamoDb(DynamoDBServiceImpl::new(mode.as_testing_mode())),
-                    ServiceImplType::TestingDynamoDb => {
+                    ServiceImplType::DynamoDb(_) => ServiceImpl::DynamoDb(DynamoDBServiceImpl::new(mode.as_testing_mode())),
+                    ServiceImplType::TestingDynamoDb(_) => {
                         let mut service_impl = DynamoDBServiceImpl::test(mode.as_testing_mode()).await;
                         service_impl.create_org(&OrgSettings {
                             org_id: "fake_test_org".to_string(),
