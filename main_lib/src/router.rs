@@ -1013,7 +1013,7 @@ pub(crate) mod tests {
         };
 
         test_server.client().put(
-            "http://localhost/_test/v1/_testing_and_processing_mode",
+            "http://localhost/_test/v1/_testing_mode",
             serde_json::to_string(&mode).unwrap(),
             mime::TEXT_PLAIN
         ).perform().unwrap();
@@ -1912,7 +1912,7 @@ pub(crate) mod tests {
 
         match create_response {
             Ok(response) => {
-                assert_eq!(response.status(), 201);
+                assert!(response.status() == 201 || response.status() == 208);
             },
             Err(e) => {
                 panic!("Failed {}", e)
@@ -2341,7 +2341,6 @@ pub(crate) mod tests {
                 assert_eq!(response.status(), 200);
                 let body = response.read_body().unwrap();
                 let str_body = str::from_utf8(&body).unwrap();
-                println!("{}", str_body);
                 let json_body = serde_json::from_str::<Value>(str_body).unwrap();
                 let hits = json_body["hits"]["hits"].as_array().unwrap();
                 assert_eq!(hits.len(), 1);

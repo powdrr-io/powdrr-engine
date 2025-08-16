@@ -410,7 +410,7 @@ pub fn test_v1_process_work(mut state: State) -> Pin<Box<HandlerFuture>> {
             Ok(vb) => {
                 let body_content = String::from_utf8(vb.to_vec()).unwrap();
                 if body_content.len() == 0 {
-                    -1
+                    0
                 } else {
                     body_content.parse::<i64>().unwrap()
                 }
@@ -433,7 +433,7 @@ pub fn test_v1_process_work(mut state: State) -> Pin<Box<HandlerFuture>> {
             let num_deletes = do_next_cleanup().await;
             work_done = work_done | (num_deletes > 0);
             if !work_done {
-                break
+                break;
             }
         }
 

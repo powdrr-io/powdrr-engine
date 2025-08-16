@@ -4772,6 +4772,7 @@ name = "powdrr_lib"
 version = "0.0.1"
 dependencies = [
  "arrow-flight",
+ "arrow-ipc",
  "arrow-json",
  "async-trait",
  "aws-config",

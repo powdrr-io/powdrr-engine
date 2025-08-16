@@ -11,14 +11,14 @@ use liquid_cache_parquet::cache::policies::DiscardPolicy;
 use liquid_cache_parquet::common::LiquidCacheMode;
 use liquid_cache_parquet::LiquidCacheInProcessBuilder;
 use lru_mem::{HeapSize, LruCache, TryInsertError};
-use object_store::{aws::{AmazonS3, AmazonS3Builder}, ObjectStore};
+use object_store::{aws::{AmazonS3, AmazonS3Builder}, ObjectStore, PutPayload};
 use object_store::client::SpawnedReqwestConnector;
 use tempfile::TempDir;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinSet;
 use url::Url;
-use crate::elastic_search_ingest::JSON_MODE;
+use crate::elastic_search_ingest::{JSON_MODE};
 use crate::util::log_err;
 
 
@@ -136,6 +136,7 @@ fn create_store() -> Arc<AmazonS3> {
     Arc::new(s3_file_system)
 }
 
+const S3_BASE_PATH: &str = "s3://warehouse";
 static S3_FILE_STORE: std::sync::LazyLock<Arc<AmazonS3>> = std::sync::LazyLock::new(|| create_store());
 
 
@@ -162,7 +163,7 @@ fn create_session() -> SessionContext {
 
     //let ctx = SessionContext::new_with_config(config);
 
-    let s3_url = Url::parse("s3://warehouse").unwrap();
+    let s3_url = Url::parse(S3_BASE_PATH).unwrap();
 
     ctx.register_object_store(&s3_url, S3_FILE_STORE.clone());
 
@@ -567,13 +568,10 @@ async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> 
             match DATA_FUSION_CONTEXT.sql(&query_str).await {
                 Err(_e) => {
                     let _ = DATA_FUSION_CONTEXT.sql(format!("DROP TABLE IF EXISTS {local_name_var};").as_str()).await;
-                    LRU_CACHE_HANDLE.table_dropped(local_name_var).await;
                 },
                 _ => return Ok(())
             }
         }
-
-
     } else {
         let result = DATA_FUSION_CONTEXT.register_parquet(local_name, file_path, ParquetReadOptions::new()).await;
         match result {
@@ -599,6 +597,7 @@ async fn load_json_file_as_table(file_path_without_suffix: &String, local_name: 
         },
         Err(e) => return log_err(e),
     };
+
     let ends_with_json = file_path_without_suffix.ends_with(".json");
     if JSON_MODE || ends_with_json {
         let file_path = if ends_with_json {
@@ -798,10 +797,30 @@ pub(crate) async fn print_datafusion_tables() -> () {
 
 pub(crate) async fn delete_s3_files(file_paths: &Vec<String>) -> () {
     for file_path in file_paths {
-        let path = object_store::path::Path::parse(file_path).unwrap();
+        assert!(file_path.starts_with(S3_BASE_PATH));
+        let final_file_path = file_path.replace(S3_BASE_PATH, "");
+        let path = object_store::path::Path::from_url_path(&final_file_path).unwrap();
         match S3_FILE_STORE.as_ref().delete(&path).await {
             Ok(_) => (),
             Err(e) => panic!("Failed to delete file {}: {}", file_path, e)
         }
     }
+}
+
+pub(crate) async fn put_s3_file(file_path: &String, file_contents: &Vec<u8>) -> Result<(), DataFusionError> {
+    assert!(file_path.starts_with(S3_BASE_PATH));
+    let path_str = file_path.replace(S3_BASE_PATH, "");
+    let path = match object_store::path::Path::from_url_path(path_str) {
+        Ok(p) => p,
+        Err(e) => return log_err(DataFusionError::ObjectStore(e.into()))
+    };
+    let payload = PutPayload::from_bytes(file_contents.to_vec().into());
+    match S3_FILE_STORE.as_ref().put(&path, payload).await {
+        Ok(_) => Ok(()),
+        Err(e) => log_err(DataFusionError::ObjectStore(e.into()))
+    }
+}
+
+pub(crate) fn s3_base_path() -> String {
+    format!("{}/default/ingest", S3_BASE_PATH)
 }
