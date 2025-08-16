@@ -145,7 +145,15 @@ impl PowdrrSchema {
         }
     }
 
-    pub fn from_iceberg(iceberg_schema: &Arc<iceberg::spec::Schema>) -> Self {
+    pub fn from_iceberg(table_iceberg_schema: &Arc<iceberg::spec::Schema>, file_iceberg_schema: &Arc<iceberg::spec::Schema>) -> Self {
+        if file_iceberg_schema.as_struct().fields().len() == 0 {
+            Self::convert_from_iceberg(table_iceberg_schema)
+        } else {
+            Self::convert_from_iceberg(file_iceberg_schema)
+        }
+    }
+
+    fn convert_from_iceberg(iceberg_schema: &Arc<iceberg::spec::Schema>) -> Self {
         let mut fields = vec!();
         for field in iceberg_schema.as_struct().fields().iter() {
             match *field.field_type.clone() {

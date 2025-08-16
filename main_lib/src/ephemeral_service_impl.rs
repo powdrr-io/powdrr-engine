@@ -179,7 +179,7 @@ impl EphemeralServiceImpl {
             );
         } else {
             let table_work_item = es_work_items.get_mut(table_name).unwrap();
-            table_work_item.table_schema =schema.clone();
+            table_work_item.table_schema = schema.clone();
             table_work_item.speedboat_files = table_work_item.speedboat_files.merge(speedboat_files);
             table_work_item.iceberg_files = table_work_item.iceberg_files.merge(&iceberg_files);
         }

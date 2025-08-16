@@ -11,6 +11,7 @@ edition.workspace = true
 
 [dependencies]
 arrow-flight = "55.1"
+arrow-ipc = "55.1.0"
 arrow-json = "55.1"
 async-trait = "0.1.88"
 aws-config = "1.8.3"
@@ -51,3 +52,4 @@ url = "2.5.4"
 url-escape = "0.1.1"
 uuid-b64 = "0.2.0"
 lazy_static = "1.5.0"
+

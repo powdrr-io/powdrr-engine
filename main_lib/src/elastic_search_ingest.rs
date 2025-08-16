@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashMap, fs::File};
-use std::io::Write;
+use std::io::{Cursor, SeekFrom, Write};
 use datafusion::arrow::ipc::writer::FileWriter;
 use futures::FutureExt;
 use gotham::mime;
@@ -17,7 +17,9 @@ use serde_json::Value;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::{mpsc, oneshot};
 use uuid_b64::UuidB64;
-
+use arrow_ipc::writer::StreamWriter;
+use arrow_json::LineDelimitedWriter;
+use tokio::io::AsyncSeekExt;
 use crate::elastic_search_commands::{df_to_serde_value, LookupById, SerdeValueResult};
 use crate::elastic_search_common::{load_command_raw_result, CommandContext, ElasticSearchResponse, MIME_ES_JSON};
 use crate::elastic_search_responses::{BulkResult, ErrorDetails, OperationResult, Shards, SingleDocCreateFailedResult};
@@ -126,6 +128,40 @@ impl WriteBuffer {
         let len = File::open(file_name).unwrap().metadata().as_ref().map(|m| m.len()).unwrap();
         Ok(len)
     }
+
+    async fn write_to_arrow_s3(&self, s3_path: &String) -> Result<u64, IngestError> {
+        assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
+        assert!(self.schema.is_some(), "Cannot write buffer without schema");
+        let full_s3_path = format!("{}.arrow", s3_path);
+        let arrow_schema = self.schema.as_ref().unwrap().to_arrow_schema();
+        let fields = arrow_schema.fields.as_ref();
+        let record_batch = serde_arrow::to_record_batch(fields, &self.lines).unwrap();
+        let mut buffer = Cursor::new(Vec::new());
+        let mut writer = StreamWriter::try_new(&mut buffer, &record_batch.schema()).unwrap();
+        writer.write(&record_batch).map_err(|e|IngestError{ message: format!("{}", e).to_string() })?;
+        writer.finish().map_err(|e|IngestError{ message: format!("{}", e).to_string() })?;
+        let _ = buffer.seek(SeekFrom::Start(0)).await.map_err(|e|IngestError{ message: format!("{}", e).to_string() })?;
+        data_access::put_s3_file(&full_s3_path, buffer.get_ref()).await.map_err(|e|IngestError{ message: format!("{}", e).to_string() })?;
+        let len = buffer.get_ref().len() as u64;
+        Ok(len)
+    }
+
+    async fn write_to_json_s3(&self, s3_path: &String) -> Result<u64, IngestError> {
+        assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
+        assert!(self.schema.is_some(), "Cannot write buffer without schema");
+        let full_s3_path = format!("{}.json", s3_path);
+        let arrow_schema = self.schema.as_ref().unwrap().to_arrow_schema();
+        let fields = arrow_schema.fields.as_ref();
+        let record_batch = serde_arrow::to_record_batch(fields, &self.lines).unwrap();
+        let mut buf = Vec::new();
+        let mut writer = LineDelimitedWriter::new(&mut buf);
+        writer.write_batches(&[&record_batch]).unwrap();
+        writer.finish().unwrap();
+        data_access::put_s3_file(&full_s3_path, &buf).await.map_err(|e|IngestError{ message: format!("{}", e).to_string() })?;
+        let len = buf.len() as u64;
+        Ok(len)
+    }
+
 
     #[cfg(test)]
     pub(crate) fn as_byte_vec(&self) -> Vec<u8> {
@@ -236,7 +272,7 @@ pub(crate) async fn create_index(table: &String, body: &String) -> Result<Create
         Err(_) => panic!("What happen?")
     };
 
-    STATE_PROVIDER.create_table(&CreateTable{ 
+    STATE_PROVIDER.create_table(&CreateTable{
         name: table.clone(),
         tags: HashMap::from([("_es_original".to_string(), serialized_body)])
     }).await.map_err(|e|IngestError::from_service_api_error(e))?;
@@ -258,7 +294,7 @@ pub(crate) async fn create_index_template(table: &String, body: &String) -> Resu
     };
 
     STATE_PROVIDER.create_table_template(&table, &parsed_body).await.map_err(|e|IngestError::from_service_api_error(e))?;
-    
+
     Ok(CreateIndexResult { index: table.clone(), shards_acknowledged: true, acknowledged: true })
 }
 
@@ -297,7 +333,7 @@ struct AliasRemove {
 struct AliasRemoveBody {
     // TODO: there are many more fields
     index: String,
-    alias: String,    
+    alias: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -336,7 +372,7 @@ pub(crate) async fn update_aliases(body: &String) -> Result<(), IngestError> {
 
 
 pub(crate) fn ingest_create(
-    create: &Create, 
+    create: &Create,
     doc: &Value,
     version: u64,
     status: Option<u32>,
@@ -362,7 +398,7 @@ pub(crate) struct IngestResult {
 
 impl IngestResult {
     fn new() -> Self {
-        IngestResult { 
+        IngestResult {
             tables: HashMap::new(),
             operations: vec!(),
         }
@@ -401,25 +437,31 @@ pub(crate) async fn upsert_single(index: &String, doc_id: &String, payload: &Str
     update_single_worker(index, doc_id, payload).await
 }
 
-pub(crate) fn write_to_file(buffer: &WriteBuffer, index: &String, label: &String) -> Result<(String, u64), IngestError> {
-    // TODO: need real paths into S3
-    let file_path = format!("tests/data/ingest/{}-{}-{}", label, index, IdInstance::next_id().to_string());
-    let write_to_file_result = buffer.write_to_file(&file_path);
-    //tracing::info!("Ingest: op {} on table {} wrote {} records", label, index, buffer.num_records());
+const USE_SPEEDBOAT_S3: bool = true;
 
-    let size = match write_to_file_result {
-        Ok(size) => size,
-        Err(_) => return Err(IngestError{ message: "File error".to_string() })
-    };
+pub(crate) async fn write_to_file(buffer: &WriteBuffer, index: &String, label: &String) -> Result<(String, u64), IngestError> {
+    if USE_SPEEDBOAT_S3 {
+        let s3_path = format!("{}/{}-{}-{}", data_access::s3_base_path(), label, index, IdInstance::next_id().to_string());
+        let size = buffer.write_to_json_s3(&s3_path).await?;
+        Ok((s3_path, size))
+    } else {
+        let file_path = format!("tests/data/ingest/{}-{}-{}", label, index, IdInstance::next_id().to_string());
+        let write_to_file_result = buffer.write_to_file(&file_path);
+        //tracing::info!("Ingest: op {} on table {} wrote {} records", label, index, buffer.num_records());
 
-    Ok((file_path, size))
+        let size = match write_to_file_result {
+            Ok(size) => size,
+            Err(_) => return Err(IngestError { message: "File error".to_string() })
+        };
+        Ok((file_path, size))
+    }
 }
 
 
 pub(crate) async fn commit_speedboat(table: &String, inserts_and_updates: &WriteBuffer, deletes: &WriteBuffer, compaction: Option<String>, commit_type: &String) -> Result<(), IngestError> {
     let mut table_infos = vec!();
     if inserts_and_updates.lines.len() != 0 {
-        let (insert_update_path, size) = write_to_file(inserts_and_updates, table, commit_type)?;
+        let (insert_update_path, size) = write_to_file(inserts_and_updates, table, commit_type).await?;
         table_infos.push(SpeedboatCommitTableInfo {
             commit_type: commit_type.clone(),
             table_name: table.clone(),
@@ -429,7 +471,7 @@ pub(crate) async fn commit_speedboat(table: &String, inserts_and_updates: &Write
         });
     }
     if deletes.lines.len() != 0 {
-        let (deletes_path, size) = write_to_file(deletes, table, &"delete".to_string())?;
+        let (deletes_path, size) = write_to_file(deletes, table, &"delete".to_string()).await?;
         table_infos.push(SpeedboatCommitTableInfo {
             commit_type: "delete".to_string(),
             table_name: table.clone(),
@@ -479,7 +521,7 @@ async fn create_single_worker(index: &String, doc_id: &String, payload: &String)
     match doc {
         Ok(valid_doc) => {
             let docs = get_existing_docs(&table_description.name, &vec!(doc_id.to_string())).await?;
-            
+
             if docs.values.len() != 0 {
                 // TODO: get version from existing doc
                 let response = SingleDocCreateFailedResult {
@@ -680,7 +722,7 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
                                     Some(pi) => pi,
                                     None => return Err(IngestError{ message: "Must provide index name".to_string() }),
                                 }
-                            }                               
+                            }
                         };
                         let table_description = match describe_table_log_error_then_none(&index).await {
                             Some(t) => t,
@@ -688,7 +730,7 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
                         };
                         let doc_str = match iterator.next() {
                             Some(ds) => ds.trim(),
-                            None => panic!("How do I make my own error? This should return an error instead of panic")                            
+                            None => panic!("How do I make my own error? This should return an error instead of panic")
                         };
                         let doc: Result<Value, serde_json::Error>  = serde_json::from_str(doc_str);
                         match doc {
@@ -819,7 +861,7 @@ impl IngestActor {
         let buffer_items = ingest(table, &payload).await;
         match buffer_items {
             Ok(bi) => {
-                let request = IngestRequest { 
+                let request = IngestRequest {
                     response: bi.operations,
                     respond_to: Some(respond_to)
                 };
@@ -829,7 +871,7 @@ impl IngestActor {
             Err(e) => {
                 let _ = respond_to.send(Err(e));
             }
-        };        
+        };
     }
 
     async fn handle_message(&mut self, msg: IngestActorMessage) -> () {
@@ -839,7 +881,7 @@ impl IngestActor {
             },
             IngestActorMessage::Ingest { payload, respond_to } => {
                 self.do_ingest(None, &payload, respond_to).await
-            },            
+            },
             IngestActorMessage::Commit { respond_to } => {
                 let _ = self.commit().await;
                 let _ = respond_to.send(());
@@ -894,7 +936,7 @@ impl IngestHandle {
 
     pub async fn send(&self, payload: &String) -> Result<BulkResult, IngestError> {
         let (send, recv) = oneshot::channel();
-        let msg = IngestActorMessage::Ingest { 
+        let msg = IngestActorMessage::Ingest {
             payload: payload.clone(),
             respond_to: send
         };
@@ -904,13 +946,13 @@ impl IngestHandle {
             Ok(r) => r,
             Err(_) => panic!("RecvError")
         }
-    }    
+    }
 
     #[allow(dead_code)]
     pub async fn send_single_table(&self, table: &String, payload: &String) -> Result<BulkResult, IngestError> {
         let (send, recv) = oneshot::channel();
-        let msg = IngestActorMessage::IngestSingleTable { 
-            table: table.clone(), 
+        let msg = IngestActorMessage::IngestSingleTable {
+            table: table.clone(),
             payload: payload.clone(),
             respond_to: send
         };
@@ -924,13 +966,13 @@ impl IngestHandle {
 
     pub async fn commit(&self) -> Result<(), RecvError> {
         let (send, recv) = oneshot::channel();
-        let msg = IngestActorMessage::Commit { 
+        let msg = IngestActorMessage::Commit {
             respond_to: send
         };
 
         let _ = self.sender.send(msg).await;
         recv.await
-    }    
+    }
 }
 
 
@@ -984,8 +1026,8 @@ mod tests {
                 }
             },
             _ => panic!("This should be a create"),
-        }        
-        
+        }
+
     }
 
     #[test]
@@ -999,7 +1041,7 @@ mod tests {
             _ => panic!("This should be a create"),
         }
     }
-   
+
     #[test]
     fn test_create_index_deser() {
         let mini_test_val = r#"{        "migrationVersion": {
@@ -1171,7 +1213,7 @@ mod tests {
         let index = deser.get(".kibana_task_manager_8.7.1_001").unwrap().clone();
         assert_eq!(index.aliases.map_or_else(|| 0, |x| x.len()), 2);
 
-/* 
+/*
         let file_content = match read_to_string("main_lib/tests/data/example_create_index.json") {
             Ok(f) => f,
             Err(_) => panic!("Missing test file")
@@ -1336,7 +1378,7 @@ mod tests {
                 let _ = fs::write("../output.txt", error);
                 panic!("nope");
             }
-        };        
+        };
 
         let test_val = r#"{
   "template": {

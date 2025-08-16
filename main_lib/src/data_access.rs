@@ -1,24 +1,29 @@
 use std::{path::Path, sync::Arc};
+use std::io::Cursor;
 use std::time::Duration;
+use arrow_ipc::writer::StreamWriter;
 use datafusion::{arrow::array::RecordBatch, error::DataFusionError, prelude::{DataFrame, NdJsonReadOptions, ParquetReadOptions, SessionContext}};
 use datafusion::arrow::datatypes::{Schema};
 use datafusion::common::HashMap;
 use datafusion::config::ConfigOptions;
 use datafusion::execution::options::ArrowReadOptions;
+use datafusion::parquet::arrow::{ArrowWriter, AsyncArrowWriter};
+use datafusion::parquet::file::properties::WriterProperties;
 use datafusion::prelude::SessionConfig;
 use idgenerator::IdInstance;
 use liquid_cache_parquet::cache::policies::DiscardPolicy;
 use liquid_cache_parquet::common::LiquidCacheMode;
 use liquid_cache_parquet::LiquidCacheInProcessBuilder;
 use lru_mem::{HeapSize, LruCache, TryInsertError};
-use object_store::{aws::{AmazonS3, AmazonS3Builder}, ObjectStore};
+use object_store::{aws::{AmazonS3, AmazonS3Builder}, ObjectStore, PutPayload};
 use object_store::client::SpawnedReqwestConnector;
 use tempfile::TempDir;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinSet;
 use url::Url;
-use crate::elastic_search_ingest::JSON_MODE;
+use crate::data_access;
+use crate::elastic_search_ingest::{IngestError, JSON_MODE};
 use crate::util::log_err;
 
 
@@ -136,6 +141,7 @@ fn create_store() -> Arc<AmazonS3> {
     Arc::new(s3_file_system)
 }
 
+const S3_BASE_PATH: &str = "s3://warehouse";
 static S3_FILE_STORE: std::sync::LazyLock<Arc<AmazonS3>> = std::sync::LazyLock::new(|| create_store());
 
 
@@ -162,7 +168,7 @@ fn create_session() -> SessionContext {
 
     //let ctx = SessionContext::new_with_config(config);
 
-    let s3_url = Url::parse("s3://warehouse").unwrap();
+    let s3_url = Url::parse(S3_BASE_PATH).unwrap();
 
     ctx.register_object_store(&s3_url, S3_FILE_STORE.clone());
 
@@ -565,15 +571,16 @@ async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> 
         LOCATION '{file_path_var}';"#);
         loop {
             match DATA_FUSION_CONTEXT.sql(&query_str).await {
-                Err(_e) => {
+                Err(e) => {
+                    println!("Error creating table - parquet - {}", file_path_var);
+                    println!("error = {}", e.message());
                     let _ = DATA_FUSION_CONTEXT.sql(format!("DROP TABLE IF EXISTS {local_name_var};").as_str()).await;
-                    LRU_CACHE_HANDLE.table_dropped(local_name_var).await;
+                    //LRU_CACHE_HANDLE.table_dropped(local_name_var).await;
+                    println!("Dropped table");
                 },
                 _ => return Ok(())
             }
         }
-
-
     } else {
         let result = DATA_FUSION_CONTEXT.register_parquet(local_name, file_path, ParquetReadOptions::new()).await;
         match result {
@@ -599,29 +606,50 @@ async fn load_json_file_as_table(file_path_without_suffix: &String, local_name: 
         },
         Err(e) => return log_err(e),
     };
-    let ends_with_json = file_path_without_suffix.ends_with(".json");
-    if JSON_MODE || ends_with_json {
-        let file_path = if ends_with_json {
-            file_path_without_suffix.clone()
-        } else {
-            format!("{}.json", file_path_without_suffix)
-        };
-        tracing::info!("Loading JSON file {}", file_path);
-        let reader_options = NdJsonReadOptions::default().schema(&schema);
-        match DATA_FUSION_CONTEXT.register_json(local_name, file_path, reader_options).await {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                if e.message().contains("already exists") {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
+
+    if false && file_path_without_suffix.starts_with("s3:") {
+        let file_path_var = format!("{}.json", file_path_without_suffix);
+
+        let local_name_var = local_name;
+
+        let query_str = format!(r#"CREATE EXTERNAL TABLE {local_name_var}
+        STORED AS JSON
+        LOCATION '{file_path_var}';"#);
+        loop {
+            match DATA_FUSION_CONTEXT.sql(&query_str).await {
+                Err(_e) => {
+                    println!("Error creating table - json - {}", file_path_var);
+                    let _ = DATA_FUSION_CONTEXT.sql(format!("DROP TABLE IF EXISTS {local_name_var};").as_str()).await;
+                    //LRU_CACHE_HANDLE.table_dropped(local_name_var).await;
+                },
+                _ => return Ok(())
             }
         }
     } else {
-        let file_path = format!("{}.arrow", file_path_without_suffix);
-        tracing::info!("Loading Arrow file {}", file_path);
-        DATA_FUSION_CONTEXT.register_arrow(local_name, &file_path, ArrowReadOptions::default()).await
+        let ends_with_json = file_path_without_suffix.ends_with(".json");
+        if true || JSON_MODE || ends_with_json {
+            let file_path = if ends_with_json {
+                file_path_without_suffix.clone()
+            } else {
+                format!("{}.json", file_path_without_suffix)
+            };
+            tracing::info!("Loading JSON file {}", file_path);
+            let reader_options = NdJsonReadOptions::default().schema(&schema);
+            match DATA_FUSION_CONTEXT.register_json(local_name, file_path, reader_options).await {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    if e.message().contains("already exists") {
+                        Ok(())
+                    } else {
+                        Err(e)
+                    }
+                }
+            }
+        } else {
+            let file_path = format!("{}.arrow", file_path_without_suffix);
+            tracing::info!("Loading Arrow file {}", file_path);
+            DATA_FUSION_CONTEXT.register_arrow(local_name, &file_path, ArrowReadOptions::default()).await
+        }
     }
 }
 
@@ -798,10 +826,70 @@ pub(crate) async fn print_datafusion_tables() -> () {
 
 pub(crate) async fn delete_s3_files(file_paths: &Vec<String>) -> () {
     for file_path in file_paths {
-        let path = object_store::path::Path::parse(file_path).unwrap();
+        assert!(file_path.starts_with(S3_BASE_PATH));
+        let final_file_path = file_path.replace(S3_BASE_PATH, "");
+        let path = object_store::path::Path::from_url_path(&final_file_path).unwrap();
         match S3_FILE_STORE.as_ref().delete(&path).await {
             Ok(_) => (),
             Err(e) => panic!("Failed to delete file {}: {}", file_path, e)
         }
     }
 }
+/*
+pub(crate) async fn write_parquet_buffer(batch: &Vec<RecordBatch>) -> Vec<u8> {
+    let mut buffer = Cursor::new(Vec::new());
+    let props = WriterProperties::builder().build(); // Or customize properties
+    let mut writer = ArrowWriter::try_new(buffer, batch[0].schema(), Some(props)).unwrap();
+    for record_batch in batch {
+        writer.write(&record_batch).map_err(|e| IngestError { message: format!("{}", e).to_string() });
+    }
+    writer.finish().unwrap();
+    writer.inner().into_inner()
+}
+*/
+
+pub(crate) async fn put_s3_file(file_path: &String, file_contents: &Vec<u8>) -> Result<(), DataFusionError> {
+    assert!(file_path.starts_with(S3_BASE_PATH));
+    let path_str = file_path.replace(S3_BASE_PATH, "");
+    let path = match object_store::path::Path::from_url_path(path_str) {
+        Ok(p) => p,
+        Err(e) => return log_err(DataFusionError::ObjectStore(e.into()))
+    };
+    let payload = PutPayload::from_bytes(file_contents.to_vec().into());
+    match S3_FILE_STORE.as_ref().put(&path, payload).await {
+        Ok(_) => Ok(()),
+        Err(e) => log_err(DataFusionError::ObjectStore(e.into()))
+    }
+}
+
+pub(crate) fn s3_base_path() -> String {
+    format!("{}/default/ingest", S3_BASE_PATH)
+}
+
+/*
+pub(crate) async fn put_s3_file_parquet(s3_path: &String, record_batches: &Vec<RecordBatch>) -> Result<(), DataFusionError> {
+    assert!(s3_path.starts_with("s3://"));
+    let path_str = s3_path.replace("s3://", "");
+    let path = match object_store::path::Path::from_url_path(path_str) {
+        Ok(p) => p,
+        Err(e) => return log_err(DataFusionError::ObjectStore(e.into()))
+    };
+
+    // 2. Get a writer for the S3 path
+    let writer = S3_FILE_STORE.as_ref().put_multipart(&path).await?;
+
+    // 3. Create ArrowWriter
+    let schema = record_batches[0].schema();
+    let mut arrow_writer = AsyncArrowWriter::try_new(writer, schema, None)?;
+
+    // 4. Write RecordBatches
+    for batch in record_batches {
+        arrow_writer.write(&batch)?;
+    }
+
+    // 5. Close the writer
+    arrow_writer.close()?;
+
+    Ok(())
+}
+*/

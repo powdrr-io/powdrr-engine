@@ -169,6 +169,7 @@ pub enum CompactionResult {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct IcebergLibMetadata {
     pub snapshot_id: i64,
+    pub table_schema: Arc<iceberg::spec::Schema>,
     pub files: Vec<String>,
     pub sizes: Vec<u64>,
     pub schemas: Vec<Arc<iceberg::spec::Schema>>,
@@ -256,6 +257,7 @@ pub async fn load_table_metadata(namespace: &String, name: &String, last_snapsho
 
     Ok(IcebergLibMetadata {
         snapshot_id: current_snapshot.snapshot_id(),
+        table_schema: table.metadata().current_schema().clone(),
         files: files,
         sizes: sizes,
         schemas: schemas,
@@ -391,7 +393,8 @@ impl CompactionCommand {
             snapshot_id: Some(compaction_response.lib_metadata.snapshot_id.to_string()),
             files: FileSetPayload {
                 file_paths: compaction_response.lib_metadata.files.clone(),
-                schemas: compaction_response.lib_metadata.schemas.iter().map(|s|PowdrrSchema::from_iceberg(s)).collect(),
+                schemas: compaction_response.lib_metadata.schemas.iter().map(|
+                    s|PowdrrSchema::from_iceberg(&compaction_response.lib_metadata.table_schema, s)).collect(),
                 file_schemas: compaction_response.lib_metadata.files.iter().enumerate().map(|(x, _)|x as u64).collect(),
                 sizes: compaction_response.lib_metadata.sizes.clone()
             },
@@ -462,6 +465,11 @@ impl Command for CompactionCommand {
             let deletes_serde_result = df_to_serde_value(&remaining_deletes_data_frame).await?;
             let deletes_buffer = WriteBuffer::delete(deletes_serde_result.values.iter().map(|x| x.clone()).collect());
 
+            match results_data_frame.clone().count().await {
+                Ok(c) => assert!(c > 0),
+                Err(_) => panic!("Results data frame count failed"),
+            };
+
             tracing::info!("!!!!!!!!!!!!!!!!!!!! Compacting to Iceberg !!!!!!!!!!!!!!!!!!!!!!!");
             // TODO: if nulls can come out there that probably means we need to intercept earlier
             // in the pipeline to cast nulls to real types.
@@ -508,7 +516,7 @@ impl Command for CompactionCommand {
             };
 
             let deletes_table_info = if deletes_buffer.num_records() > 0 {
-                let (deletes_path, size) = match write_to_file(&deletes_buffer, &public_table_name, &"delete".to_string()) {
+                let (deletes_path, size) = match write_to_file(&deletes_buffer, &public_table_name, &"delete".to_string()).await {
                     Ok(file) => file,
                     Err(e) => {
                         return Err(CommandError{ message: e.to_string() })
