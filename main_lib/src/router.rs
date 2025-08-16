@@ -1058,7 +1058,6 @@ pub(crate) mod tests {
         let body = process_work_response.read_body().unwrap();
         let str_body = str::from_utf8(&body).unwrap();
         let snapshot_id = str_body.parse::<u64>().unwrap();
-        println!("first proces work done");
 
         let body_obj  = r#"
         {
@@ -1077,7 +1076,6 @@ pub(crate) mod tests {
             mime::APPLICATION_JSON,
         ).perform();
 
-        println!("first search done");
         match response_result {
             Ok(response) => {
                 assert_eq!(response.status(), 200);
@@ -1107,7 +1105,6 @@ pub(crate) mod tests {
 
         assert_eq!(response.status(), 200);
 
-        println!("Second proces work");
         let process_work_response = test_server.client().put(
             "http://localhost/_test/v1/_process_work",
             snapshot_id.to_string(),
@@ -1115,7 +1112,6 @@ pub(crate) mod tests {
         ).perform().unwrap();
 
         assert_eq!(process_work_response.status(), 200);
-        println!("Second process work done");
 
         let response_result = test_server.client().post(
             "http://localhost/logs/_search",
@@ -2345,7 +2341,6 @@ pub(crate) mod tests {
                 assert_eq!(response.status(), 200);
                 let body = response.read_body().unwrap();
                 let str_body = str::from_utf8(&body).unwrap();
-                println!("{}", str_body);
                 let json_body = serde_json::from_str::<Value>(str_body).unwrap();
                 let hits = json_body["hits"]["hits"].as_array().unwrap();
                 assert_eq!(hits.len(), 1);

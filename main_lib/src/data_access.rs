@@ -566,12 +566,8 @@ async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> 
         LOCATION '{file_path_var}';"#);
         loop {
             match DATA_FUSION_CONTEXT.sql(&query_str).await {
-                Err(e) => {
-                    println!("Error creating table - parquet - {}", file_path_var);
-                    println!("error = {}", e.message());
+                Err(_e) => {
                     let _ = DATA_FUSION_CONTEXT.sql(format!("DROP TABLE IF EXISTS {local_name_var};").as_str()).await;
-                    //LRU_CACHE_HANDLE.table_dropped(local_name_var).await;
-                    println!("Dropped table");
                 },
                 _ => return Ok(())
             }
@@ -810,18 +806,6 @@ pub(crate) async fn delete_s3_files(file_paths: &Vec<String>) -> () {
         }
     }
 }
-/*
-pub(crate) async fn write_parquet_buffer(batch: &Vec<RecordBatch>) -> Vec<u8> {
-    let mut buffer = Cursor::new(Vec::new());
-    let props = WriterProperties::builder().build(); // Or customize properties
-    let mut writer = ArrowWriter::try_new(buffer, batch[0].schema(), Some(props)).unwrap();
-    for record_batch in batch {
-        writer.write(&record_batch).map_err(|e| IngestError { message: format!("{}", e).to_string() });
-    }
-    writer.finish().unwrap();
-    writer.inner().into_inner()
-}
-*/
 
 pub(crate) async fn put_s3_file(file_path: &String, file_contents: &Vec<u8>) -> Result<(), DataFusionError> {
     assert!(file_path.starts_with(S3_BASE_PATH));
@@ -840,31 +824,3 @@ pub(crate) async fn put_s3_file(file_path: &String, file_contents: &Vec<u8>) -> 
 pub(crate) fn s3_base_path() -> String {
     format!("{}/default/ingest", S3_BASE_PATH)
 }
-
-/*
-pub(crate) async fn put_s3_file_parquet(s3_path: &String, record_batches: &Vec<RecordBatch>) -> Result<(), DataFusionError> {
-    assert!(s3_path.starts_with("s3://"));
-    let path_str = s3_path.replace("s3://", "");
-    let path = match object_store::path::Path::from_url_path(path_str) {
-        Ok(p) => p,
-        Err(e) => return log_err(DataFusionError::ObjectStore(e.into()))
-    };
-
-    // 2. Get a writer for the S3 path
-    let writer = S3_FILE_STORE.as_ref().put_multipart(&path).await?;
-
-    // 3. Create ArrowWriter
-    let schema = record_batches[0].schema();
-    let mut arrow_writer = AsyncArrowWriter::try_new(writer, schema, None)?;
-
-    // 4. Write RecordBatches
-    for batch in record_batches {
-        arrow_writer.write(&batch)?;
-    }
-
-    // 5. Close the writer
-    arrow_writer.close()?;
-
-    Ok(())
-}
-*/
