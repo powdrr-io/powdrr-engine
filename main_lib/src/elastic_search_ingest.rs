@@ -69,7 +69,7 @@ pub(crate) struct WriteBuffer {
 }
 
 
-pub(crate) const JSON_MODE: bool = false;
+pub(crate) const JSON_MODE: bool = true;
 
 impl WriteBuffer {
     pub fn empty() -> Self {
@@ -129,6 +129,7 @@ impl WriteBuffer {
         Ok(len)
     }
 
+    #[allow(dead_code)]
     async fn write_to_arrow_s3(&self, s3_path: &String) -> Result<u64, IngestError> {
         assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
         assert!(self.schema.is_some(), "Cannot write buffer without schema");

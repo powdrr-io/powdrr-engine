@@ -1,14 +1,10 @@
 use std::{path::Path, sync::Arc};
-use std::io::Cursor;
 use std::time::Duration;
-use arrow_ipc::writer::StreamWriter;
 use datafusion::{arrow::array::RecordBatch, error::DataFusionError, prelude::{DataFrame, NdJsonReadOptions, ParquetReadOptions, SessionContext}};
 use datafusion::arrow::datatypes::{Schema};
 use datafusion::common::HashMap;
 use datafusion::config::ConfigOptions;
 use datafusion::execution::options::ArrowReadOptions;
-use datafusion::parquet::arrow::{ArrowWriter, AsyncArrowWriter};
-use datafusion::parquet::file::properties::WriterProperties;
 use datafusion::prelude::SessionConfig;
 use idgenerator::IdInstance;
 use liquid_cache_parquet::cache::policies::DiscardPolicy;
@@ -22,8 +18,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinSet;
 use url::Url;
-use crate::data_access;
-use crate::elastic_search_ingest::{IngestError, JSON_MODE};
+use crate::elastic_search_ingest::{JSON_MODE};
 use crate::util::log_err;
 
 
@@ -607,49 +602,29 @@ async fn load_json_file_as_table(file_path_without_suffix: &String, local_name: 
         Err(e) => return log_err(e),
     };
 
-    if false && file_path_without_suffix.starts_with("s3:") {
-        let file_path_var = format!("{}.json", file_path_without_suffix);
-
-        let local_name_var = local_name;
-
-        let query_str = format!(r#"CREATE EXTERNAL TABLE {local_name_var}
-        STORED AS JSON
-        LOCATION '{file_path_var}';"#);
-        loop {
-            match DATA_FUSION_CONTEXT.sql(&query_str).await {
-                Err(_e) => {
-                    println!("Error creating table - json - {}", file_path_var);
-                    let _ = DATA_FUSION_CONTEXT.sql(format!("DROP TABLE IF EXISTS {local_name_var};").as_str()).await;
-                    //LRU_CACHE_HANDLE.table_dropped(local_name_var).await;
-                },
-                _ => return Ok(())
+    let ends_with_json = file_path_without_suffix.ends_with(".json");
+    if JSON_MODE || ends_with_json {
+        let file_path = if ends_with_json {
+            file_path_without_suffix.clone()
+        } else {
+            format!("{}.json", file_path_without_suffix)
+        };
+        tracing::info!("Loading JSON file {}", file_path);
+        let reader_options = NdJsonReadOptions::default().schema(&schema);
+        match DATA_FUSION_CONTEXT.register_json(local_name, file_path, reader_options).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if e.message().contains("already exists") {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
             }
         }
     } else {
-        let ends_with_json = file_path_without_suffix.ends_with(".json");
-        if true || JSON_MODE || ends_with_json {
-            let file_path = if ends_with_json {
-                file_path_without_suffix.clone()
-            } else {
-                format!("{}.json", file_path_without_suffix)
-            };
-            tracing::info!("Loading JSON file {}", file_path);
-            let reader_options = NdJsonReadOptions::default().schema(&schema);
-            match DATA_FUSION_CONTEXT.register_json(local_name, file_path, reader_options).await {
-                Ok(_) => Ok(()),
-                Err(e) => {
-                    if e.message().contains("already exists") {
-                        Ok(())
-                    } else {
-                        Err(e)
-                    }
-                }
-            }
-        } else {
-            let file_path = format!("{}.arrow", file_path_without_suffix);
-            tracing::info!("Loading Arrow file {}", file_path);
-            DATA_FUSION_CONTEXT.register_arrow(local_name, &file_path, ArrowReadOptions::default()).await
-        }
+        let file_path = format!("{}.arrow", file_path_without_suffix);
+        tracing::info!("Loading Arrow file {}", file_path);
+        DATA_FUSION_CONTEXT.register_arrow(local_name, &file_path, ArrowReadOptions::default()).await
     }
 }
 
