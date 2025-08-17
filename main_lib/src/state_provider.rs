@@ -9,8 +9,8 @@ use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::ephemeral_state_provider::EphemeralStateProvider;
 use crate::leaderless_state_provider::LeaderlessStateProvider;
-use crate::peers::PeerClient;
-use crate::test_api::{CacheMode, CompactionMode, IndexingMode, StateMode, TestProcessingMode};
+use crate::peers::{PeerClient, PeerProvider};
+use crate::test_api::{CacheMode, CompactionMode, IndexingMode, PeerModeType, StateMode, TestProcessingMode};
 
 
 #[derive(Debug, Clone)]
@@ -49,6 +49,10 @@ enum StateProviderActorMessage {
     SetMode {
         respond_to: oneshot::Sender<()>,
         mode: TestProcessingMode,
+    },
+    SetPeerMode {
+        respond_to: oneshot::Sender<()>,
+        mode: PeerModeType,
     },
     CreatePipeline {
         respond_to: oneshot::Sender<Result<bool, ServiceApiError>>,
@@ -168,6 +172,7 @@ unsafe impl Send for StateProviderActorMessage {}
 
 struct StateProviderActor {
     state_provider: StateProvider,
+    peer_provider: PeerProvider,
     receiver: mpsc::Receiver<StateProviderActorMessage>,
     indexing_mode: IndexingMode,
     #[allow(dead_code)]
@@ -185,6 +190,7 @@ impl StateProviderActor {
     fn new(receiver: mpsc::Receiver<StateProviderActorMessage>) -> Self {
         StateProviderActor {
             state_provider: StateProvider::Ephemeral(EphemeralStateProvider::new(TestProcessingMode::default())),
+            peer_provider: PeerProvider::new(PeerModeType::SelfOnly),
             receiver,
             indexing_mode: IndexingMode::Disabled,
             compaction_mode: CompactionMode::Disabled,
@@ -243,10 +249,10 @@ impl StateProviderActor {
                     }
                 }
                 match &mode.state_mode {
-                    StateMode::Testing => self.state_provider = StateProvider::Ephemeral(EphemeralStateProvider::new(mode)),
-                    StateMode::Ephemeral => self.state_provider = StateProvider::Ephemeral(EphemeralStateProvider::new(mode)),
+                    StateMode::Testing => self.state_provider = StateProvider::Ephemeral(EphemeralStateProvider::new(mode.clone())),
+                    StateMode::Ephemeral => self.state_provider = StateProvider::Ephemeral(EphemeralStateProvider::new(mode.clone())),
                     StateMode::TestingDynamoDb(_) => {
-                        let provider = DynamoDbStateProvider::test(mode).await;
+                        let provider = DynamoDbStateProvider::test(mode.clone()).await;
                         self.state_provider = StateProvider::DynamoDb(provider);
                     },
                     StateMode::Leaderless { server_address, access_key, secret_key} => {
@@ -259,6 +265,11 @@ impl StateProviderActor {
                             ))
                     },
                 }
+                self.peer_provider.set_mode(mode.peer_mode.to_peer_mode_type());
+                respond_to.send(()).unwrap();
+            },
+            StateProviderActorMessage::SetPeerMode { respond_to, mode } => {
+                self.peer_provider.set_mode(mode);
                 respond_to.send(()).unwrap();
             },
             StateProviderActorMessage::CreatePipeline { respond_to, name, pipeline } => {
@@ -336,7 +347,8 @@ impl StateProviderActor {
                 handle_message_impl!(self, respond_to, get_cleanup_work_items());
             },
             StateProviderActorMessage::GetPeerClients { respond_to } => {
-                handle_message_impl!(self, respond_to, get_peer_clients());
+                let peers = self.peer_provider.get_peer_clients();
+                respond_to.send(peers).unwrap();
             },
             StateProviderActorMessage::GetNextPrefetchCheckpoints { respond_to, extensions } => {
                 handle_message_impl!(self, respond_to, get_next_prefetch_checkpoints(extensions));
@@ -476,10 +488,6 @@ impl StateProvider {
         state_provider_func_impl!(self, get_cleanup_work_items())
     }
 
-    pub async fn get_peer_clients(&mut self) -> Vec<Box<dyn PeerClient>> {
-        state_provider_func_impl!(self, get_peer_clients())
-    }
-
     pub async fn get_next_prefetch_checkpoints(&mut self, extensions: Option<String>) -> Result<Vec<CheckpointDescriptor>, ServiceApiError> {
         state_provider_func_impl!(self, get_next_prefetch_checkpoints(extensions))
     }
@@ -544,6 +552,10 @@ impl StateProviderHandle {
 
     pub async fn set_testing_mode(&self, mode: &TestProcessingMode) -> () {
         send_message!(self, SetMode, mode = mode.clone());
+    }
+
+    pub async fn set_peer_mode(&self, mode: &PeerModeType) -> () {
+        send_message!(self, SetPeerMode, mode = mode.clone());
     }
 
     pub async fn create_pipeline(&self, name: &String, pipeline: &PipelineDefinition) -> Result<bool, ServiceApiError> {
