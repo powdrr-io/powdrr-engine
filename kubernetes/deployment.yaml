@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: powdrr-engine-deployment
+  labels:
+    app: powdrr-engine
+spec:
+  selector:
+    matchLabels:
+      app: powdrr-engine
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: powdrr-engine
+    spec:
+      serviceAccountName: powdrr-engine-sa
+      containers:
+        - name: powdrr-engine
+          image: powdrr/engine:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 9200
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: powdrr-engine-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: powdrr-engine-rb
+subjects:
+  - kind: ServiceAccount
+    name: powdrr-engine-sa
+roleRef:
+  kind: Role
+  name: powdrr-engine-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: powdrr-engine-sa

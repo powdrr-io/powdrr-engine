@@ -4,10 +4,10 @@ use gotham::{anyhow, rustls::{Certificate, PrivateKey, ServerConfig}};
 use idgenerator::*;
 use rustls_pemfile::{certs, rsa_private_keys};
 use rustls_pki_types::PrivatePkcs1KeyDer;
-
+use powdrr_lib::peers::get_peer_ips;
 
 /// Start a server and call the `Handler` we've defined above for each `Request` we receive.
-// #[tokio::main]
+//
 
 fn build_config() -> anyhow::Result<ServerConfig> {
     let mut cert_file = BufReader::new(&include_bytes!("../ca.crt")[..]);
@@ -27,16 +27,16 @@ fn build_config() -> anyhow::Result<ServerConfig> {
 }
 
 
-fn run_server(port: &String) -> () {
+async fn run_server(port: &String) -> () {
     tracing_subscriber::fmt().init();
     let addr = format!("0.0.0.0:{}", port);
     println!("Listening for requests at http://{}", addr);
-    gotham::start_with_num_threads(addr, powdrr_lib::router::router(true), 32).unwrap()
+    gotham::init_server(addr, powdrr_lib::router::router(true)).await.unwrap();
 }
 
 
 #[allow(dead_code)]
-fn run_ssl_server() -> () {
+async fn run_ssl_server() -> () {
     tracing_subscriber::fmt().init();
     let addr = "0.0.0.0:9200";
     println!("Listening for requests at https://{}", addr);
@@ -44,8 +44,11 @@ fn run_ssl_server() -> () {
 }
 
 
-fn main() -> () {
+#[tokio::main]
+async fn main() -> () {
     let args: Vec<String> = env::args().collect();
+    rustls::crypto::ring::default_provider()
+        .install_default().unwrap();
 
     let options = IdGeneratorOptions::new().worker_id(1).worker_id_bit_len(6);
     match IdInstance::init(options) {
@@ -53,8 +56,23 @@ fn main() -> () {
         Err(_) => panic!("What happened?")
     }
 
-    match args.get(1) {
-        None => run_server(&"9200".to_string()),
-        Some(val) => run_server(val),
-    }
+    tokio::runtime::Handle::current().spawn(async move {
+        match args.get(1) {
+            None => run_server(&"9200".to_string()).await,
+            Some(val) => run_server(val).await,
+        }
+    });
+
+    tokio::runtime::Handle::current().spawn(async move {
+        loop {
+            let peer_ips = get_peer_ips().await;
+            println!("Peer IPs: {}", peer_ips.len());
+            for peer_ip in peer_ips.iter() {
+                println!("Peer IP: {}", peer_ip);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
+
+    tokio::signal::ctrl_c().await.unwrap();
 }

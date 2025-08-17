@@ -1,7 +1,10 @@
 use std::{error::Error, fmt::Display};
+use std::net::IpAddr;
 use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
+use k8s_openapi::api::core::v1::Pod;
+use kube::Api;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -264,6 +267,63 @@ impl PeerClient for RemotePeer {
             }
         }
         */
+}
+
+pub async fn get_peer_ips() -> Vec<IpAddr> {
+    let pod_name = match std::env::var("HOSTNAME") {
+        Ok(name) => name,
+        Err(_) => {
+            tracing::error!("HOSTNAME is not set");
+            return vec![];
+        }
+    };
+
+    let client = kube::Client::try_default().await.unwrap();
+    let pods: Api<Pod> = Api::default_namespaced(client.clone());
+
+    // find the app label of the own pod
+    let own_pod = pods.get_metadata(&pod_name).await.unwrap();
+    let app_label = own_pod.metadata.labels.unwrap().get("app").unwrap().to_string();
+
+    // get all pods with app label
+    let pods = pods.list(&Default::default()).await.unwrap();
+    let pods = pods.items.iter().filter(|pod| {
+        pod.metadata.labels.as_ref().unwrap().get("app").unwrap() == &app_label
+    });
+
+    let mut ips: Vec<IpAddr> = vec![];
+    for pod in pods {
+        tracing::warn!("Pod: {:?}", pod.metadata.name);
+        let pod_status = match pod.status.as_ref() {
+            Some(status) => status,
+            None => {
+                tracing::error!("Pod status is None for pod: {:?}", pod.metadata.name);
+                continue;
+            }
+        };
+
+        let pod_ip = match pod_status.pod_ip.as_ref() {
+            Some(ip) => ip,
+            None => {
+                tracing::error!("Pod IP is None for pod: {:?}", pod.metadata.name);
+                continue;
+            }
+        };
+
+        match pod_ip.parse() {
+            Ok(ip) => ips.push(ip),
+            Err(e) => {
+                tracing::error!("Failed to parse Pod IP for pod {:?}: {}", pod.metadata.name, e);
+                continue;
+            }
+        };
+    }
+
+    //filter duplicate IPs
+    ips.sort_unstable();
+    ips.dedup();
+
+    return ips;
 }
 
 

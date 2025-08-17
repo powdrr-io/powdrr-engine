@@ -28,7 +28,7 @@ use crate::elastic_search_endpoints::QueryStringAliases;
 use crate::elastic_search_endpoints::QueryStringClusterSettings;
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::private_api;
-use crate::peers::PrivateSqlInvocationExternal;
+use crate::peers::{PrivateSqlInvocationExternal};
 use crate::test_api::test_v1_add_checkpoint;
 use crate::test_api::test_v1_create_index;
 use crate::test_api::test_v1_process_work;
@@ -303,6 +303,7 @@ pub fn router(include_test_apis: bool) -> Router {
         route.post("/_monitoring/bulk")
             .to(elastic_search_lifetime_policy::es_post_monitoring_bulk);
     })
+
 }
 
 
