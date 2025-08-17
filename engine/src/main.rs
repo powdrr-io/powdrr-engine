@@ -1,10 +1,12 @@
+mod configuration;
+
 use std::{env, io::{self, BufReader}};
 
 use gotham::{anyhow, rustls::{Certificate, PrivateKey, ServerConfig}};
 use idgenerator::*;
 use rustls_pemfile::{certs, rsa_private_keys};
 use rustls_pki_types::PrivatePkcs1KeyDer;
-use powdrr_lib::peers::get_peer_ips;
+use crate::configuration::{get_operating_mode, perform_updates, OperatingMode};
 
 /// Start a server and call the `Handler` we've defined above for each `Request` we receive.
 //
@@ -27,11 +29,11 @@ fn build_config() -> anyhow::Result<ServerConfig> {
 }
 
 
-async fn run_server(port: &String) -> () {
+async fn run_server(mode: &OperatingMode) -> () {
     tracing_subscriber::fmt().init();
-    let addr = format!("0.0.0.0:{}", port);
+    let addr = format!("0.0.0.0:{}", mode.port);
     println!("Listening for requests at http://{}", addr);
-    gotham::init_server(addr, powdrr_lib::router::router(true)).await.unwrap();
+    gotham::init_server(addr, powdrr_lib::router::router(mode.testing_enabled)).await.unwrap();
 }
 
 
@@ -56,23 +58,24 @@ async fn main() -> () {
         Err(_) => panic!("What happened?")
     }
 
-    tokio::runtime::Handle::current().spawn(async move {
-        match args.get(1) {
-            None => run_server(&"9200".to_string()).await,
-            Some(val) => run_server(val).await,
-        }
-    });
+    let mode = get_operating_mode(&args);
 
-    tokio::runtime::Handle::current().spawn(async move {
-        loop {
-            let peer_ips = get_peer_ips().await;
-            println!("Peer IPs: {}", peer_ips.len());
-            for peer_ip in peer_ips.iter() {
-                println!("Peer IP: {}", peer_ip);
+    {
+        let local_mode = mode.clone();
+        tokio::runtime::Handle::current().spawn(async move {
+            run_server(&local_mode).await;
+        });
+    }
+
+    {
+        let local_mode = mode.clone();
+        tokio::runtime::Handle::current().spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                perform_updates(&local_mode).await;
             }
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        }
-    });
+        });
+    }
 
     tokio::signal::ctrl_c().await.unwrap();
 }

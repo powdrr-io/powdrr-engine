@@ -28,7 +28,8 @@ use crate::elastic_search_endpoints::QueryStringAliases;
 use crate::elastic_search_endpoints::QueryStringClusterSettings;
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::private_api;
-use crate::peers::{PrivateSqlInvocationExternal};
+use crate::peers::{PrivateExtensionInvocationExternal, PrivateSqlInvocationExternal};
+use crate::private_api::extension_query;
 use crate::test_api::test_v1_add_checkpoint;
 use crate::test_api::test_v1_create_index;
 use crate::test_api::test_v1_process_work;
@@ -50,8 +51,8 @@ pub fn private_v1_sql(mut state: State) -> Pin<Box<HandlerFuture>> {
         };
         let query_result = private_api::data_query(&invocation_obj.invocation, invocation_obj.index, invocation_obj.num).await;
         match query_result {
-            Ok(_success) => {
-                let res = create_response(&state, StatusCode::OK, mime::IMAGE_PNG, "TODO");
+            Ok(success) => {
+                let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, serde_json::to_string(&success.result).unwrap());
                 Ok((state, res))
             },
             Err(error) => {
@@ -62,6 +63,32 @@ pub fn private_v1_sql(mut state: State) -> Pin<Box<HandlerFuture>> {
         }
     }.boxed()   
 }
+
+pub fn private_v1_extension(mut state: State) -> Pin<Box<HandlerFuture>> {
+    async move {
+        let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
+            Ok(vb) => vb,
+            Err(_) => panic!("Oh no"),
+        };
+        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+        let command: PrivateExtensionInvocationExternal = match serde_json::from_str(&body_content) {
+            Ok(io) => io,
+            Err(_) => panic!("This should not happen"),
+        };
+        match extension_query(&command.invocation, command.index, command.num).await {
+            Ok(success) => {
+                let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, serde_json::to_string(&success).unwrap());
+                Ok((state, res))
+            },
+            Err(error) => {
+                let error_message = format!("{}", error);
+                let res = create_response(&state, StatusCode::BAD_REQUEST, mime::TEXT_PLAIN, error_message);
+                Ok((state, res))
+            }
+        }
+    }.boxed()
+}
+
 
 
 pub fn private_v1_compact(mut state: State) -> Pin<Box<HandlerFuture>> {
@@ -157,6 +184,7 @@ pub fn router(include_test_apis: bool) -> Router {
             route.scope("/v1", |route| {
                 route.post("/_sql").to(private_v1_sql);
                 route.post("/_compact").to(private_v1_compact);
+                route.post("/_extension").to(private_v1_extension);
             })
         });
 
@@ -314,13 +342,15 @@ pub(crate) mod tests {
     use std::sync::LazyLock;
 
     use gotham::mime;
-    use gotham::test::TestServer;
+    use gotham::plain::test::AsyncTestServer;
+    use gotham::test::{TestServer};
     use serde_json::Value;
     use crate::elastic_search_responses::{QueryResultTotal, QueryResults};
     use crate::router::router;
     use crate::schema_massager::{extract_powdrr_schema_str, PowdrrDataType, PowdrrField, PowdrrSchema};
     use crate::data_contract::{FileSetPayload, IcebergMetadata, SpeedboatMetadata, TableMetadataCheckpoint};
-    use crate::test_api::{CacheMode, CompactionMode, IndexingMode, PrefetchMode, StateMode, TestProcessingMode};
+    use crate::state_provider::STATE_PROVIDER;
+    use crate::test_api::{CacheMode, CompactionMode, IndexingMode, PeerMode, PeerModeType, PrefetchMode, StateMode, TestProcessingMode};
 
     pub(crate) static TEST_SERVER: LazyLock<TestServer> = LazyLock::new(|| TestServer::with_timeout(router(true), 1000).unwrap());
 
@@ -1008,6 +1038,7 @@ pub(crate) mod tests {
         let mode = TestProcessingMode {
             state_mode: StateMode::Testing,
             cache_mode: CacheMode::Redis(None),
+            peer_mode: PeerMode::SelfOnly,
             indexing_mode: IndexingMode::Async,
             compaction_mode: CompactionMode::Async(Some(1)),
             prefetch_mode: PrefetchMode::Disabled,
@@ -1200,15 +1231,13 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn test_es_create_single() {
-        let test_server = &*TEST_SERVER;
+    #[tokio::test]
+    async fn test_es_create_single() {
+        let test_server = AsyncTestServer::new(router(true)).await.unwrap();
 
-        test_server.client().put(
-            "http://localhost/_test/v1/_testing_mode",
-            "",
-            mime::TEXT_PLAIN
-        ).perform().unwrap();
+        test_server.client().put("http://localhost/_test/v1/_testing_mode").body("").mime(mime::TEXT_PLAIN).perform().await.unwrap();
+
+        STATE_PROVIDER.set_peer_mode(&PeerModeType::Testing(test_server.clone())).await;
 
         let body_create_index = r#"{
             "settings" : {
@@ -1218,10 +1247,7 @@ pub(crate) mod tests {
             } } }"#;
         
         let response_create_index = test_server.client().put(
-            "http://localhost/logs",
-            body_create_index,
-            mime::APPLICATION_JSON,
-        ).perform().unwrap();  
+            "http://localhost/logs").body(body_create_index).mime(mime::APPLICATION_JSON).perform().await.unwrap();
 
         assert_eq!(response_create_index.status(), 200);   
 
@@ -1234,10 +1260,7 @@ pub(crate) mod tests {
             }"#;          
 
         let create_response = test_server.client().post(
-            "http://localhost/logs/_create/my_id",
-            test_val,
-            mime::APPLICATION_JSON,
-        ).perform();
+            "http://localhost/logs/_create/my_id").body(test_val).mime(mime::APPLICATION_JSON).perform().await;
 
         match create_response {
             Ok(response) => {
@@ -1249,18 +1272,12 @@ pub(crate) mod tests {
         }
 
         let process_work_response = test_server.client().put(
-            "http://localhost/_test/v1/_process_work",
-            "",
-            mime::TEXT_PLAIN,
-        ).perform().unwrap();
+            "http://localhost/_test/v1/_process_work").body("").mime(mime::TEXT_PLAIN).perform().await.unwrap();
 
         assert_eq!(process_work_response.status(), 200);
 
         let create_response = test_server.client().post(
-            "http://localhost/logs/_create/my_id",
-            test_val,
-            mime::APPLICATION_JSON,
-        ).perform();
+            "http://localhost/logs/_create/my_id").body(test_val).mime(mime::APPLICATION_JSON).perform().await;
 
         match create_response {
             Ok(response) => {

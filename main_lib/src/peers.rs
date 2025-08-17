@@ -1,8 +1,10 @@
 use std::{error::Error, fmt::Display};
-use std::net::IpAddr;
+use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
+use gotham::mime;
+use gotham::plain::test::AsyncTestServer;
 use k8s_openapi::api::core::v1::Pod;
 use kube::Api;
 use reqwest::Client;
@@ -14,15 +16,15 @@ use crate::elastic_search_common::result_to_record_batch;
 use crate::private_api::{compaction_query, extension_query, prefetch_query};
 use crate::schema_massager::{PowdrrSchema, SqlQuery};
 use crate::data_contract::{ExtensionFileMetadata, FileSetPayload};
-use crate::test_api::CompactionMode;
+use crate::test_api::{CompactionMode, PeerModeType};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct FieldFileFilterDescriptor {
     pub field_name: String,
     pub file_filter: FileFilter,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct FileFilterDescriptor {
     pub able_name: String, // Field name to list of (operator, value)
     pub filters: Vec<FieldFileFilterDescriptor>,
@@ -94,7 +96,7 @@ pub enum PrivateInvocation {
     Prefetch(PrivatePrefetchInvocation),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct PrivateSqlInvocation {
     pub sql: SqlQuery,
     pub required_extensions: Vec<String>,
@@ -118,11 +120,18 @@ pub struct PrivateCompactionInvocation {
     pub delete_files: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct PrivateExtensionInvocation {
     pub extension_name: String,
     pub speedboat_files: FileSetPayload,
     pub iceberg_files: FileSetPayload,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PrivateExtensionInvocationExternal {
+    pub invocation: PrivateExtensionInvocation,
+    pub index: u64,
+    pub num: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -162,8 +171,11 @@ impl Error for PeerClientError{}
 unsafe impl Send for PeerClientError {}
 unsafe impl Sync for PeerClientError {}
 
+
 #[async_trait]
-pub trait PeerClient: Send + Sync {
+pub trait PeerClient: Send + Sync + Debug {
+    fn box_clone(&self) -> Box<dyn PeerClient>;
+
     async fn private_sql(&self, invocation: &PrivateSqlInvocation, index: u64, num: u64) -> Result<Vec<RecordBatch>, PeerClientError>;
 
     async fn private_compaction(&self, invocation: &PrivateCompactionInvocation, index: u64, num: u64) -> Result<Vec<RecordBatch>, PeerClientError>;
@@ -175,7 +187,14 @@ pub trait PeerClient: Send + Sync {
     async fn private_compaction_leader(&self, invocation: &CompactionCommand) -> Result<Option<CompactionResponse>, PeerClientError>;
 }
 
-#[allow(dead_code)]
+impl Clone for Box<dyn PeerClient>
+{
+    fn clone(&self) -> Box<dyn PeerClient> {
+        self.box_clone()
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct RemotePeer {
     address: String,
     client: Client,
@@ -198,6 +217,10 @@ unsafe impl Sync for RemotePeer {}
 
 #[async_trait]
 impl PeerClient for RemotePeer {
+    fn box_clone(&self) -> Box<dyn PeerClient> {
+        Box::new(self.clone())
+    }
+
     async fn private_sql(&self, invocation: &PrivateSqlInvocation, _index: u64, _num: u64) -> Result<Vec<RecordBatch>, PeerClientError> {
         let address = &self.address;
         let body = serde_json::to_string(invocation);
@@ -269,7 +292,195 @@ impl PeerClient for RemotePeer {
         */
 }
 
-pub async fn get_peer_ips() -> Vec<IpAddr> {
+
+#[derive(Clone)]
+pub(crate) struct TestingRemotePeer {
+    server: AsyncTestServer,
+}
+
+impl Debug for TestingRemotePeer {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestingRemotePeer")
+    }
+}
+
+
+impl TestingRemotePeer {
+    #[allow(dead_code)]
+    pub fn new(server: AsyncTestServer) -> Self {
+        TestingRemotePeer {
+            server,
+        }
+    }
+}
+
+unsafe impl Send for TestingRemotePeer {}
+unsafe impl Sync for TestingRemotePeer {}
+
+
+#[async_trait]
+impl PeerClient for TestingRemotePeer {
+    fn box_clone(&self) -> Box<dyn PeerClient> {
+        Box::new(self.clone())
+    }
+
+    async fn private_sql(&self, invocation: &PrivateSqlInvocation, index: u64, num: u64) -> Result<Vec<RecordBatch>, PeerClientError> {
+        let invocation_obj = PrivateSqlInvocationExternal {
+            invocation: invocation.clone(),
+            index,
+            num,
+        };
+        let body = match serde_json::to_string(&invocation_obj) {
+            Ok(b) => b,
+            Err(_) => {
+                panic!("Malformed request")
+            }
+        };
+
+        let resp = self.server.client().post(
+            "http://localhost/_private/v1/_sql").body(body).mime(mime::APPLICATION_JSON).perform().await;
+
+        match resp {
+            Ok(res) => {
+                assert!(res.status().is_success());
+                let body = res.read_body().await.unwrap();
+                Ok(result_to_record_batch(serde_json::from_slice(&body).unwrap()).await)
+            },
+            Err(e) => {
+                Err(PeerClientError { message: format!("Error: {}", e) })
+            }
+        }
+    }
+
+    async fn private_compaction(&self, _invocation: &PrivateCompactionInvocation, _index: u64, _num: u64) -> Result<Vec<RecordBatch>, PeerClientError> {
+        todo!()
+    }
+
+    async fn private_extension(&self, invocation: &PrivateExtensionInvocation, index: u64, num: u64) -> Result<ExtensionFileMetadata, PeerClientError> {
+        let invocation_obj = PrivateExtensionInvocationExternal {
+            invocation: invocation.clone(),
+            index,
+            num,
+        };
+        let body = match serde_json::to_string(&invocation_obj) {
+            Ok(b) => b,
+            Err(_) => {
+                panic!("Malformed request")
+            }
+        };
+
+        let resp = self.server.client().post(
+            "http://localhost/_private/v1/_extension").body(body).mime(mime::APPLICATION_JSON).perform().await;
+
+        match resp {
+            Ok(res) => {
+                assert!(res.status().is_success());
+                let body = res.read_body().await.unwrap();
+                Ok(serde_json::from_slice(&body).unwrap())
+            },
+            Err(e) => {
+                Err(PeerClientError { message: format!("Error: {}", e) })
+            }
+        }
+    }
+
+    async fn private_prefetch(&self, _invocation: &PrivatePrefetchInvocation, _index: u64, _num: u64) -> Result<(), PeerClientError> {
+        todo!()
+    }
+
+    async fn private_compaction_leader(&self, _invocation: &CompactionCommand) -> Result<Option<CompactionResponse>, PeerClientError> {
+        todo!()
+    }
+
+    /*
+        async fn private_metadata(&self, invocation: &PrivateMetadataInvocation) -> Result<String, PeerClientError> {
+            let address = &self.address;
+            let body = serde_json::to_string(invocation);
+            match body {
+                Ok(b) => {
+                    let resp = futures::executor::block_on(self.client.post(format!("{address}/_private/v1/_metadata"))
+                    .header("Content-Type", "application/json")
+                    .body(b)
+                    .send());
+                    match resp {
+                        Ok(r) => {
+                            let text = futures::executor::block_on(r.text());
+                            match text {
+                                Ok(t) => Ok(t),
+                                Err(e) => Err(PeerClientError{ message: "Error".to_string() }),
+                            }
+                        },
+                        Err(e) => Err(PeerClientError{ message: "Error".to_string() })
+                    }
+                },
+                Err(e) => {
+                    Err(PeerClientError{ message: "Error".to_string() })
+                }
+            }
+        }
+        */
+}
+
+
+pub struct PeerProvider {
+    mode: PeerModeType,
+    clients: Vec<Box<dyn PeerClient>>,
+}
+
+
+impl PeerProvider {
+    pub fn new(mode: PeerModeType) -> Self {
+        Self {
+            mode: mode.clone(),
+            clients: Self::create_clients(&mode),
+        }
+    }
+
+    fn create_clients(mode: &PeerModeType) -> Vec<Box<dyn PeerClient>>{
+        match mode {
+            PeerModeType::SelfOnly => {
+                let peers: Vec<Box<dyn PeerClient>> = vec![Box::new(SelfPeer::new(CompactionMode::Disabled))];
+                peers
+            },
+            PeerModeType::Remote(addresses) => {
+                let mut addresses = addresses.clone();
+                addresses.sort_unstable();
+                let mut peers: Vec<Box<dyn PeerClient>> = vec!();
+                for address in addresses.iter() {
+                    peers.push(Box::new(RemotePeer::new(address.clone())))
+                }
+                peers
+            }
+            PeerModeType::Testing(server) => {
+                let peers: Vec<Box<dyn PeerClient>> = vec![Box::new(TestingRemotePeer::new(server.clone()))];
+                peers
+            }
+        }
+    }
+
+    pub fn set_mode(&mut self, mode: PeerModeType) {
+        self.mode = mode.clone();
+        self.clients = Self::create_clients(&mode);
+    }
+
+    pub fn get_peer_clients(&self) -> Vec<Box<dyn PeerClient>> {
+        self.clients.clone()
+    }
+}
+
+pub async fn get_docker_peer_ips() -> Vec<String> {
+    let service_names = match std::env::var("SERVICE_NAMES") {
+        Ok(name) => name,
+        Err(_) => {
+            tracing::error!("SERVICE_NAMES is not set");
+            return vec![];
+        }
+    };
+    service_names.split(',').map(|x| x.to_string()).collect::<Vec<String>>()
+}
+
+
+pub async fn get_kubernetes_peer_ips() -> Vec<String> {
     let pod_name = match std::env::var("HOSTNAME") {
         Ok(name) => name,
         Err(_) => {
@@ -291,7 +502,7 @@ pub async fn get_peer_ips() -> Vec<IpAddr> {
         pod.metadata.labels.as_ref().unwrap().get("app").unwrap() == &app_label
     });
 
-    let mut ips: Vec<IpAddr> = vec![];
+    let mut ips: Vec<String> = vec![];
     for pod in pods {
         tracing::warn!("Pod: {:?}", pod.metadata.name);
         let pod_status = match pod.status.as_ref() {
@@ -310,13 +521,7 @@ pub async fn get_peer_ips() -> Vec<IpAddr> {
             }
         };
 
-        match pod_ip.parse() {
-            Ok(ip) => ips.push(ip),
-            Err(e) => {
-                tracing::error!("Failed to parse Pod IP for pod {:?}: {}", pod.metadata.name, e);
-                continue;
-            }
-        };
+        ips.push(pod_ip.clone());
     }
 
     //filter duplicate IPs
@@ -327,6 +532,7 @@ pub async fn get_peer_ips() -> Vec<IpAddr> {
 }
 
 
+#[derive(Clone, Debug)]
 pub struct SelfPeer {
     pub compaction_mode: CompactionMode
 }
@@ -343,6 +549,10 @@ unsafe impl Sync for SelfPeer {}
 
 #[async_trait]
 impl PeerClient for SelfPeer {
+    fn box_clone(&self) -> Box<dyn PeerClient> {
+        Box::new(self.clone())
+    }
+
     async fn private_sql(&self, invocation: &PrivateSqlInvocation, index: u64, num: u64) -> Result<Vec<RecordBatch>, PeerClientError> {
         let query_result = data_query(invocation, index, num).await;
         match query_result {

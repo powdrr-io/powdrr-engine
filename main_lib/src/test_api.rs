@@ -1,6 +1,7 @@
 use std::{future::Future, pin::Pin, time::Duration};
 use futures::FutureExt;
 use gotham::{handler::HandlerFuture, helpers::http::response::create_response, hyper::{body, Body, StatusCode}, mime, state::{FromState, State}};
+use gotham::plain::test::AsyncTestServer;
 use serde::{Deserialize, Serialize};
 
 use crate::{compaction::perform_compaction, data_access, elastic_search_index::{self, create_index}, state_provider::{STATE_PROVIDER}};
@@ -44,6 +45,28 @@ pub enum CacheMode {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+pub enum PeerMode {
+    SelfOnly,
+    Remote(Vec<String>)
+}
+
+impl PeerMode {
+    pub fn to_peer_mode_type(&self) -> PeerModeType {
+        match self {
+            PeerMode::Remote(addresses) => PeerModeType::Remote(addresses.clone()),
+            PeerMode::SelfOnly => PeerModeType::SelfOnly,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum PeerModeType {
+    SelfOnly,
+    Remote(Vec<String>),
+    Testing(AsyncTestServer)
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub enum IndexingMode {
     Sync,
     Async,
@@ -59,7 +82,7 @@ impl IndexingMode {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum CompactionMode {
     Async(Option<u64>),
     External(String),
@@ -105,6 +128,7 @@ impl PrefetchMode {
 pub struct TestProcessingMode {
     pub state_mode: StateMode,
     pub cache_mode: CacheMode,
+    pub peer_mode: PeerMode,
     pub indexing_mode: IndexingMode,
     pub compaction_mode: CompactionMode,
     pub prefetch_mode: PrefetchMode,
@@ -115,6 +139,7 @@ impl TestProcessingMode {
         Self {
             state_mode: StateMode::TestingDynamoDb(None),
             cache_mode: CacheMode::Redis(None),
+            peer_mode: PeerMode::SelfOnly,
             indexing_mode: IndexingMode::Sync,
             compaction_mode: CompactionMode::Async(None),
             prefetch_mode: PrefetchMode::Disabled,
@@ -125,6 +150,7 @@ impl TestProcessingMode {
         Self {
             state_mode: StateMode::TestingDynamoDb(address),
             cache_mode: CacheMode::Redis(None),
+            peer_mode: PeerMode::SelfOnly,
             indexing_mode: IndexingMode::Sync,
             compaction_mode: CompactionMode::Async(None),
             prefetch_mode: PrefetchMode::Disabled,

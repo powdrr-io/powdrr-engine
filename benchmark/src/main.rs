@@ -7,7 +7,7 @@ use rand::TryRngCore;
 use rand::rngs::OsRng;
 use powdrr_lib::compaction;
 use powdrr_lib::data_contract::{ServiceImplType, ServiceMode, TEST_ACCESS_KEY, TEST_SECRET_KEY};
-use powdrr_lib::test_api::{CompactionMode, IndexingMode, PrefetchMode, TestProcessingMode, StateMode, CacheMode};
+use powdrr_lib::test_api::{CompactionMode, IndexingMode, PrefetchMode, TestProcessingMode, StateMode, CacheMode, PeerMode};
 
 const LINE_LIMIT: u64 = 1000000;
 
@@ -252,6 +252,7 @@ async fn main() -> Result<(), std::io::Error> {
             secret_key: TEST_SECRET_KEY.to_string()
         },
         cache_mode: CacheMode::Redis(Some("redis://redis:6379".to_string())),
+        peer_mode: PeerMode::SelfOnly,
         indexing_mode: IndexingMode::Disabled,
         compaction_mode: CompactionMode::Async(None),
         prefetch_mode: PrefetchMode::Enabled,

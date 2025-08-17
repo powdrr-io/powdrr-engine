@@ -5,8 +5,8 @@ use crate::pipeline::PipelineDefinition;
 use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
 use crate::ephemeral_fetch_tracker::EphemeralFetchTracker;
 use crate::state_provider::ServiceApiError;
-use crate::peers::{CheckpointDescriptor, PeerClient, SelfPeer};
-use crate::test_api::{CompactionMode, TestProcessingMode};
+use crate::peers::{CheckpointDescriptor};
+use crate::test_api::{TestProcessingMode};
 
 pub struct EphemeralStateProvider {
     service_impl: EphemeralServiceImpl,
@@ -156,10 +156,6 @@ impl EphemeralStateProvider {
 
     pub async fn get_cleanup_work_items(&mut self) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
         self.service_impl.get_cleanup_work_items(&self.fake_org_info).await
-    }
-
-    pub async fn get_peer_clients(&mut self) -> Vec<Box<dyn PeerClient>> {
-        vec!(Box::new(SelfPeer::new(CompactionMode::Async(None))))
     }
 
     pub(crate) async fn get_latest_target_checkpoint(&mut self, table_name: &String, extension: Option<String>) -> Result<Option<String>, ServiceApiError>{

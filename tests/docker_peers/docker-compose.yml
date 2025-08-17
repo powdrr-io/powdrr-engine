@@ -4,6 +4,35 @@ volumes:
     driver: local
 
 services:
+  powdrr-service:
+    image: powdrr/service:latest
+    ports:
+      - "7784:7784"
+    networks:
+      iceberg_net:
+
+  powdrr-engine:
+    image: powdrr/engine:latest
+    ports:
+      - "9200:9200"
+    environment:
+      MODE: docker
+      PORT: 9200
+      SERVICE_NAMES: powdrr-engine:9200,powdrr-engine-2:9201
+    networks:
+      iceberg_net:
+
+  powdrr-engine-2:
+    image: powdrr/engine:latest
+    ports:
+      - "9201:9201"
+    environment:
+      MODE: docker
+      PORT: 9201
+      SERVICE_NAMES: powdrr-engine:9200,powdrr-engine-2:9201
+    networks:
+      iceberg_net:
+
   redis:
     image: redis:latest
     ports:
