@@ -27,6 +27,8 @@ http = "0.2.12"
 iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "145afdf4b553e0f1b79d27b6cbf9b3af04f87e4e" }
 iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "145afdf4b553e0f1b79d27b6cbf9b3af04f87e4e" }
 idgenerator = "2.0.0"
+k8s-openapi = { version = "0.25.0", features = ["latest"] }
+kube = { version = "1.1.0", features = ["runtime", "derive"] }
 liquid-cache-parquet = "0.1.7"
 lru-mem = "0.3.0"
 minijinja = "2.10.2"
