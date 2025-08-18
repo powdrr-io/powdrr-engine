@@ -250,7 +250,7 @@ pub(crate) async fn create_index(work_item: &ExtensionWorkItem) -> Result<(), In
         final_result.extend(result);
     }
 
-    match STATE_PROVIDER.extension_commit(
+    match crate::state_provider::StateProviderProxy::extension_commit(
         &work_item.table_name,
         &ExtensionCommit {
             id: work_item.id.clone(),
@@ -310,16 +310,12 @@ mod tests {
     use gotham::test::Server;
     use crate::elastic_search_index::create_index_parquet;
 
-    #[test]
-    fn test_simple_create_index_parquet() {
-        let test_server = &*crate::router::tests::TEST_SERVER;
-
-        test_server.run_future(async {
-            match create_index_parquet(&format!("file://{}/tests/data/flights.parquet", env::current_dir().unwrap().to_str().unwrap()), &"index_col".to_string()).await {
-                Err(_) => panic!("failed"),
-                Ok(_) => ()
-            }
-        });
+    #[tokio::test]
+    async fn test_simple_create_index_parquet() {
+        match create_index_parquet(&format!("file://{}/tests/data/flights.parquet", env::current_dir().unwrap().to_str().unwrap()), &"index_col".to_string()).await {
+            Err(_) => panic!("failed"),
+            Ok(_) => ()
+        }
     }
 /*
     #[test]

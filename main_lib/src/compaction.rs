@@ -403,7 +403,7 @@ impl CompactionCommand {
         };
         metadata.files.validate();
 
-        match STATE_PROVIDER.iceberg_commit(
+        match crate::state_provider::StateProviderProxy::iceberg_commit(
             &compaction_response.table_name,
             &IcebergCommit {
                 metadata,
@@ -569,7 +569,7 @@ pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkIt
         // a compaction commit might get committed to it but fail afterwards. If we commit to Iceberg and fail to
         // record that in the main_lib then that leads to correctness errors that aren't really possible to fix.
         let parquet_file_name = PowdrrFileNameGenerator::create_file_name();
-        match STATE_PROVIDER.compaction_commit(
+        match crate::state_provider::StateProviderProxy::compaction_commit(
             table_name,
             &CompactionCommit {
                 removed_speedboat_files: work_item.speedboat_files.file_paths.clone(),
@@ -594,7 +594,7 @@ pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkIt
             parquet_file_name
         };
 
-        let peers = STATE_PROVIDER.get_peer_clients().await;
+        let peers = crate::state_provider::StateProviderProxy::get_peer_clients().await;
         assert!(peers.len() > 0);
         let response_maybe = match peers[0].private_compaction_leader(&command).await {
             Ok(success) => success,
@@ -631,16 +631,9 @@ mod tests {
         FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY,
     };
     use crate::elastic_search_storage_schema::{FullRecord, RecordInput, SpeedboatCommitBuilder};
-    use crate::router::tests::TEST_SERVER;
     use super::list_all_tables;
 
-    #[test]
-    fn test_iceberg_catalog_list_all_tables() {
-        let test_server = &*TEST_SERVER;
-
-        test_server.run_future(test_iceberg_catalog_list_all_tables_worker());
-    }
-
+    #[tokio::test]
     async fn test_iceberg_catalog_list_all_tables_worker() {
         drop_all_tables(&"default".to_string()).await.unwrap();
 
@@ -679,13 +672,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_iceberg_compact_simple() {
-        let test_server = &*TEST_SERVER;
-
-        test_server.run_future(test_iceberg_compact_simple_worker());
-    }
-
+    #[tokio::test]
     async fn test_iceberg_compact_simple_worker() {
         drop_all_tables(&"default".to_string()).await.unwrap();
 
@@ -744,13 +731,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_iceberg_compact_okta() {
-        let test_server = &*TEST_SERVER;
-
-        test_server.run_future(test_iceberg_compact_okta_worker());
-    }
-
+    #[tokio::test]
     async fn test_iceberg_compact_okta_worker() {
         drop_all_tables(&"default".to_string()).await.unwrap();
 
@@ -806,6 +787,7 @@ mod tests {
         }
     }
 
+    #[tokio::test]
     async fn test_s3_file_io_worker() {
         drop_all_tables(&"default".to_string()).await.unwrap();
 
@@ -840,12 +822,4 @@ mod tests {
             file_io.exists("s3://default/test_input.txt").await.unwrap() == false
         );
     }
-
-    #[test]
-    fn test_s3_file_io() {
-        let test_server = &*TEST_SERVER;
-
-        test_server.run_future(test_s3_file_io_worker());
-    }
-
 }

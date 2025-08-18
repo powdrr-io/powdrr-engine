@@ -91,7 +91,7 @@ async fn determine_required_files(required_extensions: &Vec<String>, checkpoints
     }
 
     let target_checkpoint = &checkpoints[0];
-    let table_metadata = match STATE_PROVIDER.get_checkpoint(target_checkpoint.clone()).await {
+    let table_metadata = match crate::state_provider::StateProviderProxy::get_checkpoint(target_checkpoint).await {
         Ok(tmc) => {
             match tmc {
                 Some(tmc) => tmc,

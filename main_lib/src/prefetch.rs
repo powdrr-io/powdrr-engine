@@ -26,7 +26,7 @@ pub(crate) async fn perform_prefetch(required_extensions: &Vec<String>, checkpoi
         }
     }
     tracing::info!("!!!!!!!!!!!!!!!!!!!! Prefetching End !!!!!!!!!!!!!!!!!!!!!!!");
-    match STATE_PROVIDER.set_prefetch_checkpoints(checkpoints, if required_extensions.len() == 0 { None } else { Some(required_extensions[0].clone()) }).await {
+    match crate::state_provider::StateProviderProxy::set_prefetch_checkpoints(checkpoints, if required_extensions.len() == 0 { None } else { Some(required_extensions[0].clone()) }).await {
         Ok(_) => {}
         Err(e) => {
             tracing::error!("Error during prefetching: {}", e);

@@ -127,7 +127,7 @@ pub(crate) async fn call_private_sql(
 pub async fn call_peers(
     invocation: &PrivateInvocation
 ) -> Result<Vec<PrivateInvocationResult>, PeerClientError> {
-    let peer_clients: Vec<Box<dyn PeerClient>> = STATE_PROVIDER.get_peer_clients().await;
+    let peer_clients: Vec<Box<dyn PeerClient>> = crate::state_provider::StateProviderProxy::get_peer_clients().await;
 
     let all_calls = peer_clients.iter().enumerate().map(
         |(index, client)| call_private_sql(client.as_ref(), invocation, index as u64, peer_clients.len() as u64));

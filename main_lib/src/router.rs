@@ -352,7 +352,7 @@ pub(crate) mod tests {
     use crate::state_provider::STATE_PROVIDER;
     use crate::test_api::{CacheMode, CompactionMode, IndexingMode, PeerMode, PeerModeType, PrefetchMode, StateMode, TestProcessingMode};
 
-    pub(crate) static TEST_SERVER: LazyLock<TestServer> = LazyLock::new(|| TestServer::with_timeout(router(true), 1000).unwrap());
+    //pub(crate) static TEST_SERVER: LazyLock<TestServer> = LazyLock::new(|| TestServer::with_timeout(router(true), 1000).unwrap());
 
     async fn get_test_server() -> AsyncTestServer {
         let test_server = AsyncTestServer::new(router(true)).await.unwrap();
@@ -360,7 +360,7 @@ pub(crate) mod tests {
         test_server.client().put(
             "http://localhost/_test/v1/_testing_mode").mime(mime::TEXT_PLAIN).perform().await.unwrap();
 
-        STATE_PROVIDER.set_peer_mode(&PeerModeType::Testing(test_server.clone())).await;
+        crate::state_provider::StateProviderProxy::set_peer_mode(&PeerModeType::Testing(test_server.clone())).await;
 
         test_server
     }
@@ -1020,7 +1020,7 @@ pub(crate) mod tests {
         assert_eq!(response.status(), 200);
 
         let process_work_response = test_server.client().put(
-            "http://localhost/_test/v1/_process_work").mime(mime::TEXT_PLAIN).perform().await.unwrap();
+            "http://localhost/_test/v1/_process_work").body(snapshot_id.to_string()).mime(mime::TEXT_PLAIN).perform().await.unwrap();
 
         assert_eq!(process_work_response.status(), 200);
 
@@ -1104,7 +1104,7 @@ pub(crate) mod tests {
 
         test_server.client().put("http://localhost/_test/v1/_testing_mode").body("").mime(mime::TEXT_PLAIN).perform().await.unwrap();
 
-        STATE_PROVIDER.set_peer_mode(&PeerModeType::Testing(test_server.clone())).await;
+        crate::state_provider::StateProviderProxy::set_peer_mode(&PeerModeType::Testing(test_server.clone())).await;
 
         let body_create_index = r#"{
             "settings" : {

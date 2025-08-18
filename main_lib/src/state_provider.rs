@@ -1,5 +1,7 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::sync::mpsc::RecvError;
+use std::sync::RwLock;
 use tokio::sync::{mpsc, oneshot};
 use crate::{distributed_cache, peers::CheckpointDescriptor, pipeline::PipelineDefinition};
 use crate::data_contract::{CleanupCommit, CleanupWorkItem, CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
@@ -7,6 +9,7 @@ use crate::distributed_cache::set_redis_address;
 use crate::dynamodb_state_provider::DynamoDbStateProvider;
 use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
+use crate::elastic_search_pipeline::create_pipeline;
 use crate::ephemeral_state_provider::EphemeralStateProvider;
 use crate::leaderless_state_provider::LeaderlessStateProvider;
 use crate::peers::{PeerClient, PeerProvider};
@@ -494,9 +497,13 @@ impl StateProvider {
 }
 
 
-#[derive(Clone)]
 pub struct StateProviderHandle {
     sender: mpsc::Sender<StateProviderActorMessage>,
+}
+
+
+struct ActorError {
+    message: String
 }
 
 
@@ -507,9 +514,13 @@ macro_rules! send_message {
             let msg = StateProviderActorMessage::$message_type {
                 respond_to: send,
             };
-            let _ = $self.sender.send(msg).await;
-            // TODO: deal with errors
-            recv.await.expect("Actor task has been killed")
+            match $self.sender.send(msg).await {
+                Ok(_) => match recv.await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(ActorError { message: format!("Error receiving message: {:?}", e) })
+                }
+                Err(e) => Err(ActorError { message: format!("Error sending message: {:?}", e) })
+            }
         }
     };
 
@@ -520,22 +531,31 @@ macro_rules! send_message {
                 respond_to: send,
                 $field: $value
             };
-            let _ = $self.sender.send(msg).await;
-            // TODO: deal with errors
-            recv.await.expect("Actor task has been killed")
+            match $self.sender.send(msg).await {
+                Ok(_) => match recv.await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(ActorError { message: format!("Error receiving message: {:?}", e) })
+                }
+                Err(e) => Err(ActorError { message: format!("Error sending message: {:?}", e) })
+            }
         }
     };
 
     ($self:expr, $message_type:tt, $field1:ident = $value1:expr, $field2:ident = $value2:expr) => {
         {
             let (send, recv) = oneshot::channel();
-            let _ = $self.sender.send(StateProviderActorMessage::$message_type {
+            let msg = StateProviderActorMessage::$message_type {
                 respond_to: send,
                 $field1: $value1,
                 $field2: $value2
-            }).await;
-            // TODO: deal with errors
-            recv.await.expect("Actor task has been killed")
+            };
+            match $self.sender.send(msg).await {
+                Ok(_) => match recv.await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(ActorError { message: format!("Error receiving message: {:?}", e) })
+                }
+                Err(e) => Err(ActorError { message: format!("Error sending message: {:?}", e) })
+            }
         }
     };
 
@@ -550,117 +570,283 @@ impl StateProviderHandle {
         Self { sender }
     }
 
-    pub async fn set_testing_mode(&self, mode: &TestProcessingMode) -> () {
-        send_message!(self, SetMode, mode = mode.clone());
+    pub async fn set_testing_mode(&self, mode: &TestProcessingMode) -> Result<(), ActorError> {
+        send_message!(self, SetMode, mode = mode.clone())
     }
 
-    pub async fn set_peer_mode(&self, mode: &PeerModeType) -> () {
-        send_message!(self, SetPeerMode, mode = mode.clone());
+    pub async fn set_peer_mode(&self, mode: &PeerModeType) -> Result<(), ActorError> {
+        send_message!(self, SetPeerMode, mode = mode.clone())
     }
 
-    pub async fn create_pipeline(&self, name: &String, pipeline: &PipelineDefinition) -> Result<bool, ServiceApiError> {
+    pub async fn create_pipeline(&self, name: &String, pipeline: &PipelineDefinition) -> Result<Result<bool, ServiceApiError>, ActorError> {
         send_message!(self, CreatePipeline, name = name.clone(), pipeline = pipeline.clone())
     }
 
-    pub async fn describe_pipeline(&self, name: &String) -> Result<Option<PipelineDefinition>, ServiceApiError> {
+    pub async fn describe_pipeline(&self, name: &String) -> Result<Result<Option<PipelineDefinition>, ServiceApiError>, ActorError> {
         send_message!(self, DescribePipeline, name = name.clone())
     }
 
-    pub async fn create_lifetime_policy(&self, name: &String, policy: &ILMPolicyDefinition) -> Result<bool, ServiceApiError> {
+    pub async fn create_lifetime_policy(&self, name: &String, policy: &ILMPolicyDefinition) -> Result<Result<bool, ServiceApiError>, ActorError> {
         send_message!(self, CreateLifetimePolicy, name = name.clone(), policy = policy.clone())
     }
 
-    pub async fn describe_lifetime_policy(&self, name: &String) -> Result<Option<ILMPolicyDefinition>, ServiceApiError> {
+    pub async fn describe_lifetime_policy(&self, name: &String) -> Result<Result<Option<ILMPolicyDefinition>, ServiceApiError>, ActorError> {
         send_message!(self, DescribeLifetimePolicy, name = name.clone())
     }
 
-    pub async fn create_table(&self, create_table: &CreateTable) -> Result<bool, ServiceApiError> {
+    pub async fn create_table(&self, create_table: &CreateTable) -> Result<Result<bool, ServiceApiError>, ActorError> {
         send_message!(self, CreateTable, create_table = create_table.clone())
     }  
 
-    pub async fn describe_table(&self, table_name: &String) -> Result<Option<TableDescription>, ServiceApiError> {
+    pub async fn describe_table(&self, table_name: &String) -> Result<Result<Option<TableDescription>, ServiceApiError>, ActorError> {
         send_message!(self, DescribeTable, name = table_name.clone())
     } 
 
-    pub async fn add_alias(&self, table_name: &String, alias: &String) -> Result<bool, ServiceApiError> {
+    pub async fn add_alias(&self, table_name: &String, alias: &String) -> Result<Result<bool, ServiceApiError>, ActorError> {
         send_message!(self, AddAlias, table_name = table_name.clone(), alias = alias.clone())
     }  
 
-    pub async fn remove_alias(&self, table_name: &String, alias: &String) -> Result<bool, ServiceApiError> {
+    pub async fn remove_alias(&self, table_name: &String, alias: &String) -> Result<Result<bool, ServiceApiError>, ActorError> {
         send_message!(self, RemoveAlias, table_name = table_name.clone(), alias = alias.clone())
     }         
 
-    pub async fn create_table_template(&self, name: &String, template: &CreateIndexTemplateBody) -> Result<bool, ServiceApiError> {
+    pub async fn create_table_template(&self, name: &String, template: &CreateIndexTemplateBody) -> Result<Result<bool, ServiceApiError>, ActorError> {
         send_message!(self, CreateTableTemplate, name = name.clone(), template = template.clone())
     }  
 
-    pub async fn describe_table_template(&self, table_name: &String) -> Result<Option<CreateIndexTemplateBody>, ServiceApiError> {
+    pub async fn describe_table_template(&self, table_name: &String) -> Result<Result<Option<CreateIndexTemplateBody>, ServiceApiError>, ActorError> {
         send_message!(self, DescribeTableTemplate, name = table_name.clone())
     }     
 
-    pub async fn add_checkpoint(&self, checkpoint: &TableMetadataCheckpoint) -> () {
+    pub async fn add_checkpoint(&self, checkpoint: &TableMetadataCheckpoint) -> Result<(), ActorError> {
         send_message!(self, AddCheckpoint, checkpoint = checkpoint.clone())
     }
 
-    pub async fn iceberg_commit(&self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<bool, ServiceApiError> {
+    pub async fn iceberg_commit(&self, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<Result<bool, ServiceApiError>, ActorError> {
         send_message!(self, IcebergCommit, table_name = table_name.clone(), iceberg_commit = iceberg_commit.clone())
     }
 
-    pub async fn speedboat_commit(&self, speedboat_commit: &SpeedboatCommit) -> Result<bool, ServiceApiError> {
+    pub async fn speedboat_commit(&self, speedboat_commit: &SpeedboatCommit) -> Result<Result<bool, ServiceApiError>, ActorError> {
         send_message!(self, SpeedboatCommit, speedboat_commit = speedboat_commit.clone())
     }
 
-    pub async fn extension_commit(&self, table_name: &String, extension_commit: &ExtensionCommit) -> Result<bool, ServiceApiError> {
+    pub async fn extension_commit(&self, table_name: &String, extension_commit: &ExtensionCommit) -> Result<Result<bool, ServiceApiError>, ActorError> {
         send_message!(self, ExtensionCommit, table_name = table_name.clone(), extension_commit = extension_commit.clone())
     }
 
-    pub async fn compaction_commit(&self, table_name: &String, compaction_commit: &CompactionCommit) -> Result<bool, ServiceApiError> {
+    pub async fn compaction_commit(&self, table_name: &String, compaction_commit: &CompactionCommit) -> Result<Result<bool, ServiceApiError>, ActorError> {
         send_message!(self, CompactionCommit, table_name = table_name.clone(), compaction_commit = compaction_commit.clone())
     }
 
-    pub async fn cleanup_commit(&self, cleanup_commit: &CleanupCommit) -> Result<bool, ServiceApiError> {
+    pub async fn cleanup_commit(&self, cleanup_commit: &CleanupCommit) -> Result<Result<bool, ServiceApiError>, ActorError> {
         send_message!(self, CleanupCommit, cleanup_commit = cleanup_commit.clone())
     }
 
-    pub async fn get_latest_checkpoint(&self, table_name: &String, extension: Option<String>) -> Result<Option<String>, ServiceApiError> {
+    pub async fn get_latest_checkpoint(&self, table_name: &String, extension: Option<String>) -> Result<Result<Option<String>, ServiceApiError>, ActorError> {
         send_message!(self, GetLatestCommittedCheckpoint, table_name = table_name.clone(), extensions = extension.clone())
     }
 
-    pub async fn get_checkpoint(&self, checkpoint: CheckpointDescriptor) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
+    pub async fn get_checkpoint(&self, checkpoint: CheckpointDescriptor) -> Result<Result<Option<TableMetadataCheckpoint>, ServiceApiError>, ActorError> {
         send_message!(self, GetCheckpoint, checkpoint = checkpoint.clone())
     }
 
-    pub async fn update_all_checkpoints(&self) -> Result<bool, ServiceApiError> {
+    pub async fn update_all_checkpoints(&self) -> Result<Result<bool, ServiceApiError>, ActorError> {
         send_message!(self, UpdateAllCheckpoints)
     }
 
-    pub async fn get_extension_work_items(&self, extension_type: &String) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {
+    pub async fn get_extension_work_items(&self, extension_type: &String) -> Result<Result<Vec<ExtensionWorkItem>, ServiceApiError>, ActorError> {
         send_message!(self, GetExtensionWorkItems, extension_type = extension_type.clone())
     }
 
-    pub async fn get_compaction_work_items(&self) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
+    pub async fn get_compaction_work_items(&self) -> Result<Result<Vec<(String, CompactionWorkItem)>, ServiceApiError>, ActorError> {
         send_message!(self, GetCompactionWorkItems)
     }
 
-    pub async fn get_cleanup_work_items(&self) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
+    pub async fn get_cleanup_work_items(&self) -> Result<Result<Vec<CleanupWorkItem>, ServiceApiError>, ActorError> {
         send_message!(self, GetCleanupWorkItems)
     }
 
-    pub async fn get_peer_clients(&self) -> Vec<Box<dyn PeerClient>> {
+    pub async fn get_peer_clients(&self) -> Result<Vec<Box<dyn PeerClient>>, ActorError> {
         send_message!(self, GetPeerClients)
     }
 
-    pub async fn get_latest_target_checkpoint(&self, table_name: &String, extension: Option<String>) -> Result<Option<String>, ServiceApiError> {
+    pub async fn get_latest_target_checkpoint(&self, table_name: &String, extension: Option<String>) -> Result<Result<Option<String>, ServiceApiError>, ActorError> {
         send_message!(self, GetLatestTargetCheckpoint, table_name = table_name.clone(), extensions = extension.clone())
     }
 
-    pub async fn get_next_prefetch_checkpoints(&self, extension: Option<String>) -> Result<Vec<CheckpointDescriptor>, ServiceApiError> {
+    pub async fn get_next_prefetch_checkpoints(&self, extension: Option<String>) -> Result<Result<Vec<CheckpointDescriptor>, ServiceApiError>, ActorError> {
         send_message!(self, GetNextPrefetchCheckpoints, extensions = extension.clone())
     }
 
-    pub async fn set_prefetch_checkpoints(&self, checkpoints: &Vec<CheckpointDescriptor>, extension: Option<String>) -> Result<(), ServiceApiError> {
+    pub async fn set_prefetch_checkpoints(&self, checkpoints: &Vec<CheckpointDescriptor>, extension: Option<String>) -> Result<Result<(), ServiceApiError>, ActorError> {
         send_message!(self, SetTargetCheckpoints, checkpoints = checkpoints.clone(), extensions = extension.clone())
     }
 }
 
-pub static STATE_PROVIDER: std::sync::LazyLock<StateProviderHandle> = std::sync::LazyLock::new(|| StateProviderHandle::new());
+
+macro_rules! call_provider {
+    ($method_name:tt) => {
+        loop
+        {
+            match STATE_PROVIDER.read().unwrap().$method_name().await {
+                Ok(result) => {
+                    return result;
+                },
+                Err(_e) => {
+                    tracing::info!("Error calling state provider, attempting recreation");
+                    *(STATE_PROVIDER.write().unwrap()) = StateProviderHandle::new();
+                }
+            }
+        }
+    };
+
+    ($method_name:tt, $param:expr) => {
+        loop
+        {
+            match STATE_PROVIDER.read().unwrap().$method_name($param).await {
+                Ok(result) => {
+                    return result;
+                },
+                Err(_e) => {
+                    tracing::info!("Error calling state provider, attempting recreation");
+                    *(STATE_PROVIDER.write().unwrap()) = StateProviderHandle::new();
+                }
+            }
+        }
+    };
+
+    ($method_name:tt, $param:expr, $param2:expr) => {
+        loop
+        {
+            match STATE_PROVIDER.read().unwrap().$method_name($param, $param2).await {
+                Ok(result) => {
+                    return result;
+                },
+                Err(_e) => {
+                    tracing::info!("Error calling state provider, attempting recreation");
+                    *(STATE_PROVIDER.write().unwrap()) = StateProviderHandle::new();
+                }
+            }
+        }
+    };
+}
+
+
+pub(crate) struct StateProviderProxy {}
+
+impl StateProviderProxy {
+    pub async fn set_testing_mode(mode: &TestProcessingMode) -> () {
+        call_provider!(set_testing_mode, mode)
+    }
+
+    pub async fn set_peer_mode(mode: &PeerModeType) -> () {
+        call_provider!(set_peer_mode, mode)
+    }
+
+    pub async fn create_pipeline(name: &String, pipeline: &PipelineDefinition) -> Result<bool, ServiceApiError> {
+        call_provider!(create_pipeline, name, pipeline)
+    }
+
+    pub async fn describe_pipeline(name: &String) -> Result<Option<PipelineDefinition>, ServiceApiError> {
+        call_provider!(describe_pipeline, name)
+    }
+
+    pub async fn create_lifetime_policy(name: &String, policy: &ILMPolicyDefinition) -> Result<bool, ServiceApiError> {
+        call_provider!(create_lifetime_policy, name, policy)
+    }
+
+    pub async fn describe_lifetime_policy(name: &String) -> Result<Option<ILMPolicyDefinition>, ServiceApiError> {
+        call_provider!(describe_lifetime_policy, name)
+    }
+
+    pub async fn create_table(create_table: &CreateTable) -> Result<bool, ServiceApiError> {
+        call_provider!(create_table, create_table)
+    }
+
+    pub async fn describe_table(table_name: &String) -> Result<Option<TableDescription>, ServiceApiError> {
+        call_provider!(describe_table, table_name)
+    }
+
+    pub async fn add_alias(table_name: &String, alias: &String) -> Result<bool, ServiceApiError> {
+        call_provider!(add_alias, table_name, alias)
+    }
+
+    pub async fn remove_alias(table_name: &String, alias: &String) -> Result<bool, ServiceApiError> {
+        call_provider!(remove_alias, table_name, alias)
+    }
+
+    pub async fn create_table_template(name: &String, template: &CreateIndexTemplateBody) -> Result<bool, ServiceApiError> {
+        call_provider!(create_table_template, name, template)
+    }
+
+    pub async fn describe_table_template(table_name: &String) -> Result<Option<CreateIndexTemplateBody>, ServiceApiError> {
+        call_provider!(describe_table_template, table_name)
+    }
+
+    pub async fn add_checkpoint(checkpoint: &TableMetadataCheckpoint) -> () {
+        call_provider!(add_checkpoint, checkpoint)
+    }
+
+    pub async fn iceberg_commit(table_name: &String, iceberg_commit: &IcebergCommit) -> Result<bool, ServiceApiError> {
+        call_provider!(iceberg_commit, table_name, iceberg_commit)
+    }
+
+    pub async fn speedboat_commit(speedboat_commit: &SpeedboatCommit) -> Result<bool, ServiceApiError> {
+        call_provider!(speedboat_commit, speedboat_commit)
+    }
+
+    pub async fn extension_commit(table_name: &String, extension_commit: &ExtensionCommit) -> Result<bool, ServiceApiError> {
+        call_provider!(extension_commit, table_name, extension_commit)
+    }
+
+    pub async fn compaction_commit(table_name: &String, compaction_commit: &CompactionCommit) -> Result<bool, ServiceApiError> {
+        call_provider!(compaction_commit, table_name, compaction_commit)
+    }
+
+    pub async fn cleanup_commit(cleanup_commit: &CleanupCommit) -> Result<bool, ServiceApiError> {
+        call_provider!(cleanup_commit, cleanup_commit)
+    }
+
+    pub async fn get_latest_checkpoint(table_name: &String, extension: Option<String>) -> Result<Option<String>, ServiceApiError> {
+        call_provider!(get_latest_checkpoint, table_name, extension.clone())
+    }
+
+    pub async fn get_checkpoint(checkpoint: &CheckpointDescriptor) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
+        call_provider!(get_checkpoint, checkpoint.clone())
+    }
+
+    pub async fn update_all_checkpoints() -> Result<bool, ServiceApiError> {
+        call_provider!(update_all_checkpoints)
+    }
+
+    pub async fn get_extension_work_items(extension_type: &String) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {
+        call_provider!(get_extension_work_items, extension_type)
+    }
+
+    pub async fn get_compaction_work_items() -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
+        call_provider!(get_compaction_work_items)
+    }
+
+    pub async fn get_cleanup_work_items() -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
+        call_provider!(get_cleanup_work_items)
+    }
+
+    pub async fn get_peer_clients() -> Vec<Box<dyn PeerClient>> {
+        call_provider!(get_peer_clients)
+    }
+
+    pub async fn get_latest_target_checkpoint(table_name: &String, extension: Option<String>) -> Result<Option<String>, ServiceApiError> {
+        call_provider!(get_latest_target_checkpoint, table_name, extension.clone())
+    }
+
+    pub async fn get_next_prefetch_checkpoints(extension: Option<String>) -> Result<Vec<CheckpointDescriptor>, ServiceApiError> {
+        call_provider!(get_next_prefetch_checkpoints, extension.clone())
+    }
+
+    pub async fn set_prefetch_checkpoints(checkpoints: &Vec<CheckpointDescriptor>, extension: Option<String>) -> Result<(), ServiceApiError> {
+        call_provider!(set_prefetch_checkpoints, checkpoints, extension.clone())
+    }
+}
+
+
+pub static STATE_PROVIDER: std::sync::LazyLock<RwLock<StateProviderHandle>> = std::sync::LazyLock::new(|| RwLock::new(StateProviderHandle::new()));

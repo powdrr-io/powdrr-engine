@@ -130,7 +130,7 @@ fn create_store() -> Arc<AmazonS3> {
         .with_endpoint(S3_ENDPOINT_VALUE)
         .with_bucket_name("warehouse")
         .with_allow_http(true)
-        .with_http_connector(SpawnedReqwestConnector::new(io_runtime))
+        //.with_http_connector(SpawnedReqwestConnector::new(io_runtime))
         .build().unwrap();
 
     Arc::new(s3_file_system)
