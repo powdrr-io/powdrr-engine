@@ -28,8 +28,8 @@ use crate::elastic_search_endpoints::QueryStringAliases;
 use crate::elastic_search_endpoints::QueryStringClusterSettings;
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::private_api;
-use crate::peers::{PrivateExtensionInvocationExternal, PrivateSqlInvocationExternal};
-use crate::private_api::extension_query;
+use crate::peers::{PrivateCompactionInvocationExternal, PrivateExtensionInvocationExternal, PrivatePrefetchInvocationExternal, PrivateSqlInvocationExternal};
+use crate::private_api::{compaction_query, extension_query, prefetch_query};
 use crate::test_api::test_v1_add_checkpoint;
 use crate::test_api::test_v1_create_index;
 use crate::test_api::test_v1_process_work;
@@ -89,9 +89,58 @@ pub fn private_v1_extension(mut state: State) -> Pin<Box<HandlerFuture>> {
     }.boxed()
 }
 
+pub fn private_v1_prefetch(mut state: State) -> Pin<Box<HandlerFuture>> {
+    async move {
+        let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
+            Ok(vb) => vb,
+            Err(_) => panic!("Oh no"),
+        };
+        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+        let command: PrivatePrefetchInvocationExternal = match serde_json::from_str(&body_content) {
+            Ok(io) => io,
+            Err(_) => panic!("This should not happen"),
+        };
+        match prefetch_query(&command.invocation, command.index, command.num).await {
+            Ok(success) => {
+                let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, "");
+                Ok((state, res))
+            },
+            Err(error) => {
+                let error_message = format!("{}", error);
+                let res = create_response(&state, StatusCode::BAD_REQUEST, mime::TEXT_PLAIN, error_message);
+                Ok((state, res))
+            }
+        }
+    }.boxed()
+}
 
 
 pub fn private_v1_compact(mut state: State) -> Pin<Box<HandlerFuture>> {
+    async move {
+        let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
+            Ok(vb) => vb,
+            Err(_) => panic!("Oh no"),
+        };
+        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+        let command: PrivateCompactionInvocationExternal = match serde_json::from_str(&body_content) {
+            Ok(io) => io,
+            Err(_) => panic!("This should not happen"),
+        };
+        match compaction_query(&command.invocation, command.index, command.num).await {
+            Ok(success) => {
+                let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, serde_json::to_string(&success.result).unwrap());
+                Ok((state, res))
+            },
+            Err(error) => {
+                let error_message = format!("{}", error);
+                let res = create_response(&state, StatusCode::BAD_REQUEST, mime::TEXT_PLAIN, error_message);
+                Ok((state, res))
+            }
+        }
+    }.boxed()
+}
+
+pub fn private_v1_compact_leader(mut state: State) -> Pin<Box<HandlerFuture>> {
     async move {
         let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
             Ok(vb) => vb,
@@ -184,7 +233,9 @@ pub fn router(include_test_apis: bool) -> Router {
             route.scope("/v1", |route| {
                 route.post("/_sql").to(private_v1_sql);
                 route.post("/_compact").to(private_v1_compact);
+                route.post("/_compact_leader").to(private_v1_compact_leader);
                 route.post("/_extension").to(private_v1_extension);
+                route.post("/_prefetch").to(private_v1_prefetch);
             })
         });
 
@@ -1031,24 +1082,13 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn test_es_ingest_search_ingest_compact_then_search_table() {
-        let test_server = &*TEST_SERVER;
+    #[tokio::test]
+    async fn test_es_ingest_search_ingest_compact_then_search_table() {
+        let test_server = AsyncTestServer::new(router(true)).await.unwrap();
 
-        let mode = TestProcessingMode {
-            state_mode: StateMode::Testing,
-            cache_mode: CacheMode::Redis(None),
-            peer_mode: PeerMode::SelfOnly,
-            indexing_mode: IndexingMode::Async,
-            compaction_mode: CompactionMode::Async(Some(1)),
-            prefetch_mode: PrefetchMode::Disabled,
-        };
+        test_server.client().put("http://localhost/_test/v1/_testing_mode").body("").mime(mime::TEXT_PLAIN).perform().await.unwrap();
 
-        test_server.client().put(
-            "http://localhost/_test/v1/_testing_mode",
-            serde_json::to_string(&mode).unwrap(),
-            mime::TEXT_PLAIN
-        ).perform().unwrap();
+        STATE_PROVIDER.set_peer_mode(&PeerModeType::Testing(test_server.clone())).await;
 
         let body_create_index = r#"{
             "settings" : {
@@ -1058,10 +1098,7 @@ pub(crate) mod tests {
             } } }"#;
         
         let response_create_index = test_server.client().put(
-            "http://localhost/logs",
-            body_create_index,
-            mime::APPLICATION_JSON,
-        ).perform().unwrap();  
+            "http://localhost/logs").body(body_create_index).mime(mime::APPLICATION_JSON).perform().await.unwrap();
 
         assert_eq!(response_create_index.status(), 200);           
 
@@ -1073,21 +1110,15 @@ pub(crate) mod tests {
 { "@timestamp": "2099-03-09T11:07:08.000Z", "index_col": 3, "user": { "id": "l7gk7f82" }, "message": "Logout successful" }"#;
 
         let response = test_server.client().post(
-            "http://localhost/_bulk",
-            body,
-            mime::APPLICATION_JSON,
-        ).perform().unwrap();
+            "http://localhost/_bulk").body(body).mime(mime::APPLICATION_JSON).perform().await.unwrap();
 
         assert_eq!(response.status(), 200);
 
         let process_work_response = test_server.client().put(
-            "http://localhost/_test/v1/_process_work",
-            "",
-            mime::TEXT_PLAIN,
-        ).perform().unwrap();
+            "http://localhost/_test/v1/_process_work").body("").mime(mime::TEXT_PLAIN).perform().await.unwrap();
 
         assert_eq!(process_work_response.status(), 200);
-        let body = process_work_response.read_body().unwrap();
+        let body = process_work_response.read_body().await.unwrap();
         let str_body = str::from_utf8(&body).unwrap();
         let snapshot_id = str_body.parse::<u64>().unwrap();
 
@@ -1103,15 +1134,12 @@ pub(crate) mod tests {
         }"#;
 
         let response_result = test_server.client().post(
-            "http://localhost/logs/_search",
-            body_obj,
-            mime::APPLICATION_JSON,
-        ).perform();
+            "http://localhost/logs/_search").body(body_obj).mime(mime::APPLICATION_JSON).perform().await;
 
         match response_result {
             Ok(response) => {
                 assert_eq!(response.status(), 200);
-                let body = response.read_body().unwrap();
+                let body = response.read_body().await.unwrap();
                 let str_body = str::from_utf8(&body).unwrap();
                 let json_body: serde_json::Value = serde_json::from_str(&str_body).unwrap();
                 let hits = json_body["hits"]["hits"].as_array().unwrap();
@@ -1130,31 +1158,22 @@ pub(crate) mod tests {
 { "@timestamp": "2099-03-09T11:07:08.000Z", "index_col": 6, "user": { "id": "l7gk7f82" }, "message": "2 Logout successful" }"#;
 
         let response = test_server.client().post(
-            "http://localhost/_bulk",
-            body2,
-            mime::APPLICATION_JSON,
-        ).perform().unwrap();
+            "http://localhost/_bulk").body(body2).mime(mime::APPLICATION_JSON).perform().await.unwrap();
 
         assert_eq!(response.status(), 200);
 
         let process_work_response = test_server.client().put(
-            "http://localhost/_test/v1/_process_work",
-            snapshot_id.to_string(),
-            mime::TEXT_PLAIN,
-        ).perform().unwrap();
+            "http://localhost/_test/v1/_process_work").body("").mime(mime::TEXT_PLAIN).perform().await.unwrap();
 
         assert_eq!(process_work_response.status(), 200);
 
         let response_result = test_server.client().post(
-            "http://localhost/logs/_search",
-            body_obj,
-            mime::APPLICATION_JSON,
-        ).perform();
+            "http://localhost/logs/_search").body(body_obj).mime(mime::APPLICATION_JSON).perform().await;
 
         match response_result {
             Ok(response) => {
                 assert_eq!(response.status(), 200);
-                let body = response.read_body().unwrap();
+                let body = response.read_body().await.unwrap();
                 let str_body = str::from_utf8(&body).unwrap();
                 let json_body: serde_json::Value = serde_json::from_str(&str_body).unwrap();
                 let hits = json_body["hits"]["hits"].as_array().unwrap();

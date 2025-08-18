@@ -112,12 +112,19 @@ pub struct PrivateSqlInvocationExternal {
 }
 
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct PrivateCompactionInvocation {
     pub sql: SqlQuery,
     pub speedboat_files: FileSetPayload,
     pub table_schema: PowdrrSchema,
     pub delete_files: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PrivateCompactionInvocationExternal {
+    pub invocation: PrivateCompactionInvocation,
+    pub index: u64,
+    pub num: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -134,12 +141,18 @@ pub struct PrivateExtensionInvocationExternal {
     pub num: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct PrivatePrefetchInvocation {
     pub required_extensions: Vec<String>,
     pub checkpoints: Vec<CheckpointDescriptor>,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct PrivatePrefetchInvocationExternal {
+    pub invocation: PrivatePrefetchInvocation,
+    pub index: u64,
+    pub num: u64,
+}
 
 #[derive(Serialize)]
 pub struct PrivateMetadataInvocation {
@@ -352,8 +365,33 @@ impl PeerClient for TestingRemotePeer {
         }
     }
 
-    async fn private_compaction(&self, _invocation: &PrivateCompactionInvocation, _index: u64, _num: u64) -> Result<Vec<RecordBatch>, PeerClientError> {
-        todo!()
+    async fn private_compaction(&self, invocation: &PrivateCompactionInvocation, index: u64, num: u64) -> Result<Vec<RecordBatch>, PeerClientError> {
+        let invocation_obj = PrivateCompactionInvocationExternal {
+            invocation: invocation.clone(),
+            index,
+            num,
+        };
+        let body = match serde_json::to_string(&invocation_obj) {
+            Ok(b) => b,
+            Err(_) => {
+                panic!("Malformed request")
+            }
+        };
+
+        let resp = self.server.client().post(
+            "http://localhost/_private/v1/_compact").body(body).mime(mime::APPLICATION_JSON).perform().await;
+
+        match resp {
+            Ok(res) => {
+                assert!(res.status().is_success());
+                let body = res.read_body().await.unwrap();
+                Ok(result_to_record_batch(serde_json::from_slice(&body).unwrap()).await)
+            },
+            Err(e) => {
+                Err(PeerClientError { message: format!("Error: {}", e) })
+            }
+        }
+
     }
 
     async fn private_extension(&self, invocation: &PrivateExtensionInvocation, index: u64, num: u64) -> Result<ExtensionFileMetadata, PeerClientError> {
@@ -384,14 +422,45 @@ impl PeerClient for TestingRemotePeer {
         }
     }
 
-    async fn private_prefetch(&self, _invocation: &PrivatePrefetchInvocation, _index: u64, _num: u64) -> Result<(), PeerClientError> {
-        todo!()
+    async fn private_prefetch(&self, invocation: &PrivatePrefetchInvocation, index: u64, num: u64) -> Result<(), PeerClientError> {
+        let invocation_obj = PrivatePrefetchInvocationExternal {
+            invocation: invocation.clone(),
+            index,
+            num,
+        };
+        let body = match serde_json::to_string(&invocation_obj) {
+            Ok(b) => b,
+            Err(_) => {
+                panic!("Malformed request")
+            }
+        };
+
+        let resp = self.server.client().post(
+            "http://localhost/_private/v1/_prefetch").body(body).mime(mime::APPLICATION_JSON).perform().await;
+
+        match resp {
+            Ok(res) => {
+                assert!(res.status().is_success());
+                Ok(())
+            },
+            Err(e) => {
+                Err(PeerClientError { message: format!("Error: {}", e) })
+            }
+        }
     }
 
-    async fn private_compaction_leader(&self, _invocation: &CompactionCommand) -> Result<Option<CompactionResponse>, PeerClientError> {
-        todo!()
-    }
+    async fn private_compaction_leader(&self, invocation: &CompactionCommand) -> Result<Option<CompactionResponse>, PeerClientError> {
+        let res = self.server.client().post(
+            "http://localhost/_private/v1/_compact_leader").body(serde_json::to_string(&invocation).unwrap()).mime(mime::APPLICATION_JSON).perform().await.unwrap();
 
+        assert!(res.status().is_success());
+
+        let response_bytes = res.read_body().await.unwrap();
+        let response_str = String::from_utf8(response_bytes).unwrap();
+
+        let response = serde_json::from_str::<CompactionResponse>(response_str.as_str()).unwrap();
+        Ok(Some(response))
+    }
     /*
         async fn private_metadata(&self, invocation: &PrivateMetadataInvocation) -> Result<String, PeerClientError> {
             let address = &self.address;
@@ -616,7 +685,7 @@ impl PeerClient for SelfPeer {
             CompactionMode::External(compaction_leader) => {
                 let client = Client::new();
 
-                let res = match client.post(format!("{}/_private/v1/_compact", compaction_leader))
+                let res = match client.post(format!("{}/_private/v1/_compact_leader", compaction_leader))
                     .body(serde_json::to_string(&invocation).unwrap())
                     .send().await {
                     Ok(res) => res,
