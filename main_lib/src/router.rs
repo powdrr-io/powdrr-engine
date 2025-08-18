@@ -101,7 +101,7 @@ pub fn private_v1_prefetch(mut state: State) -> Pin<Box<HandlerFuture>> {
             Err(_) => panic!("This should not happen"),
         };
         match prefetch_query(&command.invocation, command.index, command.num).await {
-            Ok(success) => {
+            Ok(_success) => {
                 let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, "");
                 Ok((state, res))
             },

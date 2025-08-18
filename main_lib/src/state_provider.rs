@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use tokio::sync::{mpsc, oneshot};
-use crate::{distributed_cache, peers::CheckpointDescriptor, pipeline::PipelineDefinition};
+use crate::{data_access, distributed_cache, peers::CheckpointDescriptor, pipeline::PipelineDefinition};
 use crate::data_contract::{CleanupCommit, CleanupWorkItem, CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
 use crate::distributed_cache::set_redis_address;
 use crate::dynamodb_state_provider::DynamoDbStateProvider;
@@ -10,7 +10,7 @@ use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::ephemeral_state_provider::EphemeralStateProvider;
 use crate::leaderless_state_provider::LeaderlessStateProvider;
 use crate::peers::{PeerClient, PeerProvider};
-use crate::test_api::{CacheMode, CompactionMode, IndexingMode, PeerModeType, StateMode, TestProcessingMode};
+use crate::test_api::{CacheMode, CompactionMode, IndexingMode, PeerModeType, StateMode, StorageMode, TestProcessingMode};
 
 
 #[derive(Debug, Clone)]
@@ -265,6 +265,12 @@ impl StateProviderActor {
                             ))
                     },
                 }
+                match &mode.storage_mode {
+                    StorageMode::S3 { endpoint } => {
+                        data_access::set_s3_endpoint(endpoint).await
+                    }
+                }
+
                 self.peer_provider.set_mode(mode.peer_mode.to_peer_mode_type());
                 respond_to.send(()).unwrap();
             },

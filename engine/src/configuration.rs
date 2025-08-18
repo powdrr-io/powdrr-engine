@@ -39,7 +39,7 @@ pub(crate) fn get_operating_mode(_command_line_args: &Vec<String>) -> OperatingM
         "docker" => {
             OperatingMode {
                 peer_detection: PeerDetectionMode::Docker,
-                testing_enabled: false,
+                testing_enabled: true,
                 port
             }
         },
@@ -59,6 +59,7 @@ pub(crate) async fn perform_updates(mode: &OperatingMode) -> () {
         },
         PeerDetectionMode::Docker => {
             let peers = get_docker_peer_ips().await;
+            println!("Peers: {:?}", peers);
             STATE_PROVIDER.set_peer_mode(&PeerModeType::Remote(peers)).await;
         }
     }
