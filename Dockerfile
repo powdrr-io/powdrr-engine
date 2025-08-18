@@ -14,35 +14,31 @@ FROM rust:${RUST_VERSION}-slim-bullseye AS build
 RUN apt update && apt install -y libssl-dev pkg-config
 RUN update-ca-certificates
 
-COPY Cargo.toml Cargo.lock /app/
-
-RUN cargo new /app/benchmark
-COPY benchmark/Cargo.toml /app/benchmark/
-RUN cargo new /app/cli
-COPY cli/Cargo.toml /app/cli/
-RUN cargo new /app/engine
-COPY engine/Cargo.toml /app/engine/
-RUN cargo new /app/service
-COPY service/Cargo.toml /app/service/
-
-RUN cargo new --lib /app/main_lib
-COPY main_lib/Cargo.toml /app/main_lib/
+#COPY Cargo.toml Cargo.lock /app/
+#
+#RUN cargo new /app/benchmark
+#COPY benchmark/Cargo.toml /app/benchmark/
+#RUN cargo new /app/cli
+#COPY cli/Cargo.toml /app/cli/
+#RUN cargo new /app/engine
+#COPY engine/Cargo.toml /app/engine/
+#RUN cargo new /app/service
+#COPY service/Cargo.toml /app/service/
+#
+#RUN cargo new --lib /app/main_lib
+#COPY main_lib/Cargo.toml /app/main_lib/
 
 WORKDIR /app
-
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target \
-    cargo build --release
+#
+#RUN --mount=type=cache,target=/usr/local/cargo/registry \
+#    --mount=type=cache,target=/usr/local/cargo/git \
+#    cargo build --release
 
 COPY . .
 
 ARG TARGET
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target \
-    cargo build --release && \
+RUN cargo build --release && \
     mv /app/target/release/${TARGET} /app
 
 

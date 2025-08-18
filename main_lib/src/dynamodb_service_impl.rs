@@ -326,8 +326,14 @@ impl DynamoDBServiceImpl {
             }
         }
         match self.connector.commit_extension_work_item_taken(&used_latest, &Self::NO_WORK_ITEM.to_string()).await.map_err(from_modyne)? {
-            true => Ok(work_items),
-            false => Ok(vec!())
+            true => {
+                tracing::info!("Extensions: returning {} items", work_items.len());
+                Ok(work_items)
+            },
+            false => {
+                tracing::info!("Extensions: returning 0 items");
+                Ok(vec!())
+            }
         }
     }
 
@@ -356,8 +362,14 @@ impl DynamoDBServiceImpl {
             }
         }
         match self.connector.commit_compaction_work_item_taken(&used_latest, &Self::NO_WORK_ITEM.to_string()).await.map_err(from_modyne)? {
-            true => Ok(work_items),
-            false => Ok(vec!())
+            true => {
+                tracing::info!("Compaction: returning {} items", work_items.len());
+                Ok(work_items)
+            },
+            false => {
+                tracing::info!("Compaction: returning 0 items");
+                Ok(vec!())
+            }
         }
     }
 
@@ -377,10 +389,17 @@ impl DynamoDBServiceImpl {
 
         if work_items.len() > 0 {
             match self.connector.commit_conditional_transaction(transaction).await.map_err(from_modyne)? {
-                true => Ok(work_items),
-                false => Ok(vec!())
+                true => {
+                    tracing::info!("Cleanup: returning {} items", work_items.len());
+                    Ok(work_items)
+                },
+                false => {
+                    tracing::info!("Cleanup: returning 0 items");
+                    Ok(vec!())
+                }
             }
         } else {
+            tracing::info!("Cleanup: returning 0 items");
             Ok(vec!())
         }
     }
@@ -425,8 +444,9 @@ impl DynamoDBServiceImpl {
         let mut compaction_work_item = None;
         if new_checkpoint.speedboat_metadata.is_some() {
             let speedboat_files = &new_checkpoint.speedboat_metadata.as_ref().unwrap().files;
-            // TODO: do the real policy here
-            let compact = speedboat_files.file_paths.len() as u64 >= 2 || speedboat_files.sizes.iter().sum::<u64>() > 30 * 1024 * 1024;
+            let num_files_threshold = self.mode.compaction_mode.threshold();
+            let compact = speedboat_files.file_paths.len() as u64 >= num_files_threshold || speedboat_files.sizes.iter().sum::<u64>() > 30 * 1024 * 1024;
+            tracing::info!("Compaction threshold: {} files, {} bytes, compact: {}", num_files_threshold, speedboat_files.sizes.iter().sum::<u64>(), compact);
             if compact {
                 let latest_compaction = self.connector.describe_latest(org_id, &Self::latest_compaction_work_item_key(table_name)).await.map_err(from_modyne)?.unwrap();
                 if latest_compaction.entity_id == Self::NO_WORK_ITEM.to_owned() {

@@ -37,6 +37,20 @@ impl StateMode {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub enum StorageMode {
+    S3 {
+        endpoint: Option<String>,
+    }
+}
+
+impl StorageMode {
+    pub fn default() -> Self {
+        Self::S3 {
+            endpoint: None
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub enum CacheMode {
@@ -127,6 +141,7 @@ impl PrefetchMode {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TestProcessingMode {
     pub state_mode: StateMode,
+    pub storage_mode: StorageMode,
     pub cache_mode: CacheMode,
     pub peer_mode: PeerMode,
     pub indexing_mode: IndexingMode,
@@ -138,6 +153,7 @@ impl TestProcessingMode {
     pub fn default() -> Self {
         Self {
             state_mode: StateMode::TestingDynamoDb(None),
+            storage_mode: StorageMode::default(),
             cache_mode: CacheMode::Redis(None),
             peer_mode: PeerMode::SelfOnly,
             indexing_mode: IndexingMode::Sync,
@@ -149,6 +165,7 @@ impl TestProcessingMode {
     pub fn dynamo_testing(address: Option<String>) -> Self {
         Self {
             state_mode: StateMode::TestingDynamoDb(address),
+            storage_mode: StorageMode::default(),
             cache_mode: CacheMode::Redis(None),
             peer_mode: PeerMode::SelfOnly,
             indexing_mode: IndexingMode::Sync,

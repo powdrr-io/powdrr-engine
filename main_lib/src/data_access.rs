@@ -1,4 +1,6 @@
 use std::{path::Path, sync::Arc};
+use std::string::ToString;
+use std::sync::{LazyLock};
 use std::time::Duration;
 use datafusion::{arrow::array::RecordBatch, error::DataFusionError, prelude::{DataFrame, NdJsonReadOptions, ParquetReadOptions, SessionContext}};
 use datafusion::arrow::datatypes::{Schema};
@@ -22,7 +24,7 @@ use crate::elastic_search_ingest::{JSON_MODE};
 use crate::util::log_err;
 
 
-const S3_ENDPOINT_VALUE: &str = "http://localhost:9000";
+const DEFAULT_S3_ENDPOINT_VALUE: &str = "http://localhost:9000";
 const S3_ACCESS_KEY_ID_VALUE: &str = "admin";
 const S3_SECRET_ACCESS_KEY_VALUE: &str = "password";
 const S3_REGION_VALUE: &str = "us-east-1";
@@ -121,13 +123,13 @@ impl CPURuntime {
 
 static CPU_RUNTIME: std::sync::LazyLock<CPURuntime> = std::sync::LazyLock::new(|| CPURuntime::try_new().unwrap());
 
-fn create_store() -> Arc<AmazonS3> {
+fn create_store(address: &String) -> Arc<AmazonS3> {
     let io_runtime = Handle::current();
     let s3_file_system: object_store::aws::AmazonS3 = AmazonS3Builder::new()
         .with_access_key_id(S3_ACCESS_KEY_ID_VALUE)
         .with_secret_access_key(S3_SECRET_ACCESS_KEY_VALUE)
         .with_region(S3_REGION_VALUE)
-        .with_endpoint(S3_ENDPOINT_VALUE)
+        .with_endpoint(address)
         .with_bucket_name("warehouse")
         .with_allow_http(true)
         .with_http_connector(SpawnedReqwestConnector::new(io_runtime))
@@ -137,10 +139,8 @@ fn create_store() -> Arc<AmazonS3> {
 }
 
 const S3_BASE_PATH: &str = "s3://warehouse";
-static S3_FILE_STORE: std::sync::LazyLock<Arc<AmazonS3>> = std::sync::LazyLock::new(|| create_store());
 
-
-fn create_session() -> SessionContext {
+fn create_session(file_store: Arc<AmazonS3>) -> SessionContext {
     let options = ConfigOptions::default();
     // UNCOMMENT TO ENABLE 'SHOW TABLES'
     //options.set("datafusion.catalog.information_schema", "true").unwrap();
@@ -165,7 +165,7 @@ fn create_session() -> SessionContext {
 
     let s3_url = Url::parse(S3_BASE_PATH).unwrap();
 
-    ctx.register_object_store(&s3_url, S3_FILE_STORE.clone());
+    ctx.register_object_store(&s3_url, file_store.clone());
 
     ctx
 }
@@ -173,6 +173,14 @@ fn create_session() -> SessionContext {
 
 #[allow(dead_code)]
 enum CacheTrackerActorMessage {
+    SetS3Config {
+        respond_to: oneshot::Sender<()>,
+        access_key_id: String,
+        secret_access_key: String,
+        region: String,
+        endpoint: String,
+        bucket_name: String,
+    },
     Reserve {
         respond_to: oneshot::Sender<()>,
         top_level_name: String,
@@ -206,6 +214,23 @@ enum CacheTrackerActorMessage {
     },
     GetTables {
         respond_to: oneshot::Sender<Vec<String>>,
+    },
+    ExecuteSql {
+        respond_to: oneshot::Sender<Result<DataFrame, DataFusionError>>,
+        sql: String,
+    },
+    FileExists {
+        respond_to: oneshot::Sender<bool>,
+        file_path: String,
+    },
+    FileDelete {
+        respond_to: oneshot::Sender<()>,
+        file_paths: Vec<String>,
+    },
+    FilePut {
+        respond_to: oneshot::Sender<Result<(), DataFusionError>>,
+        file_path: String,
+        payload: Vec<u8>,
     }
 }
 
@@ -228,10 +253,13 @@ struct CacheTrackerActor {
     reservations: HashMap<String, u64>,
     top_level_to_delete: Vec<String>,
     existing_tables: Vec<String>,
+    s3_file_store: Arc<AmazonS3>,
+    data_fusion_context: SessionContext,
 }
 
 impl CacheTrackerActor {
     pub fn new(receiver: mpsc::Receiver<CacheTrackerActorMessage>) -> Self {
+        let file_store = create_store(&DEFAULT_S3_ENDPOINT_VALUE.to_string());
         Self {
             receiver,
             lru_cache: LruCache::new(2 * 1024 * 1024 * 1024),
@@ -239,6 +267,8 @@ impl CacheTrackerActor {
             reservations: HashMap::new(),
             top_level_to_delete: vec!(),
             existing_tables: vec!(),
+            s3_file_store: file_store.clone(),
+            data_fusion_context: create_session(file_store)
         }
     }
 
@@ -264,7 +294,7 @@ impl CacheTrackerActor {
     }
 
     async fn drop(&mut self, name: &String) -> () {
-        let _ = DATA_FUSION_CONTEXT.sql(format!("DROP TABLE IF EXISTS {};", name).as_str()).await;
+        let _ = self.data_fusion_context.sql(format!("DROP TABLE IF EXISTS {};", name).as_str()).await;
         // assert!(self.existing_tables.contains(&name));
         self.existing_tables.retain(|n| n != name);
         self.reservations.remove(name);
@@ -274,6 +304,19 @@ impl CacheTrackerActor {
     #[allow(unused_assignments)]
     async fn handle_message(&mut self, msg: CacheTrackerActorMessage) {
         match msg {
+            CacheTrackerActorMessage::SetS3Config { respond_to, access_key_id, secret_access_key, region, endpoint, bucket_name } => {
+                // Bogus assert to make sure the compiler doesn't give me warning about unused assignments.
+                assert!(format!("{}{}{}{} ", access_key_id, secret_access_key, region, bucket_name).len() > 0);
+                self.s3_file_store = create_store(&endpoint);
+                self.data_fusion_context = create_session(self.s3_file_store.clone());
+                // Setting a new context effectively drops all tables.
+                self.existing_tables.clear();
+                self.reservations.clear();
+                self.related.clear();
+                self.lru_cache.clear();
+                self.top_level_to_delete.clear();
+                let _ = respond_to.send(());
+            },
             CacheTrackerActorMessage::Reserve { respond_to, top_level_name, related_names, total_size } => {
                 // Increment the reservation count on the top level.
                 self.increment_reservation(&top_level_name);
@@ -364,11 +407,91 @@ impl CacheTrackerActor {
             CacheTrackerActorMessage::TableDropped { respond_to, table_name } => {
                 assert!(self.existing_tables.contains(&table_name));
                 self.existing_tables.retain(|name| name != &table_name);
+                match self.data_fusion_context.sql(format!("DROP TABLE IF EXISTS {};", table_name).as_str()).await {
+                    Ok(_) => (),
+                    Err(e) => panic!("Failed to drop table {}: {}", table_name, e)
+                }
                 let _ = respond_to.send(());
             },
             CacheTrackerActorMessage::GetTables { respond_to } => {
                 let _ = respond_to.send(self.existing_tables.clone());
+            },
+            CacheTrackerActorMessage::ExecuteSql { respond_to, sql } => {
+                let mut result: Result<DataFrame, DataFusionError> = Err(DataFusionError::Execution("Unable to execute SQL".to_string()));
+                for try_num in 1..=NUM_TRIES {
+                    match private_execute_sql(&self.data_fusion_context, &sql).await {
+                        Ok(df) => {
+                            result = Ok(df);
+                            break;
+                        },
+                        Err(e) => {
+                            if try_num == NUM_TRIES {
+                                result = Err(e);
+                                break;
+                            } else {
+                                match e {
+                                    // The metadata tracking means that in normal operation we'll never ask for an S3 object
+                                    // that we don't have a record of. Therefore most likely if there is an issue
+                                    // fetching an object it is some eventually consistency or rate limiting issue.
+                                    // We'll do some exponential backoff and hope that the issue resolves itself.
+                                    DataFusionError::ParquetError(_) => {
+                                        tokio::time::sleep(Duration::from_millis(3_u64.pow(try_num))).await;
+                                    }
+                                    DataFusionError::ObjectStore(_) => {
+                                        tokio::time::sleep(Duration::from_millis(3_u64.pow(try_num))).await;
+                                    }
+                                    _ => {
+                                        result = Err(e);
+                                        break
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                respond_to.send(result).expect("Failed to send response");
             }
+            CacheTrackerActorMessage::FileExists { respond_to, file_path } => {
+                let retval = if file_path.starts_with("s3://") {
+                    let path_only = file_path.replace(S3_BASE_PATH, "");
+                    match self.s3_file_store.as_ref().get(&object_store::path::Path::parse(path_only).unwrap()).await {
+                        Ok(_) => true,
+                        Err(_) => false
+                    }
+                } else {
+                    Path::new(&file_path).exists()
+                };
+                respond_to.send(retval).expect("Failed to send response");
+            },
+            CacheTrackerActorMessage::FileDelete { respond_to, file_paths } => {
+                for file_path in file_paths {
+                    assert!(file_path.starts_with(S3_BASE_PATH));
+                    let final_file_path = file_path.replace(S3_BASE_PATH, "");
+                    let path = object_store::path::Path::from_url_path(&final_file_path).unwrap();
+                    match self.s3_file_store.delete(&path).await {
+                        Ok(_) => (),
+                        Err(e) => panic!("Failed to delete file {}: {}", file_path, e)
+                    }
+                }
+                respond_to.send(()).expect("Failed to send response");
+            },
+            CacheTrackerActorMessage::FilePut { respond_to, file_path, payload } => {
+                assert!(file_path.starts_with(S3_BASE_PATH));
+                let path_str = file_path.replace(S3_BASE_PATH, "");
+                let path = match object_store::path::Path::from_url_path(path_str) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        respond_to.send(log_err(DataFusionError::ObjectStore(e.into()))).expect("Failed to send response");
+                        return;
+                    }
+                };
+                let payload = PutPayload::from_bytes(payload.to_vec().into());
+                let retval = match self.s3_file_store.put(&path, payload).await {
+                    Ok(_) => Ok(()),
+                    Err(e) => log_err(DataFusionError::ObjectStore(e.into()))
+                };
+                respond_to.send(retval).expect("Failed to send response");
+            },
         }
     }
 
@@ -384,7 +507,7 @@ impl CacheTrackerActor {
             Ok(t) => Arc::new(t),
             Err(e) => return log_err(e),
         };
-        match DATA_FUSION_CONTEXT.register_table(table_name, table) {
+        match self.data_fusion_context.register_table(table_name, table) {
             Ok(_) => {
                 self.track_table(&table_name).await;
                 Ok(())
@@ -395,13 +518,13 @@ impl CacheTrackerActor {
 
     async fn create_table(&mut self, table_name: &String, file_path: &String, parquet: bool, schema: Option<Schema>) -> Result< (), DataFusionError> {
         if parquet {
-            match load_parquet_file_as_table(&file_path, &table_name).await {
+            match load_parquet_file_as_table(&self.data_fusion_context, &file_path, &table_name).await {
                 Err(e) => return log_err(e),
                 Ok(_) => ()
             }
         } else {
             assert!(schema.is_some(), "You must provide a schema for a JSON file");
-            match load_json_file_as_table(file_path, &table_name, &schema.unwrap()).await {
+            match load_json_file_as_table(&self.data_fusion_context, file_path, &table_name, &schema.unwrap()).await {
                 Err(e) => return log_err(e),
                 Ok(_) => ()
             }
@@ -412,7 +535,7 @@ impl CacheTrackerActor {
     }
 
     async fn create_table_as(&mut self, table_name: &String, sql: &String) -> Result< (), DataFusionError> {
-        match private_execute_sql(&format!("CREATE TABLE {} AS {}", table_name, sql)).await {
+        match private_execute_sql(&self.data_fusion_context, &format!("CREATE TABLE {} AS {}", table_name, sql)).await {
             Ok(_) => {
                 self.track_table(&table_name).await;
                 Ok(())
@@ -440,6 +563,22 @@ impl LRUCacheHandle {
         let actor = CacheTrackerActor::new(receiver);
         tokio::spawn(run_lru_cache_actor_message_pump(actor));
         Self { sender }
+    }
+
+    async fn set_s3_config(&self, endpoint: &String) -> () {
+        let (send, recv) = oneshot::channel();
+        let msg = CacheTrackerActorMessage::SetS3Config {
+            respond_to: send,
+            access_key_id: "dummy".to_string(),
+            secret_access_key: "dummy".to_string(),
+            region: "dummy".to_string(),
+            endpoint: endpoint.clone(),
+            bucket_name: "dummy".to_string(),
+        };
+
+        let _ = self.sender.send(msg).await;
+        // TODO: deal with errors
+        recv.await.expect("Actor task has been killed")
     }
 
     async fn reserve(&self, top_level_name: &String, size: u64, related_names: Vec<String>) -> () {
@@ -521,6 +660,43 @@ impl LRUCacheHandle {
         recv.await.expect("Actor task has been killed")
     }
 
+    async fn file_exists(&self, file_path: &String) -> bool {
+        let (send, recv) = oneshot::channel();
+        let msg = CacheTrackerActorMessage::FileExists {
+            respond_to: send,
+            file_path: file_path.clone(),
+        };
+
+        let _ = self.sender.send(msg).await;
+        // TODO: deal with errors
+        recv.await.expect("Actor task has been killed")
+    }
+
+    async fn file_delete(&self, file_paths: &Vec<String>) -> () {
+        let (send, recv) = oneshot::channel();
+        let msg = CacheTrackerActorMessage::FileDelete {
+            respond_to: send,
+            file_paths: file_paths.clone(),
+        };
+
+        let _ = self.sender.send(msg).await;
+        // TODO: deal with errors
+        recv.await.expect("Actor task has been killed")
+    }
+
+    async fn file_put(&self, file_path: &String, payload: &Vec<u8>) -> Result<(), DataFusionError> {
+        let (send, recv) = oneshot::channel();
+        let msg = CacheTrackerActorMessage::FilePut {
+            respond_to: send,
+            file_path: file_path.clone(),
+            payload: payload.clone(),
+        };
+
+        let _ = self.sender.send(msg).await;
+        // TODO: deal with errors
+        recv.await.expect("Actor task has been killed")
+    }
+
     #[allow(dead_code)]
     async fn get_tables(&self) -> Vec<String> {
         let (send, recv) = oneshot::channel();
@@ -532,11 +708,27 @@ impl LRUCacheHandle {
         // TODO: deal with errors
         recv.await.expect("Actor task has been killed")
     }
+
+    async fn execute_sql(&self, sql: &String) -> Result<DataFrame, DataFusionError> {
+        let (send, recv) = oneshot::channel();
+        let msg = CacheTrackerActorMessage::ExecuteSql {
+            respond_to: send,
+            sql: sql.clone(),
+        };
+
+        let _ = self.sender.send(msg).await;
+        // TODO: deal with errors
+        recv.await.expect("Actor task has been killed")
+    }
 }
 
 
-static DATA_FUSION_CONTEXT: std::sync::LazyLock<SessionContext> = std::sync::LazyLock::new(|| create_session());
-static LRU_CACHE_HANDLE: std::sync::LazyLock<LRUCacheHandle> = std::sync::LazyLock::new(|| LRUCacheHandle::new());
+static LRU_CACHE_HANDLE: LazyLock<LRUCacheHandle> = LazyLock::new(|| LRUCacheHandle::new());
+
+
+pub(crate) async fn set_s3_endpoint(endpoint: &Option<String>) -> () {
+    LRU_CACHE_HANDLE.set_s3_config(&endpoint.clone().unwrap_or(DEFAULT_S3_ENDPOINT_VALUE.to_string())).await
+}
 
 
 pub(crate) async fn reserve(top_level_name: &String, total_size: u64, related_names: Vec<String>) -> () {
@@ -548,8 +740,8 @@ pub(crate) async fn release(top_level_name: &String) -> () {
     LRU_CACHE_HANDLE.release(top_level_name).await
 }
 
-async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> Result<(), DataFusionError> {
-    match DATA_FUSION_CONTEXT.table_exist(local_name) {
+async fn load_parquet_file_as_table(data_fusion_context: &SessionContext, file_path: &String, local_name: &String) -> Result<(), DataFusionError> {
+    match data_fusion_context.table_exist(local_name) {
         Ok(exists) => match exists {
             true => return Ok(()),
             false => ()
@@ -565,15 +757,15 @@ async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> 
         STORED AS PARQUET
         LOCATION '{file_path_var}';"#);
         loop {
-            match DATA_FUSION_CONTEXT.sql(&query_str).await {
+            match data_fusion_context.sql(&query_str).await {
                 Err(_e) => {
-                    let _ = DATA_FUSION_CONTEXT.sql(format!("DROP TABLE IF EXISTS {local_name_var};").as_str()).await;
+                    let _ = data_fusion_context.sql(format!("DROP TABLE IF EXISTS {local_name_var};").as_str()).await;
                 },
                 _ => return Ok(())
             }
         }
     } else {
-        let result = DATA_FUSION_CONTEXT.register_parquet(local_name, file_path, ParquetReadOptions::new()).await;
+        let result = data_fusion_context.register_parquet(local_name, file_path, ParquetReadOptions::new()).await;
         match result {
             Err(e) => {
                 if e.message().contains("already exists") {
@@ -589,8 +781,8 @@ async fn load_parquet_file_as_table(file_path: &String, local_name: &String) -> 
     }
 }
 
-async fn load_json_file_as_table(file_path_without_suffix: &String, local_name: &String, schema: &Schema) -> Result<(), DataFusionError> {
-    match DATA_FUSION_CONTEXT.table_exist(local_name) {
+async fn load_json_file_as_table(data_fusion_context: &SessionContext, file_path_without_suffix: &String, local_name: &String, schema: &Schema) -> Result<(), DataFusionError> {
+    match data_fusion_context.table_exist(local_name) {
         Ok(exists) => match exists {
             true => return Ok(()),
             false => ()
@@ -607,7 +799,7 @@ async fn load_json_file_as_table(file_path_without_suffix: &String, local_name: 
         };
         tracing::info!("Loading JSON file {}", file_path);
         let reader_options = NdJsonReadOptions::default().schema(&schema);
-        match DATA_FUSION_CONTEXT.register_json(local_name, file_path, reader_options).await {
+        match data_fusion_context.register_json(local_name, file_path, reader_options).await {
             Ok(_) => Ok(()),
             Err(e) => {
                 if e.message().contains("already exists") {
@@ -620,7 +812,7 @@ async fn load_json_file_as_table(file_path_without_suffix: &String, local_name: 
     } else {
         let file_path = format!("{}.arrow", file_path_without_suffix);
         tracing::info!("Loading Arrow file {}", file_path);
-        DATA_FUSION_CONTEXT.register_arrow(local_name, &file_path, ArrowReadOptions::default()).await
+        data_fusion_context.register_arrow(local_name, &file_path, ArrowReadOptions::default()).await
     }
 }
 
@@ -716,32 +908,7 @@ pub(crate) async fn execute_sql(sql: &String) -> Result<DataFrame, DataFusionErr
     assert!(!sql.to_lowercase().contains("create table"), "Use the create_table function instead");
     assert!(!sql.to_lowercase().contains("create external table"), "Use the create_table function instead");
     assert!(!sql.to_lowercase().contains("drop table"), "Use the drop function instead");
-    for try_num in 1..=NUM_TRIES {
-        match private_execute_sql(sql).await {
-            Ok(df) => return Ok(df),
-            Err(e) => {
-                if try_num == NUM_TRIES {
-                    return Err(e)
-                } else {
-                    match e {
-                        // The metadata tracking means that in normal operation we'll never ask for an S3 object
-                        // that we don't have a record of. Therefore most likely if there is an issue
-                        // fetching an object it is some eventually consistency or rate limiting issue.
-                        // We'll do some exponential backoff and hope that the issue resolves itself.
-                        DataFusionError::ParquetError(_) => {
-                            tokio::time::sleep(Duration::from_millis(3_u64.pow(try_num))).await;
-                        }
-                        DataFusionError::ObjectStore(_) => {
-                            tokio::time::sleep(Duration::from_millis(3_u64.pow(try_num))).await;
-                        }
-                        _ => return Err(e)
-                    }
-                }
-            }
-        }
-    }
-    // Unreachable
-    panic!("Should not reach this point");
+    LRU_CACHE_HANDLE.execute_sql(sql).await
 }
 
 
@@ -750,77 +917,30 @@ pub(crate) async fn create_table(table_name: &String, sql: &String) -> Result<()
 }
 
 
-async fn private_execute_sql(sql: &String) -> Result<DataFrame, DataFusionError> {
-    match DATA_FUSION_CONTEXT.sql(sql).await {
+async fn private_execute_sql(data_fusion_context: &SessionContext, sql: &String) -> Result<DataFrame, DataFusionError> {
+    match data_fusion_context.sql(sql).await {
         Ok(d) => Ok(d),
         Err(e) => log_err(e)
     }
 }
 
 
-pub(crate) async fn exists(path: &String) -> bool {
-    if path.starts_with("s3://") {
-        let path_only = path[17..].to_string();
-        match S3_FILE_STORE.as_ref().get(&object_store::path::Path::parse(path_only).unwrap()).await {
-            Ok(_) => true,
-            Err(_) => false
-        }
-    } else {
-        Path::new(path).exists()
-    }
+pub(crate) async fn file_exists(path: &String) -> bool {
+    LRU_CACHE_HANDLE.file_exists(path).await
 }
 
 pub(crate) async fn drop(table_name: &String) -> () {
     LRU_CACHE_HANDLE.table_dropped(table_name).await;
-    match DATA_FUSION_CONTEXT.sql(format!("DROP TABLE IF EXISTS {};", table_name).as_str()).await {
-        Ok(_) => (),
-        Err(e) => panic!("Failed to drop table {}: {}", table_name, e)
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) async fn get_tracked_tables() -> Vec<String> {
-    LRU_CACHE_HANDLE.get_tables().await
-}
-
-#[allow(dead_code)]
-pub(crate) async fn print_datafusion_tables() -> () {
-    let table_df = match DATA_FUSION_CONTEXT.sql("show tables;").await {
-        Ok(df) => df,
-        Err(e) => {
-            panic!("Failed to show tables: {}", e)
-        }
-    };
-
-    table_df.show().await.unwrap();
 }
 
 pub(crate) async fn delete_s3_files(file_paths: &Vec<String>) -> () {
-    for file_path in file_paths {
-        assert!(file_path.starts_with(S3_BASE_PATH));
-        let final_file_path = file_path.replace(S3_BASE_PATH, "");
-        let path = object_store::path::Path::from_url_path(&final_file_path).unwrap();
-        match S3_FILE_STORE.as_ref().delete(&path).await {
-            Ok(_) => (),
-            Err(e) => panic!("Failed to delete file {}: {}", file_path, e)
-        }
-    }
+    LRU_CACHE_HANDLE.file_delete(file_paths).await
 }
 
 pub(crate) async fn put_s3_file(file_path: &String, file_contents: &Vec<u8>) -> Result<(), DataFusionError> {
-    assert!(file_path.starts_with(S3_BASE_PATH));
-    let path_str = file_path.replace(S3_BASE_PATH, "");
-    let path = match object_store::path::Path::from_url_path(path_str) {
-        Ok(p) => p,
-        Err(e) => return log_err(DataFusionError::ObjectStore(e.into()))
-    };
-    let payload = PutPayload::from_bytes(file_contents.to_vec().into());
-    match S3_FILE_STORE.as_ref().put(&path, payload).await {
-        Ok(_) => Ok(()),
-        Err(e) => log_err(DataFusionError::ObjectStore(e.into()))
-    }
+    LRU_CACHE_HANDLE.file_put(file_path, file_contents).await
 }
 
-pub(crate) fn s3_base_path() -> String {
+pub(crate) fn s3_ingest_base_path() -> String {
     format!("{}/default/ingest", S3_BASE_PATH)
 }

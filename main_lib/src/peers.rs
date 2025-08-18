@@ -7,6 +7,7 @@ use gotham::mime;
 use gotham::plain::test::AsyncTestServer;
 use k8s_openapi::api::core::v1::Pod;
 use kube::Api;
+use prost::Message;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -234,47 +235,107 @@ impl PeerClient for RemotePeer {
         Box::new(self.clone())
     }
 
-    async fn private_sql(&self, invocation: &PrivateSqlInvocation, _index: u64, _num: u64) -> Result<Vec<RecordBatch>, PeerClientError> {
-        let address = &self.address;
-        let body = serde_json::to_string(invocation);
-        match body {
-            Ok(b) => {
-                let resp = self.client.post(format!("http://{address}/_private/v1/_sql"))
-                    .header("Content-Type", "application/json")
-                    .body(b)
-                    .send().await;
-                match resp {
-                    Ok(r) => {
-                        let text = r.text().await;
-                        match text {
-                            Ok(_) => Ok(vec!()),
-                            Err(_) => Err(PeerClientError{ message: "Error".to_string() }),
-                        }
-                    },
-                    Err(_) => Err(PeerClientError{ message: "Error".to_string() })
-                }
+    async fn private_sql(&self, invocation: &PrivateSqlInvocation, index: u64, num: u64) -> Result<Vec<RecordBatch>, PeerClientError> {
+        let invocation_obj = PrivateSqlInvocationExternal {
+            invocation: invocation.clone(),
+            index,
+            num,
+        };
+
+        let resp = self.client.post(
+            format!("http://{}/_private/v1/_sql", self.address)).json(&invocation_obj).send().await;
+
+        match resp {
+            Ok(res) => {
+                assert!(res.status().is_success());
+                let body = res.bytes().await.unwrap();
+                Ok(result_to_record_batch(serde_json::from_slice(&body).unwrap()).await)
             },
-            Err(_) => {
-                panic!("Malformed request")
+            Err(e) => {
+                Err(PeerClientError { message: format!("Error: {}", e) })
             }
         }
     }
 
-    async fn private_compaction(&self, _invocation: &PrivateCompactionInvocation, _index: u64, _num: u64) -> Result<Vec<RecordBatch>, PeerClientError> {
-        todo!()
+    async fn private_compaction(&self, invocation: &PrivateCompactionInvocation, index: u64, num: u64) -> Result<Vec<RecordBatch>, PeerClientError> {
+        let invocation_obj = PrivateCompactionInvocationExternal {
+            invocation: invocation.clone(),
+            index,
+            num,
+        };
+
+        let resp = self.client.post(
+            format!("http://{}/_private/v1/_compact", self.address)).json(&invocation_obj).send().await;
+
+        match resp {
+            Ok(res) => {
+                assert!(res.status().is_success());
+                let body = res.bytes().await.unwrap();
+                Ok(result_to_record_batch(serde_json::from_slice(&body).unwrap()).await)
+            },
+            Err(e) => {
+                Err(PeerClientError { message: format!("Error: {}", e) })
+            }
+        }
+
     }
 
-    async fn private_extension(&self, _invocation: &PrivateExtensionInvocation, _index: u64, _num: u64) -> Result<ExtensionFileMetadata, PeerClientError> {
-        todo!()
+    async fn private_extension(&self, invocation: &PrivateExtensionInvocation, index: u64, num: u64) -> Result<ExtensionFileMetadata, PeerClientError> {
+        let invocation_obj = PrivateExtensionInvocationExternal {
+            invocation: invocation.clone(),
+            index,
+            num,
+        };
+
+        let resp = self.client.post(
+            format!("http://{}/_private/v1/_extension", self.address)).json(&invocation_obj).send().await;
+
+        match resp {
+            Ok(res) => {
+                assert!(res.status().is_success());
+                let body = res.bytes().await.unwrap();
+                Ok(serde_json::from_slice(&body).unwrap())
+            },
+            Err(e) => {
+                Err(PeerClientError { message: format!("Error: {}", e) })
+            }
+        }
     }
 
-    async fn private_prefetch(&self, _invocation: &PrivatePrefetchInvocation, _index: u64, _num: u64) -> Result<(), PeerClientError> {
-        todo!()
+    async fn private_prefetch(&self, invocation: &PrivatePrefetchInvocation, index: u64, num: u64) -> Result<(), PeerClientError> {
+        let invocation_obj = PrivatePrefetchInvocationExternal {
+            invocation: invocation.clone(),
+            index,
+            num,
+        };
+
+        let resp = self.client.post(
+            format!("http://{}/_private/v1/_prefetch", self.address)).json(&invocation_obj).send().await;
+
+        match resp {
+            Ok(res) => {
+                assert!(res.status().is_success());
+                Ok(())
+            },
+            Err(e) => {
+                Err(PeerClientError { message: format!("Error: {}", e) })
+            }
+        }
     }
 
-    async fn private_compaction_leader(&self, _invocation: &CompactionCommand) -> Result<Option<CompactionResponse>, PeerClientError> {
-        todo!()
+    async fn private_compaction_leader(&self, invocation: &CompactionCommand) -> Result<Option<CompactionResponse>, PeerClientError> {
+        let res = self.client.post(
+            format!("http://{}/_private/v1/_compact_leader", self.address)).json(&invocation).send().await.unwrap();
+
+        assert!(res.status().is_success());
+
+        let response_bytes = res.bytes().await.unwrap();
+        let response_str = String::from_utf8(response_bytes.encode_to_vec()).unwrap();
+
+        let response = serde_json::from_str::<CompactionResponse>(response_str.as_str()).unwrap();
+        Ok(Some(response))
     }
+
 
     /*
         async fn private_metadata(&self, invocation: &PrivateMetadataInvocation) -> Result<String, PeerClientError> {

@@ -442,7 +442,7 @@ const USE_SPEEDBOAT_S3: bool = true;
 
 pub(crate) async fn write_to_file(buffer: &WriteBuffer, index: &String, label: &String) -> Result<(String, u64), IngestError> {
     if USE_SPEEDBOAT_S3 {
-        let s3_path = format!("{}/{}-{}-{}", data_access::s3_base_path(), label, index, IdInstance::next_id().to_string());
+        let s3_path = format!("{}/{}-{}-{}", data_access::s3_ingest_base_path(), label, index, IdInstance::next_id().to_string());
         let size = buffer.write_to_json_s3(&s3_path).await?;
         Ok((s3_path, size))
     } else {

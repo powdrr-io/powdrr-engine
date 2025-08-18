@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt::Display;
 use datafusion::{arrow::datatypes::DataType, dataframe::DataFrameWriteOptions};
 use datafusion::error::DataFusionError;
-use crate::{data_access, data_access::{execute_sql, exists}, data_contract::{ExtensionCommit, ExtensionFile}, util::add_file_suffix};
+use crate::{data_access, data_access::{execute_sql, file_exists}, data_contract::{ExtensionCommit, ExtensionFile}, util::add_file_suffix};
 use crate::data_access::load_file_as_table;
 use crate::elastic_search_common::call_peers;
 use crate::schema_massager::PowdrrSchema;
@@ -161,7 +161,7 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
 
 pub(crate) async fn create_index_jsonl(file_path: &String, doc_id_field_name: &String, schema: &PowdrrSchema) -> Result<Option<String>, IndexError> {
     let target_file_path = add_file_suffix(file_path, &"search_index".to_string(), Some(&".parquet".to_string()));
-    if exists(&target_file_path).await {
+    if file_exists(&target_file_path).await {
         return Ok(None)
     }
 
@@ -192,7 +192,7 @@ pub(crate) async fn create_index_jsonl(file_path: &String, doc_id_field_name: &S
 
 pub(crate) async fn create_index_parquet(file_path: &String, doc_id_field_name: &String) -> Result<Option<String>, IndexError> {
     let target_file_path = add_file_suffix(file_path, &"search_index".to_string(), Some(&".parquet".to_string()));
-    if exists(&target_file_path).await {
+    if file_exists(&target_file_path).await {
         return Ok(None)
     }
 

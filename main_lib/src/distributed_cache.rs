@@ -7,8 +7,8 @@ use lazy_static::lazy_static;
 pub(crate) struct CacheError {}
 
 impl Display for CacheError {
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!()
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Cache error")
     }
 }
 
@@ -23,6 +23,7 @@ lazy_static! {
 
 
 pub fn set_redis_address(address: &Option<String>) -> () {
+    tracing::info!("Setting redis address to {}", address.as_ref().unwrap_or(&DEFAULT_REDIS_URL.to_string()));
     let mut my_lock = REDIS_ADDRESS.lock().unwrap();
     *my_lock = address.as_ref().map_or_else(|| DEFAULT_REDIS_URL.to_string(), |s| s.clone());
 }
@@ -32,11 +33,17 @@ fn get_connection() -> Result<redis::Connection, CacheError> {
     let redis_address = REDIS_ADDRESS.lock().unwrap();
     let client = match redis::Client::open(redis_address.clone()) {
         Ok(c) => c,
-        Err(_) => return Err(CacheError { }),
+        Err(_) => {
+            tracing::error!("Failed to connect to redis at {}", redis_address);
+            return Err(CacheError { })
+        },
     };
     match client.get_connection() {
         Ok(c) => Ok(c),
-        Err(_) => Err(CacheError {  })
+        Err(_) => {
+            tracing::error!("Failed to connect to redis at {}", redis_address);
+            Err(CacheError {  })
+        }
     }
 }
 
