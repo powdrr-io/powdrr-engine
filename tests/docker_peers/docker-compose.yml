@@ -44,7 +44,6 @@ services:
 
   minio:
     image: minio/minio
-    container_name: minio
     networks:
       iceberg_net:
         aliases:
@@ -61,7 +60,6 @@ services:
 
   createbuckets:
     image: minio/mc
-    container_name: minio_bucket_creator
     networks:
       iceberg_net:
     depends_on:
@@ -80,7 +78,6 @@ services:
 
   rest:
     image: tabulario/iceberg-rest
-    container_name: iceberg-rest
     networks:
       iceberg_net:
     ports:

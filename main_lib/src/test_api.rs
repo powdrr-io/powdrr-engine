@@ -5,7 +5,6 @@ use gotham::plain::test::AsyncTestServer;
 use serde::{Deserialize, Serialize};
 
 use crate::{compaction::perform_compaction, data_access, elastic_search_index::{self, create_index}, state_provider::{STATE_PROVIDER}};
-use crate::compaction::drop_all_tables;
 use crate::data_contract::{CleanupCommit, CleanupWorkItem, TableMetadataCheckpoint};
 use crate::prefetch::perform_prefetch;
 
@@ -40,14 +39,16 @@ impl StateMode {
 #[derive(Serialize, Deserialize, Clone)]
 pub enum StorageMode {
     S3 {
-        endpoint: Option<String>,
+        rest_endpoint: Option<String>,
+        s3_endpoint: Option<String>,
     }
 }
 
 impl StorageMode {
     pub fn default() -> Self {
         Self::S3 {
-            endpoint: None
+            rest_endpoint: None,
+            s3_endpoint: None
         }
     }
 }
@@ -218,7 +219,7 @@ pub fn test_v1_add_checkpoint(mut state: State) -> Pin<Box<HandlerFuture>> {
 pub fn test_v1_set_testing_mode(state: State) -> Pin<Box<HandlerFuture>> {
     async {
         STATE_PROVIDER.set_testing_mode(&TestProcessingMode::default()).await;
-        drop_all_tables(&"default".to_string()).await.unwrap();
+        data_access::drop_all_iceberg_tables(&"default".to_string()).await.unwrap();
         let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "Ok");
         Ok((state, res))        
     }.boxed()
@@ -427,7 +428,7 @@ pub fn test_v1_set_testing_processing_mode(mut state: State) -> Pin<Box<HandlerF
 
         STATE_PROVIDER.set_testing_mode(&mode).await;
         if mode.state_mode.is_testing() {
-            drop_all_tables(&"default".to_string()).await.unwrap();
+            data_access::drop_all_iceberg_tables(&"default".to_string()).await.unwrap();
         }
         tokio::spawn(do_update_checkpoint_work_for_forever(1000));
         if !mode.indexing_mode.is_disabled() {

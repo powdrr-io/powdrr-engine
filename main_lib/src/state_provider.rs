@@ -266,8 +266,8 @@ impl StateProviderActor {
                     },
                 }
                 match &mode.storage_mode {
-                    StorageMode::S3 { endpoint } => {
-                        data_access::set_s3_endpoint(endpoint).await
+                    StorageMode::S3 { rest_endpoint, s3_endpoint } => {
+                        data_access::set_s3_endpoint(rest_endpoint, s3_endpoint).await
                     }
                 }
 

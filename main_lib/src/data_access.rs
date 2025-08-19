@@ -1,3 +1,4 @@
+use iceberg::Catalog;
 use std::{path::Path, sync::Arc};
 use std::string::ToString;
 use std::sync::{LazyLock};
@@ -8,6 +9,13 @@ use datafusion::common::HashMap;
 use datafusion::config::ConfigOptions;
 use datafusion::execution::options::ArrowReadOptions;
 use datafusion::prelude::SessionConfig;
+use futures_util::TryStreamExt;
+use iceberg::io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY};
+use iceberg::{NamespaceIdent, TableCreation, TableIdent};
+use iceberg::spec::DataFile;
+use iceberg::table::Table;
+use iceberg::transaction::ApplyTransactionAction;
+use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use idgenerator::IdInstance;
 use liquid_cache_parquet::cache::policies::DiscardPolicy;
 use liquid_cache_parquet::common::LiquidCacheMode;
@@ -15,6 +23,7 @@ use liquid_cache_parquet::LiquidCacheInProcessBuilder;
 use lru_mem::{HeapSize, LruCache, TryInsertError};
 use object_store::{aws::{AmazonS3, AmazonS3Builder}, ObjectStore, PutPayload};
 use object_store::client::SpawnedReqwestConnector;
+use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, Notify};
@@ -25,6 +34,7 @@ use crate::util::log_err;
 
 
 const DEFAULT_S3_ENDPOINT_VALUE: &str = "http://localhost:9000";
+const DEFAULT_ICEBERG_ENDPOINT_VALUE: &str = "http://localhost:8181";
 const S3_ACCESS_KEY_ID_VALUE: &str = "admin";
 const S3_SECRET_ACCESS_KEY_VALUE: &str = "password";
 const S3_REGION_VALUE: &str = "us-east-1";
@@ -171,10 +181,39 @@ fn create_session(file_store: Arc<AmazonS3>) -> SessionContext {
 }
 
 
+fn get_iceberg_catalog_config(rest_catalog_address: &String, s3_endpoint: &String) -> RestCatalogConfig {
+    RestCatalogConfig::builder()
+        .uri(rest_catalog_address.clone())
+        .props(std::collections::HashMap::from([
+            (S3_ENDPOINT.to_string(), s3_endpoint.clone()),
+            (S3_ACCESS_KEY_ID.to_string(), S3_ACCESS_KEY_ID_VALUE.to_string()),
+            (S3_SECRET_ACCESS_KEY.to_string(), S3_SECRET_ACCESS_KEY_VALUE.to_string()),
+            (S3_REGION.to_string(), S3_REGION_VALUE.to_string()),
+        ]))
+        .build()
+}
+
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct IcebergLibMetadata {
+    pub snapshot_id: i64,
+    pub table_schema: Arc<iceberg::spec::Schema>,
+    pub files: Vec<String>,
+    pub sizes: Vec<u64>,
+    pub schemas: Vec<Arc<iceberg::spec::Schema>>,
+    pub compactions: Vec<String>,
+    pub column_names: Vec<String>,
+    // per file, per column lower and upper bounds
+    // TODO: this needs to be generalized to support bloom filters
+    pub column_stats: Vec<(String, String)>,
+}
+
+
 #[allow(dead_code)]
 enum CacheTrackerActorMessage {
     SetS3Config {
         respond_to: oneshot::Sender<()>,
+        iceberg_rest_endpont: String,
         access_key_id: String,
         secret_access_key: String,
         region: String,
@@ -231,9 +270,36 @@ enum CacheTrackerActorMessage {
         respond_to: oneshot::Sender<Result<(), DataFusionError>>,
         file_path: String,
         payload: Vec<u8>,
+    },
+    DropIcebergTable {
+        respond_to: oneshot::Sender<Result<(), iceberg::Error>>,
+        namespace: String,
+        table_name: String,
+    },
+    DropAllIcebergTables {
+        respond_to: oneshot::Sender<Result<(), iceberg::Error>>,
+        namespace: String,
+    },
+    EnsureIcebergTable {
+        respond_to: oneshot::Sender<Result<Table, iceberg::Error>>,
+        namespace: String,
+        table_name: String,
+        schema: iceberg::spec::Schema
+    },
+    LoadIcebergTableMetadata {
+        respond_to: oneshot::Sender<Result<IcebergLibMetadata, iceberg::Error>>,
+        namespace: String,
+        table_name: String,
+        last_snapshot_id: i64
+    },
+    CommitIcebergTransaction {
+        respond_to: oneshot::Sender<Result<(), iceberg::Error>>,
+        namespace: String,
+        table_name: String,
+        compaction_id: String,
+        data_files: Vec<DataFile>,
     }
 }
-
 
 struct HeapSizeTracker {
     size: u64,
@@ -255,6 +321,7 @@ struct CacheTrackerActor {
     existing_tables: Vec<String>,
     s3_file_store: Arc<AmazonS3>,
     data_fusion_context: SessionContext,
+    rest_catalog: Arc<RestCatalog>
 }
 
 impl CacheTrackerActor {
@@ -268,7 +335,11 @@ impl CacheTrackerActor {
             top_level_to_delete: vec!(),
             existing_tables: vec!(),
             s3_file_store: file_store.clone(),
-            data_fusion_context: create_session(file_store)
+            data_fusion_context: create_session(file_store),
+            rest_catalog: Arc::new(RestCatalog::new(get_iceberg_catalog_config(
+                &DEFAULT_ICEBERG_ENDPOINT_VALUE.to_string(),
+                &DEFAULT_S3_ENDPOINT_VALUE.to_string()
+            )))
         }
     }
 
@@ -304,11 +375,15 @@ impl CacheTrackerActor {
     #[allow(unused_assignments)]
     async fn handle_message(&mut self, msg: CacheTrackerActorMessage) {
         match msg {
-            CacheTrackerActorMessage::SetS3Config { respond_to, access_key_id, secret_access_key, region, endpoint, bucket_name } => {
+            CacheTrackerActorMessage::SetS3Config { respond_to, iceberg_rest_endpont, access_key_id, secret_access_key, region, endpoint, bucket_name } => {
                 // Bogus assert to make sure the compiler doesn't give me warning about unused assignments.
                 assert!(format!("{}{}{}{} ", access_key_id, secret_access_key, region, bucket_name).len() > 0);
                 self.s3_file_store = create_store(&endpoint);
                 self.data_fusion_context = create_session(self.s3_file_store.clone());
+                self.rest_catalog = Arc::new(RestCatalog::new(get_iceberg_catalog_config(
+                    &iceberg_rest_endpont,
+                    &endpoint
+                )));
                 // Setting a new context effectively drops all tables.
                 self.existing_tables.clear();
                 self.reservations.clear();
@@ -492,6 +567,22 @@ impl CacheTrackerActor {
                 };
                 respond_to.send(retval).expect("Failed to send response");
             },
+            CacheTrackerActorMessage::DropIcebergTable { respond_to, namespace, table_name } => {
+                respond_to.send(drop_iceberg_table_worker(self.rest_catalog.clone(), &namespace, &table_name).await).expect("Failed to send response");
+            },
+            CacheTrackerActorMessage::DropAllIcebergTables { respond_to, namespace } => {
+                respond_to.send(drop_all_iceberg_tables_worker(self.rest_catalog.clone(), &namespace).await).expect("Failed to send response");
+            },
+            CacheTrackerActorMessage::EnsureIcebergTable { respond_to, namespace, table_name, schema } => {
+                respond_to.send(ensure_iceberg_table_worker(self.rest_catalog.clone(), &namespace, &table_name, &schema).await).expect("Failed to send response");
+            }
+            CacheTrackerActorMessage::LoadIcebergTableMetadata { respond_to, namespace, table_name, last_snapshot_id } => {
+                respond_to.send(load_iceberg_table_metadata_worker(self.rest_catalog.clone(), &namespace, &table_name, last_snapshot_id).await).expect("Failed to send response");
+            },
+            CacheTrackerActorMessage::CommitIcebergTransaction { respond_to, namespace, table_name, compaction_id, data_files } => {
+                respond_to.send(commit_iceberg_transaction_worker(self.rest_catalog.clone(), &namespace, &table_name, &compaction_id, &data_files).await).expect("Failed to send response");
+            }
+
         }
     }
 
@@ -565,14 +656,15 @@ impl LRUCacheHandle {
         Self { sender }
     }
 
-    async fn set_s3_config(&self, endpoint: &String) -> () {
+    async fn set_s3_config(&self, iceberg_rest_endpoint: &String, s3_endpoint: &String) -> () {
         let (send, recv) = oneshot::channel();
         let msg = CacheTrackerActorMessage::SetS3Config {
             respond_to: send,
+            iceberg_rest_endpont: iceberg_rest_endpoint.clone(),
             access_key_id: "dummy".to_string(),
             secret_access_key: "dummy".to_string(),
             region: "dummy".to_string(),
-            endpoint: endpoint.clone(),
+            endpoint: s3_endpoint.clone(),
             bucket_name: "dummy".to_string(),
         };
 
@@ -720,14 +812,86 @@ impl LRUCacheHandle {
         // TODO: deal with errors
         recv.await.expect("Actor task has been killed")
     }
+
+    #[allow(dead_code)]
+    async fn drop_iceberg_table(&self, namespace: &String, table_name: &String) -> Result<(), iceberg::Error> {
+        let (send, recv) = oneshot::channel();
+        let msg = CacheTrackerActorMessage::DropIcebergTable {
+            respond_to: send,
+            namespace: namespace.clone(),
+            table_name: table_name.clone(),
+        };
+
+        let _ = self.sender.send(msg).await;
+        // TODO: deal with errors
+        recv.await.expect("Actor task has been killed")
+    }
+
+    async fn drop_all_iceberg_tables(&self, namespace: &String) -> Result<(), iceberg::Error> {
+        let (send, recv) = oneshot::channel();
+        let msg = CacheTrackerActorMessage::DropAllIcebergTables {
+            respond_to: send,
+            namespace: namespace.clone(),
+        };
+
+        let _ = self.sender.send(msg).await;
+        // TODO: deal with errors
+        recv.await.expect("Actor task has been killed")
+    }
+
+    async fn ensure_iceberg_table(&self, namespace: &String, table_name: &String, iceberg_schema: &iceberg::spec::Schema) -> Result<Table, iceberg::Error> {
+        let (send, recv) = oneshot::channel();
+        let msg = CacheTrackerActorMessage::EnsureIcebergTable {
+            respond_to: send,
+            namespace: namespace.clone(),
+            table_name: table_name.clone(),
+            schema: iceberg_schema.clone(),
+        };
+
+        let _ = self.sender.send(msg).await;
+        // TODO: deal with errors
+        recv.await.expect("Actor task has been killed")
+    }
+
+    async fn load_iceberg_table_metadata(&self, namespace: &String, table_name: &String, last_snapshot_id: i64) -> Result<IcebergLibMetadata, iceberg::Error> {
+        let (send, recv) = oneshot::channel();
+        let msg = CacheTrackerActorMessage::LoadIcebergTableMetadata {
+            respond_to: send,
+            namespace: namespace.clone(),
+            table_name: table_name.clone(),
+            last_snapshot_id: last_snapshot_id
+        };
+
+        let _ = self.sender.send(msg).await;
+        // TODO: deal with errors
+        recv.await.expect("Actor task has been killed")
+    }
+
+    async fn commit_iceberg_transaction(&self, namespace: &String, table_name: &String, compaction_id: &String, data_files: &Vec<DataFile>) -> Result<(), iceberg::Error> {
+        let (send, recv) = oneshot::channel();
+        let msg = CacheTrackerActorMessage::CommitIcebergTransaction {
+            respond_to: send,
+            namespace: namespace.clone(),
+            table_name: table_name.clone(),
+            compaction_id: compaction_id.clone(),
+            data_files: data_files.clone(),
+        };
+
+        let _ = self.sender.send(msg).await;
+        // TODO: deal with errors
+        recv.await.expect("Actor task has been killed")
+    }
 }
 
 
 static LRU_CACHE_HANDLE: LazyLock<LRUCacheHandle> = LazyLock::new(|| LRUCacheHandle::new());
 
 
-pub(crate) async fn set_s3_endpoint(endpoint: &Option<String>) -> () {
-    LRU_CACHE_HANDLE.set_s3_config(&endpoint.clone().unwrap_or(DEFAULT_S3_ENDPOINT_VALUE.to_string())).await
+pub(crate) async fn set_s3_endpoint(rest_endpoint: &Option<String>, s3_endpoint: &Option<String>) -> () {
+    LRU_CACHE_HANDLE.set_s3_config(
+        &rest_endpoint.clone().unwrap_or(DEFAULT_ICEBERG_ENDPOINT_VALUE.to_string()),
+        &s3_endpoint.clone().unwrap_or(DEFAULT_S3_ENDPOINT_VALUE.to_string())
+    ).await
 }
 
 
@@ -924,6 +1088,187 @@ async fn private_execute_sql(data_fusion_context: &SessionContext, sql: &String)
     }
 }
 
+#[allow(dead_code)]
+pub async fn drop_iceberg_table(namespace: &String, table_name: &String) -> Result<(), iceberg::Error> {
+    LRU_CACHE_HANDLE.drop_iceberg_table(namespace, table_name).await
+}
+
+async fn drop_iceberg_table_worker(catalog: Arc<RestCatalog>, namespace: &String, name: &String) -> Result<(), iceberg::Error> {
+    let namespace_ident = NamespaceIdent::new(namespace.clone());
+
+    let table_ident = TableIdent {
+        namespace: namespace_ident.clone(),
+        name: name.clone()
+    };
+
+    catalog.drop_table(&table_ident).await
+}
+
+pub async fn drop_all_iceberg_tables(namespace: &String) -> Result<(), iceberg::Error> {
+    LRU_CACHE_HANDLE.drop_all_iceberg_tables(namespace).await
+}
+
+async fn drop_all_iceberg_tables_worker(catalog: Arc<RestCatalog>, namespace: &String) -> Result<(), iceberg::Error> {
+    let namespace_ident = NamespaceIdent::new(namespace.clone());
+    let all_tables: Vec<TableIdent> = match catalog.get_namespace(&namespace_ident).await {
+        Ok(_) => catalog.list_tables(&namespace_ident).await?,
+        Err(_) => vec!()
+    };
+    for table_ident in all_tables.iter() {
+        catalog.drop_table(table_ident).await?
+    }
+    Ok(())
+}
+
+pub async fn ensure_iceberg_table( namespace: &String, name: &String, schema: &iceberg::spec::Schema) -> Result<Table, iceberg::Error> {
+    LRU_CACHE_HANDLE.ensure_iceberg_table(namespace, name, schema).await
+}
+
+async fn ensure_iceberg_table_worker(catalog: Arc<RestCatalog>, namespace: &String, name: &String, iceberg_schema: &iceberg::spec::Schema) -> Result<Table, iceberg::Error> {
+    let namespace_ident = NamespaceIdent::new(namespace.clone());
+
+    let table_ident = TableIdent {
+        namespace: namespace_ident.clone(),
+        name: name.clone()
+    };
+
+    match catalog.get_namespace(&namespace_ident).await {
+        Err(_) => {
+            catalog.create_namespace(&namespace_ident, std::collections::HashMap::new()).await?;
+        },
+        Ok(_) => ()
+    };
+
+    match catalog.load_table(&table_ident).await {
+        Ok(t) => Ok(t),
+        Err(_) => {
+            let creation = TableCreation::builder()
+                .name(name.clone())
+                .schema(iceberg_schema.clone())
+                .build();
+
+            match catalog.create_table(&namespace_ident, creation).await {
+                Ok(t) => Ok(t),
+                Err(e) => {
+                    tracing::info!("Failed to create table {}: {}", name, e);
+                    Err(e)
+                }
+            }
+        }
+    }
+
+}
+
+pub async fn load_iceberg_table_metadata(namespace: &String, table_name: &String, last_snapshot_id: i64) -> Result<IcebergLibMetadata, iceberg::Error> {
+    LRU_CACHE_HANDLE.load_iceberg_table_metadata(namespace, table_name, last_snapshot_id).await
+}
+
+async fn load_iceberg_table_metadata_worker(catalog: Arc<RestCatalog>, namespace: &String, name: &String, last_snapshot_id: i64) -> Result<IcebergLibMetadata, iceberg::Error> {
+    let namespace_ident = NamespaceIdent::new(namespace.clone());
+
+    let table_ident = TableIdent {
+        namespace: namespace_ident.clone(),
+        name: name.clone()
+    };
+
+    let table: Table = match catalog.load_table(&table_ident).await {
+        Ok(t) => t,
+        Err(_) => {
+            return Err(iceberg::Error::new(iceberg::ErrorKind::DataInvalid, format!("No such table {}", name)))
+        }
+    };
+
+    let snapshot_log = Vec::from_iter(table.metadata().history());
+    let mut compactions = vec!();
+    for snapshot_info in snapshot_log.iter().rev() {
+        let snapshot = match table.metadata().snapshot_by_id(snapshot_info.snapshot_id) {
+            Some(s) => s,
+            None => {
+                tracing::info!("Unable to find iceberg snapshot {}", snapshot_info.snapshot_id);
+                return Err(iceberg::Error::new(iceberg::ErrorKind::DataInvalid, format!("Unable to find iceberg snapshot {}", snapshot_info.snapshot_id)))
+            }
+        };
+
+        if snapshot_info.snapshot_id == last_snapshot_id {
+            break;
+        }
+
+        let summary = snapshot.summary();
+        match summary.additional_properties.get("compaction") {
+            Some(c) => compactions.push(c.clone()),
+            None => ()
+        };
+    }
+
+    let current_snapshot = match table.metadata().current_snapshot() {
+        Some(c) => c,
+        None => return Err(iceberg::Error::new(iceberg::ErrorKind::DataInvalid, "No snapshot for this table"))
+    };
+
+    let table_scan = match table.scan().select_all().build() {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(iceberg::Error::new(iceberg::ErrorKind::DataInvalid, format!("No table scan task generated, {}", e)))
+        }
+    };
+
+    let plan_files = match table_scan.plan_files().await {
+        Ok(p) => p,
+        Err(_) => {
+            return Err(iceberg::Error::new(iceberg::ErrorKind::DataInvalid, "No plan files task generated"))
+        }
+    };
+
+    let files_result = plan_files.map_ok(|f| (f.data_file_path, f.length, f.schema))
+        .map_err(|err| iceberg::Error::new(iceberg::ErrorKind::Unexpected, format!("file scan task generate failed, {}", err)).with_source(err))
+        .try_collect::<Vec<_>>()
+        .await;
+
+    let (files, sizes, schemas) = match files_result {
+        Ok(r) => {
+            (
+                r.iter().map(|(f, _, _)| f.clone()).collect(),
+                r.iter().map(|(_, s, _)| *s).collect(),
+                r.iter().map(|(_, _, s)| s.clone()).collect()
+            )
+        },
+        Err(e) => return Err(e),
+    };
+
+    Ok(IcebergLibMetadata {
+        snapshot_id: current_snapshot.snapshot_id(),
+        table_schema: table.metadata().current_schema().clone(),
+        files: files,
+        sizes: sizes,
+        schemas: schemas,
+        compactions: compactions,
+        column_names: vec!(),
+        column_stats: vec!(),
+    })
+}
+
+async fn commit_iceberg_transaction_worker(catalog: Arc<RestCatalog>, namespace: &String, name: &String, compaction_id: &String, data_files: &Vec<DataFile>) -> Result<(), iceberg::Error> {
+    let table_ident = TableIdent {
+        namespace: NamespaceIdent::new(namespace.clone()),
+        name: name.clone()
+    };
+
+    let table = match catalog.load_table(&table_ident).await {
+        Ok(t) => t,
+        Err(_) => panic!("You must ensure the table exists before calling this function.")
+    };
+
+    let tx = iceberg::transaction::Transaction::new(&table);
+    let mut action = tx.fast_append();
+    action = action.set_snapshot_properties(std::collections::HashMap::from([("compaction".to_string(), compaction_id.clone())]));
+    action = action.add_data_files(data_files.clone());
+    match action.apply(tx)?.commit(catalog.as_ref()).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            return Err(e)
+        }
+    }
+}
 
 pub(crate) async fn file_exists(path: &String) -> bool {
     LRU_CACHE_HANDLE.file_exists(path).await
@@ -939,6 +1284,10 @@ pub(crate) async fn delete_s3_files(file_paths: &Vec<String>) -> () {
 
 pub(crate) async fn put_s3_file(file_path: &String, file_contents: &Vec<u8>) -> Result<(), DataFusionError> {
     LRU_CACHE_HANDLE.file_put(file_path, file_contents).await
+}
+
+pub(crate) async fn commit_iceberg_transaction(namespace: &String, table_name: &String, compaction_id: &String, data_files: &Vec<DataFile>) -> Result<(), iceberg::Error> {
+    LRU_CACHE_HANDLE.commit_iceberg_transaction(namespace, table_name, compaction_id, data_files).await
 }
 
 pub(crate) fn s3_ingest_base_path() -> String {

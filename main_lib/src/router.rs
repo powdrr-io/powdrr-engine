@@ -401,7 +401,7 @@ pub(crate) mod tests {
     use crate::schema_massager::{extract_powdrr_schema_str, PowdrrDataType, PowdrrField, PowdrrSchema};
     use crate::data_contract::{FileSetPayload, IcebergMetadata, SpeedboatMetadata, TableMetadataCheckpoint};
     use crate::state_provider::STATE_PROVIDER;
-    use crate::test_api::{CacheMode, CompactionMode, IndexingMode, PeerMode, PeerModeType, PrefetchMode, StateMode, TestProcessingMode};
+    use crate::test_api::{PeerModeType};
 
     pub(crate) static TEST_SERVER: LazyLock<TestServer> = LazyLock::new(|| TestServer::with_timeout(router(true), 1000).unwrap());
 
@@ -1163,7 +1163,7 @@ pub(crate) mod tests {
         assert_eq!(response.status(), 200);
 
         let process_work_response = test_server.client().put(
-            "http://localhost/_test/v1/_process_work").body("").mime(mime::TEXT_PLAIN).perform().await.unwrap();
+            "http://localhost/_test/v1/_process_work").body(snapshot_id.to_string()).mime(mime::TEXT_PLAIN).perform().await.unwrap();
 
         assert_eq!(process_work_response.status(), 200);
 
