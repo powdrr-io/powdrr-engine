@@ -1,33 +1,26 @@
 
-use iceberg::Catalog;
 use std::{error::Error, fmt};
-use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc};
 use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use datafusion::parquet::file::properties::WriterProperties;
-use futures_util::{FutureExt, TryStreamExt};
+use futures_util::FutureExt;
 use gotham::mime;
 use http::StatusCode;
 use iceberg::arrow::arrow_schema_to_schema;
-use iceberg::io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY};
-use iceberg::{NamespaceIdent, TableCreation, TableIdent};
-use iceberg::table::Table;
-use iceberg::transaction::ApplyTransactionAction;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{DefaultLocationGenerator, FileNameGenerator};
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
-use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
 
-use crate::{state_provider::{STATE_PROVIDER}};
-use crate::data_access::execute_sql;
+use crate::{data_access, state_provider::{STATE_PROVIDER}};
+use crate::data_access::{execute_sql, IcebergLibMetadata};
 use crate::elastic_search_commands::df_to_serde_value;
 use crate::elastic_search_common::{execute_command, Command, CommandContext, CommandError, ElasticSearchResponse, ResultGeneratorFuture};
 use crate::elastic_search_ingest::{write_to_file, WriteBuffer};
@@ -35,110 +28,6 @@ use crate::schema_massager::{PowdrrSchema, SqlBuilder};
 use crate::data_contract::{CompactionCommit, CompactionWorkItem, FileSetPayload, IcebergCommit, IcebergMetadata, SpeedboatCommitTableInfo};
 use crate::state_provider::ServiceApiError;
 use crate::peers::{PrivateCompactionInvocation, PrivateInvocation};
-
-
-const REST_CATALOG_IP: &str = "localhost";
-const REST_CATALOG_PORT: i16 = 8181;
-const S3_ENDPOINT_VALUE: &str = "http://localhost:9000";
-const S3_ACCESS_KEY_ID_VALUE: &str = "admin";
-const S3_SECRET_ACCESS_KEY_VALUE: &str = "password";
-const S3_REGION_VALUE: &str = "us-east-1"; // TODO: figure out a good number here
-
-
-fn get_iceberg_catalog_config() -> RestCatalogConfig {
-    RestCatalogConfig::builder()
-        .uri(format!("http://{}:{}", REST_CATALOG_IP, REST_CATALOG_PORT))
-        .props(HashMap::from([
-            (S3_ENDPOINT.to_string(), S3_ENDPOINT_VALUE.to_string()),
-            (S3_ACCESS_KEY_ID.to_string(), S3_ACCESS_KEY_ID_VALUE.to_string()),
-            (S3_SECRET_ACCESS_KEY.to_string(), S3_SECRET_ACCESS_KEY_VALUE.to_string()),
-            (S3_REGION.to_string(), S3_REGION_VALUE.to_string()),
-        ]))
-        .build()
-}
-
-#[allow(dead_code)]
-fn get_catalog() -> RestCatalog {
-    RestCatalog::new(get_iceberg_catalog_config())
-}
-
-
-static REST_CATALOG: LazyLock<Arc<RestCatalog>> = LazyLock::new(|| Arc::new(get_catalog()));
-
-
-#[allow(dead_code)]
-async fn list_all_tables(namespace: &String) -> Result<Vec<TableIdent>, iceberg::Error> {
-    let catalog = REST_CATALOG.clone();
-    let namespace_ident = NamespaceIdent::new(namespace.clone());
-    match catalog.get_namespace(&namespace_ident).await {
-        Ok(_) => catalog.list_tables(&namespace_ident).await,
-        Err(_) => Ok(vec!())
-    }
-}
-
-#[cfg(test)]
-async fn drop_table(namespace: &String, name: &String) -> Result<(), iceberg::Error> {
-    let catalog = REST_CATALOG.clone();
-
-    let namespace_ident = NamespaceIdent::new(namespace.clone());
-
-    let table_ident = TableIdent {
-        namespace: namespace_ident.clone(),
-        name: name.clone()
-    };
-
-    catalog.drop_table(&table_ident).await
-}
-
-pub async fn drop_all_tables(namespace: &String) -> Result<(), iceberg::Error> {
-    let catalog = REST_CATALOG.clone();
-    let namespace_ident = NamespaceIdent::new(namespace.clone());
-    let all_tables: Vec<TableIdent> = match catalog.get_namespace(&namespace_ident).await {
-        Ok(_) => catalog.list_tables(&namespace_ident).await?,
-        Err(_) => vec!()
-    };
-    for table_ident in all_tables.iter() {
-        catalog.drop_table(table_ident).await?
-    }
-    Ok(())
-}
-
-async fn ensure_table(namespace: &String, name: &String, iceberg_schema: &iceberg::spec::Schema) -> Result<Table, iceberg::Error> {
-    let catalog = REST_CATALOG.clone();
-
-    let namespace_ident = NamespaceIdent::new(namespace.clone());
-
-    let table_ident = TableIdent {
-        namespace: namespace_ident.clone(),
-        name: name.clone()
-    };
-
-    match catalog.get_namespace(&namespace_ident).await {
-        Err(_) => {
-            catalog.create_namespace(&namespace_ident,  HashMap::new()).await?;
-        },
-        Ok(_) => ()
-    };
-
-    match catalog.load_table(&table_ident).await {
-        Ok(t) => Ok(t),
-        Err(_) => {
-            let creation = TableCreation::builder()
-                .name(name.clone())
-                .schema(iceberg_schema.clone())
-                .build();
-
-            match catalog.create_table(&namespace_ident, creation).await {
-                Ok(t) => Ok(t),
-                Err(e) => {
-                    tracing::info!("Failed to create table {}: {}", name, e);
-                    Err(e)
-                }
-            }
-        }
-    }
-
-}
 
 
 #[derive(Debug)]
@@ -164,107 +53,6 @@ pub enum CompactionResult {
         file_location: String,
         num_records: usize,
     }
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct IcebergLibMetadata {
-    pub snapshot_id: i64,
-    pub table_schema: Arc<iceberg::spec::Schema>,
-    pub files: Vec<String>,
-    pub sizes: Vec<u64>,
-    pub schemas: Vec<Arc<iceberg::spec::Schema>>,
-    pub compactions: Vec<String>,
-    pub column_names: Vec<String>,
-    // per file, per column lower and upper bounds
-    // TODO: this needs to be generalized to support bloom filters
-    pub column_stats: Vec<(String, String)>,
-}
-
-
-pub async fn load_table_metadata(namespace: &String, name: &String, last_snapshot_id: i64) -> Result<IcebergLibMetadata, iceberg::Error> {
-    let catalog = REST_CATALOG.clone();
-
-    let namespace_ident = NamespaceIdent::new(namespace.clone());
-
-    let table_ident = TableIdent {
-        namespace: namespace_ident.clone(),
-        name: name.clone()
-    };
-
-    let table: Table = match catalog.load_table(&table_ident).await {
-        Ok(t) => t,
-        Err(_) => {
-            return Err(iceberg::Error::new(iceberg::ErrorKind::DataInvalid, format!("No such table {}", name)))
-        }
-    };
-
-    let snapshot_log = Vec::from_iter(table.metadata().history());
-    let mut compactions = vec!();
-    for snapshot_info in snapshot_log.iter().rev() {
-        let snapshot = match table.metadata().snapshot_by_id(snapshot_info.snapshot_id) {
-            Some(s) => s,
-            None => {
-                tracing::info!("Unable to find iceberg snapshot {}", snapshot_info.snapshot_id);
-                return Err(iceberg::Error::new(iceberg::ErrorKind::DataInvalid, format!("Unable to find iceberg snapshot {}", snapshot_info.snapshot_id)))
-            }
-        };
-
-        if snapshot_info.snapshot_id == last_snapshot_id {
-            break;
-        }
-
-        let summary = snapshot.summary();
-        match summary.additional_properties.get("compaction") {
-            Some(c) => compactions.push(c.clone()),
-            None => ()
-        };
-    }
-
-    let current_snapshot = match table.metadata().current_snapshot() {
-        Some(c) => c,
-        None => return Err(iceberg::Error::new(iceberg::ErrorKind::DataInvalid, "No snapshot for this table"))
-    };
-
-    let table_scan = match table.scan().select_all().build() {
-        Ok(s) => s,
-        Err(e) => {
-            return Err(iceberg::Error::new(iceberg::ErrorKind::DataInvalid, format!("No table scan task generated, {}", e)))
-        }
-    };
-
-    let plan_files = match table_scan.plan_files().await {
-        Ok(p) => p,
-        Err(_) => {
-            return Err(iceberg::Error::new(iceberg::ErrorKind::DataInvalid, "No plan files task generated"))
-        }
-    };
-
-    let files_result = plan_files.map_ok(|f| (f.data_file_path, f.length, f.schema))
-        .map_err(|err| iceberg::Error::new(iceberg::ErrorKind::Unexpected, format!("file scan task generate failed, {}", err)).with_source(err))
-        .try_collect::<Vec<_>>()
-        .await;
-
-    let (files, sizes, schemas) = match files_result {
-        Ok(r) => {
-            (
-                r.iter().map(|(f, _, _)| f.clone()).collect(),
-                r.iter().map(|(_, s, _)| *s).collect(),
-                r.iter().map(|(_, _, s)| s.clone()).collect()
-            )
-        },
-        Err(e) => return Err(e),
-    };
-
-    Ok(IcebergLibMetadata {
-        snapshot_id: current_snapshot.snapshot_id(),
-        table_schema: table.metadata().current_schema().clone(),
-        files: files,
-        sizes: sizes,
-        schemas: schemas,
-        compactions: compactions,
-        column_names: vec!(),
-        column_stats: vec!(),
-    })
 }
 
 
@@ -322,7 +110,7 @@ impl CompactionCommand {
         data: &Vec<RecordBatch>,
         parquet_file_name: &String,
     ) -> Result<(), iceberg::Error> {
-        let table = ensure_table(namespace, name, &iceberg_schema).await?;
+        let table = data_access::ensure_iceberg_table(namespace, name, &iceberg_schema).await?;
         let location_generator = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
 
         let parquet_writer_builder = ParquetWriterBuilder::new(
@@ -350,19 +138,12 @@ impl CompactionCommand {
             }
         };
 
-        let tx = iceberg::transaction::Transaction::new(&table);
-        let mut action = tx.fast_append();
-        action = action.set_snapshot_properties(HashMap::from([("compaction".to_string(), compaction_id.clone())]));
-        action = action.add_data_files(data_files.clone());
-        let catalog = REST_CATALOG.clone();
-        match action.apply(tx)?.commit(catalog.as_ref()).await {
-            Ok(_) => (),
-            Err(e) => {
-                return Err(e)
-            }
-        }
-
-        Ok(())
+        data_access::commit_iceberg_transaction(
+            namespace,
+            name,
+            compaction_id,
+            &data_files
+        ).await
     }
 
     async fn update_iceberg(data: &Vec<RecordBatch>, table_name: &String, compaction_id: &String, parquet_file_name: &String) -> Result<(), iceberg::Error> {
@@ -502,7 +283,7 @@ impl Command for CompactionCommand {
                 }
             }
 
-            let lib_metadata = match load_table_metadata(
+            let lib_metadata = match data_access::load_iceberg_table_metadata(
                 &"default".to_string(),
                 &public_table_name,
                 old_snapshot_id
@@ -626,13 +407,13 @@ mod tests {
     use gotham::test::Server;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
-    use super::{drop_all_tables, drop_table, ensure_table, load_table_metadata, CompactionCommand, PowdrrFileNameGenerator};
+    use super::{CompactionCommand, PowdrrFileNameGenerator};
     use iceberg::io::{
         FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY,
     };
+    use crate::data_access;
     use crate::elastic_search_storage_schema::{FullRecord, RecordInput, SpeedboatCommitBuilder};
     use crate::router::tests::TEST_SERVER;
-    use super::list_all_tables;
 
     #[test]
     fn test_iceberg_catalog_list_all_tables() {
@@ -642,7 +423,7 @@ mod tests {
     }
 
     async fn test_iceberg_catalog_list_all_tables_worker() {
-        drop_all_tables(&"default".to_string()).await.unwrap();
+        data_access::drop_all_iceberg_tables(&"default".to_string()).await.unwrap();
 
         let iceberg_schema = Schema::builder()
             .with_schema_id(1)
@@ -655,24 +436,14 @@ mod tests {
             .build()
             .unwrap();
 
-        match ensure_table(&"default".to_string(), &"test_table".to_string(), &iceberg_schema).await {
+        match data_access::ensure_iceberg_table(&"default".to_string(), &"test_table".to_string(), &iceberg_schema).await {
             Ok(_) => (),
             Err(e) => {
                 panic!("oh no = {}", e)
             }
         };
 
-        match list_all_tables(&"default".to_string()).await {
-            Ok(tables) => {
-                match tables.len() {
-                    0 => panic!("Table creation or listing failed"),
-                    _ => ()
-                }
-            }
-            Err(e) => panic!("oh no = {}", e)
-        }
-
-        match drop_table(&"default".to_string(), &"test_table".to_string()).await {
+        match data_access::drop_iceberg_table(&"default".to_string(), &"test_table".to_string()).await {
             Ok(_) => (),
             Err(_) => {
             }
@@ -687,7 +458,7 @@ mod tests {
     }
 
     async fn test_iceberg_compact_simple_worker() {
-        drop_all_tables(&"default".to_string()).await.unwrap();
+        data_access::drop_all_iceberg_tables(&"default".to_string()).await.unwrap();
 
         let file_content = include_str!("../tests/data/logs.json");
         let mut values = vec!();
@@ -725,7 +496,7 @@ mod tests {
             }
         }
 
-        let metadata = match load_table_metadata(&"default".to_string(), &"simple".to_string(), -1).await {
+        let metadata = match data_access::load_iceberg_table_metadata(&"default".to_string(), &"simple".to_string(), -1).await {
             Ok(m) => m,
             Err(e) => {
                 panic!("nope {}", e)
@@ -737,7 +508,7 @@ mod tests {
         assert_eq!(metadata.column_names.len(), 0);
         assert_eq!(metadata.column_stats.len(), 0);
 
-        match drop_table(&"default".to_string(), &"simple".to_string()).await {
+        match data_access::drop_iceberg_table(&"default".to_string(), &"simple".to_string()).await {
             Ok(_) => (),
             Err(_) => {
             }
@@ -752,7 +523,7 @@ mod tests {
     }
 
     async fn test_iceberg_compact_okta_worker() {
-        drop_all_tables(&"default".to_string()).await.unwrap();
+        data_access::drop_all_iceberg_tables(&"default".to_string()).await.unwrap();
 
         let okta_1 = include_str!("../tests/data/okta_system_log_1.json").replace("\n", "");
         let okta_2 = include_str!("../tests/data/okta_system_log_2.json").replace("\n", "");
@@ -787,7 +558,7 @@ mod tests {
             }
         }
 
-        let metadata = match load_table_metadata(&"default".to_string(), &"okta".to_string(), -1).await {
+        let metadata = match data_access::load_iceberg_table_metadata(&"default".to_string(), &"okta".to_string(), -1).await {
             Ok(m) => m,
             Err(e) => {
                 panic!("nope {}", e)
@@ -799,7 +570,7 @@ mod tests {
         assert_eq!(metadata.column_names.len(), 0);
         assert_eq!(metadata.column_stats.len(), 0);
 
-        match drop_table(&"default".to_string(), &"okta".to_string()).await {
+        match data_access::drop_iceberg_table(&"default".to_string(), &"okta".to_string()).await {
             Ok(_) => (),
             Err(_) => {
             }
@@ -807,7 +578,7 @@ mod tests {
     }
 
     async fn test_s3_file_io_worker() {
-        drop_all_tables(&"default".to_string()).await.unwrap();
+        data_access::drop_all_iceberg_tables(&"default".to_string()).await.unwrap();
 
         let file_io = FileIOBuilder::new("s3")
             .with_props(vec![

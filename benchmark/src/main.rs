@@ -5,7 +5,7 @@ use futures::future::join_all;
 use idgenerator::{IdGeneratorOptions, IdInstance};
 use rand::TryRngCore;
 use rand::rngs::OsRng;
-use powdrr_lib::compaction;
+use powdrr_lib::{compaction, data_access};
 use powdrr_lib::data_contract::{ServiceImplType, ServiceMode, TEST_ACCESS_KEY, TEST_SECRET_KEY};
 use powdrr_lib::test_api::{CompactionMode, IndexingMode, PrefetchMode, TestProcessingMode, StateMode, CacheMode, PeerMode, StorageMode};
 
@@ -219,7 +219,7 @@ async fn main() -> Result<(), std::io::Error> {
 
     println!("Drop All Iceberg Tables");
 
-    compaction::drop_all_tables(&"default".to_string()).await.unwrap();
+    data_access::drop_all_iceberg_tables(&"default".to_string()).await.unwrap();
 
     println!("Setting Modes");
 
@@ -251,7 +251,9 @@ async fn main() -> Result<(), std::io::Error> {
             access_key: TEST_ACCESS_KEY.to_string(),
             secret_key: TEST_SECRET_KEY.to_string()
         },
-        storage_mode: StorageMode::S3 { endpoint: Some("http://minio:9000".to_string()) },
+        storage_mode: StorageMode::S3 {
+            rest_endpoint: Some("http://rest:8181".to_string()),
+            s3_endpoint: Some("http://minio:9000".to_string()) },
         cache_mode: CacheMode::Redis(Some("redis://redis:6379".to_string())),
         peer_mode: PeerMode::SelfOnly,
         indexing_mode: IndexingMode::Disabled,
