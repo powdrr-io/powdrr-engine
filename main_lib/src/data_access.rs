@@ -3,7 +3,7 @@ use std::{path::Path, sync::Arc};
 use std::string::ToString;
 use std::sync::{LazyLock};
 use std::time::Duration;
-use datafusion::{arrow::array::RecordBatch, error::DataFusionError, prelude::{DataFrame, NdJsonReadOptions, ParquetReadOptions, SessionContext}};
+use datafusion::{arrow, arrow::array::RecordBatch, error::DataFusionError, prelude::{DataFrame, NdJsonReadOptions, ParquetReadOptions, SessionContext}};
 use datafusion::arrow::datatypes::{Schema};
 use datafusion::common::HashMap;
 use datafusion::config::ConfigOptions;
@@ -594,16 +594,29 @@ impl CacheTrackerActor {
 
     async fn load_table(&mut self, table_name: &String, records: &Vec<RecordBatch>) -> Result< (), DataFusionError> {
         let schema = records.get(0).unwrap().schema();
-        let table = match datafusion::datasource::MemTable::try_new(schema, vec!(records.to_vec())) {
+        let concated = match arrow::compute::concat_batches(&records[0].schema(), records) {
+            Ok(batch) => batch,
+            Err(e) => return {
+                tracing::error!("Failed to concat_batches: {}", e);
+                log_err(DataFusionError::ArrowError(e, None))
+            },
+        };
+        let table = match datafusion::datasource::MemTable::try_new(schema, vec!(vec!(concated))) {
             Ok(t) => Arc::new(t),
-            Err(e) => return log_err(e),
+            Err(e) => return {
+                tracing::error!("Failed to create MemTable: {}", e);
+                log_err(e)
+            },
         };
         match self.data_fusion_context.register_table(table_name, table) {
             Ok(_) => {
                 self.track_table(&table_name).await;
                 Ok(())
             },
-            Err(e) => log_err(e)
+            Err(e) => {
+                tracing::error!("Failed to register MemTable: {}", e);
+                log_err(e)
+            }
         }
     }
 
