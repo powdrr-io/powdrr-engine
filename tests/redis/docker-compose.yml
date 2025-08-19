@@ -15,7 +15,6 @@ services:
 
   minio:
     image: minio/minio
-    container_name: minio
     networks:
       iceberg_net:
         aliases:

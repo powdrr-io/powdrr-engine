@@ -7,7 +7,6 @@ use gotham::mime;
 use gotham::plain::test::AsyncTestServer;
 use k8s_openapi::api::core::v1::Pod;
 use kube::Api;
-use prost::Message;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -329,10 +328,8 @@ impl PeerClient for RemotePeer {
 
         assert!(res.status().is_success());
 
-        let response_bytes = res.bytes().await.unwrap();
-        let response_str = String::from_utf8(response_bytes.encode_to_vec()).unwrap();
-
-        let response = serde_json::from_str::<CompactionResponse>(response_str.as_str()).unwrap();
+        let body = res.bytes().await.unwrap();
+        let response = serde_json::from_slice(&body).unwrap();
         Ok(Some(response))
     }
 

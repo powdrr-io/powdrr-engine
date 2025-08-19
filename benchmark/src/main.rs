@@ -5,7 +5,7 @@ use futures::future::join_all;
 use idgenerator::{IdGeneratorOptions, IdInstance};
 use rand::TryRngCore;
 use rand::rngs::OsRng;
-use powdrr_lib::{compaction, data_access};
+use powdrr_lib::{data_access};
 use powdrr_lib::data_contract::{ServiceImplType, ServiceMode, TEST_ACCESS_KEY, TEST_SECRET_KEY};
 use powdrr_lib::test_api::{CompactionMode, IndexingMode, PrefetchMode, TestProcessingMode, StateMode, CacheMode, PeerMode, StorageMode};
 

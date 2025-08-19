@@ -324,7 +324,7 @@ impl Command for CompactionCommand {
 
             Ok(ElasticSearchResponse {
                 status: StatusCode::OK,
-                mime: mime::TEXT_PLAIN,
+                mime: mime::APPLICATION_JSON,
                 body: serde_json::to_string(&command_response).unwrap(),
                 headers: vec![],
             })
