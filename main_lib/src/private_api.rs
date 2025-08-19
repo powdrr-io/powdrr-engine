@@ -55,32 +55,46 @@ pub(crate) struct DataQueryResult {
 struct RequiredFiles {
     table_schema: PowdrrSchema,
     iceberg_files: Vec<FileDescriptor>,
+    all_iceberg_files_count: usize,
     iceberg_file_extensions: Vec<Vec<ExtensionFileSpec>>,
     speedboat_files: Vec<FileDescriptor>,
+    all_speedboat_files_count: usize,
     speedboat_file_extensions: Vec<Vec<ExtensionFileSpec>>,
     delete_files: Vec<String>,
 }
 
 
-fn filter_iceberg<'a>(iceberg_metadata: &'a Option<IcebergMetadata>, index: u64, num: u64) -> Vec<FileDescriptor> {
+struct FilteredFiles {
+    files: Vec<FileDescriptor>,
+    all_files_count: usize,
+}
+
+
+fn filter_iceberg(iceberg_metadata: &Option<IcebergMetadata>, index: u64, num: u64) -> FilteredFiles {
     match iceberg_metadata {
         Some(im) => {
             let filtered_files = im.files.as_selected_tuples(index, num);
             // TODO: apply filters
-            filtered_files
+            FilteredFiles {
+                files: filtered_files,
+                all_files_count: im.files.len(),
+            }
         },
-        None => vec!()
+        None => FilteredFiles{ files: vec!(), all_files_count: 0 }
     }    
 }
 
-fn filter_speedboat(speedboat_metadata: &Option<SpeedboatMetadata>, index: u64, num: u64) -> Vec<FileDescriptor> {
+fn filter_speedboat(speedboat_metadata: &Option<SpeedboatMetadata>, index: u64, num: u64) -> FilteredFiles {
     match speedboat_metadata {
         Some(sm) => {
-            let files = sm.files.as_selected_tuples(index, num);
+            let filtered_files = sm.files.as_selected_tuples(index, num);
             // TODO: apply filters
-            files
+            FilteredFiles {
+                files: filtered_files,
+                all_files_count: sm.files.len(),
+            }
         },
-        None => vec!()
+        None => FilteredFiles{ files: vec!(), all_files_count: 0 }
     }
 }
 
@@ -107,10 +121,12 @@ async fn determine_required_files(required_extensions: &Vec<String>, checkpoints
     let filtered_speedboat_files = filter_speedboat(&table_metadata.speedboat_metadata, index, num);
     Ok(RequiredFiles {
         table_schema: table_metadata.schema.clone(),
-        iceberg_files: filtered_iceberg_files.to_vec(),
-        iceberg_file_extensions: filtered_iceberg_files.iter().map(|f|get_extension_files(required_extensions, &f.file_path)).collect(),
-        speedboat_files: filtered_speedboat_files.to_vec(),
-        speedboat_file_extensions: filtered_speedboat_files.iter().map(|f|get_extension_files(required_extensions, &f.file_path)).collect(),
+        iceberg_files: filtered_iceberg_files.files.clone(),
+        all_iceberg_files_count: filtered_iceberg_files.all_files_count,
+        iceberg_file_extensions: filtered_iceberg_files.files.iter().map(|f|get_extension_files(required_extensions, &f.file_path)).collect(),
+        speedboat_files: filtered_speedboat_files.files.clone(),
+        all_speedboat_files_count: filtered_speedboat_files.all_files_count,
+        speedboat_file_extensions: filtered_speedboat_files.files.iter().map(|f|get_extension_files(required_extensions, &f.file_path)).collect(),
         delete_files: table_metadata.deletes_metadata.map_or_else(|| vec!(), |d|d.files.clone()),
     })
 }
@@ -121,7 +137,9 @@ fn generate_required_files(invocation: &PrivateCompactionInvocation, index: u64,
     RequiredFiles {
         table_schema: invocation.table_schema.clone(),
         iceberg_files: vec![],
+        all_iceberg_files_count: 0,
         speedboat_files: speedboat_files.clone(),
+        all_speedboat_files_count: speedboat_files.len(),
         iceberg_file_extensions: vec![],
         speedboat_file_extensions: speedboat_files.iter().map(|_|vec![]).collect(),
         delete_files: invocation.delete_files.clone(),
@@ -283,7 +301,15 @@ pub(crate) async fn data_query(invocation: &PrivateSqlInvocation, index: u64, nu
 
     let parquet_size = required_files.iceberg_files.iter().map(|f|f.size).sum::<u64>();
     let speedboat_size = required_files.speedboat_files.iter().map(|f|f.size).sum::<u64>();
-    tracing::info!("Query: parquet = {}, {}, speedboat = {}, {}", required_files.iceberg_files.len(), parquet_size, required_files.speedboat_files.len(), speedboat_size);
+    tracing::info!(
+        "Query: parquet = {}/{}, {}, speedboat = {}/{}, {}",
+        required_files.iceberg_files.len(),
+        required_files.all_iceberg_files_count,
+        parquet_size,
+        required_files.speedboat_files.len(),
+        required_files.all_speedboat_files_count,
+        speedboat_size
+    );
 
     data_query_worker(
         &invocation.sql,
