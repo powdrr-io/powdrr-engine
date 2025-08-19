@@ -8,44 +8,34 @@
 # Create a stage for building the application.
 
 ARG RUST_VERSION=1.89.0
-FROM rust:${RUST_VERSION}-slim-bullseye AS build
+FROM rust:${RUST_VERSION}-slim-bullseye AS base
+
+RUN cargo install cargo-chef
 
 # RUN rustup target add x86_64-unknown-linux-musl
 RUN apt update && apt install -y libssl-dev pkg-config
 RUN update-ca-certificates
 
-#COPY Cargo.toml Cargo.lock /app/
-#
-#RUN cargo new /app/benchmark
-#COPY benchmark/Cargo.toml /app/benchmark/
-#RUN cargo new /app/cli
-#COPY cli/Cargo.toml /app/cli/
-#RUN cargo new /app/engine
-#COPY engine/Cargo.toml /app/engine/
-#RUN cargo new /app/service
-#COPY service/Cargo.toml /app/service/
-#
-#RUN cargo new --lib /app/main_lib
-#COPY main_lib/Cargo.toml /app/main_lib/
-
-WORKDIR /app
-#
-#RUN --mount=type=cache,target=/usr/local/cargo/registry \
-#    --mount=type=cache,target=/usr/local/cargo/git \
-#    cargo build --release
-
+FROM base AS planner
+WORKDIR app
 COPY . .
+RUN cargo chef prepare  --recipe-path recipe.json
 
-ARG TARGET
+FROM base AS builder
+WORKDIR app
+COPY --from=planner /app/recipe.json recipe.json
+# Build dependencies - this is the caching Docker layer!
+RUN cargo chef cook --release --recipe-path recipe.json
+# Build application
+COPY . .
+RUN cargo build --release
 
-RUN cargo build --release && \
-    mv /app/target/release/${TARGET} /app
-
-
-FROM rust:${RUST_VERSION}-slim-bullseye
+FROM base
 ARG PORT
 ARG TARGET
-COPY --from=build /app/${TARGET} ./
+WORKDIR app
+COPY --from=builder /app/target/release/${TARGET} ./
+
 ENV TARGET_ENV=$TARGET
 CMD [ "sh", "-c", "./$TARGET_ENV" ]
 
