@@ -1,0 +1,372 @@
+{
+  "cases": [
+    {
+      "id": "create_index_acknowledged",
+      "description": "Create index returns acknowledged fields",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        }
+      ],
+      "request": {
+        "method": "PUT",
+        "path": "/{{index}}",
+        "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_bool", "path": "acknowledged", "value": true },
+        { "kind": "json_path_bool", "path": "shards_acknowledged", "value": true },
+        { "kind": "json_path_string", "path": "index", "value": "{{index}}" }
+      ]
+    },
+    {
+      "id": "bulk_match_search_returns_expected_hits",
+      "description": "Bulk ingest followed by a match query returns the expected docs",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:04:05.000Z\", \"index_col\": 1, \"user\": { \"id\": \"vlb44hny\" }, \"message\": \"Login attempt failed\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:06:07.000Z\", \"index_col\": 2, \"user\": { \"id\": \"8a4f500d\" }, \"message\": \"Login successful\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-09T11:07:08.000Z\", \"index_col\": 3, \"user\": { \"id\": \"l7gk7f82\" }, \"message\": \"Logout successful\" }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/{{index}}/_search",
+        "body": "{\n  \"query\": {\n    \"match\": {\n      \"message\": {\n        \"query\": \"Login\"\n      }\n    }\n  }\n}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number", "path": "hits.total.value", "value": 2 },
+        {
+          "kind": "json_path_string_set",
+          "path": "hits.hits[*]._source.message",
+          "values": ["Login attempt failed", "Login successful"]
+        }
+      ]
+    },
+    {
+      "id": "create_with_id_conflict_after_refresh",
+      "description": "A second create with the same id conflicts after refresh",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_create/my_id",
+            "body": "{ \"@timestamp\": \"2099-11-15T13:12:00\", \"message\": \"GET /search HTTP/1.1 200 1070000\", \"user\": { \"id\": \"kimchy\" } }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/{{index}}/_create/my_id",
+        "body": "{ \"@timestamp\": \"2099-11-15T13:12:00\", \"message\": \"GET /search HTTP/1.1 200 1070000\", \"user\": { \"id\": \"kimchy\" } }",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 409 }
+      ]
+    },
+    {
+      "id": "get_existing_doc_returns_source",
+      "description": "Get by id returns the stored source document",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_create/my_id",
+            "body": "{ \"@timestamp\": \"2099-11-15T13:12:00\", \"message\": \"GET /search HTTP/1.1 200 1070000\", \"user\": { \"id\": \"kimchy\" } }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/{{index}}/_doc/my_id",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_string", "path": "_id", "value": "my_id" },
+        { "kind": "json_path_string", "path": "_source.message", "value": "GET /search HTTP/1.1 200 1070000" }
+      ]
+    },
+    {
+      "id": "delete_existing_doc_returns_200",
+      "description": "Deleting an existing document succeeds",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_create/my_id",
+            "body": "{ \"@timestamp\": \"2099-11-15T13:12:00\", \"message\": \"GET /search HTTP/1.1 200 1070000\", \"user\": { \"id\": \"kimchy\" } }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "DELETE",
+        "path": "/{{index}}/_doc/my_id",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 }
+      ]
+    },
+    {
+      "id": "get_deleted_doc_returns_404",
+      "description": "A deleted document is not retrievable after refresh",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_create/my_id",
+            "body": "{ \"@timestamp\": \"2099-11-15T13:12:00\", \"message\": \"GET /search HTTP/1.1 200 1070000\", \"user\": { \"id\": \"kimchy\" } }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "DELETE",
+            "path": "/{{index}}/_doc/my_id",
+            "body": "",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/{{index}}/_doc/my_id",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 404 }
+      ]
+    }
+  ]
+}

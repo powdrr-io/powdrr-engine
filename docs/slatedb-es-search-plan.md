@@ -1,5 +1,13 @@
 # SlateDB Elasticsearch Search Migration Plan
 
+## Status
+
+Rejected.
+
+This plan is kept for historical analysis only. It was superseded once the
+storage requirement became Iceberg-managed immutable table storage rather than
+SlateDB SST storage. The active direction is
+`docs/iceberg-es-roadmap.md`.
 ## Goal
 
 Expose the existing Elasticsearch-compatible HTTP API while using SlateDB as the
