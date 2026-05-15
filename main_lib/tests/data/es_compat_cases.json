@@ -367,6 +367,779 @@
       "assertions": [
         { "kind": "status", "value": 404 }
       ]
+    },
+    {
+      "id": "term_query_on_numeric_field_returns_exact_hit",
+      "description": "A term query on a numeric field returns the exact matching document",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:04:05.000Z\", \"index_col\": 1, \"user\": { \"id\": \"vlb44hny\" }, \"message\": \"Login attempt failed\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:06:07.000Z\", \"index_col\": 2, \"user\": { \"id\": \"8a4f500d\" }, \"message\": \"Login successful\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-09T11:07:08.000Z\", \"index_col\": 3, \"user\": { \"id\": \"l7gk7f82\" }, \"message\": \"Logout successful\" }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/{{index}}/_search",
+        "body": "{\"query\":{\"term\":{\"index_col\":2}}}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number", "path": "hits.total.value", "value": 1 },
+        {
+          "kind": "json_path_string_set",
+          "path": "hits.hits[*]._source.message",
+          "values": ["Login successful"]
+        }
+      ]
+    },
+    {
+      "id": "bool_must_and_must_not_returns_single_hit",
+      "description": "A bool query with must and must_not narrows the hit set correctly",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:04:05.000Z\", \"index_col\": 1, \"user\": { \"id\": \"vlb44hny\" }, \"message\": \"Login attempt failed\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:06:07.000Z\", \"index_col\": 2, \"user\": { \"id\": \"8a4f500d\" }, \"message\": \"Login successful\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-09T11:07:08.000Z\", \"index_col\": 3, \"user\": { \"id\": \"l7gk7f82\" }, \"message\": \"Logout successful\" }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/{{index}}/_search",
+        "body": "{\"query\":{\"bool\":{\"must\":[{\"match\":{\"message\":{\"query\":\"Login\"}}}],\"must_not\":[{\"term\":{\"index_col\":1}}]}}}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number", "path": "hits.total.value", "value": 1 },
+        {
+          "kind": "json_path_string_set",
+          "path": "hits.hits[*]._source.message",
+          "values": ["Login successful"]
+        }
+      ]
+    },
+    {
+      "id": "bool_filter_should_minimum_should_match_returns_filtered_hits",
+      "description": "A bool query with filter, should, and minimum_should_match returns the filtered hits",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:04:05.000Z\", \"index_col\": 1, \"user\": { \"id\": \"vlb44hny\" }, \"message\": \"Login attempt failed\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:06:07.000Z\", \"index_col\": 2, \"user\": { \"id\": \"8a4f500d\" }, \"message\": \"Login successful\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-09T11:07:08.000Z\", \"index_col\": 3, \"user\": { \"id\": \"l7gk7f82\" }, \"message\": \"Logout successful\" }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/{{index}}/_search",
+        "body": "{\"query\":{\"bool\":{\"must\":[{\"match\":{\"message\":{\"query\":\"successful\"}}}],\"filter\":[{\"bool\":{\"should\":[{\"term\":{\"index_col\":2}},{\"term\":{\"index_col\":3}}],\"minimum_should_match\":1}}]}}}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number", "path": "hits.total.value", "value": 2 },
+        {
+          "kind": "json_path_string_set",
+          "path": "hits.hits[*]._source.message",
+          "values": ["Login successful", "Logout successful"]
+        }
+      ]
+    },
+    {
+      "id": "range_query_on_timestamp_returns_expected_hits",
+      "description": "A range query on the timestamp field returns the expected hit set",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:04:05.000Z\", \"index_col\": 1, \"user\": { \"id\": \"vlb44hny\" }, \"message\": \"Login attempt failed\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:06:07.000Z\", \"index_col\": 2, \"user\": { \"id\": \"8a4f500d\" }, \"message\": \"Login successful\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-09T11:07:08.000Z\", \"index_col\": 3, \"user\": { \"id\": \"l7gk7f82\" }, \"message\": \"Logout successful\" }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/{{index}}/_search",
+        "body": "{\"query\":{\"range\":{\"@timestamp\":{\"gte\":\"2099-03-09T00:00:00.000Z\"}}}}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number", "path": "hits.total.value", "value": 1 },
+        {
+          "kind": "json_path_string_set",
+          "path": "hits.hits[*]._source.message",
+          "values": ["Logout successful"]
+        }
+      ]
+    },
+    {
+      "id": "simple_query_string_with_and_operator_returns_expected_hit",
+      "description": "A simple_query_string query with a single term returns the expected hits",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:04:05.000Z\", \"index_col\": 1, \"user\": { \"id\": \"vlb44hny\" }, \"message\": \"Login attempt failed\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:06:07.000Z\", \"index_col\": 2, \"user\": { \"id\": \"8a4f500d\" }, \"message\": \"Login successful\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-09T11:07:08.000Z\", \"index_col\": 3, \"user\": { \"id\": \"l7gk7f82\" }, \"message\": \"Logout successful\" }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/{{index}}/_search",
+        "body": "{\"query\":{\"simple_query_string\":{\"query\":\"Login\",\"fields\":[\"message\"],\"default_operator\":\"OR\"}}}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number", "path": "hits.total.value", "value": 2 },
+        {
+          "kind": "json_path_string_set",
+          "path": "hits.hits[*]._source.message",
+          "values": ["Login attempt failed", "Login successful"]
+        }
+      ]
+    },
+    {
+      "id": "zero_hit_query_on_existing_index_returns_zero_total",
+      "description": "A query that matches nothing on an existing index reports zero hits",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:04:05.000Z\", \"index_col\": 1, \"user\": { \"id\": \"vlb44hny\" }, \"message\": \"Login attempt failed\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:06:07.000Z\", \"index_col\": 2, \"user\": { \"id\": \"8a4f500d\" }, \"message\": \"Login successful\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-09T11:07:08.000Z\", \"index_col\": 3, \"user\": { \"id\": \"l7gk7f82\" }, \"message\": \"Logout successful\" }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/{{index}}/_search",
+        "body": "{\"query\":{\"term\":{\"index_col\":99}}}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number", "path": "hits.total.value", "value": 0 }
+      ]
+    },
+    {
+      "id": "update_by_query_scripted_field_becomes_searchable_after_refresh",
+      "description": "Update-by-query writes a scripted field that becomes searchable after refresh",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:04:05.000Z\", \"index_col\": 1, \"user\": { \"id\": \"vlb44hny\" }, \"message\": \"Login attempt failed\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:06:07.000Z\", \"index_col\": 2, \"user\": { \"id\": \"8a4f500d\" }, \"message\": \"Login successful\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-09T11:07:08.000Z\", \"index_col\": 3, \"user\": { \"id\": \"l7gk7f82\" }, \"message\": \"Logout successful\" }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_update_by_query",
+            "body": "{\"query\":{\"match\":{\"message\":{\"query\":\"Login\"}}},\"script\":{\"source\":\"ctx._source.dude = params.foo\",\"lang\":\"painless\",\"params\":{\"foo\":\"bar\"}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/{{index}}/_search",
+        "body": "{\"query\":{\"match\":{\"dude\":{\"query\":\"bar\"}}}}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number", "path": "hits.total.value", "value": 2 }
+      ]
+    },
+    {
+      "id": "alias_update_allows_search_via_alias_name",
+      "description": "Updating aliases allows subsequent search requests through the alias name",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_aliases",
+            "body": "{\"actions\":[{\"add\":{\"index\":\"{{index}}\",\"alias\":\"{{index}}-alias\"}}]}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_create/my_id",
+            "body": "{ \"@timestamp\": \"2099-11-15T13:12:00\", \"message\": \"Alias routing works\", \"user\": { \"id\": \"kimchy\" } }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/{{index}}-alias/_search",
+        "body": "{\"query\":{\"match\":{\"message\":{\"query\":\"Alias\"}}}}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number", "path": "hits.total.value", "value": 1 },
+        {
+          "kind": "json_path_string_set",
+          "path": "hits.hits[*]._source.message",
+          "values": ["Alias routing works"]
+        }
+      ]
+    },
+    {
+      "id": "index_template_head_returns_200_after_create",
+      "description": "A created index template is visible via HEAD",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/_index_template/{{index}}_template",
+            "body": "{\"index_patterns\":[\"{{index}}-*\"],\"priority\":7,\"template\":{\"settings\":{\"index\":{\"number_of_shards\":3,\"number_of_replicas\":1}}}}",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "HEAD",
+        "path": "/_index_template/{{index}}_template",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 }
+      ]
+    },
+    {
+      "id": "index_template_get_returns_stored_body",
+      "description": "The current engine returns the stored template body on GET",
+      "differential_enabled": false,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/_index_template/{{index}}_template",
+            "body": "{\"index_patterns\":[\"{{index}}-*\"],\"priority\":7,\"template\":{\"settings\":{\"index\":{\"number_of_shards\":3,\"number_of_replicas\":1}}}}",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/_index_template/{{index}}_template",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number", "path": "priority", "value": 7 },
+        { "kind": "json_path_number", "path": "template.settings.index.number_of_shards", "value": 3 },
+        {
+          "kind": "json_path_string_set",
+          "path": "index_patterns[*]",
+          "values": ["{{index}}-*"]
+        }
+      ]
+    },
+    {
+      "id": "terms_aggregation_returns_expected_bucket_keys_and_counts",
+      "description": "A terms aggregation over message values returns the expected buckets",
+      "differential_enabled": false,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:04:05.000Z\", \"index_col\": 1, \"user\": { \"id\": \"vlb44hny\" }, \"message\": \"Login attempt failed\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:06:07.000Z\", \"index_col\": 2, \"user\": { \"id\": \"8a4f500d\" }, \"message\": \"Login successful\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-09T11:07:08.000Z\", \"index_col\": 3, \"user\": { \"id\": \"l7gk7f82\" }, \"message\": \"Logout successful\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-10T11:08:07.000Z\", \"index_col\": 4, \"user\": { \"id\": \"8a2f500d\" }, \"message\": \"Login successful\" }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/{{index}}/_search",
+        "body": "{\n  \"query\": {\n    \"match\": {\n      \"message\": {\n        \"query\": \"Login\"\n      }\n    }\n  },\n  \"aggs\": {\n    \"messageType\": {\n      \"terms\": {\n        \"field\": \"message\"\n      }\n    }\n  }\n}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number", "path": "hits.total.value", "value": 3 },
+        {
+          "kind": "json_path_string_set",
+          "path": "aggregations.messageType.buckets[*].key",
+          "values": ["Login attempt failed", "Login successful"]
+        },
+        {
+          "kind": "json_path_number_set",
+          "path": "aggregations.messageType.buckets[*].doc_count",
+          "values": [1, 2]
+        }
+      ]
+    },
+    {
+      "id": "avg_and_filter_subaggregation_return_expected_values",
+      "description": "Metric and filtered sub-aggregation results return the expected averages",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:04:05.000Z\", \"index_col\": 1, \"user\": { \"id\": \"vlb44hny\" }, \"type\": \"tshirt\", \"price\": 100.00 }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:06:07.000Z\", \"index_col\": 2, \"user\": { \"id\": \"8a4f500d\" }, \"type\": \"tshirt\", \"price\": 80.00 }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-09T11:07:08.000Z\", \"index_col\": 3, \"user\": { \"id\": \"l7gk7f82\" }, \"type\": \"buttondown\", \"price\": 120.00 }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-10T11:08:07.000Z\", \"index_col\": 4, \"user\": { \"id\": \"8a2f500d\" }, \"type\": \"buttondown\", \"price\": 140.00 }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/{{index}}/_search",
+        "body": "{\n  \"aggs\": {\n    \"avg_price\": { \"avg\": { \"field\": \"price\" } },\n    \"t_shirts\": {\n      \"filter\": { \"term\": { \"type\": \"tshirt\" } },\n      \"aggs\": {\n        \"avg_price\": { \"avg\": { \"field\": \"price\" } }\n      }\n    }\n  }\n}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_float", "path": "aggregations.avg_price.value", "value": 110.0, "tolerance": 0.000001 },
+        { "kind": "json_path_number", "path": "aggregations.t_shirts.doc_count", "value": 2 },
+        { "kind": "json_path_float", "path": "aggregations.t_shirts.avg_price.value", "value": 90.0, "tolerance": 0.000001 }
+      ]
     }
   ]
 }

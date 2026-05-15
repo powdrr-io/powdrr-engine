@@ -1,0 +1,102 @@
+volumes:
+  redis_data:
+    driver: local
+  minio_data:
+    driver: local
+  esdata01:
+    driver: local
+
+services:
+  redis:
+    image: redis:latest
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  createbuckets:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc alias set myminio http://minio:9000 admin password) do echo 'waiting for minio' && sleep 1; done;
+      /usr/bin/mc rm -r --force myminio/warehouse || true;
+      /usr/bin/mc rm -r --force myminio/default || true;
+      /usr/bin/mc mb myminio/warehouse;
+      /usr/bin/mc mb myminio/default;
+      /usr/bin/mc anonymous set public myminio/warehouse;
+      /usr/bin/mc anonymous set public myminio/default;
+      tail -f /dev/null
+      "
+
+  rest:
+    image: tabulario/iceberg-rest
+    depends_on:
+      minio:
+        condition: service_healthy
+      createbuckets:
+        condition: service_started
+    ports:
+      - "8181:8181"
+    environment:
+      CATALOG_WAREHOUSE: s3://warehouse
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+
+  localstack:
+    image: localstack/localstack@sha256:91271bdd1a2c3e59cd43c97483c1394672c1e4d2e13e883cfac3f832b23b3876
+    environment:
+      SERVICES: dynamodb
+      EAGER_SERVICE_LOADING: "1"
+    ports:
+      - "4566:4566"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.7.1
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      xpack.security.http.ssl.enabled: "false"
+      xpack.security.transport.ssl.enabled: "false"
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - esdata01:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200 >/dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
