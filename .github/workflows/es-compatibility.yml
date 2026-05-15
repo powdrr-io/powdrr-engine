@@ -1,0 +1,25 @@
+name: ES Compatibility
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Validate Compatibility Fixture File
+        run: cargo test -p powdrr_lib --test es_compatibility_matrix compatibility_matrix_case_file_parses_and_ids_are_unique -- --nocapture
+
+      - name: Run Differential Compatibility Matrix
+        run: bash scripts/run_es_compat_local.sh
