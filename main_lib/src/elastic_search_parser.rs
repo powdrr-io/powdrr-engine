@@ -1,382 +1,55 @@
-use std::collections::HashMap;
-use std::string::ToString;
-use std::sync::LazyLock;
-use chrono::Utc;
+use crate::elastic_search_commands::UpdateByQueryCommand;
+use crate::elastic_search_common::ParseError;
+use crate::elastic_search_endpoints::QueryStringSearch;
+use crate::search_executor::{
+    search_plan_to_command, update_by_query_plan_to_command, SearchCommand,
+};
+use crate::search_plan;
+use crate::search_runtime::ScriptBlock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use crate::data_access::execute_sql;
-use crate::elastic_search_commands::{df_to_serde_value, SqlCommand, UpdateByQueryCommand};
-use crate::elastic_search_common::{CommandError, ParseError};
-use crate::elastic_search_datetime_parser;
-use crate::elastic_search_endpoints::QueryStringSearch;
-use crate::elastic_search_responses::{AggregationResult, AverageAggregationResult, CardinalityAggregationResult, FilterAggregationResult, HistogramAggregationResult, RangeAggregationBucket, RangeAggregationResult, TermAggregationBucket, TermAggregationResult};
-use crate::schema_massager::{FieldExpression, PowdrrDataType, PowdrrField, PowdrrSchema, SqlBuilder, SqlExpression, SqlQuery};
+use std::collections::HashMap;
 
-
-static TERM_AGG_SCHEMA: LazyLock<PowdrrSchema> = LazyLock::new(|| PowdrrSchema::from(&vec!(
-    PowdrrField{ name: "field_name".to_string(), data_type: PowdrrDataType::String},
-    PowdrrField{ name: "cnt".to_string(), data_type: PowdrrDataType::String},
-)));
-
-static RANGE_AGG_SCHEMA: LazyLock<PowdrrSchema> = LazyLock::new(|| PowdrrSchema::from(&vec!(
-    PowdrrField{ name: "field_name".to_string(), data_type: PowdrrDataType::String},
-    PowdrrField{ name: "cnt".to_string(), data_type: PowdrrDataType::String},
-)));
-
-static AVERAGE_AGG_SCHEMA: LazyLock<PowdrrSchema> = LazyLock::new(|| PowdrrSchema::from(&vec!(
-    PowdrrField{ name: "field_name".to_string(), data_type: PowdrrDataType::String},
-    PowdrrField{ name: "cnt".to_string(), data_type: PowdrrDataType::String},
-)));
-
-static CARDINALITY_AGG_SCHEMA: LazyLock<PowdrrSchema> = LazyLock::new(|| PowdrrSchema::from(&vec!(
-    PowdrrField{ name: "field_name".to_string(), data_type: PowdrrDataType::String},
-    PowdrrField{ name: "cnt".to_string(), data_type: PowdrrDataType::String},
-)));
-
-static FILTER_AGG_SCHEMA: LazyLock<PowdrrSchema> = LazyLock::new(|| PowdrrSchema::from(&vec!(
-    PowdrrField{ name: "field_name".to_string(), data_type: PowdrrDataType::String},
-    PowdrrField{ name: "cnt".to_string(), data_type: PowdrrDataType::String},
-)));
-
-#[derive(Clone)]
-pub(crate) struct TermAggProcessor {
-    sql: SqlQuery,
+pub fn parse(
+    table: Option<String>,
+    val: &String,
+    query: &QueryStringSearch,
+) -> Result<SearchCommand, ParseError> {
+    let plan = parse_search_plan(table, val)?;
+    search_plan_to_command(plan, query)
 }
 
-impl TermAggProcessor {
-    fn create_aggregation_bucket(value: &Value) -> TermAggregationBucket {
-        let value_map = value.as_object().unwrap();
-        let key = match value_map.get("field_name") {
-            Some(v) => {
-                if v.is_string() {
-                    v.as_str().unwrap()
-                } else if v.is_null() {
-                    "null"
-                } else {
-                    panic!("nope")
-                }
-            },
-            None => {
-                let value_str = serde_json::to_string(&value).unwrap();
-                println!("value_str: {}", value_str);
-                panic!("nope")
-            }
-        };
-        let doc_count = value_map.get("cnt").unwrap().as_u64().unwrap();
-
-        TermAggregationBucket {
-            key: key.to_string(),
-            doc_count
-        }
-    }
-
-    async fn create_buckets(schema: Option<PowdrrSchema>, table_name: &String, query: &SqlQuery) -> Result<Vec<TermAggregationBucket>, CommandError> {
-        let final_sql = query.build_same(&schema.unwrap_or_else(|| TERM_AGG_SCHEMA.clone())).replace("{target_table}", table_name);
-        let data_frame = match execute_sql(&final_sql).await {
-            Ok(df) => df,
-            Err(_) => panic!("nope")
-        };
-
-        assert_eq!(data_frame.schema().columns().len(), 2);
-
-        let serde_result = df_to_serde_value(&data_frame).await?;
-
-        Ok(serde_result.values.iter().map(|v| TermAggProcessor::create_aggregation_bucket(v)).collect::<Vec<TermAggregationBucket>>())
-    }
-
-    async fn process(&self, schema: Option<PowdrrSchema>, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> Result<AggregationResult, CommandError> {
-        let child_aggs = process_aggregations(schema.clone(), subaggregations, table_name.clone()).await?;
-
-        let buckets = match &table_name {
-            Some(t) => TermAggProcessor::create_buckets(schema.clone(), t, &self.sql).await?,
-            None => vec!()
-        };
-
-        Ok(AggregationResult::Terms(TermAggregationResult{
-            doc_count_error_upper_bound: 0,
-            sum_other_doc_count: 0,
-            buckets: buckets,
-            aggs: child_aggs
-        }))
-    }
+pub fn parse_search_plan(
+    table: Option<String>,
+    val: &String,
+) -> Result<search_plan::SearchPlan, ParseError> {
+    let body: SearchBody = serde_json::from_str(val.as_str()).map_err(|e| ParseError {
+        message: format!("{}", e),
+    })?;
+    to_search_plan(table, &body)
 }
 
-#[derive(Clone)]
-pub(crate) struct RangeAggBucket {
-    sql: SqlQuery,
-    key: String,
-    from: u64,
-    from_as_string: String,
-    to: u64,
-    to_as_string: String,
-    subaggregations: Option<Vec<Aggregation>>
+pub fn parse_update_by_query(
+    table: Option<String>,
+    val: &String,
+) -> Result<UpdateByQueryCommand, ParseError> {
+    let plan = parse_update_by_query_plan(table, val)?;
+    update_by_query_plan_to_command(plan)
 }
 
-#[derive(Clone)]
-pub(crate) struct RangeAggProcessor {
-    buckets: Vec<RangeAggBucket>
-}
-
-impl RangeAggProcessor {
-    async fn create_aggregation_bucket(schema: Option<PowdrrSchema>, bucket_spec: &RangeAggBucket, table_name: Option<String>) -> Result<RangeAggregationBucket, CommandError> {
-        let child_aggs = process_aggregations(schema.clone(), bucket_spec.subaggregations.clone(), table_name.clone()).await?;
-
-        let doc_count = match &table_name {
-            Some(t) => {
-                let final_sql = bucket_spec.sql.build_same(&schema.unwrap_or_else(|| RANGE_AGG_SCHEMA.clone())).replace("{target_table}", t);
-                let data_frame = match execute_sql(&final_sql).await {
-                    Ok(df) => df,
-                    Err(_) => panic!("nope")
-                };
-
-                assert_eq!(data_frame.schema().columns().len(), 1);
-
-                let serde_result = df_to_serde_value(&data_frame).await?;
-
-                serde_result.values.get(0).unwrap().as_object().unwrap().get("cnt").unwrap().as_u64().unwrap()
-            },
-            None => 0
-        };
-
-        Ok(RangeAggregationBucket {
-            key: bucket_spec.key.clone(),
-            from: bucket_spec.from,
-            from_as_string: bucket_spec.from_as_string.clone(),
-            to: bucket_spec.to,
-            to_as_string: bucket_spec.to_as_string.clone(),
-            doc_count: doc_count,
-            aggs: child_aggs,
-        })
-    }
-
-    async fn create_buckets(&self, schema: Option<PowdrrSchema>, table_name: Option<String>) -> Result<Vec<RangeAggregationBucket>, CommandError> {
-        let mut buckets = vec!();
-        for bucket_spec in self.buckets.iter() {
-            buckets.push(RangeAggProcessor::create_aggregation_bucket(schema.clone(), &bucket_spec, table_name.clone()).await?)
-        }
-        Ok(buckets)
-    }
-
-    async fn process(&self, schema: Option<PowdrrSchema>, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> Result<AggregationResult, CommandError> {
-        // The subaggregations should get passed into each bucket
-        assert!(subaggregations.is_none());
-
-        let buckets = self.create_buckets(schema, table_name).await?;
-
-        Ok(AggregationResult::Range(RangeAggregationResult{
-            buckets: buckets,
-        }))
-    }
-}
-
-
-
-
-#[derive(Clone)]
-pub(crate) struct AverageAggProcessor {
-    sql: SqlQuery,
-}
-
-impl AverageAggProcessor {
-    async fn calculate_average(table_name: &String, query: &String) -> Result<f64, CommandError> {
-        let final_sql = query.replace("{target_table}", table_name);
-        let data_frame = match execute_sql(&final_sql).await {
-            Ok(df) => df,
-            Err(e) => return Err(CommandError{ message: format!("{}", e)})
-        };
-
-        assert_eq!(data_frame.schema().columns().len(), 1);
-
-        let serde_result = df_to_serde_value(&data_frame).await?;
-
-        Ok(serde_result.values.get(0).unwrap().as_object().unwrap().get("avg").unwrap().as_f64().unwrap())
-    }
-
-    async fn process(&self, schema: Option<PowdrrSchema>, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> Result<AggregationResult, CommandError> {
-        let child_aggs = process_aggregations(schema.clone(), subaggregations, table_name.clone()).await?;
-
-        let avg = match &table_name {
-            Some(t) => AverageAggProcessor::calculate_average(t, &self.sql.build_same(&schema.unwrap_or_else(||AVERAGE_AGG_SCHEMA.clone()))).await?,
-            None => 0.0
-        };
-
-        Ok(AggregationResult::Average(AverageAggregationResult{
-            value: avg,
-            aggs: child_aggs,
-        }))
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct CardinalityAggProcessor {
-    sql: SqlQuery,
-}
-
-impl CardinalityAggProcessor {
-    async fn calculate_cardinality(table_name: &String, query: &String) -> Result<u64, CommandError> {
-        let final_sql = query.replace("{target_table}", table_name);
-        let data_frame = match execute_sql(&final_sql).await {
-            Ok(df) => df,
-            Err(e) => return Err(CommandError{ message: format!("{}", e)})
-        };
-
-        assert_eq!(data_frame.schema().columns().len(), 1);
-
-        let serde_result = df_to_serde_value(&data_frame).await?;
-
-        Ok(serde_result.values.get(0).unwrap().as_object().unwrap().get("type_count").unwrap().as_u64().unwrap())
-    }
-
-    async fn process(&self, schema: Option<PowdrrSchema>, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> Result<AggregationResult, CommandError> {
-        let child_aggs = process_aggregations(schema.clone(), subaggregations, table_name.clone()).await?;
-
-        let value = match &table_name {
-            Some(t) => CardinalityAggProcessor::calculate_cardinality(t, &self.sql.build_same(&schema.unwrap_or_else(||CARDINALITY_AGG_SCHEMA.clone()))).await?,
-            None => 0
-        };
-        Ok(AggregationResult::Cardinality(CardinalityAggregationResult{
-            value: value,
-            aggs: child_aggs,
-        }))
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct DateHistogramAggBucket {
-    #[allow(dead_code)]
-    subaggregations: Option<Vec<Aggregation>>
-}
-
-#[derive(Clone)]
-pub(crate) struct DateHistogramAggProcessor {
-    #[allow(dead_code)]
-    buckets: Vec<DateHistogramAggBucket>
-}
-
-impl DateHistogramAggProcessor {
-    async fn process(&self, _schema: Option<PowdrrSchema>, _table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> Result<AggregationResult, CommandError> {
-        assert!(subaggregations.is_none());
-        Ok(AggregationResult::Histogram(HistogramAggregationResult{
-            buckets: vec!()
-        }))
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct FilterAggProcessor {
-    sql: SqlQuery,
-}
-
-impl FilterAggProcessor {
-    async fn process(&self, schema: Option<PowdrrSchema>, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> Result<AggregationResult, CommandError> {
-        let doc_count = match &table_name {
-            Some(t) => {
-                let final_sql = self.sql.build_same(&schema.clone().unwrap_or_else(||FILTER_AGG_SCHEMA.clone())).replace("{target_table}", t);
-                let data_frame = execute_sql(&final_sql).await.unwrap();
-                assert_eq!(data_frame.schema().columns().len(), 1);
-                let serde_result = df_to_serde_value(&data_frame).await?;
-                serde_result.values.get(0).unwrap().as_object().unwrap().get("cnt").unwrap().as_u64().unwrap()
-            },
-            None => 0
-        };
-        let child_aggs = process_aggregations(schema.clone(), subaggregations, table_name.clone()).await?;
-
-        Ok(AggregationResult::Filter(FilterAggregationResult {
-            doc_count: doc_count,
-            aggs: child_aggs
-        }))
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct MissingAggProcessor {
-}
-
-impl MissingAggProcessor {
-    async fn process(&self, schema: Option<PowdrrSchema>, table_name: Option<String>, subaggregations: Option<Vec<Aggregation>>) -> Result<AggregationResult, CommandError> {
-        let child_aggs = process_aggregations(schema.clone(), subaggregations, table_name).await?;
-
-        // TODO: we need to find doc that are actually missing values
-        Ok(AggregationResult::Filter(FilterAggregationResult {
-            doc_count: 0,
-            aggs: child_aggs
-        }))
-    }
-}
-
-
-#[derive(Clone)]
-pub(crate) enum AggProcessor {
-    Average(AverageAggProcessor),
-    Cardinality(CardinalityAggProcessor),
-    DateHistogram(DateHistogramAggProcessor),
-    Filter(FilterAggProcessor),
-    Missing(MissingAggProcessor),
-    Range(RangeAggProcessor),
-    Term(TermAggProcessor),
-}
-
-#[derive(Clone)]
-pub(crate) struct Aggregation {
-    pub name: String,
-    pub processor: AggProcessor,
-    pub subaggregations: Option<Vec<Aggregation>>
-}
-
-pub(crate) async fn process_aggregation(schema: Option<PowdrrSchema>, aggregation: &Aggregation, table_name: Option<String>) -> Result<AggregationResult, CommandError> {
-    match &aggregation.processor {
-        AggProcessor::Average(average) => {
-            average.process(schema, table_name, aggregation.subaggregations.clone()).await
-        },
-        AggProcessor::Cardinality(cardinality) => {
-            cardinality.process(schema, table_name, aggregation.subaggregations.clone()).await
-        },
-        AggProcessor::DateHistogram(date_histogram) => {
-            date_histogram.process(schema, table_name, aggregation.subaggregations.clone()).await
-        },
-        AggProcessor::Filter(filter) => {
-            filter.process(schema, table_name, aggregation.subaggregations.clone()).await
-        },
-        AggProcessor::Missing(missing) => {
-            missing.process(schema, table_name, aggregation.subaggregations.clone()).await
-        },
-        AggProcessor::Range(range) => {
-            range.process(schema, table_name, aggregation.subaggregations.clone()).await
-        },
-        AggProcessor::Term(term) => {
-            term.process(schema, table_name, aggregation.subaggregations.clone()).await
-        },
-    }
-}
-
-pub(crate) async fn process_aggregations(schema: Option<PowdrrSchema>, aggregations: Option<Vec<Aggregation>>, table_name: Option<String>) -> Result<HashMap<String, AggregationResult>, CommandError> {
-    let mut results = HashMap::new();
-    if aggregations.is_some() {
-        for aggregation in aggregations.unwrap() {
-            results.insert(aggregation.name.clone(), Box::pin(process_aggregation(schema.clone(), &aggregation, table_name.clone())).await?);
-        }
-    }
-    Ok(results)
-}
-
-
-pub fn parse(table: Option<String>, val: &String, query: &QueryStringSearch) -> Result<SqlCommand, ParseError> {
-    let body: SearchBody = serde_json::from_str(val.as_str()).map_err(|e|ParseError{ message: format!("{}", e)})?;
-    let command = to_command(table, &body, query)?;
-    Ok(command)
-}
-
-pub fn parse_update_by_query(table: Option<String>, val: &String) -> Result<UpdateByQueryCommand, ParseError> {
+pub fn parse_update_by_query_plan(
+    table: Option<String>,
+    val: &String,
+) -> Result<search_plan::UpdateByQueryPlan, ParseError> {
     let body: UpdateByQueryBody = match serde_json::from_str::<UpdateByQueryBody>(val.as_str()) {
-      Ok(b) => b,
-      Err(e) => {
-          let error = format!("{}", e);
-          println!("{}", error);
-          return Err(ParseError{ message: error })
-      }
+        Ok(b) => b,
+        Err(e) => {
+            let error = format!("{}", e);
+            println!("{}", error);
+            return Err(ParseError { message: error });
+        }
     };
-    let command = to_command_update_by_query(table, &body)?;
-    Ok(command)
+    to_update_by_query_plan(table, &body)
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -385,7 +58,6 @@ enum SortSection {
     Single(SortType),
     Multiple(Vec<SortType>),
 }
-
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(untagged)]
@@ -420,7 +92,6 @@ pub(crate) struct AggSpecTerms {
     aggs: Option<HashMap<String, AggSpec>>,
 }
 
-
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct AggSpecMissingBody {
     field: String,
@@ -432,18 +103,18 @@ pub(crate) struct AggSpecMissingBody {
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct AggSpecMissing {
     missing: AggSpecMissingBody,
-    aggs: Option<HashMap<String, AggSpec>>
+    aggs: Option<HashMap<String, AggSpec>>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct AggSpecFilterTerm {
-    term: HashMap<String, String>
+    term: HashMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct AggSpecFilterRangeSpan {
     from: String,
-    to: String
+    to: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -474,7 +145,7 @@ pub(crate) enum AggSpecFilterBody {
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct AggSpecFilter {
     filter: AggSpecFilterBody,
-    aggs: Option<HashMap<String, AggSpec>>
+    aggs: Option<HashMap<String, AggSpec>>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -483,11 +154,10 @@ pub(crate) struct AggSpecDateHistogramBody {
     fixed_interval: String,
 }
 
-
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct AggSpecDateHistogram {
     date_histogram: AggSpecDateHistogramBody,
-    aggs: Option<HashMap<String, AggSpec>>
+    aggs: Option<HashMap<String, AggSpec>>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -498,25 +168,24 @@ pub(crate) struct AggSpecCardinalityBody {
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct AggSpecCardinality {
     cardinality: AggSpecCardinalityBody,
-    aggs: Option<HashMap<String, AggSpec>>
+    aggs: Option<HashMap<String, AggSpec>>,
 }
-
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct AggSpecRange {
     range: AggSpecFilterRangeBody,
-    aggs: Option<HashMap<String, AggSpec>>
+    aggs: Option<HashMap<String, AggSpec>>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct AggSpecAverageBody {
-    field: String
+    field: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct AggSpecAverage {
     avg: AggSpecAverageBody,
-    aggs: Option<HashMap<String, AggSpec>>
+    aggs: Option<HashMap<String, AggSpec>>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -531,7 +200,6 @@ pub(crate) enum AggSpec {
     Average(AggSpecAverage),
 }
 
-
 #[derive(Serialize, Deserialize, Clone)]
 struct SearchBody {
     pit: Option<PitInfo>,
@@ -540,16 +208,14 @@ struct SearchBody {
     seq_no_primary_term: Option<bool>,
     query: Option<Query>,
     aggs: Option<HashMap<String, AggSpec>>,
-    sort: Option<SortSection>
+    sort: Option<SortSection>,
 }
-
 
 #[derive(Serialize, Deserialize, Clone)]
 struct PitInfo {
     id: String,
-    keep_alive: String
+    keep_alive: String,
 }
-
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(untagged)]
@@ -572,19 +238,18 @@ pub(crate) struct Match {
 #[serde(untagged)]
 pub(crate) enum FieldMatch {
     String(String),
-    Struct(FieldMatchBody)
+    Struct(FieldMatchBody),
 }
-
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct FieldMatchBody {
-    query: String
+    query: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct Bool {
     #[serde(rename = "bool")]
-    _bool: BoolBody
+    _bool: BoolBody,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -598,17 +263,15 @@ impl SingleOrVec {
     fn as_vec(&self) -> Vec<Query> {
         match self {
             SingleOrVec::Single(s) => {
-                vec!(*s.clone())
-            },
-            SingleOrVec::Vec(v) => {
-                v.clone()
+                vec![*s.clone()]
             }
+            SingleOrVec::Vec(v) => v.clone(),
         }
     }
 }
 
 fn default_single_or_vec() -> SingleOrVec {
-    SingleOrVec::Vec(vec!())
+    SingleOrVec::Vec(vec![])
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -629,7 +292,6 @@ pub(crate) struct Term {
     term: HashMap<String, Value>,
 }
 
-
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct Exists {
     exists: ExistsBody,
@@ -637,28 +299,27 @@ pub(crate) struct Exists {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct ExistsBody {
-    field: String
+    field: String,
 }
-
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct RangeSpecGt {
-    gt: Value
+    gt: Value,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct RangeSpecGte {
-    gte: Value
+    gte: Value,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct RangeSpecLt {
-    lt: Value
+    lt: Value,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct RangeSpecLte {
-    lte: Value
+    lte: Value,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -668,33 +329,6 @@ pub(crate) enum RangeSpecOperator {
     GTE(RangeSpecGte),
     LT(RangeSpecLt),
     LTE(RangeSpecLte),
-}
-
-impl RangeSpecOperator {
-    fn convert_to_sql(&self) -> (String, SqlExpression) {
-        let (op, val) = match self {
-            RangeSpecOperator::GT(op) => {
-                (">", op.gt.clone())
-            },
-            RangeSpecOperator::GTE(op) => {
-                (">=", op.gte.clone())
-            },
-            RangeSpecOperator::LT(op) => {
-                ("<", op.lt.clone())
-            },
-            RangeSpecOperator::LTE(op) => {
-                ("<=", op.lte.clone())
-            },
-        };
-
-        let final_val = if val.is_string() {
-            SqlExpression::LiteralString(convert_datetime_if_necessary(val.as_str().unwrap()))
-        } else {
-            SqlExpression::LiteralNonString(val.to_string())
-        };
-
-        (op.to_string(), final_val)
-    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -751,452 +385,332 @@ pub(crate) struct UpdateBody {
     pub doc_as_upsert: Option<bool>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct ScriptBlock {
-    pub source: String,
-    pub lang: String,
-    #[serde(default)]
-    pub params: Value,
+fn to_search_plan(
+    table: Option<String>,
+    body: &SearchBody,
+) -> Result<search_plan::SearchPlan, ParseError> {
+    let target = match table {
+        Some(table_name) => search_plan::SearchTarget::Table(table_name),
+        None => match &body.pit {
+            Some(pit) => search_plan::SearchTarget::Pit(search_plan::PitTarget {
+                id: pit.id.clone(),
+                keep_alive: pit.keep_alive.clone(),
+            }),
+            None => {
+                return Err(ParseError {
+                    message: "Didn't find a table".to_string(),
+                });
+            }
+        },
+    };
+
+    Ok(search_plan::SearchPlan {
+        target,
+        from: body.from.unwrap_or(0),
+        size: body.size,
+        seq_no_primary_term: body.seq_no_primary_term,
+        query: body.query.as_ref().map(to_query_plan),
+        aggregations: aggs_to_plan(&body.aggs),
+        sort: sort_section_to_plans(&body.sort),
+    })
 }
 
+fn to_update_by_query_plan(
+    table: Option<String>,
+    body: &UpdateByQueryBody,
+) -> Result<search_plan::UpdateByQueryPlan, ParseError> {
+    let table_name = match table {
+        Some(table_name) => table_name,
+        None => {
+            return Err(ParseError {
+                message: "Didn't find a table".to_string(),
+            });
+        }
+    };
 
-fn create_aggregation_filters(filter: &AggSpecFilterBody) -> Vec<SqlExpression> {
+    Ok(search_plan::UpdateByQueryPlan {
+        table: table_name,
+        query: to_query_plan(&body.query),
+        script: to_script_plan(&body.script),
+        sort: sort_vec_to_plans(&body.sort),
+        max_docs: body.max_docs,
+        conflicts: body.conflicts.clone(),
+    })
+}
+
+fn to_script_plan(script: &ScriptBlock) -> search_plan::ScriptPlan {
+    search_plan::ScriptPlan {
+        source: script.source.clone(),
+        lang: script.lang.clone(),
+        params: script.params.clone(),
+    }
+}
+
+fn to_query_plan(query: &Query) -> search_plan::QueryPlan {
+    match query {
+        Query::Match(match_obj) => {
+            let mut clauses = match_obj
+                ._match
+                .iter()
+                .map(|(field, value)| search_plan::MatchClausePlan {
+                    field: field.clone(),
+                    query: to_field_term(value),
+                })
+                .collect::<Vec<_>>();
+            clauses.sort_by(|left, right| left.field.cmp(&right.field));
+            search_plan::QueryPlan::Match(search_plan::MatchPlan { clauses })
+        }
+        Query::Bool(bool_obj) => search_plan::QueryPlan::Bool(search_plan::BoolPlan {
+            filter: bool_obj
+                ._bool
+                .filter
+                .as_vec()
+                .iter()
+                .map(to_query_plan)
+                .collect(),
+            should: bool_obj
+                ._bool
+                .should
+                .as_vec()
+                .iter()
+                .map(to_query_plan)
+                .collect(),
+            must: bool_obj
+                ._bool
+                .must
+                .as_vec()
+                .iter()
+                .map(to_query_plan)
+                .collect(),
+            must_not: bool_obj
+                ._bool
+                .must_not
+                .as_vec()
+                .iter()
+                .map(to_query_plan)
+                .collect(),
+            minimum_should_match: bool_obj._bool.minimum_should_match,
+        }),
+        Query::Term(term_obj) => {
+            let mut clauses = term_obj
+                .term
+                .iter()
+                .map(|(field, value)| search_plan::TermClausePlan {
+                    field: field.clone(),
+                    value: value.clone(),
+                })
+                .collect::<Vec<_>>();
+            clauses.sort_by(|left, right| left.field.cmp(&right.field));
+            search_plan::QueryPlan::Term(search_plan::TermPlan { clauses })
+        }
+        Query::Exists(exists_obj) => search_plan::QueryPlan::Exists(search_plan::ExistsPlan {
+            field: exists_obj.exists.field.clone(),
+        }),
+        Query::Range(range_obj) => {
+            let mut clauses = range_obj
+                .range
+                .iter()
+                .map(|(field, spec)| search_plan::RangeClausePlan {
+                    field: field.clone(),
+                    operator: range_operator_to_plan(&spec.op),
+                    format: spec.format.clone(),
+                    relation: spec.relation.clone(),
+                    time_zone: spec.time_zone.clone(),
+                    boost: spec.boost,
+                })
+                .collect::<Vec<_>>();
+            clauses.sort_by(|left, right| left.field.cmp(&right.field));
+            search_plan::QueryPlan::Range(search_plan::RangePlan { clauses })
+        }
+        Query::SimpleQueryString(simple_query) => {
+            search_plan::QueryPlan::SimpleQueryString(search_plan::SimpleQueryStringPlan {
+                query: simple_query.simple_query_string.query.clone(),
+                fields: simple_query.simple_query_string.fields.clone(),
+                default_operator: simple_query.simple_query_string.default_operator.clone(),
+            })
+        }
+    }
+}
+
+fn range_operator_to_plan(operator: &RangeSpecOperator) -> search_plan::RangeOperatorPlan {
+    match operator {
+        RangeSpecOperator::GT(value) => search_plan::RangeOperatorPlan::Gt(value.gt.clone()),
+        RangeSpecOperator::GTE(value) => search_plan::RangeOperatorPlan::Gte(value.gte.clone()),
+        RangeSpecOperator::LT(value) => search_plan::RangeOperatorPlan::Lt(value.lt.clone()),
+        RangeSpecOperator::LTE(value) => search_plan::RangeOperatorPlan::Lte(value.lte.clone()),
+    }
+}
+
+fn sort_section_to_plans(sort: &Option<SortSection>) -> Vec<search_plan::SortPlan> {
+    match sort {
+        Some(SortSection::Single(sort)) => vec![sort_type_to_plan(sort)],
+        Some(SortSection::Multiple(sort)) => sort.iter().map(sort_type_to_plan).collect(),
+        None => vec![],
+    }
+}
+
+fn sort_vec_to_plans(sort: &Option<Vec<SortType>>) -> Vec<search_plan::SortPlan> {
+    sort.as_ref()
+        .map(|values| values.iter().map(sort_type_to_plan).collect())
+        .unwrap_or_default()
+}
+
+fn sort_type_to_plan(sort: &SortType) -> search_plan::SortPlan {
+    match sort {
+        SortType::Bare(field) => search_plan::SortPlan::Bare(field.clone()),
+        SortType::Parameterized(parameters) => {
+            assert_eq!(parameters.len(), 1);
+            let (field, body) = parameters.iter().next().unwrap();
+            search_plan::SortPlan::Field {
+                field: field.clone(),
+                order: body.order.clone(),
+                unmapped_type: body.unmapped_type.clone(),
+                script: body.script.as_ref().map(to_script_plan),
+            }
+        }
+    }
+}
+
+fn aggs_to_plan(aggs: &Option<HashMap<String, AggSpec>>) -> Vec<search_plan::AggregationPlan> {
+    let Some(aggs) = aggs else {
+        return vec![];
+    };
+
+    let mut plans = aggs
+        .iter()
+        .map(|(name, spec)| agg_spec_to_plan(name, spec))
+        .collect::<Vec<_>>();
+    plans.sort_by(|left, right| left.name.cmp(&right.name));
+    plans
+}
+
+fn agg_spec_to_plan(name: &str, spec: &AggSpec) -> search_plan::AggregationPlan {
+    let spec = match spec {
+        AggSpec::Terms(terms) => {
+            search_plan::AggregationPlanSpec::Terms(search_plan::TermsAggregationPlan {
+                field: terms.terms.field.clone(),
+                size: terms.terms.size,
+                show_term_doc_count_error: terms.terms.show_term_doc_count_error,
+                sub_aggregations: aggs_to_plan(&terms.aggs),
+            })
+        }
+        AggSpec::Missing(missing) => {
+            search_plan::AggregationPlanSpec::Missing(search_plan::MissingAggregationPlan {
+                field: missing.missing.field.clone(),
+                size: missing.missing.size,
+                show_term_doc_count_error: missing.missing.show_term_doc_count_error,
+                sub_aggregations: aggs_to_plan(&missing.aggs),
+            })
+        }
+        AggSpec::Filter(filter) => {
+            search_plan::AggregationPlanSpec::Filter(search_plan::FilterAggregationPlan {
+                filter: aggregation_filter_to_plan(&filter.filter),
+                sub_aggregations: aggs_to_plan(&filter.aggs),
+            })
+        }
+        AggSpec::DateHistogram(histogram) => search_plan::AggregationPlanSpec::DateHistogram(
+            search_plan::DateHistogramAggregationPlan {
+                field: histogram.date_histogram.field.clone(),
+                fixed_interval: histogram.date_histogram.fixed_interval.clone(),
+                sub_aggregations: aggs_to_plan(&histogram.aggs),
+            },
+        ),
+        AggSpec::Cardinality(cardinality) => {
+            search_plan::AggregationPlanSpec::Cardinality(search_plan::CardinalityAggregationPlan {
+                field: cardinality.cardinality.field.clone(),
+                sub_aggregations: aggs_to_plan(&cardinality.aggs),
+            })
+        }
+        AggSpec::Range(range) => {
+            search_plan::AggregationPlanSpec::Range(search_plan::RangeAggregationPlan {
+                range: aggregation_range_to_plan(&range.range),
+                sub_aggregations: aggs_to_plan(&range.aggs),
+            })
+        }
+        AggSpec::Average(average) => {
+            search_plan::AggregationPlanSpec::Average(search_plan::AverageAggregationPlan {
+                field: average.avg.field.clone(),
+                sub_aggregations: aggs_to_plan(&average.aggs),
+            })
+        }
+    };
+
+    search_plan::AggregationPlan {
+        name: name.to_string(),
+        spec,
+    }
+}
+
+fn aggregation_filter_to_plan(filter: &AggSpecFilterBody) -> search_plan::AggregationFilterPlan {
     match filter {
         AggSpecFilterBody::Term(term) => {
             assert_eq!(term.term.len(), 1);
-            let (name, value) = term.term.iter().next().unwrap();
-            vec!(SqlExpression::Comparison(
-                Box::new(SqlExpression::FieldRef("t".to_string(), name.clone())),
-                "=".to_string(),
-                Box::new(SqlExpression::LiteralString(value.clone())),
-            ))
-        },
+            let (field, value) = term.term.iter().next().unwrap();
+            search_plan::AggregationFilterPlan::Term {
+                field: field.clone(),
+                value: value.clone(),
+            }
+        }
         AggSpecFilterBody::Range(range) => {
-            create_aggregation_range_filters(&range.range)
+            search_plan::AggregationFilterPlan::Range(aggregation_range_to_plan(&range.range))
         }
     }
 }
 
-fn create_aggregation_range_filters(range: &AggSpecFilterRangeBody) -> Vec<SqlExpression> {
+fn aggregation_range_to_plan(
+    range: &AggSpecFilterRangeBody,
+) -> search_plan::AggregationRangeBoundsPlan {
     match range {
         AggSpecFilterRangeBody::Raw(raw) => {
             assert_eq!(raw.len(), 1);
-            let (name, value_and_op) = raw.iter().next().unwrap();
-
-            let (converted_op, converted_value) = value_and_op.convert_to_sql();
-            vec!(SqlExpression::Comparison(
-                Box::new(SqlExpression::FieldRef("t".to_string(), name.clone())),
-                converted_op.clone(),
-                Box::new(converted_value),
-            ))
-        },
+            let (field, operator) = raw.iter().next().unwrap();
+            search_plan::AggregationRangeBoundsPlan::Raw {
+                field: field.clone(),
+                operator: range_operator_to_plan(operator),
+            }
+        }
         AggSpecFilterRangeBody::Structured(structured) => {
-            let mut retval = vec!();
-            let name = &structured.field;
-            for range in structured.ranges.iter() {
-                let converted_from_value = convert_datetime_if_necessary(&range.from);
-                let converted_to_value = convert_datetime_if_necessary(&range.to);
-                retval.push(SqlExpression::Comparison(
-                    Box::new(SqlExpression::FieldRef("t".to_string(), name.clone())),
-                    ">=".to_string(),
-                    Box::new(SqlExpression::LiteralString(converted_from_value.clone())),
-                ));
-                retval.push(SqlExpression::Comparison(
-                    Box::new(SqlExpression::FieldRef("t".to_string(), name.clone())),
-                    "<".to_string(),
-                    Box::new(SqlExpression::LiteralString(converted_to_value.clone())),
-                ));
+            search_plan::AggregationRangeBoundsPlan::Structured {
+                field: structured.field.clone(),
+                ranges: structured
+                    .ranges
+                    .iter()
+                    .map(|range| search_plan::AggregationWindowPlan {
+                        from: range.from.clone(),
+                        to: range.to.clone(),
+                    })
+                    .collect(),
             }
-            retval
         }
     }
 }
 
-fn create_aggregation_processor(input_builder: &SqlBuilder, spec: &AggSpec) -> (AggProcessor, Option<Vec<Aggregation>>) {
-    match spec {
-        AggSpec::Terms(terms) => {
-            let field_name = terms.terms.field.clone();
-            let mut builder = input_builder.clone();
-            let field_ref_expr = SqlExpression::FieldRef("t".to_string(), field_name.clone());
-            builder.group_by.push(field_ref_expr.clone());
-            let aggregations = aggs_to_sql(Some(builder.clone()), terms.aggs.clone());
-            builder.fields.push(FieldExpression {
-                name: "field_name".to_string(),
-                expression: field_ref_expr.clone()
-            });
-            builder.fields.push(FieldExpression {
-                name: "cnt".to_string(),
-                expression: SqlExpression::Count,
-            });
-            let sql = builder.build();
-            let processor = AggProcessor::Term(TermAggProcessor{ sql: sql });
-            (processor, aggregations)
-        },
-        AggSpec::Filter(filter) => {
-            let mut builder = input_builder.clone();
-            for filter in create_aggregation_filters(&filter.filter) {
-                builder.filter(filter);
-            }
-            let mut query_builder = builder.clone();
-            query_builder.fields.push(FieldExpression {
-                name: "cnt".to_string(),
-                expression: SqlExpression::Count,
-            });
-            let sql = query_builder.build();
-            let processor = AggProcessor::Filter(FilterAggProcessor{ sql });
-            let aggregations = aggs_to_sql(Some(builder), filter.aggs.clone());
-            (processor, aggregations)
-        },
-        AggSpec::Missing(missing) => {
-            let processor = AggProcessor::Missing(MissingAggProcessor{ });
-            let aggregations = aggs_to_sql(Some(input_builder.clone()), missing.aggs.clone());
-            (processor, aggregations)
-        },
-        AggSpec::DateHistogram(hist) => {
-            // TODO: this is a mess. Need to figure out how histograms work
-            let mut builder = input_builder.clone();
-            let field_name = hist.date_histogram.field.clone();
-            builder.fields.push(FieldExpression{
-                name: "field_value".to_string(),
-                expression: SqlExpression::FieldRef("t".to_string(), field_name.clone())
-            });
-            builder.fields.push(FieldExpression{
-                name: "doc_count".to_string(),
-                expression: SqlExpression::Count,
-            });
-            // TODO: get offset and interval from the spec
-            // TODO: convert the field as necessary (aka datetime to millis since epoch)
-            let offset = 0;
-            let interval = 5;
-            builder.group_by.push(SqlExpression::Arithmetic(
-                Box::new(SqlExpression::Arithmetic(
-                    Box::new(SqlExpression::Arithmetic(
-                        Box::new(SqlExpression::FieldRef("t".to_string(), field_name.clone())),
-                        "-".to_string(),
-                        Box::new(SqlExpression::LiteralNonString(offset.to_string()))
-                    )),
-                    "/".to_string(),
-                    Box::new(SqlExpression::LiteralNonString(interval.to_string())),
-                )),
-                "+".to_string(),
-                Box::new(SqlExpression::LiteralNonString(offset.to_string()))
-            ));
-            let _sql = builder.build();
-            let processor = AggProcessor::DateHistogram(DateHistogramAggProcessor{ buckets: vec!() });
-            (processor, None)
-        },
-        AggSpec::Cardinality(cardinality) => {
-            let mut builder = input_builder.clone();
-            let field_name = &cardinality.cardinality.field;
-            builder.fields.push(FieldExpression{
-                name: "type_count".to_string(),
-                expression: SqlExpression::CountDistinct(
-                    Box::new(SqlExpression::FieldRef("t".to_string(), field_name.clone()))
-                )
-            });
-            let sql = builder.build();
-            let processor = AggProcessor::Cardinality(CardinalityAggProcessor{ sql: sql });
-            let aggregations = aggs_to_sql(Some(input_builder.clone()), cardinality.aggs.clone());
-            (processor, aggregations)
-        } ,
-        AggSpec::Range(range) => {
-            // TODO: this is a mess. Need to figure out the full range of options here
-            // and figure out how to target the multibucket range case
-            let mut builder = input_builder.clone();
-            for filter in create_aggregation_range_filters(&range.range) {
-                builder.filter(filter);
-            }
-            let mut query_builder = builder.clone();
-            query_builder.fields.push(FieldExpression {
-                name: "cnt".to_string(),
-                expression: SqlExpression::Count,
-            });
-            let sql = query_builder.build();
-            let aggregations = aggs_to_sql(Some(builder), range.aggs.clone());
-            let processor = AggProcessor::Range(RangeAggProcessor {
-                buckets: vec!(
-                    RangeAggBucket {
-                        sql,
-                        key: "2025-06-27T20:18:59.356Z-2025-06-27T20:20:59.356Z".to_string(),
-                        from: 1751055539356,
-                        from_as_string: "2025-06-27T20:18:59.356Z".to_string(),
-                        to: 1751055659356,
-                        to_as_string: "2025-06-27T20:20:59.356Z".to_string(),
-                        subaggregations: aggregations,
-                    }
-                )
-            });
-
-            (processor, None)
-        }
-        AggSpec::Average(average) => {
-            let mut builder = input_builder.clone();
-            let field_name = &average.avg.field;
-            builder.fields.push(FieldExpression{
-                name: "avg".to_string(),
-                expression: SqlExpression::Average(
-                    Box::new(SqlExpression::FieldRef("t".to_string(), field_name.clone()))
-                )
-            });
-            let sql = builder.build();
-            let processor = AggProcessor::Average(AverageAggProcessor{ sql: sql });
-            let aggregations = aggs_to_sql(Some(input_builder.clone()), average.aggs.clone());
-            (processor, aggregations)
-        }
-    }
-}
-
-fn create_aggregation(input_builder: Option<SqlBuilder>, name: &String, spec: &AggSpec) -> Aggregation {
-    let builder = input_builder.unwrap_or_else(|| SqlBuilder::for_agg());
-    let (processor, subaggregations) = create_aggregation_processor(&builder, spec);
-    Aggregation {
-        name: name.clone(),
-        processor: processor,
-        subaggregations: subaggregations,
-    }
-}
-
-fn aggs_to_sql(input_builder: Option<SqlBuilder>, aggs: Option<HashMap<String, AggSpec>>) -> Option<Vec<Aggregation>> {
-    if aggs.is_none() {
-        return None;
-    }
-
-    Some(aggs.unwrap().iter().map(|x| create_aggregation(input_builder.clone(), x.0, x.1)).collect())
-}
-
-fn to_command(table: Option<String>, body: &SearchBody, query: &QueryStringSearch) -> Result<SqlCommand, ParseError> {
-    let mut builder = SqlBuilder::for_query(true);
-
-    if body.from.is_some() {
-        if body.from.unwrap() != 0 {
-            panic!("Not implemented");
-        }
-    }
-
-    if body.query.is_some() {
-        to_command_worker(&mut builder, &body.query.clone().unwrap())?;
-    }
-
-    let table_name = match table {
-        Some(t) => t,
-        None => match &body.pit {
-            // TODO: parse the pit to get the table name
-            Some(p) => p.id.clone(),
-            None => panic!("Didn't find a table")
-        }
-    };
-
-    let aggs = aggs_to_sql(None, body.aggs.clone());
-
-    Ok(SqlCommand{
-        sql: builder.build(),
-        table: table_name,
-        calculate_score: builder.calculate_score,
-        aggs: aggs,
-        query_params: query.clone()
-    })
-}
-
-fn to_command_update_by_query(table: Option<String>, body: &UpdateByQueryBody) -> Result<UpdateByQueryCommand, ParseError> {
-    let mut builder = SqlBuilder::for_query(true);
-
-    to_command_worker(&mut builder, &body.query)?;
-
-    let table_name = match table {
-        Some(t) => t,
-        None => panic!("Didn't find a table")
-    };
-
-    Ok(UpdateByQueryCommand{
-        query_command: SqlCommand{
-            sql: builder.build(),
-            table: table_name,
-            calculate_score: builder.calculate_score,
-            aggs: None,
-            query_params: QueryStringSearch {
-                allow_partial_search_results: None,
-                sort: None,
-                rest_total_hits_as_int: None,
-            }
-        },
-        script_block: body.script.clone(),
-    })
-}
-
-fn to_command_worker(builder: &mut SqlBuilder, query: &Query) -> Result<(), ParseError> {
-    match query {
-        Query::Match(m) => to_sql_match(builder, &m),
-        Query::Bool(b) => to_sql_bool(builder, &b),
-        Query::Term(t) => to_sql_term(builder, &t),
-        Query::Exists(e) => to_sql_exists(builder, &e),
-        Query::Range(r) => to_sql_range(builder, &r),
-        Query::SimpleQueryString(s) => to_sql_simple_query(builder, &s),
-    }
+#[cfg(test)]
+fn to_command(
+    table: Option<String>,
+    body: &SearchBody,
+    query: &QueryStringSearch,
+) -> Result<SearchCommand, ParseError> {
+    let plan = to_search_plan(table, body)?;
+    search_plan_to_command(plan, query)
 }
 
 fn to_field_term(body: &FieldMatch) -> String {
     match body {
         FieldMatch::String(s) => s.clone(),
-        FieldMatch::Struct(s) => s.query.clone()
+        FieldMatch::Struct(s) => s.query.clone(),
     }
 }
-
-fn to_sql_match(builder: &mut SqlBuilder, match_obj: &Match) -> Result<(), ParseError> {
-    if match_obj._match.len() != 1 {
-        panic!("Not implemented")
-    }
-
-    builder.calculate_score = true;
-
-    builder.push_filter_context();
-    for pair in match_obj._match.iter() {
-        builder.filter(SqlExpression::Comparison(
-            Box::new(SqlExpression::FieldRef("si".to_string(), "field_name".to_string())),
-            "=".to_string(),
-            Box::new(SqlExpression::LiteralString(pair.0.clone()))
-        ));
-        builder.filter(SqlExpression::Comparison(
-            Box::new(SqlExpression::FieldRef("si".to_string(), "field_term".to_string())),
-            "=".to_string(),
-            Box::new(SqlExpression::LiteralString(to_field_term(pair.1)))
-        ));
-    }
-    builder.pop_filter_context(true);
-    Ok(())
-}
-
-fn to_sql_bool(builder: &mut SqlBuilder, bool_obj: &Bool) -> Result<(), ParseError> {
-    builder.push_filter_context();
-    if bool_obj._bool.must.as_vec().len() > 0 {
-        builder.push_filter_context();
-
-        bool_obj._bool.must.as_vec().iter().map(|x|to_command_worker(builder, x)).collect::<Result<Vec<()>, ParseError>>()?;
-
-        builder.pop_filter_context(true);
-    }
-    if bool_obj._bool.should.as_vec().len() > 0 {
-        builder.push_filter_context();
-
-        bool_obj._bool.should.as_vec().iter().map(|x|to_command_worker(builder, x)).collect::<Result<Vec<()>, ParseError>>()?;
-
-        builder.pop_filter_context(false);        
-    }
-    if bool_obj._bool.must_not.as_vec().len() > 0 {
-        // Must not is an AND of NOTS which we rewrite into a NOT of ORS to simplify the codegen logic a bit here.
-        builder.push_filter_context();
-
-        bool_obj._bool.must_not.as_vec().iter().map(|x|to_command_worker(builder, x)).collect::<Result<Vec<()>, ParseError>>()?;
-
-        builder.pop_and_not_filter_context(false);
-    } 
-    if bool_obj._bool.filter.as_vec().len() > 0 {
-        builder.push_filter_context();
-
-        bool_obj._bool.filter.as_vec().iter().map(|x|to_command_worker(builder, x)).collect::<Result<Vec<()>, ParseError>>()?;
-
-        builder.pop_filter_context(true);
-    }
-    builder.pop_filter_context(true);
-    Ok(())
-}
-
-fn to_sql_term(builder: &mut SqlBuilder, term_obj: &Term) -> Result<(), ParseError> {
-    for (name, value) in term_obj.term.iter() {
-        if value.is_string() {
-            builder.filter(SqlExpression::Comparison(
-                Box::new(SqlExpression::FieldRef("t".to_string(), name.clone())),
-                "=".to_string(),
-                Box::new(SqlExpression::LiteralString(value.as_str().unwrap().to_string()))
-            ));
-        } else {
-            builder.filter(SqlExpression::Comparison(
-                Box::new(SqlExpression::FieldRef("t".to_string(), name.clone())),
-                "=".to_string(),
-                Box::new(SqlExpression::LiteralNonString(value.to_string()))
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn to_sql_exists(_builder: &mut SqlBuilder, _exists_obj: &Exists) -> Result<(), ParseError> {
-    // TODO: need to figure out how to query the schema
-    // builder.filter(format!("t.{} is not null", exists_obj.exists.field));
-    Ok(())
-}
-
-fn convert_datetime_if_necessary(value: &str) -> String {
-    let converted_value = if value.contains("now") {
-        // TODO: need to handle errors
-        elastic_search_datetime_parser::evaluate(&value.to_string(), &Utc::now()).unwrap()
-    } else {
-        value.to_string()
-    };
-
-    converted_value
-}
-
-fn to_sql_range(builder: &mut SqlBuilder, range_obj: &Range) -> Result<(), ParseError> {
-    if range_obj.range.len() != 1 {
-        panic!("Not implemented")
-    }
-    
-    let (field_name, spec) = range_obj.range.iter().next().unwrap();
-
-    if spec.format.is_some() || spec.relation.is_some() || spec.time_zone.is_some() || spec.boost.is_some() {
-        panic!("Not implemented")
-    }
-
-    let (op, final_val) = spec.op.convert_to_sql();
-    builder.push_filter_context();
-    builder.filter(SqlExpression::Comparison(
-        Box::new(SqlExpression::FieldRef("t".to_string(), field_name.clone())),
-        op.clone(),
-        Box::new(final_val)
-    ));
-    builder.filter(SqlExpression::IsNull(
-        Box::new(SqlExpression::FieldRef("t".to_string(), field_name.clone()))
-    ));
-    builder.pop_filter_context(false);
-
-    Ok(())
-}
-
-fn to_sql_simple_query(builder: &mut SqlBuilder, query_obj: &SimpleQueryString) -> Result<(), ParseError> {
-    if query_obj.simple_query_string.fields.len() == 0 {
-        panic!("Not implemented")
-    }
-
-    builder.calculate_score = true;
-
-    // TODO: need to really parse the query string
-    let split_query = query_obj.simple_query_string.query.split(" ");
-    builder.push_filter_context();
-    for field_term in split_query {
-        for field_name in query_obj.simple_query_string.fields.iter() {
-            builder.filter(SqlExpression::Comparison(
-                Box::new(SqlExpression::FieldRef("si".to_string(), "field_name".to_string())),
-                "=".to_string(),
-                Box::new(SqlExpression::LiteralString(field_name.clone()))
-            ));
-            builder.filter(SqlExpression::Comparison(
-                Box::new(SqlExpression::FieldRef("si".to_string(), "field_term".to_string())),
-                "=".to_string(),
-                Box::new(SqlExpression::LiteralString(field_term.to_string()))
-            ));
-        }
-    }
-    builder.pop_filter_context(true);
-    Ok(())    
-}
-
 
 #[cfg(test)]
 mod tests {
-    use crate::elastic_search_endpoints::QueryStringSearch;
-    use crate::elastic_search_parser::{parse, UpdateByQueryBody};
-    use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
     use super::{to_command, SearchBody};
+    use crate::elastic_search_endpoints::QueryStringSearch;
+    use crate::elastic_search_parser::{
+        parse, parse_search_plan, parse_update_by_query_plan, UpdateByQueryBody,
+    };
+    use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
+    use crate::search_plan;
 
     #[test]
     fn test_parse_match() {
@@ -1211,19 +725,52 @@ mod tests {
        }
      }
    }
-}"#.to_string(),
+}"#
+            .to_string(),
             &QueryStringSearch::new(),
         );
 
         match parse_result {
             Ok(pr) => {
-                let sql = pr.sql.build_debug();
+                let sql = pr.legacy_sql_command().unwrap().sql.build_debug();
                 assert!(sql.contains("this is a test"))
             }
-            _ => panic!("Parsing error")
+            _ => panic!("Parsing error"),
         }
     }
 
+    #[test]
+    fn test_parse_search_plan_match() {
+        let plan = parse_search_plan(
+            Some("foo".to_string()),
+            &r#"
+{
+   "query": {
+     "match": {
+       "message": {
+         "query": "this is a test"
+       }
+     }
+   }
+}"#
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.target,
+            search_plan::SearchTarget::Table("foo".to_string())
+        );
+
+        match plan.query.unwrap() {
+            search_plan::QueryPlan::Match(match_plan) => {
+                assert_eq!(match_plan.clauses.len(), 1);
+                assert_eq!(match_plan.clauses[0].field, "message");
+                assert_eq!(match_plan.clauses[0].query, "this is a test");
+            }
+            _ => panic!("Expected match plan"),
+        }
+    }
 
     #[test]
     fn test_parse_match_new() {
@@ -1237,7 +784,7 @@ mod tests {
        }
      }
    }
-}"#
+}"#,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -1247,14 +794,31 @@ mod tests {
             }
         };
 
-        let command = to_command(Some("testtime".to_string()), &parse_result, &QueryStringSearch::new()).unwrap();
+        let command = to_command(
+            Some("testtime".to_string()),
+            &parse_result,
+            &QueryStringSearch::new(),
+        )
+        .unwrap();
+        assert_eq!(command.execution_plan().shards.len(), 1);
+        assert_eq!(command.execution_plan().shards[0].segments.len(), 1);
 
-        let schema = PowdrrSchema::from(&vec!(
-            PowdrrField{ name: "message".to_string(), data_type: PowdrrDataType::String},
-            PowdrrField{ name: "_seq_no".to_string(), data_type: PowdrrDataType::Integer},
-        ));
+        let schema = PowdrrSchema::from(&vec![
+            PowdrrField {
+                name: "message".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "_seq_no".to_string(),
+                data_type: PowdrrDataType::Integer,
+            },
+        ]);
 
-        let sql = command.sql.build_same(&schema);
+        let sql = command
+            .legacy_sql_command()
+            .unwrap()
+            .sql
+            .build_same(&schema);
 
         assert!(sql.contains("t.\"message\""));
         assert!(sql.contains("si.\"field_name\" = 'message'"));
@@ -1315,16 +879,40 @@ mod tests {
             }
         };
 
-        let command = to_command(Some("testtime".to_string()), &parse_result, &QueryStringSearch::new()).unwrap();
+        let command = to_command(
+            Some("testtime".to_string()),
+            &parse_result,
+            &QueryStringSearch::new(),
+        )
+        .unwrap();
 
-        let schema = PowdrrSchema::from(&vec!(
-            PowdrrField{ name: "type".to_string(), data_type: PowdrrDataType::String},
-            PowdrrField{ name: "ingest-package-policies_package_name".to_string(), data_type: PowdrrDataType::String},
-            PowdrrField{ name: "task_runAt".to_string(), data_type: PowdrrDataType::String},
-            PowdrrField{ name: "_seq_no".to_string(), data_type: PowdrrDataType::Integer},
-        ));
+        let schema = PowdrrSchema::from(&vec![
+            PowdrrField {
+                name: "type".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "ingest-package-policies_package_name".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "task_runAt".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "_seq_no".to_string(),
+                data_type: PowdrrDataType::Integer,
+            },
+        ]);
 
-        println!("{}", command.sql.build_same(&schema));
+        println!(
+            "{}",
+            command
+                .legacy_sql_command()
+                .unwrap()
+                .sql
+                .build_same(&schema)
+        );
 
         let test_val = r#"{
   "size": 20,
@@ -1459,15 +1047,36 @@ mod tests {
             }
         };
 
-        let command = to_command(Some("testtime".to_string()), &parse_result, &QueryStringSearch::new()).unwrap();
+        let command = to_command(
+            Some("testtime".to_string()),
+            &parse_result,
+            &QueryStringSearch::new(),
+        )
+        .unwrap();
 
-        let schema = PowdrrSchema::from(&vec!(
-            PowdrrField{ name: "type".to_string(), data_type: PowdrrDataType::String},
-            PowdrrField{ name: "ingest-package-policies_package_name".to_string(), data_type: PowdrrDataType::String},
-            PowdrrField{ name: "_seq_no".to_string(), data_type: PowdrrDataType::Integer},
-        ));
+        let schema = PowdrrSchema::from(&vec![
+            PowdrrField {
+                name: "type".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "ingest-package-policies_package_name".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "_seq_no".to_string(),
+                data_type: PowdrrDataType::Integer,
+            },
+        ]);
 
-        println!("{}", command.sql.build_same(&schema));
+        println!(
+            "{}",
+            command
+                .legacy_sql_command()
+                .unwrap()
+                .sql
+                .build_same(&schema)
+        );
 
         let test_val = r#"{
   "size": 1000,
@@ -1538,7 +1147,11 @@ mod tests {
             }
         };
 
-        let _command = to_command(Some("fake_name".to_string()), &parse_result, &QueryStringSearch::new());
+        let _command = to_command(
+            Some("fake_name".to_string()),
+            &parse_result,
+            &QueryStringSearch::new(),
+        );
     }
 
     #[test]
@@ -1557,15 +1170,19 @@ mod tests {
         let test_val = include_str!("../tests/data/update_by_query_1.json");
 
         let _parse_result: UpdateByQueryBody = match serde_json::from_str(test_val) {
-            Ok(pr) => {
-                pr
-            },
+            Ok(pr) => pr,
             Err(e) => {
                 let error = format!("{}", e);
                 println!("{}", error);
                 panic!("ERROR");
             }
         };
+
+        let plan =
+            parse_update_by_query_plan(Some("foobar".to_string()), &test_val.to_string()).unwrap();
+
+        assert_eq!(plan.table, "foobar");
+        assert_eq!(plan.script.lang, "painless");
     }
 
     #[test]
@@ -1690,7 +1307,7 @@ mod tests {
 
         //let _command = to_command(Some("foobar".to_string()), &parse_result);
 
-        let test_val  = r#"
+        let test_val = r#"
         {
            "query": {
              "match": {
@@ -1717,6 +1334,10 @@ mod tests {
             }
         };
 
-        let _command = to_command(Some("foobar".to_string()), &parse_result, &QueryStringSearch::new());
+        let _command = to_command(
+            Some("foobar".to_string()),
+            &parse_result,
+            &QueryStringSearch::new(),
+        );
     }
 }

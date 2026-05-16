@@ -1006,6 +1006,73 @@
       ]
     },
     {
+      "id": "field_sort_returns_expected_descending_hit_order",
+      "description": "A field sort returns hits in descending numeric order",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:04:05.000Z\", \"index_col\": 1, \"category\": \"alpha\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:06:07.000Z\", \"index_col\": 2, \"category\": \"bravo\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-09T11:07:08.000Z\", \"index_col\": 3, \"category\": \"charlie\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-10T11:08:07.000Z\", \"index_col\": 4, \"category\": \"delta\" }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/{{index}}/_search",
+        "body": "{\n  \"size\": 3,\n  \"sort\": [\n    {\n      \"index_col\": {\n        \"order\": \"desc\"\n      }\n    }\n  ]\n}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number", "path": "hits.total.value", "value": 4 },
+        {
+          "kind": "json_path_number_list",
+          "path": "hits.hits[*]._source.index_col",
+          "values": [4, 3, 2]
+        }
+      ]
+    },
+    {
       "id": "terms_aggregation_returns_expected_bucket_keys_and_counts",
       "description": "A terms aggregation over message values returns the expected buckets",
       "differential_enabled": false,

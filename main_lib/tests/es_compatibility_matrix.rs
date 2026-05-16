@@ -56,8 +56,10 @@ enum Assertion {
         value: f64,
         tolerance: Option<f64>,
     },
+    JsonPathNumberList { path: String, values: Vec<i64> },
     JsonPathNumber { path: String, value: i64 },
     JsonPathNumberSet { path: String, values: Vec<i64> },
+    JsonPathStringList { path: String, values: Vec<String> },
     JsonPathString { path: String, value: String },
     JsonPathStringSet { path: String, values: Vec<String> },
 }
@@ -195,6 +197,7 @@ fn compatibility_matrix_local_current_engine() {
         let cases = load_cases();
         let mut failures = Vec::new();
         for case in cases.iter() {
+            eprintln!("local case: {}", case.id);
             if let Err(message) = run_case_with_capture(&case.id, || {
                 let vars = case_vars(case);
                 let response = execute_case(&target, case, &vars);
@@ -225,6 +228,7 @@ fn compatibility_matrix_differential_when_external_es_is_configured() {
         let cases = load_cases();
         let mut failures = Vec::new();
         for case in cases.iter().filter(|case| case.differential_enabled) {
+            eprintln!("differential case: {}", case.id);
             if let Err(message) = run_case_with_capture(&case.id, || {
                 let vars = case_vars(case);
                 let local_response = execute_case(&local_target, case, &vars);
@@ -324,11 +328,24 @@ fn execute_case(
 ) -> ResponseRecord {
     for setup_step in case.setup_steps.iter().filter(|step| step.targets.iter().any(|v| v == target.label() || v == "all")) {
         let resolved = resolve_request(&setup_step.request, vars);
+        eprintln!(
+            "  {} setup: {} {}",
+            target.label(),
+            resolved.method,
+            resolved.path
+        );
         let response = target.execute(&resolved);
         assert_setup_step_succeeded(&response, case, target.label(), &resolved);
     }
 
-    target.execute(&resolve_request(&case.request, vars))
+    let resolved = resolve_request(&case.request, vars);
+    eprintln!(
+        "  {} request: {} {}",
+        target.label(),
+        resolved.method,
+        resolved.path
+    );
+    target.execute(&resolved)
 }
 
 fn validate_case(
@@ -417,6 +434,16 @@ fn evaluate_assertion(
                 case.id, target_label, path
             );
         }
+        Assertion::JsonPathNumberList { path, values } => {
+            let expected = values.clone();
+            let json = parse_json_body(response, case, target_label);
+            let actual = number_list(&json, path, case);
+            assert_eq!(
+                actual, expected,
+                "case '{}' failed on target '{}' for path '{}'",
+                case.id, target_label, path
+            );
+        }
         Assertion::JsonPathNumberSet { path, values } => {
             let expected: BTreeSet<i64> = values.iter().copied().collect();
             let json = parse_json_body(response, case, target_label);
@@ -442,6 +469,19 @@ fn evaluate_assertion(
                 .and_then(|v| v.as_str())
                 .unwrap_or_else(|| panic!("missing string path '{}' in case '{}'", path, case.id))
                 .to_string();
+            assert_eq!(
+                actual, expected,
+                "case '{}' failed on target '{}' for path '{}'",
+                case.id, target_label, path
+            );
+        }
+        Assertion::JsonPathStringList { path, values } => {
+            let expected: Vec<String> = values
+                .iter()
+                .map(|value| render_template(value, vars))
+                .collect();
+            let json = parse_json_body(response, case, target_label);
+            let actual = string_list(&json, path, case);
             assert_eq!(
                 actual, expected,
                 "case '{}' failed on target '{}' for path '{}'",
@@ -524,6 +564,17 @@ fn compare_assertion_projection(
                 case.id, path, local, external
             );
         }
+        Assertion::JsonPathNumberList { path, .. } => {
+            let local_json = parse_json_body(local_response, case, "local");
+            let external_json = parse_json_body(external_response, case, "external");
+            let local = number_list(&local_json, path, case);
+            let external = number_list(&external_json, path, case);
+            assert_eq!(
+                local, external,
+                "case '{}' produced different numeric lists for path '{}': local={:?}, external={:?}",
+                case.id, path, local, external
+            );
+        }
         Assertion::JsonPathNumberSet { path, .. } => {
             let local_json = parse_json_body(local_response, case, "local");
             let external_json = parse_json_body(external_response, case, "external");
@@ -543,6 +594,17 @@ fn compare_assertion_projection(
             assert_eq!(
                 local, external,
                 "case '{}' produced different string values for path '{}': local={}, external={}",
+                case.id, path, local, external
+            );
+        }
+        Assertion::JsonPathStringList { path, .. } => {
+            let local_json = parse_json_body(local_response, case, "local");
+            let external_json = parse_json_body(external_response, case, "external");
+            let local = string_list(&local_json, path, case);
+            let external = string_list(&external_json, path, case);
+            assert_eq!(
+                local, external,
+                "case '{}' produced different string lists for path '{}': local={:?}, external={:?}",
                 case.id, path, local, external
             );
         }
@@ -630,12 +692,33 @@ fn number_set(value: &Value, path: &str, case: &CompatibilityCase) -> BTreeSet<i
         .collect()
 }
 
+fn number_list(value: &Value, path: &str, case: &CompatibilityCase) -> Vec<i64> {
+    extract_values(value, path)
+        .into_iter()
+        .map(|v| {
+            v.as_i64()
+                .unwrap_or_else(|| panic!("non-integer value for path '{}' in case '{}'", path, case.id))
+        })
+        .collect()
+}
+
 fn string_set(
     value: &Value,
     path: &str,
     _vars: &HashMap<String, String>,
     case: &CompatibilityCase,
 ) -> BTreeSet<String> {
+    extract_values(value, path)
+        .into_iter()
+        .map(|v| {
+            v.as_str()
+                .unwrap_or_else(|| panic!("non-string value for path '{}' in case '{}'", path, case.id))
+                .to_string()
+        })
+        .collect()
+}
+
+fn string_list(value: &Value, path: &str, case: &CompatibilityCase) -> Vec<String> {
     extract_values(value, path)
         .into_iter()
         .map(|v| {

@@ -24,6 +24,10 @@ services:
     ports:
       - "9000:9000"
       - "9001:9001"
+    networks:
+      default:
+        aliases:
+          - warehouse.minio
     environment:
       MINIO_ROOT_USER: admin
       MINIO_ROOT_PASSWORD: password

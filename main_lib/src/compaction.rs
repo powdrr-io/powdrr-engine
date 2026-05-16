@@ -1,8 +1,3 @@
-
-use std::{error::Error, fmt};
-use std::pin::Pin;
-use std::sync::{Arc};
-use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::DataType;
@@ -13,22 +8,33 @@ use gotham::mime;
 use http::StatusCode;
 use iceberg::arrow::arrow_schema_to_schema;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-use iceberg::writer::file_writer::location_generator::{DefaultLocationGenerator, FileNameGenerator};
+use iceberg::writer::file_writer::location_generator::{
+    DefaultLocationGenerator, FileNameGenerator,
+};
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::{error::Error, fmt};
 
-use crate::{data_access, state_provider::{STATE_PROVIDER}};
 use crate::data_access::{execute_sql, IcebergLibMetadata};
-use crate::elastic_search_commands::df_to_serde_value;
-use crate::elastic_search_common::{execute_command, Command, CommandContext, CommandError, ElasticSearchResponse, ResultGeneratorFuture};
+use crate::data_contract::{
+    CompactionCommit, CompactionWorkItem, FileSetPayload, IcebergCommit, IcebergMetadata,
+    SpeedboatCommitTableInfo,
+};
+use crate::elastic_search_common::{
+    execute_command, Command, CommandContext, CommandError, ElasticSearchResponse,
+    ResultGeneratorFuture,
+};
 use crate::elastic_search_ingest::{write_to_file, WriteBuffer};
-use crate::schema_massager::{PowdrrSchema, SqlBuilder};
-use crate::data_contract::{CompactionCommit, CompactionWorkItem, FileSetPayload, IcebergCommit, IcebergMetadata, SpeedboatCommitTableInfo};
-use crate::state_provider::ServiceApiError;
 use crate::peers::{PrivateCompactionInvocation, PrivateInvocation};
-
+use crate::schema_massager::{PowdrrSchema, SqlBuilder};
+use crate::search_runtime::df_to_serde_value;
+use crate::state_provider::ServiceApiError;
+use crate::{data_access, state_provider::STATE_PROVIDER};
 
 #[derive(Debug)]
 pub(crate) struct CompactionError {
@@ -52,9 +58,8 @@ pub enum CompactionResult {
     Speedboat {
         file_location: String,
         num_records: usize,
-    }
+    },
 }
-
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CompactionResponse {
@@ -62,7 +67,7 @@ pub struct CompactionResponse {
     pub lib_metadata: IcebergLibMetadata,
     pub schema: PowdrrSchema,
     pub deletes_table_info: Option<SpeedboatCommitTableInfo>,
-    pub compactions: Vec<String>
+    pub compactions: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -71,7 +76,7 @@ pub struct CompactionCommand {
     work_item: CompactionWorkItem,
     compaction_id: String,
     last_snapshot_id: i64,
-    parquet_file_name: String
+    parquet_file_name: String,
 }
 
 #[derive(Clone, Debug)]
@@ -126,36 +131,30 @@ impl CompactionCommand {
         for batch in data.iter() {
             match data_file_writer.write(batch.clone()).await {
                 Ok(_) => (),
-                Err(e) => {
-                    return Err(e)
-                }
+                Err(e) => return Err(e),
             }
         }
         let data_files = match data_file_writer.close().await {
             Ok(df) => df,
-            Err(e) => {
-                return Err(e)
-            }
+            Err(e) => return Err(e),
         };
 
-        data_access::commit_iceberg_transaction(
-            namespace,
-            name,
-            compaction_id,
-            &data_files
-        ).await
+        data_access::commit_iceberg_transaction(namespace, name, compaction_id, &data_files).await
     }
 
-    async fn update_iceberg(data: &Vec<RecordBatch>, table_name: &String, compaction_id: &String, parquet_file_name: &String) -> Result<(), iceberg::Error> {
+    async fn update_iceberg(
+        data: &Vec<RecordBatch>,
+        table_name: &String,
+        compaction_id: &String,
+        parquet_file_name: &String,
+    ) -> Result<(), iceberg::Error> {
         if data.len() == 0 {
-            return Ok(())
+            return Ok(());
         }
 
         let converted_schema = match arrow_schema_to_schema(&data[0].schema()) {
             Ok(s) => s,
-            Err(e) => {
-                return Err(e)
-            },
+            Err(e) => return Err(e),
         };
 
         Self::append_iceberg_table(
@@ -165,42 +164,60 @@ impl CompactionCommand {
             compaction_id,
             &data,
             parquet_file_name,
-        ).await
+        )
+        .await
     }
 
-    async fn do_iceberg_commit(compaction_response: &CompactionResponse) -> Result<i64, ServiceApiError> {
+    async fn do_iceberg_commit(
+        compaction_response: &CompactionResponse,
+    ) -> Result<i64, ServiceApiError> {
         let metadata = IcebergMetadata {
             table_schema: compaction_response.schema.clone(),
             snapshot_id: Some(compaction_response.lib_metadata.snapshot_id.to_string()),
             files: FileSetPayload {
                 file_paths: compaction_response.lib_metadata.files.clone(),
-                schemas: compaction_response.lib_metadata.schemas.iter().map(|
-                    s|PowdrrSchema::from_iceberg(&compaction_response.lib_metadata.table_schema, s)).collect(),
-                file_schemas: compaction_response.lib_metadata.files.iter().enumerate().map(|(x, _)|x as u64).collect(),
-                sizes: compaction_response.lib_metadata.sizes.clone()
+                schemas: compaction_response
+                    .lib_metadata
+                    .schemas
+                    .iter()
+                    .map(|s| {
+                        PowdrrSchema::from_iceberg(
+                            &compaction_response.lib_metadata.table_schema,
+                            s,
+                        )
+                    })
+                    .collect(),
+                file_schemas: compaction_response
+                    .lib_metadata
+                    .files
+                    .iter()
+                    .enumerate()
+                    .map(|(x, _)| x as u64)
+                    .collect(),
+                sizes: compaction_response.lib_metadata.sizes.clone(),
             },
             column_names: compaction_response.lib_metadata.column_names.clone(),
             column_stats: compaction_response.lib_metadata.column_stats.clone(),
         };
         metadata.files.validate();
 
-        match STATE_PROVIDER.iceberg_commit(
-            &compaction_response.table_name,
-            &IcebergCommit {
-                metadata,
-                compactions: compaction_response.lib_metadata.compactions.clone(),
-                deletes_table_info: compaction_response.deletes_table_info.clone(),
-            }
-        ).await {
+        match STATE_PROVIDER
+            .iceberg_commit(
+                &compaction_response.table_name,
+                &IcebergCommit {
+                    metadata,
+                    compactions: compaction_response.lib_metadata.compactions.clone(),
+                    deletes_table_info: compaction_response.deletes_table_info.clone(),
+                },
+            )
+            .await
+        {
             Ok(_) => (),
-            Err(e) => {
-                return Err(e)
-            }
+            Err(e) => return Err(e),
         };
 
         Ok(compaction_response.lib_metadata.snapshot_id)
     }
-
 }
 
 #[async_trait]
@@ -214,9 +231,12 @@ impl Command for CompactionCommand {
         })
     }
 
-    fn result_generator(&self, result_table_name: Option<String>) -> Pin<Box<ResultGeneratorFuture>> {
+    fn result_generator(
+        &self,
+        result_table_name: Option<String>,
+    ) -> Pin<Box<ResultGeneratorFuture>> {
         let public_table_name = self.table.clone();
-        let compactions = vec!(self.compaction_id.clone());
+        let compactions = vec![self.compaction_id.clone()];
         let schema = self.work_item.table_schema.clone();
         let old_snapshot_id = self.last_snapshot_id;
         let parquet_file_name = self.parquet_file_name.clone();
@@ -332,16 +352,19 @@ impl Command for CompactionCommand {
     }
 }
 
-
-pub(crate) async fn compact_logs(command: Arc<dyn Command>) -> Result<ElasticSearchResponse, CompactionError> {
+pub(crate) async fn compact_logs(
+    command: Arc<dyn Command>,
+) -> Result<ElasticSearchResponse, CompactionError> {
     tracing::info!("!!!!!!!!!!!!!!!!!!!! Compacting Start !!!!!!!!!!!!!!!!!!!!!!!");
-    let response = execute_command(CommandContext{}, command).await;
+    let response = execute_command(CommandContext {}, command).await;
     tracing::info!("!!!!!!!!!!!!!!!!!!!! Compacting End !!!!!!!!!!!!!!!!!!!!!!!");
     Ok(response)
 }
 
-
-pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkItem)>, last_snapshot_id: i64) -> Result<i64, CompactionError> {
+pub(crate) async fn perform_compaction(
+    work_items: Vec<(String, CompactionWorkItem)>,
+    last_snapshot_id: i64,
+) -> Result<i64, CompactionError> {
     let mut new_last_snapshot_id = last_snapshot_id;
     for (table_name, work_item) in work_items.iter() {
         let compaction_id = work_item.id.clone();
@@ -350,21 +373,26 @@ pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkIt
         // a compaction commit might get committed to it but fail afterwards. If we commit to Iceberg and fail to
         // record that in the main_lib then that leads to correctness errors that aren't really possible to fix.
         let parquet_file_name = PowdrrFileNameGenerator::create_file_name();
-        match STATE_PROVIDER.compaction_commit(
-            table_name,
-            &CompactionCommit {
-                removed_speedboat_files: work_item.speedboat_files.file_paths.clone(),
-                compaction_id: compaction_id.clone(),
-                checkpoint_id_to_replace: work_item.checkpoint_id_to_replace.clone(),
-                removed_delete_files: work_item.delete_files.clone(),
-                checkpoints_to_delete: work_item.checkpoints_to_delete.clone(),
-                parquet_file_name: parquet_file_name.clone(),
-            }
-        ).await {
+        match STATE_PROVIDER
+            .compaction_commit(
+                table_name,
+                &CompactionCommit {
+                    removed_speedboat_files: work_item.speedboat_files.file_paths.clone(),
+                    compaction_id: compaction_id.clone(),
+                    checkpoint_id_to_replace: work_item.checkpoint_id_to_replace.clone(),
+                    removed_delete_files: work_item.delete_files.clone(),
+                    checkpoints_to_delete: work_item.checkpoints_to_delete.clone(),
+                    parquet_file_name: parquet_file_name.clone(),
+                },
+            )
+            .await
+        {
             Ok(_) => (),
             Err(e) => {
-                return Err(CompactionError { message: format!("api call failed: {}", e) })
-            },
+                return Err(CompactionError {
+                    message: format!("api call failed: {}", e),
+                })
+            }
         }
 
         let command = CompactionCommand {
@@ -372,48 +400,53 @@ pub(crate) async fn perform_compaction(work_items: Vec<(String, CompactionWorkIt
             work_item: work_item.clone(),
             compaction_id: compaction_id.clone(),
             last_snapshot_id,
-            parquet_file_name
+            parquet_file_name,
         };
 
         let peers = STATE_PROVIDER.get_peer_clients().await;
         assert!(peers.len() > 0);
         let response_maybe = match peers[0].private_compaction_leader(&command).await {
             Ok(success) => success,
-            Err(e) => return Err(CompactionError{ message: e.to_string() })
+            Err(e) => {
+                return Err(CompactionError {
+                    message: e.to_string(),
+                })
+            }
         };
 
         new_last_snapshot_id = match response_maybe {
-            Some(response) => {
-                match CompactionCommand::do_iceberg_commit(&response).await {
-                    Ok(id) => id,
-                    Err(e) => return Err(CompactionError{ message: e.to_string() })
+            Some(response) => match CompactionCommand::do_iceberg_commit(&response).await {
+                Ok(id) => id,
+                Err(e) => {
+                    return Err(CompactionError {
+                        message: e.to_string(),
+                    })
                 }
             },
-            None => new_last_snapshot_id
+            None => new_last_snapshot_id,
         };
     }
-   
+
     Ok(new_last_snapshot_id)
 }
 
-
 #[cfg(test)]
 mod tests {
-    use std::io::BufReader;
-    use std::sync::Arc;
     use datafusion::arrow::array::RecordBatch;
     use datafusion::arrow::error::ArrowError;
     use datafusion::parquet::data_type::AsBytes;
     use gotham::test::Server;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use std::io::BufReader;
+    use std::sync::Arc;
 
     use super::{CompactionCommand, PowdrrFileNameGenerator};
-    use iceberg::io::{
-        FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY,
-    };
     use crate::data_access;
     use crate::elastic_search_storage_schema::{FullRecord, RecordInput, SpeedboatCommitBuilder};
     use crate::router::tests::TEST_SERVER;
+    use iceberg::io::{
+        FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY,
+    };
 
     #[test]
     fn test_iceberg_catalog_list_all_tables() {
@@ -423,7 +456,9 @@ mod tests {
     }
 
     async fn test_iceberg_catalog_list_all_tables_worker() {
-        data_access::drop_all_iceberg_tables(&"default".to_string()).await.unwrap();
+        data_access::drop_all_iceberg_tables(&"default".to_string())
+            .await
+            .unwrap();
 
         let iceberg_schema = Schema::builder()
             .with_schema_id(1)
@@ -436,17 +471,24 @@ mod tests {
             .build()
             .unwrap();
 
-        match data_access::ensure_iceberg_table(&"default".to_string(), &"test_table".to_string(), &iceberg_schema).await {
+        match data_access::ensure_iceberg_table(
+            &"default".to_string(),
+            &"test_table".to_string(),
+            &iceberg_schema,
+        )
+        .await
+        {
             Ok(_) => (),
             Err(e) => {
                 panic!("oh no = {}", e)
             }
         };
 
-        match data_access::drop_iceberg_table(&"default".to_string(), &"test_table".to_string()).await {
+        match data_access::drop_iceberg_table(&"default".to_string(), &"test_table".to_string())
+            .await
+        {
             Ok(_) => (),
-            Err(_) => {
-            }
+            Err(_) => {}
         }
     }
 
@@ -458,10 +500,12 @@ mod tests {
     }
 
     async fn test_iceberg_compact_simple_worker() {
-        data_access::drop_all_iceberg_tables(&"default".to_string()).await.unwrap();
+        data_access::drop_all_iceberg_tables(&"default".to_string())
+            .await
+            .unwrap();
 
         let file_content = include_str!("../tests/data/logs.json");
-        let mut values = vec!();
+        let mut values = vec![];
         for split_str in file_content.split("\n") {
             if split_str.len() == 0 {
                 continue;
@@ -476,31 +520,48 @@ mod tests {
             values.push(parsed_val)
         }
         let mut builder = SpeedboatCommitBuilder::new(&"simple".to_string());
-        let records = values.iter().map(|x|FullRecord::from_record(x).record_input).collect::<Vec<RecordInput>>();
+        let records = values
+            .iter()
+            .map(|x| FullRecord::from_record(x).record_input)
+            .collect::<Vec<RecordInput>>();
         for record in records.iter() {
             builder.insert(record)
         }
         let (insert_buffer, _, _) = builder.build_buffers();
-        let json = arrow_json::ReaderBuilder::new(Arc::new(insert_buffer.schema().unwrap().to_arrow_schema())).build(BufReader::new(file_content.as_bytes())).unwrap();
-        let batch = json.collect::<Result<Vec<RecordBatch>, ArrowError>>().unwrap();
+        let json = arrow_json::ReaderBuilder::new(Arc::new(
+            insert_buffer.schema().unwrap().to_arrow_schema(),
+        ))
+        .build(BufReader::new(file_content.as_bytes()))
+        .unwrap();
+        let batch = json
+            .collect::<Result<Vec<RecordBatch>, ArrowError>>()
+            .unwrap();
 
         match CompactionCommand::update_iceberg(
             &batch,
             &"simple".to_string(),
             &"thing1".to_string(),
-            &PowdrrFileNameGenerator::create_file_name()
-        ).await {
+            &PowdrrFileNameGenerator::create_file_name(),
+        )
+        .await
+        {
             Ok(_) => (),
             Err(e) => {
                 panic!("oh no = {}", e)
             }
         }
 
-        let metadata = match data_access::load_iceberg_table_metadata(&"default".to_string(), &"simple".to_string(), -1).await {
+        let metadata = match data_access::load_iceberg_table_metadata(
+            &"default".to_string(),
+            &"simple".to_string(),
+            -1,
+        )
+        .await
+        {
             Ok(m) => m,
             Err(e) => {
                 panic!("nope {}", e)
-            },
+            }
         };
 
         assert_eq!(metadata.files.len(), 1);
@@ -510,8 +571,7 @@ mod tests {
 
         match data_access::drop_iceberg_table(&"default".to_string(), &"simple".to_string()).await {
             Ok(_) => (),
-            Err(_) => {
-            }
+            Err(_) => {}
         }
     }
 
@@ -523,46 +583,64 @@ mod tests {
     }
 
     async fn test_iceberg_compact_okta_worker() {
-        data_access::drop_all_iceberg_tables(&"default".to_string()).await.unwrap();
+        data_access::drop_all_iceberg_tables(&"default".to_string())
+            .await
+            .unwrap();
 
         let okta_1 = include_str!("../tests/data/okta_system_log_1.json").replace("\n", "");
         let okta_2 = include_str!("../tests/data/okta_system_log_2.json").replace("\n", "");
         let okta_3 = include_str!("../tests/data/okta_system_log_3.json").replace("\n", "");
         let okta_4 = include_str!("../tests/data/okta_system_log_4.json").replace("\n", "");
-        let values = vec!(
+        let values = vec![
             serde_json::from_str::<serde_json::Value>(&okta_1).unwrap(),
             serde_json::from_str::<serde_json::Value>(&okta_2).unwrap(),
             serde_json::from_str::<serde_json::Value>(&okta_3).unwrap(),
             serde_json::from_str::<serde_json::Value>(&okta_4).unwrap(),
-        );
+        ];
         let mut builder = SpeedboatCommitBuilder::new(&"simple".to_string());
-        let records = values.iter().enumerate().map(|(id, x)|RecordInput::new(format!("id_{}", id), 1, x, None)).collect::<Vec<RecordInput>>();
+        let records = values
+            .iter()
+            .enumerate()
+            .map(|(id, x)| RecordInput::new(format!("id_{}", id), 1, x, None))
+            .collect::<Vec<RecordInput>>();
         for record in records.iter() {
             builder.insert(record)
         }
         let (insert_buffer, _, _) = builder.build_buffers();
         let insert_buffer_vec = insert_buffer.as_byte_vec();
         let arrow_schema = insert_buffer.schema().unwrap().to_arrow_schema();
-        let json = arrow_json::ReaderBuilder::new(Arc::new(arrow_schema)).build(BufReader::new(insert_buffer_vec.as_bytes())).unwrap();
-        let batch = json.collect::<Result<Vec<RecordBatch>, ArrowError>>().unwrap();
+        let json = arrow_json::ReaderBuilder::new(Arc::new(arrow_schema))
+            .build(BufReader::new(insert_buffer_vec.as_bytes()))
+            .unwrap();
+        let batch = json
+            .collect::<Result<Vec<RecordBatch>, ArrowError>>()
+            .unwrap();
 
         match CompactionCommand::update_iceberg(
             &batch,
             &"okta".to_string(),
             &"thing1".to_string(),
-            &PowdrrFileNameGenerator::create_file_name()
-        ).await {
+            &PowdrrFileNameGenerator::create_file_name(),
+        )
+        .await
+        {
             Ok(_) => (),
             Err(e) => {
                 panic!("oh no = {}", e)
             }
         }
 
-        let metadata = match data_access::load_iceberg_table_metadata(&"default".to_string(), &"okta".to_string(), -1).await {
+        let metadata = match data_access::load_iceberg_table_metadata(
+            &"default".to_string(),
+            &"okta".to_string(),
+            -1,
+        )
+        .await
+        {
             Ok(m) => m,
             Err(e) => {
                 panic!("nope {}", e)
-            },
+            }
         };
 
         assert_eq!(metadata.files.len(), 1);
@@ -572,13 +650,14 @@ mod tests {
 
         match data_access::drop_iceberg_table(&"default".to_string(), &"okta".to_string()).await {
             Ok(_) => (),
-            Err(_) => {
-            }
+            Err(_) => {}
         }
     }
 
     async fn test_s3_file_io_worker() {
-        data_access::drop_all_iceberg_tables(&"default".to_string()).await.unwrap();
+        data_access::drop_all_iceberg_tables(&"default".to_string())
+            .await
+            .unwrap();
 
         let file_io = FileIOBuilder::new("s3")
             .with_props(vec![
@@ -590,13 +669,14 @@ mod tests {
             .build()
             .unwrap();
         file_io.delete("s3://default/test_input.txt").await.unwrap();
-        assert!(
-            file_io.exists("s3://default/test_input.txt").await.unwrap() == false
-        );
+        assert!(file_io.exists("s3://default/test_input.txt").await.unwrap() == false);
 
         let output_file = file_io.new_output("s3://default/test_input.txt").unwrap();
         {
-            output_file.write("testing stuff is fun and useful".into()).await.unwrap();
+            output_file
+                .write("testing stuff is fun and useful".into())
+                .await
+                .unwrap();
         }
 
         let input_file = file_io.new_input("s3://default/test_input.txt").unwrap();
@@ -607,9 +687,7 @@ mod tests {
         }
 
         file_io.delete("s3://default/test_input.txt").await.unwrap();
-        assert!(
-            file_io.exists("s3://default/test_input.txt").await.unwrap() == false
-        );
+        assert!(file_io.exists("s3://default/test_input.txt").await.unwrap() == false);
     }
 
     #[test]
@@ -618,5 +696,4 @@ mod tests {
 
         test_server.run_future(test_s3_file_io_worker());
     }
-
 }

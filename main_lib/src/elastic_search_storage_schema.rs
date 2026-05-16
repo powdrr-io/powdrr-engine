@@ -1,9 +1,9 @@
-use serde_json::Value;
 use crate::distributed_cache;
 use crate::elastic_search_common::create_denormalized_value;
 use crate::elastic_search_ingest::{commit_speedboat, IngestError, WriteBuffer};
 use crate::elastic_search_responses::{OperationResult, QueryResultHit, Shards};
 use crate::schema_massager::{extract_powdrr_schema_option, PowdrrSchema};
+use serde_json::Value;
 
 #[derive(Clone)]
 pub(crate) struct RecordInput {
@@ -72,14 +72,29 @@ impl RecordInput {
             let denormalized_value = create_denormalized_value(self.source.as_ref().unwrap());
             values.insert("_id".to_string(), Value::String(self.id.clone()));
             values.insert("_seq_no".to_string(), Value::Number(seq_no.unwrap().into()));
-            values.insert("_id_seq_no".to_string(), Value::String(format!("{}_{}", self.id, seq_no.unwrap())));
+            values.insert(
+                "_id_seq_no".to_string(),
+                Value::String(format!("{}_{}", self.id, seq_no.unwrap())),
+            );
             values.insert("_version".to_string(), Value::Number(self.version.into()));
             if self.source_str.is_some() {
-                values.insert("_source".to_string(), Value::String(self.source_str.as_ref().unwrap().clone()));
+                values.insert(
+                    "_source".to_string(),
+                    Value::String(self.source_str.as_ref().unwrap().clone()),
+                );
             } else {
-                values.insert("_source".to_string(), Value::String(serde_json::to_string(&self.source).unwrap()));
+                values.insert(
+                    "_source".to_string(),
+                    Value::String(serde_json::to_string(&self.source).unwrap()),
+                );
             }
-            values.extend(denormalized_value.as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())));
+            values.extend(
+                denormalized_value
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
             self.existing_normalized = Some(Value::Object(values));
         }
     }
@@ -118,8 +133,9 @@ impl RecordInput {
                     _score: None,
                     _primary_term: Some(1),
                     found: Some(true),
-                    _source: self.source().cloned().unwrap()
-                })
+                    sort: None,
+                    _source: self.source().cloned().unwrap(),
+                }),
             }
         } else {
             OperationResult {
@@ -135,7 +151,7 @@ impl RecordInput {
                 status: self.status,
                 _seq_no: seq_no,
                 _primary_term: 1,
-                get: None
+                get: None,
             }
         }
     }
@@ -144,13 +160,18 @@ impl RecordInput {
 #[derive(Clone)]
 pub(crate) struct FullRecord {
     pub record_input: RecordInput,
-    pub seq_no: u64
+    pub seq_no: u64,
 }
-
 
 impl FullRecord {
     pub fn from_record(value: &Value) -> Self {
-        let seq_no = value.as_object().unwrap().get("_seq_no").unwrap().as_u64().unwrap();
+        let seq_no = value
+            .as_object()
+            .unwrap()
+            .get("_seq_no")
+            .unwrap()
+            .as_u64()
+            .unwrap();
         let record_input = RecordInput::from_record(value);
         FullRecord {
             record_input,
@@ -176,11 +197,10 @@ impl RecordDelete {
     }
 
     pub fn as_value(&self) -> Value {
-        Value::Object(
-            serde_json::Map::from_iter(vec![
-                ("_id_seq_no".to_string(), Value::String(format!("{}_{}", self.id, self.seq_no)))
-            ])
-        )
+        Value::Object(serde_json::Map::from_iter(vec![(
+            "_id_seq_no".to_string(),
+            Value::String(format!("{}_{}", self.id, self.seq_no)),
+        )]))
     }
 
     pub fn as_operation(&self, table: &String) -> OperationResult {
@@ -218,9 +238,9 @@ impl SpeedboatCommitBuilder {
     pub fn new(table_name: &String) -> Self {
         SpeedboatCommitBuilder {
             table_name: table_name.clone(),
-            insert_records: vec!(),
-            update_records: vec!(),
-            delete_records: vec!(),
+            insert_records: vec![],
+            update_records: vec![],
+            delete_records: vec![],
         }
     }
 
@@ -249,36 +269,78 @@ impl SpeedboatCommitBuilder {
     }
 
     pub fn extend(&mut self, builder: &SpeedboatCommitBuilder) {
-        self.insert_records.extend(builder.insert_records.iter().map(|r| r.clone()));
-        self.update_records.extend(builder.update_records.iter().map(|r| r.clone()));
-        self.delete_records.extend(builder.delete_records.iter().map(|r| r.clone()));
+        self.insert_records
+            .extend(builder.insert_records.iter().map(|r| r.clone()));
+        self.update_records
+            .extend(builder.update_records.iter().map(|r| r.clone()));
+        self.delete_records
+            .extend(builder.delete_records.iter().map(|r| r.clone()));
     }
 
     pub fn build_buffers(&mut self) -> (WriteBuffer, WriteBuffer, Vec<OperationResult>) {
-        let mut operations = vec!();
-        let seq_no_vec = distributed_cache::report_table_changes(&self.table_name, self.insert_records.len(), self.update_records.len(), self.delete_records.len()).unwrap();
-        let insert_update_write_buffer = if self.insert_records.len() > 0 || self.update_records.len() > 0 {
-            self.insert_records.iter_mut().chain(self.update_records.iter_mut()).zip(seq_no_vec.iter())
+        let mut operations = vec![];
+        let seq_no_vec = distributed_cache::report_table_changes(
+            &self.table_name,
+            self.insert_records.len(),
+            self.update_records.len(),
+            self.delete_records.len(),
+        )
+        .unwrap();
+        let insert_update_write_buffer = if self.insert_records.len() > 0
+            || self.update_records.len() > 0
+        {
+            self.insert_records
+                .iter_mut()
+                .chain(self.update_records.iter_mut())
+                .zip(seq_no_vec.iter())
                 .for_each(|(record, seq_no)| record.ensure_normalized_value(Some(*seq_no as u64)));
 
-            operations.extend(self.insert_records.iter().zip(seq_no_vec.iter())
-                .map(|(record, seq_no)| record.as_operation(&self.table_name, *seq_no, false)));
-            operations.extend(self.update_records.iter().zip(seq_no_vec[self.insert_records.len()..].iter())
-                .map(|(record, seq_no)| record.as_operation(&self.table_name, *seq_no, true)));
+            operations.extend(
+                self.insert_records
+                    .iter()
+                    .zip(seq_no_vec.iter())
+                    .map(|(record, seq_no)| record.as_operation(&self.table_name, *seq_no, false)),
+            );
+            operations.extend(
+                self.update_records
+                    .iter()
+                    .zip(seq_no_vec[self.insert_records.len()..].iter())
+                    .map(|(record, seq_no)| record.as_operation(&self.table_name, *seq_no, true)),
+            );
 
-            let input_schemas = self.insert_records.iter().chain(self.update_records.iter())
-                .map(|v| extract_powdrr_schema_option(&v.existing_normalized)).collect::<Vec<PowdrrSchema>>();
+            let input_schemas = self
+                .insert_records
+                .iter()
+                .chain(self.update_records.iter())
+                .map(|v| extract_powdrr_schema_option(&v.existing_normalized))
+                .collect::<Vec<PowdrrSchema>>();
             let merged_schema = PowdrrSchema::merge_all(input_schemas);
-            self.insert_records.iter_mut().chain(self.update_records.iter_mut()).for_each(|r| merged_schema.coerce_value_option(&mut r.existing_normalized));
+            self.insert_records
+                .iter_mut()
+                .chain(self.update_records.iter_mut())
+                .for_each(|r| merged_schema.coerce_value_option(&mut r.existing_normalized));
 
-            let final_records = self.insert_records.iter_mut().chain(self.update_records.iter_mut()).map(|r| r.as_record(None)).collect::<Vec<Value>>();
-            WriteBuffer::insert_and_update(merged_schema, final_records.iter().map(|r| r.clone()).collect())
+            let final_records = self
+                .insert_records
+                .iter_mut()
+                .chain(self.update_records.iter_mut())
+                .map(|r| r.as_record(None))
+                .collect::<Vec<Value>>();
+            WriteBuffer::insert_and_update(
+                merged_schema,
+                final_records.iter().map(|r| r.clone()).collect(),
+            )
         } else {
             WriteBuffer::empty()
         };
 
-        operations.extend(self.delete_records.iter().map(|r|r.as_operation(&self.table_name)));
-        let delete_write_buffer = WriteBuffer::delete(self.delete_records.iter().map(|r| r.as_value()).collect());
+        operations.extend(
+            self.delete_records
+                .iter()
+                .map(|r| r.as_operation(&self.table_name)),
+        );
+        let delete_write_buffer =
+            WriteBuffer::delete(self.delete_records.iter().map(|r| r.as_value()).collect());
         (insert_update_write_buffer, delete_write_buffer, operations)
     }
 
@@ -289,15 +351,13 @@ impl SpeedboatCommitBuilder {
             &insert_update_write_buffer,
             &delete_write_buffer,
             None,
-            &"commit".to_string()
-        ).await?;
+            &"commit".to_string(),
+        )
+        .await?;
 
-        Ok(SpeedboatCommitResult {
-            operations,
-        })
+        Ok(SpeedboatCommitResult { operations })
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -310,8 +370,11 @@ mod tests {
         builder.insert_records.push(RecordInput::new(
             "abc".to_string(),
             1,
-            &serde_json::from_str(r#"{"a": 1, "b": "2", "c": 3.3, "d":{"e": 4, "f": 5}, "g": [1, 2, 3]}"#).unwrap(),
-            None
+            &serde_json::from_str(
+                r#"{"a": 1, "b": "2", "c": 3.3, "d":{"e": 4, "f": 5}, "g": [1, 2, 3]}"#,
+            )
+            .unwrap(),
+            None,
         ));
         builder.insert_records.push(RecordInput::new(
             "def".to_string(),
