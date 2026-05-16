@@ -38,6 +38,7 @@ The backing test artifacts are:
 | Search | `bool.filter` plus `should` and `minimum_should_match` returns filtered hits | `bool_filter_should_minimum_should_match_returns_filtered_hits` | Yes | Yes | Freezes a Kibana-like bool pattern |
 | Search | `range` query on `@timestamp` returns expected hits | `range_query_on_timestamp_returns_expected_hits` | Yes | Yes | Important for future shard-pruning and doc-values work |
 | Search | `simple_query_string` with a single term returns the expected hits | `simple_query_string_with_and_operator_returns_expected_hit` | Yes | Yes | Freezes the currently working parser path before engine swap |
+| Search | field sort returns hits in descending numeric order | `field_sort_returns_expected_descending_hit_order` | Yes | Yes | Covers the typed node-local/controller merge path for explicit sorts |
 | Search | zero-hit query on an existing index returns zero total hits | `zero_hit_query_on_existing_index_returns_zero_total` | Yes | Yes | Guards empty-result behavior |
 | Document lifecycle | `POST /:index/_create/:id` conflicts after refresh | `create_with_id_conflict_after_refresh` | Yes | Yes | Captures current create-vs-existing semantics |
 | Document lifecycle | `GET /:index/_doc/:id` returns stored source | `get_existing_doc_returns_source` | Yes | Yes | Freezes current `_doc` retrieval behavior |

@@ -1,11 +1,25 @@
-use std::error::Error;
-use std::fmt::Display;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::Duration;
-use std::{collections::HashMap, fs::File};
-use std::io::{Cursor, SeekFrom, Write};
+use crate::data_access;
+use crate::data_contract::{
+    CreateIndexBody, CreateIndexResult, CreateIndexTemplateBody, CreateTable, SpeedboatCommit,
+    SpeedboatCommitTableInfo, TableDescription,
+};
+use crate::elastic_search_commands::LookupById;
+use crate::elastic_search_common::{
+    load_command_raw_result, CommandContext, ElasticSearchResponse, MIME_ES_JSON,
+};
+use crate::elastic_search_parser::UpdateBody;
+use crate::elastic_search_responses::{
+    BulkResult, ErrorDetails, OperationResult, Shards, SingleDocCreateFailedResult,
+};
+use crate::elastic_search_storage_schema::{
+    FullRecord, RecordDelete, RecordInput, SpeedboatCommitBuilder,
+};
+use crate::schema_massager::PowdrrSchema;
+use crate::search_runtime::{df_to_serde_value, SerdeValueResult};
+use crate::state_provider::{ServiceApiError, STATE_PROVIDER};
+use crate::util::{describe_table_log_error_then_none, log_err, log_service_err};
+use arrow_ipc::writer::StreamWriter;
+use arrow_json::LineDelimitedWriter;
 use datafusion::arrow::ipc::writer::FileWriter;
 use futures::FutureExt;
 use gotham::mime;
@@ -14,24 +28,18 @@ use http::StatusCode;
 use idgenerator::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::error::Error;
+use std::fmt::Display;
+use std::future::Future;
+use std::io::{Cursor, SeekFrom, Write};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+use std::{collections::HashMap, fs::File};
+use tokio::io::AsyncSeekExt;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::{mpsc, oneshot};
 use uuid_b64::UuidB64;
-use arrow_ipc::writer::StreamWriter;
-use arrow_json::LineDelimitedWriter;
-use tokio::io::AsyncSeekExt;
-use crate::elastic_search_commands::{df_to_serde_value, LookupById, SerdeValueResult};
-use crate::elastic_search_common::{load_command_raw_result, CommandContext, ElasticSearchResponse, MIME_ES_JSON};
-use crate::elastic_search_responses::{BulkResult, ErrorDetails, OperationResult, Shards, SingleDocCreateFailedResult};
-use crate::data_access;
-use crate::elastic_search_parser::UpdateBody;
-use crate::elastic_search_storage_schema::{FullRecord, RecordDelete, RecordInput, SpeedboatCommitBuilder};
-use crate::schema_massager::{PowdrrSchema};
-use crate::data_contract::{CreateIndexBody, CreateIndexResult, CreateIndexTemplateBody, CreateTable, SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription};
-use crate::state_provider::{ServiceApiError, STATE_PROVIDER};
-use crate::util::{describe_table_log_error_then_none, log_err, log_service_err};
-
-
 
 #[derive(Debug)]
 pub struct IngestError {
@@ -50,46 +58,43 @@ impl Error for IngestError {}
 impl IngestError {
     fn from_service_api_error(e: ServiceApiError) -> Self {
         log_service_err(e.clone());
-        IngestError { message: format!("{}", e) }
+        IngestError {
+            message: format!("{}", e),
+        }
     }
 }
-
 
 fn default_as_false() -> bool {
     false
 }
 
-
-
-
 #[derive(Clone)]
 pub(crate) struct WriteBuffer {
     lines: Vec<Value>,
-    schema: Option<PowdrrSchema>
+    schema: Option<PowdrrSchema>,
 }
-
 
 pub(crate) const JSON_MODE: bool = true;
 
 impl WriteBuffer {
     pub fn empty() -> Self {
         WriteBuffer {
-            lines: vec!(),
-            schema: None
+            lines: vec![],
+            schema: None,
         }
     }
 
     pub fn insert_and_update(schema: PowdrrSchema, lines: Vec<Value>) -> Self {
         WriteBuffer {
             lines,
-            schema: Some(schema)
+            schema: Some(schema),
         }
     }
 
     pub fn delete(lines: Vec<Value>) -> Self {
         WriteBuffer {
             lines,
-            schema: Some(PowdrrSchema::deletes())
+            schema: Some(PowdrrSchema::deletes()),
         }
     }
 
@@ -106,11 +111,19 @@ impl WriteBuffer {
         let mut file_write = File::create(file_name).expect("Cannot create file");
         for line in self.lines.iter() {
             match writeln!(&mut file_write, "{}", line) {
-                Err(e) => return Err(IngestError { message: format!("{}", e).to_string() }),
-                _ => ()
+                Err(e) => {
+                    return Err(IngestError {
+                        message: format!("{}", e).to_string(),
+                    })
+                }
+                _ => (),
             }
         }
-        Ok(self.lines.iter().map(|l|l.to_string().len()).sum::<usize>() as u64)
+        Ok(self
+            .lines
+            .iter()
+            .map(|l| l.to_string().len())
+            .sum::<usize>() as u64)
     }
 
     fn write_to_arrow_file(&self, file_name: &String) -> Result<u64, IngestError> {
@@ -120,12 +133,15 @@ impl WriteBuffer {
         let fields = arrow_schema.fields.as_ref();
         let record_batch = serde_arrow::to_record_batch(fields, &self.lines).unwrap();
         let file = File::create(file_name).unwrap();
-        let mut writer =
-            FileWriter::try_new_buffered(file, &record_batch.schema())
-                .unwrap();
+        let mut writer = FileWriter::try_new_buffered(file, &record_batch.schema()).unwrap();
         writer.write(&record_batch).unwrap();
         writer.finish().unwrap();
-        let len = File::open(file_name).unwrap().metadata().as_ref().map(|m| m.len()).unwrap();
+        let len = File::open(file_name)
+            .unwrap()
+            .metadata()
+            .as_ref()
+            .map(|m| m.len())
+            .unwrap();
         Ok(len)
     }
 
@@ -139,10 +155,23 @@ impl WriteBuffer {
         let record_batch = serde_arrow::to_record_batch(fields, &self.lines).unwrap();
         let mut buffer = Cursor::new(Vec::new());
         let mut writer = StreamWriter::try_new(&mut buffer, &record_batch.schema()).unwrap();
-        writer.write(&record_batch).map_err(|e|IngestError{ message: format!("{}", e).to_string() })?;
-        writer.finish().map_err(|e|IngestError{ message: format!("{}", e).to_string() })?;
-        let _ = buffer.seek(SeekFrom::Start(0)).await.map_err(|e|IngestError{ message: format!("{}", e).to_string() })?;
-        data_access::put_s3_file(&full_s3_path, buffer.get_ref()).await.map_err(|e|IngestError{ message: format!("{}", e).to_string() })?;
+        writer.write(&record_batch).map_err(|e| IngestError {
+            message: format!("{}", e).to_string(),
+        })?;
+        writer.finish().map_err(|e| IngestError {
+            message: format!("{}", e).to_string(),
+        })?;
+        let _ = buffer
+            .seek(SeekFrom::Start(0))
+            .await
+            .map_err(|e| IngestError {
+                message: format!("{}", e).to_string(),
+            })?;
+        data_access::put_s3_file(&full_s3_path, buffer.get_ref())
+            .await
+            .map_err(|e| IngestError {
+                message: format!("{}", e).to_string(),
+            })?;
         let len = buffer.get_ref().len() as u64;
         Ok(len)
     }
@@ -158,11 +187,14 @@ impl WriteBuffer {
         let mut writer = LineDelimitedWriter::new(&mut buf);
         writer.write_batches(&[&record_batch]).unwrap();
         writer.finish().unwrap();
-        data_access::put_s3_file(&full_s3_path, &buf).await.map_err(|e|IngestError{ message: format!("{}", e).to_string() })?;
+        data_access::put_s3_file(&full_s3_path, &buf)
+            .await
+            .map_err(|e| IngestError {
+                message: format!("{}", e).to_string(),
+            })?;
         let len = buf.len() as u64;
         Ok(len)
     }
-
 
     #[cfg(test)]
     pub(crate) fn as_byte_vec(&self) -> Vec<u8> {
@@ -200,7 +232,6 @@ struct IndexOrCreateBody {
     dynamic_templates: Option<HashMap<String, String>>,
 }
 
-
 #[derive(Deserialize)]
 struct UpdateOrDeleteBody {
     #[serde(rename(deserialize = "_index"))]
@@ -214,33 +245,28 @@ struct UpdateOrDeleteBody {
     require_alias: bool,
 }
 
-
 #[derive(Deserialize)]
 pub(crate) struct Create {
-    create: IndexOrCreateBody
+    create: IndexOrCreateBody,
 }
-
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
 pub(crate) struct Index {
-    index: IndexOrCreateBody
+    index: IndexOrCreateBody,
 }
-
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
 struct Delete {
-    delete: UpdateOrDeleteBody
+    delete: UpdateOrDeleteBody,
 }
-
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
 struct Update {
-    update: UpdateOrDeleteBody
+    update: UpdateOrDeleteBody,
 }
-
 
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -251,54 +277,81 @@ enum IngestCommand {
     Update(Update),
 }
 
-
-
-
-
-
-
-pub(crate) async fn create_index(table: &String, body: &String) -> Result<CreateIndexResult, IngestError> {
+pub(crate) async fn create_index(
+    table: &String,
+    body: &String,
+) -> Result<CreateIndexResult, IngestError> {
     let parsed_body = if body.len() == 0 {
-        CreateIndexBody{ aliases: None, mappings: None, settings: None }
+        CreateIndexBody {
+            aliases: None,
+            mappings: None,
+            settings: None,
+        }
     } else {
         match CreateIndexBody::parse(body) {
             Ok(pb) => pb,
-            Err(_e) => return log_err(IngestError { message: "body parsing error".to_string() })
+            Err(_e) => {
+                return log_err(IngestError {
+                    message: "body parsing error".to_string(),
+                })
+            }
         }
         // TODO: fill in defaults
     };
 
     let serialized_body = match serde_json::to_string(&parsed_body) {
         Ok(s) => s,
-        Err(_) => panic!("What happen?")
+        Err(_) => panic!("What happen?"),
     };
 
-    STATE_PROVIDER.create_table(&CreateTable{
-        name: table.clone(),
-        tags: HashMap::from([("_es_original".to_string(), serialized_body)])
-    }).await.map_err(|e|IngestError::from_service_api_error(e))?;
+    STATE_PROVIDER
+        .create_table(&CreateTable {
+            name: table.clone(),
+            tags: HashMap::from([("_es_original".to_string(), serialized_body)]),
+        })
+        .await
+        .map_err(|e| IngestError::from_service_api_error(e))?;
 
     if parsed_body.aliases.is_some() {
         for (name, _) in parsed_body.aliases.unwrap() {
-            STATE_PROVIDER.add_alias(table, &name).await.map_err(|e|IngestError::from_service_api_error(e))?;
+            STATE_PROVIDER
+                .add_alias(table, &name)
+                .await
+                .map_err(|e| IngestError::from_service_api_error(e))?;
         }
     }
 
-    Ok(CreateIndexResult { index: table.clone(), shards_acknowledged: true, acknowledged: true })
+    Ok(CreateIndexResult {
+        index: table.clone(),
+        shards_acknowledged: true,
+        acknowledged: true,
+    })
 }
 
-
-pub(crate) async fn create_index_template(table: &String, body: &String) -> Result<CreateIndexResult, IngestError> {
+pub(crate) async fn create_index_template(
+    table: &String,
+    body: &String,
+) -> Result<CreateIndexResult, IngestError> {
     let parsed_body: CreateIndexTemplateBody = match serde_json::from_str(body) {
         Ok(pb) => pb,
-        Err(_e) => return log_err(IngestError{ message: "body parsing error".to_string() })
+        Err(_e) => {
+            return log_err(IngestError {
+                message: "body parsing error".to_string(),
+            })
+        }
     };
 
-    STATE_PROVIDER.create_table_template(&table, &parsed_body).await.map_err(|e|IngestError::from_service_api_error(e))?;
+    STATE_PROVIDER
+        .create_table_template(&table, &parsed_body)
+        .await
+        .map_err(|e| IngestError::from_service_api_error(e))?;
 
-    Ok(CreateIndexResult { index: table.clone(), shards_acknowledged: true, acknowledged: true })
+    Ok(CreateIndexResult {
+        index: table.clone(),
+        shards_acknowledged: true,
+        acknowledged: true,
+    })
 }
-
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Aliases {
@@ -315,7 +368,7 @@ enum AliasAction {
 
 #[derive(Serialize, Deserialize, Clone)]
 struct AliasAdd {
-    add: AliasAddBody
+    add: AliasAddBody,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -327,7 +380,7 @@ struct AliasAddBody {
 
 #[derive(Serialize, Deserialize, Clone)]
 struct AliasRemove {
-    remove: AliasRemoveBody
+    remove: AliasRemoveBody,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -347,48 +400,51 @@ struct AliasRemoveIndexBody {
     index: String,
 }
 
-
 pub(crate) async fn update_aliases(body: &String) -> Result<(), IngestError> {
     let parsed_body: Aliases = match serde_json::from_str(body) {
         Ok(pb) => pb,
-        Err(_e) => return log_err(IngestError{ message: "body parsing error".to_string() })
+        Err(_e) => {
+            return log_err(IngestError {
+                message: "body parsing error".to_string(),
+            })
+        }
     };
 
     // TODO: the actions should probably be pushed up in bulk
     for action in parsed_body.actions {
         match action {
             AliasAction::Add(a) => {
-                STATE_PROVIDER.add_alias(&a.add.index, &a.add.alias).await.map_err(|e|IngestError::from_service_api_error(e))?;
-            },
+                STATE_PROVIDER
+                    .add_alias(&a.add.index, &a.add.alias)
+                    .await
+                    .map_err(|e| IngestError::from_service_api_error(e))?;
+            }
             AliasAction::Remove(r) => {
-                STATE_PROVIDER.remove_alias(&r.remove.index, &r.remove.alias).await.map_err(|e|IngestError::from_service_api_error(e))?;
-            },
+                STATE_PROVIDER
+                    .remove_alias(&r.remove.index, &r.remove.alias)
+                    .await
+                    .map_err(|e| IngestError::from_service_api_error(e))?;
+            }
             AliasAction::RemoveIndex(_) => {
                 panic!("TODO: What does this mean?")
-            },
+            }
         }
     }
     Ok(())
 }
-
 
 pub(crate) fn ingest_create(
     create: &Create,
     doc: &Value,
     version: u64,
     status: Option<u32>,
-    buffer: &mut SpeedboatCommitBuilder
+    buffer: &mut SpeedboatCommitBuilder,
 ) -> () {
     let id = match &create.create.id {
         Some(id) => id.clone(),
-        None => UuidB64::new().to_string()
+        None => UuidB64::new().to_string(),
     };
-    let doc_with_id = RecordInput::new(
-        id.clone(),
-        version,
-        &doc,
-        status,
-    );
+    let doc_with_id = RecordInput::new(id.clone(), version, &doc, status);
     buffer.insert(&doc_with_id);
 }
 
@@ -401,7 +457,7 @@ impl IngestResult {
     fn new() -> Self {
         IngestResult {
             tables: HashMap::new(),
-            operations: vec!(),
+            operations: vec![],
         }
     }
 
@@ -409,65 +465,93 @@ impl IngestResult {
         match self.tables.get_mut(table) {
             Some(_) => (),
             None => {
-                self.tables.insert(table.clone(), SpeedboatCommitBuilder::new(table));
+                self.tables
+                    .insert(table.clone(), SpeedboatCommitBuilder::new(table));
             }
         }
         self.tables.get_mut(table).unwrap()
     }
 }
 
+#[derive(Serialize)]
+#[allow(dead_code)]
+struct CreateSingleSuccessResult {}
 
 #[derive(Serialize)]
 #[allow(dead_code)]
-struct CreateSingleSuccessResult {
+struct CreateSingleErrorResult {}
 
-}
-
-#[derive(Serialize)]
-#[allow(dead_code)]
-struct CreateSingleErrorResult {
-
-}
-
-
-pub(crate) async fn create_single(index: &String, doc_id: &String, payload: &String) -> Result<ElasticSearchResponse, IngestError> {
+pub(crate) async fn create_single(
+    index: &String,
+    doc_id: &String,
+    payload: &String,
+) -> Result<ElasticSearchResponse, IngestError> {
     create_single_worker(index, doc_id, payload).await
 }
 
-pub(crate) async fn upsert_single(index: &String, doc_id: &String, payload: &String) -> Result<ElasticSearchResponse, IngestError> {
+pub(crate) async fn upsert_single(
+    index: &String,
+    doc_id: &String,
+    payload: &String,
+) -> Result<ElasticSearchResponse, IngestError> {
     update_single_worker(index, doc_id, payload).await
 }
 
 const USE_SPEEDBOAT_S3: bool = true;
 
-pub(crate) async fn write_to_file(buffer: &WriteBuffer, index: &String, label: &String) -> Result<(String, u64), IngestError> {
+pub(crate) async fn write_to_file(
+    buffer: &WriteBuffer,
+    index: &String,
+    label: &String,
+) -> Result<(String, u64), IngestError> {
     if USE_SPEEDBOAT_S3 {
-        let s3_path = format!("{}/{}-{}-{}", data_access::s3_ingest_base_path(), label, index, IdInstance::next_id().to_string());
+        let s3_path = format!(
+            "{}/{}-{}-{}",
+            data_access::s3_ingest_base_path(),
+            label,
+            index,
+            IdInstance::next_id().to_string()
+        );
         let size = buffer.write_to_json_s3(&s3_path).await?;
         Ok((s3_path, size))
     } else {
-        let file_path = format!("tests/data/ingest/{}-{}-{}", label, index, IdInstance::next_id().to_string());
+        let file_path = format!(
+            "tests/data/ingest/{}-{}-{}",
+            label,
+            index,
+            IdInstance::next_id().to_string()
+        );
         let write_to_file_result = buffer.write_to_file(&file_path);
         //tracing::info!("Ingest: op {} on table {} wrote {} records", label, index, buffer.num_records());
 
         let size = match write_to_file_result {
             Ok(size) => size,
-            Err(_) => return Err(IngestError { message: "File error".to_string() })
+            Err(_) => {
+                return Err(IngestError {
+                    message: "File error".to_string(),
+                })
+            }
         };
         Ok((file_path, size))
     }
 }
 
-
-pub(crate) async fn commit_speedboat(table: &String, inserts_and_updates: &WriteBuffer, deletes: &WriteBuffer, compaction: Option<String>, commit_type: &String) -> Result<(), IngestError> {
-    let mut table_infos = vec!();
+pub(crate) async fn commit_speedboat(
+    table: &String,
+    inserts_and_updates: &WriteBuffer,
+    deletes: &WriteBuffer,
+    compaction: Option<String>,
+    commit_type: &String,
+) -> Result<(), IngestError> {
+    let mut table_infos = vec![];
     if inserts_and_updates.lines.len() != 0 {
-        let (insert_update_path, size) = write_to_file(inserts_and_updates, table, commit_type).await?;
+        let (insert_update_path, size) =
+            write_to_file(inserts_and_updates, table, commit_type).await?;
         table_infos.push(SpeedboatCommitTableInfo {
             commit_type: commit_type.clone(),
             table_name: table.clone(),
-            files: vec!(insert_update_path),
-            sizes: vec!(size),
+            files: vec![insert_update_path],
+            sizes: vec![size],
             schema: inserts_and_updates.schema.clone(),
         });
     }
@@ -476,52 +560,78 @@ pub(crate) async fn commit_speedboat(table: &String, inserts_and_updates: &Write
         table_infos.push(SpeedboatCommitTableInfo {
             commit_type: "delete".to_string(),
             table_name: table.clone(),
-            files: vec!(deletes_path),
-            sizes: vec!(size),
+            files: vec![deletes_path],
+            sizes: vec![size],
             schema: deletes.schema.clone(),
         });
     }
-    match STATE_PROVIDER.speedboat_commit(&SpeedboatCommit {
-        type_files: table_infos,
-        compaction: compaction.clone()
-    }).await {
+    match STATE_PROVIDER
+        .speedboat_commit(&SpeedboatCommit {
+            type_files: table_infos,
+            compaction: compaction.clone(),
+        })
+        .await
+    {
         Ok(_) => (),
-        Err(_) => panic!("nope")
+        Err(_) => panic!("nope"),
     }
 
     Ok(())
 }
 
-
-async fn get_existing_docs(index: &String, doc_ids: &Vec<String>) -> Result<SerdeValueResult, IngestError> {
-    let docs = match load_command_raw_result(CommandContext{}, Arc::new(LookupById::new(&index, &doc_ids))).await {
+async fn get_existing_docs(
+    index: &String,
+    doc_ids: &Vec<String>,
+) -> Result<SerdeValueResult, IngestError> {
+    let docs = match load_command_raw_result(
+        CommandContext {},
+        Arc::new(LookupById::new(&index, &doc_ids)),
+    )
+    .await
+    {
         Ok(lcrr) => match lcrr {
             Some(raw_table) => {
-                let df = match data_access::execute_sql(&format!("SELECT * from {raw_table}")).await {
+                let df = match data_access::execute_sql(&format!("SELECT * from {raw_table}")).await
+                {
                     Ok(df) => df,
-                    Err(_) => panic!("weird")
+                    Err(_) => panic!("weird"),
                 };
 
-                let serde_result = df_to_serde_value(&df).await.map_err(|e|IngestError{ message: e.message.clone() })?;
+                let serde_result = df_to_serde_value(&df).await.map_err(|e| IngestError {
+                    message: e.message.clone(),
+                })?;
                 data_access::drop(&raw_table).await;
                 serde_result
+            }
+            None => SerdeValueResult {
+                values: vec![],
+                schema: None,
             },
-            None => SerdeValueResult{ values: vec!(), schema: None }
         },
-        Err(_) => panic!("weird")
+        Err(_) => panic!("weird"),
     };
     Ok(docs)
 }
 
-async fn create_single_worker(index: &String, doc_id: &String, payload: &String) -> Result<ElasticSearchResponse, IngestError> {
-    let table_description: TableDescription = match describe_table_log_error_then_none(&index).await {
+async fn create_single_worker(
+    index: &String,
+    doc_id: &String,
+    payload: &String,
+) -> Result<ElasticSearchResponse, IngestError> {
+    let table_description: TableDescription = match describe_table_log_error_then_none(&index).await
+    {
         Some(t) => t,
-        None => return Err(IngestError { message: "Index does not exist".to_string() })
+        None => {
+            return Err(IngestError {
+                message: "Index does not exist".to_string(),
+            })
+        }
     };
     let doc: Result<Value, serde_json::Error> = serde_json::from_str(payload);
     match doc {
         Ok(valid_doc) => {
-            let docs = get_existing_docs(&table_description.name, &vec!(doc_id.to_string())).await?;
+            let docs =
+                get_existing_docs(&table_description.name, &vec![doc_id.to_string()]).await?;
 
             if docs.values.len() != 0 {
                 // TODO: get version from existing doc
@@ -535,36 +645,60 @@ async fn create_single_worker(index: &String, doc_id: &String, payload: &String)
                     ),
                     status: 409,
                 };
-                return Ok(ElasticSearchResponse { status: StatusCode::CONFLICT, mime: mime::APPLICATION_JSON, body: serde_json::to_string(&response).unwrap(), headers: vec!() })
+                return Ok(ElasticSearchResponse {
+                    status: StatusCode::CONFLICT,
+                    mime: mime::APPLICATION_JSON,
+                    body: serde_json::to_string(&response).unwrap(),
+                    headers: vec![],
+                });
             };
 
             let mut buffer = SpeedboatCommitBuilder::new(index);
             ingest_create(
-                &Create{ create: IndexOrCreateBody { index: None, id: Some(doc_id.clone()), list_executed_pipelines: false, require_alias: false, dynamic_templates: None }},
+                &Create {
+                    create: IndexOrCreateBody {
+                        index: None,
+                        id: Some(doc_id.clone()),
+                        list_executed_pipelines: false,
+                        require_alias: false,
+                        dynamic_templates: None,
+                    },
+                },
                 &valid_doc,
                 1,
                 None,
-                &mut buffer
+                &mut buffer,
             );
 
             let commit_result = buffer.commit().await?;
             assert_eq!(commit_result.operations.len(), 1);
-            let headers = vec!((LOCATION, format!("/{}/_doc/{}", table_description.name, url_escape::encode_userinfo(doc_id))));
+            let headers = vec![(
+                LOCATION,
+                format!(
+                    "/{}/_doc/{}",
+                    table_description.name,
+                    url_escape::encode_userinfo(doc_id)
+                ),
+            )];
             Ok(ElasticSearchResponse {
                 status: StatusCode::CREATED,
                 mime: MIME_ES_JSON.clone(),
                 body: serde_json::to_string(&commit_result.operations[0]).unwrap(),
-                headers: headers
+                headers: headers,
             })
-        },
+        }
         Err(e) => {
             let error = format!("{}", e);
             println!("{}", error);
-            Ok(ElasticSearchResponse{ status: StatusCode::BAD_REQUEST, mime: mime::APPLICATION_JSON, body: "Bad request".to_string(), headers: vec!() })
+            Ok(ElasticSearchResponse {
+                status: StatusCode::BAD_REQUEST,
+                mime: mime::APPLICATION_JSON,
+                body: "Bad request".to_string(),
+                headers: vec![],
+            })
         }
     }
 }
-
 
 fn merge_source(existing_doc: &Value, update_doc: &Value) -> Value {
     assert!(existing_doc.is_object());
@@ -580,7 +714,7 @@ fn merge_source(existing_doc: &Value, update_doc: &Value) -> Value {
                 } else {
                     new_doc_map.insert(key.clone(), value.clone());
                 }
-            },
+            }
             None => {
                 new_doc_map.insert(key.clone(), value.clone());
             }
@@ -589,27 +723,41 @@ fn merge_source(existing_doc: &Value, update_doc: &Value) -> Value {
     new_doc
 }
 
-
-async fn update_single_worker(index: &String, doc_id: &String, payload: &String) -> Result<ElasticSearchResponse, IngestError> {
+async fn update_single_worker(
+    index: &String,
+    doc_id: &String,
+    payload: &String,
+) -> Result<ElasticSearchResponse, IngestError> {
     let table_description: TableDescription = match STATE_PROVIDER.describe_table(&index).await {
         Ok(t) => match t {
             Some(t) => t,
-            None => return Err(IngestError { message: "Index does not exist".to_string() })
+            None => {
+                return Err(IngestError {
+                    message: "Index does not exist".to_string(),
+                })
+            }
         },
         Err(e) => {
             log_service_err(e);
-            return Err(IngestError { message: "Index does not exist".to_string() })
+            return Err(IngestError {
+                message: "Index does not exist".to_string(),
+            });
         }
     };
 
     let update_request: UpdateBody = match serde_json::from_str(payload) {
         Ok(body) => body,
         Err(_) => {
-            return Ok(ElasticSearchResponse{ status: StatusCode::BAD_REQUEST, mime: mime::APPLICATION_JSON, body: "Bad request".to_string(), headers: vec!() })
+            return Ok(ElasticSearchResponse {
+                status: StatusCode::BAD_REQUEST,
+                mime: mime::APPLICATION_JSON,
+                body: "Bad request".to_string(),
+                headers: vec![],
+            })
         }
     };
 
-    let docs = get_existing_docs(&table_description.name, &vec!(doc_id.to_string())).await?;
+    let docs = get_existing_docs(&table_description.name, &vec![doc_id.to_string()]).await?;
 
     let mut buffer = SpeedboatCommitBuilder::new(&table_description.name);
     if docs.values.len() != 0 {
@@ -622,12 +770,19 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
         let mut updated_doc = RecordInput::new(
             existing_doc.record_input.id().clone(),
             existing_doc.record_input.version() + 1,
-            &merge_source(existing_doc.record_input.source().unwrap(), update_request.doc.as_ref().unwrap()),
-            None
+            &merge_source(
+                existing_doc.record_input.source().unwrap(),
+                update_request.doc.as_ref().unwrap(),
+            ),
+            None,
         );
         updated_doc.ensure_source();
         buffer.update(&updated_doc);
-        buffer.delete(&RecordDelete::new(&existing_doc.record_input.id(), existing_doc.seq_no, existing_doc.record_input.version()));
+        buffer.delete(&RecordDelete::new(
+            &existing_doc.record_input.id(),
+            existing_doc.seq_no,
+            existing_doc.record_input.version(),
+        ));
     } else {
         if update_request.upsert.is_none() {
             // TODO: this is the doc_as_upsert path to figure out
@@ -636,34 +791,55 @@ async fn update_single_worker(index: &String, doc_id: &String, payload: &String)
 
         let upsert_doc = update_request.upsert.unwrap();
         ingest_create(
-            &Create { create: IndexOrCreateBody { index: None, id: Some(doc_id.clone()), list_executed_pipelines: false, require_alias: false, dynamic_templates: None } },
+            &Create {
+                create: IndexOrCreateBody {
+                    index: None,
+                    id: Some(doc_id.clone()),
+                    list_executed_pipelines: false,
+                    require_alias: false,
+                    dynamic_templates: None,
+                },
+            },
             &upsert_doc,
             1,
             None,
-            &mut buffer
+            &mut buffer,
         );
     };
 
     let result = buffer.commit().await?;
     assert_eq!(result.operations.len(), 1);
-    let headers = vec!((LOCATION, format!("/{}/_doc/{}", table_description.name, url_escape::encode_userinfo(doc_id))));
+    let headers = vec![(
+        LOCATION,
+        format!(
+            "/{}/_doc/{}",
+            table_description.name,
+            url_escape::encode_userinfo(doc_id)
+        ),
+    )];
     Ok(ElasticSearchResponse {
         status: StatusCode::CREATED,
         mime: MIME_ES_JSON.clone(),
         body: serde_json::to_string(&result.operations[0]).unwrap(),
-        headers: headers
+        headers: headers,
     })
-
 }
 
-
-pub(crate) async fn delete(index: &String, doc_id: &String) -> Result<ElasticSearchResponse, IngestError> {
-    let table_description: TableDescription = match describe_table_log_error_then_none(&index).await {
+pub(crate) async fn delete(
+    index: &String,
+    doc_id: &String,
+) -> Result<ElasticSearchResponse, IngestError> {
+    let table_description: TableDescription = match describe_table_log_error_then_none(&index).await
+    {
         Some(t) => t,
-        None => return Err(IngestError{ message: "Index does not exist".to_string() })
+        None => {
+            return Err(IngestError {
+                message: "Index does not exist".to_string(),
+            })
+        }
     };
 
-    let docs = get_existing_docs(&table_description.name, &vec!(doc_id.clone())).await?;
+    let docs = get_existing_docs(&table_description.name, &vec![doc_id.clone()]).await?;
     if docs.values.len() == 0 {
         let result = OperationResult {
             _index: index.clone(),
@@ -680,7 +856,12 @@ pub(crate) async fn delete(index: &String, doc_id: &String) -> Result<ElasticSea
             status: None,
             get: None,
         };
-        return Ok(ElasticSearchResponse { status: StatusCode::NOT_FOUND, mime: mime::APPLICATION_JSON, body: serde_json::to_string(&result).unwrap(), headers: vec!() })
+        return Ok(ElasticSearchResponse {
+            status: StatusCode::NOT_FOUND,
+            mime: mime::APPLICATION_JSON,
+            body: serde_json::to_string(&result).unwrap(),
+            headers: vec![],
+        });
     }
     let mut buffer = SpeedboatCommitBuilder::new(&table_description.name);
     let target_seq_no = docs.values[0].get("_seq_no").unwrap().as_u64().unwrap();
@@ -688,11 +869,18 @@ pub(crate) async fn delete(index: &String, doc_id: &String) -> Result<ElasticSea
     buffer.delete(&RecordDelete::new(doc_id, target_seq_no, target_version));
     let result = buffer.commit().await?;
     assert_eq!(result.operations.len(), 1);
-    Ok(ElasticSearchResponse { status: StatusCode::OK, mime: mime::APPLICATION_JSON, body: serde_json::to_string(&result.operations[0]).unwrap(), headers: vec!() })
+    Ok(ElasticSearchResponse {
+        status: StatusCode::OK,
+        mime: mime::APPLICATION_JSON,
+        body: serde_json::to_string(&result.operations[0]).unwrap(),
+        headers: vec![],
+    })
 }
 
-
-pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) -> Result<IngestResult, IngestError> {
+pub(crate) async fn ingest(
+    provided_index: Option<&String>,
+    payload: &String,
+) -> Result<IngestResult, IngestError> {
     let payload_split = payload.lines();
     let mut ingest_result = IngestResult::new();
     let mut iterator = payload_split.into_iter().peekable();
@@ -702,115 +890,157 @@ pub(crate) async fn ingest(provided_index: Option<&String>, payload: &String) ->
             continue;
         }
 
-        let deser_command: Result<IngestCommand, serde_json::Error> = serde_json::from_str(command_str);
+        let deser_command: Result<IngestCommand, serde_json::Error> =
+            serde_json::from_str(command_str);
         match deser_command {
             // TODO: we could bulkify the fetching of the docs to be updated
-            Ok(command) => {
-                match command {
-                    IngestCommand::Create(c) => {
-                        let index = match &c.create.index {
-                            Some(i) => {
-                                match provided_index {
-                                    Some(pi) => if i != pi {
-                                        return Err(IngestError{ message: "Can not provide a index in create here".to_string() });
-                                    },
-                                    None => (),
+            Ok(command) => match command {
+                IngestCommand::Create(c) => {
+                    let index = match &c.create.index {
+                        Some(i) => {
+                            match provided_index {
+                                Some(pi) => {
+                                    if i != pi {
+                                        return Err(IngestError {
+                                            message: "Can not provide a index in create here"
+                                                .to_string(),
+                                        });
+                                    }
                                 }
-                                i
+                                None => (),
                             }
+                            i
+                        }
+                        None => match provided_index {
+                            Some(pi) => pi,
                             None => {
-                                match provided_index {
-                                    Some(pi) => pi,
-                                    None => return Err(IngestError{ message: "Must provide index name".to_string() }),
-                                }
+                                return Err(IngestError {
+                                    message: "Must provide index name".to_string(),
+                                })
                             }
-                        };
-                        let table_description = match describe_table_log_error_then_none(&index).await {
-                            Some(t) => t,
-                            None => return Err(IngestError{ message: "Index does not exist".to_string() })
-                        };
-                        let doc_str = match iterator.next() {
+                        },
+                    };
+                    let table_description = match describe_table_log_error_then_none(&index).await {
+                        Some(t) => t,
+                        None => {
+                            return Err(IngestError {
+                                message: "Index does not exist".to_string(),
+                            })
+                        }
+                    };
+                    let doc_str = match iterator.next() {
                             Some(ds) => ds.trim(),
                             None => panic!("How do I make my own error? This should return an error instead of panic")
                         };
-                        let doc: Result<Value, serde_json::Error>  = serde_json::from_str(doc_str);
-                        match doc {
-                            Ok(valid_doc) => {
-                                ingest_create(
-                                    &c,
-                                    &valid_doc,
-                                    1,
-                                    Some(201),
-                                    ingest_result.get(&table_description.name)
-                                );
-                            },
-                            Err(e) => return Err(IngestError{ message: format!("Serde error doc: {}", e) })
+                    let doc: Result<Value, serde_json::Error> = serde_json::from_str(doc_str);
+                    match doc {
+                        Ok(valid_doc) => {
+                            ingest_create(
+                                &c,
+                                &valid_doc,
+                                1,
+                                Some(201),
+                                ingest_result.get(&table_description.name),
+                            );
                         }
-                    },
-                    IngestCommand::Update(u) => {
-                        let index = match &u.update.index {
-                            Some(i) => {
-                                match provided_index {
-                                    Some(pi) => if i != pi {
-                                        return Err(IngestError{ message: "Can not provide a index in create here".to_string() });
-                                    },
-                                    None => (),
-                                }
-                                i
-                            }
-                            None => {
-                                match provided_index {
-                                    Some(pi) => pi,
-                                    None => return Err(IngestError{ message: "Must provide index name".to_string() }),
-                                }
-                            }
-                        };
-                        let table_description = match describe_table_log_error_then_none(&index).await {
-                            Some(t) => t,
-                            None => return Err(IngestError{ message: "Index does not exist".to_string() })
-                        };
-                        let existing_docs = get_existing_docs(&table_description.name, &vec!(u.update.id.unwrap())).await?;
-                        if existing_docs.values.len() == 0 {
-                            todo!("Need to handle this case")
-                        }
-                        let doc_str = match iterator.next() {
-                            Some(ds) => ds.trim(),
-                            None => panic!("How do I make my own error? This should return an error instead of panic")
-                        };
-                        let doc: Result<UpdateBody, serde_json::Error>  = serde_json::from_str(doc_str);
-                        match doc {
-                            Ok(update_request) => {
-                                if update_request.doc.is_none() {
-                                    todo!("What do we do here?")
-                                }
-                                let mut existing_doc = FullRecord::from_record(&existing_docs.values[0]);
-                                existing_doc.record_input.ensure_source();
-
-                                let mut updated_doc = RecordInput::new(
-                                    existing_doc.record_input.id().clone(),
-                                    existing_doc.record_input.version() + 1,
-                                    &merge_source(existing_doc.record_input.source().unwrap(), update_request.doc.as_ref().unwrap()),
-                                    Some(201)
-                                );
-                                updated_doc.ensure_source();
-                                ingest_result.get(index).update(&updated_doc);
-                                ingest_result.get(index).delete(&RecordDelete::new(existing_doc.record_input.id(), existing_doc.seq_no, existing_doc.record_input.version()));
-                            },
-                            Err(e) => return Err(IngestError{ message: format!("Serde error doc: {}", e) })
+                        Err(e) => {
+                            return Err(IngestError {
+                                message: format!("Serde error doc: {}", e),
+                            })
                         }
                     }
-                    _ => {
-                        panic!("Not implemented")
-                    },
+                }
+                IngestCommand::Update(u) => {
+                    let index = match &u.update.index {
+                        Some(i) => {
+                            match provided_index {
+                                Some(pi) => {
+                                    if i != pi {
+                                        return Err(IngestError {
+                                            message: "Can not provide a index in create here"
+                                                .to_string(),
+                                        });
+                                    }
+                                }
+                                None => (),
+                            }
+                            i
+                        }
+                        None => match provided_index {
+                            Some(pi) => pi,
+                            None => {
+                                return Err(IngestError {
+                                    message: "Must provide index name".to_string(),
+                                })
+                            }
+                        },
+                    };
+                    let table_description = match describe_table_log_error_then_none(&index).await {
+                        Some(t) => t,
+                        None => {
+                            return Err(IngestError {
+                                message: "Index does not exist".to_string(),
+                            })
+                        }
+                    };
+                    let existing_docs =
+                        get_existing_docs(&table_description.name, &vec![u.update.id.unwrap()])
+                            .await?;
+                    if existing_docs.values.len() == 0 {
+                        todo!("Need to handle this case")
+                    }
+                    let doc_str = match iterator.next() {
+                            Some(ds) => ds.trim(),
+                            None => panic!("How do I make my own error? This should return an error instead of panic")
+                        };
+                    let doc: Result<UpdateBody, serde_json::Error> = serde_json::from_str(doc_str);
+                    match doc {
+                        Ok(update_request) => {
+                            if update_request.doc.is_none() {
+                                todo!("What do we do here?")
+                            }
+                            let mut existing_doc =
+                                FullRecord::from_record(&existing_docs.values[0]);
+                            existing_doc.record_input.ensure_source();
+
+                            let mut updated_doc = RecordInput::new(
+                                existing_doc.record_input.id().clone(),
+                                existing_doc.record_input.version() + 1,
+                                &merge_source(
+                                    existing_doc.record_input.source().unwrap(),
+                                    update_request.doc.as_ref().unwrap(),
+                                ),
+                                Some(201),
+                            );
+                            updated_doc.ensure_source();
+                            ingest_result.get(index).update(&updated_doc);
+                            ingest_result.get(index).delete(&RecordDelete::new(
+                                existing_doc.record_input.id(),
+                                existing_doc.seq_no,
+                                existing_doc.record_input.version(),
+                            ));
+                        }
+                        Err(e) => {
+                            return Err(IngestError {
+                                message: format!("Serde error doc: {}", e),
+                            })
+                        }
+                    }
+                }
+                _ => {
+                    panic!("Not implemented")
                 }
             },
-            Err(e) => return Err(IngestError{ message: format!("Serde error command: {}", e) })
+            Err(e) => {
+                return Err(IngestError {
+                    message: format!("Serde error command: {}", e),
+                })
+            }
         }
     }
 
     Ok(ingest_result)
 }
-
 
 struct IngestRequest {
     response: Vec<OperationResult>,
@@ -835,14 +1065,14 @@ enum IngestActorMessage {
     },
     Commit {
         respond_to: oneshot::Sender<()>,
-    }
+    },
 }
 
 impl IngestActor {
     fn new(receiver: mpsc::Receiver<IngestActorMessage>) -> Self {
         IngestActor {
             tables: HashMap::new(),
-            requests: vec!(),
+            requests: vec![],
             receiver: receiver,
         }
     }
@@ -858,17 +1088,22 @@ impl IngestActor {
         }
     }
 
-    async fn do_ingest(&mut self, table: Option<&String>, payload: &String, respond_to: oneshot::Sender<Result<BulkResult, IngestError>>) -> () {
+    async fn do_ingest(
+        &mut self,
+        table: Option<&String>,
+        payload: &String,
+        respond_to: oneshot::Sender<Result<BulkResult, IngestError>>,
+    ) -> () {
         let buffer_items = ingest(table, &payload).await;
         match buffer_items {
             Ok(bi) => {
                 let request = IngestRequest {
                     response: bi.operations,
-                    respond_to: Some(respond_to)
+                    respond_to: Some(respond_to),
                 };
                 self.requests.push(request);
                 self.merge_table_buffers(&bi.tables);
-            },
+            }
             Err(e) => {
                 let _ = respond_to.send(Err(e));
             }
@@ -877,12 +1112,15 @@ impl IngestActor {
 
     async fn handle_message(&mut self, msg: IngestActorMessage) -> () {
         match msg {
-            IngestActorMessage::IngestSingleTable { table, payload, respond_to } => {
-                self.do_ingest(Some(&table), &payload, respond_to).await
-            },
-            IngestActorMessage::Ingest { payload, respond_to } => {
-                self.do_ingest(None, &payload, respond_to).await
-            },
+            IngestActorMessage::IngestSingleTable {
+                table,
+                payload,
+                respond_to,
+            } => self.do_ingest(Some(&table), &payload, respond_to).await,
+            IngestActorMessage::Ingest {
+                payload,
+                respond_to,
+            } => self.do_ingest(None, &payload, respond_to).await,
             IngestActorMessage::Commit { respond_to } => {
                 let _ = self.commit().await;
                 let _ = respond_to.send(());
@@ -901,7 +1139,11 @@ impl IngestActor {
 
         for request in self.requests.iter_mut() {
             // TODO: track and report time correctly
-            let _ = request.respond_to.take().unwrap().send(Ok(BulkResult::success(0, request.response.clone())));
+            let _ = request
+                .respond_to
+                .take()
+                .unwrap()
+                .send(Ok(BulkResult::success(0, request.response.clone())));
         }
 
         self.requests.clear();
@@ -909,23 +1151,18 @@ impl IngestActor {
 
         Ok(())
     }
-
-
 }
-
 
 #[derive(Clone)]
 pub struct IngestHandle {
     sender: mpsc::Sender<IngestActorMessage>,
 }
 
-
 async fn run_ingest_message_pump(mut actor: IngestActor) {
     while let Some(msg) = actor.receiver.recv().await {
         actor.handle_message(msg).await;
     }
 }
-
 
 impl IngestHandle {
     pub fn new() -> Self {
@@ -939,43 +1176,44 @@ impl IngestHandle {
         let (send, recv) = oneshot::channel();
         let msg = IngestActorMessage::Ingest {
             payload: payload.clone(),
-            respond_to: send
+            respond_to: send,
         };
 
         let _ = self.sender.send(msg).await;
         match recv.await {
             Ok(r) => r,
-            Err(_) => panic!("RecvError")
+            Err(_) => panic!("RecvError"),
         }
     }
 
     #[allow(dead_code)]
-    pub async fn send_single_table(&self, table: &String, payload: &String) -> Result<BulkResult, IngestError> {
+    pub async fn send_single_table(
+        &self,
+        table: &String,
+        payload: &String,
+    ) -> Result<BulkResult, IngestError> {
         let (send, recv) = oneshot::channel();
         let msg = IngestActorMessage::IngestSingleTable {
             table: table.clone(),
             payload: payload.clone(),
-            respond_to: send
+            respond_to: send,
         };
 
         let _ = self.sender.send(msg).await;
         match recv.await {
             Ok(r) => r,
-            Err(_) => panic!("RecvError")
+            Err(_) => panic!("RecvError"),
         }
     }
 
     pub async fn commit(&self) -> Result<(), RecvError> {
         let (send, recv) = oneshot::channel();
-        let msg = IngestActorMessage::Commit {
-            respond_to: send
-        };
+        let msg = IngestActorMessage::Commit { respond_to: send };
 
         let _ = self.sender.send(msg).await;
         recv.await
     }
 }
-
 
 fn commit_messages() -> Pin<Box<dyn Future<Output = ()> + Send>> {
     async move {
@@ -983,9 +1221,9 @@ fn commit_messages() -> Pin<Box<dyn Future<Output = ()> + Send>> {
             tokio::time::sleep(Duration::from_millis(200)).await;
             let _ = INGEST_HANDLE.commit().await;
         }
-    }.boxed()
+    }
+    .boxed()
 }
-
 
 fn create_ingest() -> IngestHandle {
     let handle = IngestHandle::new();
@@ -993,15 +1231,14 @@ fn create_ingest() -> IngestHandle {
     handle
 }
 
-pub(crate) static INGEST_HANDLE: std::sync::LazyLock<IngestHandle> = std::sync::LazyLock::new(|| create_ingest());
-
-
+pub(crate) static INGEST_HANDLE: std::sync::LazyLock<IngestHandle> =
+    std::sync::LazyLock::new(|| create_ingest());
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, fs};
     use crate::data_contract::{CreateIndexTemplateBody, PropertyInfo};
-    use crate::elastic_search_ingest::{IngestCommand};
+    use crate::elastic_search_ingest::IngestCommand;
+    use std::{collections::HashMap, fs};
 
     use super::CreateIndexBody;
 
@@ -1012,12 +1249,12 @@ mod tests {
             IngestCommand::Create(c) => {
                 assert_eq!(c.create.index, None);
                 assert_eq!(c.create.id, None);
-            },
+            }
             _ => panic!("This should be a create"),
         }
 
-
-        let index_deser: IngestCommand = serde_json::from_str("{\"create\": { \"_index\": \"test\" } }").unwrap();
+        let index_deser: IngestCommand =
+            serde_json::from_str("{\"create\": { \"_index\": \"test\" } }").unwrap();
         match index_deser {
             IngestCommand::Create(c) => {
                 assert_eq!(c.create.id, None);
@@ -1025,10 +1262,9 @@ mod tests {
                     Some(cci) => assert_eq!(cci, "test".to_string()),
                     _ => panic!("Should be index == test"),
                 }
-            },
+            }
             _ => panic!("This should be a create"),
         }
-
     }
 
     #[test]
@@ -1038,7 +1274,7 @@ mod tests {
             IngestCommand::Index(i) => {
                 assert_eq!(i.index.index, None);
                 assert_eq!(i.index.id, None);
-            },
+            }
             _ => panic!("This should be a create"),
         }
     }
@@ -1068,7 +1304,6 @@ mod tests {
                 panic!("nope");
             }
         };
-
 
         let test_val = r#"{
   ".kibana_task_manager_8.7.1_001": {
@@ -1214,21 +1449,21 @@ mod tests {
         let index = deser.get(".kibana_task_manager_8.7.1_001").unwrap().clone();
         assert_eq!(index.aliases.map_or_else(|| 0, |x| x.len()), 2);
 
-/*
-        let file_content = match read_to_string("main_lib/tests/data/example_create_index.json") {
-            Ok(f) => f,
-            Err(_) => panic!("Missing test file")
-        };
-        let deser_file: CreateIndexBody =  match serde_json::from_str(file_content.as_str()) {
-            Ok(d) => d,
-            Err(e) => {
-                let error = format!("{}", e);
-                println!("{}", error);
-                let _ = fs::write("main_lib/output.txt", error);
-                panic!("nope");
-            }
-        };
-*/
+        /*
+                let file_content = match read_to_string("main_lib/tests/data/example_create_index.json") {
+                    Ok(f) => f,
+                    Err(_) => panic!("Missing test file")
+                };
+                let deser_file: CreateIndexBody =  match serde_json::from_str(file_content.as_str()) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let error = format!("{}", e);
+                        println!("{}", error);
+                        let _ = fs::write("main_lib/output.txt", error);
+                        panic!("nope");
+                    }
+                };
+        */
 
         let test_val = include_str!("../tests/data/component_template_2.json");
 
@@ -2186,7 +2421,10 @@ mod tests {
                 let error = format!("{}", e);
                 let error_str = error.as_str();
                 println!("{}", error_str);
-                let _ = fs::write("/Users/gregory/code/powdrr-engine/main_lib/output.txt", error);
+                let _ = fs::write(
+                    "/Users/gregory/code/powdrr-engine/main_lib/output.txt",
+                    error,
+                );
                 panic!("nope");
             }
         };
@@ -2217,5 +2455,4 @@ mod tests {
             }
         };
     }
-
 }

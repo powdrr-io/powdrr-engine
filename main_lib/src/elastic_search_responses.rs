@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use gotham::{hyper::StatusCode, mime};
@@ -6,14 +7,12 @@ use serde_json::Value;
 
 use crate::elastic_search_common::ElasticSearchResponse;
 
-
 #[derive(Serialize, Clone)]
 pub struct Shards {
     pub total: u32,
     pub successful: u32,
     pub failed: u32,
 }
-
 
 #[derive(Serialize, Clone)]
 pub struct OperationResult {
@@ -27,23 +26,25 @@ pub struct OperationResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub get: Option<QueryResultHit>
+    pub get: Option<QueryResultHit>,
 }
 
 #[derive(Serialize)]
 pub struct BulkResult {
     pub errors: bool,
     pub took: u32,
-    pub items: Vec<HashMap<String, OperationResult>>
+    pub items: Vec<HashMap<String, OperationResult>>,
 }
-
 
 impl BulkResult {
     pub fn success(took: u32, created: Vec<OperationResult>) -> Self {
-        BulkResult { 
-            errors: false, 
+        BulkResult {
+            errors: false,
             took: took,
-            items: created.iter().map(|x|HashMap::from([("created".to_string(), x.clone())])).collect()
+            items: created
+                .iter()
+                .map(|x| HashMap::from([("created".to_string(), x.clone())]))
+                .collect(),
         }
     }
 }
@@ -83,13 +84,27 @@ pub struct QueryResultHit {
     pub _primary_term: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub found: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort: Option<Vec<Value>>,
     pub _source: Value,
 }
 
 impl QueryResultHit {
     pub fn from_record(index: &Option<String>, value: &Value, found: Option<bool>) -> Self {
+        Self::from_record_with_sort(index, value, found, None)
+    }
+
+    pub fn from_record_with_sort(
+        index: &Option<String>,
+        value: &Value,
+        found: Option<bool>,
+        sort: Option<Vec<Value>>,
+    ) -> Self {
         let value_map = value.as_object().unwrap().clone();
-        let score = value_map.get("score").map_or_else(|| None, |f|f.as_f64());
+        let score = value_map
+            .get("score")
+            .and_then(|f| f.as_f64())
+            .or_else(|| bm25_fallback_score(&value_map));
         let id = value_map.get("_id").unwrap().as_str().unwrap().to_string();
         let version = value_map.get("_version").unwrap().as_u64().unwrap();
         let seq_no = value_map.get("_seq_no").unwrap().as_u64().unwrap();
@@ -106,17 +121,45 @@ impl QueryResultHit {
             _score: score,
             _primary_term: Some(1),
             found,
+            sort,
             _source: source_value,
         }
     }
 }
 
+fn bm25_fallback_score(value_map: &serde_json::Map<String, Value>) -> Option<f64> {
+    let term_cnt = value_map.get("term_cnt")?.as_f64()?;
+    let word_cnt = value_map.get("word_cnt")?.as_f64()?;
+    let constant_k = 1.2;
+    let constant_b = 0.75;
+    let avgdl = 5.6;
+    Some(
+        (term_cnt * (constant_k + 1.0))
+            / (term_cnt + constant_k * (1.0 - constant_b + (constant_b * word_cnt / avgdl))),
+    )
+}
+
+pub(crate) fn compare_query_result_hits_desc(
+    left: &QueryResultHit,
+    right: &QueryResultHit,
+) -> Ordering {
+    match (left._score, right._score) {
+        (Some(left_score), Some(right_score)) => right_score
+            .partial_cmp(&left_score)
+            .unwrap_or(Ordering::Equal),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+    .then_with(|| right._seq_no.cmp(&left._seq_no))
+    .then_with(|| left._id.cmp(&right._id))
+}
 
 #[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct QueryResultHits {
     pub total: QueryResultTotal,
     pub max_score: Option<f64>,
-    pub hits: Vec<QueryResultHit>
+    pub hits: Vec<QueryResultHit>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -145,14 +188,14 @@ pub(crate) struct AverageAggregationResult {
 pub(crate) struct FilterAggregationResult {
     pub doc_count: u64,
     #[serde(flatten)]
-    pub aggs: HashMap<String, AggregationResult>
+    pub aggs: HashMap<String, AggregationResult>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct CardinalityAggregationResult {
     pub value: u64,
     #[serde(flatten)]
-    pub aggs: HashMap<String, AggregationResult>
+    pub aggs: HashMap<String, AggregationResult>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -164,7 +207,7 @@ pub(crate) struct RangeAggregationBucket {
     pub to_as_string: String,
     pub doc_count: u64,
     #[serde(flatten)]
-    pub aggs: HashMap<String, AggregationResult>
+    pub aggs: HashMap<String, AggregationResult>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -177,15 +220,13 @@ pub(crate) struct HistogramAggregationBucket {
     pub to_as_string: String,
     pub doc_count: u64,
     #[serde(flatten)]
-    pub aggs: HashMap<String, AggregationResult>
+    pub aggs: HashMap<String, AggregationResult>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct HistogramAggregationResult {
     pub(crate) buckets: Vec<HistogramAggregationBucket>,
-
 }
-
 
 #[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct RangeAggregationResult {
@@ -251,17 +292,19 @@ impl QueryResultsNotFound {
             status: StatusCode::NOT_FOUND,
             mime: mime::APPLICATION_JSON,
             body: serde_json::to_string(self).unwrap(),
-            headers: vec!()
+            headers: vec![],
         }
     }
 }
 
 impl QueryResultTotalComplex {
     fn new(num: usize) -> Self {
-        QueryResultTotalComplex { value: num as u64, relation: "eq".to_string() }
+        QueryResultTotalComplex {
+            value: num as u64,
+            relation: "eq".to_string(),
+        }
     }
 }
-
 
 pub(crate) fn transient_error(message: &String) -> ElasticSearchResponse {
     // TODO: probably pass in the error here, put traceback in debug logs
@@ -271,22 +314,35 @@ pub(crate) fn transient_error(message: &String) -> ElasticSearchResponse {
         status: StatusCode::SERVICE_UNAVAILABLE,
         mime: mime::TEXT_PLAIN,
         body: "An error occurred".to_string(),
-        headers: vec!()
+        headers: vec![],
     }
 }
 
-
 impl QueryResults {
-    pub fn empty(took: u32, num_shards: u32, aggregations: Option<HashMap<String, AggregationResult>>, total_hits_complex: bool) -> Self {
+    pub fn empty(
+        took: u32,
+        num_shards: u32,
+        aggregations: Option<HashMap<String, AggregationResult>>,
+        total_hits_complex: bool,
+    ) -> Self {
         let total_hits = match total_hits_complex {
             true => QueryResultTotal::Complex(QueryResultTotalComplex::new(0)),
-            false => QueryResultTotal::Simple(0)
+            false => QueryResultTotal::Simple(0),
         };
-        QueryResults { 
-            took: took, 
-            timed_out: false, 
-            _shards: QueryResultShards { total: num_shards, successful: num_shards, skipped: 0, failed: 0 }, 
-            hits: QueryResultHits { total: total_hits, max_score: None, hits: vec!() },
+        QueryResults {
+            took: took,
+            timed_out: false,
+            _shards: QueryResultShards {
+                total: num_shards,
+                successful: num_shards,
+                skipped: 0,
+                failed: 0,
+            },
+            hits: QueryResultHits {
+                total: total_hits,
+                max_score: None,
+                hits: vec![],
+            },
             aggregations: aggregations,
         }
     }
@@ -297,28 +353,54 @@ impl QueryResults {
             true => QueryResultTotal::Complex(QueryResultTotalComplex::new(0)),
             false => QueryResultTotal::Simple(0),
         };
-        QueryResults { 
-            took: took, 
-            timed_out: true, 
-            _shards: QueryResultShards { total: num_shards, successful: num_shards, skipped: 0, failed: 0 }, 
-            hits: QueryResultHits { total: total_hits, max_score: None, hits: vec!() },
+        QueryResults {
+            took: took,
+            timed_out: true,
+            _shards: QueryResultShards {
+                total: num_shards,
+                successful: num_shards,
+                skipped: 0,
+                failed: 0,
+            },
+            hits: QueryResultHits {
+                total: total_hits,
+                max_score: None,
+                hits: vec![],
+            },
             aggregations: None,
-        }        
+        }
     }
 
-    pub fn success(took: u32, num_shards: u32, total_hits: usize, max_score: Option<f64>, hits: Vec<QueryResultHit>, aggregations: Option<HashMap<String, AggregationResult>>, total_hits_complex: bool) -> Self {
+    pub fn success(
+        took: u32,
+        num_shards: u32,
+        total_hits: usize,
+        max_score: Option<f64>,
+        hits: Vec<QueryResultHit>,
+        aggregations: Option<HashMap<String, AggregationResult>>,
+        total_hits_complex: bool,
+    ) -> Self {
         let total_hits = match total_hits_complex {
             true => QueryResultTotal::Complex(QueryResultTotalComplex::new(total_hits)),
-            false => QueryResultTotal::Simple(total_hits as u64)
+            false => QueryResultTotal::Simple(total_hits as u64),
         };
 
-        QueryResults { 
-            took: took, 
-            timed_out: false, 
-            _shards: QueryResultShards { total: num_shards, successful: num_shards, skipped: 0, failed: 0 }, 
-            hits: QueryResultHits { total: total_hits, max_score: max_score, hits: hits },
+        QueryResults {
+            took: took,
+            timed_out: false,
+            _shards: QueryResultShards {
+                total: num_shards,
+                successful: num_shards,
+                skipped: 0,
+                failed: 0,
+            },
+            hits: QueryResultHits {
+                total: total_hits,
+                max_score: max_score,
+                hits: hits,
+            },
             aggregations: aggregations,
-        }  
+        }
     }
 
     pub(crate) fn to_response(&self) -> ElasticSearchResponse {
@@ -326,14 +408,13 @@ impl QueryResults {
             status: StatusCode::OK,
             mime: mime::APPLICATION_JSON,
             body: serde_json::to_string(self).unwrap(),
-            headers: vec!()
+            headers: vec![],
         }
     }
 }
 
-
 pub(crate) struct QueryFailure {
-    pub message: String
+    pub message: String,
 }
 
 impl QueryFailure {
@@ -343,13 +424,13 @@ impl QueryFailure {
             status: StatusCode::BAD_REQUEST,
             mime: mime::TEXT_PLAIN,
             body: self.message.clone(),
-            headers: vec!()
+            headers: vec![],
         }
     }
 }
 
 pub(crate) struct UpdateByQuerySuccess {
-    pub result: UpdateByQueryResults
+    pub result: UpdateByQueryResults,
 }
 
 impl UpdateByQuerySuccess {
@@ -358,8 +439,71 @@ impl UpdateByQuerySuccess {
             status: StatusCode::OK,
             mime: mime::APPLICATION_JSON,
             body: serde_json::to_string(&self.result).unwrap(),
-            headers: vec!()
+            headers: vec![],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compare_query_result_hits_desc, QueryResultHit};
+    use serde_json::json;
+
+    #[test]
+    fn test_query_result_hit_uses_bm25_fallback_score() {
+        let value = json!({
+            "_id": "doc-1",
+            "_version": 1,
+            "_seq_no": 9,
+            "_source": "{\"message\":\"hello\"}",
+            "term_cnt": 2.0,
+            "word_cnt": 4.0
+        });
+
+        let hit = QueryResultHit::from_record(&Some("logs".to_string()), &value, None);
+
+        assert!(hit._score.is_some());
+        assert!(hit._score.unwrap() > 0.0);
+    }
+
+    #[test]
+    fn test_compare_query_result_hits_desc_prefers_score_then_seq_no() {
+        let higher_score = QueryResultHit {
+            _index: Some("logs".to_string()),
+            _id: Some("doc-1".to_string()),
+            _version: 1,
+            _seq_no: 1,
+            _score: Some(2.0),
+            _primary_term: Some(1),
+            found: None,
+            sort: None,
+            _source: json!({"message": "higher"}),
+        };
+        let lower_score = QueryResultHit {
+            _index: Some("logs".to_string()),
+            _id: Some("doc-2".to_string()),
+            _version: 1,
+            _seq_no: 5,
+            _score: Some(1.0),
+            _primary_term: Some(1),
+            found: None,
+            sort: None,
+            _source: json!({"message": "lower"}),
+        };
+        let newer_seq_no = QueryResultHit {
+            _index: Some("logs".to_string()),
+            _id: Some("doc-3".to_string()),
+            _version: 1,
+            _seq_no: 11,
+            _score: Some(1.0),
+            _primary_term: Some(1),
+            found: None,
+            sort: None,
+            _source: json!({"message": "newer"}),
+        };
+
+        assert!(compare_query_result_hits_desc(&higher_score, &lower_score).is_lt());
+        assert!(compare_query_result_hits_desc(&newer_seq_no, &lower_score).is_lt());
     }
 }
 
@@ -373,9 +517,8 @@ pub(crate) struct SingleDocResult {
     _seq_no: u64,
     _shards: Shards,
     _version: u64,
-    forced_refresh: bool
+    forced_refresh: bool,
 }
-
 
 impl SingleDocResult {
     #[allow(dead_code)]
@@ -384,23 +527,21 @@ impl SingleDocResult {
             status: StatusCode::OK,
             mime: mime::APPLICATION_JSON,
             body: serde_json::to_string(self).unwrap(),
-            headers: vec!()
+            headers: vec![],
         }
     }
 }
 
-
 #[derive(Serialize)]
 pub(crate) struct SingleDocCreateFailedResult {
     pub error: ErrorDetails,
-    pub status: u32
+    pub status: u32,
 }
-
 
 #[derive(Serialize)]
 pub(crate) struct ErrorDetails {
     root_cause: Option<Vec<ErrorDetails>>,
-    #[serde(rename="type")]
+    #[serde(rename = "type")]
     _type: String,
     reason: String,
     index_uuid: Option<String>,
@@ -408,27 +549,31 @@ pub(crate) struct ErrorDetails {
     index: Option<String>,
 }
 
-
 impl ErrorDetails {
-    pub(crate) fn single_cause(_type: &String, reason: &String, index_uuid: Option<String>, shard: Option<String>, index: Option<String>) -> Self {
-        ErrorDetails { 
-            root_cause: Some(vec!(ErrorDetails{ 
-                root_cause: None, 
-                _type: _type.clone(), 
-                reason: reason.clone(), 
-                index_uuid: index_uuid.clone(), 
-                shard: shard.clone(), 
+    pub(crate) fn single_cause(
+        _type: &String,
+        reason: &String,
+        index_uuid: Option<String>,
+        shard: Option<String>,
+        index: Option<String>,
+    ) -> Self {
+        ErrorDetails {
+            root_cause: Some(vec![ErrorDetails {
+                root_cause: None,
+                _type: _type.clone(),
+                reason: reason.clone(),
+                index_uuid: index_uuid.clone(),
+                shard: shard.clone(),
                 index: index.clone(),
-            })),
-            _type: _type.clone(), 
-            reason: reason.clone(), 
-            index_uuid: index_uuid.clone(), 
-            shard: shard.clone(), 
+            }]),
+            _type: _type.clone(),
+            reason: reason.clone(),
+            index_uuid: index_uuid.clone(),
+            shard: shard.clone(),
             index: index.clone(),
         }
     }
 }
-
 
 impl ErrorDetails {
     #[allow(dead_code)]
@@ -437,7 +582,7 @@ impl ErrorDetails {
             status: StatusCode::OK,
             mime: mime::APPLICATION_JSON,
             body: serde_json::to_string(self).unwrap(),
-            headers: vec!()
+            headers: vec![],
         }
     }
 }

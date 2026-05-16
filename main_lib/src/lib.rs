@@ -20,21 +20,22 @@ mod elastic_search_parser;
 pub mod elastic_search_pipeline;
 mod elastic_search_responses;
 mod elastic_search_storage_schema;
+mod ephemeral_fetch_tracker;
 pub mod ephemeral_service_impl;
 mod ephemeral_state_provider;
 mod expression_evaluator;
 mod leaderless_state_provider;
 mod painless_parser;
+pub mod peers;
 pub mod pipeline;
 mod prefetch;
 mod private_api;
 pub mod router;
 pub mod schema_massager;
+mod search_executor;
+pub mod search_plan;
+pub mod search_runtime;
 mod state_common;
 pub mod state_provider;
-pub mod peers;
 pub mod test_api;
 mod util;
-mod ephemeral_fetch_tracker;
-
-
