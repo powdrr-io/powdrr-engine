@@ -4,13 +4,13 @@ use crate::util::log_err;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::common::HashMap;
 use datafusion::config::ConfigOptions;
-use datafusion::execution::options::ArrowReadOptions;
+use datafusion::execution::options::{ArrowReadOptions, JsonReadOptions};
 use datafusion::prelude::SessionConfig;
 use datafusion::{
     arrow,
     arrow::array::RecordBatch,
     error::DataFusionError,
-    prelude::{DataFrame, NdJsonReadOptions, ParquetReadOptions, SessionContext},
+    prelude::{DataFrame, ParquetReadOptions, SessionContext},
 };
 use futures_util::TryStreamExt;
 use iceberg::Catalog;
@@ -21,13 +21,16 @@ use iceberg::transaction::ApplyTransactionAction;
 use iceberg::{NamespaceIdent, TableCreation, TableIdent};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use idgenerator::IdInstance;
-use liquid_cache_parquet::LiquidCacheInProcessBuilder;
-use liquid_cache_parquet::cache::policies::DiscardPolicy;
-use liquid_cache_parquet::common::LiquidCacheMode;
+#[cfg(target_os = "linux")]
+use liquid_cache_parquet::LiquidCacheLocalBuilder;
+#[cfg(target_os = "linux")]
+use liquid_cache_parquet::storage::cache::squeeze_policies::Evict;
+#[cfg(target_os = "linux")]
+use liquid_cache_parquet::storage::cache_policies::LiquidPolicy;
 use lru_mem::{HeapSize, LruCache, TryInsertError};
 use object_store::client::SpawnedReqwestConnector;
 use object_store::{
-    ObjectStore, PutPayload,
+    ObjectStoreExt, PutPayload,
     aws::{AmazonS3, AmazonS3Builder},
 };
 use serde::{Deserialize, Serialize};
@@ -36,6 +39,7 @@ use std::string::ToString;
 use std::sync::LazyLock;
 use std::time::Duration;
 use std::{path::Path, sync::Arc};
+#[cfg(target_os = "linux")]
 use tempfile::TempDir;
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -160,6 +164,7 @@ fn create_store(address: &String) -> Arc<AmazonS3> {
 
 const S3_BASE_PATH: &str = "s3://warehouse";
 
+#[cfg(target_os = "linux")]
 fn create_session(file_store: Arc<AmazonS3>) -> SessionContext {
     let options = ConfigOptions::default();
     // UNCOMMENT TO ENABLE 'SHOW TABLES'
@@ -169,15 +174,17 @@ fn create_session(file_store: Arc<AmazonS3>) -> SessionContext {
 
     let temp_dir = TempDir::new().unwrap();
 
-    let (ctx, _) = match LiquidCacheInProcessBuilder::new()
-        .with_max_cache_bytes(10 * 1024 * 1024 * 1024) // 10GB
-        .with_cache_dir(temp_dir.path().to_path_buf())
-        .with_cache_mode(LiquidCacheMode::Liquid {
-            transcode_in_background: false,
-        })
-        .with_cache_strategy(Box::new(DiscardPolicy))
-        .build(config)
-    {
+    let build_cache = async {
+        LiquidCacheLocalBuilder::new()
+            .with_max_memory_bytes(10 * 1024 * 1024 * 1024) // 10GB
+            .with_cache_dir(temp_dir.path().to_path_buf())
+            .with_cache_policy(Box::new(LiquidPolicy::new()))
+            .with_squeeze_policy(Box::new(Evict))
+            .build(config)
+            .await
+    };
+
+    let (ctx, _) = match tokio::task::block_in_place(|| Handle::current().block_on(build_cache)) {
         Ok(ctx) => ctx,
         Err(e) => panic!("Failed to create session: {}", e),
     };
@@ -187,6 +194,18 @@ fn create_session(file_store: Arc<AmazonS3>) -> SessionContext {
     let s3_url = Url::parse(S3_BASE_PATH).unwrap();
 
     ctx.register_object_store(&s3_url, file_store.clone());
+
+    ctx
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_session(file_store: Arc<AmazonS3>) -> SessionContext {
+    let options = ConfigOptions::default();
+    let config = SessionConfig::from(options);
+    let ctx = SessionContext::new_with_config(config);
+    let s3_url = Url::parse(S3_BASE_PATH).unwrap();
+
+    ctx.register_object_store(&s3_url, file_store);
 
     ctx
 }
@@ -675,7 +694,7 @@ impl CacheTrackerActor {
                     Ok(p) => p,
                     Err(e) => {
                         respond_to
-                            .send(log_err(DataFusionError::ObjectStore(e.into())))
+                            .send(log_err(DataFusionError::ObjectStore(Box::new(e.into()))))
                             .expect("Failed to send response");
                         return;
                     }
@@ -683,7 +702,7 @@ impl CacheTrackerActor {
                 let payload = PutPayload::from_bytes(payload.to_vec().into());
                 let retval = match self.s3_file_store.put(&path, payload).await {
                     Ok(_) => Ok(()),
-                    Err(e) => log_err(DataFusionError::ObjectStore(e.into())),
+                    Err(e) => log_err(DataFusionError::ObjectStore(Box::new(e.into()))),
                 };
                 respond_to.send(retval).expect("Failed to send response");
             }
@@ -786,13 +805,13 @@ impl CacheTrackerActor {
         let schema = records.get(0).unwrap().schema();
         let concated = match arrow::compute::concat_batches(&records[0].schema(), records) {
             Ok(batch) => batch,
-            Err(e) => {
-                return {
-                    tracing::error!("Failed to concat_batches: {}", e);
-                    log_err(DataFusionError::ArrowError(e, None))
-                };
-            }
-        };
+                Err(e) => {
+                    return {
+                        tracing::error!("Failed to concat_batches: {}", e);
+                        log_err(DataFusionError::ArrowError(Box::new(e), None))
+                    };
+                }
+            };
         let table = match datafusion::datasource::MemTable::try_new(schema, vec![vec![concated]]) {
             Ok(t) => Arc::new(t),
             Err(e) => {
@@ -1252,7 +1271,7 @@ async fn load_json_file_as_table(
             format!("{}.json", file_path_without_suffix)
         };
         tracing::info!("Loading JSON file {}", file_path);
-        let reader_options = NdJsonReadOptions::default().schema(&schema);
+        let reader_options = JsonReadOptions::default().schema(&schema);
         match data_fusion_context
             .register_json(local_name, file_path, reader_options)
             .await
@@ -1321,7 +1340,7 @@ pub(crate) async fn load_json_as_memtable(
 
     let record_batches: Vec<RecordBatch> = match json_reader.collect() {
         Ok(batches) => batches,
-        Err(e) => return log_err(DataFusionError::ArrowError(e, None)),
+        Err(e) => return log_err(DataFusionError::ArrowError(Box::new(e), None)),
     };
 
     load_memtable_with_name(local_name, &record_batches).await
@@ -1721,7 +1740,6 @@ fn datum_to_json_value(
         Err(_) => None,
     }
 }
-
 async fn commit_iceberg_transaction_worker(
     catalog: Arc<RestCatalog>,
     namespace: &String,

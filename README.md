@@ -3,8 +3,11 @@
 Run Cargo from linked worktrees through `scripts/cargo-worktree.sh`.
 
 - The script computes the repo root from `git rev-parse --git-common-dir`.
-- It exports a shared `CARGO_TARGET_DIR` at `.cargo-target/` in the repo root.
-- That lets linked worktrees reuse the same compiled dependency cache instead of creating a fresh `target/` tree per worktree.
+- It exports a shared `CARGO_TARGET_DIR` under `.cargo-target/` in the repo root.
+- Targeted package commands like `scripts/cargo-worktree.sh check -p powdrr-cli` get their own shared shard at `.cargo-target/<package>`.
+- Untargeted workspace commands fall back to `.cargo-target/workspace`.
+- That preserves cross-worktree reuse while reducing lock contention between unrelated package builds.
+- Set `POWDRR_CARGO_SHARD=<name>` to force a specific shard when you want manual control.
 
 Examples:
 
@@ -87,6 +90,16 @@ scripts/cargo-worktree.sh run -p powdrr-cli -- elastic query \
   --cache-dir /tmp/powdrr-search \
   --body-file clients/query.json
 ```
+
+Classify an Elasticsearch JSON query before running it:
+
+```
+scripts/cargo-worktree.sh run -p powdrr-cli -- elastic analyze \
+  --body-file clients/query.json
+```
+
+The analysis reports whether the query stays on a highly optimized path,
+falls back to a supported but probably slower path, or is currently unsupported.
 
 For S3 sources, point `--source` at an `s3://bucket/prefix` and provide the
 usual AWS environment variables before running the build command.
