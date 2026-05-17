@@ -40,7 +40,7 @@ wait_for_http "http://localhost:9200" "Elasticsearch"
 wait_for_mongo
 
 cd "$ROOT_DIR"
-cargo test -p powdrr_lib --lib serving_protocol::tests -- --nocapture
-cargo test -p powdrr_lib --lib lakehouse_serving::tests -- --nocapture
-cargo test -p powdrr_lib --lib router::tests::test_serving_config_and_fast_path_query -- --nocapture
-cargo run -p powdrr-benchmark
+./scripts/cargo-worktree.sh test -p powdrr_lib --lib serving_protocol::tests -- --nocapture
+./scripts/cargo-worktree.sh test -p powdrr_lib --lib lakehouse_serving::tests -- --nocapture
+./scripts/cargo-worktree.sh test -p powdrr_lib --lib router::tests::test_serving_config_and_fast_path_query -- --nocapture
+./scripts/cargo-worktree.sh run -p powdrr-benchmark

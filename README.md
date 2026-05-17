@@ -1,16 +1,19 @@
 ## BUILD SPEED
 
-Run Cargo from linked worktrees through `scripts/cargo-worktree.sh`.
+Pin the Rust toolchain through `rust-toolchain.toml`, then bootstrap each linked
+worktree once with `scripts/setup-worktree.sh`.
 
-- The script computes the repo root from `git rev-parse --git-common-dir`.
-- It exports a shared `CARGO_TARGET_DIR` at `.cargo-target/` in the repo root.
-- That lets linked worktrees reuse the same compiled dependency cache instead of creating a fresh `target/` tree per worktree.
+- `scripts/setup-worktree.sh` creates `target -> <repo>/.cargo-target` in the worktree.
+- That makes plain `cargo`, editor-driven builds, and the wrapper script all reuse the same repo-level artifact cache.
+- `scripts/cargo-worktree.sh` still exports `CARGO_TARGET_DIR` explicitly so automated commands and CI stay on the shared cache even if the shell environment changes.
 
 Examples:
 
 ```
+scripts/setup-worktree.sh
 scripts/cargo-worktree.sh check -p powdrr-cli
-scripts/cargo-worktree.sh test -p powdrr_lib -- --nocapture --test-threads=1
+scripts/cargo-worktree.sh nextest run
+scripts/cargo-worktree.sh test --doc
 scripts/cargo-worktree.sh build --timings
 ```
 
@@ -19,6 +22,29 @@ The workspace now excludes `powdrr-benchmark` from default root-level `cargo bui
 
 ```
 scripts/cargo-worktree.sh run -p powdrr-benchmark
+```
+
+## FAST TESTS
+
+The default fast test loop uses `cargo-nextest` with repo config in
+`.config/nextest.toml`.
+
+With the pinned `rust-toolchain.toml`, install the compatible local runner with:
+
+```
+cargo install --locked cargo-nextest --version 0.9.128
+```
+
+- The default filter excludes the heavy `powdrr_lib::es_compatibility_matrix` integration binary.
+- The `ci` profile retries once and applies a stricter slow-test timeout.
+- Doctests still run separately through `cargo test --doc`.
+
+Examples:
+
+```
+scripts/cargo-worktree.sh nextest run
+scripts/cargo-worktree.sh nextest run --profile ci
+scripts/cargo-worktree.sh test --doc
 ```
 
 ## RUNNING TESTS
