@@ -2,10 +2,10 @@ use crate::data_contract::{ExtensionFile, FileDescriptor, FileSetPayload, Iceber
 use crate::elastic_search_common::CommandContext;
 use crate::elastic_search_index::{create_index_inner_with_doc_id, IndexError};
 use crate::elastic_search_parser;
-use crate::peers::PeerModeType;
 use crate::schema_massager::{to_powdrr_schema, PowdrrSchema};
 use crate::search_executor;
 use crate::state_provider::STATE_PROVIDER;
+use crate::test_api::PeerModeType;
 use crate::util::add_file_suffix;
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use futures_util::TryStreamExt;
