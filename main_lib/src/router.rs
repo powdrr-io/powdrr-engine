@@ -1,4 +1,5 @@
-use crate::compaction::{CompactionCommand, compact_logs};
+use crate::compaction::{compact_logs, CompactionCommand};
+use crate::dynamodb_protocol;
 use crate::elastic_search_endpoints::NameIdPathExtractor;
 use crate::elastic_search_endpoints::NamePathExtractor;
 use crate::elastic_search_endpoints::QueryStringAliases;
@@ -288,9 +289,12 @@ impl Middleware for RouterMiddleware {
         let f = result.and_then(move |(state, mut response)| {
             let request_headers = state.borrow::<HeaderMap>();
             let request_opaque_id = request_headers.get("X-Opaque-Id").clone();
+            let is_dynamodb_request = request_headers.contains_key("x-amz-target");
 
             let headers = response.headers_mut();
-            headers.insert("X-elastic-product", "Elasticsearch".parse().unwrap());
+            if !is_dynamodb_request {
+                headers.insert("X-elastic-product", "Elasticsearch".parse().unwrap());
+            }
             if request_opaque_id.is_some() {
                 headers.insert("X-Opaque-Id", request_opaque_id.unwrap().clone());
             }
@@ -348,6 +352,8 @@ pub fn router(include_test_apis: bool) -> Router {
             });
         }
 
+        route.post("/").to(dynamodb_protocol::dynamodb_api);
+
         // ES endpoints
         route.get("/").to(elastic_search_endpoints::es_root);
         route.get("/_nodes").to(elastic_search_endpoints::es_nodes);
@@ -399,9 +405,17 @@ pub fn router(include_test_apis: bool) -> Router {
             .with_path_extractor::<NamePathExtractor>()
             .to(lakehouse_serving::get_serving_config);
         route
+            .get("/:name/_dynamodb/config")
+            .with_path_extractor::<NamePathExtractor>()
+            .to(dynamodb_protocol::get_dynamodb_config);
+        route
             .put("/:name/_serve/config")
             .with_path_extractor::<NamePathExtractor>()
             .to(lakehouse_serving::put_serving_config);
+        route
+            .put("/:name/_dynamodb/config")
+            .with_path_extractor::<NamePathExtractor>()
+            .to(dynamodb_protocol::put_dynamodb_config);
         route
             .post("/:name/_serve")
             .with_path_extractor::<NamePathExtractor>()
