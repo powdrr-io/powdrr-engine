@@ -91,6 +91,8 @@ scripts/cargo-worktree.sh check -p <crate>
 - Never use destructive Git commands such as `git reset --hard` or `git checkout -- <path>` unless explicitly requested.
 - Prefer small, reviewable diffs.
 - Update tests and docs in the same change when behavior or workflow changes.
+- Open PRs in ready-for-review form by default. Do not create draft PRs unless the user explicitly asks for a draft.
+- Once a PR is open, check for merge conflicts against its base branch and resolve them immediately instead of leaving the PR in a conflicted state.
 
 ## Maintenance
 - Update this file when the repo-wide workflow changes.
