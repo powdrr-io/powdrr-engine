@@ -1,8 +1,10 @@
+use arrow_array_55::RecordBatch as IcebergRecordBatch;
+use arrow_ipc_55::reader::FileReader as IcebergFileReader;
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::ipc::writer::FileWriter as DataFusionFileWriter;
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use datafusion::parquet::file::properties::WriterProperties;
 use futures_util::FutureExt;
 use gotham::mime;
 use http::StatusCode;
@@ -14,7 +16,9 @@ use iceberg::writer::file_writer::location_generator::{
 };
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use idgenerator::IdInstance;
+use parquet_55::file::properties::WriterProperties;
 use serde::{Deserialize, Serialize};
+use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -107,12 +111,63 @@ impl FileNameGenerator for PowdrrFileNameGenerator {
 }
 
 impl CompactionCommand {
+    fn to_iceberg_batches(data: &[RecordBatch]) -> Result<Vec<IcebergRecordBatch>, iceberg::Error> {
+        if data.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut bytes = Vec::new();
+        let schema = data[0].schema();
+        let mut writer = DataFusionFileWriter::try_new(&mut bytes, &schema).map_err(|e| {
+            iceberg::Error::new(
+                iceberg::ErrorKind::Unexpected,
+                "Failed to create Arrow IPC writer for Iceberg conversion",
+            )
+            .with_source(e)
+        })?;
+
+        for batch in data {
+            writer.write(batch).map_err(|e| {
+                iceberg::Error::new(
+                    iceberg::ErrorKind::Unexpected,
+                    "Failed to serialize DataFusion batches for Iceberg conversion",
+                )
+                .with_source(e)
+            })?;
+        }
+
+        writer.finish().map_err(|e| {
+            iceberg::Error::new(
+                iceberg::ErrorKind::Unexpected,
+                "Failed to finalize Arrow IPC writer for Iceberg conversion",
+            )
+            .with_source(e)
+        })?;
+
+        IcebergFileReader::try_new(Cursor::new(bytes), None)
+            .map_err(|e| {
+                iceberg::Error::new(
+                    iceberg::ErrorKind::Unexpected,
+                    "Failed to open Arrow IPC reader for Iceberg conversion",
+                )
+                .with_source(e)
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                iceberg::Error::new(
+                    iceberg::ErrorKind::Unexpected,
+                    "Failed to deserialize Iceberg-compatible record batches",
+                )
+                .with_source(e)
+            })
+    }
+
     async fn append_iceberg_table(
         namespace: &String,
         name: &String,
         iceberg_schema: iceberg::spec::Schema,
         compaction_id: &String,
-        data: &Vec<RecordBatch>,
+        data: &[IcebergRecordBatch],
         parquet_file_name: &String,
     ) -> Result<(), iceberg::Error> {
         let table = data_access::ensure_iceberg_table(namespace, name, &iceberg_schema).await?;
@@ -152,7 +207,9 @@ impl CompactionCommand {
             return Ok(());
         }
 
-        let converted_schema = match arrow_schema_to_schema(&data[0].schema()) {
+        let iceberg_batches = Self::to_iceberg_batches(data)?;
+
+        let converted_schema = match arrow_schema_to_schema(iceberg_batches[0].schema().as_ref()) {
             Ok(s) => s,
             Err(e) => return Err(e),
         };
@@ -162,7 +219,7 @@ impl CompactionCommand {
             table_name,
             converted_schema,
             compaction_id,
-            &data,
+            &iceberg_batches,
             parquet_file_name,
         )
         .await

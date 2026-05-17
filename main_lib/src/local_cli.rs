@@ -12,7 +12,9 @@ use crate::util::add_file_suffix;
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use futures_util::TryStreamExt;
 use idgenerator::IdInstance;
-use object_store::{ObjectStore, aws::AmazonS3Builder, path::Path as ObjectStorePath};
+use object_store::{
+    ObjectStore, ObjectStoreExt, aws::AmazonS3Builder, path::Path as ObjectStorePath,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
