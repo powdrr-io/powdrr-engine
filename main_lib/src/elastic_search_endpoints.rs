@@ -5,22 +5,25 @@ use gotham::helpers::http::response::create_empty_response;
 use gotham::{
     handler::HandlerFuture,
     helpers::http::response::create_response,
-    hyper::{body, Body},
+    hyper::{Body, body},
     mime,
     prelude::StaticResponseExtender,
     state::{FromState, State, StateData},
 };
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Map, Value, json};
 
 use crate::elastic_search_common::MIME_ES_JSON;
 use crate::util::{log_service_err, log_service_err_response};
 use crate::{
+    data_contract::{AliasInfo, CreateIndexBody, TableDescription},
     elastic_search_cluster_info,
     elastic_search_commands::LookupById,
-    elastic_search_common::{execute_command, CommandContext},
-    elastic_search_ingest, elastic_search_parser, elastic_search_pipeline, search_executor,
+    elastic_search_common::{CommandContext, execute_command},
+    elastic_search_ingest, elastic_search_parser, elastic_search_pipeline,
+    elastic_search_responses::QueryResultShards,
+    search_executor,
     state_provider::STATE_PROVIDER,
 };
 
@@ -131,6 +134,15 @@ pub fn es_root(state: State) -> Pin<Box<HandlerFuture>> {
     .boxed()
 }
 
+pub fn es_root_head(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_root_head");
+    async {
+        let res = create_empty_response(&state, StatusCode::OK);
+        Ok((state, res))
+    }
+    .boxed()
+}
+
 pub fn es_nodes(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_nodes");
     async {
@@ -213,10 +225,107 @@ pub fn es_cluster_settings(mut state: State) -> Pin<Box<HandlerFuture>> {
     .boxed()
 }
 
+fn empty_index_body() -> CreateIndexBody {
+    CreateIndexBody {
+        aliases: None,
+        mappings: None,
+        settings: None,
+    }
+}
+
+fn parse_index_body(table_desc: &TableDescription) -> CreateIndexBody {
+    table_desc
+        .tags
+        .get("_es_original")
+        .and_then(|content| CreateIndexBody::parse(content).ok())
+        .unwrap_or_else(empty_index_body)
+}
+
+fn alias_info_value(alias_info: &AliasInfo) -> Value {
+    if alias_info.is_hidden {
+        json!({ "is_hidden": true })
+    } else {
+        json!({})
+    }
+}
+
+fn aliases_value(body: &CreateIndexBody) -> Value {
+    let aliases = body.aliases.clone().unwrap_or_default();
+    let alias_map = aliases
+        .into_iter()
+        .map(|(name, alias_info)| (name, alias_info_value(&alias_info)))
+        .collect::<Map<String, Value>>();
+    Value::Object(alias_map)
+}
+
+fn normalize_settings_value(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (key, normalize_settings_value(value)))
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(normalize_settings_value)
+                .collect::<Vec<_>>(),
+        ),
+        Value::Number(number) => Value::String(number.to_string()),
+        Value::Bool(boolean) => Value::String(boolean.to_string()),
+        other => other,
+    }
+}
+
+fn mappings_value(body: &CreateIndexBody) -> Value {
+    body.mappings
+        .clone()
+        .map(|mappings| serde_json::to_value(mappings).unwrap())
+        .unwrap_or_else(|| json!({}))
+}
+
+fn settings_value(body: &CreateIndexBody) -> Value {
+    body.settings
+        .clone()
+        .map(|settings| normalize_settings_value(serde_json::to_value(settings).unwrap()))
+        .unwrap_or_else(|| json!({}))
+}
+
+fn index_info_value(body: &CreateIndexBody) -> Value {
+    json!({
+        "aliases": aliases_value(body),
+        "mappings": mappings_value(body),
+        "settings": settings_value(body),
+    })
+}
+
+fn count_body_as_search_body(body_content: &str) -> Result<String, String> {
+    let mut parsed_body = if body_content.trim().is_empty() {
+        Value::Object(Map::new())
+    } else {
+        serde_json::from_str::<Value>(body_content).map_err(|e| e.to_string())?
+    };
+
+    match parsed_body.as_object_mut() {
+        Some(object) => {
+            object.insert("size".to_string(), json!(0));
+            Ok(parsed_body.to_string())
+        }
+        None => Err("count body must be a JSON object".to_string()),
+    }
+}
+
+#[derive(Serialize)]
+struct CountResponse {
+    count: u64,
+    _shards: QueryResultShards,
+}
+
 pub fn es_get_index(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_get_index");
     async {
         let path_extractor = NamePathExtractor::borrow_from(&state);
+        let mut response = Map::new();
 
         for table_name in path_extractor.name.to_string().split(",") {
             let table_desc = match STATE_PROVIDER.describe_table(&table_name.to_string()).await {
@@ -226,22 +335,24 @@ pub fn es_get_index(state: State) -> Pin<Box<HandlerFuture>> {
                     return Ok((state, res));
                 }
             };
-            if table_desc.is_none() {
-                continue;
-            }
-            let response = table_desc.map_or_else(
-                || "{}".to_string(),
-                |x| {
-                    x.tags
-                        .get("_es_original")
-                        .map_or_else(|| "{}".to_string(), |x| x.clone())
-                },
-            );
 
-            let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, response);
+            if let Some(table_desc) = table_desc {
+                let body = parse_index_body(&table_desc);
+                response.insert(table_desc.name.clone(), index_info_value(&body));
+            }
+        }
+
+        if response.is_empty() {
+            let res = create_empty_response(&state, StatusCode::NOT_FOUND);
             return Ok((state, res));
         }
-        let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, "{}");
+
+        let res = create_response(
+            &state,
+            StatusCode::OK,
+            mime::APPLICATION_JSON,
+            Value::Object(response).to_string(),
+        );
         Ok((state, res))
     }
     .boxed()
@@ -263,20 +374,11 @@ pub fn es_head_index(state: State) -> Pin<Box<HandlerFuture>> {
             let res = if table_desc.is_none() {
                 create_empty_response(&state, StatusCode::NOT_FOUND)
             } else {
-                let response = table_desc.map_or_else(
-                    || "{}".to_string(),
-                    |x| {
-                        x.tags
-                            .get("_es_original")
-                            .map_or_else(|| "{}".to_string(), |x| x.clone())
-                    },
-                );
-
-                create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, response)
+                create_empty_response(&state, StatusCode::OK)
             };
             return Ok((state, res));
         }
-        let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, "{}");
+        let res = create_empty_response(&state, StatusCode::NOT_FOUND);
         Ok((state, res))
     }
     .boxed()
@@ -285,9 +387,38 @@ pub fn es_head_index(state: State) -> Pin<Box<HandlerFuture>> {
 pub fn es_get_index_aliases(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_get_index_aliases");
     async {
-        let _path_extractor = NamePathExtractor::borrow_from(&state);
-        // TODO: make this actually work
-        let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, "{}");
+        let path_extractor = NamePathExtractor::borrow_from(&state);
+        let mut response = Map::new();
+
+        for table_name in path_extractor.name.to_string().split(",") {
+            let table_desc = match STATE_PROVIDER.describe_table(&table_name.to_string()).await {
+                Ok(td) => td,
+                Err(e) => {
+                    let res = log_service_err(e).generate_response(&state);
+                    return Ok((state, res));
+                }
+            };
+
+            if let Some(table_desc) = table_desc {
+                let body = parse_index_body(&table_desc);
+                response.insert(
+                    table_desc.name.clone(),
+                    json!({ "aliases": aliases_value(&body) }),
+                );
+            }
+        }
+
+        if response.is_empty() {
+            let res = create_empty_response(&state, StatusCode::NOT_FOUND);
+            return Ok((state, res));
+        }
+
+        let res = create_response(
+            &state,
+            StatusCode::OK,
+            mime::APPLICATION_JSON,
+            Value::Object(response).to_string(),
+        );
         Ok((state, res))
     }
     .boxed()
@@ -296,9 +427,78 @@ pub fn es_get_index_aliases(state: State) -> Pin<Box<HandlerFuture>> {
 pub fn es_get_index_settings(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_get_index_aliases");
     async {
-        let _path_extractor = NamePathExtractor::borrow_from(&state);
-        // TODO: make this actually work
-        let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, "{}");
+        let path_extractor = NamePathExtractor::borrow_from(&state);
+        let mut response = Map::new();
+
+        for table_name in path_extractor.name.to_string().split(",") {
+            let table_desc = match STATE_PROVIDER.describe_table(&table_name.to_string()).await {
+                Ok(td) => td,
+                Err(e) => {
+                    let res = log_service_err(e).generate_response(&state);
+                    return Ok((state, res));
+                }
+            };
+
+            if let Some(table_desc) = table_desc {
+                let body = parse_index_body(&table_desc);
+                response.insert(
+                    table_desc.name.clone(),
+                    json!({ "settings": settings_value(&body) }),
+                );
+            }
+        }
+
+        if response.is_empty() {
+            let res = create_empty_response(&state, StatusCode::NOT_FOUND);
+            return Ok((state, res));
+        }
+
+        let res = create_response(
+            &state,
+            StatusCode::OK,
+            mime::APPLICATION_JSON,
+            Value::Object(response).to_string(),
+        );
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_get_index_mapping(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_get_index_mapping");
+    async {
+        let path_extractor = NamePathExtractor::borrow_from(&state);
+        let mut response = Map::new();
+
+        for table_name in path_extractor.name.to_string().split(",") {
+            let table_desc = match STATE_PROVIDER.describe_table(&table_name.to_string()).await {
+                Ok(td) => td,
+                Err(e) => {
+                    let res = log_service_err(e).generate_response(&state);
+                    return Ok((state, res));
+                }
+            };
+
+            if let Some(table_desc) = table_desc {
+                let body = parse_index_body(&table_desc);
+                response.insert(
+                    table_desc.name.clone(),
+                    json!({ "mappings": mappings_value(&body) }),
+                );
+            }
+        }
+
+        if response.is_empty() {
+            let res = create_empty_response(&state, StatusCode::NOT_FOUND);
+            return Ok((state, res));
+        }
+
+        let res = create_response(
+            &state,
+            StatusCode::OK,
+            mime::APPLICATION_JSON,
+            Value::Object(response).to_string(),
+        );
         Ok((state, res))
     }
     .boxed()
@@ -744,6 +944,151 @@ pub fn es_search(mut state: State) -> Pin<Box<HandlerFuture>> {
         let response =
             search_executor::execute_search_command(CommandContext {}, Arc::new(command)).await;
         let res = response.generate_response(&state);
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_count(mut state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_count");
+    async {
+        let query_string = QueryStringSearch::take_from(&mut state);
+        let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
+            Ok(vb) => vb,
+            Err(_) => panic!("Oh no"),
+        };
+        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+        let search_body = match count_body_as_search_body(&body_content) {
+            Ok(body) => body,
+            Err(_) => {
+                let res = create_response(
+                    &state,
+                    StatusCode::BAD_REQUEST,
+                    mime::TEXT_PLAIN,
+                    "Bad request".to_string(),
+                );
+                return Ok((state, res));
+            }
+        };
+
+        let command = match elastic_search_parser::parse(None, &search_body, &query_string) {
+            Ok(c) => c,
+            Err(_) => {
+                let res = create_response(
+                    &state,
+                    StatusCode::BAD_REQUEST,
+                    mime::TEXT_PLAIN,
+                    "Bad request".to_string(),
+                );
+                return Ok((state, res));
+            }
+        };
+
+        let count_result = match search_executor::execute_count_command(Arc::new(command)).await {
+            Ok(result) => result,
+            Err(response) => {
+                let res = response.generate_response(&state);
+                return Ok((state, res));
+            }
+        };
+
+        let count_response = CountResponse {
+            count: count_result.total_hits,
+            _shards: QueryResultShards {
+                total: count_result.num_shards,
+                successful: count_result.num_shards,
+                skipped: 0,
+                failed: 0,
+            },
+        };
+        let res = create_response(
+            &state,
+            StatusCode::OK,
+            mime::APPLICATION_JSON,
+            serde_json::to_string(&count_response).unwrap(),
+        );
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_count_table(mut state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_count_table");
+    async {
+        let path_extractor = NamePathExtractor::take_from(&mut state);
+        let query_string = QueryStringSearch::take_from(&mut state);
+        let table = path_extractor.name.to_string();
+        let table_desc = match STATE_PROVIDER.describe_table(&table).await {
+            Ok(td) => match td {
+                Some(td) => td,
+                None => {
+                    let res = create_response(
+                        &state,
+                        StatusCode::BAD_REQUEST,
+                        mime::TEXT_PLAIN,
+                        "Bad request".to_string(),
+                    );
+                    return Ok((state, res));
+                }
+            },
+            Err(e) => return Ok(log_service_err_response(e, state)),
+        };
+        let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
+            Ok(vb) => vb,
+            Err(_) => panic!("Oh no"),
+        };
+        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+        let search_body = match count_body_as_search_body(&body_content) {
+            Ok(body) => body,
+            Err(_) => {
+                let res = create_response(
+                    &state,
+                    StatusCode::BAD_REQUEST,
+                    mime::TEXT_PLAIN,
+                    "Bad request".to_string(),
+                );
+                return Ok((state, res));
+            }
+        };
+        let command = match elastic_search_parser::parse(
+            Some(table_desc.name),
+            &search_body,
+            &query_string,
+        ) {
+            Ok(c) => c,
+            Err(_) => {
+                let res = create_response(
+                    &state,
+                    StatusCode::BAD_REQUEST,
+                    mime::TEXT_PLAIN,
+                    "Bad request".to_string(),
+                );
+                return Ok((state, res));
+            }
+        };
+        let count_result = match search_executor::execute_count_command(Arc::new(command)).await {
+            Ok(result) => result,
+            Err(response) => {
+                let res = response.generate_response(&state);
+                return Ok((state, res));
+            }
+        };
+
+        let count_response = CountResponse {
+            count: count_result.total_hits,
+            _shards: QueryResultShards {
+                total: count_result.num_shards,
+                successful: count_result.num_shards,
+                skipped: 0,
+                failed: 0,
+            },
+        };
+        let res = create_response(
+            &state,
+            StatusCode::OK,
+            mime::APPLICATION_JSON,
+            serde_json::to_string(&count_response).unwrap(),
+        );
         Ok((state, res))
     }
     .boxed()
