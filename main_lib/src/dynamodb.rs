@@ -561,6 +561,8 @@ pub struct TableBody {
     pub tags: HashMap<String, String>,
     #[serde(default)]
     pub serving: Option<crate::data_contract::ServingTableConfig>,
+    #[serde(default)]
+    pub dynamodb: Option<crate::data_contract::DynamoDbTableConfig>,
 }
 
 impl TableBody {
@@ -569,6 +571,7 @@ impl TableBody {
         Self {
             tags: HashMap::new(),
             serving: None,
+            dynamodb: None,
         }
     }
 }
@@ -1020,7 +1023,17 @@ mod tests {
     async fn test_basic_create_and_search() {
         let connector = create_connector().await;
 
-        match connector.create_powdrr_table(&"dude".to_string(), &"fresh".to_string(), &TableBody { tags: HashMap::from([("foo".to_string(), "bar".to_string())]), serving: None }).await {
+        match connector.create_powdrr_table(
+            &"dude".to_string(),
+            &"fresh".to_string(),
+            &TableBody {
+                tags: HashMap::from([("foo".to_string(), "bar".to_string())]),
+                serving: None,
+                dynamodb: None,
+            },
+        )
+        .await
+        {
             Ok(_) => (),
             Err(e) => {
                 panic!("{:?}", e)

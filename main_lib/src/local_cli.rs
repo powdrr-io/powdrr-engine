@@ -625,6 +625,7 @@ fn build_checkpoint(
             files: file_set,
             column_names: vec![],
             column_stats: vec![],
+            file_stats: vec![],
         }),
         speedboat_metadata: None,
         deletes_metadata: None,

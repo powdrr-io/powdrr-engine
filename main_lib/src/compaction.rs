@@ -255,6 +255,7 @@ impl CompactionCommand {
             },
             column_names: compaction_response.lib_metadata.column_names.clone(),
             column_stats: compaction_response.lib_metadata.column_stats.clone(),
+            file_stats: compaction_response.lib_metadata.file_stats.clone(),
         };
         metadata.files.validate();
 

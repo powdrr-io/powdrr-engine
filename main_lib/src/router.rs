@@ -1,4 +1,5 @@
 use crate::compaction::{compact_logs, CompactionCommand};
+use crate::dynamodb_protocol;
 use crate::elastic_search_endpoints::NameIdPathExtractor;
 use crate::elastic_search_endpoints::NamePathExtractor;
 use crate::elastic_search_endpoints::QueryStringAliases;
@@ -17,21 +18,21 @@ use crate::test_api::test_v1_process_work;
 use crate::test_api::test_v1_set_testing_mode;
 use crate::test_api::test_v1_set_testing_processing_mode;
 use crate::{elastic_search_endpoints, elastic_search_lifetime_policy, lakehouse_serving};
-use futures::future;
 use futures::TryFutureExt;
+use futures::future;
 use futures_util::future::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
 use gotham::hyper::StatusCode;
-use gotham::hyper::{body, Body};
+use gotham::hyper::{Body, body};
 use gotham::middleware::Middleware;
 use gotham::mime;
 use gotham::pipeline::new_pipeline;
 use gotham::pipeline::single_pipeline;
 use gotham::prelude::NewMiddleware;
 use gotham::prelude::StaticResponseExtender;
-use gotham::router::builder::*;
 use gotham::router::Router;
+use gotham::router::builder::*;
 use gotham::state::FromState;
 use gotham::state::State;
 use gotham::state::StateData;
@@ -288,9 +289,12 @@ impl Middleware for RouterMiddleware {
         let f = result.and_then(move |(state, mut response)| {
             let request_headers = state.borrow::<HeaderMap>();
             let request_opaque_id = request_headers.get("X-Opaque-Id").clone();
+            let is_dynamodb_request = request_headers.contains_key("x-amz-target");
 
             let headers = response.headers_mut();
-            headers.insert("X-elastic-product", "Elasticsearch".parse().unwrap());
+            if !is_dynamodb_request {
+                headers.insert("X-elastic-product", "Elasticsearch".parse().unwrap());
+            }
             if request_opaque_id.is_some() {
                 headers.insert("X-Opaque-Id", request_opaque_id.unwrap().clone());
             }
@@ -348,6 +352,8 @@ pub fn router(include_test_apis: bool) -> Router {
             });
         }
 
+        route.post("/").to(dynamodb_protocol::dynamodb_api);
+
         // ES endpoints
         route.get("/").to(elastic_search_endpoints::es_root);
         route.get("/_nodes").to(elastic_search_endpoints::es_nodes);
@@ -399,9 +405,17 @@ pub fn router(include_test_apis: bool) -> Router {
             .with_path_extractor::<NamePathExtractor>()
             .to(lakehouse_serving::get_serving_config);
         route
+            .get("/:name/_dynamodb/config")
+            .with_path_extractor::<NamePathExtractor>()
+            .to(dynamodb_protocol::get_dynamodb_config);
+        route
             .put("/:name/_serve/config")
             .with_path_extractor::<NamePathExtractor>()
             .to(lakehouse_serving::put_serving_config);
+        route
+            .put("/:name/_dynamodb/config")
+            .with_path_extractor::<NamePathExtractor>()
+            .to(dynamodb_protocol::put_dynamodb_config);
         route
             .post("/:name/_serve")
             .with_path_extractor::<NamePathExtractor>()
@@ -544,17 +558,17 @@ pub(crate) mod tests {
     use crate::data_contract::{
         FileSetPayload, IcebergMetadata, SpeedboatMetadata, TableMetadataCheckpoint,
     };
-    use crate::lakehouse_serving::ServingConfigResponse;
-    use crate::serving_plan::ServingQueryClassification;
     use crate::elastic_search_responses::{QueryResultTotal, QueryResults};
+    use crate::lakehouse_serving::ServingConfigResponse;
     use crate::router::router;
     use crate::schema_massager::{
-        extract_powdrr_schema_str, PowdrrDataType, PowdrrField, PowdrrSchema,
+        PowdrrDataType, PowdrrField, PowdrrSchema, extract_powdrr_schema_str,
     };
+    use crate::serving_plan::ServingQueryClassification;
     use crate::state_provider::STATE_PROVIDER;
     use crate::test_api::{
-        CacheMode, CompactionMode, IndexingMode, PeerMode, PeerModeType, PrefetchMode,
-        StateMode, StorageMode, TestProcessingMode,
+        CacheMode, CompactionMode, IndexingMode, PeerMode, PeerModeType, PrefetchMode, StateMode,
+        StorageMode, TestProcessingMode,
     };
     use gotham::mime;
     use gotham::plain::test::AsyncTestServer;
@@ -621,6 +635,7 @@ pub(crate) mod tests {
                 files: FileSetPayload::single(file_path, 1, schema.clone()),
                 column_names: vec![],
                 column_stats: vec![],
+                file_stats: vec![],
             }),
             speedboat_metadata: None,
             deletes_metadata: None,
@@ -696,7 +711,10 @@ pub(crate) mod tests {
             .unwrap(),
             ServingQueryClassification::FastPath
         );
-        assert_eq!(response_obj["matched_pattern"].as_str().unwrap(), "title_top_n");
+        assert_eq!(
+            response_obj["matched_pattern"].as_str().unwrap(),
+            "title_top_n"
+        );
         assert_eq!(response_obj["rows"].as_array().unwrap().len(), 2);
     }
 
@@ -908,6 +926,7 @@ pub(crate) mod tests {
                 files: FileSetPayload::single(file_path, 1, schema.clone()),
                 column_names: vec![],
                 column_stats: vec![],
+                file_stats: vec![],
             }),
             speedboat_metadata: None,
             deletes_metadata: None,

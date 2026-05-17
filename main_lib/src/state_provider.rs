@@ -84,6 +84,9 @@ enum StateProviderActorMessage {
         respond_to: oneshot::Sender<Result<Option<TableDescription>, ServiceApiError>>,
         name: String,
     },
+    GetAllIcebergTables {
+        respond_to: oneshot::Sender<Result<Vec<String>, ServiceApiError>>,
+    },
     AddAlias {
         respond_to: oneshot::Sender<Result<bool, ServiceApiError>>,
         table_name: String,
@@ -306,6 +309,9 @@ impl StateProviderActor {
             },
             StateProviderActorMessage::DescribeTable { respond_to, name } => {
                 handle_message_impl!(self, respond_to, describe_table(&name));
+            },
+            StateProviderActorMessage::GetAllIcebergTables { respond_to } => {
+                handle_message_impl!(self, respond_to, get_all_iceberg_tables());
             },
             StateProviderActorMessage::AddAlias { respond_to, table_name, alias } => {
                 handle_message_impl!(self, respond_to, add_alias(&table_name, &alias));
@@ -602,6 +608,10 @@ impl StateProviderHandle {
 
     pub async fn describe_table(&self, table_name: &String) -> Result<Option<TableDescription>, ServiceApiError> {
         send_message!(self, DescribeTable, name = table_name.clone())
+    }
+
+    pub async fn get_all_iceberg_tables(&self) -> Result<Vec<String>, ServiceApiError> {
+        send_message!(self, GetAllIcebergTables)
     } 
 
     pub async fn add_alias(&self, table_name: &String, alias: &String) -> Result<bool, ServiceApiError> {

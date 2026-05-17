@@ -3,6 +3,7 @@ use crate::schema_massager::PowdrrSchema;
 use crate::test_api::TestProcessingMode;
 use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -53,6 +54,27 @@ pub struct FileDescriptor {
     pub size: u64,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct IcebergColumnStats {
+    pub field_id: i32,
+    pub field_name: String,
+    #[serde(default)]
+    pub null_count: Option<u64>,
+    #[serde(default)]
+    pub lower_bound: Option<Value>,
+    #[serde(default)]
+    pub upper_bound: Option<Value>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct IcebergFileStats {
+    pub file_path: String,
+    #[serde(default)]
+    pub record_count: Option<u64>,
+    #[serde(default)]
+    pub columns: Vec<IcebergColumnStats>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IcebergMetadata {
     pub table_schema: PowdrrSchema,
@@ -62,6 +84,8 @@ pub struct IcebergMetadata {
     // per file, per column lower and upper bounds
     // TODO: this needs to be generalized to support bloom filters
     pub column_stats: Vec<(String, String)>,
+    #[serde(default)]
+    pub file_stats: Vec<IcebergFileStats>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -293,6 +317,7 @@ impl TableMetadataCheckpoint {
         self.extension_metadata
             .retain(|key, _| !compaction.removed_speedboat_files.contains(key));
         let file_payload = iceberg_metadata.files.select(&compaction.parquet_file_name);
+        let file_stats = iceberg_metadata.select_file_stats(&compaction.parquet_file_name);
         if self.iceberg_metadata.is_none() {
             self.iceberg_metadata = Some(IcebergMetadata {
                 table_schema: iceberg_metadata.table_schema.clone(),
@@ -300,13 +325,20 @@ impl TableMetadataCheckpoint {
                 files: file_payload,
                 column_names: vec![],
                 column_stats: vec![],
+                file_stats,
             });
         } else {
-            self.iceberg_metadata
-                .as_mut()
-                .unwrap()
-                .files
-                .merge(&file_payload);
+            let metadata = self.iceberg_metadata.as_mut().unwrap();
+            metadata.files.merge_inplace(&file_payload);
+            for stat in file_stats {
+                if !metadata
+                    .file_stats
+                    .iter()
+                    .any(|existing| existing.file_path == stat.file_path)
+                {
+                    metadata.file_stats.push(stat);
+                }
+            }
         }
     }
 
@@ -441,6 +473,16 @@ impl TableMetadataCheckpoint {
     }
 }
 
+impl IcebergMetadata {
+    pub(crate) fn select_file_stats(&self, file_name: &String) -> Vec<IcebergFileStats> {
+        self.file_stats
+            .iter()
+            .filter(|stats| stats.file_path.contains(file_name))
+            .cloned()
+            .collect()
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct ProposedCompaction {
     pub table_name: String,
@@ -456,6 +498,8 @@ pub struct CreateTable {
     pub tags: HashMap<String, String>,
     #[serde(default)]
     pub serving: Option<ServingTableConfig>,
+    #[serde(default)]
+    pub dynamodb: Option<DynamoDbTableConfig>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -464,6 +508,8 @@ pub struct TableDescription {
     pub tags: HashMap<String, String>,
     #[serde(default)]
     pub serving: Option<ServingTableConfig>,
+    #[serde(default)]
+    pub dynamodb: Option<DynamoDbTableConfig>,
 }
 
 impl TableDescription {
@@ -472,6 +518,7 @@ impl TableDescription {
             name: create_table.name.clone(),
             tags: create_table.tags.clone(),
             serving: create_table.serving.clone(),
+            dynamodb: create_table.dynamodb.clone(),
         }
     }
 }
@@ -499,6 +546,12 @@ pub struct ServingPattern {
     pub projection: Option<Vec<String>>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct DynamoDbTableConfig {
+    pub partition_key: String,
+    #[serde(default)]
+    pub sort_key: Option<String>,
+}
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AddAlias {
     pub table_name: String,

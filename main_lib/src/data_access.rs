@@ -1,3 +1,4 @@
+use crate::data_contract::{IcebergColumnStats, IcebergFileStats};
 use crate::elastic_search_ingest::JSON_MODE;
 use crate::util::log_err;
 use datafusion::arrow::datatypes::Schema;
@@ -14,7 +15,7 @@ use datafusion::{
 use futures_util::TryStreamExt;
 use iceberg::Catalog;
 use iceberg::io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY};
-use iceberg::spec::DataFile;
+use iceberg::spec::{DataContentType, DataFile, Literal, ManifestContentType, Type};
 use iceberg::table::Table;
 use iceberg::transaction::ApplyTransactionAction;
 use iceberg::{NamespaceIdent, TableCreation, TableIdent};
@@ -33,6 +34,7 @@ use object_store::{
     aws::{AmazonS3, AmazonS3Builder},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::string::ToString;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -241,6 +243,7 @@ pub struct IcebergLibMetadata {
     // per file, per column lower and upper bounds
     // TODO: this needs to be generalized to support bloom filters
     pub column_stats: Vec<(String, String)>,
+    pub file_stats: Vec<IcebergFileStats>,
 }
 
 #[allow(dead_code)]
@@ -802,13 +805,13 @@ impl CacheTrackerActor {
         let schema = records.get(0).unwrap().schema();
         let concated = match arrow::compute::concat_batches(&records[0].schema(), records) {
             Ok(batch) => batch,
-            Err(e) => {
-                return {
-                    tracing::error!("Failed to concat_batches: {}", e);
-                    log_err(DataFusionError::ArrowError(Box::new(e), None))
-                };
-            }
-        };
+                Err(e) => {
+                    return {
+                        tracing::error!("Failed to concat_batches: {}", e);
+                        log_err(DataFusionError::ArrowError(Box::new(e), None))
+                    };
+                }
+            };
         let table = match datafusion::datasource::MemTable::try_new(schema, vec![vec![concated]]) {
             Ok(t) => Arc::new(t),
             Err(e) => {
@@ -1587,6 +1590,7 @@ async fn load_iceberg_table_metadata_worker(
             ));
         }
     };
+    let file_stats = load_iceberg_file_stats(&table, current_snapshot).await?;
 
     let table_scan = match table.scan().select_all().build() {
         Ok(s) => s,
@@ -1638,9 +1642,104 @@ async fn load_iceberg_table_metadata_worker(
         compactions: compactions,
         column_names: vec![],
         column_stats: vec![],
+        file_stats,
     })
 }
 
+async fn load_iceberg_file_stats(
+    table: &Table,
+    current_snapshot: &iceberg::spec::Snapshot,
+) -> Result<Vec<IcebergFileStats>, iceberg::Error> {
+    let manifest_list = current_snapshot
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await?;
+    let mut file_stats = HashMap::new();
+
+    for manifest_file in manifest_list.entries().iter() {
+        if manifest_file.content != ManifestContentType::Data {
+            continue;
+        }
+
+        let manifest = manifest_file.load_manifest(table.file_io()).await?;
+        for manifest_entry in manifest.entries() {
+            if !manifest_entry.is_alive() || manifest_entry.content_type() != DataContentType::Data
+            {
+                continue;
+            }
+
+            let data_file = manifest_entry.data_file();
+            file_stats.insert(
+                data_file.file_path().to_string(),
+                IcebergFileStats {
+                    file_path: data_file.file_path().to_string(),
+                    record_count: Some(data_file.record_count()),
+                    columns: collect_iceberg_column_stats(
+                        data_file,
+                        table.metadata().current_schema(),
+                    ),
+                },
+            );
+        }
+    }
+
+    let mut file_stats = file_stats.into_values().collect::<Vec<_>>();
+    file_stats.sort_by(|left, right| left.file_path.cmp(&right.file_path));
+    Ok(file_stats)
+}
+
+fn collect_iceberg_column_stats(
+    data_file: &DataFile,
+    schema: &iceberg::spec::Schema,
+) -> Vec<IcebergColumnStats> {
+    let mut field_ids = HashSet::new();
+    field_ids.extend(data_file.null_value_counts().keys().copied());
+    field_ids.extend(data_file.lower_bounds().keys().copied());
+    field_ids.extend(data_file.upper_bounds().keys().copied());
+
+    let mut column_stats = field_ids
+        .into_iter()
+        .filter_map(|field_id| {
+            let field = schema.field_by_id(field_id)?;
+            let field_name = schema.name_by_field_id(field_id)?.to_string();
+            let field_type = field.field_type.as_ref();
+            let null_count = data_file.null_value_counts().get(&field_id).copied();
+            let lower_bound = data_file
+                .lower_bounds()
+                .get(&field_id)
+                .and_then(|datum| datum_to_json_value(datum, field_type));
+            let upper_bound = data_file
+                .upper_bounds()
+                .get(&field_id)
+                .and_then(|datum| datum_to_json_value(datum, field_type));
+
+            if null_count.is_none() && lower_bound.is_none() && upper_bound.is_none() {
+                return None;
+            }
+
+            Some(IcebergColumnStats {
+                field_id,
+                field_name,
+                null_count,
+                lower_bound,
+                upper_bound,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    column_stats.sort_by(|left, right| left.field_name.cmp(&right.field_name));
+    column_stats
+}
+
+fn datum_to_json_value(
+    datum: &iceberg::spec::Datum,
+    field_type: &Type,
+) -> Option<serde_json::Value> {
+    match Literal::from(datum.clone()).try_into_json(field_type) {
+        Ok(serde_json::Value::Null) => None,
+        Ok(value) => Some(value),
+        Err(_) => None,
+    }
+}
 async fn commit_iceberg_transaction_worker(
     catalog: Arc<RestCatalog>,
     namespace: &String,
