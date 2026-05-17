@@ -16,7 +16,7 @@ use crate::test_api::test_v1_create_index;
 use crate::test_api::test_v1_process_work;
 use crate::test_api::test_v1_set_testing_mode;
 use crate::test_api::test_v1_set_testing_processing_mode;
-use crate::{elastic_search_endpoints, elastic_search_lifetime_policy};
+use crate::{elastic_search_endpoints, elastic_search_lifetime_policy, lakehouse_serving};
 use futures::future;
 use futures::TryFutureExt;
 use futures_util::future::FutureExt;
@@ -395,6 +395,18 @@ pub fn router(include_test_apis: bool) -> Router {
             .with_path_extractor::<NamePathExtractor>()
             .to(elastic_search_endpoints::es_get_index_settings);
         route
+            .get("/:name/_serve/config")
+            .with_path_extractor::<NamePathExtractor>()
+            .to(lakehouse_serving::get_serving_config);
+        route
+            .put("/:name/_serve/config")
+            .with_path_extractor::<NamePathExtractor>()
+            .to(lakehouse_serving::put_serving_config);
+        route
+            .post("/:name/_serve")
+            .with_path_extractor::<NamePathExtractor>()
+            .to(lakehouse_serving::serve_query);
+        route
             .get("/_index_template/:name")
             .with_path_extractor::<NamePathExtractor>()
             .to(elastic_search_endpoints::es_get_index_template);
@@ -532,13 +544,18 @@ pub(crate) mod tests {
     use crate::data_contract::{
         FileSetPayload, IcebergMetadata, SpeedboatMetadata, TableMetadataCheckpoint,
     };
+    use crate::lakehouse_serving::ServingConfigResponse;
+    use crate::serving_plan::ServingQueryClassification;
     use crate::elastic_search_responses::{QueryResultTotal, QueryResults};
     use crate::router::router;
     use crate::schema_massager::{
         extract_powdrr_schema_str, PowdrrDataType, PowdrrField, PowdrrSchema,
     };
     use crate::state_provider::STATE_PROVIDER;
-    use crate::test_api::PeerModeType;
+    use crate::test_api::{
+        CacheMode, CompactionMode, IndexingMode, PeerMode, PeerModeType, PrefetchMode,
+        StateMode, StorageMode, TestProcessingMode,
+    };
     use gotham::mime;
     use gotham::plain::test::AsyncTestServer;
     use gotham::test::TestServer;
@@ -546,6 +563,142 @@ pub(crate) mod tests {
 
     pub(crate) static TEST_SERVER: LazyLock<TestServer> =
         LazyLock::new(|| TestServer::with_timeout(router(true), 1000).unwrap());
+
+    #[test]
+    fn test_serving_config_and_fast_path_query() {
+        let test_server = &*TEST_SERVER;
+
+        test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_testing_and_processing_mode",
+                serde_json::to_string(&TestProcessingMode {
+                    state_mode: StateMode::Testing,
+                    storage_mode: StorageMode::default(),
+                    cache_mode: CacheMode::Redis(None),
+                    peer_mode: PeerMode::SelfOnly,
+                    indexing_mode: IndexingMode::Disabled,
+                    compaction_mode: CompactionMode::Disabled,
+                    prefetch_mode: PrefetchMode::Disabled,
+                })
+                .unwrap(),
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        let schema = PowdrrSchema::from(&vec![
+            PowdrrField {
+                name: "_id_seq_no".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "snippet".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "searchTerms".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "title".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+        ]);
+
+        let file_path = format!(
+            "file://{}/tests/data/flights.parquet",
+            env::current_dir().unwrap().to_str().unwrap()
+        );
+
+        let checkpoint = TableMetadataCheckpoint {
+            table_name: "serve_flights".to_string(),
+            original_checkpoint_id: None,
+            checkpoint_id: "serve_checkpoint_0".to_string(),
+            iceberg_metadata: Some(IcebergMetadata {
+                table_schema: schema.clone(),
+                snapshot_id: Some("snapshot_1".to_string()),
+                files: FileSetPayload::single(file_path, 1, schema.clone()),
+                column_names: vec![],
+                column_stats: vec![],
+            }),
+            speedboat_metadata: None,
+            deletes_metadata: None,
+            extension_metadata: HashMap::new(),
+            schema: schema.clone(),
+        };
+
+        test_server
+            .client()
+            .post(
+                "http://localhost/_test/v1/_add_checkpoint",
+                serde_json::to_string(&checkpoint).unwrap(),
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        let config_response = test_server
+            .client()
+            .put(
+                "http://localhost/serve_flights/_serve/config",
+                r#"{
+                  "patterns": [
+                    {
+                      "name": "title_top_n",
+                      "order_field": "title",
+                      "descending": false,
+                      "max_limit": 10,
+                      "projection": ["title"]
+                    }
+                  ]
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(config_response.status(), 200);
+
+        let get_config_response = test_server
+            .client()
+            .get("http://localhost/serve_flights/_serve/config")
+            .perform()
+            .unwrap();
+
+        assert_eq!(get_config_response.status(), 200);
+        let config_obj: ServingConfigResponse =
+            serde_json::from_str(&get_config_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(config_obj.serving.patterns.len(), 1);
+        assert_eq!(config_obj.serving.patterns[0].name, "title_top_n");
+
+        let query_response = test_server
+            .client()
+            .post(
+                "http://localhost/serve_flights/_serve",
+                r#"{
+                  "select": ["title"],
+                  "order_by": [{ "field": "title", "descending": false }],
+                  "limit": 2
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(query_response.status(), 200);
+        let response_obj: serde_json::Value =
+            serde_json::from_str(&query_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ServingQueryClassification>(
+                response_obj["classification"].clone()
+            )
+            .unwrap(),
+            ServingQueryClassification::FastPath
+        );
+        assert_eq!(response_obj["matched_pattern"].as_str().unwrap(), "title_top_n");
+        assert_eq!(response_obj["rows"].as_array().unwrap().len(), 2);
+    }
 
     #[test]
     fn test_es_bulk_create() {

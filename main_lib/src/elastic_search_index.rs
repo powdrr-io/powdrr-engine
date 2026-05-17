@@ -99,7 +99,7 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
     };
     created_tables.push(format!("{new_local_name}_split_unnest"));
 
-    match data_access::create_table(&format!("{new_local_name}_term_frequency"), &format!("SELECT doc_id, field_name, doc_id || '_' || field_name as doc_id_field_name, field_term, count(1) as term_cnt from {new_local_name}_split_unnest group by doc_id, field_name, field_term")).await {
+    match data_access::create_table(&format!("{new_local_name}_term_frequency"), &format!("SELECT doc_id, field_name, cast(doc_id as string) || '_' || field_name as doc_id_field_name, field_term, count(1) as term_cnt from {new_local_name}_split_unnest group by doc_id, field_name, field_term")).await {
         Err(e)  => {
             drop_all(&created_tables).await;
             return Err(IndexError::from(e))
@@ -108,7 +108,7 @@ async fn create_index_worker(table_name: &String, doc_id_field_name: &String, ta
     }; 
     created_tables.push(format!("{new_local_name}_term_frequency"));
 
-    match data_access::create_table(&format!("{new_local_name}_field_size"), &format!("SELECT doc_id, field_name, doc_id || '_' || field_name as doc_id_field_name, array_length(field_terms) as word_cnt from {new_local_name}_split")).await {
+    match data_access::create_table(&format!("{new_local_name}_field_size"), &format!("SELECT doc_id, field_name, cast(doc_id as string) || '_' || field_name as doc_id_field_name, array_length(field_terms) as word_cnt from {new_local_name}_split")).await {
         Err(e) => {
             drop_all(&created_tables).await;
             return Err(IndexError::from(e))
@@ -265,11 +265,15 @@ pub(crate) async fn create_index(work_item: &ExtensionWorkItem) -> Result<(), In
     Ok(())
 }
 
-pub(crate) async fn create_index_inner(iceberg_files: &Vec<FileDescriptor>, speedboat_files: &Vec<FileDescriptor>) -> Result<ExtensionFileMetadata, IndexError> {
+pub(crate) async fn create_index_inner_with_doc_id(
+    iceberg_files: &Vec<FileDescriptor>,
+    speedboat_files: &Vec<FileDescriptor>,
+    doc_id_field_name: &String,
+) -> Result<ExtensionFileMetadata, IndexError> {
     let mut files = ExtensionFileMetadata::new();
 
     for file_desc in iceberg_files {
-        match create_index_parquet(&file_desc.file_path, &"_id_seq_no".to_string()).await {
+        match create_index_parquet(&file_desc.file_path, doc_id_field_name).await {
             Ok(output) => match output {
                 Some(extension_file_path) => {
                     files.insert(
@@ -288,7 +292,7 @@ pub(crate) async fn create_index_inner(iceberg_files: &Vec<FileDescriptor>, spee
     }
 
     for file_desc in speedboat_files {
-        match create_index_jsonl(&file_desc.file_path, &"_id_seq_no".to_string(), &file_desc.schema).await {
+        match create_index_jsonl(&file_desc.file_path, doc_id_field_name, &file_desc.schema).await {
             Ok(output) => match output {
                 Some(extension_file_path) => {
                     files.insert(
@@ -302,6 +306,18 @@ pub(crate) async fn create_index_inner(iceberg_files: &Vec<FileDescriptor>, spee
         }
     }
     Ok(files)
+}
+
+pub(crate) async fn create_index_inner(
+    iceberg_files: &Vec<FileDescriptor>,
+    speedboat_files: &Vec<FileDescriptor>,
+) -> Result<ExtensionFileMetadata, IndexError> {
+    create_index_inner_with_doc_id(
+        iceberg_files,
+        speedboat_files,
+        &"_id_seq_no".to_string(),
+    )
+    .await
 }
 
 #[cfg(test)]

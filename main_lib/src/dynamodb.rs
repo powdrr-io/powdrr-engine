@@ -559,6 +559,8 @@ macro_rules! powdrr_tracker {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TableBody {
     pub tags: HashMap<String, String>,
+    #[serde(default)]
+    pub serving: Option<crate::data_contract::ServingTableConfig>,
 }
 
 impl TableBody {
@@ -566,6 +568,7 @@ impl TableBody {
     pub(crate) fn new() -> Self {
         Self {
             tags: HashMap::new(),
+            serving: None,
         }
     }
 }
@@ -1017,7 +1020,7 @@ mod tests {
     async fn test_basic_create_and_search() {
         let connector = create_connector().await;
 
-        match connector.create_powdrr_table(&"dude".to_string(), &"fresh".to_string(), &TableBody { tags: HashMap::from([("foo".to_string(), "bar".to_string())]) }).await {
+        match connector.create_powdrr_table(&"dude".to_string(), &"fresh".to_string(), &TableBody { tags: HashMap::from([("foo".to_string(), "bar".to_string())]), serving: None }).await {
             Ok(_) => (),
             Err(e) => {
                 panic!("{:?}", e)

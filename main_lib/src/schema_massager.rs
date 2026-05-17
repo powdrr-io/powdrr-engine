@@ -838,6 +838,7 @@ pub struct SqlBuilder {
     pub(crate) calculate_score: bool,
     pub(crate) order_by: Vec<SqlExpression>,
     pub(crate) group_by: Vec<SqlExpression>,
+    doc_id_field_name: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -854,17 +855,39 @@ pub struct SqlQuery {
 
 impl SqlBuilder {
     pub(crate) fn for_query(all_fields: bool) -> Self {
+        Self::for_query_with_options(all_fields, "_id_seq_no", true)
+    }
+
+    pub(crate) fn for_query_with_options(
+        all_fields: bool,
+        doc_id_field_name: &str,
+        include_deletes_join: bool,
+    ) -> Self {
+        let normalized_doc_id_field_name = doc_id_field_name.replace(".", "_");
         SqlBuilder {
             all_fields,
             fields: vec![],
-            joins: vec!["LEFT JOIN {deletes_table} dt ON dt._id_seq_no = t._id_seq_no".to_string()],
-            filter_stack: RefCell::new(vec![vec![SqlExpression::IsNull(Box::new(
-                SqlExpression::FieldRef("dt".to_string(), "_id_seq_no".to_string()),
-            ))]]),
+            joins: if include_deletes_join {
+                vec![format!(
+                    "LEFT JOIN {{deletes_table}} dt ON dt._id_seq_no = t.\"{}\"",
+                    normalized_doc_id_field_name
+                )]
+            } else {
+                vec![]
+            },
+            filter_stack: RefCell::new(vec![if include_deletes_join {
+                vec![SqlExpression::IsNull(Box::new(SqlExpression::FieldRef(
+                    "dt".to_string(),
+                    "_id_seq_no".to_string(),
+                )))]
+            } else {
+                vec![]
+            }]),
             limit: None,
             calculate_score: false,
             order_by: vec![],
             group_by: vec![],
+            doc_id_field_name: normalized_doc_id_field_name,
         }
     }
 
@@ -878,6 +901,7 @@ impl SqlBuilder {
             calculate_score: false,
             order_by: vec![],
             group_by: vec![],
+            doc_id_field_name: "_id_seq_no".to_string(),
         }
     }
 
@@ -896,6 +920,7 @@ impl SqlBuilder {
             calculate_score: false,
             order_by: vec![],
             group_by: vec![],
+            doc_id_field_name: "_id_seq_no".to_string(),
         }
     }
 
@@ -950,9 +975,10 @@ impl SqlBuilder {
     fn _joins(&self) -> Vec<String> {
         let mut joins_copy = self.joins.clone();
         if self.calculate_score {
-            joins_copy.push(
-                "INNER JOIN {target_table}_search_index si on si.doc_id = t._id_seq_no".to_string(),
-            )
+            joins_copy.push(format!(
+                "INNER JOIN {{target_table}}_search_index si on si.doc_id = t.\"{}\"",
+                self.doc_id_field_name
+            ))
         }
         joins_copy
     }

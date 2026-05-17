@@ -28,6 +28,46 @@ cargo run --package powdrr-io-engine --release 9201
 cargo run --package powdrr-benchmark
 ```
 
+## LOCAL ELASTIC CLI
+
+`powdrr-cli` includes an `elastic` mode that reuses the existing Powdrr
+search stack without starting the HTTP service.
+
+The CLI works by:
+
+- mirroring parquet files into a local cache directory
+- building the existing `_search_index.parquet` sidecars against the cached files
+- executing queries locally through the same parser and executor used by the service
+
+Current constraints:
+
+- the parquet data must have a stable document id column
+- pass that column with `--doc-id-field` unless it is already `_id_seq_no`
+- for S3 sources, the build step mirrors the source data into the local cache and
+  queries run against that cache
+
+Build a cache and BM25 sidecars:
+
+```
+cargo run -p powdrr-cli -- elastic build \
+  --source /path/to/parquet-dir \
+  --cache-dir /tmp/powdrr-search \
+  --table logs \
+  --doc-id-field doc_id \
+  --replace
+```
+
+Query that cache with the Elasticsearch JSON body Powdrr already supports:
+
+```
+cargo run -p powdrr-cli -- elastic query \
+  --cache-dir /tmp/powdrr-search \
+  --body-file clients/query.json
+```
+
+For S3 sources, point `--source` at an `s3://bucket/prefix` and provide the
+usual AWS environment variables before running the build command.
+
 Run test script
 
 Monolith
