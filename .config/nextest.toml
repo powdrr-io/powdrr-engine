@@ -1,7 +1,10 @@
 nextest-version = "0.9.128"
 
 [profile.default]
-default-filter = "all() - binary_id(=powdrr_lib::es_compatibility_matrix)"
+# Keep the fast lane self-contained: exclude tests that require external
+# services like the Iceberg REST catalog, MinIO, or LocalStack. The `ci`
+# profile inherits this filter unless it overrides it.
+default-filter = "all() - binary_id(=powdrr_lib::es_compatibility_matrix) - package(=powdrr-io-service) - test(/^compaction::tests::/) - test(/^dynamodb::tests::/) - test(=elastic_search_storage_schema::tests::test_builder_basic) - test(/^router::tests::test_es_(create_single|create_then_delete_single|bulk_create|date_comparison|ingest_search_ingest_compact_then_search_table|ingest_then_search_space|ingest_then_search_table(_agg|_for_nonexistent|_sub_agg)?|ingest_then_update_then_search_table|search_table_(json(_okta_system_log)?|parquet)|update_by_query_kibana)$/)"
 slow-timeout = { period = "60s", terminate-after = 4 }
 
 [profile.ci]

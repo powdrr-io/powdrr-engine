@@ -108,11 +108,14 @@ impl QueryResultHit {
         let id = value_map.get("_id").unwrap().as_str().unwrap().to_string();
         let version = value_map.get("_version").unwrap().as_u64().unwrap();
         let seq_no = value_map.get("_seq_no").unwrap().as_u64().unwrap();
-        let source = value_map.get("_source").unwrap().as_str().unwrap();
-        // TODO: we are parsing the string into a value just to put it an object
-        // that will get serialized out again. That is lame. If we can get the serializer
-        // to look at a string but put it in like it is a Value, that would be better.
-        let source_value = serde_json::from_str(source).unwrap();
+        let source_value = match value_map.get("_source").unwrap() {
+            Value::String(source) => {
+                // Elasticsearch wire responses store _source as an encoded JSON string here,
+                // while local parquet-backed paths already materialize it as a JSON object.
+                serde_json::from_str(source).unwrap()
+            }
+            source => source.clone(),
+        };
         QueryResultHit {
             _index: index.clone(),
             _id: Some(id),
@@ -464,6 +467,20 @@ mod tests {
 
         assert!(hit._score.is_some());
         assert!(hit._score.unwrap() > 0.0);
+    }
+
+    #[test]
+    fn test_query_result_hit_accepts_object_source() {
+        let value = json!({
+            "_id": "doc-2",
+            "_version": 1,
+            "_seq_no": 10,
+            "_source": {"message": "hello"}
+        });
+
+        let hit = QueryResultHit::from_record(&Some("logs".to_string()), &value, None);
+
+        assert_eq!(hit._source["message"], "hello");
     }
 
     #[test]
