@@ -1,14 +1,13 @@
 use crate::elastic_search_commands::{SqlCommand, UpdateByQueryCommand};
 use crate::elastic_search_common::{
-    execute_command, Command, CommandContext, ElasticSearchResponse, ParseError,
-    ResultGeneratorFuture,
+    Command, CommandContext, ElasticSearchResponse, ParseError, ResultGeneratorFuture,
+    execute_command,
 };
 use crate::elastic_search_datetime_parser;
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::elastic_search_responses::{
-    compare_query_result_hits_desc, AggregationResult, AverageAggregationResult,
-    FilterAggregationResult, QueryFailure, QueryResults, TermAggregationBucket,
-    TermAggregationResult,
+    AggregationResult, AverageAggregationResult, FilterAggregationResult, QueryFailure,
+    QueryResults, TermAggregationBucket, TermAggregationResult, compare_query_result_hits_desc,
 };
 use crate::peers::{
     CheckpointDescriptor, PrivateInvocation, PrivateSearchAggregationFilterSpec,
@@ -98,6 +97,18 @@ enum SearchResultOrder {
     ExplicitSort,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SearchPerformancePath {
+    TypedNodeMerge,
+    LegacySqlFanout,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SearchPerformanceAssessment {
+    pub path: SearchPerformancePath,
+    pub reason: String,
+}
+
 pub(crate) struct SearchCommand {
     #[allow(dead_code)]
     pub logical_plan: search_plan::SearchPlan,
@@ -128,6 +139,19 @@ impl SearchCommand {
             self.execution_strategy,
             SearchExecutionStrategy::LegacySqlFanout
         )
+    }
+
+    pub(crate) fn performance_assessment(&self) -> SearchPerformanceAssessment {
+        match self.execution_strategy {
+            SearchExecutionStrategy::TypedNodeMerge(result_order) => SearchPerformanceAssessment {
+                path: SearchPerformancePath::TypedNodeMerge,
+                reason: typed_node_merge_reason(result_order),
+            },
+            SearchExecutionStrategy::LegacySqlFanout => SearchPerformanceAssessment {
+                path: SearchPerformancePath::LegacySqlFanout,
+                reason: legacy_sql_fanout_reason(self),
+            },
+        }
     }
 
     async fn private_search_invocation(&self) -> Option<PrivateSearchInvocation> {
@@ -168,6 +192,140 @@ impl SearchCommand {
                     e
                 );
                 vec![]
+            }
+        }
+    }
+}
+
+fn typed_node_merge_reason(result_order: SearchResultOrder) -> String {
+    match result_order {
+        SearchResultOrder::ScoreDesc => {
+            "Query stays on the typed node-merge path with score-based merging.".to_string()
+        }
+        SearchResultOrder::PeerConcat => {
+            "Query stays on the typed node-merge path without legacy SQL fanout.".to_string()
+        }
+        SearchResultOrder::ExplicitSort => {
+            "Query stays on the typed node-merge path with typed sort merging.".to_string()
+        }
+    }
+}
+
+fn legacy_sql_fanout_reason(command: &SearchCommand) -> String {
+    if let Some(reason) = command
+        .logical_plan
+        .aggregations
+        .iter()
+        .find_map(aggregation_legacy_path_reason)
+    {
+        return reason;
+    }
+
+    let backend = match &command.backend {
+        SearchBackend::LegacySql(backend) => backend,
+    };
+    if let Some(reason) = command
+        .logical_plan
+        .sort
+        .iter()
+        .find_map(|plan| sort_legacy_path_reason(plan, backend))
+    {
+        return reason;
+    }
+
+    if backend.query_params.sort.is_some() {
+        return "Query-string sort currently uses the legacy SQL fanout path.".to_string();
+    }
+
+    if matches!(
+        command.logical_plan.target,
+        search_plan::SearchTarget::Pit(_)
+    ) {
+        return "Point-in-time queries currently use the legacy SQL fanout path.".to_string();
+    }
+
+    "Query is supported, but it falls back to the legacy SQL fanout path.".to_string()
+}
+
+fn aggregation_legacy_path_reason(plan: &search_plan::AggregationPlan) -> Option<String> {
+    match &plan.spec {
+        search_plan::AggregationPlanSpec::Terms(terms_plan) => {
+            if terms_plan.sub_aggregations.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "Terms aggregation `{}` has sub-aggregations, which currently use the legacy SQL fanout path.",
+                    plan.name
+                ))
+            }
+        }
+        search_plan::AggregationPlanSpec::Average(_) => None,
+        search_plan::AggregationPlanSpec::Filter(filter_plan) => {
+            if !matches!(
+                filter_plan.filter,
+                search_plan::AggregationFilterPlan::Term { .. }
+            ) {
+                return Some(format!(
+                    "Filter aggregation `{}` uses a non-term filter, which currently uses the legacy SQL fanout path.",
+                    plan.name
+                ));
+            }
+            filter_plan
+                .sub_aggregations
+                .iter()
+                .find_map(aggregation_legacy_path_reason)
+        }
+        search_plan::AggregationPlanSpec::Missing(_) => Some(format!(
+            "Missing aggregation `{}` currently uses the legacy SQL fanout path.",
+            plan.name
+        )),
+        search_plan::AggregationPlanSpec::DateHistogram(_) => Some(format!(
+            "Date histogram aggregation `{}` currently uses the legacy SQL fanout path.",
+            plan.name
+        )),
+        search_plan::AggregationPlanSpec::Cardinality(_) => Some(format!(
+            "Cardinality aggregation `{}` currently uses the legacy SQL fanout path.",
+            plan.name
+        )),
+        search_plan::AggregationPlanSpec::Range(_) => Some(format!(
+            "Range aggregation `{}` currently uses the legacy SQL fanout path.",
+            plan.name
+        )),
+    }
+}
+
+fn sort_legacy_path_reason(plan: &search_plan::SortPlan, backend: &SqlCommand) -> Option<String> {
+    match plan {
+        search_plan::SortPlan::Bare(field) => {
+            if field == "_score" && !backend.calculate_score {
+                Some(
+                    "Sorting by `_score` without a scoring query currently uses the legacy SQL fanout path."
+                        .to_string(),
+                )
+            } else {
+                None
+            }
+        }
+        search_plan::SortPlan::Field {
+            field,
+            order,
+            script,
+            ..
+        } => {
+            if script.is_some() {
+                return Some(format!(
+                    "Sort on `{}` uses a script, which currently uses the legacy SQL fanout path.",
+                    field
+                ));
+            }
+
+            match order.as_deref().map(str::to_ascii_lowercase) {
+                None => None,
+                Some(value) if value == "asc" || value == "desc" => None,
+                Some(value) => Some(format!(
+                    "Sort on `{}` uses unsupported order `{}`, which currently uses the legacy SQL fanout path.",
+                    field, value
+                )),
             }
         }
     }
@@ -232,7 +390,7 @@ pub(crate) async fn execute_search_command(
             return QueryFailure {
                 message: format!("{:?}", e),
             }
-            .to_response()
+            .to_response();
         }
     };
 
