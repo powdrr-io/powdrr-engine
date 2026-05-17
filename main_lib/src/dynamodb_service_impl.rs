@@ -113,6 +113,12 @@ impl DynamoDBServiceImpl {
 
     const NO_WORK_ITEM: &'static str = "-1";
 
+    fn enqueue_checkpoint_update(&mut self, org_id: &String, table_name: &String) -> () {
+        if !self.update_cache.iter().any(|(cached_org_id, cached_table_name)| cached_org_id == org_id && cached_table_name == table_name) {
+            self.update_cache.push((org_id.clone(), table_name.clone()));
+        }
+    }
+
     pub async fn add_checkpoint(&mut self, org_info: &OrgInfo, metadata: &TableMetadataCheckpoint) -> Result<(), ServiceApiError> {
         self.create_table(org_info, &CreateTable {
             name: metadata.table_name.clone(),
@@ -237,7 +243,7 @@ impl DynamoDBServiceImpl {
         assert_eq!(tables.len(), 1, "Only really support single table commits right now");
         let retval = self.connector.commit_speedboat(&org_info.org_id.clone(), &commit.type_files[0].table_name, commit).await.map_err(from_modyne)?;
         if retval {
-            self.update_cache.push((org_info.org_id.clone(), commit.type_files[0].table_name.clone()));
+            self.enqueue_checkpoint_update(&org_info.org_id, &commit.type_files[0].table_name);
         }
         Ok(retval)
     }
@@ -284,11 +290,19 @@ impl DynamoDBServiceImpl {
     }
 
     pub async fn iceberg_commit(&mut self, org_info: &OrgInfo, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<bool, ServiceApiError> {
-        self.connector.commit_iceberg(&org_info.org_id.clone(), table_name, iceberg_commit).await.map_err(from_modyne)
+        let retval = self.connector.commit_iceberg(&org_info.org_id.clone(), table_name, iceberg_commit).await.map_err(from_modyne)?;
+        if retval {
+            self.enqueue_checkpoint_update(&org_info.org_id, table_name);
+        }
+        Ok(retval)
     }
 
     pub async fn extension_commit(&mut self, org_info: &OrgInfo, table_name: &String, commit: &ExtensionCommit) -> Result<bool, ServiceApiError> {
-        self.connector.commit_extension_work_item_completed(&org_info.org_id, table_name, &commit).await.map_err(from_modyne)
+        let retval = self.connector.commit_extension_work_item_completed(&org_info.org_id, table_name, &commit).await.map_err(from_modyne)?;
+        if retval {
+            self.enqueue_checkpoint_update(&org_info.org_id, table_name);
+        }
+        Ok(retval)
     }
 
     pub async fn compaction_commit(&mut self, org_info: &OrgInfo, _table_name: &String, commit: &CompactionCommit) -> Result<bool, ServiceApiError> {
@@ -570,5 +584,84 @@ impl DynamoDBServiceImpl {
 
     pub async fn lookup_org(&mut self, access_key_id: &String, secret_access_key: &String) -> Result<Option<OrgInfo>, ServiceApiError> {
         self.connector.describe_org_creds(&mut self.org_cache, &MANAGEMENT_ORG_ID.to_string(), &Self::org_info_key(access_key_id, secret_access_key)).await.map_err(from_modyne)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_contract::{FileSetPayload, IcebergMetadata, ExtensionFile, LicenseType};
+    use crate::schema_massager::PowdrrSchema;
+    use std::collections::HashMap;
+
+    fn fake_org_info() -> OrgInfo {
+        OrgInfo {
+            org_id: "fake_org_id".to_string(),
+            license_type: LicenseType::Free,
+        }
+    }
+
+    fn iceberg_metadata(file_path: &String, snapshot_id: &str) -> IcebergMetadata {
+        let schema = PowdrrSchema::minimal();
+        IcebergMetadata {
+            table_schema: schema.clone(),
+            snapshot_id: Some(snapshot_id.to_string()),
+            files: FileSetPayload::single(file_path.clone(), 128, schema),
+            column_names: vec![],
+            column_stats: vec![],
+            file_stats: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn iceberg_extension_checkpoints_publish_after_extension_commit() {
+        let mut service_impl = DynamoDBServiceImpl::test(TestProcessingMode::default()).await;
+        let org_info = fake_org_info();
+        let table_name = "iceberg_snapshot_table".to_string();
+        let file_path = "s3://warehouse/table/data-0001.parquet".to_string();
+
+        service_impl.create_table(&org_info, &CreateTable {
+            name: table_name.clone(),
+            tags: HashMap::new(),
+            serving: None,
+            dynamodb: None,
+        }).await.unwrap();
+
+        let initial_extension_checkpoint = service_impl.get_latest_committed_checkpoint(&org_info, &table_name, Some("es".to_string())).await.unwrap().unwrap();
+
+        service_impl.iceberg_commit(&org_info, &table_name, &IcebergCommit {
+            metadata: iceberg_metadata(&file_path, "1"),
+            deletes_table_info: None,
+            compactions: vec![],
+        }).await.unwrap();
+        assert_eq!(service_impl.update_cache.clone(), vec![(org_info.org_id.clone(), table_name.clone())]);
+        assert!(!service_impl.update_all_checkpoints().await.unwrap());
+        assert!(service_impl.update_cache.is_empty());
+
+        let work_items = service_impl.get_extension_work_items(&org_info, &"es".to_string()).await.unwrap();
+        assert_eq!(work_items.len(), 1);
+        let work_item = work_items.first().unwrap();
+        assert_eq!(work_item.iceberg_files.file_paths.clone(), vec![file_path.clone()]);
+
+        let extension_files = vec![ExtensionFile {
+            suffix: "search_index".to_string(),
+            location: "s3://warehouse/table/data-0001.search_index.parquet".to_string(),
+        }];
+        service_impl.extension_commit(&org_info, &table_name, &ExtensionCommit {
+            id: work_item.id.clone(),
+            extension: "es".to_string(),
+            files: HashMap::from([(file_path.clone(), extension_files.clone())]),
+        }).await.unwrap();
+        assert_eq!(service_impl.update_cache.clone(), vec![(org_info.org_id.clone(), table_name.clone())]);
+
+        assert!(service_impl.update_all_checkpoints().await.unwrap());
+
+        let latest_extension_checkpoint = service_impl.get_latest_committed_checkpoint(&org_info, &table_name, Some("es".to_string())).await.unwrap().unwrap();
+        assert_ne!(latest_extension_checkpoint, initial_extension_checkpoint);
+
+        let checkpoint = service_impl.get_checkpoint(&org_info, &CheckpointDescriptor::new(table_name.clone(), latest_extension_checkpoint)).await.unwrap().unwrap();
+        assert!(checkpoint.fully_covered_for_extension(&"es".to_string()));
+        assert_eq!(checkpoint.iceberg_metadata.as_ref().unwrap().snapshot_id.as_deref(), Some("1"));
+        assert_eq!(checkpoint.extension_metadata.get("es").unwrap().get(&file_path).unwrap(), &extension_files);
     }
 }
