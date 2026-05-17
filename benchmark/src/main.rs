@@ -117,7 +117,12 @@ async fn main() -> Result<()> {
     let dataset = read_parquet_documents(dataset_path.to_str().unwrap(), None)
         .await
         .map_err(|error| anyhow!(error))
-        .with_context(|| format!("failed to read parquet dataset at {}", dataset_path.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to read parquet dataset at {}",
+                dataset_path.display()
+            )
+        })?;
     let workload = infer_workload(&dataset)?;
     let cases = build_benchmark_cases(&workload, config.limit);
     if cases.is_empty() {
@@ -139,7 +144,14 @@ async fn main() -> Result<()> {
     let test_server = AsyncTestServer::new(router(true))
         .await
         .context("failed to start in-process Powdrr benchmark server")?;
-    setup_powdrr(&test_server, &table_name, &dataset_path, &dataset.schema, &cases).await?;
+    setup_powdrr(
+        &test_server,
+        &table_name,
+        &dataset_path,
+        &dataset.schema,
+        &cases,
+    )
+    .await?;
 
     let http_client = HttpClient::new();
     let mut es_target = None;
@@ -153,8 +165,14 @@ async fn main() -> Result<()> {
     if !config.skip_mongo {
         let db_name = unique_name("serve_bench_mongo");
         let collection_name = "docs".to_string();
-        let collection =
-            setup_mongodb(&config.mongo_uri, &db_name, &collection_name, &dataset, &cases).await?;
+        let collection = setup_mongodb(
+            &config.mongo_uri,
+            &db_name,
+            &collection_name,
+            &dataset,
+            &cases,
+        )
+        .await?;
         mongo_target = Some((db_name, collection_name, collection));
     }
 
@@ -174,15 +192,22 @@ async fn main() -> Result<()> {
             );
         }
 
-        let (powdrr_result, powdrr_latency) = measure_runner(config.warmup, config.iterations, || {
-            run_powdrr_case(&test_server, &table_name, &case.plan).boxed()
-        })
-        .await?;
+        let (powdrr_result, powdrr_latency) =
+            measure_runner(config.warmup, config.iterations, || {
+                run_powdrr_case(&test_server, &table_name, &case.plan).boxed()
+            })
+            .await?;
         print_summary(&case.name, "powdrr", &powdrr_latency);
 
         if let Some((es_url, index_name)) = es_target.as_ref() {
             let es_first = run_es_case(&http_client, es_url, index_name, &case.plan).await?;
-            assert_same_rows("powdrr", &powdrr_baseline, "elasticsearch", &es_first, &case.name)?;
+            assert_same_rows(
+                "powdrr",
+                &powdrr_baseline,
+                "elasticsearch",
+                &es_first,
+                &case.name,
+            )?;
             let (_, es_latency) = measure_runner(config.warmup, config.iterations, || {
                 run_es_case(&http_client, es_url, index_name, &case.plan).boxed()
             })
@@ -192,7 +217,13 @@ async fn main() -> Result<()> {
 
         if let Some((_, _, collection)) = mongo_target.as_ref() {
             let mongo_first = run_mongo_case(collection, &case.plan).await?;
-            assert_same_rows("powdrr", &powdrr_baseline, "mongodb", &mongo_first, &case.name)?;
+            assert_same_rows(
+                "powdrr",
+                &powdrr_baseline,
+                "mongodb",
+                &mongo_first,
+                &case.name,
+            )?;
             let (_, mongo_latency) = measure_runner(config.warmup, config.iterations, || {
                 run_mongo_case(collection, &case.plan).boxed()
             })
@@ -266,7 +297,12 @@ fn infer_workload(dataset: &ParquetDocumentSet) -> Result<WorkloadShape> {
     if let Some(eq_field) = eq_field.as_ref() {
         projection.push(eq_field.clone());
     }
-    for field in dataset.schema.fields().iter().map(|field| field.name.clone()) {
+    for field in dataset
+        .schema
+        .fields()
+        .iter()
+        .map(|field| field.name.clone())
+    {
         if projection.len() >= 3 {
             break;
         }
@@ -463,7 +499,10 @@ async fn setup_powdrr(
 
     let response = test_server
         .client()
-        .put(format!("{}/_test/v1/_testing_and_processing_mode", BENCH_BASE_URL))
+        .put(format!(
+            "{}/_test/v1/_testing_and_processing_mode",
+            BENCH_BASE_URL
+        ))
         .mime(mime::APPLICATION_JSON)
         .body(serde_json::to_string(&mode)?)
         .perform()
@@ -490,8 +529,13 @@ async fn setup_powdrr(
                 file_schemas: vec![0],
                 schemas: vec![schema.clone()],
             },
-            column_names: schema.fields().iter().map(|field| field.name.clone()).collect(),
+            column_names: schema
+                .fields()
+                .iter()
+                .map(|field| field.name.clone())
+                .collect(),
             column_stats: vec![],
+            file_stats: vec![],
         }),
         speedboat_metadata: None,
         deletes_metadata: None,
@@ -542,7 +586,10 @@ fn pattern_from_case(name: &str, plan: &ServingRequestPlan) -> ServingPattern {
         if filter.eq.is_some() || filter.in_values.is_some() {
             eq_fields.push(filter.field.clone());
         }
-        if filter.gt.is_some() || filter.gte.is_some() || filter.lt.is_some() || filter.lte.is_some()
+        if filter.gt.is_some()
+            || filter.gte.is_some()
+            || filter.lt.is_some()
+            || filter.lte.is_some()
         {
             range_field = Some(filter.field.clone());
         }
@@ -580,7 +627,10 @@ async fn setup_elasticsearch(
         .send()
         .await?;
     if !create_response.status().is_success() {
-        bail!("failed to create Elasticsearch index {}", create_response.text().await?);
+        bail!(
+            "failed to create Elasticsearch index {}",
+            create_response.text().await?
+        );
     }
 
     let mut bulk_payload = String::new();
