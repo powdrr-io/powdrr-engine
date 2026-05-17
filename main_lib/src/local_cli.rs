@@ -1,8 +1,10 @@
-use crate::data_contract::{ExtensionFile, FileDescriptor, FileSetPayload, IcebergMetadata, TableMetadataCheckpoint};
+use crate::data_contract::{
+    ExtensionFile, FileDescriptor, FileSetPayload, IcebergMetadata, TableMetadataCheckpoint,
+};
 use crate::elastic_search_common::CommandContext;
-use crate::elastic_search_index::{create_index_inner_with_doc_id, IndexError};
+use crate::elastic_search_index::{IndexError, create_index_inner_with_doc_id};
 use crate::elastic_search_parser;
-use crate::schema_massager::{to_powdrr_schema, PowdrrSchema};
+use crate::schema_massager::{PowdrrSchema, to_powdrr_schema};
 use crate::search_executor;
 use crate::state_provider::STATE_PROVIDER;
 use crate::test_api::PeerModeType;
@@ -10,7 +12,7 @@ use crate::util::add_file_suffix;
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use futures_util::TryStreamExt;
 use idgenerator::IdInstance;
-use object_store::{aws::AmazonS3Builder, path::Path as ObjectStorePath, ObjectStore};
+use object_store::{ObjectStore, aws::AmazonS3Builder, path::Path as ObjectStorePath};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
@@ -147,10 +149,15 @@ pub async fn build_local_parquet_cache(
         )));
     }
 
-    let file_descriptors = validate_and_describe_cached_files(&cached_file_paths, &request.doc_id_field)?;
+    let file_descriptors =
+        validate_and_describe_cached_files(&cached_file_paths, &request.doc_id_field)?;
     let dummy_speedboat_files = vec![];
-    create_index_inner_with_doc_id(&file_descriptors, &dummy_speedboat_files, &request.doc_id_field)
-        .await?;
+    create_index_inner_with_doc_id(
+        &file_descriptors,
+        &dummy_speedboat_files,
+        &request.doc_id_field,
+    )
+    .await?;
 
     let manifest = CacheManifest {
         version: 1,
@@ -200,20 +207,22 @@ pub async fn query_local_parquet_cache(
     let file_descriptors =
         validate_and_describe_cached_files(&cached_file_paths, &manifest.doc_id_field)?;
     let dummy_speedboat_files = vec![];
-    create_index_inner_with_doc_id(&file_descriptors, &dummy_speedboat_files, &manifest.doc_id_field)
-        .await?;
+    create_index_inner_with_doc_id(
+        &file_descriptors,
+        &dummy_speedboat_files,
+        &manifest.doc_id_field,
+    )
+    .await?;
 
     let checkpoint = build_checkpoint(&manifest, &file_descriptors);
     STATE_PROVIDER.set_peer_mode(&PeerModeType::SelfOnly).await;
     STATE_PROVIDER.add_checkpoint(&checkpoint).await;
 
     let plan = match request.language {
-        LocalQueryLanguage::ElasticsearchJson => {
-            elastic_search_parser::parse_search_plan(
-                Some(manifest.table_name.clone()),
-                &request.body,
-            )?
-        }
+        LocalQueryLanguage::ElasticsearchJson => elastic_search_parser::parse_search_plan(
+            Some(manifest.table_name.clone()),
+            &request.body,
+        )?,
     };
 
     let query_string = crate::elastic_search_endpoints::QueryStringSearch {
@@ -366,7 +375,10 @@ fn collect_local_source_files_recursive(
 ) -> Result<(), LocalCliError> {
     let entries = fs::read_dir(current).map_err(|error| {
         LocalCliError::from_io(
-            &format!("Failed to list local source directory {}", current.display()),
+            &format!(
+                "Failed to list local source directory {}",
+                current.display()
+            ),
             error,
         )
     })?;
@@ -416,8 +428,13 @@ fn parse_s3_source(source: &str) -> Result<(String, Option<String>), LocalCliErr
         .next()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| LocalCliError::new(format!("Invalid S3 source {}", source)))?;
-    let key_prefix = parts.next().map(|value| value.trim_matches('/').to_string());
-    Ok((bucket.to_string(), key_prefix.filter(|value| !value.is_empty())))
+    let key_prefix = parts
+        .next()
+        .map(|value| value.trim_matches('/').to_string());
+    Ok((
+        bucket.to_string(),
+        key_prefix.filter(|value| !value.is_empty()),
+    ))
 }
 
 fn build_s3_store(bucket: &str) -> Result<Arc<dyn ObjectStore>, LocalCliError> {
@@ -486,7 +503,10 @@ async fn list_s3_source_files(
             ))
         })?;
 
-    for meta in metas.into_iter().filter(|meta| meta.location.as_ref().ends_with(".parquet")) {
+    for meta in metas
+        .into_iter()
+        .filter(|meta| meta.location.as_ref().ends_with(".parquet"))
+    {
         let object_path = meta.location.to_string();
         let relative_path = match key_prefix {
             Some(prefix) => {
@@ -537,10 +557,15 @@ fn validate_and_describe_cached_files(
                 error,
             )
         })?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|error| LocalCliError::new(format!("Failed to read {}: {}", path.display(), error)))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| {
+            LocalCliError::new(format!("Failed to read {}: {}", path.display(), error))
+        })?;
         let schema = to_powdrr_schema(builder.schema().as_ref());
-        if !schema.fields().iter().any(|field| field.name == doc_id_field) {
+        if !schema
+            .fields()
+            .iter()
+            .any(|field| field.name == doc_id_field)
+        {
             return Err(LocalCliError::new(format!(
                 "File {} is missing doc id field {}",
                 path.display(),
@@ -598,6 +623,7 @@ fn build_checkpoint(
             files: file_set,
             column_names: vec![],
             column_stats: vec![],
+            file_stats: vec![],
         }),
         speedboat_metadata: None,
         deletes_metadata: None,
@@ -608,8 +634,9 @@ fn build_checkpoint(
 
 fn write_manifest(cache_dir: &Path, manifest: &CacheManifest) -> Result<(), LocalCliError> {
     let manifest_path = cache_dir.join(MANIFEST_FILE_NAME);
-    let body = serde_json::to_vec_pretty(manifest)
-        .map_err(|error| LocalCliError::new(format!("Failed to serialize cache manifest: {}", error)))?;
+    let body = serde_json::to_vec_pretty(manifest).map_err(|error| {
+        LocalCliError::new(format!("Failed to serialize cache manifest: {}", error))
+    })?;
     fs::write(&manifest_path, body).map_err(|error| {
         LocalCliError::from_io(
             &format!("Failed to write cache manifest {}", manifest_path.display()),
@@ -638,8 +665,8 @@ fn read_manifest(cache_dir: &Path) -> Result<CacheManifest, LocalCliError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_local_parquet_cache, query_local_parquet_cache, LocalParquetBuildRequest,
-        LocalParquetQueryRequest, LocalQueryLanguage,
+        LocalParquetBuildRequest, LocalParquetQueryRequest, LocalQueryLanguage,
+        build_local_parquet_cache, query_local_parquet_cache,
     };
     use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -709,6 +736,9 @@ mod tests {
         assert_eq!(response.status_code, 200);
         let parsed = serde_json::from_str::<Value>(&response.body).unwrap();
         assert_eq!(parsed["hits"]["total"]["value"], 1);
-        assert_eq!(parsed["hits"]["hits"][0]["_source"]["message"], "login failed");
+        assert_eq!(
+            parsed["hits"]["hits"][0]["_source"]["message"],
+            "login failed"
+        );
     }
 }
