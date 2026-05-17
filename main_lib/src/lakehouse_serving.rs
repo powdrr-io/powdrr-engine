@@ -1112,6 +1112,7 @@ mod tests {
                 name: "events".to_string(),
                 tags: HashMap::new(),
                 serving: Some(serving),
+                dynamodb: None,
             },
             checkpoint: TableMetadataCheckpoint::new(
                 "events".to_string(),

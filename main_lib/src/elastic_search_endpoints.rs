@@ -38,6 +38,17 @@ pub struct NameIdPathExtractor {
     id: String,
 }
 
+#[derive(Deserialize, StateData, StaticResponseExtender)]
+pub struct AliasPathExtractor {
+    alias: String,
+}
+
+#[derive(Deserialize, StateData, StaticResponseExtender)]
+pub struct NameAliasPathExtractor {
+    name: String,
+    alias: String,
+}
+
 #[derive(Serialize)]
 struct ServerVersion {
     number: String,
@@ -258,6 +269,95 @@ fn aliases_value(body: &CreateIndexBody) -> Value {
     Value::Object(alias_map)
 }
 
+fn alias_names(body: &CreateIndexBody) -> Vec<String> {
+    let mut aliases = body
+        .aliases
+        .clone()
+        .unwrap_or_default()
+        .into_keys()
+        .collect::<Vec<_>>();
+    aliases.sort();
+    aliases
+}
+
+fn requested_parts(requested: &str) -> Vec<String> {
+    requested
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn requests_all(parts: &[String]) -> bool {
+    parts.is_empty() || parts.iter().any(|part| part == "*" || part == "_all")
+}
+
+fn matches_requested_value(value: &str, requested: &[String]) -> bool {
+    requests_all(requested) || requested.iter().any(|requested_value| requested_value == value)
+}
+
+async fn all_table_descriptions() -> Result<Vec<TableDescription>, crate::state_provider::ServiceApiError>
+{
+    let mut table_descriptions = Vec::new();
+    let mut table_names = STATE_PROVIDER.get_all_iceberg_tables().await?;
+    table_names.sort();
+
+    for table_name in table_names {
+        if let Some(table_desc) = STATE_PROVIDER.describe_table(&table_name).await? {
+            table_descriptions.push(table_desc);
+        }
+    }
+
+    Ok(table_descriptions)
+}
+
+async fn requested_table_descriptions(
+    requested_indices: &[String],
+) -> Result<Vec<TableDescription>, crate::state_provider::ServiceApiError> {
+    if requests_all(requested_indices) {
+        return all_table_descriptions().await;
+    }
+
+    let mut table_descriptions = Vec::new();
+
+    for table_name in requested_indices {
+        if let Some(table_desc) = STATE_PROVIDER.describe_table(table_name).await? {
+            table_descriptions.push(table_desc);
+        }
+    }
+
+    Ok(table_descriptions)
+}
+
+fn filtered_aliases_value(body: &CreateIndexBody, requested_aliases: &[String]) -> Value {
+    let aliases = body.aliases.clone().unwrap_or_default();
+    let alias_map = aliases
+        .into_iter()
+        .filter(|(name, _)| matches_requested_value(name, requested_aliases))
+        .map(|(name, alias_info)| (name, alias_info_value(&alias_info)))
+        .collect::<Map<String, Value>>();
+    Value::Object(alias_map)
+}
+
+async fn build_alias_response(
+    requested_indices: &[String],
+    requested_aliases: &[String],
+) -> Result<Map<String, Value>, crate::state_provider::ServiceApiError> {
+    let mut response = Map::new();
+    let table_descriptions = requested_table_descriptions(requested_indices).await?;
+
+    for table_desc in table_descriptions {
+        let body = parse_index_body(&table_desc);
+        let aliases = filtered_aliases_value(&body, requested_aliases);
+        if aliases.as_object().is_some_and(|aliases| !aliases.is_empty()) {
+            response.insert(table_desc.name.clone(), json!({ "aliases": aliases }));
+        }
+    }
+
+    Ok(response)
+}
+
 fn normalize_settings_value(value: Value) -> Value {
     match value {
         Value::Object(map) => Value::Object(
@@ -312,6 +412,14 @@ fn count_body_as_search_body(body_content: &str) -> Result<String, String> {
             Ok(parsed_body.to_string())
         }
         None => Err("count body must be a JSON object".to_string()),
+    }
+}
+
+fn normalize_search_body(body_content: &str) -> String {
+    if body_content.trim().is_empty() {
+        "{}".to_string()
+    } else {
+        body_content.to_string()
     }
 }
 
@@ -388,25 +496,14 @@ pub fn es_get_index_aliases(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_get_index_aliases");
     async {
         let path_extractor = NamePathExtractor::borrow_from(&state);
-        let mut response = Map::new();
-
-        for table_name in path_extractor.name.to_string().split(",") {
-            let table_desc = match STATE_PROVIDER.describe_table(&table_name.to_string()).await {
-                Ok(td) => td,
-                Err(e) => {
-                    let res = log_service_err(e).generate_response(&state);
-                    return Ok((state, res));
-                }
-            };
-
-            if let Some(table_desc) = table_desc {
-                let body = parse_index_body(&table_desc);
-                response.insert(
-                    table_desc.name.clone(),
-                    json!({ "aliases": aliases_value(&body) }),
-                );
+        let requested_indices = requested_parts(&path_extractor.name);
+        let response = match build_alias_response(&requested_indices, &[]).await {
+            Ok(response) => response,
+            Err(e) => {
+                let res = log_service_err(e).generate_response(&state);
+                return Ok((state, res));
             }
-        }
+        };
 
         if response.is_empty() {
             let res = create_empty_response(&state, StatusCode::NOT_FOUND);
@@ -419,6 +516,116 @@ pub fn es_get_index_aliases(state: State) -> Pin<Box<HandlerFuture>> {
             mime::APPLICATION_JSON,
             Value::Object(response).to_string(),
         );
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_get_aliases(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_get_aliases");
+    async {
+        let response = match build_alias_response(&[], &[]).await {
+            Ok(response) => response,
+            Err(e) => {
+                let res = log_service_err(e).generate_response(&state);
+                return Ok((state, res));
+            }
+        };
+
+        if response.is_empty() {
+            let res = create_empty_response(&state, StatusCode::NOT_FOUND);
+            return Ok((state, res));
+        }
+
+        let res = create_response(
+            &state,
+            StatusCode::OK,
+            mime::APPLICATION_JSON,
+            Value::Object(response).to_string(),
+        );
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_get_named_aliases(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_get_named_aliases");
+    async {
+        let path_extractor = AliasPathExtractor::borrow_from(&state);
+        let requested_aliases = requested_parts(&path_extractor.alias);
+        let response = match build_alias_response(&[], &requested_aliases).await {
+            Ok(response) => response,
+            Err(e) => {
+                let res = log_service_err(e).generate_response(&state);
+                return Ok((state, res));
+            }
+        };
+
+        if response.is_empty() {
+            let res = create_empty_response(&state, StatusCode::NOT_FOUND);
+            return Ok((state, res));
+        }
+
+        let res = create_response(
+            &state,
+            StatusCode::OK,
+            mime::APPLICATION_JSON,
+            Value::Object(response).to_string(),
+        );
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_get_index_named_aliases(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_get_index_named_aliases");
+    async {
+        let path_extractor = NameAliasPathExtractor::borrow_from(&state);
+        let requested_indices = requested_parts(&path_extractor.name);
+        let requested_aliases = requested_parts(&path_extractor.alias);
+        let response = match build_alias_response(&requested_indices, &requested_aliases).await {
+            Ok(response) => response,
+            Err(e) => {
+                let res = log_service_err(e).generate_response(&state);
+                return Ok((state, res));
+            }
+        };
+
+        if response.is_empty() {
+            let res = create_empty_response(&state, StatusCode::NOT_FOUND);
+            return Ok((state, res));
+        }
+
+        let res = create_response(
+            &state,
+            StatusCode::OK,
+            mime::APPLICATION_JSON,
+            Value::Object(response).to_string(),
+        );
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_head_index_alias(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_head_index_alias");
+    async {
+        let path_extractor = NameAliasPathExtractor::borrow_from(&state);
+        let requested_indices = requested_parts(&path_extractor.name);
+        let requested_aliases = requested_parts(&path_extractor.alias);
+        let response = match build_alias_response(&requested_indices, &requested_aliases).await {
+            Ok(response) => response,
+            Err(e) => {
+                let res = log_service_err(e).generate_response(&state);
+                return Ok((state, res));
+            }
+        };
+
+        let res = if response.is_empty() {
+            create_empty_response(&state, StatusCode::NOT_FOUND)
+        } else {
+            create_empty_response(&state, StatusCode::OK)
+        };
         Ok((state, res))
     }
     .boxed()
@@ -519,6 +726,90 @@ pub fn es_get_index_template(state: State) -> Pin<Box<HandlerFuture>> {
             table_desc.map_or_else(|| "{}".to_string(), |x| serde_json::to_string(&x).unwrap());
 
         let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, response);
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_resolve_index(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_resolve_index");
+    async {
+        let path_extractor = NamePathExtractor::borrow_from(&state);
+        let requested_names = requested_parts(&path_extractor.name);
+        let table_descriptions = match all_table_descriptions().await {
+            Ok(table_descriptions) => table_descriptions,
+            Err(e) => {
+                let res = log_service_err(e).generate_response(&state);
+                return Ok((state, res));
+            }
+        };
+
+        let mut indices = Vec::new();
+        let mut aliases_to_indices: HashMap<String, Vec<String>> = HashMap::new();
+
+        for table_desc in table_descriptions {
+            let body = parse_index_body(&table_desc);
+            let aliases = alias_names(&body);
+            let table_name = table_desc.name.clone();
+
+            if matches_requested_value(&table_name, &requested_names) {
+                indices.push(json!({
+                    "name": table_name,
+                    "aliases": aliases,
+                    "attributes": ["open"],
+                }));
+            }
+
+            for alias in alias_names(&body) {
+                if matches_requested_value(&alias, &requested_names) {
+                    aliases_to_indices
+                        .entry(alias)
+                        .or_default()
+                        .push(table_desc.name.clone());
+                }
+            }
+        }
+
+        let mut aliases = aliases_to_indices
+            .into_iter()
+            .map(|(name, mut indices)| {
+                indices.sort();
+                json!({
+                    "name": name,
+                    "indices": indices,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        indices.sort_by(|left, right| {
+            left["name"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(right["name"].as_str().unwrap_or_default())
+        });
+        aliases.sort_by(|left, right| {
+            left["name"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(right["name"].as_str().unwrap_or_default())
+        });
+
+        if indices.is_empty() && aliases.is_empty() {
+            let res = create_empty_response(&state, StatusCode::NOT_FOUND);
+            return Ok((state, res));
+        }
+
+        let res = create_response(
+            &state,
+            StatusCode::OK,
+            mime::APPLICATION_JSON,
+            json!({
+                "indices": indices,
+                "aliases": aliases,
+                "data_streams": [],
+            })
+            .to_string(),
+        );
         Ok((state, res))
     }
     .boxed()
@@ -928,7 +1219,7 @@ pub fn es_search(mut state: State) -> Pin<Box<HandlerFuture>> {
             Ok(vb) => vb,
             Err(_) => panic!("Oh no"),
         };
-        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+        let body_content = normalize_search_body(&String::from_utf8(valid_body.to_vec()).unwrap());
         let command = match elastic_search_parser::parse(None, &body_content, &query_string) {
             Ok(c) => c,
             Err(_) => {
@@ -1176,7 +1467,7 @@ pub fn es_search_table(mut state: State) -> Pin<Box<HandlerFuture>> {
                 return Ok((state, res));
             }
         };
-        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+        let body_content = normalize_search_body(&String::from_utf8(valid_body.to_vec()).unwrap());
         let command = match elastic_search_parser::parse(
             Some(table_desc.name),
             &body_content,

@@ -782,6 +782,7 @@ pub struct CleanupWorkItem {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AliasInfo {
+    #[serde(default)]
     pub is_hidden: bool,
 }
 
@@ -814,7 +815,8 @@ pub struct PropertyInfo {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Mappings {
-    pub dynamic: StringOrBool,
+    #[serde(default)]
+    pub dynamic: Option<StringOrBool>,
     pub _meta: Option<MetaInfo>,
     pub properties: HashMap<String, PropertyInfo>,
 }

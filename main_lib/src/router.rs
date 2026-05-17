@@ -1,6 +1,8 @@
 use crate::compaction::{compact_logs, CompactionCommand};
 use crate::dynamodb_protocol;
+use crate::elastic_search_endpoints::AliasPathExtractor;
 use crate::elastic_search_endpoints::NameIdPathExtractor;
+use crate::elastic_search_endpoints::NameAliasPathExtractor;
 use crate::elastic_search_endpoints::NamePathExtractor;
 use crate::elastic_search_endpoints::QueryStringAliases;
 use crate::elastic_search_endpoints::QueryStringClusterSettings;
@@ -385,6 +387,15 @@ pub fn router(include_test_apis: bool) -> Router {
             .get("_cluster/settings")
             .with_query_string_extractor::<QueryStringClusterSettings>()
             .to(elastic_search_endpoints::es_cluster_settings);
+        route.get("/_alias").to(elastic_search_endpoints::es_get_aliases);
+        route
+            .get("/_alias/:alias")
+            .with_path_extractor::<AliasPathExtractor>()
+            .to(elastic_search_endpoints::es_get_named_aliases);
+        route
+            .get("/_resolve/index/:name")
+            .with_path_extractor::<NamePathExtractor>()
+            .to(elastic_search_endpoints::es_resolve_index);
         route
             .get("/:name")
             .with_path_extractor::<NamePathExtractor>()
@@ -397,6 +408,14 @@ pub fn router(include_test_apis: bool) -> Router {
             .get("/:name/_alias")
             .with_path_extractor::<NamePathExtractor>()
             .to(elastic_search_endpoints::es_get_index_aliases);
+        route
+            .get("/:name/_alias/:alias")
+            .with_path_extractor::<NameAliasPathExtractor>()
+            .to(elastic_search_endpoints::es_get_index_named_aliases);
+        route
+            .head("/:name/_alias/:alias")
+            .with_path_extractor::<NameAliasPathExtractor>()
+            .to(elastic_search_endpoints::es_head_index_alias);
         route
             .get("/:name/_settings")
             .with_path_extractor::<NamePathExtractor>()
@@ -438,9 +457,18 @@ pub fn router(include_test_apis: bool) -> Router {
             .with_path_extractor::<NamePathExtractor>()
             .to(elastic_search_endpoints::es_get_index_template);
         route
+            .get("/_search")
+            .with_query_string_extractor::<QueryStringSearch>()
+            .to(elastic_search_endpoints::es_search);
+        route
             .post("/_search")
             .with_query_string_extractor::<QueryStringSearch>()
             .to(elastic_search_endpoints::es_search);
+        route
+            .get("/:name/_search")
+            .with_query_string_extractor::<QueryStringSearch>()
+            .with_path_extractor::<NamePathExtractor>()
+            .to(elastic_search_endpoints::es_search_table);
         route
             .get("/_count")
             .with_query_string_extractor::<QueryStringSearch>()
@@ -888,6 +916,35 @@ pub(crate) mod tests {
             dynamodb: None,
         }))
         .unwrap();
+        futures::executor::block_on(STATE_PROVIDER.upsert_table_metadata(&CreateTable {
+            name: "logs_archive".to_string(),
+            tags: HashMap::from([(
+                "_es_original".to_string(),
+                json!({
+                    "aliases": {
+                        "logs_alias": {},
+                        "archive_alias": {}
+                    },
+                    "mappings": {
+                        "properties": {
+                            "index_col": {
+                                "type": "keyword"
+                            }
+                        }
+                    },
+                    "settings": {
+                        "index": {
+                            "number_of_shards": 1,
+                            "number_of_replicas": 0
+                        }
+                    }
+                })
+                .to_string(),
+            )]),
+            serving: None,
+            dynamodb: None,
+        }))
+        .unwrap();
 
         let checkpoint = TableMetadataCheckpoint {
             table_name: "logs".to_string(),
@@ -1018,6 +1075,105 @@ pub(crate) mod tests {
             get_alias_json["logs"]["aliases"]["logs_secondary"],
             json!({})
         );
+
+        let get_global_aliases_response =
+            test_server.client().get("http://localhost/_alias").perform().unwrap();
+        assert_eq!(get_global_aliases_response.status(), 200);
+        let get_global_aliases_json: Value =
+            serde_json::from_str(&get_global_aliases_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(get_global_aliases_json["logs"]["aliases"]["logs_alias"], json!({}));
+        assert_eq!(
+            get_global_aliases_json["logs_archive"]["aliases"]["archive_alias"],
+            json!({})
+        );
+
+        let get_named_aliases_response = test_server
+            .client()
+            .get("http://localhost/_alias/logs_alias")
+            .perform()
+            .unwrap();
+        assert_eq!(get_named_aliases_response.status(), 200);
+        let get_named_aliases_json: Value =
+            serde_json::from_str(&get_named_aliases_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(get_named_aliases_json["logs"]["aliases"]["logs_alias"], json!({}));
+        assert_eq!(
+            get_named_aliases_json["logs_archive"]["aliases"]["logs_alias"],
+            json!({})
+        );
+        assert!(get_named_aliases_json["logs"]["aliases"]
+            .get("logs_secondary")
+            .is_none());
+
+        let get_index_named_alias_response = test_server
+            .client()
+            .get("http://localhost/logs/_alias/logs_secondary")
+            .perform()
+            .unwrap();
+        assert_eq!(get_index_named_alias_response.status(), 200);
+        let get_index_named_alias_json: Value =
+            serde_json::from_str(&get_index_named_alias_response.read_utf8_body().unwrap())
+                .unwrap();
+        assert_eq!(
+            get_index_named_alias_json["logs"]["aliases"]["logs_secondary"],
+            json!({})
+        );
+
+        let head_index_alias_response = test_server
+            .client()
+            .head("http://localhost/logs/_alias/logs_secondary")
+            .perform()
+            .unwrap();
+        assert_eq!(head_index_alias_response.status(), 200);
+
+        let missing_head_index_alias_response = test_server
+            .client()
+            .head("http://localhost/logs/_alias/does_not_exist")
+            .perform()
+            .unwrap();
+        assert_eq!(missing_head_index_alias_response.status(), 404);
+
+        let resolve_index_response = test_server
+            .client()
+            .get("http://localhost/_resolve/index/logs")
+            .perform()
+            .unwrap();
+        assert_eq!(resolve_index_response.status(), 200);
+        let resolve_index_json: Value =
+            serde_json::from_str(&resolve_index_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(resolve_index_json["indices"][0]["name"], "logs");
+        assert_eq!(resolve_index_json["indices"][0]["attributes"], json!(["open"]));
+        assert_eq!(
+            resolve_index_json["indices"][0]["aliases"],
+            json!(["logs_alias", "logs_secondary"])
+        );
+        assert_eq!(resolve_index_json["aliases"], json!([]));
+
+        let resolve_alias_response = test_server
+            .client()
+            .get("http://localhost/_resolve/index/logs_alias")
+            .perform()
+            .unwrap();
+        assert_eq!(resolve_alias_response.status(), 200);
+        let resolve_alias_json: Value =
+            serde_json::from_str(&resolve_alias_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(resolve_alias_json["indices"], json!([]));
+        assert_eq!(
+            resolve_alias_json["aliases"][0],
+            json!({
+                "name": "logs_alias",
+                "indices": ["logs", "logs_archive"]
+            })
+        );
+
+        let get_search_response = test_server
+            .client()
+            .get("http://localhost/logs/_search")
+            .perform()
+            .unwrap();
+        assert_eq!(get_search_response.status(), 200);
+        let get_search_json: Value =
+            serde_json::from_str(&get_search_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(get_search_json["hits"]["total"]["value"], 6);
 
         let get_count_response = test_server
             .client()
