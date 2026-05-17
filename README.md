@@ -88,6 +88,16 @@ scripts/cargo-worktree.sh run -p powdrr-cli -- elastic query \
   --body-file clients/query.json
 ```
 
+Classify an Elasticsearch JSON query before running it:
+
+```
+scripts/cargo-worktree.sh run -p powdrr-cli -- elastic analyze \
+  --body-file clients/query.json
+```
+
+The analysis reports whether the query stays on a highly optimized path,
+falls back to a supported but probably slower path, or is currently unsupported.
+
 For S3 sources, point `--source` at an `s3://bucket/prefix` and provide the
 usual AWS environment variables before running the build command.
 
