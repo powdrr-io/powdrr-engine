@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
 
 use futures::FutureExt;
@@ -13,7 +14,7 @@ use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::data_access::{self, execute_sql_async, load_file_as_table, path_to_table_name};
+use crate::data_access::{self, execute_sql_async, load_files_as_table};
 use crate::data_contract::{
     CreateTable, FileDescriptor, IcebergColumnStats, IcebergFileStats, ServingPattern,
     ServingTableConfig, TableDescription, TableMetadataCheckpoint,
@@ -458,10 +459,11 @@ async fn execute_plan(
 ) -> Result<Vec<Value>, ServingQueryError> {
     let mut rows = vec![];
     let sql_template = sql.to_string();
-    let concurrency = files.len().clamp(1, serving_file_parallelism());
-    let mut results = stream::iter(files.iter().cloned().map(|file| {
+    let file_groups = group_files_by_schema(files);
+    let concurrency = file_groups.len().clamp(1, serving_file_parallelism());
+    let mut results = stream::iter(file_groups.into_iter().map(|files| {
         let local_sql_template = sql_template.clone();
-        async move { execute_file_plan(file, &local_sql_template).await }
+        async move { execute_file_group_plan(files, &local_sql_template).await }
     }))
     .buffer_unordered(concurrency);
 
@@ -505,14 +507,19 @@ fn serving_file_parallelism() -> usize {
         .unwrap_or(4)
 }
 
-async fn execute_file_plan(
-    file: FileDescriptor,
+async fn execute_file_group_plan(
+    files: Vec<FileDescriptor>,
     sql_template: &str,
 ) -> Result<Vec<Value>, ServingQueryError> {
-    let local_name = path_to_table_name(&file.file_path);
-    data_access::reserve(&local_name, file.size, vec![]).await;
+    let local_name = file_group_table_name(&files);
+    let file_paths = files
+        .iter()
+        .map(|file| file.file_path.clone())
+        .collect::<Vec<_>>();
+    let total_size = files.iter().map(|file| file.size).sum::<u64>();
+    data_access::reserve(&local_name, total_size, vec![]).await;
     let result = async {
-        load_file_as_table(&local_name, &file.file_path, true, None)
+        load_files_as_table(&local_name, &file_paths, &files[0].schema.to_arrow_schema())
             .await
             .map_err(|error| {
                 ServingQueryError::new(StatusCode::SERVICE_UNAVAILABLE, &error.to_string())
@@ -530,6 +537,40 @@ async fn execute_file_plan(
     .await;
     data_access::release(&local_name).await;
     result
+}
+
+fn group_files_by_schema(files: &[FileDescriptor]) -> Vec<Vec<FileDescriptor>> {
+    let mut groups: Vec<Vec<FileDescriptor>> = vec![];
+
+    for file in files.iter().cloned() {
+        if let Some(existing_group) = groups.iter_mut().find(|group| {
+            group
+                .first()
+                .map(|existing| existing.schema == file.schema)
+                .unwrap_or(false)
+        }) {
+            existing_group.push(file);
+        } else {
+            groups.push(vec![file]);
+        }
+    }
+
+    groups
+}
+
+fn file_group_table_name(files: &[FileDescriptor]) -> String {
+    let mut file_paths = files
+        .iter()
+        .map(|file| file.file_path.clone())
+        .collect::<Vec<_>>();
+    file_paths.sort();
+
+    let mut hasher = DefaultHasher::new();
+    for file_path in file_paths.iter() {
+        file_path.hash(&mut hasher);
+    }
+
+    format!("table_group_{:016x}", hasher.finish())
 }
 
 fn validate_request(
@@ -1060,8 +1101,8 @@ impl ServingQueryError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ServingExecutionContext, build_sql, plan_request, prune_candidate_files,
-        request_matches_pattern,
+        ServingExecutionContext, build_sql, file_group_table_name, group_files_by_schema,
+        plan_request, prune_candidate_files, request_matches_pattern,
     };
     use crate::data_contract::{
         FileDescriptor, IcebergColumnStats, IcebergFileStats, ServingPattern, ServingTableConfig,
@@ -1079,6 +1120,23 @@ mod tests {
             PowdrrField {
                 name: "score".to_string(),
                 data_type: PowdrrDataType::Integer,
+            },
+            PowdrrField {
+                name: "tenant".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+        ])
+    }
+
+    fn alternate_schema() -> PowdrrSchema {
+        PowdrrSchema::from(&vec![
+            PowdrrField {
+                name: "score".to_string(),
+                data_type: PowdrrDataType::Integer,
+            },
+            PowdrrField {
+                name: "region".to_string(),
+                data_type: PowdrrDataType::String,
             },
             PowdrrField {
                 name: "tenant".to_string(),
@@ -1112,6 +1170,7 @@ mod tests {
                 name: "events".to_string(),
                 tags: HashMap::new(),
                 serving: Some(serving),
+                dynamodb: None,
             },
             checkpoint: TableMetadataCheckpoint::new(
                 "events".to_string(),
@@ -1388,6 +1447,70 @@ mod tests {
                 .map(|file| file.file_path.as_str())
                 .collect::<Vec<_>>(),
             vec!["file://second.parquet"]
+        );
+    }
+
+    #[test]
+    fn test_group_files_by_schema_batches_compatible_files() {
+        let schema = test_schema();
+        let other_schema = alternate_schema();
+        let files = vec![
+            FileDescriptor {
+                file_path: "file://first.parquet".to_string(),
+                schema: schema.clone(),
+                size: 100,
+            },
+            FileDescriptor {
+                file_path: "file://second.parquet".to_string(),
+                schema: schema.clone(),
+                size: 200,
+            },
+            FileDescriptor {
+                file_path: "file://third.parquet".to_string(),
+                schema: other_schema,
+                size: 300,
+            },
+        ];
+
+        let groups = group_files_by_schema(&files);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[0]
+                .iter()
+                .map(|file| file.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["file://first.parquet", "file://second.parquet"]
+        );
+        assert_eq!(
+            groups[1]
+                .iter()
+                .map(|file| file.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["file://third.parquet"]
+        );
+    }
+
+    #[test]
+    fn test_file_group_table_name_is_order_independent() {
+        let schema = test_schema();
+        let forward = vec![
+            FileDescriptor {
+                file_path: "file://alpha.parquet".to_string(),
+                schema: schema.clone(),
+                size: 100,
+            },
+            FileDescriptor {
+                file_path: "file://beta.parquet".to_string(),
+                schema: schema.clone(),
+                size: 200,
+            },
+        ];
+        let reverse = vec![forward[1].clone(), forward[0].clone()];
+
+        assert_eq!(
+            file_group_table_name(&forward),
+            file_group_table_name(&reverse)
         );
     }
 }
