@@ -2,11 +2,11 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 
-use futures::stream::{self, StreamExt};
 use futures::FutureExt;
+use futures::stream::{self, StreamExt};
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{body, Body};
+use gotham::hyper::{Body, body};
 use gotham::mime;
 use gotham::state::{FromState, State};
 use http::StatusCode;
@@ -15,8 +15,8 @@ use serde_json::Value;
 
 use crate::data_access::{self, execute_sql_async, load_file_as_table, path_to_table_name};
 use crate::data_contract::{
-    CreateTable, FileDescriptor, ServingPattern, ServingTableConfig, TableDescription,
-    TableMetadataCheckpoint,
+    CreateTable, FileDescriptor, IcebergColumnStats, IcebergFileStats, ServingPattern,
+    ServingTableConfig, TableDescription, TableMetadataCheckpoint,
 };
 use crate::elastic_search_endpoints::NamePathExtractor;
 use crate::peers::CheckpointDescriptor;
@@ -60,6 +60,7 @@ struct ServingExecutionContext {
     checkpoint: TableMetadataCheckpoint,
     schema: PowdrrSchema,
     files: Vec<FileDescriptor>,
+    file_stats: HashMap<String, IcebergFileStats>,
     snapshot_id: Option<String>,
 }
 
@@ -69,6 +70,7 @@ struct ServingPlan {
     reason: Option<String>,
     limit: usize,
     sql: String,
+    selected_files: Vec<FileDescriptor>,
     files_considered: usize,
     files_selected: usize,
     estimated_bytes: u64,
@@ -101,8 +103,11 @@ pub fn get_serving_config(state: State) -> Pin<Box<HandlerFuture>> {
                 }
             },
             Ok(None) => {
-                let response =
-                    json_response(&state, StatusCode::NOT_FOUND, &json_error("Table not found"));
+                let response = json_response(
+                    &state,
+                    StatusCode::NOT_FOUND,
+                    &json_error("Table not found"),
+                );
                 Ok((state, response))
             }
             Err(error) => {
@@ -198,8 +203,7 @@ pub fn serve_query(mut state: State) -> Pin<Box<HandlerFuture>> {
                 Ok((state, response))
             }
             Err(error) => {
-                let response =
-                    json_response(&state, error.status, &json_error(&error.message));
+                let response = json_response(&state, error.status, &json_error(&error.message));
                 Ok((state, response))
             }
         }
@@ -283,7 +287,7 @@ async fn execute_serving_query(
         });
     }
 
-    let mut rows = execute_plan(&context, &request, &plan.sql, plan.limit).await?;
+    let mut rows = execute_plan(&plan.selected_files, &request, &plan.sql, plan.limit).await?;
     if request.order_by.is_empty() {
         rows.truncate(plan.limit);
     }
@@ -302,20 +306,22 @@ async fn execute_serving_query(
     })
 }
 
-async fn load_serving_context(table_name: &str) -> Result<ServingExecutionContext, ServingQueryError> {
+async fn load_serving_context(
+    table_name: &str,
+) -> Result<ServingExecutionContext, ServingQueryError> {
     let description = match STATE_PROVIDER.describe_table(&table_name.to_string()).await {
         Ok(Some(description)) => description,
         Ok(None) => {
             return Err(ServingQueryError::new(
                 StatusCode::NOT_FOUND,
                 "Table not found",
-            ))
+            ));
         }
         Err(error) => {
             return Err(ServingQueryError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &error.to_string(),
-            ))
+            ));
         }
     };
 
@@ -328,13 +334,13 @@ async fn load_serving_context(table_name: &str) -> Result<ServingExecutionContex
             return Err(ServingQueryError::new(
                 StatusCode::NOT_FOUND,
                 "No checkpoint available for table",
-            ))
+            ));
         }
         Err(error) => {
             return Err(ServingQueryError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &error.to_string(),
-            ))
+            ));
         }
     };
 
@@ -350,13 +356,13 @@ async fn load_serving_context(table_name: &str) -> Result<ServingExecutionContex
             return Err(ServingQueryError::new(
                 StatusCode::NOT_FOUND,
                 "Checkpoint metadata was not found",
-            ))
+            ));
         }
         Err(error) => {
             return Err(ServingQueryError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &error.to_string(),
-            ))
+            ));
         }
     };
 
@@ -366,17 +372,24 @@ async fn load_serving_context(table_name: &str) -> Result<ServingExecutionContex
             return Err(ServingQueryError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "Serving queries currently require Iceberg-backed storage",
-            ))
+            ));
         }
     };
 
     let files = iceberg_metadata.files.as_file_tuples();
+    let file_stats = iceberg_metadata
+        .file_stats
+        .iter()
+        .cloned()
+        .map(|stats| (stats.file_path.clone(), stats))
+        .collect();
     Ok(ServingExecutionContext {
         description,
         schema: iceberg_metadata.table_schema.clone(),
         snapshot_id: iceberg_metadata.snapshot_id.clone(),
         checkpoint,
         files,
+        file_stats,
     })
 }
 
@@ -384,14 +397,9 @@ fn plan_request(
     context: &ServingExecutionContext,
     request: &ServingRequestPlan,
 ) -> Result<ServingPlan, ServingQueryError> {
-    let serving = context
-        .description
-        .serving
-        .clone()
-        .unwrap_or_default();
+    let serving = context.description.serving.clone().unwrap_or_default();
     let limit = request.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     let sql = build_sql("{table}", request, limit)?;
-    let estimated_bytes = context.files.iter().map(|file| file.size).sum::<u64>();
 
     if !request_supported(request) {
         return Ok(ServingPlan {
@@ -400,11 +408,15 @@ fn plan_request(
             reason: Some("Unsupported serving query shape".to_string()),
             limit,
             sql,
+            selected_files: vec![],
             files_considered: context.files.len(),
             files_selected: 0,
             estimated_bytes: 0,
         });
     }
+
+    let selected_files = prune_candidate_files(&context.files, &context.file_stats, request);
+    let estimated_bytes = selected_files.iter().map(|file| file.size).sum::<u64>();
 
     if let Some(pattern) = serving
         .patterns
@@ -417,8 +429,9 @@ fn plan_request(
             reason: None,
             limit,
             sql,
+            selected_files: selected_files.clone(),
             files_considered: context.files.len(),
-            files_selected: context.files.len(),
+            files_selected: selected_files.len(),
             estimated_bytes,
         });
     }
@@ -429,22 +442,23 @@ fn plan_request(
         reason: Some("No declared serving pattern matched this query".to_string()),
         limit,
         sql,
+        selected_files: selected_files.clone(),
         files_considered: context.files.len(),
-        files_selected: context.files.len(),
+        files_selected: selected_files.len(),
         estimated_bytes,
     })
 }
 
 async fn execute_plan(
-    context: &ServingExecutionContext,
+    files: &[FileDescriptor],
     request: &ServingRequestPlan,
     sql: &str,
     limit: usize,
 ) -> Result<Vec<Value>, ServingQueryError> {
     let mut rows = vec![];
     let sql_template = sql.to_string();
-    let concurrency = context.files.len().clamp(1, serving_file_parallelism());
-    let mut results = stream::iter(context.files.iter().cloned().map(|file| {
+    let concurrency = files.len().clamp(1, serving_file_parallelism());
+    let mut results = stream::iter(files.iter().cloned().map(|file| {
         let local_sql_template = sql_template.clone();
         async move { execute_file_plan(file, &local_sql_template).await }
     }))
@@ -467,7 +481,11 @@ fn merge_rows(
 
     if let Some(sort) = request.order_by.first() {
         rows.sort_by(|left, right| {
-            compare_row_values(left.get(&sort.field), right.get(&sort.field), sort.descending)
+            compare_row_values(
+                left.get(&sort.field),
+                right.get(&sort.field),
+                sort.descending,
+            )
         });
         rows.truncate(limit);
         return;
@@ -560,7 +578,7 @@ fn validate_request(
                 return Err(ServingQueryError::new(
                     StatusCode::BAD_REQUEST,
                     &format!("Unknown filter field {}", filter.field),
-                ))
+                ));
             }
         };
         validate_filter(filter, &field.data_type)?;
@@ -602,7 +620,10 @@ fn validate_filter(
         if values.is_empty() || values.len() > MAX_IN_VALUES {
             return Err(ServingQueryError::new(
                 StatusCode::BAD_REQUEST,
-                &format!("IN filter for {} must have 1-{} values", filter.field, MAX_IN_VALUES),
+                &format!(
+                    "IN filter for {} must have 1-{} values",
+                    filter.field, MAX_IN_VALUES
+                ),
             ));
         }
         for value in values.iter() {
@@ -655,7 +676,7 @@ fn validate_literal(
             return Err(ServingQueryError::new(
                 StatusCode::BAD_REQUEST,
                 &format!("Field {} is not supported by the serving MVP", field_name),
-            ))
+            ));
         }
     }
     Ok(())
@@ -679,7 +700,9 @@ fn request_matches_pattern(
     }
 
     let select_fields = normalized_select(request.select.clone());
-    if let (Some(select_fields), Some(projection)) = (select_fields.as_ref(), pattern.projection.as_ref()) {
+    if let (Some(select_fields), Some(projection)) =
+        (select_fields.as_ref(), pattern.projection.as_ref())
+    {
         if !select_fields.iter().all(|field| projection.contains(field)) {
             return false;
         }
@@ -701,7 +724,10 @@ fn request_matches_pattern(
     for filter in request.filters.iter() {
         seen_fields.insert(filter.field.clone());
         let is_eq = filter.eq.is_some() || filter.in_values.is_some();
-        let is_range = filter.gt.is_some() || filter.gte.is_some() || filter.lt.is_some() || filter.lte.is_some();
+        let is_range = filter.gt.is_some()
+            || filter.gte.is_some()
+            || filter.lt.is_some()
+            || filter.lte.is_some();
         if is_eq && !eq_field_set.contains(&filter.field) {
             return false;
         }
@@ -710,7 +736,11 @@ fn request_matches_pattern(
         }
     }
 
-    if !pattern.eq_fields.iter().all(|field| seen_fields.contains(field)) {
+    if !pattern
+        .eq_fields
+        .iter()
+        .all(|field| seen_fields.contains(field))
+    {
         return false;
     }
     if let Some(range_field) = pattern.range_field.as_ref() {
@@ -720,6 +750,149 @@ fn request_matches_pattern(
     }
 
     true
+}
+
+fn prune_candidate_files(
+    files: &[FileDescriptor],
+    file_stats: &HashMap<String, IcebergFileStats>,
+    request: &ServingRequestPlan,
+) -> Vec<FileDescriptor> {
+    files
+        .iter()
+        .filter(|file| {
+            file_stats
+                .get(&file.file_path)
+                .map(|stats| file_may_match_request(stats, request))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect()
+}
+
+fn file_may_match_request(file_stats: &IcebergFileStats, request: &ServingRequestPlan) -> bool {
+    request
+        .filters
+        .iter()
+        .all(|predicate| predicate_may_match_file(file_stats, predicate))
+}
+
+fn predicate_may_match_file(file_stats: &IcebergFileStats, predicate: &ServingPredicate) -> bool {
+    let Some(column_stats) = file_stats
+        .columns
+        .iter()
+        .find(|stats| stats.field_name == predicate.field)
+    else {
+        return true;
+    };
+
+    if let Some(eq) = predicate.eq.as_ref() {
+        return equality_may_match(column_stats, file_stats.record_count, eq);
+    }
+    if let Some(values) = predicate.in_values.as_ref() {
+        return values
+            .iter()
+            .any(|value| equality_may_match(column_stats, file_stats.record_count, value));
+    }
+
+    range_may_match(column_stats, file_stats.record_count, predicate)
+}
+
+fn equality_may_match(
+    column_stats: &IcebergColumnStats,
+    record_count: Option<u64>,
+    value: &Value,
+) -> bool {
+    if column_is_all_null(column_stats, record_count) {
+        return false;
+    }
+
+    if let Some(lower_bound) = column_stats.lower_bound.as_ref() {
+        if matches!(
+            compare_scalar_values(value, lower_bound),
+            Some(Ordering::Less)
+        ) {
+            return false;
+        }
+    }
+    if let Some(upper_bound) = column_stats.upper_bound.as_ref() {
+        if matches!(
+            compare_scalar_values(value, upper_bound),
+            Some(Ordering::Greater)
+        ) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn range_may_match(
+    column_stats: &IcebergColumnStats,
+    record_count: Option<u64>,
+    predicate: &ServingPredicate,
+) -> bool {
+    if column_is_all_null(column_stats, record_count) {
+        return false;
+    }
+
+    if let Some(value) = predicate.gt.as_ref() {
+        if let Some(upper_bound) = column_stats.upper_bound.as_ref() {
+            if matches!(
+                compare_scalar_values(upper_bound, value),
+                Some(Ordering::Less | Ordering::Equal)
+            ) {
+                return false;
+            }
+        }
+    }
+    if let Some(value) = predicate.gte.as_ref() {
+        if let Some(upper_bound) = column_stats.upper_bound.as_ref() {
+            if matches!(
+                compare_scalar_values(upper_bound, value),
+                Some(Ordering::Less)
+            ) {
+                return false;
+            }
+        }
+    }
+    if let Some(value) = predicate.lt.as_ref() {
+        if let Some(lower_bound) = column_stats.lower_bound.as_ref() {
+            if matches!(
+                compare_scalar_values(lower_bound, value),
+                Some(Ordering::Greater | Ordering::Equal)
+            ) {
+                return false;
+            }
+        }
+    }
+    if let Some(value) = predicate.lte.as_ref() {
+        if let Some(lower_bound) = column_stats.lower_bound.as_ref() {
+            if matches!(
+                compare_scalar_values(lower_bound, value),
+                Some(Ordering::Greater)
+            ) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+fn column_is_all_null(column_stats: &IcebergColumnStats, record_count: Option<u64>) -> bool {
+    match (column_stats.null_count, record_count) {
+        (Some(null_count), Some(record_count)) => null_count >= record_count,
+        _ => false,
+    }
+}
+
+fn compare_scalar_values(left: &Value, right: &Value) -> Option<Ordering> {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => left.as_f64()?.partial_cmp(&right.as_f64()?),
+        (Value::String(left), Value::String(right)) => Some(left.cmp(right)),
+        (Value::Bool(left), Value::Bool(right)) => Some(left.cmp(right)),
+        _ => None,
+    }
 }
 
 fn build_sql(
@@ -789,7 +962,11 @@ fn sql_literal(value: &Value) -> Result<String, ServingQueryError> {
     match value {
         Value::String(text) => Ok(format!("'{}'", text.replace('\'', "''"))),
         Value::Number(number) => Ok(number.to_string()),
-        Value::Bool(boolean) => Ok(if *boolean { "TRUE".to_string() } else { "FALSE".to_string() }),
+        Value::Bool(boolean) => Ok(if *boolean {
+            "TRUE".to_string()
+        } else {
+            "FALSE".to_string()
+        }),
         _ => Err(ServingQueryError::new(
             StatusCode::BAD_REQUEST,
             "Only scalar literals are supported in serving queries",
@@ -840,16 +1017,18 @@ fn escape_identifier(identifier: &str) -> String {
     identifier.replace('"', "\"\"")
 }
 
-async fn parse_json_body<T: for<'de> Deserialize<'de>>(
-    state: &mut State,
-) -> Result<T, String> {
+async fn parse_json_body<T: for<'de> Deserialize<'de>>(state: &mut State) -> Result<T, String> {
     let valid_body = body::to_bytes(Body::take_from(state))
         .await
         .map_err(|error| error.to_string())?;
     serde_json::from_slice::<T>(&valid_body).map_err(|error| error.to_string())
 }
 
-fn json_response<T: Serialize>(state: &State, status: StatusCode, body: &T) -> gotham::hyper::Response<Body> {
+fn json_response<T: Serialize>(
+    state: &State,
+    status: StatusCode,
+    body: &T,
+) -> gotham::hyper::Response<Body> {
     create_response(
         state,
         status,
@@ -880,11 +1059,100 @@ impl ServingQueryError {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_sql, request_matches_pattern,
+        ServingExecutionContext, build_sql, plan_request, prune_candidate_files,
+        request_matches_pattern,
     };
-    use crate::data_contract::ServingPattern;
-    use crate::serving_plan::{ServingPredicate, ServingRequestPlan, ServingSort};
+    use crate::data_contract::{
+        FileDescriptor, IcebergColumnStats, IcebergFileStats, ServingPattern, ServingTableConfig,
+        TableDescription, TableMetadataCheckpoint,
+    };
+    use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
+    use crate::serving_plan::{
+        ServingPredicate, ServingQueryClassification, ServingRequestPlan, ServingSort,
+    };
     use serde_json::json;
+    use std::collections::HashMap;
+
+    fn test_schema() -> PowdrrSchema {
+        PowdrrSchema::from(&vec![
+            PowdrrField {
+                name: "score".to_string(),
+                data_type: PowdrrDataType::Integer,
+            },
+            PowdrrField {
+                name: "tenant".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+        ])
+    }
+
+    fn test_files(schema: &PowdrrSchema) -> Vec<FileDescriptor> {
+        vec![
+            FileDescriptor {
+                file_path: "file://first.parquet".to_string(),
+                schema: schema.clone(),
+                size: 100,
+            },
+            FileDescriptor {
+                file_path: "file://second.parquet".to_string(),
+                schema: schema.clone(),
+                size: 200,
+            },
+        ]
+    }
+
+    fn test_context(
+        serving: ServingTableConfig,
+        file_stats: Vec<IcebergFileStats>,
+    ) -> ServingExecutionContext {
+        let schema = test_schema();
+        ServingExecutionContext {
+            description: TableDescription {
+                name: "events".to_string(),
+                tags: HashMap::new(),
+                serving: Some(serving),
+            },
+            checkpoint: TableMetadataCheckpoint::new(
+                "events".to_string(),
+                "checkpoint_1".to_string(),
+                schema.clone(),
+            ),
+            schema: schema.clone(),
+            files: test_files(&schema),
+            file_stats: file_stats
+                .into_iter()
+                .map(|stats| (stats.file_path.clone(), stats))
+                .collect(),
+            snapshot_id: Some("snapshot_1".to_string()),
+        }
+    }
+
+    fn column_stats(
+        field_name: &str,
+        null_count: Option<u64>,
+        lower_bound: Option<serde_json::Value>,
+        upper_bound: Option<serde_json::Value>,
+    ) -> IcebergColumnStats {
+        IcebergColumnStats {
+            field_id: if field_name == "tenant" { 1 } else { 2 },
+            field_name: field_name.to_string(),
+            null_count,
+            lower_bound,
+            upper_bound,
+        }
+    }
+
+    fn file_stats(
+        file_path: &str,
+        record_count: Option<u64>,
+        columns: Vec<IcebergColumnStats>,
+    ) -> IcebergFileStats {
+        IcebergFileStats {
+            file_path: file_path.to_string(),
+            record_count,
+            columns,
+        }
+    }
 
     #[test]
     fn test_build_sql_for_range_top_n() {
@@ -943,5 +1211,182 @@ mod tests {
         };
 
         assert!(request_matches_pattern(&request, &pattern, 3));
+    }
+
+    #[test]
+    fn test_plan_request_prunes_files_for_fast_path_eq_query() {
+        let context = test_context(
+            ServingTableConfig {
+                patterns: vec![ServingPattern {
+                    name: "tenant_lookup".to_string(),
+                    eq_fields: vec!["tenant".to_string()],
+                    range_field: None,
+                    order_field: None,
+                    descending: false,
+                    max_limit: Some(25),
+                    projection: None,
+                }],
+            },
+            vec![
+                file_stats(
+                    "file://first.parquet",
+                    Some(10),
+                    vec![column_stats(
+                        "tenant",
+                        Some(0),
+                        Some(json!("acme")),
+                        Some(json!("acme")),
+                    )],
+                ),
+                file_stats(
+                    "file://second.parquet",
+                    Some(10),
+                    vec![column_stats(
+                        "tenant",
+                        Some(0),
+                        Some(json!("omega")),
+                        Some(json!("omega")),
+                    )],
+                ),
+            ],
+        );
+        let request = ServingRequestPlan {
+            select: None,
+            filters: vec![ServingPredicate {
+                field: "tenant".to_string(),
+                eq: Some(json!("acme")),
+                in_values: None,
+                gt: None,
+                gte: None,
+                lt: None,
+                lte: None,
+            }],
+            order_by: vec![],
+            limit: Some(10),
+            allow_slow_path: false,
+            explain: false,
+        };
+
+        let plan = plan_request(&context, &request).unwrap();
+
+        assert_eq!(plan.classification, ServingQueryClassification::FastPath);
+        assert_eq!(plan.files_considered, 2);
+        assert_eq!(plan.files_selected, 1);
+        assert_eq!(plan.estimated_bytes, 100);
+        assert_eq!(
+            plan.selected_files
+                .iter()
+                .map(|file| file.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["file://first.parquet"]
+        );
+    }
+
+    #[test]
+    fn test_plan_request_prunes_files_for_range_query() {
+        let context = test_context(
+            ServingTableConfig {
+                patterns: vec![ServingPattern {
+                    name: "score_scan".to_string(),
+                    eq_fields: vec![],
+                    range_field: Some("score".to_string()),
+                    order_field: None,
+                    descending: false,
+                    max_limit: None,
+                    projection: None,
+                }],
+            },
+            vec![
+                file_stats(
+                    "file://first.parquet",
+                    Some(10),
+                    vec![column_stats(
+                        "score",
+                        Some(0),
+                        Some(json!(0)),
+                        Some(json!(10)),
+                    )],
+                ),
+                file_stats(
+                    "file://second.parquet",
+                    Some(10),
+                    vec![column_stats(
+                        "score",
+                        Some(0),
+                        Some(json!(60)),
+                        Some(json!(100)),
+                    )],
+                ),
+            ],
+        );
+        let request = ServingRequestPlan {
+            select: None,
+            filters: vec![ServingPredicate {
+                field: "score".to_string(),
+                eq: None,
+                in_values: None,
+                gt: None,
+                gte: Some(json!(50)),
+                lt: None,
+                lte: None,
+            }],
+            order_by: vec![],
+            limit: Some(10),
+            allow_slow_path: false,
+            explain: false,
+        };
+
+        let plan = plan_request(&context, &request).unwrap();
+
+        assert_eq!(plan.classification, ServingQueryClassification::FastPath);
+        assert_eq!(plan.files_selected, 1);
+        assert_eq!(plan.estimated_bytes, 200);
+        assert_eq!(
+            plan.selected_files
+                .iter()
+                .map(|file| file.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["file://second.parquet"]
+        );
+    }
+
+    #[test]
+    fn test_prune_candidate_files_keeps_unknown_stats_and_drops_all_nulls() {
+        let schema = test_schema();
+        let files = test_files(&schema);
+        let file_stats = HashMap::from([(
+            "file://first.parquet".to_string(),
+            file_stats(
+                "file://first.parquet",
+                Some(10),
+                vec![column_stats("tenant", Some(10), None, None)],
+            ),
+        )]);
+        let request = ServingRequestPlan {
+            select: None,
+            filters: vec![ServingPredicate {
+                field: "tenant".to_string(),
+                eq: Some(json!("acme")),
+                in_values: None,
+                gt: None,
+                gte: None,
+                lt: None,
+                lte: None,
+            }],
+            order_by: vec![],
+            limit: Some(10),
+            allow_slow_path: false,
+            explain: false,
+        };
+
+        let selected_files = prune_candidate_files(&files, &file_stats, &request);
+
+        assert_eq!(
+            selected_files
+                .iter()
+                .map(|file| file.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["file://second.parquet"]
+        );
     }
 }
