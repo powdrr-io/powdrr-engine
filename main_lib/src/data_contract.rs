@@ -456,6 +456,8 @@ pub struct CreateTable {
     pub tags: HashMap<String, String>,
     #[serde(default)]
     pub serving: Option<ServingTableConfig>,
+    #[serde(default)]
+    pub dynamodb: Option<DynamoDbTableConfig>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -464,6 +466,8 @@ pub struct TableDescription {
     pub tags: HashMap<String, String>,
     #[serde(default)]
     pub serving: Option<ServingTableConfig>,
+    #[serde(default)]
+    pub dynamodb: Option<DynamoDbTableConfig>,
 }
 
 impl TableDescription {
@@ -472,6 +476,7 @@ impl TableDescription {
             name: create_table.name.clone(),
             tags: create_table.tags.clone(),
             serving: create_table.serving.clone(),
+            dynamodb: create_table.dynamodb.clone(),
         }
     }
 }
@@ -499,6 +504,12 @@ pub struct ServingPattern {
     pub projection: Option<Vec<String>>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct DynamoDbTableConfig {
+    pub partition_key: String,
+    #[serde(default)]
+    pub sort_key: Option<String>,
+}
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AddAlias {
     pub table_name: String,

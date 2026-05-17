@@ -6,6 +6,7 @@ pub mod data_contract;
 mod data_fusion_functions;
 mod distributed_cache;
 mod dynamodb;
+mod dynamodb_protocol;
 pub mod dynamodb_service_impl;
 mod dynamodb_state_provider;
 mod elastic_search_cluster_info;

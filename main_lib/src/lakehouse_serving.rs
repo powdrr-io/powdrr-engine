@@ -147,6 +147,7 @@ pub fn put_serving_config(mut state: State) -> Pin<Box<HandlerFuture>> {
             name: path.clone(),
             tags,
             serving: Some(body.clone()),
+            dynamodb: None,
         };
 
         match STATE_PROVIDER.upsert_table_metadata(&request).await {
@@ -207,7 +208,7 @@ pub fn serve_query(mut state: State) -> Pin<Box<HandlerFuture>> {
     .boxed()
 }
 
-async fn execute_serving_query(
+pub async fn execute_serving_query(
     table_name: &str,
     request: ServingRequestPlan,
 ) -> Result<ServingQueryResponse, ServingQueryError> {
@@ -863,9 +864,9 @@ fn json_error(message: &str) -> Value {
 }
 
 #[derive(Debug)]
-struct ServingQueryError {
-    status: StatusCode,
-    message: String,
+pub struct ServingQueryError {
+    pub status: StatusCode,
+    pub message: String,
 }
 
 impl ServingQueryError {

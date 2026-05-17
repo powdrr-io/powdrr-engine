@@ -44,7 +44,21 @@ impl DynamoDbStateProvider {
 
     #[allow(dead_code)]
     pub async fn get_all_iceberg_tables(&mut self) -> Result<Vec<String>, ServiceApiError> {
-        self.service_impl.get_all_iceberg_tables().await
+        let entities = self
+            .service_impl
+            .connector
+            .fetch_entities(
+                &self.fake_org_info.org_id,
+                &"powdrr_table".to_string(),
+                None,
+            )
+            .await
+            .map_err(|error| ServiceApiError::new(error.to_string()))?;
+        Ok(entities
+            .entities
+            .into_iter()
+            .map(|entity| entity.entity_id)
+            .collect())
     }
 
     pub async fn create_table(&mut self, create_table: &CreateTable) -> Result<bool, ServiceApiError> {
