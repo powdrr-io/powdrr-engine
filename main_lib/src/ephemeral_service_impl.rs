@@ -126,7 +126,12 @@ impl EphemeralServiceImpl {
         if !self.tables.contains_key(&metadata.table_name) {
             self.tables.insert(
                 metadata.table_name.clone(),
-                TableDescription{ name: metadata.table_name.clone(), tags: Default::default() }
+                TableDescription {
+                    name: metadata.table_name.clone(),
+                    tags: Default::default(),
+                    serving: None,
+                    dynamodb: None,
+                }
             );
         }
         let key = format!("{}_{}", &metadata.table_name, &metadata.checkpoint_id);
@@ -462,15 +467,13 @@ impl EphemeralServiceImpl {
     }
 
     pub async fn get_all_iceberg_tables(&mut self) -> Result<Vec<String>, ServiceApiError> {
-        todo!()
+        Ok(self.tables.keys().cloned().collect())
     }
 
     pub async fn create_table(&mut self, _org_info: &OrgInfo, create_table: &CreateTable) -> Result<bool, ServiceApiError> {
         match self.tables.get(&create_table.name) {
             Some(_) => {
-                self.tables.remove(&create_table.name);
                 self.tables.insert(create_table.name.clone(), TableDescription::from_create_table(create_table));
-                self.not_compacted_checkpoint_ids.insert(create_table.name.clone(), Vec::new());
             }
             None => {
                 self.tables.insert(create_table.name.clone(), TableDescription::from_create_table(create_table));

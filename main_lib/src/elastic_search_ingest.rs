@@ -308,6 +308,8 @@ pub(crate) async fn create_index(
         .create_table(&CreateTable {
             name: table.clone(),
             tags: HashMap::from([("_es_original".to_string(), serialized_body)]),
+            serving: None,
+            dynamodb: None,
         })
         .await
         .map_err(|e| IngestError::from_service_api_error(e))?;

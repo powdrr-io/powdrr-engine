@@ -350,6 +350,8 @@ mod tests {
         let body = CreateTable {
             name: "the_name".to_string(),
             tags: Default::default(),
+            serving: None,
+            dynamodb: None,
         };
 
         let client = test_server.client();
