@@ -15,6 +15,7 @@ Repo-wide instructions for agent work in this checkout of `powdrr-engine`.
 - **Never implement changes from the primary checkout at repo root.**
 - **The primary checkout must stay clean.**
 - Every implementation task must run in its own linked worktree under `.worktrees/`.
+- A worktree is not ready for Rust commands until `scripts/setup-worktree.sh` has run successfully there.
 - Read-only exploration may happen from the primary checkout, but stop and create or resume a worktree before the first file edit, commit, generated repo-tracked output, or "ready" claim.
 - Never commit directly to `main`.
 - Never rewrite shared history unless the user explicitly asks for it.
@@ -38,9 +39,9 @@ Repo-wide instructions for agent work in this checkout of `powdrr-engine`.
 ## Standard Workflow
 1. Explore from the root checkout if needed, but do not edit there.
 2. Verify the root checkout is clean and on `main`.
-3. Create a task worktree from `origin/main`.
-4. Run `scripts/setup-worktree.sh` once in the new worktree so `target/` becomes a symlink to the shared repo-level `.cargo-target/` cache.
-5. Run Cargo commands from the worktree through `scripts/cargo-worktree.sh` whenever possible.
+3. Create or resume a task worktree under `.worktrees/`.
+4. Run `scripts/setup-worktree.sh` immediately in that worktree. This is required so `target/` points at the shared repo-level `.cargo-target/` cache instead of consuming duplicate disk in each checkout.
+5. Use `scripts/cargo-worktree.sh` as the default entrypoint for Cargo commands in the worktree. If plain `cargo` is used, it must still run from that bootstrapped worktree.
 6. Do all edits, tests, commits, and generated tracked outputs inside that worktree only.
 7. Validate the touched surface before calling the change ready.
 8. Report exactly which checks passed, failed, or were not run.
@@ -75,6 +76,7 @@ scripts/cargo-worktree.sh check -p <crate>
 
 ## Validation Expectations
 - Run targeted checks while iterating.
+- Bootstrap or re-check the worktree setup before Rust validation if `target/` is missing or looks wrong.
 - Prefer `scripts/cargo-worktree.sh nextest run` for the fast default test loop, and keep `cargo test --doc` as a separate step.
 - Prefer `scripts/cargo-worktree.sh check -p <crate>` or `scripts/cargo-worktree.sh test -p <crate>` over whole-workspace commands during the edit loop.
 - Run formatting before handoff: `cargo fmt --all`.
