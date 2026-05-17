@@ -1,14 +1,13 @@
 use crate::elastic_search_commands::{SqlCommand, UpdateByQueryCommand};
 use crate::elastic_search_common::{
-    execute_command, Command, CommandContext, ElasticSearchResponse, ParseError,
-    ResultGeneratorFuture,
+    Command, CommandContext, ElasticSearchResponse, ParseError, ResultGeneratorFuture,
+    execute_command,
 };
 use crate::elastic_search_datetime_parser;
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::elastic_search_responses::{
-    compare_query_result_hits_desc, AggregationResult, AverageAggregationResult,
-    FilterAggregationResult, QueryFailure, QueryResults, TermAggregationBucket,
-    TermAggregationResult,
+    AggregationResult, AverageAggregationResult, FilterAggregationResult, QueryFailure,
+    QueryResults, TermAggregationBucket, TermAggregationResult, compare_query_result_hits_desc,
 };
 use crate::peers::{
     CheckpointDescriptor, PrivateInvocation, PrivateSearchAggregationFilterSpec,
@@ -107,6 +106,11 @@ pub(crate) struct SearchCommand {
     typed_aggregation_specs: Option<Vec<PrivateSearchAggregationSpec>>,
     typed_sort_specs: Vec<PrivateSearchSortSpec>,
     backend: SearchBackend,
+}
+
+pub(crate) struct CountCommandResult {
+    pub total_hits: u64,
+    pub num_shards: u32,
 }
 
 impl SearchCommand {
@@ -232,7 +236,7 @@ pub(crate) async fn execute_search_command(
             return QueryFailure {
                 message: format!("{:?}", e),
             }
-            .to_response()
+            .to_response();
         }
     };
 
@@ -300,6 +304,52 @@ pub(crate) async fn execute_search_command(
         total_hits_complex,
     )
     .to_response()
+}
+
+pub(crate) async fn execute_count_command(
+    command: Arc<SearchCommand>,
+) -> Result<CountCommandResult, ElasticSearchResponse> {
+    let invocation = match command.private_search_invocation().await {
+        Some(invocation) => invocation,
+        None => {
+            return Ok(CountCommandResult {
+                total_hits: 0,
+                num_shards: 1,
+            });
+        }
+    };
+
+    if invocation.checkpoints.is_empty() {
+        return Ok(CountCommandResult {
+            total_hits: 0,
+            num_shards: 1,
+        });
+    }
+
+    let peer_clients = STATE_PROVIDER.get_peer_clients().await;
+    let num_peers = peer_clients.len();
+    let peer_calls = peer_clients.iter().enumerate().map(|(index, peer_client)| {
+        peer_client.private_search(&invocation, index as u64, num_peers as u64)
+    });
+
+    let peer_results = match try_join_all(peer_calls).await {
+        Ok(results) => results,
+        Err(e) => {
+            return Err(QueryFailure {
+                message: format!("{:?}", e),
+            }
+            .to_response());
+        }
+    };
+
+    let total_hits = peer_results
+        .iter()
+        .map(|result| result.total_hits)
+        .sum::<usize>() as u64;
+    Ok(CountCommandResult {
+        total_hits,
+        num_shards: num_peers as u32,
+    })
 }
 
 pub(crate) fn search_plan_to_command(

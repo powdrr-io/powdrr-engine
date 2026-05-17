@@ -2,8 +2,8 @@ use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::error::DataFusionError;
-use futures_util::future::try_join_all;
 use futures_util::StreamExt;
+use futures_util::future::try_join_all;
 use idgenerator::IdInstance;
 use prost::Message;
 use std::{error::Error, fmt};
@@ -13,7 +13,7 @@ use crate::data_contract::{
     ExtensionFileMetadata, FileDescriptor, IcebergMetadata, SpeedboatMetadata,
 };
 use crate::elastic_search_index::create_index_inner;
-use crate::elastic_search_responses::{compare_query_result_hits_desc, QueryResultHit};
+use crate::elastic_search_responses::{QueryResultHit, compare_query_result_hits_desc};
 use crate::peers::{
     CheckpointDescriptor, PrivateCompactionInvocation, PrivateExtensionInvocation,
     PrivatePrefetchInvocation, PrivateSearchAggregationFilterSpec, PrivateSearchAggregationPartial,
@@ -144,7 +144,7 @@ async fn determine_required_files(
         Err(_e) => {
             return log_err(PrivateApiError {
                 message: "Error calling get checkpoint".to_string(),
-            })
+            });
         }
     };
 
@@ -373,7 +373,7 @@ async fn process_speedboat_file(
                 return {
                     data_access::release(&local_name).await;
                     log_err(PrivateApiError::from(e))
-                }
+                };
             }
         };
     data_access::release(&local_name).await;
@@ -462,6 +462,17 @@ pub(crate) async fn search_query(
         Err(e) => return Err(PrivateApiError { message: e.message }),
     };
 
+    let total_hits = serde_result.values.len();
+    let aggregations =
+        compute_search_aggregation_partials(&serde_result.values, &invocation.aggregations);
+    if invocation.size == 0 {
+        return Ok(PrivateSearchResult {
+            hits: vec![],
+            total_hits,
+            aggregations,
+        });
+    }
+
     let mut hits = serde_result
         .values
         .iter()
@@ -485,10 +496,7 @@ pub(crate) async fn search_query(
         hits.sort_by(compare_query_result_hits_desc);
     }
 
-    let total_hits = hits.len();
     hits.truncate(invocation.size);
-    let aggregations =
-        compute_search_aggregation_partials(&serde_result.values, &invocation.aggregations);
 
     Ok(PrivateSearchResult {
         hits,

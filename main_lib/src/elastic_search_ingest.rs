@@ -1,11 +1,11 @@
 use crate::data_access;
 use crate::data_contract::{
-    CreateIndexBody, CreateIndexResult, CreateIndexTemplateBody, CreateTable, SpeedboatCommit,
-    SpeedboatCommitTableInfo, TableDescription,
+    AliasInfo, CreateIndexBody, CreateIndexResult, CreateIndexTemplateBody, CreateTable,
+    SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription,
 };
 use crate::elastic_search_commands::LookupById;
 use crate::elastic_search_common::{
-    load_command_raw_result, CommandContext, ElasticSearchResponse, MIME_ES_JSON,
+    CommandContext, ElasticSearchResponse, MIME_ES_JSON, load_command_raw_result,
 };
 use crate::elastic_search_parser::UpdateBody;
 use crate::elastic_search_responses::{
@@ -15,16 +15,16 @@ use crate::elastic_search_storage_schema::{
     FullRecord, RecordDelete, RecordInput, SpeedboatCommitBuilder,
 };
 use crate::schema_massager::PowdrrSchema;
-use crate::search_runtime::{df_to_serde_value, SerdeValueResult};
-use crate::state_provider::{ServiceApiError, STATE_PROVIDER};
+use crate::search_runtime::{SerdeValueResult, df_to_serde_value};
+use crate::state_provider::{STATE_PROVIDER, ServiceApiError};
 use crate::util::{describe_table_log_error_then_none, log_err, log_service_err};
 use arrow_ipc::writer::StreamWriter;
 use arrow_json::LineDelimitedWriter;
 use datafusion::arrow::ipc::writer::FileWriter;
 use futures::FutureExt;
 use gotham::mime;
-use http::header::LOCATION;
 use http::StatusCode;
+use http::header::LOCATION;
 use idgenerator::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -114,7 +114,7 @@ impl WriteBuffer {
                 Err(e) => {
                     return Err(IngestError {
                         message: format!("{}", e).to_string(),
-                    })
+                    });
                 }
                 _ => (),
             }
@@ -293,7 +293,7 @@ pub(crate) async fn create_index(
             Err(_e) => {
                 return log_err(IngestError {
                     message: "body parsing error".to_string(),
-                })
+                });
             }
         }
         // TODO: fill in defaults
@@ -330,6 +330,55 @@ pub(crate) async fn create_index(
     })
 }
 
+async fn update_index_alias_metadata<F>(table_name: &String, update: F) -> Result<(), IngestError>
+where
+    F: FnOnce(&mut HashMap<String, AliasInfo>),
+{
+    let table_description = STATE_PROVIDER
+        .describe_table(table_name)
+        .await
+        .map_err(IngestError::from_service_api_error)?
+        .ok_or_else(|| IngestError {
+            message: format!("index does not exist: {}", table_name),
+        })?;
+
+    let mut create_index_body = table_description
+        .tags
+        .get("_es_original")
+        .and_then(|value| CreateIndexBody::parse(value).ok())
+        .unwrap_or(CreateIndexBody {
+            aliases: None,
+            mappings: None,
+            settings: None,
+        });
+
+    let mut aliases = create_index_body.aliases.clone().unwrap_or_default();
+    update(&mut aliases);
+    create_index_body.aliases = if aliases.is_empty() {
+        None
+    } else {
+        Some(aliases)
+    };
+
+    let mut tags = table_description.tags.clone();
+    tags.insert(
+        "_es_original".to_string(),
+        serde_json::to_string(&create_index_body).unwrap(),
+    );
+
+    STATE_PROVIDER
+        .upsert_table_metadata(&CreateTable {
+            name: table_description.name,
+            tags,
+            serving: table_description.serving,
+            dynamodb: table_description.dynamodb,
+        })
+        .await
+        .map_err(IngestError::from_service_api_error)?;
+
+    Ok(())
+}
+
 pub(crate) async fn create_index_template(
     table: &String,
     body: &String,
@@ -339,7 +388,7 @@ pub(crate) async fn create_index_template(
         Err(_e) => {
             return log_err(IngestError {
                 message: "body parsing error".to_string(),
-            })
+            });
         }
     };
 
@@ -408,7 +457,7 @@ pub(crate) async fn update_aliases(body: &String) -> Result<(), IngestError> {
         Err(_e) => {
             return log_err(IngestError {
                 message: "body parsing error".to_string(),
-            })
+            });
         }
     };
 
@@ -420,12 +469,20 @@ pub(crate) async fn update_aliases(body: &String) -> Result<(), IngestError> {
                     .add_alias(&a.add.index, &a.add.alias)
                     .await
                     .map_err(|e| IngestError::from_service_api_error(e))?;
+                update_index_alias_metadata(&a.add.index, |aliases| {
+                    aliases.insert(a.add.alias.clone(), AliasInfo { is_hidden: false });
+                })
+                .await?;
             }
             AliasAction::Remove(r) => {
                 STATE_PROVIDER
                     .remove_alias(&r.remove.index, &r.remove.alias)
                     .await
                     .map_err(|e| IngestError::from_service_api_error(e))?;
+                update_index_alias_metadata(&r.remove.index, |aliases| {
+                    aliases.remove(&r.remove.alias);
+                })
+                .await?;
             }
             AliasAction::RemoveIndex(_) => {
                 panic!("TODO: What does this mean?")
@@ -531,7 +588,7 @@ pub(crate) async fn write_to_file(
             Err(_) => {
                 return Err(IngestError {
                     message: "File error".to_string(),
-                })
+                });
             }
         };
         Ok((file_path, size))
@@ -626,7 +683,7 @@ async fn create_single_worker(
         None => {
             return Err(IngestError {
                 message: "Index does not exist".to_string(),
-            })
+            });
         }
     };
     let doc: Result<Value, serde_json::Error> = serde_json::from_str(payload);
@@ -640,7 +697,10 @@ async fn create_single_worker(
                 let response = SingleDocCreateFailedResult {
                     error: ErrorDetails::single_cause(
                         &"version_conflict_engine_exception".to_string(),
-                        &format!("[{}]: version conflict, document already exists (current version [{}])", doc_id, 1),
+                        &format!(
+                            "[{}]: version conflict, document already exists (current version [{}])",
+                            doc_id, 1
+                        ),
                         Some("what is an index uuid?".to_string()),
                         Some("1".to_string()),
                         Some(index.to_string()),
@@ -736,7 +796,7 @@ async fn update_single_worker(
             None => {
                 return Err(IngestError {
                     message: "Index does not exist".to_string(),
-                })
+                });
             }
         },
         Err(e) => {
@@ -755,7 +815,7 @@ async fn update_single_worker(
                 mime: mime::APPLICATION_JSON,
                 body: "Bad request".to_string(),
                 headers: vec![],
-            })
+            });
         }
     };
 
@@ -837,7 +897,7 @@ pub(crate) async fn delete(
         None => {
             return Err(IngestError {
                 message: "Index does not exist".to_string(),
-            })
+            });
         }
     };
 
@@ -918,7 +978,7 @@ pub(crate) async fn ingest(
                             None => {
                                 return Err(IngestError {
                                     message: "Must provide index name".to_string(),
-                                })
+                                });
                             }
                         },
                     };
@@ -927,13 +987,15 @@ pub(crate) async fn ingest(
                         None => {
                             return Err(IngestError {
                                 message: "Index does not exist".to_string(),
-                            })
+                            });
                         }
                     };
                     let doc_str = match iterator.next() {
-                            Some(ds) => ds.trim(),
-                            None => panic!("How do I make my own error? This should return an error instead of panic")
-                        };
+                        Some(ds) => ds.trim(),
+                        None => panic!(
+                            "How do I make my own error? This should return an error instead of panic"
+                        ),
+                    };
                     let doc: Result<Value, serde_json::Error> = serde_json::from_str(doc_str);
                     match doc {
                         Ok(valid_doc) => {
@@ -948,7 +1010,7 @@ pub(crate) async fn ingest(
                         Err(e) => {
                             return Err(IngestError {
                                 message: format!("Serde error doc: {}", e),
-                            })
+                            });
                         }
                     }
                 }
@@ -973,7 +1035,7 @@ pub(crate) async fn ingest(
                             None => {
                                 return Err(IngestError {
                                     message: "Must provide index name".to_string(),
-                                })
+                                });
                             }
                         },
                     };
@@ -982,7 +1044,7 @@ pub(crate) async fn ingest(
                         None => {
                             return Err(IngestError {
                                 message: "Index does not exist".to_string(),
-                            })
+                            });
                         }
                     };
                     let existing_docs =
@@ -992,9 +1054,11 @@ pub(crate) async fn ingest(
                         todo!("Need to handle this case")
                     }
                     let doc_str = match iterator.next() {
-                            Some(ds) => ds.trim(),
-                            None => panic!("How do I make my own error? This should return an error instead of panic")
-                        };
+                        Some(ds) => ds.trim(),
+                        None => panic!(
+                            "How do I make my own error? This should return an error instead of panic"
+                        ),
+                    };
                     let doc: Result<UpdateBody, serde_json::Error> = serde_json::from_str(doc_str);
                     match doc {
                         Ok(update_request) => {
@@ -1025,7 +1089,7 @@ pub(crate) async fn ingest(
                         Err(e) => {
                             return Err(IngestError {
                                 message: format!("Serde error doc: {}", e),
-                            })
+                            });
                         }
                     }
                 }
@@ -1036,7 +1100,7 @@ pub(crate) async fn ingest(
             Err(e) => {
                 return Err(IngestError {
                     message: format!("Serde error command: {}", e),
-                })
+                });
             }
         }
     }
