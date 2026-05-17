@@ -1450,6 +1450,7 @@ mod tests {
                     .map(|field| field.name.clone())
                     .collect(),
                 column_stats: vec![],
+                file_stats: vec![],
             }),
             speedboat_metadata: None,
             deletes_metadata: None,
