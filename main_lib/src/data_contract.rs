@@ -510,7 +510,6 @@ pub struct DynamoDbTableConfig {
     #[serde(default)]
     pub sort_key: Option<String>,
 }
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AddAlias {
     pub table_name: String,

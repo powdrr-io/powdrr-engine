@@ -1,3 +1,26 @@
+## BUILD SPEED
+
+Run Cargo from linked worktrees through `scripts/cargo-worktree.sh`.
+
+- The script computes the repo root from `git rev-parse --git-common-dir`.
+- It exports a shared `CARGO_TARGET_DIR` at `.cargo-target/` in the repo root.
+- That lets linked worktrees reuse the same compiled dependency cache instead of creating a fresh `target/` tree per worktree.
+
+Examples:
+
+```
+scripts/cargo-worktree.sh check -p powdrr-cli
+scripts/cargo-worktree.sh test -p powdrr_lib -- --nocapture --test-threads=1
+scripts/cargo-worktree.sh build --timings
+```
+
+The workspace now excludes `powdrr-benchmark` from default root-level `cargo build`,
+`cargo check`, and `cargo test` commands. Run benchmark builds explicitly when needed:
+
+```
+scripts/cargo-worktree.sh run -p powdrr-benchmark
+```
+
 ## RUNNING TESTS
 
 https://www.elastic.co/blog/getting-started-with-the-elastic-stack-and-docker-compose
@@ -9,24 +32,64 @@ curl -X PUT http://localhost:9200/_test/v1/_testing_and_processing_mode
 Some of the tests use shared data state so they must be run single threaded.
 
 ```
-RUST_BACKTRACE=1 cargo test -- --nocapture --test-threads=1
+RUST_BACKTRACE=1 scripts/cargo-worktree.sh test -- --nocapture --test-threads=1
 ```
 
 Run flamegraph
 
 ```
-CARGO_PROFILE_RELEASE_DEBUG=true cargo flamegraph
-CARGO_PROFILE_RELEASE_DEBUG=true cargo flamegraph --package powdrr-io-engine -- 9200
+CARGO_PROFILE_RELEASE_DEBUG=true scripts/cargo-worktree.sh flamegraph
+CARGO_PROFILE_RELEASE_DEBUG=true scripts/cargo-worktree.sh flamegraph --package powdrr-io-engine -- 9200
 ```
 
 
 Run the benchmark
 
 ```
-cargo run --package powdrr-io-engine --release 9200
-cargo run --package powdrr-io-engine --release 9201
-cargo run --package powdrr-benchmark
+scripts/cargo-worktree.sh run --package powdrr-io-engine --release 9200
+scripts/cargo-worktree.sh run --package powdrr-io-engine --release 9201
+scripts/cargo-worktree.sh run --package powdrr-benchmark
 ```
+
+## LOCAL ELASTIC CLI
+
+`powdrr-cli` includes an `elastic` mode that reuses the existing Powdrr
+search stack without starting the HTTP service.
+
+The CLI works by:
+
+- mirroring parquet files into a local cache directory
+- building the existing `_search_index.parquet` sidecars against the cached files
+- executing queries locally through the same parser and executor used by the service
+
+Current constraints:
+
+- the parquet data must have a stable document id column
+- pass that column with `--doc-id-field` unless it is already `_id_seq_no`
+- for S3 sources, the build step mirrors the source data into the local cache and
+  queries run against that cache
+
+Build a cache and BM25 sidecars:
+
+```
+scripts/cargo-worktree.sh run -p powdrr-cli -- elastic build \
+  --source /path/to/parquet-dir \
+  --cache-dir /tmp/powdrr-search \
+  --table logs \
+  --doc-id-field doc_id \
+  --replace
+```
+
+Query that cache with the Elasticsearch JSON body Powdrr already supports:
+
+```
+scripts/cargo-worktree.sh run -p powdrr-cli -- elastic query \
+  --cache-dir /tmp/powdrr-search \
+  --body-file clients/query.json
+```
+
+For S3 sources, point `--source` at an `s3://bucket/prefix` and provide the
+usual AWS environment variables before running the build command.
 
 Run test script
 
