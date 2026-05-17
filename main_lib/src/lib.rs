@@ -28,6 +28,7 @@ mod leaderless_state_provider;
 mod painless_parser;
 pub mod peers;
 pub mod pipeline;
+pub mod local_cli;
 mod prefetch;
 mod private_api;
 pub mod router;

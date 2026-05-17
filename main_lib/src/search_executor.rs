@@ -306,7 +306,17 @@ pub(crate) fn search_plan_to_command(
     plan: search_plan::SearchPlan,
     query: &QueryStringSearch,
 ) -> Result<SearchCommand, ParseError> {
-    let backend = compile_legacy_sql_command(&plan, query)?;
+    search_plan_to_command_with_options(plan, query, None, true)
+}
+
+pub(crate) fn search_plan_to_command_with_options(
+    plan: search_plan::SearchPlan,
+    query: &QueryStringSearch,
+    doc_id_field_name: Option<&str>,
+    include_deletes_join: bool,
+) -> Result<SearchCommand, ParseError> {
+    let backend =
+        compile_legacy_sql_command(&plan, query, doc_id_field_name, include_deletes_join)?;
     let execution_plan = create_execution_plan(&plan, &backend);
     let typed_aggregation_specs = private_search_aggregation_specs(&plan.aggregations);
     let typed_sort_specs = private_search_sort_specs(&plan.sort, &backend);
@@ -653,8 +663,14 @@ fn merge_typed_aggregation_partial(
 fn compile_legacy_sql_command(
     plan: &search_plan::SearchPlan,
     query: &QueryStringSearch,
+    doc_id_field_name: Option<&str>,
+    include_deletes_join: bool,
 ) -> Result<SqlCommand, ParseError> {
-    let mut builder = SqlBuilder::for_query(true);
+    let mut builder = SqlBuilder::for_query_with_options(
+        true,
+        doc_id_field_name.unwrap_or("_id_seq_no"),
+        include_deletes_join,
+    );
 
     if plan.from != 0 {
         return Err(ParseError {
