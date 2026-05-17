@@ -5,7 +5,9 @@ use crate::elastic_search_endpoints::NameIdPathExtractor;
 use crate::elastic_search_endpoints::NameAliasPathExtractor;
 use crate::elastic_search_endpoints::NamePathExtractor;
 use crate::elastic_search_endpoints::QueryStringAliases;
+use crate::elastic_search_endpoints::QueryStringClusterHealth;
 use crate::elastic_search_endpoints::QueryStringClusterSettings;
+use crate::elastic_search_endpoints::QueryStringFieldCaps;
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::mongodb_protocol;
 use crate::peers::{
@@ -388,6 +390,15 @@ pub fn router(include_test_apis: bool) -> Router {
             .get("_cluster/settings")
             .with_query_string_extractor::<QueryStringClusterSettings>()
             .to(elastic_search_endpoints::es_cluster_settings);
+        route
+            .get("/_cluster/health")
+            .with_query_string_extractor::<QueryStringClusterHealth>()
+            .to(elastic_search_endpoints::es_cluster_health);
+        route
+            .get("/_cluster/health/:name")
+            .with_query_string_extractor::<QueryStringClusterHealth>()
+            .with_path_extractor::<NamePathExtractor>()
+            .to(elastic_search_endpoints::es_cluster_health);
         route.get("/_alias").to(elastic_search_endpoints::es_get_aliases);
         route
             .get("/_alias/:alias")
@@ -466,6 +477,14 @@ pub fn router(include_test_apis: bool) -> Router {
             .with_query_string_extractor::<QueryStringSearch>()
             .to(elastic_search_endpoints::es_search);
         route
+            .get("/_field_caps")
+            .with_query_string_extractor::<QueryStringFieldCaps>()
+            .to(elastic_search_endpoints::es_field_caps);
+        route
+            .post("/_field_caps")
+            .with_query_string_extractor::<QueryStringFieldCaps>()
+            .to(elastic_search_endpoints::es_field_caps);
+        route
             .post("/_search")
             .with_query_string_extractor::<QueryStringSearch>()
             .to(elastic_search_endpoints::es_search);
@@ -474,6 +493,16 @@ pub fn router(include_test_apis: bool) -> Router {
             .with_query_string_extractor::<QueryStringSearch>()
             .with_path_extractor::<NamePathExtractor>()
             .to(elastic_search_endpoints::es_search_table);
+        route
+            .get("/:name/_field_caps")
+            .with_query_string_extractor::<QueryStringFieldCaps>()
+            .with_path_extractor::<NamePathExtractor>()
+            .to(elastic_search_endpoints::es_field_caps_index);
+        route
+            .post("/:name/_field_caps")
+            .with_query_string_extractor::<QueryStringFieldCaps>()
+            .with_path_extractor::<NamePathExtractor>()
+            .to(elastic_search_endpoints::es_field_caps_index);
         route
             .get("/_count")
             .with_query_string_extractor::<QueryStringSearch>()
@@ -1207,6 +1236,18 @@ pub(crate) mod tests {
             "2"
         );
 
+        let cluster_health_response = test_server
+            .client()
+            .get("http://localhost/_cluster/health")
+            .perform()
+            .unwrap();
+        assert_eq!(cluster_health_response.status(), 200);
+        let cluster_health_json: Value =
+            serde_json::from_str(&cluster_health_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(cluster_health_json["cluster_name"], "docker-cluster");
+        assert_eq!(cluster_health_json["status"], "green");
+        assert_eq!(cluster_health_json["number_of_nodes"], 1);
+
         let alias_update_response = test_server
             .client()
             .post(
@@ -1328,6 +1369,52 @@ pub(crate) mod tests {
                 "name": "logs_alias",
                 "indices": ["logs", "logs_archive"]
             })
+        );
+
+        let get_field_caps_response = test_server
+            .client()
+            .get("http://localhost/logs/_field_caps?fields=message,index_col")
+            .perform()
+            .unwrap();
+        assert_eq!(get_field_caps_response.status(), 200);
+        let get_field_caps_json: Value =
+            serde_json::from_str(&get_field_caps_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(get_field_caps_json["indices"], json!(["logs"]));
+        assert_eq!(
+            get_field_caps_json["fields"]["message"]["text"]["searchable"],
+            true
+        );
+        assert_eq!(
+            get_field_caps_json["fields"]["message"]["text"]["aggregatable"],
+            false
+        );
+        assert_eq!(
+            get_field_caps_json["fields"]["index_col"]["long"]["indices"],
+            json!(["logs"])
+        );
+
+        let post_field_caps_response = test_server
+            .client()
+            .post(
+                "http://localhost/_field_caps",
+                r#"{
+                  "fields": ["index_col"]
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(post_field_caps_response.status(), 200);
+        let post_field_caps_json: Value =
+            serde_json::from_str(&post_field_caps_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(post_field_caps_json["indices"], json!(["logs", "logs_archive"]));
+        assert_eq!(
+            post_field_caps_json["fields"]["index_col"]["long"]["indices"],
+            json!(["logs"])
+        );
+        assert_eq!(
+            post_field_caps_json["fields"]["index_col"]["keyword"]["indices"],
+            json!(["logs_archive"])
         );
 
         let get_search_response = test_server
