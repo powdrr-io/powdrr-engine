@@ -4,6 +4,10 @@ use crate::util::log_err;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::common::HashMap;
 use datafusion::config::ConfigOptions;
+use datafusion::datasource::{
+    file_format::parquet::ParquetFormat,
+    listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
+};
 use datafusion::execution::options::{ArrowReadOptions, JsonReadOptions};
 use datafusion::prelude::SessionConfig;
 use datafusion::{
@@ -278,6 +282,12 @@ enum CacheTrackerActorMessage {
         file_path: String,
         parquet: bool,
         schema: Option<Schema>,
+    },
+    CreateMultiTable {
+        respond_to: oneshot::Sender<Result<(), DataFusionError>>,
+        table_name: String,
+        file_paths: Vec<String>,
+        schema: Schema,
     },
     CreateTableAs {
         respond_to: oneshot::Sender<Result<(), DataFusionError>>,
@@ -579,6 +589,17 @@ impl CacheTrackerActor {
                         .await,
                 );
             }
+            CacheTrackerActorMessage::CreateMultiTable {
+                respond_to,
+                table_name,
+                file_paths,
+                schema,
+            } => {
+                let _ = respond_to.send(
+                    self.create_multi_table(&table_name, &file_paths, &schema)
+                        .await,
+                );
+            }
             CacheTrackerActorMessage::CreateTableAs {
                 respond_to,
                 table_name,
@@ -869,6 +890,18 @@ impl CacheTrackerActor {
         Ok(())
     }
 
+    async fn create_multi_table(
+        &mut self,
+        table_name: &String,
+        file_paths: &Vec<String>,
+        schema: &Schema,
+    ) -> Result<(), DataFusionError> {
+        load_parquet_files_as_table(&self.data_fusion_context, file_paths, table_name, schema)
+            .await?;
+        self.track_table(table_name).await;
+        Ok(())
+    }
+
     async fn create_table_as(
         &mut self,
         table_name: &String,
@@ -986,6 +1019,24 @@ impl LRUCacheHandle {
 
         let _ = self.sender.send(msg).await;
         // TODO: deal with errors
+        recv.await.expect("Actor task has been killed")
+    }
+
+    async fn create_multi_table(
+        &self,
+        table_name: &String,
+        file_paths: &Vec<String>,
+        schema: &Schema,
+    ) -> Result<(), DataFusionError> {
+        let (send, recv) = oneshot::channel();
+        let msg = CacheTrackerActorMessage::CreateMultiTable {
+            respond_to: send,
+            table_name: table_name.clone(),
+            file_paths: file_paths.clone(),
+            schema: schema.clone(),
+        };
+
+        let _ = self.sender.send(msg).await;
         recv.await.expect("Actor task has been killed")
     }
 
@@ -1249,6 +1300,63 @@ async fn load_parquet_file_as_table(
     }
 }
 
+async fn load_parquet_files_as_table(
+    data_fusion_context: &SessionContext,
+    file_paths: &Vec<String>,
+    local_name: &String,
+    schema: &Schema,
+) -> Result<(), DataFusionError> {
+    match data_fusion_context.table_exist(local_name) {
+        Ok(exists) => match exists {
+            true => return Ok(()),
+            false => (),
+        },
+        Err(e) => return log_err(e),
+    };
+
+    if file_paths.is_empty() {
+        return log_err(DataFusionError::Execution(
+            "No parquet files were provided".to_string(),
+        ));
+    }
+
+    tracing::info!(
+        "Loading {} PARQUET files into {}",
+        file_paths.len(),
+        local_name
+    );
+
+    let table_paths = match file_paths
+        .iter()
+        .map(ListingTableUrl::parse)
+        .collect::<datafusion::error::Result<Vec<_>>>()
+    {
+        Ok(paths) => paths,
+        Err(e) => return log_err(e),
+    };
+    let listing_options =
+        ListingOptions::new(Arc::new(ParquetFormat::default().with_enable_pruning(true)))
+            .with_file_extension(".parquet");
+    let config = ListingTableConfig::new_with_multi_paths(table_paths)
+        .with_listing_options(listing_options)
+        .with_schema(Arc::new(schema.clone()));
+    let table = match ListingTable::try_new(config) {
+        Ok(table) => Arc::new(table),
+        Err(e) => return log_err(e),
+    };
+
+    match data_fusion_context.register_table(local_name, table) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if e.message().contains("already exists") {
+                Ok(())
+            } else {
+                log_err(e)
+            }
+        }
+    }
+}
+
 async fn load_json_file_as_table(
     data_fusion_context: &SessionContext,
     file_path_without_suffix: &String,
@@ -1311,6 +1419,16 @@ pub(crate) async fn load_file_as_table(
 ) -> Result<(), DataFusionError> {
     LRU_CACHE_HANDLE
         .create_table(new_local_name, file_path, parquet, schema)
+        .await
+}
+
+pub(crate) async fn load_files_as_table(
+    new_local_name: &String,
+    file_paths: &Vec<String>,
+    schema: &Schema,
+) -> Result<(), DataFusionError> {
+    LRU_CACHE_HANDLE
+        .create_multi_table(new_local_name, file_paths, schema)
         .await
 }
 

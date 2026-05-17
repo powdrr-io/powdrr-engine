@@ -105,21 +105,42 @@ impl QueryResultHit {
             .get("score")
             .and_then(|f| f.as_f64())
             .or_else(|| bm25_fallback_score(&value_map));
-        let id = value_map.get("_id").unwrap().as_str().unwrap().to_string();
-        let version = value_map.get("_version").unwrap().as_u64().unwrap();
-        let seq_no = value_map.get("_seq_no").unwrap().as_u64().unwrap();
-        let source = value_map.get("_source").unwrap().as_str().unwrap();
-        // TODO: we are parsing the string into a value just to put it an object
-        // that will get serialized out again. That is lame. If we can get the serializer
-        // to look at a string but put it in like it is a Value, that would be better.
-        let source_value = serde_json::from_str(source).unwrap();
+        let id = value_map
+            .get("_id")
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned);
+        let has_id = id.is_some();
+        let version = value_map
+            .get("_version")
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default();
+        let seq_no = value_map
+            .get("_seq_no")
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default();
+        let source_value = if let Some(source) = value_map.get("_source").and_then(|value| value.as_str()) {
+            // TODO: we are parsing the string into a value just to put it an object
+            // that will get serialized out again. That is lame. If we can get the serializer
+            // to look at a string but put it in like it is a Value, that would be better.
+            serde_json::from_str(source).unwrap()
+        } else if let Some(source) = value_map.get("_source") {
+            source.clone()
+        } else {
+            let mut source_map = value_map.clone();
+            source_map.remove("_id");
+            source_map.remove("_version");
+            source_map.remove("_seq_no");
+            source_map.remove("_source");
+            source_map.remove("score");
+            Value::Object(source_map)
+        };
         QueryResultHit {
             _index: index.clone(),
-            _id: Some(id),
+            _id: id,
             _version: version,
             _seq_no: seq_no,
             _score: score,
-            _primary_term: Some(1),
+            _primary_term: has_id.then_some(1),
             found,
             sort,
             _source: source_value,
@@ -504,6 +525,22 @@ mod tests {
 
         assert!(compare_query_result_hits_desc(&higher_score, &lower_score).is_lt());
         assert!(compare_query_result_hits_desc(&newer_seq_no, &lower_score).is_lt());
+    }
+
+    #[test]
+    fn test_query_result_hit_falls_back_to_row_object_when_metadata_is_missing() {
+        let value = json!({
+            "message": "hello",
+            "index_col": 7
+        });
+
+        let hit = QueryResultHit::from_record(&Some("logs".to_string()), &value, None);
+
+        assert_eq!(hit._index, Some("logs".to_string()));
+        assert_eq!(hit._id, None);
+        assert_eq!(hit._version, 0);
+        assert_eq!(hit._seq_no, 0);
+        assert_eq!(hit._source, json!({"message": "hello", "index_col": 7}));
     }
 }
 
