@@ -1,0 +1,43 @@
+name: Fast Checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: fast-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_DIR: .cargo-target
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.128
+          fallback: none
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Bootstrap Shared Target
+        run: ./scripts/setup-worktree.sh
+
+      - name: Check Default Workspace
+        run: ./scripts/cargo-worktree.sh check --workspace --all-targets
+
+      - name: Run Fast Test Suite
+        run: ./scripts/cargo-worktree.sh nextest run --profile ci
+
+      - name: Run Doctests
+        run: ./scripts/cargo-worktree.sh test --doc

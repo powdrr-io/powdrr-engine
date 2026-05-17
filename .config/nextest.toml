@@ -1,0 +1,21 @@
+nextest-version = "0.9.128"
+
+[profile.default]
+default-filter = "all() - binary_id(=powdrr_lib::es_compatibility_matrix)"
+slow-timeout = { period = "60s", terminate-after = 4 }
+
+[profile.ci]
+retries = 1
+slow-timeout = { period = "90s", terminate-after = 2 }
+status-level = "all"
+
+[test-groups]
+serial-integration = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = "binary_id(=powdrr_lib::es_compatibility_matrix)"
+test-group = "serial-integration"
+
+[[profile.ci.overrides]]
+filter = "binary_id(=powdrr_lib::es_compatibility_matrix)"
+test-group = "serial-integration"

@@ -6,23 +6,31 @@ on:
     branches:
       - main
 
+concurrency:
+  group: es-compatibility-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   compatibility:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_DIR: .cargo-target
       CARGO_PROFILE_TEST_DEBUG: "0"
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Bootstrap Shared Target
+        run: ./scripts/setup-worktree.sh
+
       - name: Validate Compatibility Fixture File
-        run: cargo test -p powdrr_lib --test es_compatibility_matrix compatibility_matrix_case_file_parses_and_ids_are_unique -- --nocapture
+        run: ./scripts/cargo-worktree.sh test -p powdrr_lib --test es_compatibility_matrix compatibility_matrix_case_file_parses_and_ids_are_unique -- --nocapture
 
       - name: Run Differential Compatibility Matrix
         run: bash scripts/run_es_compat_local.sh
