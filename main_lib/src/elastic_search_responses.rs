@@ -105,20 +105,22 @@ impl QueryResultHit {
             .get("score")
             .and_then(|f| f.as_f64())
             .or_else(|| bm25_fallback_score(&value_map));
-        let id = value_map.get("_id").unwrap().as_str().unwrap().to_string();
-        let version = value_map.get("_version").unwrap().as_u64().unwrap();
-        let seq_no = value_map.get("_seq_no").unwrap().as_u64().unwrap();
-        let source_value = match value_map.get("_source").unwrap() {
-            Value::String(source) => {
-                // Elasticsearch wire responses store _source as an encoded JSON string here,
-                // while local parquet-backed paths already materialize it as a JSON object.
-                serde_json::from_str(source).unwrap()
-            }
-            source => source.clone(),
-        };
+        let id = value_map
+            .get("_id")
+            .and_then(value_to_string)
+            .or_else(|| value_map.get("_id_seq_no").and_then(value_to_string));
+        let version = value_map
+            .get("_version")
+            .and_then(value_to_u64)
+            .unwrap_or(1);
+        let seq_no = value_map.get("_seq_no").and_then(value_to_u64).unwrap_or(0);
+        let source_value = value_map
+            .get("_source")
+            .map(parse_source_value)
+            .unwrap_or_else(|| derive_source_value(&value_map));
         QueryResultHit {
             _index: index.clone(),
-            _id: Some(id),
+            _id: id,
             _version: version,
             _seq_no: seq_no,
             _score: score,
@@ -128,6 +130,54 @@ impl QueryResultHit {
             _source: source_value,
         }
     }
+}
+
+fn value_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(boolean) => Some(boolean.to_string()),
+        _ => None,
+    }
+}
+
+fn value_to_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| {
+            value
+                .as_i64()
+                .filter(|number| *number >= 0)
+                .map(|number| number as u64)
+        })
+        .or_else(|| value.as_str().and_then(|number| number.parse::<u64>().ok()))
+}
+
+fn parse_source_value(source: &Value) -> Value {
+    match source {
+        Value::String(source) => {
+            // Elasticsearch wire responses store _source as an encoded JSON string here,
+            // while local parquet-backed paths already materialize it as a JSON object.
+            serde_json::from_str(source).unwrap()
+        }
+        source => source.clone(),
+    }
+}
+
+fn derive_source_value(value_map: &serde_json::Map<String, Value>) -> Value {
+    let mut source = value_map.clone();
+    for field in [
+        "_id",
+        "_id_seq_no",
+        "_version",
+        "_seq_no",
+        "score",
+        "term_cnt",
+        "word_cnt",
+    ] {
+        source.remove(field);
+    }
+    Value::Object(source)
 }
 
 fn bm25_fallback_score(value_map: &serde_json::Map<String, Value>) -> Option<f64> {
@@ -481,6 +531,24 @@ mod tests {
         let hit = QueryResultHit::from_record(&Some("logs".to_string()), &value, None);
 
         assert_eq!(hit._source["message"], "hello");
+    }
+
+    #[test]
+    fn test_query_result_hit_derives_source_from_local_rows() {
+        let value = json!({
+            "doc_id": 2,
+            "message": "hello",
+            "term_cnt": 1.0,
+            "word_cnt": 2.0
+        });
+
+        let hit = QueryResultHit::from_record(&Some("logs".to_string()), &value, None);
+
+        assert_eq!(hit._id, None);
+        assert_eq!(hit._version, 1);
+        assert_eq!(hit._seq_no, 0);
+        assert_eq!(hit._source, json!({"doc_id": 2, "message": "hello"}));
+        assert!(hit._score.is_some());
     }
 
     #[test]
