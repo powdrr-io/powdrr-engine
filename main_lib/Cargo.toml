@@ -10,15 +10,17 @@ edition.workspace = true
 
 
 [dependencies]
-arrow-flight = "55.1"
-arrow-ipc = "55.1.0"
-arrow-json = "55.1"
+arrow-flight = "58.0.0"
+arrow-array-55 = { package = "arrow-array", version = "55.1.0" }
+arrow-ipc = "58.0.0"
+arrow-ipc-55 = { package = "arrow-ipc", version = "55.1.0" }
+arrow-json = "58.0.0"
 async-trait = "0.1.88"
 aws-config = "1.8.3"
 aws-credential-types = "1.2.4"
 aws-sdk-dynamodb = "1.86.0"
 chrono = "0.4.41"
-datafusion = "47"
+datafusion = "53.1.0"
 futures = "0.3.31"
 futures-util = "0.3.31"
 gotham = { version = "0.7.4", features = ["rustls"] }
@@ -28,20 +30,20 @@ iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "
 idgenerator = "2.0.0"
 k8s-openapi = { version = "0.25.0", features = ["latest"] }
 kube = { version = "1.1.0", features = ["runtime", "derive"] }
-liquid-cache-parquet = "0.1.7"
 lru-mem = "0.3.0"
 minijinja = "2.10.2"
 modyne = "0.3.0"
 modyne-derive = "0.3.0"
-object_store = { version = "0.12.3", default-features = false, features = ["aws", "http"] }
+object_store = { version = "0.13.2", default-features = false, features = ["aws", "http"] }
 paste = "1.0.15"
-prost = "0.13.5"
+parquet-55 = { package = "parquet", version = "55.1.0" }
+prost = "0.14.3"
 redis = "0.30.0"
 reqwest = { version = "0.12.14", default-features = false, features = ["json", "rustls-tls"] }
 rustls-pemfile = "2.2.0"
 rustls-pki-types = "1.12.0"
 serde = { version = "1.0.219", features = ["derive"] }
-serde_arrow = { version = "0.13.4", features = ["arrow-55"] }
+serde_arrow = { version = "0.14.1", features = ["arrow-58"] }
 serde_dynamo = "4.2.14"
 serde_json = "1.0.140"
 tempfile = "3.20.0"
@@ -53,6 +55,9 @@ url = "2.5.4"
 url-escape = "0.1.1"
 uuid-b64 = "0.2.0"
 lazy_static = "1.5.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+liquid-cache-parquet = { package = "liquid-cache-datafusion-local", git = "https://github.com/XiangpengHao/liquid-cache", rev = "4597d1d1c434100031b00bd743c91d0c70b334d9" }
 
 [dev-dependencies]
 reqwest = { version = "0.12.14", default-features = false, features = ["json", "blocking", "rustls-tls"] }
