@@ -114,7 +114,7 @@ impl DynamoDBServiceImpl {
     const NO_WORK_ITEM: &'static str = "-1";
 
     pub async fn add_checkpoint(&mut self, org_info: &OrgInfo, metadata: &TableMetadataCheckpoint) -> Result<(), ServiceApiError> {
-        self.create_table(org_info, &CreateTable { name: metadata.table_name.clone(), tags: Default::default() }).await?;
+        self.create_table(org_info, &CreateTable { name: metadata.table_name.clone(), tags: Default::default(), serving: None }).await?;
         if metadata.speedboat_metadata.is_some() {
             self.speedboat_commit(
                 org_info,
@@ -152,12 +152,12 @@ impl DynamoDBServiceImpl {
     }
 
     pub async fn create_table(&mut self, org_info: &OrgInfo, create_table: &CreateTable) -> Result<bool, ServiceApiError> {
-        self.connector.create_table_helper(&org_info.org_id.to_string(), &create_table.name, &TableBody { tags: create_table.tags.clone() }).await.map_err(from_modyne)
+        self.connector.create_table_helper(&org_info.org_id.to_string(), &create_table.name, &TableBody { tags: create_table.tags.clone(), serving: create_table.serving.clone() }).await.map_err(from_modyne)
     }
 
     pub async fn describe_table(&mut self, org_info: &OrgInfo, name: &String) -> Result<Option<TableDescription>, ServiceApiError> {
         let result = self.connector.describe_powdrr_table(&org_info.org_id.to_string(), name).await
-            .map(|x| x.map(|x| TableDescription { name: name.clone(), tags: x.tags.clone() }))
+            .map(|x| x.map(|x| TableDescription { name: name.clone(), tags: x.tags.clone(), serving: x.serving.clone() }))
             .map_err(from_modyne)?;
 
         match result {
@@ -167,7 +167,7 @@ impl DynamoDBServiceImpl {
                     None => Ok(None),
                     Some(table_name) => {
                         self.connector.describe_powdrr_table(&org_info.org_id.to_string(), &table_name).await
-                            .map(|x| x.map(|x| TableDescription { name: table_name.clone(), tags: x.tags.clone() }))
+                            .map(|x| x.map(|x| TableDescription { name: table_name.clone(), tags: x.tags.clone(), serving: x.serving.clone() }))
                             .map_err(from_modyne)
                     }
                 }

@@ -1,10 +1,10 @@
-use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
-use idgenerator::IdInstance;
-use serde::{Deserialize, Serialize};
 use crate::peers::CheckpointDescriptor;
 use crate::schema_massager::PowdrrSchema;
 use crate::test_api::TestProcessingMode;
+use idgenerator::IdInstance;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SpeedboatCommitTableInfo {
@@ -20,7 +20,7 @@ impl SpeedboatCommitTableInfo {
         FileSetPayload {
             file_paths: self.files.clone(),
             sizes: self.sizes.clone(),
-            schemas: vec!(self.schema.as_ref().unwrap().clone()),
+            schemas: vec![self.schema.as_ref().unwrap().clone()],
             file_schemas: self.files.iter().map(|_| 0).collect(),
         }
     }
@@ -32,11 +32,10 @@ pub struct GetLatestCheckpoint {
     pub extension: Option<String>,
 }
 
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SpeedboatCommit {
     pub type_files: Vec<SpeedboatCommitTableInfo>,
-    pub compaction: Option<String,>
+    pub compaction: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -54,7 +53,6 @@ pub struct FileDescriptor {
     pub size: u64,
 }
 
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IcebergMetadata {
     pub table_schema: PowdrrSchema,
@@ -66,7 +64,6 @@ pub struct IcebergMetadata {
     pub column_stats: Vec<(String, String)>,
 }
 
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IcebergCommit {
     pub metadata: IcebergMetadata,
@@ -76,15 +73,13 @@ pub struct IcebergCommit {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SpeedboatMetadata {
-    pub files: FileSetPayload
+    pub files: FileSetPayload,
 }
-
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DeletesMetadata {
     pub files: Vec<String>,
 }
-
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ExtensionFile {
@@ -92,17 +87,14 @@ pub struct ExtensionFile {
     pub location: String,
 }
 
-
 pub type ExtensionFileMetadata = HashMap<String, Vec<ExtensionFile>>;
-
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ExtensionCommit {
     pub id: String,
     pub extension: String,
-    pub files: ExtensionFileMetadata
+    pub files: ExtensionFileMetadata,
 }
-
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CompactionCommit {
@@ -120,7 +112,6 @@ pub struct CleanupCommit {
     pub table_name: String,
 }
 
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TableMetadataCheckpoint {
     pub table_name: String,
@@ -132,7 +123,6 @@ pub struct TableMetadataCheckpoint {
     pub extension_metadata: HashMap<String, HashMap<String, Vec<ExtensionFile>>>,
     pub schema: PowdrrSchema,
 }
-
 
 impl TableMetadataCheckpoint {
     pub fn new(table_name: String, checkpoint_id: String, schema: PowdrrSchema) -> Self {
@@ -161,17 +151,20 @@ impl TableMetadataCheckpoint {
         speedboat_commits: &Vec<SpeedboatCommit>,
         iceberg_commits: &Vec<IcebergCommit>,
         extension_commits: &Vec<ExtensionCommit>,
-        compactions_lookup: &HashMap<String, CompactionCommit>
+        compactions_lookup: &HashMap<String, CompactionCommit>,
     ) -> (Self, bool) {
         let mut new_table_metadata_checkpoint = self.clone();
         new_table_metadata_checkpoint.checkpoint_id = IdInstance::next_id().to_string();
 
         let mut changed = false;
         for speedboat_commit in speedboat_commits {
-            changed = changed | new_table_metadata_checkpoint.apply_speedboat(speedboat_commit, compactions_lookup);
+            changed = changed
+                | new_table_metadata_checkpoint
+                    .apply_speedboat(speedboat_commit, compactions_lookup);
         }
         for iceberg_commit in iceberg_commits {
-            changed = changed | new_table_metadata_checkpoint.apply_iceberg(iceberg_commit, compactions_lookup);
+            changed = changed
+                | new_table_metadata_checkpoint.apply_iceberg(iceberg_commit, compactions_lookup);
         }
         for extension_commit in extension_commits {
             changed = changed | new_table_metadata_checkpoint.add_coverage(extension_commit);
@@ -180,75 +173,125 @@ impl TableMetadataCheckpoint {
         (new_table_metadata_checkpoint, changed)
     }
 
-    pub fn apply_speedboat(&mut self, speedboat_commit: &SpeedboatCommit, compactions_lookup: &HashMap<String, CompactionCommit>) -> bool {
+    pub fn apply_speedboat(
+        &mut self,
+        speedboat_commit: &SpeedboatCommit,
+        compactions_lookup: &HashMap<String, CompactionCommit>,
+    ) -> bool {
         if self.speedboat_metadata.is_none() {
-            self.speedboat_metadata = Some(SpeedboatMetadata{ files: FileSetPayload::new() });
+            self.speedboat_metadata = Some(SpeedboatMetadata {
+                files: FileSetPayload::new(),
+            });
         }
         if self.deletes_metadata.is_none() {
-            self.deletes_metadata = Some(DeletesMetadata{ files: vec!() });
+            self.deletes_metadata = Some(DeletesMetadata { files: vec![] });
         }
         for speedboat_commit_table_info in speedboat_commit.type_files.iter() {
             if speedboat_commit_table_info.commit_type == "delete" {
-                self.deletes_metadata.as_mut().unwrap().files.extend(speedboat_commit_table_info.files.clone());
-            } else if speedboat_commit_table_info.commit_type == "commit" || speedboat_commit_table_info.commit_type == "compaction" {
-                self.speedboat_metadata.as_mut().unwrap().files.merge_inplace(&speedboat_commit_table_info.as_file_set_payload());
+                self.deletes_metadata
+                    .as_mut()
+                    .unwrap()
+                    .files
+                    .extend(speedboat_commit_table_info.files.clone());
+            } else if speedboat_commit_table_info.commit_type == "commit"
+                || speedboat_commit_table_info.commit_type == "compaction"
+            {
+                self.speedboat_metadata
+                    .as_mut()
+                    .unwrap()
+                    .files
+                    .merge_inplace(&speedboat_commit_table_info.as_file_set_payload());
                 if speedboat_commit_table_info.schema.is_some() {
-                    self.schema.merge_from(speedboat_commit_table_info.schema.as_ref().unwrap());
+                    self.schema
+                        .merge_from(speedboat_commit_table_info.schema.as_ref().unwrap());
                 }
             } else {
                 panic!("Unknown commit type");
             }
         }
         if speedboat_commit.compaction.is_some() {
-            self.apply_compactions(&vec!(speedboat_commit.compaction.as_ref().unwrap().clone()), compactions_lookup);
+            self.apply_compactions(
+                &vec![speedboat_commit.compaction.as_ref().unwrap().clone()],
+                compactions_lookup,
+            );
         }
 
         true
     }
 
-    pub fn apply_iceberg(&mut self, iceberg_commit: &IcebergCommit, compactions_lookup: &HashMap<String, CompactionCommit>) -> bool {
+    pub fn apply_iceberg(
+        &mut self,
+        iceberg_commit: &IcebergCommit,
+        compactions_lookup: &HashMap<String, CompactionCommit>,
+    ) -> bool {
         self.iceberg_metadata = Some(iceberg_commit.metadata.clone());
         if iceberg_commit.deletes_table_info.is_some() {
             if self.deletes_metadata.is_none() {
-                self.deletes_metadata = Some(DeletesMetadata{ files: vec!() });
+                self.deletes_metadata = Some(DeletesMetadata { files: vec![] });
             }
-            self.deletes_metadata.as_mut().unwrap().files.extend(iceberg_commit.deletes_table_info.as_ref().unwrap().files.clone());
+            self.deletes_metadata.as_mut().unwrap().files.extend(
+                iceberg_commit
+                    .deletes_table_info
+                    .as_ref()
+                    .unwrap()
+                    .files
+                    .clone(),
+            );
         }
-        self.schema.merge_from(&self.iceberg_metadata.as_mut().unwrap().table_schema);
+        self.schema
+            .merge_from(&self.iceberg_metadata.as_mut().unwrap().table_schema);
         self.apply_compactions(&iceberg_commit.compactions, compactions_lookup);
 
         true
     }
 
-    fn apply_compactions(&mut self, compactions: &Vec<String>, compactions_lookup: &HashMap<String, CompactionCommit>) -> () {
-        let (removed_speedboat, removed_deletes) = Self::get_removed_files(compactions, compactions_lookup);
+    fn apply_compactions(
+        &mut self,
+        compactions: &Vec<String>,
+        compactions_lookup: &HashMap<String, CompactionCommit>,
+    ) -> () {
+        let (removed_speedboat, removed_deletes) =
+            Self::get_removed_files(compactions, compactions_lookup);
 
         match self.speedboat_metadata.as_mut() {
             Some(speedboat) => {
                 speedboat.files.remove(&removed_speedboat);
-            },
-            None => ()
+            }
+            None => (),
         };
 
         match self.deletes_metadata.as_mut() {
             Some(deletes) => {
-                deletes.files.retain(|x|!removed_deletes.contains(x));
-            },
-            None => ()
+                deletes.files.retain(|x| !removed_deletes.contains(x));
+            }
+            None => (),
         };
 
         for metadata in self.extension_metadata.values_mut() {
-            metadata.retain(|key, _|!removed_speedboat.contains(key))
+            metadata.retain(|key, _| !removed_speedboat.contains(key))
         }
     }
 
-    pub(crate) fn apply_compaction_for_replacement(&mut self, compaction: &CompactionCommit, iceberg_metadata: &IcebergMetadata) -> () {
+    pub(crate) fn apply_compaction_for_replacement(
+        &mut self,
+        compaction: &CompactionCommit,
+        iceberg_metadata: &IcebergMetadata,
+    ) -> () {
         assert!(self.speedboat_metadata.is_some());
-        self.speedboat_metadata.as_mut().unwrap().files.remove(&compaction.removed_speedboat_files);
+        self.speedboat_metadata
+            .as_mut()
+            .unwrap()
+            .files
+            .remove(&compaction.removed_speedboat_files);
         if self.deletes_metadata.is_some() {
-            self.deletes_metadata.as_mut().unwrap().files.retain(|x| !compaction.removed_delete_files.contains(x));
+            self.deletes_metadata
+                .as_mut()
+                .unwrap()
+                .files
+                .retain(|x| !compaction.removed_delete_files.contains(x));
         }
-        self.extension_metadata.retain(|key, _|!compaction.removed_speedboat_files.contains(key));
+        self.extension_metadata
+            .retain(|key, _| !compaction.removed_speedboat_files.contains(key));
         let file_payload = iceberg_metadata.files.select(&compaction.parquet_file_name);
         if self.iceberg_metadata.is_none() {
             self.iceberg_metadata = Some(IcebergMetadata {
@@ -259,34 +302,66 @@ impl TableMetadataCheckpoint {
                 column_stats: vec![],
             });
         } else {
-            self.iceberg_metadata.as_mut().unwrap().files.merge(&file_payload);
+            self.iceberg_metadata
+                .as_mut()
+                .unwrap()
+                .files
+                .merge(&file_payload);
         }
     }
 
-    fn get_removed_files(compactions: &Vec<String>, compactions_lookup: &HashMap<String, CompactionCommit>) -> (Vec<String>, Vec<String>) {
-        let compactions_data: Vec<&CompactionCommit> = compactions.iter().map(|x| compactions_lookup.get(x).unwrap()).collect();
+    fn get_removed_files(
+        compactions: &Vec<String>,
+        compactions_lookup: &HashMap<String, CompactionCommit>,
+    ) -> (Vec<String>, Vec<String>) {
+        let compactions_data: Vec<&CompactionCommit> = compactions
+            .iter()
+            .map(|x| compactions_lookup.get(x).unwrap())
+            .collect();
         (
-            compactions_data.iter().map(|x| x.removed_speedboat_files.clone()).flatten().collect(),
-            compactions_data.iter().map(|x| x.removed_delete_files.clone()).flatten().collect(),
+            compactions_data
+                .iter()
+                .map(|x| x.removed_speedboat_files.clone())
+                .flatten()
+                .collect(),
+            compactions_data
+                .iter()
+                .map(|x| x.removed_delete_files.clone())
+                .flatten()
+                .collect(),
         )
     }
 
     pub fn fully_covered_for_extension(&self, extension_name: &String) -> bool {
-        let total_num_files =
-            self.speedboat_metadata.as_ref().map_or(0, |x| x.files.file_paths.len()) +
-                self.iceberg_metadata.as_ref().map_or(0, |x| x.files.file_paths.len());
+        let total_num_files = self
+            .speedboat_metadata
+            .as_ref()
+            .map_or(0, |x| x.files.file_paths.len())
+            + self
+                .iceberg_metadata
+                .as_ref()
+                .map_or(0, |x| x.files.file_paths.len());
 
-        let total_num_extension_files = self.extension_metadata.get(extension_name).map_or(0, |x| x.len());
+        let total_num_extension_files = self
+            .extension_metadata
+            .get(extension_name)
+            .map_or(0, |x| x.len());
 
         let size_check_method = total_num_files == total_num_extension_files;
 
-        assert_eq!(size_check_method, self.validate_fully_covered_for_extension(extension_name));
+        assert_eq!(
+            size_check_method,
+            self.validate_fully_covered_for_extension(extension_name)
+        );
 
         size_check_method
     }
 
     fn validate_fully_covered_for_extension(&self, extension_name: &String) -> bool {
-        let extension_metadata_map = self.extension_metadata.get(extension_name).map_or(HashMap::new(), |x| x.clone());
+        let extension_metadata_map = self
+            .extension_metadata
+            .get(extension_name)
+            .map_or(HashMap::new(), |x| x.clone());
 
         match &self.iceberg_metadata {
             Some(im) => {
@@ -295,7 +370,7 @@ impl TableMetadataCheckpoint {
                         return false;
                     }
                 }
-            },
+            }
             None => {}
         };
 
@@ -306,7 +381,7 @@ impl TableMetadataCheckpoint {
                         return false;
                     }
                 }
-            },
+            }
             None => {}
         };
 
@@ -314,34 +389,51 @@ impl TableMetadataCheckpoint {
     }
 
     pub fn add_coverage(&mut self, extension_commit: &ExtensionCommit) -> bool {
-        let existing_extension_metadata_map = self.extension_metadata.get(&extension_commit.extension).map_or(HashMap::new(), |x| x.clone());
+        let existing_extension_metadata_map = self
+            .extension_metadata
+            .get(&extension_commit.extension)
+            .map_or(HashMap::new(), |x| x.clone());
 
-        if !self.extension_metadata.contains_key(&extension_commit.extension) {
-            self.extension_metadata.insert(extension_commit.extension.clone(), HashMap::new());
+        if !self
+            .extension_metadata
+            .contains_key(&extension_commit.extension)
+        {
+            self.extension_metadata
+                .insert(extension_commit.extension.clone(), HashMap::new());
         }
 
         let mut changed = false;
         match &self.iceberg_metadata {
             Some(im) => {
                 for file_path in im.files.file_paths.iter() {
-                    if extension_commit.files.contains_key(file_path) && !existing_extension_metadata_map.contains_key(file_path) {
-                        self.extension_metadata.get_mut(&extension_commit.extension).unwrap().insert(file_path.clone(), extension_commit.files[file_path].clone());
+                    if extension_commit.files.contains_key(file_path)
+                        && !existing_extension_metadata_map.contains_key(file_path)
+                    {
+                        self.extension_metadata
+                            .get_mut(&extension_commit.extension)
+                            .unwrap()
+                            .insert(file_path.clone(), extension_commit.files[file_path].clone());
                         changed = true;
                     }
                 }
-            },
+            }
             None => {}
         };
 
         match &self.speedboat_metadata {
             Some(im) => {
                 for file_path in im.files.file_paths.iter() {
-                    if extension_commit.files.contains_key(file_path) && !existing_extension_metadata_map.contains_key(file_path) {
-                        self.extension_metadata.get_mut(&extension_commit.extension).unwrap().insert(file_path.clone(), extension_commit.files[file_path].clone());
+                    if extension_commit.files.contains_key(file_path)
+                        && !existing_extension_metadata_map.contains_key(file_path)
+                    {
+                        self.extension_metadata
+                            .get_mut(&extension_commit.extension)
+                            .unwrap()
+                            .insert(file_path.clone(), extension_commit.files[file_path].clone());
                         changed = true;
                     }
                 }
-            },
+            }
             None => {}
         };
 
@@ -362,12 +454,16 @@ pub(crate) struct ProposedCompaction {
 pub struct CreateTable {
     pub name: String,
     pub tags: HashMap<String, String>,
+    #[serde(default)]
+    pub serving: Option<ServingTableConfig>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TableDescription {
     pub name: String,
-    pub tags: HashMap<String, String>
+    pub tags: HashMap<String, String>,
+    #[serde(default)]
+    pub serving: Option<ServingTableConfig>,
 }
 
 impl TableDescription {
@@ -375,8 +471,32 @@ impl TableDescription {
         TableDescription {
             name: create_table.name.clone(),
             tags: create_table.tags.clone(),
+            serving: create_table.serving.clone(),
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServingTableConfig {
+    #[serde(default)]
+    pub patterns: Vec<ServingPattern>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ServingPattern {
+    pub name: String,
+    #[serde(default)]
+    pub eq_fields: Vec<String>,
+    #[serde(default)]
+    pub range_field: Option<String>,
+    #[serde(default)]
+    pub order_field: Option<String>,
+    #[serde(default)]
+    pub descending: bool,
+    #[serde(default)]
+    pub max_limit: Option<u64>,
+    #[serde(default)]
+    pub projection: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -385,14 +505,13 @@ pub struct AddAlias {
     pub alias: String,
 }
 
-
 impl FileSetPayload {
     pub fn new() -> Self {
         FileSetPayload {
-            file_paths: vec!(),
-            sizes: vec!(),
-            file_schemas: vec!(),
-            schemas: vec!(),
+            file_paths: vec![],
+            sizes: vec![],
+            file_schemas: vec![],
+            schemas: vec![],
         }
     }
 
@@ -406,10 +525,10 @@ impl FileSetPayload {
     #[cfg(test)]
     pub fn single(file_path: String, size: u64, schema: PowdrrSchema) -> Self {
         FileSetPayload {
-            file_paths: vec!(file_path),
-            sizes: vec!(size),
-            file_schemas: vec!(0),
-            schemas: vec!(schema),
+            file_paths: vec![file_path],
+            sizes: vec![size],
+            file_schemas: vec![0],
+            schemas: vec![schema],
         }
     }
 
@@ -441,10 +560,16 @@ impl FileSetPayload {
     }
 
     pub fn as_file_tuples(&self) -> Vec<FileDescriptor> {
-        self.file_paths.iter().zip(self.sizes.iter()).zip(self.file_schemas.iter()).map(
-            |((path, size), schema_index)|
-                FileDescriptor{ file_path: path.clone(), schema: self.schemas[*schema_index as usize].clone(), size: *size }
-        ).collect()
+        self.file_paths
+            .iter()
+            .zip(self.sizes.iter())
+            .zip(self.file_schemas.iter())
+            .map(|((path, size), schema_index)| FileDescriptor {
+                file_path: path.clone(),
+                schema: self.schemas[*schema_index as usize].clone(),
+                size: *size,
+            })
+            .collect()
     }
 
     fn selected_file(file_path: &String, index: u64, num: u64) -> bool {
@@ -456,7 +581,11 @@ impl FileSetPayload {
     }
 
     pub fn as_selected_tuples(&self, index: u64, num: u64) -> Vec<FileDescriptor> {
-        self.as_file_tuples().iter().filter(|x|Self::selected_file(&x.file_path, index, num)).cloned().collect()
+        self.as_file_tuples()
+            .iter()
+            .filter(|x| Self::selected_file(&x.file_path, index, num))
+            .cloned()
+            .collect()
     }
 
     pub fn merge(&self, other: &FileSetPayload) -> Self {
@@ -483,7 +612,11 @@ impl FileSetPayload {
         }
         self.file_paths.push(file_descriptor.file_path.clone());
         self.sizes.push(file_descriptor.size);
-        if let Some(index) = self.schemas.iter().position(|item| item == &file_descriptor.schema) {
+        if let Some(index) = self
+            .schemas
+            .iter()
+            .position(|item| item == &file_descriptor.schema)
+        {
             self.file_schemas.push(index as u64);
         } else {
             self.file_schemas.push(self.schemas.len() as u64);
@@ -497,11 +630,11 @@ impl FileSetPayload {
         for (i, file_path) in self.file_paths.iter().enumerate() {
             if file_path.contains(file_name) {
                 return FileSetPayload {
-                    file_paths: vec!(file_path.clone()),
-                    sizes: vec!(self.sizes[i]),
-                    file_schemas: vec!(0),
-                    schemas: vec!(self.schemas[self.file_schemas[i] as usize].clone()),
-                }
+                    file_paths: vec![file_path.clone()],
+                    sizes: vec![self.sizes[i]],
+                    file_schemas: vec![0],
+                    schemas: vec![self.schemas[self.file_schemas[i] as usize].clone()],
+                };
             }
         }
         assert!(false, "File not found");
@@ -509,7 +642,6 @@ impl FileSetPayload {
         FileSetPayload::new()
     }
 }
-
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ExtensionWorkItem {
@@ -533,8 +665,11 @@ impl ExtensionWorkItem {
 
     pub fn merge_speedboat(&mut self, commit: &SpeedboatCommit) -> () {
         for speedboat_commit_table_info in commit.type_files.iter() {
-            if speedboat_commit_table_info.commit_type == "commit" || speedboat_commit_table_info.commit_type == "compaction" {
-                self.speedboat_files.merge_inplace(&speedboat_commit_table_info.as_file_set_payload());
+            if speedboat_commit_table_info.commit_type == "commit"
+                || speedboat_commit_table_info.commit_type == "compaction"
+            {
+                self.speedboat_files
+                    .merge_inplace(&speedboat_commit_table_info.as_file_set_payload());
             }
         }
     }
@@ -543,7 +678,6 @@ impl ExtensionWorkItem {
         self.iceberg_files.merge_inplace(&commit.metadata.files);
     }
 }
-
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CompactionWorkItem {
@@ -558,24 +692,33 @@ pub struct CompactionWorkItem {
 #[derive(Clone)]
 pub(crate) struct CompactionWorkItemTracker {
     pub(crate) in_progress: bool,
-    pub(crate) work_item: CompactionWorkItem
+    pub(crate) work_item: CompactionWorkItem,
 }
 
-
 impl CompactionWorkItem {
-    pub fn from_checkpoint(checkpoint: &TableMetadataCheckpoint, checkpoints_to_delete: &Vec<String>) -> Self {
+    pub fn from_checkpoint(
+        checkpoint: &TableMetadataCheckpoint,
+        checkpoints_to_delete: &Vec<String>,
+    ) -> Self {
         assert!(checkpoint.speedboat_metadata.is_some());
         CompactionWorkItem {
             id: IdInstance::next_id().to_string(),
             table_schema: checkpoint.schema.clone(),
-            speedboat_files: checkpoint.speedboat_metadata.as_ref().unwrap().files.clone(),
-            delete_files: checkpoint.deletes_metadata.as_ref().map_or(vec![], |x| x.files.clone()),
+            speedboat_files: checkpoint
+                .speedboat_metadata
+                .as_ref()
+                .unwrap()
+                .files
+                .clone(),
+            delete_files: checkpoint
+                .deletes_metadata
+                .as_ref()
+                .map_or(vec![], |x| x.files.clone()),
             checkpoint_id_to_replace: checkpoint.checkpoint_id.clone(),
             checkpoints_to_delete: checkpoints_to_delete.clone(),
         }
     }
 }
-
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CleanupWorkItem {
@@ -584,12 +727,10 @@ pub struct CleanupWorkItem {
     pub files_to_delete: Vec<String>,
 }
 
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AliasInfo {
     pub is_hidden: bool,
 }
-
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(untagged)]
@@ -618,15 +759,12 @@ pub struct PropertyInfo {
     pub scaling_factor: Option<u32>,
 }
 
-
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Mappings {
     pub dynamic: StringOrBool,
     pub _meta: Option<MetaInfo>,
     pub properties: HashMap<String, PropertyInfo>,
 }
-
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IndexMappingSettings {
@@ -635,9 +773,8 @@ pub struct IndexMappingSettings {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IndexMappingFieldSettings {
-    pub limit: Option<u32>
+    pub limit: Option<u32>,
 }
-
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IndexSettings {
@@ -656,10 +793,9 @@ pub struct CreateIndexResult {
     pub index: String,
 }
 
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CreateIndexSettings {
-    pub index: IndexSettings
+    pub index: IndexSettings,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -668,7 +804,6 @@ pub enum CreateIndexSettingsOption {
     Indirect(CreateIndexSettings),
     Direct(IndexSettings),
 }
-
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CreateIndexBody {
@@ -680,7 +815,11 @@ pub struct CreateIndexBody {
 impl CreateIndexBody {
     pub(crate) fn parse(content: &String) -> Result<Self, serde_json::Error> {
         if content.len() == 0 {
-            Ok(CreateIndexBody{ aliases: None, mappings: None, settings: None })
+            Ok(CreateIndexBody {
+                aliases: None,
+                mappings: None,
+                settings: None,
+            })
         } else {
             serde_json::from_str(content)
         }
@@ -708,7 +847,6 @@ pub struct ServiceMode {
     pub impl_type: ServiceImplType,
 }
 
-
 impl ServiceMode {
     pub fn test() -> Self {
         ServiceMode {
@@ -718,12 +856,13 @@ impl ServiceMode {
 
     pub fn as_testing_mode(&self) -> TestProcessingMode {
         match &self.impl_type {
-            ServiceImplType::TestingDynamoDb(address) => TestProcessingMode::dynamo_testing(address.clone()),
-            _ => TestProcessingMode::default()
+            ServiceImplType::TestingDynamoDb(address) => {
+                TestProcessingMode::dynamo_testing(address.clone())
+            }
+            _ => TestProcessingMode::default(),
         }
     }
 }
-
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum LicenseType {
@@ -731,10 +870,8 @@ pub enum LicenseType {
     Pro,
 }
 
-
 pub const ACCESS_KEY_HEADER_KEY: &str = "ACCESS_KEY";
 pub const SECRET_KEY_HEADER_KEY: &str = "SECRET_KEY";
-
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct OrgCreds {
@@ -742,7 +879,6 @@ pub struct OrgCreds {
     pub secret_access_key: String,
     pub nickname: Option<String>,
 }
-
 
 impl OrgCreds {
     #[allow(dead_code)]
@@ -755,7 +891,6 @@ impl OrgCreds {
         }
     }
 }
-
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct OrgSettings {
@@ -778,7 +913,6 @@ pub struct OrgInfo {
     pub org_id: String,
     pub license_type: LicenseType,
 }
-
 
 pub const TEST_ACCESS_KEY: &str = "access_key";
 pub const TEST_SECRET_KEY: &str = "secret_key";
