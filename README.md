@@ -275,6 +275,12 @@ bash scripts/run_es_compat_local.sh
 bash scripts/run_dynamodb_sdk_compat_local.sh
 ```
 
+`run_es_compat_local.sh` now covers:
+
+- the Rust Elasticsearch fixture matrix
+- live Powdrr-vs-Elasticsearch differential checks
+- an official JavaScript `@elastic/elasticsearch` smoke suite against the read-only subset
+
 ## Where To Read Next
 
 - `docs/zero-copy-lakehouse-serving-requirements.md`

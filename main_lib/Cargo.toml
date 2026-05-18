@@ -85,4 +85,8 @@ required-features = ["integration-tests"]
 [[test]]
 name = "dynamodb_compatibility_matrix"
 path = "tests/dynamodb_compatibility_matrix.rs"
+
+[[test]]
+name = "elasticsearch_js_client_compat"
+path = "tests/elasticsearch_js_client_compat.rs"
 required-features = ["integration-tests"]

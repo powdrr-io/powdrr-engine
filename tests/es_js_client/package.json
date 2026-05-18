@@ -1,0 +1,8 @@
+{
+  "name": "powdrr-es-js-client-smoke",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@elastic/elasticsearch": "^8.19.1"
+  }
+}

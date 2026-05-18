@@ -15,7 +15,10 @@ idgenerator = "2.0.0"
 minijinja = "2.10.2"
 modyne = "0.3.0"
 modyne-derive = "0.3.0"
+openraft = { version = "0.9.24", features = ["serde"] }
+openraft-memstore = "0.9.24"
 paste = "1.0.15"
+reqwest = { version = "0.12.5", features = ["json"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
