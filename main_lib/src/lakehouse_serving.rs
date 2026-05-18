@@ -77,6 +77,12 @@ struct ServingPlan {
     estimated_bytes: u64,
 }
 
+#[derive(Clone, Debug)]
+struct OrderedFileGroup {
+    files: Vec<FileDescriptor>,
+    best_case_sort_value: Value,
+}
+
 pub fn get_serving_config(state: State) -> Pin<Box<HandlerFuture>> {
     async move {
         let path = NamePathExtractor::borrow_from(&state);
@@ -290,7 +296,14 @@ pub async fn execute_serving_query(
         });
     }
 
-    let mut rows = execute_plan(&plan.selected_files, &request, &plan.sql, plan.limit).await?;
+    let mut rows = execute_plan(
+        &plan.selected_files,
+        &context.file_stats,
+        &request,
+        &plan.sql,
+        plan.limit,
+    )
+    .await?;
     if request.order_by.is_empty() {
         rows.truncate(plan.limit);
     }
@@ -454,6 +467,28 @@ fn plan_request(
 
 async fn execute_plan(
     files: &[FileDescriptor],
+    file_stats: &HashMap<String, IcebergFileStats>,
+    request: &ServingRequestPlan,
+    sql: &str,
+    limit: usize,
+) -> Result<Vec<Value>, ServingQueryError> {
+    if limit == 0 {
+        return Ok(vec![]);
+    }
+
+    if let Some(sort) = request.order_by.first() {
+        if let Some(ordered_groups) =
+            ordered_file_groups_for_top_k(files, file_stats, &sort.field, sort.descending)
+        {
+            return execute_ordered_top_k_plan(ordered_groups, request, sql, limit).await;
+        }
+    }
+
+    execute_parallel_plan(files, request, sql, limit).await
+}
+
+async fn execute_parallel_plan(
+    files: &[FileDescriptor],
     request: &ServingRequestPlan,
     sql: &str,
     limit: usize,
@@ -470,6 +505,38 @@ async fn execute_plan(
 
     while let Some(result) = results.next().await {
         merge_rows(&mut rows, result?, request, limit);
+    }
+
+    Ok(rows)
+}
+
+async fn execute_ordered_top_k_plan(
+    file_groups: Vec<OrderedFileGroup>,
+    request: &ServingRequestPlan,
+    sql: &str,
+    limit: usize,
+) -> Result<Vec<Value>, ServingQueryError> {
+    let mut rows = vec![];
+    let Some(sort) = request.order_by.first() else {
+        return Ok(rows);
+    };
+    let mut file_groups = file_groups.into_iter().peekable();
+
+    while let Some(file_group) = file_groups.next() {
+        let new_rows = execute_file_group_plan(file_group.files, sql).await?;
+        merge_rows(&mut rows, new_rows, request, limit);
+
+        if let Some(next_group) = file_groups.peek() {
+            if remaining_groups_cannot_beat_kth_row(
+                &rows,
+                &next_group.best_case_sort_value,
+                &sort.field,
+                sort.descending,
+                limit,
+            ) {
+                break;
+            }
+        }
     }
 
     Ok(rows)
@@ -506,6 +573,97 @@ fn serving_file_parallelism() -> usize {
     std::thread::available_parallelism()
         .map(|parallelism| parallelism.get().clamp(1, 8))
         .unwrap_or(4)
+}
+
+fn ordered_file_groups_for_top_k(
+    files: &[FileDescriptor],
+    file_stats: &HashMap<String, IcebergFileStats>,
+    sort_field: &str,
+    descending: bool,
+) -> Option<Vec<OrderedFileGroup>> {
+    let mut groups = group_files_by_schema(files)
+        .into_iter()
+        .map(|group| {
+            file_group_sort_bound(&group, file_stats, sort_field, descending).map(|bound| {
+                OrderedFileGroup {
+                    files: group,
+                    best_case_sort_value: bound,
+                }
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    groups.sort_by(|left, right| {
+        compare_sort_values(
+            &left.best_case_sort_value,
+            &right.best_case_sort_value,
+            descending,
+        )
+    });
+    Some(groups)
+}
+
+fn file_group_sort_bound(
+    files: &[FileDescriptor],
+    file_stats: &HashMap<String, IcebergFileStats>,
+    sort_field: &str,
+    descending: bool,
+) -> Option<Value> {
+    let mut best_bound: Option<Value> = None;
+
+    for file in files {
+        let candidate = file_sort_bound(file, file_stats, sort_field, descending)?;
+        if best_bound
+            .as_ref()
+            .map(|best| compare_sort_values(&candidate, best, descending) == Ordering::Less)
+            .unwrap_or(true)
+        {
+            best_bound = Some(candidate);
+        }
+    }
+
+    best_bound
+}
+
+fn file_sort_bound(
+    file: &FileDescriptor,
+    file_stats: &HashMap<String, IcebergFileStats>,
+    sort_field: &str,
+    descending: bool,
+) -> Option<Value> {
+    let stats = file_stats.get(&file.file_path)?;
+    let column_stats = stats
+        .columns
+        .iter()
+        .find(|stats| stats.field_name == sort_field)?;
+
+    if column_is_all_null(column_stats, stats.record_count) {
+        return Some(Value::Null);
+    }
+
+    if descending {
+        column_stats.upper_bound.clone()
+    } else {
+        column_stats.lower_bound.clone()
+    }
+}
+
+fn remaining_groups_cannot_beat_kth_row(
+    rows: &[Value],
+    next_best_sort_value: &Value,
+    sort_field: &str,
+    descending: bool,
+    limit: usize,
+) -> bool {
+    if limit == 0 || rows.len() < limit {
+        return false;
+    }
+
+    let Some(kth_row_value) = rows.get(limit - 1).and_then(|row| row.get(sort_field)) else {
+        return false;
+    };
+
+    compare_sort_values(next_best_sort_value, kth_row_value, descending) == Ordering::Greater
 }
 
 async fn execute_file_group_plan(
@@ -1034,6 +1192,10 @@ fn compare_row_values(left: Option<&Value>, right: Option<&Value>, descending: b
     }
 }
 
+fn compare_sort_values(left: &Value, right: &Value, descending: bool) -> Ordering {
+    compare_row_values(Some(left), Some(right), descending)
+}
+
 fn compare_values(left: &Value, right: &Value) -> Ordering {
     match (left, right) {
         (Value::Null, Value::Null) => Ordering::Equal,
@@ -1102,8 +1264,9 @@ impl ServingQueryError {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_sql, file_group_table_name, group_files_by_schema, plan_request,
-        prune_candidate_files, request_matches_pattern, ServingExecutionContext,
+        build_sql, file_group_table_name, group_files_by_schema, ordered_file_groups_for_top_k,
+        plan_request, prune_candidate_files, remaining_groups_cannot_beat_kth_row,
+        request_matches_pattern, ServingExecutionContext,
     };
     use crate::data_contract::{
         FileDescriptor, IcebergColumnStats, IcebergFileStats, ServingPattern, ServingTableConfig,
@@ -1491,6 +1654,155 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["file://third.parquet"]
         );
+    }
+
+    #[test]
+    fn test_ordered_file_groups_for_top_k_sorts_groups_by_descending_upper_bound() {
+        let schema = test_schema();
+        let other_schema = alternate_schema();
+        let files = vec![
+            FileDescriptor {
+                file_path: "file://first.parquet".to_string(),
+                schema: schema.clone(),
+                size: 100,
+            },
+            FileDescriptor {
+                file_path: "file://second.parquet".to_string(),
+                schema: schema.clone(),
+                size: 200,
+            },
+            FileDescriptor {
+                file_path: "file://third.parquet".to_string(),
+                schema: other_schema,
+                size: 300,
+            },
+        ];
+        let file_stats = HashMap::from([
+            (
+                "file://first.parquet".to_string(),
+                file_stats(
+                    "file://first.parquet",
+                    Some(10),
+                    vec![column_stats(
+                        "score",
+                        Some(0),
+                        Some(json!(0)),
+                        Some(json!(40)),
+                    )],
+                ),
+            ),
+            (
+                "file://second.parquet".to_string(),
+                file_stats(
+                    "file://second.parquet",
+                    Some(10),
+                    vec![column_stats(
+                        "score",
+                        Some(0),
+                        Some(json!(10)),
+                        Some(json!(60)),
+                    )],
+                ),
+            ),
+            (
+                "file://third.parquet".to_string(),
+                file_stats(
+                    "file://third.parquet",
+                    Some(10),
+                    vec![column_stats(
+                        "score",
+                        Some(0),
+                        Some(json!(70)),
+                        Some(json!(90)),
+                    )],
+                ),
+            ),
+        ]);
+
+        let ordered_groups = ordered_file_groups_for_top_k(&files, &file_stats, "score", true)
+            .expect("score bounds should enable ordered top-k");
+
+        assert_eq!(
+            ordered_groups[0]
+                .files
+                .iter()
+                .map(|file| file.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["file://third.parquet"]
+        );
+        assert_eq!(ordered_groups[0].best_case_sort_value, json!(90));
+        assert_eq!(
+            ordered_groups[1]
+                .files
+                .iter()
+                .map(|file| file.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["file://first.parquet", "file://second.parquet"]
+        );
+        assert_eq!(ordered_groups[1].best_case_sort_value, json!(60));
+    }
+
+    #[test]
+    fn test_ordered_file_groups_for_top_k_returns_none_when_sort_bounds_are_missing() {
+        let schema = test_schema();
+        let files = test_files(&schema);
+        let file_stats = HashMap::from([
+            (
+                "file://first.parquet".to_string(),
+                file_stats(
+                    "file://first.parquet",
+                    Some(10),
+                    vec![column_stats(
+                        "score",
+                        Some(0),
+                        Some(json!(0)),
+                        Some(json!(40)),
+                    )],
+                ),
+            ),
+            (
+                "file://second.parquet".to_string(),
+                file_stats("file://second.parquet", Some(10), vec![]),
+            ),
+        ]);
+
+        assert!(
+            ordered_file_groups_for_top_k(&files, &file_stats, "score", true).is_none(),
+            "missing score bounds should fall back to the existing parallel path"
+        );
+    }
+
+    #[test]
+    fn test_remaining_groups_cannot_beat_kth_row_descending() {
+        let rows = vec![json!({ "score": 100 }), json!({ "score": 90 })];
+
+        assert!(remaining_groups_cannot_beat_kth_row(
+            &rows,
+            &json!(89),
+            "score",
+            true,
+            2,
+        ));
+        assert!(!remaining_groups_cannot_beat_kth_row(
+            &rows,
+            &json!(90),
+            "score",
+            true,
+            2,
+        ));
+    }
+
+    #[test]
+    fn test_remaining_groups_cannot_beat_kth_row_ignores_zero_limit() {
+        let rows = vec![json!({ "score": 100 })];
+
+        assert!(!remaining_groups_cannot_beat_kth_row(
+            &rows,
+            &json!(99),
+            "score",
+            true,
+            0,
+        ));
     }
 
     #[test]
