@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::net::TcpStream;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -7,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
 use aws_sdk_dynamodb::client::Waiters;
+use aws_sdk_dynamodb::operation::query::QueryOutput;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, KeySchemaElement,
     KeyType, KeysAndAttributes, Projection, ProjectionType, ScalarAttributeType, TableDescription,
@@ -27,13 +29,103 @@ use powdrr_lib::router::router;
 use powdrr_lib::serving_dataset::read_parquet_documents;
 use powdrr_lib::test_api::{CompactionMode, IndexingMode, StateMode, TestProcessingMode};
 use reqwest::Client as HttpClient;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
+const CASES_JSON: &str = include_str!("data/dynamodb_compat_cases.json");
+
 static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+const ALL_DYNAMODB_OPERATIONS: &[&str] = &[
+    "BatchExecuteStatement",
+    "BatchGetItem",
+    "BatchWriteItem",
+    "CreateBackup",
+    "CreateGlobalTable",
+    "CreateTable",
+    "DeleteBackup",
+    "DeleteItem",
+    "DeleteResourcePolicy",
+    "DeleteTable",
+    "DescribeBackup",
+    "DescribeContinuousBackups",
+    "DescribeContributorInsights",
+    "DescribeEndpoints",
+    "DescribeExport",
+    "DescribeGlobalTable",
+    "DescribeGlobalTableSettings",
+    "DescribeImport",
+    "DescribeKinesisStreamingDestination",
+    "DescribeLimits",
+    "DescribeTable",
+    "DescribeTableReplicaAutoScaling",
+    "DescribeTimeToLive",
+    "DisableKinesisStreamingDestination",
+    "EnableKinesisStreamingDestination",
+    "ExecuteStatement",
+    "ExecuteTransaction",
+    "ExportTableToPointInTime",
+    "GetItem",
+    "GetResourcePolicy",
+    "ImportTable",
+    "ListBackups",
+    "ListContributorInsights",
+    "ListExports",
+    "ListGlobalTables",
+    "ListImports",
+    "ListTables",
+    "ListTagsOfResource",
+    "PutItem",
+    "PutResourcePolicy",
+    "Query",
+    "RestoreTableFromBackup",
+    "RestoreTableToPointInTime",
+    "Scan",
+    "TagResource",
+    "TransactGetItems",
+    "TransactWriteItems",
+    "UntagResource",
+    "UpdateContinuousBackups",
+    "UpdateContributorInsights",
+    "UpdateGlobalTable",
+    "UpdateGlobalTableSettings",
+    "UpdateItem",
+    "UpdateKinesisStreamingDestination",
+    "UpdateTable",
+    "UpdateTableReplicaAutoScaling",
+    "UpdateTimeToLive",
+];
+
+const SUPPORTED_DYNAMODB_OPERATIONS: &[&str] = &[
+    "BatchGetItem",
+    "DescribeTable",
+    "GetItem",
+    "ListTables",
+    "Query",
+];
+
+#[derive(Debug, Deserialize)]
+struct CaseFile {
+    operations: Vec<OperationCase>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OperationCase {
+    operation: String,
+    mode: CoverageMode,
+    #[serde(rename = "description")]
+    _description: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CoverageMode {
+    DifferentialSupported,
+    ExplicitError,
+}
 
 #[derive(Clone, Debug, Serialize)]
 struct EventRow {
@@ -79,40 +171,130 @@ impl Drop for PowdrrServer {
     }
 }
 
+struct DifferentialFixture {
+    _temp_dir: TempDir,
+    powdrr_client: DynamoClient,
+    localstack_client: DynamoClient,
+    rows: Vec<EventRow>,
+    primary_table_name: String,
+    begins_with_table_name: String,
+    hidden_table_name: String,
+    region_event_id_index: String,
+}
+
 #[test]
-fn dynamodb_sdk_compat_matches_localstack_for_read_only_mvp() {
+fn compatibility_matrix_operations_are_complete_and_unique() {
     let _guard = TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    let Err(reason) = ensure_local_engine_dependencies() else {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            run_dynamodb_sdk_compat_test().await;
-        });
-        return;
-    };
+    let cases = load_cases();
+    assert!(
+        !cases.is_empty(),
+        "expected at least one DynamoDB compatibility operation case"
+    );
 
-    eprintln!("Skipping DynamoDB SDK compatibility run; {}", reason);
+    let mut operation_set = BTreeSet::new();
+    let mut supported = BTreeSet::new();
+    for case in cases {
+        assert!(
+            operation_set.insert(case.operation.clone()),
+            "duplicate DynamoDB operation coverage entry '{}'",
+            case.operation
+        );
+        if case.mode == CoverageMode::DifferentialSupported {
+            supported.insert(case.operation.clone());
+        }
+    }
+
+    let expected_operations = ALL_DYNAMODB_OPERATIONS
+        .iter()
+        .map(|operation| operation.to_string())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        operation_set, expected_operations,
+        "DynamoDB compatibility matrix must enumerate the full SDK operation surface"
+    );
+
+    let expected_supported = SUPPORTED_DYNAMODB_OPERATIONS
+        .iter()
+        .map(|operation| operation.to_string())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        supported, expected_supported,
+        "supported operation coverage drifted from the tracked contract"
+    );
 }
 
-async fn run_dynamodb_sdk_compat_test() {
+#[test]
+fn compatibility_matrix_wire_contract_locally() {
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let server = PowdrrServer::spawn().await;
+        let fixture = match ensure_local_engine_dependencies() {
+            Ok(()) => Some(build_differential_fixture(&server.base_url).await),
+            Err(reason) => {
+                eprintln!(
+                    "Skipping DynamoDB stateful and differential contract run; {}",
+                    reason
+                );
+                None
+            }
+        };
+
+        assert_unsupported_operations_explicit(&server.base_url).await;
+        assert_parser_rejections_explicit(&server.base_url).await;
+        if let Some(fixture) = fixture {
+            assert_stateful_query_errors(&server.base_url, &fixture.primary_table_name).await;
+            for case in load_cases()
+                .into_iter()
+                .filter(|case| case.mode == CoverageMode::DifferentialSupported)
+            {
+                eprintln!("dynamo differential operation: {}", case.operation);
+                match case.operation.as_str() {
+                    "ListTables" => compare_list_tables(&fixture).await,
+                    "DescribeTable" => compare_describe_table(&fixture).await,
+                    "GetItem" => compare_get_item(&fixture).await,
+                    "BatchGetItem" => compare_batch_get_item(&fixture).await,
+                    "Query" => compare_query_operation(&fixture).await,
+                    other => panic!(
+                        "missing supported DynamoDB differential executor for {}",
+                        other
+                    ),
+                }
+            }
+        }
+    });
+}
+
+fn load_cases() -> Vec<OperationCase> {
+    serde_json::from_str::<CaseFile>(CASES_JSON)
+        .unwrap()
+        .operations
+}
+
+async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
     let temp_dir = TempDir::new().unwrap();
     let parquet_path = temp_dir.path().join("events.parquet");
     let rows = fixture_rows();
     write_test_parquet(&parquet_path, &rows);
 
-    let table_name = unique_table_name("dynamo_sdk_compat");
-    let begins_with_table_name = unique_table_name("dynamo_sdk_begins_with");
+    let primary_table_name = unique_table_name("dynamo_matrix_primary");
+    let begins_with_table_name = unique_table_name("dynamo_matrix_begins_with");
+    let hidden_table_name = unique_table_name("dynamo_matrix_hidden");
     let region_event_id_index = "region-event-id-index".to_string();
-    let powdrr_server = PowdrrServer::spawn().await;
-    configure_powdrr_testing_mode(&powdrr_server.base_url).await;
+
+    configure_powdrr_testing_mode(base_url).await;
     configure_powdrr_table(
-        &powdrr_server.base_url,
-        &table_name,
+        base_url,
+        &primary_table_name,
         &parquet_path,
         &DynamoDbTableConfig {
             partition_key: "tenant".to_string(),
@@ -126,7 +308,7 @@ async fn run_dynamodb_sdk_compat_test() {
     )
     .await;
     configure_powdrr_table(
-        &powdrr_server.base_url,
+        base_url,
         &begins_with_table_name,
         &parquet_path,
         &DynamoDbTableConfig {
@@ -136,12 +318,13 @@ async fn run_dynamodb_sdk_compat_test() {
         },
     )
     .await;
+    add_powdrr_checkpoint(base_url, &hidden_table_name, &parquet_path).await;
 
-    let powdrr_client = dynamodb_client(&powdrr_server.base_url).await;
+    let powdrr_client = dynamodb_client(base_url).await;
     let localstack_client = dynamodb_client("http://127.0.0.1:4566").await;
     create_localstack_table(
         &localstack_client,
-        &table_name,
+        &primary_table_name,
         &rows,
         "ts",
         ScalarAttributeType::N,
@@ -163,42 +346,241 @@ async fn run_dynamodb_sdk_compat_test() {
     )
     .await;
 
-    let powdrr_tables = powdrr_client.list_tables().limit(100).send().await.unwrap();
-    assert!(
-        powdrr_tables
-            .table_names()
-            .iter()
-            .any(|name| name == &table_name),
-        "Powdrr ListTables did not include {}; tables={:?}",
-        table_name,
-        powdrr_tables.table_names()
-    );
+    DifferentialFixture {
+        _temp_dir: temp_dir,
+        powdrr_client,
+        localstack_client,
+        rows,
+        primary_table_name,
+        begins_with_table_name,
+        hidden_table_name,
+        region_event_id_index,
+    }
+}
 
-    let localstack_tables = localstack_client
+async fn assert_unsupported_operations_explicit(base_url: &str) {
+    for case in load_cases()
+        .into_iter()
+        .filter(|case| case.mode == CoverageMode::ExplicitError)
+    {
+        let response = raw_dynamodb_request(base_url, &case.operation, &json!({})).await;
+        assert_eq!(
+            response.status, 400,
+            "{} should fail explicitly, got status {} body {}",
+            case.operation, response.status, response.body
+        );
+        assert_eq!(
+            response.body["__type"],
+            json!("ValidationException"),
+            "{} should return a ValidationException body, got {}",
+            case.operation,
+            response.body
+        );
+        assert_eq!(
+            response.body["message"],
+            json!(format!("Unsupported x-amz-target {}", case.operation)),
+            "{} should surface the unsupported x-amz-target explicitly, got {}",
+            case.operation,
+            response.body
+        );
+    }
+}
+
+async fn assert_parser_rejections_explicit(base_url: &str) {
+    let table_name = "parser_only_table".to_string();
+    let explicit_error_cases = vec![
+        (
+            "ListTables",
+            json!({ "UnknownField": true }),
+            "unknown field `UnknownField`",
+        ),
+        (
+            "DescribeTable",
+            json!({
+                "TableName": table_name,
+                "ReturnConsumedCapacity": "TOTAL"
+            }),
+            "unknown field `ReturnConsumedCapacity`",
+        ),
+        (
+            "GetItem",
+            json!({
+                "TableName": table_name,
+                "Key": {
+                    "tenant": { "S": "acme" },
+                    "ts": { "N": "10" }
+                },
+                "ConsistentRead": true
+            }),
+            "unknown field `ConsistentRead`",
+        ),
+        (
+            "BatchGetItem",
+            json!({
+                "RequestItems": {
+                    table_name.clone(): {
+                        "Keys": [{
+                            "tenant": { "S": "acme" },
+                            "ts": { "N": "10" }
+                        }]
+                    }
+                },
+                "ReturnConsumedCapacity": "TOTAL"
+            }),
+            "unknown field `ReturnConsumedCapacity`",
+        ),
+        (
+            "Query",
+            json!({
+                "TableName": table_name,
+                "KeyConditionExpression": "#pk = :pk",
+                "ExpressionAttributeNames": {
+                    "#pk": "tenant"
+                },
+                "ExpressionAttributeValues": {
+                    ":pk": { "S": "acme" }
+                },
+                "Select": "COUNT"
+            }),
+            "unknown field `Select`",
+        ),
+    ];
+
+    for (operation, body, expected_message_fragment) in explicit_error_cases {
+        let response = raw_dynamodb_request(base_url, operation, &body).await;
+        assert_eq!(
+            response.status, 400,
+            "{} should fail explicitly, got status {} body {}",
+            operation, response.status, response.body
+        );
+        assert_eq!(
+            response.body["__type"],
+            json!("ValidationException"),
+            "{} should return ValidationException, got {}",
+            operation,
+            response.body
+        );
+        let message = response.body["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(expected_message_fragment),
+            "{} should surface '{}', got '{}'",
+            operation,
+            expected_message_fragment,
+            message
+        );
+    }
+}
+
+async fn assert_stateful_query_errors(base_url: &str, table_name: &str) {
+    let explicit_error_cases = vec![
+        (
+            "Query",
+            json!({
+                "TableName": table_name,
+                "KeyConditionExpression": "#pk = :pk AND #sk BETWEEN :start AND :end",
+                "ExpressionAttributeNames": {
+                    "#pk": "tenant",
+                    "#sk": "ts",
+                    "#region": "region"
+                },
+                "ExpressionAttributeValues": {
+                    ":pk": { "S": "acme" },
+                    ":start": { "N": "10" },
+                    ":end": { "N": "30" },
+                    ":prefix": { "S": "us" }
+                },
+                "FilterExpression": "contains(#region, :prefix)"
+            }),
+            "Unsupported FilterExpression clause contains(region, :prefix)",
+        ),
+        (
+            "Query",
+            json!({
+                "TableName": table_name,
+                "KeyConditionExpression": "#pk = :pk AND #sk IN (:one, :two)",
+                "ExpressionAttributeNames": {
+                    "#pk": "tenant",
+                    "#sk": "ts"
+                },
+                "ExpressionAttributeValues": {
+                    ":pk": { "S": "acme" },
+                    ":one": { "N": "10" },
+                    ":two": { "N": "20" }
+                }
+            }),
+            "Unsupported KeyConditionExpression form",
+        ),
+    ];
+
+    for (operation, body, expected_message_fragment) in explicit_error_cases {
+        let response = raw_dynamodb_request(base_url, operation, &body).await;
+        assert_eq!(
+            response.status, 400,
+            "{} should fail explicitly, got status {} body {}",
+            operation, response.status, response.body
+        );
+        assert_eq!(
+            response.body["__type"],
+            json!("ValidationException"),
+            "{} should return ValidationException, got {}",
+            operation,
+            response.body
+        );
+        let message = response.body["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(expected_message_fragment),
+            "{} should surface '{}', got '{}'",
+            operation,
+            expected_message_fragment,
+            message
+        );
+    }
+}
+
+async fn compare_list_tables(fixture: &DifferentialFixture) {
+    let powdrr_tables = fixture
+        .powdrr_client
         .list_tables()
         .limit(100)
         .send()
         .await
         .unwrap();
-    assert!(
-        localstack_tables
-            .table_names()
-            .iter()
-            .any(|name| name == &table_name),
-        "LocalStack ListTables did not include {}; tables={:?}",
-        table_name,
-        localstack_tables.table_names()
-    );
-
-    let powdrr_description = powdrr_client
-        .describe_table()
-        .table_name(&table_name)
+    let localstack_tables = fixture
+        .localstack_client
+        .list_tables()
+        .limit(100)
         .send()
         .await
         .unwrap();
-    let localstack_description = localstack_client
+
+    let mut powdrr_names = powdrr_tables.table_names().to_vec();
+    let mut localstack_names = localstack_tables.table_names().to_vec();
+    powdrr_names.sort();
+    localstack_names.sort();
+
+    assert!(
+        !powdrr_names
+            .iter()
+            .any(|name| name == &fixture.hidden_table_name),
+        "Powdrr ListTables exposed non-Dynamo table {}; tables={:?}",
+        fixture.hidden_table_name,
+        powdrr_names
+    );
+    assert_eq!(powdrr_names, localstack_names);
+}
+
+async fn compare_describe_table(fixture: &DifferentialFixture) {
+    let powdrr_description = fixture
+        .powdrr_client
         .describe_table()
-        .table_name(&table_name)
+        .table_name(&fixture.primary_table_name)
+        .send()
+        .await
+        .unwrap();
+    let localstack_description = fixture
+        .localstack_client
+        .describe_table()
+        .table_name(&fixture.primary_table_name)
         .send()
         .await
         .unwrap();
@@ -206,17 +588,20 @@ async fn run_dynamodb_sdk_compat_test() {
         powdrr_description.table().unwrap(),
         localstack_description.table().unwrap(),
     );
+}
 
-    let get_key = primary_key_item(&rows[1]);
+async fn compare_get_item(fixture: &DifferentialFixture) {
+    let get_key = primary_key_item(&fixture.rows[1]);
     let expected_get_item = json!({
         "tenant": "acme",
         "ts": 20,
         "event_id": "evt-2",
         "count": 2,
     });
-    let powdrr_get_item = powdrr_client
+    let powdrr_get_item = fixture
+        .powdrr_client
         .get_item()
-        .table_name(&table_name)
+        .table_name(&fixture.primary_table_name)
         .set_key(Some(get_key.clone()))
         .projection_expression("#pk, ts, event_id, #count")
         .expression_attribute_names("#pk", "tenant")
@@ -224,9 +609,10 @@ async fn run_dynamodb_sdk_compat_test() {
         .send()
         .await
         .unwrap();
-    let localstack_get_item = localstack_client
+    let localstack_get_item = fixture
+        .localstack_client
         .get_item()
-        .table_name(&table_name)
+        .table_name(&fixture.primary_table_name)
         .set_key(Some(get_key))
         .projection_expression("#pk, ts, event_id, #count")
         .expression_attribute_names("#pk", "tenant")
@@ -234,13 +620,19 @@ async fn run_dynamodb_sdk_compat_test() {
         .send()
         .await
         .unwrap();
-    let powdrr_get_json = optional_item_to_json(powdrr_get_item.item());
-    let localstack_get_json = optional_item_to_json(localstack_get_item.item());
-    assert_eq!(powdrr_get_json, Some(expected_get_item.clone()));
-    assert_eq!(powdrr_get_json, localstack_get_json);
 
-    let batch_keys = vec![primary_key_item(&rows[1]), primary_key_item(&rows[3])];
-    let expected_batch_items = vec![
+    let powdrr_json = optional_item_to_json(powdrr_get_item.item());
+    let localstack_json = optional_item_to_json(localstack_get_item.item());
+    assert_eq!(powdrr_json, Some(expected_get_item));
+    assert_eq!(powdrr_json, localstack_json);
+}
+
+async fn compare_batch_get_item(fixture: &DifferentialFixture) {
+    let batch_keys = vec![
+        primary_key_item(&fixture.rows[1]),
+        primary_key_item(&fixture.rows[3]),
+    ];
+    let expected_batch_items = normalize_item_list(vec![
         json!({
             "tenant": "acme",
             "ts": 20,
@@ -251,276 +643,210 @@ async fn run_dynamodb_sdk_compat_test() {
             "ts": 15,
             "event_id": "evt-4",
         }),
-    ];
+    ]);
     let batch_request = KeysAndAttributes::builder()
         .set_keys(Some(batch_keys.clone()))
         .projection_expression("#pk, ts, event_id")
         .expression_attribute_names("#pk", "tenant")
         .build()
         .unwrap();
-    let powdrr_batch = powdrr_client
+
+    let powdrr_output = fixture
+        .powdrr_client
         .batch_get_item()
-        .request_items(table_name.clone(), batch_request.clone())
+        .request_items(fixture.primary_table_name.clone(), batch_request.clone())
         .send()
         .await
         .unwrap();
-    let localstack_batch = localstack_client
+    let localstack_output = fixture
+        .localstack_client
         .batch_get_item()
-        .request_items(table_name.clone(), batch_request)
+        .request_items(fixture.primary_table_name.clone(), batch_request)
         .send()
         .await
         .unwrap();
+
     assert_eq!(
-        powdrr_batch.unprocessed_keys().map(|keys| keys.len()),
-        Some(0)
+        normalize_item_list(batch_output_items(
+            &powdrr_output,
+            &fixture.primary_table_name
+        )),
+        expected_batch_items
     );
     assert_eq!(
-        normalize_item_list(batch_output_items(&powdrr_batch, &table_name)),
-        normalize_item_list(expected_batch_items.clone())
+        normalize_item_list(batch_output_items(
+            &powdrr_output,
+            &fixture.primary_table_name
+        )),
+        normalize_item_list(batch_output_items(
+            &localstack_output,
+            &fixture.primary_table_name
+        ))
     );
-    assert_eq!(
-        normalize_item_list(batch_output_items(&powdrr_batch, &table_name)),
-        normalize_item_list(batch_output_items(&localstack_batch, &table_name))
+}
+
+async fn compare_query_operation(fixture: &DifferentialFixture) {
+    let powdrr_first_page =
+        query_page(&fixture.powdrr_client, &fixture.primary_table_name, None).await;
+    let localstack_first_page = query_page(
+        &fixture.localstack_client,
+        &fixture.primary_table_name,
+        None,
+    )
+    .await;
+    compare_query_page_outputs(
+        &powdrr_first_page,
+        &localstack_first_page,
+        normalize_item_list(vec![
+            json!({
+                "tenant": "acme",
+                "ts": 10,
+                "event_id": "evt-1",
+                "region": "us-east-1",
+            }),
+            json!({
+                "tenant": "acme",
+                "ts": 20,
+                "event_id": "evt-2",
+                "region": "us-west-2",
+            }),
+        ]),
     );
 
-    let expected_query_page_one = vec![
-        json!({
+    let powdrr_second_page = query_page(
+        &fixture.powdrr_client,
+        &fixture.primary_table_name,
+        powdrr_first_page.last_evaluated_key().cloned(),
+    )
+    .await;
+    let localstack_second_page = query_page(
+        &fixture.localstack_client,
+        &fixture.primary_table_name,
+        localstack_first_page.last_evaluated_key().cloned(),
+    )
+    .await;
+    compare_query_page_outputs(
+        &powdrr_second_page,
+        &localstack_second_page,
+        normalize_item_list(vec![json!({
             "tenant": "acme",
-            "ts": 10,
-            "event_id": "evt-1",
-            "region": "us-east-1",
-        }),
-        json!({
+            "ts": 30,
+            "event_id": "evt-3",
+            "region": "eu-central-1",
+        })]),
+    );
+
+    let powdrr_begins_with = query_begins_with_page(
+        &fixture.powdrr_client,
+        &fixture.begins_with_table_name,
+        None,
+    )
+    .await;
+    let localstack_begins_with = query_begins_with_page(
+        &fixture.localstack_client,
+        &fixture.begins_with_table_name,
+        None,
+    )
+    .await;
+    compare_query_page_outputs(
+        &powdrr_begins_with,
+        &localstack_begins_with,
+        normalize_item_list(vec![
+            json!({
+                "tenant": "acme",
+                "event_id": "evt-1",
+                "region": "us-east-1",
+                "ts": 10,
+            }),
+            json!({
+                "tenant": "acme",
+                "event_id": "evt-2",
+                "region": "us-west-2",
+                "ts": 20,
+            }),
+        ]),
+    );
+
+    let powdrr_filtered =
+        query_with_filter_page(&fixture.powdrr_client, &fixture.primary_table_name, None).await;
+    let localstack_filtered = query_with_filter_page(
+        &fixture.localstack_client,
+        &fixture.primary_table_name,
+        None,
+    )
+    .await;
+    compare_query_page_outputs(
+        &powdrr_filtered,
+        &localstack_filtered,
+        normalize_item_list(vec![json!({
             "tenant": "acme",
             "ts": 20,
             "event_id": "evt-2",
-            "region": "us-west-2",
-        }),
-    ];
-    let powdrr_query_page_one = query_page(&powdrr_client, &table_name, None).await;
-    let localstack_query_page_one = query_page(&localstack_client, &table_name, None).await;
-    assert_eq!(powdrr_query_page_one.count(), 2);
-    assert_eq!(powdrr_query_page_one.scanned_count(), 2);
-    assert_eq!(
-        normalize_item_list(items_to_json(powdrr_query_page_one.items())),
-        normalize_item_list(expected_query_page_one)
+            "count": 2,
+        })]),
     );
-    assert_eq!(
-        normalize_item_list(items_to_json(powdrr_query_page_one.items())),
-        normalize_item_list(items_to_json(localstack_query_page_one.items()))
-    );
-    let expected_last_key = json!({
-        "tenant": "acme",
-        "ts": 20,
-    });
-    let powdrr_last_key = optional_item_to_json(powdrr_query_page_one.last_evaluated_key());
-    let localstack_last_key = optional_item_to_json(localstack_query_page_one.last_evaluated_key());
-    assert_eq!(powdrr_last_key, Some(expected_last_key.clone()));
-    assert_eq!(powdrr_last_key, localstack_last_key);
 
-    let powdrr_query_page_two = query_page(
-        &powdrr_client,
-        &table_name,
-        powdrr_query_page_one.last_evaluated_key().cloned(),
+    let powdrr_filtered_second_page = query_with_filter_page(
+        &fixture.powdrr_client,
+        &fixture.primary_table_name,
+        powdrr_filtered.last_evaluated_key().cloned(),
     )
     .await;
-    let localstack_query_page_two = query_page(
-        &localstack_client,
-        &table_name,
-        localstack_query_page_one.last_evaluated_key().cloned(),
+    let localstack_filtered_second_page = query_with_filter_page(
+        &fixture.localstack_client,
+        &fixture.primary_table_name,
+        localstack_filtered.last_evaluated_key().cloned(),
     )
     .await;
-    let expected_query_page_two = vec![json!({
-        "tenant": "acme",
-        "ts": 30,
-        "event_id": "evt-3",
-        "region": "eu-central-1",
-    })];
-    assert_eq!(powdrr_query_page_two.count(), 1);
-    assert_eq!(powdrr_query_page_two.scanned_count(), 1);
-    assert_eq!(
-        normalize_item_list(items_to_json(powdrr_query_page_two.items())),
-        normalize_item_list(expected_query_page_two)
-    );
-    assert_eq!(
-        normalize_item_list(items_to_json(powdrr_query_page_two.items())),
-        normalize_item_list(items_to_json(localstack_query_page_two.items()))
-    );
-    assert_eq!(powdrr_query_page_two.last_evaluated_key(), None);
-    assert_eq!(localstack_query_page_two.last_evaluated_key(), None);
-
-    let powdrr_filter_page_one = query_with_filter_page(&powdrr_client, &table_name, None).await;
-    let localstack_filter_page_one =
-        query_with_filter_page(&localstack_client, &table_name, None).await;
-    let expected_filter_page_one = vec![json!({
-        "tenant": "acme",
-        "ts": 20,
-        "event_id": "evt-2",
-        "count": 2,
-    })];
-    assert_eq!(
-        items_to_json(powdrr_filter_page_one.items()),
-        expected_filter_page_one
-    );
-    assert_eq!(powdrr_filter_page_one.count(), 1);
-    assert_eq!(powdrr_filter_page_one.scanned_count(), 2);
-    assert_eq!(
-        items_to_json(powdrr_filter_page_one.items()),
-        items_to_json(localstack_filter_page_one.items())
-    );
-    assert_eq!(
-        powdrr_filter_page_one.count(),
-        localstack_filter_page_one.count()
-    );
-    assert_eq!(
-        powdrr_filter_page_one.scanned_count(),
-        localstack_filter_page_one.scanned_count()
-    );
-    let expected_filter_last_key = json!({
-        "tenant": "acme",
-        "ts": 20,
-    });
-    let powdrr_filter_last_key = optional_item_to_json(powdrr_filter_page_one.last_evaluated_key());
-    let localstack_filter_last_key =
-        optional_item_to_json(localstack_filter_page_one.last_evaluated_key());
-    assert_eq!(
-        powdrr_filter_last_key,
-        Some(expected_filter_last_key.clone())
-    );
-    assert_eq!(powdrr_filter_last_key, localstack_filter_last_key);
-
-    let powdrr_filter_page_two = query_with_filter_page(
-        &powdrr_client,
-        &table_name,
-        powdrr_filter_page_one.last_evaluated_key().cloned(),
-    )
-    .await;
-    let localstack_filter_page_two = query_with_filter_page(
-        &localstack_client,
-        &table_name,
-        localstack_filter_page_one.last_evaluated_key().cloned(),
-    )
-    .await;
-    let expected_filter_page_two = vec![json!({
-        "tenant": "acme",
-        "ts": 30,
-        "event_id": "evt-3",
-        "count": 3,
-    })];
-    assert_eq!(
-        items_to_json(powdrr_filter_page_two.items()),
-        expected_filter_page_two
-    );
-    assert_eq!(powdrr_filter_page_two.count(), 1);
-    assert_eq!(powdrr_filter_page_two.scanned_count(), 1);
-    assert_eq!(
-        items_to_json(powdrr_filter_page_two.items()),
-        items_to_json(localstack_filter_page_two.items())
-    );
-    assert_eq!(
-        powdrr_filter_page_two.count(),
-        localstack_filter_page_two.count()
-    );
-    assert_eq!(
-        powdrr_filter_page_two.scanned_count(),
-        localstack_filter_page_two.scanned_count()
-    );
-    assert_eq!(powdrr_filter_page_two.last_evaluated_key(), None);
-    assert_eq!(localstack_filter_page_two.last_evaluated_key(), None);
-
-    let expected_begins_with_page_one = vec![
-        json!({
+    compare_query_page_outputs(
+        &powdrr_filtered_second_page,
+        &localstack_filtered_second_page,
+        normalize_item_list(vec![json!({
             "tenant": "acme",
-            "event_id": "evt-1",
-            "region": "us-east-1",
-            "ts": 10,
-        }),
-        json!({
-            "tenant": "acme",
-            "event_id": "evt-2",
-            "region": "us-west-2",
-            "ts": 20,
-        }),
-    ];
-    let powdrr_begins_with_page_one =
-        query_begins_with_page(&powdrr_client, &begins_with_table_name, None).await;
-    let localstack_begins_with_page_one =
-        query_begins_with_page(&localstack_client, &begins_with_table_name, None).await;
-    assert_eq!(
-        items_to_json(powdrr_begins_with_page_one.items()),
-        expected_begins_with_page_one
+            "ts": 30,
+            "event_id": "evt-3",
+            "count": 3,
+        })]),
     );
-    assert_eq!(
-        items_to_json(powdrr_begins_with_page_one.items()),
-        items_to_json(localstack_begins_with_page_one.items())
-    );
-    let expected_begins_with_last_key = json!({
-        "tenant": "acme",
-        "event_id": "evt-2",
-    });
-    let powdrr_begins_with_last_key =
-        optional_item_to_json(powdrr_begins_with_page_one.last_evaluated_key());
-    let localstack_begins_with_last_key =
-        optional_item_to_json(localstack_begins_with_page_one.last_evaluated_key());
-    assert_eq!(
-        powdrr_begins_with_last_key,
-        Some(expected_begins_with_last_key.clone())
-    );
-    assert_eq!(powdrr_begins_with_last_key, localstack_begins_with_last_key);
 
-    let expected_begins_with_page_two = vec![json!({
-        "tenant": "acme",
-        "event_id": "evt-3",
-        "region": "eu-central-1",
-        "ts": 30,
-    })];
-    let powdrr_begins_with_page_two = query_begins_with_page(
-        &powdrr_client,
-        &begins_with_table_name,
-        powdrr_begins_with_page_one.last_evaluated_key().cloned(),
+    let powdrr_gsi = query_region_index_page(
+        &fixture.powdrr_client,
+        &fixture.primary_table_name,
+        &fixture.region_event_id_index,
     )
     .await;
-    let localstack_begins_with_page_two = query_begins_with_page(
-        &localstack_client,
-        &begins_with_table_name,
-        localstack_begins_with_page_one
-            .last_evaluated_key()
-            .cloned(),
+    let localstack_gsi = query_region_index_page(
+        &fixture.localstack_client,
+        &fixture.primary_table_name,
+        &fixture.region_event_id_index,
     )
     .await;
-    assert_eq!(
-        items_to_json(powdrr_begins_with_page_two.items()),
-        expected_begins_with_page_two
-    );
-    assert_eq!(
-        items_to_json(powdrr_begins_with_page_two.items()),
-        items_to_json(localstack_begins_with_page_two.items())
-    );
-    assert_eq!(powdrr_begins_with_page_two.last_evaluated_key(), None);
-    assert_eq!(localstack_begins_with_page_two.last_evaluated_key(), None);
-
-    let powdrr_gsi_query =
-        query_region_index_page(&powdrr_client, &table_name, &region_event_id_index).await;
-    let localstack_gsi_query =
-        query_region_index_page(&localstack_client, &table_name, &region_event_id_index).await;
-    let expected_gsi_items = vec![
-        json!({
+    compare_query_page_outputs(
+        &powdrr_gsi,
+        &localstack_gsi,
+        vec![json!({
             "tenant": "acme",
             "region": "us-east-1",
             "event_id": "evt-1",
             "ts": 10,
-        }),
-        json!({
-            "tenant": "initech",
-            "region": "us-east-1",
-            "event_id": "evt-5",
-            "ts": 25,
-        }),
-    ];
-    assert_eq!(items_to_json(powdrr_gsi_query.items()), expected_gsi_items);
+        })],
+    );
+}
+
+fn compare_query_page_outputs(
+    powdrr: &QueryOutput,
+    localstack: &QueryOutput,
+    expected_items: Vec<Value>,
+) {
+    let powdrr_items = normalize_item_list(items_to_json(powdrr.items()));
+    let localstack_items = normalize_item_list(items_to_json(localstack.items()));
+    assert_eq!(powdrr_items, expected_items);
+    assert_eq!(powdrr_items, localstack_items);
+    assert_eq!(powdrr.count(), localstack.count());
+    assert_eq!(powdrr.scanned_count(), localstack.scanned_count());
     assert_eq!(
-        items_to_json(powdrr_gsi_query.items()),
-        items_to_json(localstack_gsi_query.items())
+        optional_item_to_json(powdrr.last_evaluated_key()),
+        optional_item_to_json(localstack.last_evaluated_key())
     );
 }
 
@@ -534,20 +860,14 @@ fn ensure_local_engine_dependencies() -> Result<(), String> {
 
 fn require_local_service(name: &str, address: &str) -> Result<(), String> {
     let socket_address = address.parse().unwrap();
-    std::net::TcpStream::connect_timeout(&socket_address, Duration::from_millis(200))
+    TcpStream::connect_timeout(&socket_address, Duration::from_millis(200))
         .map(|_| ())
         .map_err(|error| format!("requires {} at {} ({})", name, address, error))
 }
 
-async fn configure_powdrr_table(
-    base_url: &str,
-    table_name: &str,
-    parquet_path: &Path,
-    config: &DynamoDbTableConfig,
-) {
+async fn add_powdrr_checkpoint(base_url: &str, table_name: &str, parquet_path: &Path) {
     let client = HttpClient::new();
     let checkpoint = checkpoint_from_parquet(table_name, parquet_path).await;
-
     client
         .post(format!("{}/_test/v1/_add_checkpoint", base_url))
         .json(&checkpoint)
@@ -556,13 +876,24 @@ async fn configure_powdrr_table(
         .unwrap()
         .error_for_status()
         .unwrap();
+}
 
+async fn put_powdrr_dynamodb_config(
+    base_url: &str,
+    table_name: &str,
+    config: &DynamoDbTableConfig,
+) {
     let url = format!("{}/{}/_dynamodb/config", base_url, table_name);
     let mut last_status = None;
     let mut last_body = String::new();
 
     for _ in 0..25 {
-        let response = client.put(&url).json(config).send().await.unwrap();
+        let response = HttpClient::new()
+            .put(&url)
+            .json(config)
+            .send()
+            .await
+            .unwrap();
         let status = response.status();
         let body = response.text().await.unwrap();
         if status.is_success() {
@@ -589,14 +920,23 @@ async fn configure_powdrr_table(
     );
 }
 
+async fn configure_powdrr_table(
+    base_url: &str,
+    table_name: &str,
+    parquet_path: &Path,
+    config: &DynamoDbTableConfig,
+) {
+    add_powdrr_checkpoint(base_url, table_name, parquet_path).await;
+    put_powdrr_dynamodb_config(base_url, table_name, config).await;
+}
+
 async fn configure_powdrr_testing_mode(base_url: &str) {
-    let client = HttpClient::new();
     let mut mode = TestProcessingMode::default();
     mode.state_mode = StateMode::Testing;
     mode.indexing_mode = IndexingMode::Disabled;
     mode.compaction_mode = CompactionMode::Disabled;
 
-    client
+    HttpClient::new()
         .put(format!(
             "{}/_test/v1/_testing_and_processing_mode",
             base_url
@@ -778,11 +1118,32 @@ async fn create_localstack_table(
     }
 }
 
+async fn raw_dynamodb_request(base_url: &str, operation: &str, body: &Value) -> HttpResponseRecord {
+    let response = HttpClient::new()
+        .post(format!("{}/", base_url.trim_end_matches('/')))
+        .header("x-amz-target", format!("DynamoDB_20120810.{}", operation))
+        .json(body)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap();
+    HttpResponseRecord {
+        status,
+        body: serde_json::from_str(&body).unwrap_or_else(|_| json!({ "raw": body })),
+    }
+}
+
+struct HttpResponseRecord {
+    status: u16,
+    body: Value,
+}
+
 async fn query_page(
     client: &DynamoClient,
     table_name: &str,
     exclusive_start_key: Option<HashMap<String, AttributeValue>>,
-) -> aws_sdk_dynamodb::operation::query::QueryOutput {
+) -> QueryOutput {
     client
         .query()
         .table_name(table_name)
@@ -806,7 +1167,7 @@ async fn query_begins_with_page(
     client: &DynamoClient,
     table_name: &str,
     exclusive_start_key: Option<HashMap<String, AttributeValue>>,
-) -> aws_sdk_dynamodb::operation::query::QueryOutput {
+) -> QueryOutput {
     client
         .query()
         .table_name(table_name)
@@ -829,7 +1190,7 @@ async fn query_with_filter_page(
     client: &DynamoClient,
     table_name: &str,
     exclusive_start_key: Option<HashMap<String, AttributeValue>>,
-) -> aws_sdk_dynamodb::operation::query::QueryOutput {
+) -> QueryOutput {
     client
         .query()
         .table_name(table_name)
@@ -858,7 +1219,7 @@ async fn query_region_index_page(
     client: &DynamoClient,
     table_name: &str,
     index_name: &str,
-) -> aws_sdk_dynamodb::operation::query::QueryOutput {
+) -> QueryOutput {
     client
         .query()
         .table_name(table_name)
@@ -1006,15 +1367,20 @@ fn normalize_item_list(items: Vec<Value>) -> Vec<Value> {
     keyed.into_iter().map(|(_, item)| item).collect()
 }
 
-fn item_sort_key(item: &Value) -> (String, i64) {
+fn item_sort_key(item: &Value) -> (String, String, i64) {
     let object = item.as_object().unwrap();
     let tenant = object
         .get("tenant")
         .and_then(Value::as_str)
-        .unwrap()
+        .unwrap_or_default()
         .to_string();
-    let ts = object.get("ts").and_then(Value::as_i64).unwrap();
-    (tenant, ts)
+    let event_id = object
+        .get("event_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let ts = object.get("ts").and_then(Value::as_i64).unwrap_or_default();
+    (tenant, event_id, ts)
 }
 
 fn primary_key_item(row: &EventRow) -> HashMap<String, AttributeValue> {

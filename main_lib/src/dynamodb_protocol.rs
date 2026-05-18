@@ -102,6 +102,7 @@ struct ListTablesResponse {
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "PascalCase")]
 struct ListTablesRequest {
     exclusive_start_table_name: Option<String>,
@@ -109,6 +110,7 @@ struct ListTablesRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "PascalCase")]
 struct DescribeTableRequest {
     table_name: String,
@@ -172,6 +174,7 @@ struct SecondaryIndexProjection {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "PascalCase")]
 struct GetItemRequest {
     table_name: String,
@@ -189,12 +192,14 @@ struct GetItemResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "PascalCase")]
 struct BatchGetItemRequest {
     request_items: HashMap<String, KeysAndAttributes>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "PascalCase")]
 struct KeysAndAttributes {
     keys: Vec<Map<String, Value>>,
@@ -213,6 +218,7 @@ struct BatchGetItemResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "PascalCase")]
 struct QueryRequest {
     table_name: String,
@@ -429,10 +435,23 @@ async fn handle_list_tables(payload: Value) -> Result<Value, DynamoDbError> {
     let request = serde_json::from_value::<ListTablesRequest>(payload).map_err(|error| {
         DynamoDbError::validation(format!("Invalid ListTables request: {}", error))
     })?;
-    let mut table_names = STATE_PROVIDER
+    let mut table_names = vec![];
+    for table_name in STATE_PROVIDER
         .get_all_iceberg_tables()
         .await
-        .map_err(service_error)?;
+        .map_err(service_error)?
+    {
+        let Some(description) = STATE_PROVIDER
+            .describe_table(&table_name)
+            .await
+            .map_err(service_error)?
+        else {
+            continue;
+        };
+        if description.dynamodb.is_some() {
+            table_names.push(description.name);
+        }
+    }
     table_names.sort();
 
     let start_index = match request.exclusive_start_table_name.as_ref() {
@@ -2353,13 +2372,11 @@ mod tests {
             &list_tables_response.read_utf8_body().unwrap(),
         )
         .unwrap();
-        assert!(
-            list_tables_body["TableNames"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value == &json!(table_name))
-        );
+        assert!(list_tables_body["TableNames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == &json!(table_name)));
 
         let get_item_response = perform_dynamodb_request(
             &test_server,
