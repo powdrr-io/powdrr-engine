@@ -660,7 +660,7 @@ impl DynamoDbConnector {
 
     const NO_WORK_ITEM: &'static str = "-1";
 
-    fn bump_version(
+    pub(crate) fn bump_version(
         transaction: TransactWrite,
         old: &EntityVersionInfo,
         new_entity_id: &String,
@@ -1065,6 +1065,15 @@ impl DynamoDbConnector {
             entity: new_checkpoint.clone(),
         };
         transaction = transaction.operation(checkpoint_obj.create());
+        if !new_checkpoint.fully_covered_for_extension(&"es".to_string()) {
+            transaction = Self::create_checkpoint_waiting_for_extension_core(
+                transaction,
+                org_id,
+                &new_checkpoint.table_name,
+                &new_checkpoint.get_descriptor().full_name(),
+                None,
+            );
+        }
 
         // Step 3
         let latest_es_key = &Self::latest_extension_work_item_key(&table_name, &"es".to_string());
@@ -1122,9 +1131,11 @@ impl DynamoDbConnector {
             cloned_checkpoint_to_replace.checkpoint_id = IdInstance::next_id().to_string();
             cloned_checkpoint_to_replace
                 .apply_compaction_for_replacement(compaction_commit, &commit.metadata);
-            assert!(cloned_checkpoint_to_replace
-                .original_checkpoint_id
-                .is_none());
+            assert!(
+                cloned_checkpoint_to_replace
+                    .original_checkpoint_id
+                    .is_none()
+            );
             cloned_checkpoint_to_replace.original_checkpoint_id =
                 Some(compaction_commit.checkpoint_id_to_replace.clone());
 

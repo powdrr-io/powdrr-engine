@@ -679,7 +679,7 @@ fn build_checkpoint(
         extension_files.insert(
             file_descriptor.file_path.clone(),
             vec![ExtensionFile {
-                suffix: "_search_index".to_string(),
+                suffix: "search_index".to_string(),
                 location: add_file_suffix(
                     &file_descriptor.file_path,
                     &"search_index".to_string(),

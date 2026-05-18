@@ -2,18 +2,19 @@ use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::error::DataFusionError;
-use futures_util::StreamExt;
 use futures_util::future::try_join_all;
+use futures_util::StreamExt;
 use idgenerator::IdInstance;
 use prost::Message;
 use std::{error::Error, fmt};
 
 use crate::data_access::{self, load_file_as_table};
 use crate::data_contract::{
-    ExtensionFileMetadata, FileDescriptor, IcebergMetadata, SpeedboatMetadata,
+    ExtensionFile, ExtensionFileMetadata, FileDescriptor, IcebergMetadata, SpeedboatMetadata,
+    TableMetadataCheckpoint,
 };
 use crate::elastic_search_index::create_index_inner;
-use crate::elastic_search_responses::{QueryResultHit, compare_query_result_hits_desc};
+use crate::elastic_search_responses::{compare_query_result_hits_desc, QueryResultHit};
 use crate::peers::{
     CheckpointDescriptor, PrivateCompactionInvocation, PrivateExtensionInvocation,
     PrivatePrefetchInvocation, PrivateSearchAggregationFilterSpec, PrivateSearchAggregationPartial,
@@ -23,9 +24,9 @@ use crate::peers::{
 use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema, SqlQuery};
 use crate::search_runtime::batches_to_serde_value;
 use crate::state_provider::*;
-use crate::util::{add_file_suffix, log_err};
+use crate::util::log_err;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct ExtensionFileSpec {
     suffix: String,
     file_path: String,
@@ -152,22 +153,24 @@ async fn determine_required_files(
 
     let filtered_iceberg_files = filter_iceberg(&table_metadata.iceberg_metadata, index, num);
     let filtered_speedboat_files = filter_speedboat(&table_metadata.speedboat_metadata, index, num);
+    let iceberg_file_extensions = filtered_iceberg_files
+        .files
+        .iter()
+        .map(|f| get_extension_files(required_extensions, &table_metadata, &f.file_path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let speedboat_file_extensions = filtered_speedboat_files
+        .files
+        .iter()
+        .map(|f| get_extension_files(required_extensions, &table_metadata, &f.file_path))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(RequiredFiles {
         table_schema: table_metadata.schema.clone(),
         iceberg_files: filtered_iceberg_files.files.clone(),
         all_iceberg_files_count: filtered_iceberg_files.all_files_count,
-        iceberg_file_extensions: filtered_iceberg_files
-            .files
-            .iter()
-            .map(|f| get_extension_files(required_extensions, &f.file_path))
-            .collect(),
+        iceberg_file_extensions,
         speedboat_files: filtered_speedboat_files.files.clone(),
         all_speedboat_files_count: filtered_speedboat_files.all_files_count,
-        speedboat_file_extensions: filtered_speedboat_files
-            .files
-            .iter()
-            .map(|f| get_extension_files(required_extensions, &f.file_path))
-            .collect(),
+        speedboat_file_extensions,
         delete_files: table_metadata
             .deletes_metadata
             .map_or_else(|| vec![], |d| d.files.clone()),
@@ -195,20 +198,62 @@ fn generate_required_files(
 
 fn get_extension_files(
     required_extensions: &Vec<String>,
+    table_metadata: &TableMetadataCheckpoint,
     file_path: &String,
-) -> Vec<ExtensionFileSpec> {
-    // TODO - need to look at the actual extension metadata and figure out the file required
-    if required_extensions.len() == 0 {
-        vec![]
-    } else {
-        vec![ExtensionFileSpec {
-            suffix: "search_index".to_string(),
-            file_path: add_file_suffix(
-                file_path,
-                &"search_index".to_string(),
-                Some(&".parquet".to_string()),
+) -> Result<Vec<ExtensionFileSpec>, PrivateApiError> {
+    if required_extensions.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut specs = vec![];
+    for extension_name in required_extensions.iter() {
+        let extension_files =
+            get_extension_files_for_name(table_metadata, extension_name, file_path)?;
+        specs.extend(extension_files.iter().map(extension_file_spec));
+    }
+
+    Ok(specs)
+}
+
+fn get_extension_files_for_name<'a>(
+    table_metadata: &'a TableMetadataCheckpoint,
+    extension_name: &String,
+    file_path: &String,
+) -> Result<&'a Vec<ExtensionFile>, PrivateApiError> {
+    let descriptor = table_metadata.get_descriptor().full_name();
+    let extension_metadata = table_metadata
+        .extension_metadata
+        .get(extension_name)
+        .ok_or_else(|| PrivateApiError {
+            message: format!(
+                "Checkpoint {} is missing published metadata for required extension {}",
+                descriptor, extension_name
             ),
-        }]
+        })?;
+
+    extension_metadata
+        .get(file_path)
+        .ok_or_else(|| PrivateApiError {
+            message: format!(
+                "Checkpoint {} is missing published {} files for {}",
+                descriptor, extension_name, file_path
+            ),
+        })
+}
+
+fn extension_file_spec(extension_file: &ExtensionFile) -> ExtensionFileSpec {
+    ExtensionFileSpec {
+        suffix: normalize_extension_suffix(&extension_file.suffix),
+        file_path: extension_file.location.clone(),
+    }
+}
+
+fn normalize_extension_suffix(suffix: &str) -> String {
+    let trimmed = suffix.trim_start_matches('_');
+    if trimmed.is_empty() {
+        suffix.to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -606,6 +651,65 @@ fn bm25_fallback_score_from_values(
     let avgdl = 5.6;
     (term_cnt * (constant_k + 1.0))
         / (term_cnt + constant_k * (1.0 - constant_b + (constant_b * word_cnt / avgdl)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn checkpoint_with_extension_metadata(
+        extension_metadata: HashMap<String, HashMap<String, Vec<ExtensionFile>>>,
+    ) -> TableMetadataCheckpoint {
+        TableMetadataCheckpoint {
+            table_name: "table".to_string(),
+            original_checkpoint_id: None,
+            checkpoint_id: "checkpoint".to_string(),
+            iceberg_metadata: None,
+            speedboat_metadata: None,
+            deletes_metadata: None,
+            extension_metadata,
+            schema: PowdrrSchema::minimal(),
+        }
+    }
+
+    #[test]
+    fn get_extension_files_uses_checkpoint_metadata_and_normalizes_suffixes() {
+        let file_path = "s3://warehouse/table/data.parquet".to_string();
+        let checkpoint = checkpoint_with_extension_metadata(HashMap::from([(
+            "es".to_string(),
+            HashMap::from([(
+                file_path.clone(),
+                vec![ExtensionFile {
+                    suffix: "_search_index".to_string(),
+                    location: "s3://warehouse/table/data.search_index.parquet".to_string(),
+                }],
+            )]),
+        )]));
+
+        let specs = get_extension_files(&vec!["es".to_string()], &checkpoint, &file_path).unwrap();
+
+        assert_eq!(
+            specs,
+            vec![ExtensionFileSpec {
+                suffix: "search_index".to_string(),
+                file_path: "s3://warehouse/table/data.search_index.parquet".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn get_extension_files_errors_when_checkpoint_lacks_required_metadata() {
+        let file_path = "s3://warehouse/table/data.parquet".to_string();
+        let checkpoint = checkpoint_with_extension_metadata(HashMap::new());
+
+        let error =
+            get_extension_files(&vec!["es".to_string()], &checkpoint, &file_path).unwrap_err();
+
+        assert!(error
+            .message
+            .contains("missing published metadata for required extension es"));
+    }
 }
 
 pub(crate) async fn compaction_query(
