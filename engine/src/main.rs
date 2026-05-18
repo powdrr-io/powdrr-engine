@@ -5,7 +5,9 @@ use std::{
     io::{self, BufReader},
 };
 
-use crate::configuration::{OperatingMode, get_operating_mode, perform_updates};
+use crate::configuration::{
+    OperatingMode, get_operating_mode, initialize_state_provider, perform_updates,
+};
 use gotham::{
     anyhow,
     rustls::{Certificate, PrivateKey, ServerConfig},
@@ -84,6 +86,7 @@ async fn main() -> () {
     }
 
     let mode = get_operating_mode(&args);
+    initialize_state_provider(&mode).await;
 
     {
         let local_mode = mode.clone();

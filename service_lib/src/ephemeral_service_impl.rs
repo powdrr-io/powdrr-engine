@@ -19,9 +19,30 @@ use crate::schema_massager::PowdrrSchema;
 use crate::state_provider::ServiceApiError;
 use crate::test_api::TestProcessingMode;
 use idgenerator::IdInstance;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 type CommittedCheckpoints = HashMap<String, String>;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EphemeralServiceSnapshot {
+    tables: HashMap<String, TableDescription>,
+    table_aliases: HashMap<String, String>,
+    table_templates: HashMap<String, CreateIndexTemplateBody>,
+    pipelines: HashMap<String, PipelineDefinition>,
+    lifetime_policies: HashMap<String, ILMPolicyDefinition>,
+    latest_committed_checkpoint_id: HashMap<Option<String>, CommittedCheckpoints>,
+    compaction_work_items: HashMap<String, CompactionWorkItemTracker>,
+    not_compacted_checkpoint_ids: HashMap<String, Vec<String>>,
+    extension_work_items: HashMap<String, HashMap<String, ExtensionWorkItem>>,
+    cleanup_work_items: Vec<CleanupWorkItem>,
+    compactions: HashMap<String, (String, CompactionCommit)>,
+    checkpoints: HashMap<String, TableMetadataCheckpoint>,
+    checkpoints_needing_extension_work: HashMap<String, Vec<String>>,
+    recent_file_extension_metadata: HashMap<String, Vec<ExtensionFile>>,
+    org_settings_by_id: HashMap<String, OrgSettings>,
+    org_lookup: HashMap<String, OrgInfo>,
+}
 
 pub struct EphemeralServiceImpl {
     mode: TestProcessingMode,
@@ -40,27 +61,64 @@ pub struct EphemeralServiceImpl {
     checkpoints: HashMap<String, TableMetadataCheckpoint>,
     checkpoints_needing_extension_work: HashMap<String, Vec<String>>,
     recent_file_extension_metadata: HashMap<String, Vec<ExtensionFile>>,
+    org_settings_by_id: HashMap<String, OrgSettings>,
+    org_lookup: HashMap<String, OrgInfo>,
 }
 
 impl EphemeralServiceImpl {
     pub fn new(mode: TestProcessingMode) -> Self {
+        Self::from_snapshot(mode, EphemeralServiceSnapshot::default())
+    }
+
+    pub fn from_snapshot(mode: TestProcessingMode, snapshot: EphemeralServiceSnapshot) -> Self {
         EphemeralServiceImpl {
             mode: mode,
-            tables: HashMap::new(),
-            table_aliases: HashMap::new(),
-            table_templates: HashMap::new(),
-            pipelines: HashMap::new(),
-            lifetime_policies: HashMap::new(),
-            latest_committed_checkpoint_id: HashMap::new(),
-            compaction_work_items: HashMap::new(),
-            not_compacted_checkpoint_ids: HashMap::new(),
-            compactions: HashMap::new(),
-            cleanup_work_items: Vec::new(),
-            checkpoints: HashMap::new(),
-            checkpoints_needing_extension_work: HashMap::new(),
-            extension_work_items: HashMap::from([("es".to_string(), HashMap::new())]),
-            recent_file_extension_metadata: HashMap::new(),
+            tables: snapshot.tables,
+            table_aliases: snapshot.table_aliases,
+            table_templates: snapshot.table_templates,
+            pipelines: snapshot.pipelines,
+            lifetime_policies: snapshot.lifetime_policies,
+            latest_committed_checkpoint_id: snapshot.latest_committed_checkpoint_id,
+            compaction_work_items: snapshot.compaction_work_items,
+            not_compacted_checkpoint_ids: snapshot.not_compacted_checkpoint_ids,
+            extension_work_items: if snapshot.extension_work_items.is_empty() {
+                HashMap::from([("es".to_string(), HashMap::new())])
+            } else {
+                snapshot.extension_work_items
+            },
+            cleanup_work_items: snapshot.cleanup_work_items,
+            compactions: snapshot.compactions,
+            checkpoints: snapshot.checkpoints,
+            checkpoints_needing_extension_work: snapshot.checkpoints_needing_extension_work,
+            recent_file_extension_metadata: snapshot.recent_file_extension_metadata,
+            org_settings_by_id: snapshot.org_settings_by_id,
+            org_lookup: snapshot.org_lookup,
         }
+    }
+
+    pub fn snapshot_state(&self) -> EphemeralServiceSnapshot {
+        EphemeralServiceSnapshot {
+            tables: self.tables.clone(),
+            table_aliases: self.table_aliases.clone(),
+            table_templates: self.table_templates.clone(),
+            pipelines: self.pipelines.clone(),
+            lifetime_policies: self.lifetime_policies.clone(),
+            latest_committed_checkpoint_id: self.latest_committed_checkpoint_id.clone(),
+            compaction_work_items: self.compaction_work_items.clone(),
+            not_compacted_checkpoint_ids: self.not_compacted_checkpoint_ids.clone(),
+            extension_work_items: self.extension_work_items.clone(),
+            cleanup_work_items: self.cleanup_work_items.clone(),
+            compactions: self.compactions.clone(),
+            checkpoints: self.checkpoints.clone(),
+            checkpoints_needing_extension_work: self.checkpoints_needing_extension_work.clone(),
+            recent_file_extension_metadata: self.recent_file_extension_metadata.clone(),
+            org_settings_by_id: self.org_settings_by_id.clone(),
+            org_lookup: self.org_lookup.clone(),
+        }
+    }
+
+    fn org_info_key(access_key_id: &String, secret_access_key: &String) -> String {
+        format!("{}:{}", access_key_id, secret_access_key)
     }
 
     fn checkpoints_needing_extension_work(
@@ -1003,17 +1061,28 @@ impl EphemeralServiceImpl {
     }
 
     pub async fn create_org(&mut self, _settings: &OrgSettings) -> Result<(), ServiceApiError> {
-        // Ephemeral service doesn't track orgs
+        let settings = _settings.clone();
+        let org_info = settings.to_org_info();
+        self.org_settings_by_id
+            .insert(settings.org_id.clone(), settings.clone());
+        for creds in settings.creds.iter() {
+            self.org_lookup.insert(
+                Self::org_info_key(&creds.access_key_id, &creds.secret_access_key),
+                org_info.clone(),
+            );
+        }
         Ok(())
     }
 
     pub async fn lookup_org(
         &mut self,
-        _access_key: &String,
-        _secret_key: &String,
+        access_key: &String,
+        secret_key: &String,
     ) -> Result<Option<OrgInfo>, ServiceApiError> {
-        // Ephemeral service doesn't track orgs
-        Ok(None)
+        Ok(self
+            .org_lookup
+            .get(&Self::org_info_key(access_key, secret_key))
+            .cloned())
     }
 }
 
@@ -1102,5 +1171,38 @@ impl MetadataStore for EphemeralServiceImpl {
 
     async fn advance_published_checkpoints(&mut self) -> Result<bool, ServiceApiError> {
         EphemeralServiceImpl::update_all_checkpoints(self).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EphemeralServiceImpl;
+    use crate::data_contract::{LicenseType, OrgCreds, OrgSettings};
+    use crate::test_api::TestProcessingMode;
+
+    #[tokio::test]
+    async fn org_lookup_survives_snapshot_round_trip() {
+        let mut state = EphemeralServiceImpl::new(TestProcessingMode::default());
+        let settings = OrgSettings {
+            org_id: "org-1".to_string(),
+            license_type: LicenseType::Pro,
+            creds: vec![OrgCreds {
+                access_key_id: "access".to_string(),
+                secret_access_key: "secret".to_string(),
+                nickname: Some("primary".to_string()),
+            }],
+        };
+
+        state.create_org(&settings).await.unwrap();
+        let snapshot = state.snapshot_state();
+        let mut restored =
+            EphemeralServiceImpl::from_snapshot(TestProcessingMode::default(), snapshot);
+
+        let org = restored
+            .lookup_org(&"access".to_string(), &"secret".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(org.unwrap().org_id, "org-1".to_string());
     }
 }

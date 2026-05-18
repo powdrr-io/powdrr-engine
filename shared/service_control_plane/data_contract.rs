@@ -805,7 +805,7 @@ pub struct CompactionWorkItem {
     pub checkpoints_to_delete: Vec<String>,
 }
 
-#[derive(Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct CompactionWorkItemTracker {
     pub(crate) in_progress: bool,
     pub(crate) work_item: CompactionWorkItem,

@@ -1,6 +1,9 @@
 use powdrr_engine_lib::peers::get_docker_peer_ips;
 use powdrr_engine_lib::state_provider::STATE_PROVIDER;
-use powdrr_engine_lib::test_api::PeerModeType;
+use powdrr_engine_lib::test_api::{
+    CacheMode, CompactionMode, IndexingMode, PeerMode, PeerModeType, PrefetchMode, StateMode,
+    StorageMode, TestProcessingMode,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) enum PeerDetectionMode {
@@ -8,12 +11,13 @@ pub(crate) enum PeerDetectionMode {
     Docker,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct OperatingMode {
     pub(crate) peer_detection: PeerDetectionMode,
     pub(crate) testing_enabled: bool,
     pub(crate) port: u32,
     pub(crate) mongo_port: Option<u32>,
+    pub(crate) state_mode: Option<TestProcessingMode>,
 }
 
 pub(crate) fn get_operating_mode(_command_line_args: &Vec<String>) -> OperatingMode {
@@ -35,16 +39,46 @@ pub(crate) fn get_operating_mode(_command_line_args: &Vec<String>) -> OperatingM
             testing_enabled: true,
             port,
             mongo_port,
+            state_mode: None,
         },
         "docker" => OperatingMode {
             peer_detection: PeerDetectionMode::Docker,
             testing_enabled: true,
             port,
             mongo_port,
+            state_mode: None,
+        },
+        "leaderless" => OperatingMode {
+            peer_detection: PeerDetectionMode::SelfOnly,
+            testing_enabled: false,
+            port,
+            mongo_port,
+            state_mode: Some(TestProcessingMode {
+                state_mode: StateMode::Leaderless {
+                    server_address: std::env::var("SERVICE_BASE_URL")
+                        .expect("SERVICE_BASE_URL must be set for MODE=leaderless"),
+                    access_key: std::env::var("SERVICE_ACCESS_KEY")
+                        .expect("SERVICE_ACCESS_KEY must be set for MODE=leaderless"),
+                    secret_key: std::env::var("SERVICE_SECRET_KEY")
+                        .expect("SERVICE_SECRET_KEY must be set for MODE=leaderless"),
+                },
+                storage_mode: StorageMode::default(),
+                cache_mode: CacheMode::Redis(None),
+                peer_mode: PeerMode::SelfOnly,
+                indexing_mode: IndexingMode::Sync,
+                compaction_mode: CompactionMode::Async(None),
+                prefetch_mode: PrefetchMode::Disabled,
+            }),
         },
         _ => {
             panic!("Invalid mode specified: {}", mode);
         }
+    }
+}
+
+pub(crate) async fn initialize_state_provider(mode: &OperatingMode) -> () {
+    if let Some(state_mode) = &mode.state_mode {
+        STATE_PROVIDER.set_testing_mode(state_mode).await;
     }
 }
 

@@ -1,16 +1,17 @@
 use crate::checkpoint_updater::ensure_checkpoint_updater_started;
+use crate::raft_handlers;
 use crate::service_impl_provider::SERVICE_IMPL;
 use crate::v1_handlers;
 use futures_util::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{body, Body, StatusCode};
+use gotham::hyper::{Body, StatusCode, body};
 use gotham::mime;
 use gotham::pipeline::{new_pipeline, single_pipeline};
 use gotham::prelude::{
     DefineSingleRoute, DrawRoutes, FromState, StateData, StaticResponseExtender,
 };
-use gotham::router::{build_router, Router};
+use gotham::router::{Router, build_router};
 use gotham::state::State;
 use powdrr_service_lib::data_contract::ServiceMode;
 use serde::Deserialize;
@@ -103,6 +104,13 @@ pub fn router(include_test_apis: bool) -> Router {
         route.scope("/management", |route| {
             route.scope("/v1", |route| {
                 route.post("/create_org").to(v1_handlers::create_org);
+            })
+        });
+        route.scope("/_raft", |route| {
+            route.scope("/v1", |route| {
+                route.post("/append").to(raft_handlers::append_entries);
+                route.post("/vote").to(raft_handlers::vote);
+                route.post("/snapshot").to(raft_handlers::install_snapshot);
             })
         });
 
