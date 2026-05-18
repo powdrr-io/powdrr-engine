@@ -5,7 +5,7 @@ use gotham::helpers::http::response::create_empty_response;
 use gotham::{
     handler::HandlerFuture,
     helpers::http::response::create_response,
-    hyper::{body, Body},
+    hyper::{Body, body},
     mime,
     prelude::StaticResponseExtender,
     state::{FromState, State, StateData},
@@ -13,7 +13,7 @@ use gotham::{
 use http::StatusCode;
 use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::elastic_search_common::MIME_ES_JSON;
 use crate::util::{log_service_err, log_service_err_response};
@@ -21,9 +21,11 @@ use crate::{
     data_access,
     data_contract::{AliasInfo, CreateIndexBody, PropertyInfo, TableDescription},
     elastic_search_cluster_info,
-    elastic_search_common::{execute_command, CommandContext},
+    elastic_search_common::{CommandContext, execute_command},
     elastic_search_ingest, elastic_search_parser, elastic_search_pipeline,
-    elastic_search_responses::{QueryResultShards, QueryResults},
+    elastic_search_responses::{
+        ErrorDetails, QueryResultShards, QueryResults, SingleDocCreateFailedResult,
+    },
     search_executor,
     search_runtime::df_to_serde_value,
     state_provider::STATE_PROVIDER,
@@ -208,6 +210,7 @@ pub fn es_xpack(state: State) -> Pin<Box<HandlerFuture>> {
 #[derive(Deserialize, StateData, StaticResponseExtender)]
 pub(crate) struct QueryStringClusterSettings {
     include_defaults: Option<bool>,
+    #[allow(dead_code)]
     flat_settings: Option<bool>,
 }
 
@@ -275,9 +278,6 @@ pub fn es_cluster_settings(mut state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_cluster_settings");
     async {
         let query_string = QueryStringClusterSettings::take_from(&mut state);
-        if !query_string.flat_settings.unwrap_or(false) {
-            panic!("What does this mean?")
-        }
         let res = if query_string.include_defaults.unwrap_or(false) {
             create_response(
                 &state,
@@ -293,6 +293,123 @@ pub fn es_cluster_settings(mut state: State) -> Pin<Box<HandlerFuture>> {
                 elastic_search_cluster_info::CLUSTER_SETTINGS,
             )
         };
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+fn elasticsearch_error_response(
+    state: &State,
+    status: StatusCode,
+    error_type: &str,
+    reason: &str,
+) -> gotham::hyper::Response<Body> {
+    let response = SingleDocCreateFailedResult {
+        error: ErrorDetails::single_cause(
+            &error_type.to_string(),
+            &reason.to_string(),
+            None,
+            None,
+            None,
+        ),
+        status: status.as_u16() as u32,
+    };
+    create_response(
+        state,
+        status,
+        mime::APPLICATION_JSON,
+        serde_json::to_string(&response).unwrap(),
+    )
+}
+
+fn unsupported_api_response(state: &State, reason: &str) -> gotham::hyper::Response<Body> {
+    elasticsearch_error_response(
+        state,
+        StatusCode::NOT_IMPLEMENTED,
+        "unsupported_operation_exception",
+        reason,
+    )
+}
+
+pub fn es_unsupported_search_scroll(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_unsupported_search_scroll");
+    async {
+        let res = unsupported_api_response(
+            &state,
+            "The scroll API is not supported. Use point in time plus search_after instead.",
+        );
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_unsupported_search_template(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_unsupported_search_template");
+    async {
+        let res = unsupported_api_response(&state, "The search template API is not supported.");
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_unsupported_async_search(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_unsupported_async_search");
+    async {
+        let res = unsupported_api_response(&state, "The async search API is not supported.");
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_unsupported_cat_indices(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_unsupported_cat_indices");
+    async {
+        let res = unsupported_api_response(&state, "The cat indices API is not supported.");
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_unsupported_cat_aliases(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_unsupported_cat_aliases");
+    async {
+        let res = unsupported_api_response(&state, "The cat aliases API is not supported.");
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_unsupported_get_pipeline(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_unsupported_get_pipeline");
+    async {
+        let res = unsupported_api_response(
+            &state,
+            "Reading ingest pipeline definitions is not supported.",
+        );
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_unsupported_get_pipeline_simulate(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_unsupported_get_pipeline_simulate");
+    async {
+        let res = unsupported_api_response(
+            &state,
+            "GET pipeline simulation is not supported. Use POST /_ingest/pipeline/_simulate or POST /_ingest/pipeline/{name}/_simulate.",
+        );
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_unsupported_update_api(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_unsupported_update_api");
+    async {
+        let res = unsupported_api_response(
+            &state,
+            "The document update API is not supported. Use document indexing with POST /{index}/_doc/{id} or update_by_query.",
+        );
         Ok((state, res))
     }
     .boxed()
@@ -429,8 +546,8 @@ fn matches_requested_value(value: &str, requested: &[String]) -> bool {
             .any(|requested_value| wildcard_matches(requested_value, value))
 }
 
-async fn all_table_descriptions(
-) -> Result<Vec<TableDescription>, crate::state_provider::ServiceApiError> {
+async fn all_table_descriptions()
+-> Result<Vec<TableDescription>, crate::state_provider::ServiceApiError> {
     let mut table_descriptions = Vec::new();
     let mut table_names = STATE_PROVIDER.get_all_iceberg_tables().await?;
     table_names.sort();
@@ -2653,7 +2770,10 @@ pub fn es_index_pit(state: State) -> Pin<Box<HandlerFuture>> {
     async {
         let _path_extractor = NamePathExtractor::borrow_from(&state);
         // TODO: really generate this. just needs to be an encoded checkpoint id for this table
-        let response_data = HashMap::from([("succeeded", json!(true)), ("num_freed", json!(1))]);
+        let response_data = HashMap::from([(
+            "id",
+            json!("t8jsAwEeLmtpYmFuYV90YXNrX21hbmFnZXJfOC43LjFfMDAxFkNScFZFdlZZUzNHTTBZdzVmOVY1VHcAFk0yQkNZM0s0UldDQUlvZTBaTkRqNXcAAAAAAAAAAAEWUkxXRUxKbWhUWkt3LXRTWHdhb3loQQABFkNScFZFdlZZUzNHTTBZdzVmOVY1VHcAAA=="),
+        )]);
         let res = create_response(
             &state,
             StatusCode::OK,
@@ -2669,10 +2789,16 @@ pub fn es_index_pit(state: State) -> Pin<Box<HandlerFuture>> {
 pub fn es_delete_pit(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_delete_pit");
     async {
-        let response_data = HashMap::from([("id", "t8jsAwEeLmtpYmFuYV90YXNrX21hbmFnZXJfOC43LjFfMDAxFkNScFZFdlZZUzNHTTBZdzVmOVY1VHcAFk0yQkNZM0s0UldDQUlvZTBaTkRqNXcAAAAAAAAAAAEWUkxXRUxKbWhUWkt3LXRTWHdhb3loQQABFkNScFZFdlZZUzNHTTBZdzVmOVY1VHcAAA==")]);
-        let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, serde_json::to_string(&response_data).unwrap());
+        let response_data = HashMap::from([("succeeded", json!(true)), ("num_freed", json!(1))]);
+        let res = create_response(
+            &state,
+            StatusCode::OK,
+            mime::APPLICATION_JSON,
+            serde_json::to_string(&response_data).unwrap(),
+        );
         Ok((state, res))
-    }.boxed()
+    }
+    .boxed()
 }
 
 /// Handler function for `POST` and 'PUT' requests directed to `/_bulk'

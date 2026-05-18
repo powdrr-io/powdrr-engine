@@ -1,4 +1,4 @@
-use crate::compaction::{compact_logs, CompactionCommand};
+use crate::compaction::{CompactionCommand, compact_logs};
 use crate::dynamodb_protocol;
 use crate::elastic_search_endpoints::AliasPathExtractor;
 use crate::elastic_search_endpoints::NameAliasPathExtractor;
@@ -23,21 +23,21 @@ use crate::test_api::test_v1_process_work;
 use crate::test_api::test_v1_set_testing_mode;
 use crate::test_api::test_v1_set_testing_processing_mode;
 use crate::{elastic_search_endpoints, elastic_search_lifetime_policy, lakehouse_serving};
-use futures::future;
 use futures::TryFutureExt;
+use futures::future;
 use futures_util::future::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
 use gotham::hyper::StatusCode;
-use gotham::hyper::{body, Body};
+use gotham::hyper::{Body, body};
 use gotham::middleware::Middleware;
 use gotham::mime;
 use gotham::pipeline::new_pipeline;
 use gotham::pipeline::single_pipeline;
 use gotham::prelude::NewMiddleware;
 use gotham::prelude::StaticResponseExtender;
-use gotham::router::builder::*;
 use gotham::router::Router;
+use gotham::router::builder::*;
 use gotham::state::FromState;
 use gotham::state::State;
 use gotham::state::StateData;
@@ -369,22 +369,49 @@ pub fn router(include_test_apis: bool) -> Router {
         route.get("/_xpack").to(elastic_search_endpoints::es_xpack);
         route
             .get("/_ingest/pipeline/:name")
+            .to(elastic_search_endpoints::es_unsupported_get_pipeline);
+        route
+            .put("/_ingest/pipeline/:name")
+            .with_path_extractor::<NamePathExtractor>()
+            .to(elastic_search_endpoints::es_create_pipeline);
+        route
+            .post("/_ingest/pipeline/:name")
             .with_path_extractor::<NamePathExtractor>()
             .to(elastic_search_endpoints::es_create_pipeline);
         route
             .get("/_ingest/pipeline/_simulate")
-            .to(elastic_search_endpoints::es_simulate_pipeline);
+            .to(elastic_search_endpoints::es_unsupported_get_pipeline_simulate);
         route
             .post("/_ingest/pipeline/_simulate")
             .to(elastic_search_endpoints::es_simulate_pipeline);
         route
             .get("/_ingest/pipeline/:name/_simulate")
-            .with_path_extractor::<NamePathExtractor>()
-            .to(elastic_search_endpoints::es_simulate_named_pipeline);
+            .to(elastic_search_endpoints::es_unsupported_get_pipeline_simulate);
         route
             .post("/_ingest/pipeline/:name/_simulate")
             .with_path_extractor::<NamePathExtractor>()
             .to(elastic_search_endpoints::es_simulate_named_pipeline);
+        route
+            .post("/_search/scroll")
+            .to(elastic_search_endpoints::es_unsupported_search_scroll);
+        route
+            .delete("/_search/scroll")
+            .to(elastic_search_endpoints::es_unsupported_search_scroll);
+        route
+            .post("/_search/template")
+            .to(elastic_search_endpoints::es_unsupported_search_template);
+        route
+            .post("/:name/_search/template")
+            .to(elastic_search_endpoints::es_unsupported_search_template);
+        route
+            .post("/_async_search")
+            .to(elastic_search_endpoints::es_unsupported_async_search);
+        route
+            .get("/_cat/indices")
+            .to(elastic_search_endpoints::es_unsupported_cat_indices);
+        route
+            .get("/_cat/aliases")
+            .to(elastic_search_endpoints::es_unsupported_cat_aliases);
 
         route
             .get("_cluster/settings")
@@ -479,10 +506,6 @@ pub fn router(include_test_apis: bool) -> Router {
             .with_path_extractor::<NamePathExtractor>()
             .to(elastic_search_endpoints::es_get_index_template);
         route
-            .get("/_template/:name")
-            .with_path_extractor::<NamePathExtractor>()
-            .to(elastic_search_endpoints::es_get_index_template);
-        route
             .get("/_component_template/:name")
             .with_path_extractor::<NamePathExtractor>()
             .to(elastic_search_endpoints::es_get_index_template);
@@ -568,8 +591,7 @@ pub fn router(include_test_apis: bool) -> Router {
             .to(elastic_search_endpoints::es_update_with_id);
         route
             .post("/:name/_update/:id")
-            .with_path_extractor::<NameIdPathExtractor>()
-            .to(elastic_search_endpoints::es_update_with_id);
+            .to(elastic_search_endpoints::es_unsupported_update_api);
         route
             .get("/:name/_doc/:id")
             .with_path_extractor::<NameIdPathExtractor>()
@@ -682,7 +704,7 @@ pub(crate) mod tests {
     use crate::lakehouse_serving::ServingConfigResponse;
     use crate::router::router;
     use crate::schema_massager::{
-        extract_powdrr_schema_str, PowdrrDataType, PowdrrField, PowdrrSchema,
+        PowdrrDataType, PowdrrField, PowdrrSchema, extract_powdrr_schema_str,
     };
     use crate::serving_plan::ServingQueryClassification;
     use crate::state_provider::STATE_PROVIDER;
@@ -697,7 +719,7 @@ pub(crate) mod tests {
     use gotham::mime;
     use gotham::plain::test::AsyncTestServer;
     use gotham::test::{TestResponse, TestServer};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -1174,15 +1196,21 @@ pub(crate) mod tests {
             json!(format!("{}.$cmd.listCollections", database))
         );
         let first_batch = response_obj["cursor"]["firstBatch"].as_array().unwrap();
-        assert!(first_batch
-            .iter()
-            .any(|entry| entry["name"] == json!("alpha")));
-        assert!(!first_batch
-            .iter()
-            .any(|entry| entry["name"] == json!("beta_disabled")));
-        assert!(!first_batch
-            .iter()
-            .any(|entry| entry["name"] == json!("other")));
+        assert!(
+            first_batch
+                .iter()
+                .any(|entry| entry["name"] == json!("alpha"))
+        );
+        assert!(
+            !first_batch
+                .iter()
+                .any(|entry| entry["name"] == json!("beta_disabled"))
+        );
+        assert!(
+            !first_batch
+                .iter()
+                .any(|entry| entry["name"] == json!("other"))
+        );
 
         let name_only_response = perform_mongo_command(
             test_server,
@@ -1234,9 +1262,11 @@ pub(crate) mod tests {
         let response_obj: Value =
             serde_json::from_str(&response.read_utf8_body().unwrap()).unwrap();
         let databases = response_obj["databases"].as_array().unwrap();
-        assert!(databases
-            .iter()
-            .any(|entry| entry["name"] == json!(database)));
+        assert!(
+            databases
+                .iter()
+                .any(|entry| entry["name"] == json!(database))
+        );
     }
 
     #[test]
@@ -1643,10 +1673,12 @@ pub(crate) mod tests {
         let response_obj: Value =
             serde_json::from_str(&response.read_utf8_body().unwrap()).unwrap();
         assert_eq!(response_obj["codeName"], json!("BadValue"));
-        assert!(response_obj["errmsg"]
-            .as_str()
-            .unwrap()
-            .contains("already exposed by table mongo_duplicate_config_first"));
+        assert!(
+            response_obj["errmsg"]
+                .as_str()
+                .unwrap()
+                .contains("already exposed by table mongo_duplicate_config_first")
+        );
     }
 
     #[test]
@@ -1783,10 +1815,12 @@ pub(crate) mod tests {
         assert_eq!(response_obj["ok"], json!(0.0));
         assert_eq!(response_obj["code"], json!(2));
         assert_eq!(response_obj["codeName"], json!("BadValue"));
-        assert!(response_obj["errmsg"]
-            .as_str()
-            .unwrap()
-            .contains("is exposed as Mongo collection logs_mismatch"));
+        assert!(
+            response_obj["errmsg"]
+                .as_str()
+                .unwrap()
+                .contains("is exposed as Mongo collection logs_mismatch")
+        );
     }
 
     #[test]
@@ -2224,9 +2258,11 @@ pub(crate) mod tests {
             get_named_aliases_json["logs_archive"]["aliases"]["logs_alias"],
             json!({})
         );
-        assert!(get_named_aliases_json["logs"]["aliases"]
-            .get("logs_secondary")
-            .is_none());
+        assert!(
+            get_named_aliases_json["logs"]["aliases"]
+                .get("logs_secondary")
+                .is_none()
+        );
 
         let get_index_named_alias_response = test_server
             .client()
