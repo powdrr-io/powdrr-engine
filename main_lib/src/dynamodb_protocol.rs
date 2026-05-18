@@ -3,19 +3,19 @@ use std::pin::Pin;
 
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{body, Body};
+use gotham::hyper::{Body, body};
 use gotham::mime;
 use gotham::state::{FromState, State};
 use http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::data_contract::{
     CreateTable, DynamoDbTableConfig, ServingPattern, ServingTableConfig, TableDescription,
     TableMetadataCheckpoint,
 };
 use crate::elastic_search_endpoints::NamePathExtractor;
-use crate::lakehouse_serving::{execute_serving_query, ServingQueryError, ServingQueryResponse};
+use crate::lakehouse_serving::{ServingQueryError, ServingQueryResponse, execute_serving_query};
 use crate::peers::CheckpointDescriptor;
 use crate::schema_massager::{PowdrrDataType, PowdrrSchema};
 use crate::serving_plan::{
@@ -367,7 +367,7 @@ pub fn dynamodb_api(mut state: State) -> Pin<Box<HandlerFuture>> {
                     return Err(DynamoDbError::validation(format!(
                         "Unsupported x-amz-target {}",
                         target
-                    )))
+                    )));
                 }
             };
 
@@ -997,7 +997,7 @@ fn parse_key_condition_expression(
         (None, Some(_)) => {
             return Err(DynamoDbError::validation(
                 "This table does not define a sort key",
-            ))
+            ));
         }
         (Some(sort_key), Some(segment)) => Some(parse_sort_condition(segment, sort_key, values)?),
     };

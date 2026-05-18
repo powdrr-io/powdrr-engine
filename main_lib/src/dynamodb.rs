@@ -11,8 +11,8 @@ use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use idgenerator::IdInstance;
 use modyne::expr::Filter;
 use modyne::{
-    expr, keys, model::TransactWrite, projections, read_projection, Aggregate, Entity, EntityExt,
-    Error, Item, ProjectionExt, QueryInput, QueryInputExt, Table,
+    Aggregate, Entity, EntityExt, Error, Item, ProjectionExt, QueryInput, QueryInputExt, Table,
+    expr, keys, model::TransactWrite, projections, read_projection,
 };
 use std::collections::HashMap;
 
@@ -744,6 +744,27 @@ impl DynamoDbConnector {
                 &Self::latest_compaction_work_item_key(table_name),
                 &Self::NO_WORK_ITEM.to_owned(),
             ),
+        );
+        self.commit_conditional_transaction(transaction).await
+    }
+
+    pub async fn upsert_table_helper(
+        &mut self,
+        org_id: &String,
+        table_name: &String,
+        table_body: &TableBody,
+    ) -> Result<bool, Error> {
+        if self.describe_powdrr_table(org_id, table_name).await?.is_none() {
+            return self.create_table_helper(org_id, table_name, table_body).await;
+        }
+
+        let expression = expr::Update::new("SET entity = :entity").value(":entity", table_body);
+        let transaction = TransactWrite::new().operation(
+            PowdrrNamedTableBody::update(OrgIdNameInput {
+                org_id,
+                name: table_name,
+            })
+            .expression(expression),
         );
         self.commit_conditional_transaction(transaction).await
     }
