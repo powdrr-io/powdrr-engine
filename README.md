@@ -17,11 +17,13 @@ scripts/cargo-worktree.sh test -p powdrr_lib -- --nocapture --test-threads=1
 scripts/cargo-worktree.sh build --timings
 ```
 
-The workspace now excludes `powdrr-benchmark` from default root-level `cargo build`,
-`cargo check`, and `cargo test` commands. Run benchmark builds explicitly when needed:
+The workspace now excludes `powdrr-benchmark` and `powdrr_lib` from default root-level
+`cargo build`, `cargo check`, and `cargo test` package selection. Run those surfaces
+explicitly when needed:
 
 ```
 scripts/cargo-worktree.sh run -p powdrr-benchmark
+scripts/cargo-worktree.sh check -p powdrr_lib
 ```
 
 ## RUNNING TESTS
@@ -36,6 +38,15 @@ Some of the tests use shared data state so they must be run single threaded.
 
 ```
 RUST_BACKTRACE=1 scripts/cargo-worktree.sh test -- --nocapture --test-threads=1
+RUST_BACKTRACE=1 scripts/cargo-worktree.sh test -p powdrr_lib -- --nocapture --test-threads=1
+```
+
+The heavy `powdrr_lib` compatibility suites are opt-in behind `--features integration-tests`.
+Run them explicitly when you touch those surfaces:
+
+```
+scripts/cargo-worktree.sh test -p powdrr_lib --features integration-tests --test es_compatibility_matrix -- --nocapture --test-threads=1
+scripts/cargo-worktree.sh test -p powdrr_lib --features integration-tests --test dynamodb_sdk_compat -- --nocapture --test-threads=1
 ```
 
 Run the DynamoDB SDK compatibility suite against the local dependency stack:

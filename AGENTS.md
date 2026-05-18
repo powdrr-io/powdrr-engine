@@ -75,6 +75,7 @@ scripts/cargo-worktree.sh check -p <crate>
 - Prefer `scripts/cargo-worktree.sh check -p <crate>` or `scripts/cargo-worktree.sh test -p <crate>` over whole-workspace commands during the edit loop so Cargo can use a package-specific shard instead of the workspace shard.
 - Run formatting before handoff: `cargo fmt --all`.
 - Run the most relevant crate-level or workspace-level tests for the touched code.
+- The heavy `powdrr_lib` compatibility suites are opt-in behind `--features integration-tests`; only run them when you touch those surfaces.
 - When test isolation is unclear, default to the repo guidance in `README.md`:
   `RUST_BACKTRACE=1 scripts/cargo-worktree.sh test -- --nocapture --test-threads=1`
 - If the change touches Elasticsearch or integration behavior, read `README.md` first and run the required local dependencies.

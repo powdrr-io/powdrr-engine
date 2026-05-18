@@ -7,6 +7,10 @@ publish = false
 readme = "README.md"
 version.workspace = true
 edition.workspace = true
+autotests = false
+
+[features]
+integration-tests = []
 
 
 [dependencies]
@@ -61,3 +65,17 @@ liquid-cache-parquet = { package = "liquid-cache-datafusion-local", git = "https
 
 [dev-dependencies]
 reqwest = { version = "0.12.14", default-features = false, features = ["json", "blocking", "rustls-tls"] }
+
+[[test]]
+name = "local_cli_analyze"
+path = "tests/local_cli_analyze.rs"
+
+[[test]]
+name = "es_compatibility_matrix"
+path = "tests/es_compatibility_matrix.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "dynamodb_sdk_compat"
+path = "tests/dynamodb_sdk_compat.rs"
+required-features = ["integration-tests"]

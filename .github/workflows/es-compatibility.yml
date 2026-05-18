@@ -22,7 +22,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Validate Compatibility Fixture File
-        run: cargo test -p powdrr_lib --test es_compatibility_matrix compatibility_matrix_case_file_parses_and_ids_are_unique -- --nocapture
+        run: cargo test -p powdrr_lib --features integration-tests --test es_compatibility_matrix compatibility_matrix_case_file_parses_and_ids_are_unique -- --nocapture
 
       - name: Run Differential Compatibility Matrix
         run: bash scripts/run_es_compat_local.sh
