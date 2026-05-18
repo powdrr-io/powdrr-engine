@@ -574,6 +574,8 @@ pub struct TableBody {
     pub serving: Option<crate::data_contract::ServingTableConfig>,
     #[serde(default)]
     pub dynamodb: Option<crate::data_contract::DynamoDbTableConfig>,
+    #[serde(default)]
+    pub mongodb: Option<crate::data_contract::MongoDbTableConfig>,
 }
 
 impl TableBody {
@@ -583,6 +585,7 @@ impl TableBody {
             tags: HashMap::new(),
             serving: None,
             dynamodb: None,
+            mongodb: None,
         }
     }
 }
@@ -1244,6 +1247,7 @@ mod tests {
                     tags: HashMap::from([("foo".to_string(), "bar".to_string())]),
                     serving: None,
                     dynamodb: None,
+                    mongodb: None,
                 },
             )
             .await

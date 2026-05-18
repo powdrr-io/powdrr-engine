@@ -149,6 +149,7 @@ impl DynamoDBServiceImpl {
                 tags: Default::default(),
                 serving: None,
                 dynamodb: None,
+                mongodb: None,
             },
         )
         .await?;
@@ -216,6 +217,7 @@ impl DynamoDBServiceImpl {
                     tags: create_table.tags.clone(),
                     serving: create_table.serving.clone(),
                     dynamodb: create_table.dynamodb.clone(),
+                    mongodb: create_table.mongodb.clone(),
                 },
             )
             .await
@@ -237,6 +239,7 @@ impl DynamoDBServiceImpl {
                     tags: x.tags.clone(),
                     serving: x.serving.clone(),
                     dynamodb: x.dynamodb.clone(),
+                    mongodb: x.mongodb.clone(),
                 })
             })
             .map_err(from_modyne)?;
@@ -261,6 +264,7 @@ impl DynamoDBServiceImpl {
                                 tags: x.tags.clone(),
                                 serving: x.serving.clone(),
                                 dynamodb: x.dynamodb.clone(),
+                                mongodb: x.mongodb.clone(),
                             })
                         })
                         .map_err(from_modyne),

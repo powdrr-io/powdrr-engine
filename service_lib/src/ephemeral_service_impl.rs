@@ -182,6 +182,7 @@ impl EphemeralServiceImpl {
                     tags: Default::default(),
                     serving: None,
                     dynamodb: None,
+                    mongodb: None,
                 },
             );
         }
