@@ -13,6 +13,7 @@ pub(crate) struct OperatingMode {
     pub(crate) peer_detection: PeerDetectionMode,
     pub(crate) testing_enabled: bool,
     pub(crate) port: u32,
+    pub(crate) mongo_port: Option<u32>,
 }
 
 pub(crate) fn get_operating_mode(_command_line_args: &Vec<String>) -> OperatingMode {
@@ -24,17 +25,22 @@ pub(crate) fn get_operating_mode(_command_line_args: &Vec<String>) -> OperatingM
         Ok(port) => port.parse::<u32>().unwrap(),
         Err(_) => 9200,
     };
+    let mongo_port = std::env::var("MONGO_PORT")
+        .ok()
+        .map(|port| port.parse::<u32>().unwrap());
 
     match mode.as_str() {
         "default" => OperatingMode {
             peer_detection: PeerDetectionMode::SelfOnly,
             testing_enabled: true,
             port,
+            mongo_port,
         },
         "docker" => OperatingMode {
             peer_detection: PeerDetectionMode::Docker,
             testing_enabled: true,
             port,
+            mongo_port,
         },
         _ => {
             panic!("Invalid mode specified: {}", mode);
