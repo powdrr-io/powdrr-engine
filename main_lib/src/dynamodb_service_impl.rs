@@ -17,8 +17,8 @@ use crate::state_provider::ServiceApiError;
 use crate::test_api::{StateMode, TestProcessingMode};
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_dynamodb::Client;
-use modyne::model::TransactWrite;
 use modyne::TestTableExt;
+use modyne::model::TransactWrite;
 use std::collections::{HashMap, HashSet};
 
 const LEASE_LENGTH_MS: i64 = 60 * 1000; // 1 minute
@@ -138,17 +138,13 @@ impl DynamoDBServiceImpl {
         org_info: &OrgInfo,
         metadata: &TableMetadataCheckpoint,
     ) -> Result<(), ServiceApiError> {
-        self.create_table(
-            org_info,
-            &CreateTable {
-                name: metadata.table_name.clone(),
-                tags: Default::default(),
-                serving: None,
-                dynamodb: None,
-                mongodb: None,
-            },
-        )
-        .await?;
+        self.create_table(org_info, &CreateTable {
+            name: metadata.table_name.clone(),
+            tags: Default::default(),
+            serving: None,
+            dynamodb: None,
+            mongodb: None,
+        }).await?;
         if metadata.speedboat_metadata.is_some() {
             self.speedboat_commit(
                 org_info,
@@ -232,6 +228,25 @@ impl DynamoDBServiceImpl {
             .map_err(from_modyne)
     }
 
+    pub async fn upsert_table_metadata(
+        &mut self,
+        org_info: &OrgInfo,
+        create_table: &CreateTable,
+    ) -> Result<bool, ServiceApiError> {
+        self.connector
+            .upsert_table_helper(
+                &org_info.org_id.to_string(),
+                &create_table.name,
+                &TableBody {
+                    tags: create_table.tags.clone(),
+                    serving: create_table.serving.clone(),
+                    dynamodb: create_table.dynamodb.clone(),
+                    mongodb: create_table.mongodb.clone(),
+                },
+            )
+            .await
+            .map_err(from_modyne)
+    }
     pub async fn describe_table(
         &mut self,
         org_info: &OrgInfo,

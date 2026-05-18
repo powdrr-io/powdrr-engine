@@ -326,7 +326,11 @@ impl StateProviderActor {
                 respond_to,
                 create_table,
             } => {
-                handle_message_impl!(self, respond_to, create_table(&create_table));
+                match distributed_cache::create_table(&create_table.name) {
+                    Ok(_) => (),
+                    Err(e) => panic!("Unable to create table = {}", e),
+                };
+                handle_message_impl!(self, respond_to, upsert_table_metadata(&create_table));
             }
             StateProviderActorMessage::DescribeTable { respond_to, name } => {
                 handle_message_impl!(self, respond_to, describe_table(&name));
@@ -539,7 +543,7 @@ impl StateProvider {
         &mut self,
         create_table: &CreateTable,
     ) -> Result<bool, ServiceApiError> {
-        state_provider_func_impl!(self, create_table(create_table))
+        state_provider_func_impl!(self, upsert_table_metadata(create_table))
     }
 
     pub async fn describe_table(
