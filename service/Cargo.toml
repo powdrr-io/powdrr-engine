@@ -12,7 +12,10 @@ edition.workspace = true
 futures-util = "0.3.31"
 gotham = { version = "0.7.4", features = ["rustls"] }
 idgenerator = "2.0.0"
+openraft = { version = "0.9.24", features = ["serde"] }
+openraft-memstore = "0.9.24"
 powdrr-service-lib = { path = "../service_lib" }
+reqwest = { version = "0.12.5", features = ["json"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 tokio = "1.45.1"
