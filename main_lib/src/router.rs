@@ -447,6 +447,10 @@ pub fn router(include_test_apis: bool) -> Router {
             .with_path_extractor::<NamePathExtractor>()
             .to(dynamodb_protocol::get_dynamodb_config);
         route
+            .get("/:name/_mongo/config")
+            .with_path_extractor::<NamePathExtractor>()
+            .to(mongodb_protocol::get_mongodb_config);
+        route
             .put("/:name/_serve/config")
             .with_path_extractor::<NamePathExtractor>()
             .to(lakehouse_serving::put_serving_config);
@@ -454,6 +458,14 @@ pub fn router(include_test_apis: bool) -> Router {
             .put("/:name/_dynamodb/config")
             .with_path_extractor::<NamePathExtractor>()
             .to(dynamodb_protocol::put_dynamodb_config);
+        route
+            .put("/:name/_mongo/config")
+            .with_path_extractor::<NamePathExtractor>()
+            .to(mongodb_protocol::put_mongodb_config);
+        route
+            .post("/_mongo/:database/_command")
+            .with_path_extractor::<mongodb_protocol::MongoDatabasePathExtractor>()
+            .to(mongodb_protocol::mongodb_command);
         route
             .post("/:name/_serve")
             .with_path_extractor::<NamePathExtractor>()
@@ -653,6 +665,8 @@ pub fn router(include_test_apis: bool) -> Router {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::HashMap;
+    use std::fs;
+    use std::path::Path;
     use std::sync::LazyLock;
     use std::{env, str};
 
@@ -671,13 +685,204 @@ pub(crate) mod tests {
         CacheMode, CompactionMode, IndexingMode, PeerMode, PeerModeType, PrefetchMode, StateMode,
         StorageMode, TestProcessingMode,
     };
+    use datafusion::arrow::array::{ArrayRef, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::parquet::arrow::ArrowWriter;
     use gotham::mime;
     use gotham::plain::test::AsyncTestServer;
-    use gotham::test::TestServer;
-    use serde_json::{Value, json};
+    use gotham::test::{TestResponse, TestServer};
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+    use tempfile::TempDir;
 
     pub(crate) static TEST_SERVER: LazyLock<TestServer> =
         LazyLock::new(|| TestServer::with_timeout(router(true), 1000).unwrap());
+
+    fn set_testing_and_processing_mode(test_server: &TestServer) {
+        test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_testing_and_processing_mode",
+                serde_json::to_string(&TestProcessingMode {
+                    state_mode: StateMode::Testing,
+                    storage_mode: StorageMode::default(),
+                    cache_mode: CacheMode::Redis(None),
+                    peer_mode: PeerMode::SelfOnly,
+                    indexing_mode: IndexingMode::Disabled,
+                    compaction_mode: CompactionMode::Disabled,
+                    prefetch_mode: PrefetchMode::Disabled,
+                })
+                .unwrap(),
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+    }
+
+    fn write_mongo_test_parquet(path: &Path) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_id_seq_no", DataType::Utf8, false),
+            Field::new("message", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1_1", "2_1"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    "Login attempt failed",
+                    "Login successful",
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let file = fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    fn add_mongo_parquet_checkpoint(test_server: &TestServer, table_name: &str) -> TempDir {
+        let schema = PowdrrSchema::from(&vec![
+            PowdrrField {
+                name: "_id_seq_no".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "message".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+        ]);
+        let temp_dir = TempDir::new().unwrap();
+        let parquet_path = temp_dir.path().join(format!("{}.parquet", table_name));
+        write_mongo_test_parquet(&parquet_path);
+        let checkpoint = TableMetadataCheckpoint {
+            table_name: table_name.to_string(),
+            original_checkpoint_id: None,
+            checkpoint_id: format!("{}_checkpoint_0", table_name),
+            iceberg_metadata: Some(IcebergMetadata {
+                table_schema: schema.clone(),
+                snapshot_id: Some(format!("{}_snapshot_0", table_name)),
+                files: FileSetPayload::single(
+                    format!("file://{}", parquet_path.display()),
+                    fs::metadata(&parquet_path).unwrap().len(),
+                    schema.clone(),
+                ),
+                column_names: vec![],
+                column_stats: vec![],
+                file_stats: vec![],
+            }),
+            speedboat_metadata: None,
+            deletes_metadata: None,
+            extension_metadata: HashMap::new(),
+            schema,
+        };
+
+        test_server
+            .client()
+            .post(
+                "http://localhost/_test/v1/_add_checkpoint",
+                serde_json::to_string(&checkpoint).unwrap(),
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        temp_dir
+    }
+
+    fn put_mongo_lookup_serving_config(test_server: &TestServer, table_name: &str) {
+        let response = test_server
+            .client()
+            .put(
+                &format!("http://localhost/{}/_serve/config", table_name),
+                r#"{
+                  "patterns": [
+                    {
+                      "name": "mongo_id_lookup",
+                      "eq_fields": ["_id_seq_no"],
+                      "max_limit": 1
+                    }
+                  ]
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+    }
+
+    fn put_mongo_cursor_serving_config(test_server: &TestServer, table_name: &str) {
+        let response = test_server
+            .client()
+            .put(
+                &format!("http://localhost/{}/_serve/config", table_name),
+                r#"{
+                  "patterns": [
+                    {
+                      "name": "mongo_message_top_n",
+                      "order_field": "message",
+                      "descending": false,
+                      "max_limit": 10,
+                      "projection": ["message", "_id_seq_no"]
+                    }
+                  ]
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+    }
+
+    fn put_mongo_config(test_server: &TestServer, table_name: &str, collection: &str) {
+        put_mongo_config_with_options(test_server, table_name, "powdrr_mongo", collection, true);
+    }
+
+    fn put_mongo_config_with_options(
+        test_server: &TestServer,
+        table_name: &str,
+        database: &str,
+        collection: &str,
+        enabled: bool,
+    ) {
+        let response = test_server
+            .client()
+            .put(
+                &format!("http://localhost/{}/_mongo/config", table_name),
+                json!({
+                    "enabled": enabled,
+                    "database": database,
+                    "collection": collection,
+                    "id": { "field": "_id_seq_no" }
+                })
+                .to_string(),
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+    }
+
+    fn perform_mongo_command(
+        test_server: &TestServer,
+        database: &str,
+        payload: Value,
+    ) -> TestResponse {
+        test_server
+            .client()
+            .post(
+                &format!("http://localhost/_mongo/{}/_command", database),
+                payload.to_string(),
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap()
+    }
 
     #[test]
     fn test_serving_config_and_fast_path_query() {
@@ -820,111 +1025,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_mongodb_find_http_bridge_fast_path_query() {
+    fn test_mongodb_config_round_trip() {
         let test_server = &*TEST_SERVER;
+        let table_name = "mongo_logs_config";
 
-        test_server
+        set_testing_and_processing_mode(test_server);
+        let _temp_dir = add_mongo_parquet_checkpoint(test_server, table_name);
+
+        let put_response = test_server
             .client()
             .put(
-                "http://localhost/_test/v1/_testing_and_processing_mode",
-                serde_json::to_string(&TestProcessingMode {
-                    state_mode: StateMode::Testing,
-                    storage_mode: StorageMode::default(),
-                    cache_mode: CacheMode::Redis(None),
-                    peer_mode: PeerMode::SelfOnly,
-                    indexing_mode: IndexingMode::Disabled,
-                    compaction_mode: CompactionMode::Disabled,
-                    prefetch_mode: PrefetchMode::Disabled,
-                })
-                .unwrap(),
-                mime::APPLICATION_JSON,
-            )
-            .perform()
-            .unwrap();
-
-        let schema = PowdrrSchema::from(&vec![
-            PowdrrField {
-                name: "_id_seq_no".to_string(),
-                data_type: PowdrrDataType::String,
-            },
-            PowdrrField {
-                name: "snippet".to_string(),
-                data_type: PowdrrDataType::String,
-            },
-            PowdrrField {
-                name: "searchTerms".to_string(),
-                data_type: PowdrrDataType::String,
-            },
-            PowdrrField {
-                name: "title".to_string(),
-                data_type: PowdrrDataType::String,
-            },
-        ]);
-
-        let file_path = format!(
-            "file://{}/tests/data/flights.parquet",
-            env::current_dir().unwrap().to_str().unwrap()
-        );
-
-        let checkpoint = TableMetadataCheckpoint {
-            table_name: "serve_flights_mongo".to_string(),
-            original_checkpoint_id: None,
-            checkpoint_id: "serve_checkpoint_mongo_0".to_string(),
-            iceberg_metadata: Some(IcebergMetadata {
-                table_schema: schema.clone(),
-                snapshot_id: Some("snapshot_mongo_1".to_string()),
-                files: FileSetPayload::single(file_path, 1, schema.clone()),
-                column_names: vec![],
-                column_stats: vec![],
-                file_stats: vec![],
-            }),
-            speedboat_metadata: None,
-            deletes_metadata: None,
-            extension_metadata: HashMap::new(),
-            schema: schema.clone(),
-        };
-
-        test_server
-            .client()
-            .post(
-                "http://localhost/_test/v1/_add_checkpoint",
-                serde_json::to_string(&checkpoint).unwrap(),
-                mime::APPLICATION_JSON,
-            )
-            .perform()
-            .unwrap();
-
-        let config_response = test_server
-            .client()
-            .put(
-                "http://localhost/serve_flights_mongo/_serve/config",
-                r#"{
-                  "patterns": [
-                    {
-                      "name": "mongo_title_top_n",
-                      "order_field": "title",
-                      "descending": false,
-                      "max_limit": 10,
-                      "projection": ["title"]
-                    }
-                  ]
-                }"#,
-                mime::APPLICATION_JSON,
-            )
-            .perform()
-            .unwrap();
-
-        assert_eq!(config_response.status(), 200);
-
-        let query_response = test_server
-            .client()
-            .post(
-                "http://localhost/serve_flights_mongo/_mongo/find",
+                &format!("http://localhost/{}/_mongo/config", table_name),
                 json!({
-                    "find": "serve_flights_mongo",
-                    "projection": { "title": 1, "_id": 0 },
-                    "sort": { "title": 1 },
-                    "limit": 2
+                    "enabled": true,
+                    "database": "powdrr_mongo",
+                    "collection": "logs_roundtrip",
+                    "id": { "field": "_id_seq_no" }
                 })
                 .to_string(),
                 mime::APPLICATION_JSON,
@@ -932,37 +1048,445 @@ pub(crate) mod tests {
             .perform()
             .unwrap();
 
-        assert_eq!(query_response.status(), 200);
-        let response_obj: Value =
-            serde_json::from_str(&query_response.read_utf8_body().unwrap()).unwrap();
-        assert_eq!(response_obj["ok"], json!(1.0));
-        assert_eq!(response_obj["cursor"]["id"], json!(0));
-        assert_eq!(
-            response_obj["cursor"]["ns"],
-            json!("powdrr.serve_flights_mongo")
-        );
-        assert_eq!(
-            response_obj["cursor"]["firstBatch"]
-                .as_array()
-                .unwrap()
-                .len(),
-            2
-        );
-        assert_eq!(
-            response_obj["cursor"]["firstBatch"][0]["title"].is_string(),
-            true
-        );
+        assert_eq!(put_response.status(), 200);
+        let put_obj: Value = serde_json::from_str(&put_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(put_obj["acknowledged"], json!(true));
+        assert_eq!(put_obj["mongodb"]["collection"], json!("logs_roundtrip"));
+        assert_eq!(put_obj["mongodb"]["id"]["field"], json!("_id_seq_no"));
+
+        let get_response = test_server
+            .client()
+            .get(&format!("http://localhost/{}/_mongo/config", table_name))
+            .perform()
+            .unwrap();
+
+        assert_eq!(get_response.status(), 200);
+        let get_obj: Value = serde_json::from_str(&get_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(get_obj["acknowledged"], json!(true));
+        assert_eq!(get_obj["table"], json!(table_name));
+        assert_eq!(get_obj["mongodb"]["database"], json!("powdrr_mongo"));
+        assert_eq!(get_obj["mongodb"]["collection"], json!("logs_roundtrip"));
+        assert_eq!(get_obj["mongodb"]["id"]["field"], json!("_id_seq_no"));
     }
 
     #[test]
-    fn test_mongodb_find_http_bridge_rejects_path_collection_mismatch() {
+    fn test_mongodb_command_hello() {
         let test_server = &*TEST_SERVER;
+
+        let response = perform_mongo_command(
+            test_server,
+            "admin",
+            json!({
+                "hello": 1,
+                "$db": "admin"
+            }),
+        );
+
+        assert_eq!(response.status(), 200);
+        let response_obj: Value =
+            serde_json::from_str(&response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(response_obj["ok"], json!(1.0));
+        assert_eq!(response_obj["helloOk"], json!(true));
+        assert_eq!(response_obj["readOnly"], json!(true));
+        assert_eq!(response_obj["maxWireVersion"], json!(21));
+    }
+
+    #[test]
+    fn test_mongodb_command_list_collections_only_returns_enabled_bindings_for_database() {
+        let test_server = &*TEST_SERVER;
+        let database = "mongo_list_collections_db";
+
+        set_testing_and_processing_mode(test_server);
+        let _alpha_dir = add_mongo_parquet_checkpoint(test_server, "mongo_list_collections_alpha");
+        let _beta_dir = add_mongo_parquet_checkpoint(test_server, "mongo_list_collections_beta");
+        let _other_dir = add_mongo_parquet_checkpoint(test_server, "mongo_list_collections_other");
+
+        put_mongo_lookup_serving_config(test_server, "mongo_list_collections_alpha");
+        put_mongo_lookup_serving_config(test_server, "mongo_list_collections_beta");
+        put_mongo_lookup_serving_config(test_server, "mongo_list_collections_other");
+
+        put_mongo_config_with_options(
+            test_server,
+            "mongo_list_collections_alpha",
+            database,
+            "alpha",
+            true,
+        );
+        put_mongo_config_with_options(
+            test_server,
+            "mongo_list_collections_beta",
+            database,
+            "beta_disabled",
+            false,
+        );
+        put_mongo_config_with_options(
+            test_server,
+            "mongo_list_collections_other",
+            "mongo_list_collections_other_db",
+            "other",
+            true,
+        );
+
+        let response = perform_mongo_command(
+            test_server,
+            database,
+            json!({
+                "listCollections": 1,
+                "$db": database
+            }),
+        );
+
+        assert_eq!(response.status(), 200);
+        let response_obj: Value =
+            serde_json::from_str(&response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(
+            response_obj["cursor"]["ns"],
+            json!(format!("{}.$cmd.listCollections", database))
+        );
+        let first_batch = response_obj["cursor"]["firstBatch"].as_array().unwrap();
+        assert!(first_batch
+            .iter()
+            .any(|entry| entry["name"] == json!("alpha")));
+        assert!(!first_batch
+            .iter()
+            .any(|entry| entry["name"] == json!("beta_disabled")));
+        assert!(!first_batch
+            .iter()
+            .any(|entry| entry["name"] == json!("other")));
+    }
+
+    #[test]
+    fn test_mongodb_command_list_databases_includes_configured_databases() {
+        let test_server = &*TEST_SERVER;
+        let database = "mongo_list_databases_unique";
+
+        set_testing_and_processing_mode(test_server);
+        let _temp_dir = add_mongo_parquet_checkpoint(test_server, "mongo_list_databases_table");
+        put_mongo_lookup_serving_config(test_server, "mongo_list_databases_table");
+        put_mongo_config_with_options(
+            test_server,
+            "mongo_list_databases_table",
+            database,
+            "logs",
+            true,
+        );
+
+        let response = perform_mongo_command(
+            test_server,
+            "admin",
+            json!({
+                "listDatabases": 1,
+                "$db": "admin"
+            }),
+        );
+
+        assert_eq!(response.status(), 200);
+        let response_obj: Value =
+            serde_json::from_str(&response.read_utf8_body().unwrap()).unwrap();
+        let databases = response_obj["databases"].as_array().unwrap();
+        assert!(databases
+            .iter()
+            .any(|entry| entry["name"] == json!(database)));
+    }
+
+    #[test]
+    fn test_mongodb_command_find_resolves_collection_to_table() {
+        let test_server = &*TEST_SERVER;
+        let table_name = "mongo_logs_command_lookup";
+        let database = "mongo_find_command_db";
+
+        set_testing_and_processing_mode(test_server);
+        let _temp_dir = add_mongo_parquet_checkpoint(test_server, table_name);
+        put_mongo_lookup_serving_config(test_server, table_name);
+        put_mongo_config_with_options(test_server, table_name, database, "logs", true);
+
+        let response = perform_mongo_command(
+            test_server,
+            database,
+            json!({
+                "find": "logs",
+                "filter": { "_id": "1_1" },
+                "projection": { "message": 1 },
+                "limit": 1,
+                "$db": database
+            }),
+        );
+
+        assert_eq!(response.status(), 200);
+        let response_obj: Value =
+            serde_json::from_str(&response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(response_obj["ok"], json!(1.0));
+        assert_eq!(
+            response_obj["cursor"]["ns"],
+            json!(format!("{}.logs", database))
+        );
+        let row = response_obj["cursor"]["firstBatch"][0].as_object().unwrap();
+        assert_eq!(row.get("_id"), Some(&json!("1_1")));
+        assert_eq!(row.get("message"), Some(&json!("Login attempt failed")));
+        assert!(row.get("_id_seq_no").is_none());
+    }
+
+    #[test]
+    fn test_mongodb_command_find_get_more_and_kill_cursors() {
+        let test_server = &*TEST_SERVER;
+        let table_name = "mongo_logs_cursor_lookup";
+        let database = "mongo_cursor_command_db";
+        let collection = "logs_cursor";
+
+        set_testing_and_processing_mode(test_server);
+        let _temp_dir = add_mongo_parquet_checkpoint(test_server, table_name);
+        put_mongo_cursor_serving_config(test_server, table_name);
+        put_mongo_config_with_options(test_server, table_name, database, collection, true);
+
+        let find_response = perform_mongo_command(
+            test_server,
+            database,
+            json!({
+                "find": collection,
+                "sort": { "message": 1 },
+                "projection": { "message": 1 },
+                "limit": 2,
+                "batchSize": 1,
+                "$db": database
+            }),
+        );
+
+        assert_eq!(find_response.status(), 200);
+        let find_obj: Value =
+            serde_json::from_str(&find_response.read_utf8_body().unwrap()).unwrap();
+        let cursor_id = find_obj["cursor"]["id"].as_i64().unwrap();
+        assert!(cursor_id > 0);
+        assert_eq!(
+            find_obj["cursor"]["firstBatch"].as_array().unwrap().len(),
+            1
+        );
+
+        let get_more_response = perform_mongo_command(
+            test_server,
+            database,
+            json!({
+                "getMore": cursor_id,
+                "collection": collection,
+                "batchSize": 1,
+                "$db": database
+            }),
+        );
+
+        assert_eq!(get_more_response.status(), 200);
+        let get_more_obj: Value =
+            serde_json::from_str(&get_more_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(get_more_obj["cursor"]["id"], json!(0));
+        assert_eq!(
+            get_more_obj["cursor"]["ns"],
+            json!(format!("{}.{}", database, collection))
+        );
+        let next_batch = get_more_obj["cursor"]["nextBatch"].as_array().unwrap();
+        assert_eq!(next_batch.len(), 1);
+        assert_eq!(next_batch[0]["message"], json!("Login successful"));
+
+        let kill_find_response = perform_mongo_command(
+            test_server,
+            database,
+            json!({
+                "find": collection,
+                "sort": { "message": 1 },
+                "projection": { "message": 1 },
+                "limit": 2,
+                "batchSize": 1,
+                "$db": database
+            }),
+        );
+
+        let kill_find_obj: Value =
+            serde_json::from_str(&kill_find_response.read_utf8_body().unwrap()).unwrap();
+        let kill_cursor_id = kill_find_obj["cursor"]["id"].as_i64().unwrap();
+        assert!(kill_cursor_id > 0);
+
+        let kill_response = perform_mongo_command(
+            test_server,
+            database,
+            json!({
+                "killCursors": collection,
+                "cursors": [kill_cursor_id],
+                "$db": database
+            }),
+        );
+
+        assert_eq!(kill_response.status(), 200);
+        let kill_obj: Value =
+            serde_json::from_str(&kill_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(kill_obj["cursorsKilled"], json!([kill_cursor_id]));
+        assert_eq!(kill_obj["cursorsNotFound"], json!([]));
+    }
+
+    #[test]
+    fn test_mongodb_config_rejects_duplicate_enabled_namespace() {
+        let test_server = &*TEST_SERVER;
+        let database = "mongo_duplicate_config_db";
+        let collection = "duplicate_logs";
+
+        set_testing_and_processing_mode(test_server);
+        let _first_dir = add_mongo_parquet_checkpoint(test_server, "mongo_duplicate_config_first");
+        let _second_dir =
+            add_mongo_parquet_checkpoint(test_server, "mongo_duplicate_config_second");
+
+        put_mongo_lookup_serving_config(test_server, "mongo_duplicate_config_first");
+        put_mongo_lookup_serving_config(test_server, "mongo_duplicate_config_second");
+
+        put_mongo_config_with_options(
+            test_server,
+            "mongo_duplicate_config_first",
+            database,
+            collection,
+            true,
+        );
+
+        let response = test_server
+            .client()
+            .put(
+                "http://localhost/mongo_duplicate_config_second/_mongo/config",
+                json!({
+                    "enabled": true,
+                    "database": database,
+                    "collection": collection,
+                    "id": { "field": "_id_seq_no" }
+                })
+                .to_string(),
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(response.status(), 400);
+        let response_obj: Value =
+            serde_json::from_str(&response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(response_obj["codeName"], json!("BadValue"));
+        assert!(response_obj["errmsg"]
+            .as_str()
+            .unwrap()
+            .contains("already exposed by table mongo_duplicate_config_first"));
+    }
+
+    #[test]
+    fn test_mongodb_find_http_bridge_requires_mongo_config() {
+        let test_server = &*TEST_SERVER;
+        let table_name = "mongo_logs_unconfigured";
+
+        set_testing_and_processing_mode(test_server);
+        let _temp_dir = add_mongo_parquet_checkpoint(test_server, table_name);
+        put_mongo_lookup_serving_config(test_server, table_name);
+
         let response = test_server
             .client()
             .post(
-                "http://localhost/serve_flights_mismatch/_mongo/find",
+                &format!("http://localhost/{}/_mongo/find", table_name),
+                json!({
+                    "find": table_name,
+                    "limit": 1
+                })
+                .to_string(),
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(response.status(), 404);
+        let response_obj: Value =
+            serde_json::from_str(&response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(response_obj["ok"], json!(0.0));
+        assert_eq!(response_obj["code"], json!(26));
+        assert_eq!(response_obj["codeName"], json!("NamespaceNotFound"));
+    }
+
+    #[test]
+    fn test_mongodb_find_http_bridge_uses_id_mapping_and_collection_namespace() {
+        let test_server = &*TEST_SERVER;
+        let table_name = "mongo_logs_lookup";
+
+        set_testing_and_processing_mode(test_server);
+        let _temp_dir = add_mongo_parquet_checkpoint(test_server, table_name);
+        put_mongo_lookup_serving_config(test_server, table_name);
+        put_mongo_config(test_server, table_name, "logs");
+
+        let response = test_server
+            .client()
+            .post(
+                &format!("http://localhost/{}/_mongo/find", table_name),
+                json!({
+                    "find": "logs",
+                    "filter": { "_id": "1_1" },
+                    "projection": { "message": 1 },
+                    "limit": 1
+                })
+                .to_string(),
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        let response_obj: Value =
+            serde_json::from_str(&response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(response_obj["ok"], json!(1.0));
+        assert_eq!(response_obj["cursor"]["ns"], json!("powdrr_mongo.logs"));
+        let row = response_obj["cursor"]["firstBatch"][0].as_object().unwrap();
+        assert_eq!(row.get("_id"), Some(&json!("1_1")));
+        assert_eq!(row.get("message"), Some(&json!("Login attempt failed")));
+        assert!(row.get("_id_seq_no").is_none());
+    }
+
+    #[test]
+    fn test_mongodb_find_http_bridge_respects_id_exclusion_projection() {
+        let test_server = &*TEST_SERVER;
+        let table_name = "mongo_logs_projection";
+
+        set_testing_and_processing_mode(test_server);
+        let _temp_dir = add_mongo_parquet_checkpoint(test_server, table_name);
+        put_mongo_lookup_serving_config(test_server, table_name);
+        put_mongo_config(test_server, table_name, "logs_projection");
+
+        let response = test_server
+            .client()
+            .post(
+                &format!("http://localhost/{}/_mongo/find", table_name),
+                json!({
+                    "find": "logs_projection",
+                    "filter": { "_id": "1_1" },
+                    "projection": { "message": 1, "_id": 0 },
+                    "limit": 1
+                })
+                .to_string(),
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        let response_obj: Value =
+            serde_json::from_str(&response.read_utf8_body().unwrap()).unwrap();
+        let row = response_obj["cursor"]["firstBatch"][0].as_object().unwrap();
+        assert_eq!(row.get("message"), Some(&json!("Login attempt failed")));
+        assert!(row.get("_id").is_none());
+        assert!(row.get("_id_seq_no").is_none());
+    }
+
+    #[test]
+    fn test_mongodb_find_http_bridge_rejects_collection_mismatch_under_config() {
+        let test_server = &*TEST_SERVER;
+        let table_name = "mongo_logs_mismatch";
+
+        set_testing_and_processing_mode(test_server);
+        let _temp_dir = add_mongo_parquet_checkpoint(test_server, table_name);
+        put_mongo_lookup_serving_config(test_server, table_name);
+        put_mongo_config(test_server, table_name, "logs_mismatch");
+
+        let response = test_server
+            .client()
+            .post(
+                &format!("http://localhost/{}/_mongo/find", table_name),
                 json!({
                     "find": "other_collection",
+                    "filter": { "_id": "1_1" },
                     "limit": 1
                 })
                 .to_string(),
@@ -977,6 +1501,10 @@ pub(crate) mod tests {
         assert_eq!(response_obj["ok"], json!(0.0));
         assert_eq!(response_obj["code"], json!(2));
         assert_eq!(response_obj["codeName"], json!("BadValue"));
+        assert!(response_obj["errmsg"]
+            .as_str()
+            .unwrap()
+            .contains("is exposed as Mongo collection logs_mismatch"));
     }
 
     #[test]
@@ -1124,6 +1652,7 @@ pub(crate) mod tests {
             tags: HashMap::from([("_es_original".to_string(), original_index_body.to_string())]),
             serving: None,
             dynamodb: None,
+            mongodb: None,
         }))
         .unwrap();
         futures::executor::block_on(
@@ -1154,6 +1683,7 @@ pub(crate) mod tests {
                 )]),
                 serving: None,
                 dynamodb: None,
+                mongodb: None,
             }),
         )
         .unwrap();

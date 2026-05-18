@@ -3,11 +3,11 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
 
-use futures::FutureExt;
 use futures::stream::{self, StreamExt};
+use futures::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{Body, body};
+use gotham::hyper::{body, Body};
 use gotham::mime;
 use gotham::state::{FromState, State};
 use http::StatusCode;
@@ -136,9 +136,9 @@ pub fn put_serving_config(mut state: State) -> Pin<Box<HandlerFuture>> {
             }
         };
 
-        let tags = match STATE_PROVIDER.describe_table(&path).await {
-            Ok(Some(description)) => description.tags,
-            Ok(None) => HashMap::new(),
+        let (tags, dynamodb, mongodb) = match STATE_PROVIDER.describe_table(&path).await {
+            Ok(Some(description)) => (description.tags, description.dynamodb, description.mongodb),
+            Ok(None) => (HashMap::new(), None, None),
             Err(error) => {
                 let response = json_response(
                     &state,
@@ -153,7 +153,8 @@ pub fn put_serving_config(mut state: State) -> Pin<Box<HandlerFuture>> {
             name: path.clone(),
             tags,
             serving: Some(body.clone()),
-            dynamodb: None,
+            dynamodb,
+            mongodb,
         };
 
         match STATE_PROVIDER.upsert_table_metadata(&request).await {
@@ -1101,8 +1102,8 @@ impl ServingQueryError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ServingExecutionContext, build_sql, file_group_table_name, group_files_by_schema,
-        plan_request, prune_candidate_files, request_matches_pattern,
+        build_sql, file_group_table_name, group_files_by_schema, plan_request,
+        prune_candidate_files, request_matches_pattern, ServingExecutionContext,
     };
     use crate::data_contract::{
         FileDescriptor, IcebergColumnStats, IcebergFileStats, ServingPattern, ServingTableConfig,
@@ -1171,6 +1172,7 @@ mod tests {
                 tags: HashMap::new(),
                 serving: Some(serving),
                 dynamodb: None,
+                mongodb: None,
             },
             checkpoint: TableMetadataCheckpoint::new(
                 "events".to_string(),
