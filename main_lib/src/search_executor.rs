@@ -199,7 +199,7 @@ impl SearchCommand {
         legacy_command: &SqlCommand,
     ) -> Vec<CheckpointDescriptor> {
         match STATE_PROVIDER
-            .get_latest_servable_checkpoint(&legacy_command.table)
+            .get_active_servable_checkpoint(&legacy_command.table)
             .await
         {
             Ok(Some(checkpoint_id)) => {

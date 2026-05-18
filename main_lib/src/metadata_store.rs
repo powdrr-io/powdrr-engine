@@ -5,25 +5,94 @@ use crate::peers::CheckpointDescriptor;
 use crate::state_provider::ServiceApiError;
 use async_trait::async_trait;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishedCheckpointRole {
+    Active,
+    Target,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishedCheckpointSelector {
     pub table_name: String,
     pub extension: Option<String>,
+    pub role: PublishedCheckpointRole,
 }
 
 impl PublishedCheckpointSelector {
     pub fn new(table_name: String, extension: Option<String>) -> Self {
+        Self::active(table_name, extension)
+    }
+
+    pub fn active(table_name: String, extension: Option<String>) -> Self {
         Self {
             table_name,
             extension,
+            role: PublishedCheckpointRole::Active,
+        }
+    }
+
+    pub fn target(table_name: String, extension: Option<String>) -> Self {
+        Self {
+            table_name,
+            extension,
+            role: PublishedCheckpointRole::Target,
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishedCheckpointRecord {
     pub selector: PublishedCheckpointSelector,
     pub checkpoint_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CutoverEpoch(pub u64);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointCutoverState {
+    pub selector: PublishedCheckpointSelector,
+    pub epoch: CutoverEpoch,
+    pub active_checkpoint_id: Option<String>,
+    pub target_checkpoint_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServingNodeLease {
+    pub node_id: String,
+    pub membership_epoch: CutoverEpoch,
+    pub observed_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServingNodeActivationAck {
+    pub selector: PublishedCheckpointSelector,
+    pub node_id: String,
+    pub epoch: CutoverEpoch,
+    pub checkpoint_id: String,
+    pub activated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointCutoverRequest {
+    pub org_id: String,
+    pub selector: PublishedCheckpointSelector,
+    pub target_checkpoint_id: String,
+}
+
+impl CheckpointCutoverRequest {
+    pub fn new(
+        org_id: String,
+        table_name: String,
+        extension: Option<String>,
+        target_checkpoint_id: String,
+    ) -> Self {
+        Self {
+            org_id,
+            selector: PublishedCheckpointSelector::target(table_name, extension),
+            target_checkpoint_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -100,13 +169,88 @@ pub trait MetadataStore {
 
     async fn advance_published_checkpoints(&mut self) -> Result<bool, ServiceApiError>;
 
+    async fn plan_checkpoint_cutover(
+        &mut self,
+        request: &CheckpointCutoverRequest,
+    ) -> Result<(), ServiceApiError> {
+        self.queue_checkpoint_publication(&CheckpointUpdateRequest::new(
+            request.org_id.clone(),
+            request.selector.table_name.clone(),
+        ))
+        .await
+    }
+
+    async fn get_checkpoint_cutover_state(
+        &mut self,
+        org_info: &OrgInfo,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> Result<CheckpointCutoverState, ServiceApiError> {
+        let active_selector =
+            PublishedCheckpointSelector::active(table_name.clone(), extension.clone());
+        let target_selector = PublishedCheckpointSelector::target(table_name.clone(), extension);
+        let active_checkpoint_id = self
+            .get_published_checkpoint_record(org_info, &active_selector)
+            .await?
+            .map(|record| record.checkpoint_id);
+        let target_checkpoint_id = self
+            .get_published_checkpoint_record(org_info, &target_selector)
+            .await?
+            .map(|record| record.checkpoint_id)
+            .or_else(|| active_checkpoint_id.clone());
+        Ok(CheckpointCutoverState {
+            selector: target_selector,
+            epoch: CutoverEpoch::default(),
+            active_checkpoint_id,
+            target_checkpoint_id,
+        })
+    }
+
+    async fn heartbeat_serving_node(
+        &mut self,
+        _org_info: &OrgInfo,
+        _lease: &ServingNodeLease,
+    ) -> Result<(), ServiceApiError> {
+        Ok(())
+    }
+
+    async fn record_serving_node_activation(
+        &mut self,
+        _org_info: &OrgInfo,
+        _ack: &ServingNodeActivationAck,
+    ) -> Result<(), ServiceApiError> {
+        Ok(())
+    }
+
+    async fn list_serving_node_activations(
+        &mut self,
+        _org_info: &OrgInfo,
+        _table_name: &String,
+        _extension: Option<String>,
+    ) -> Result<Vec<ServingNodeActivationAck>, ServiceApiError> {
+        Ok(vec![])
+    }
+
     async fn get_latest_committed_checkpoint(
         &mut self,
         org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
-        let selector = PublishedCheckpointSelector::new(table_name.clone(), extension);
+        let selector = PublishedCheckpointSelector::active(table_name.clone(), extension);
+        Ok(self
+            .get_published_checkpoint_record(org_info, &selector)
+            .await?
+            .map(|record| record.checkpoint_id))
+    }
+
+    async fn get_latest_target_checkpoint(
+        &mut self,
+        org_info: &OrgInfo,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> Result<Option<String>, ServiceApiError> {
+        let selector = PublishedCheckpointSelector::target(table_name.clone(), extension);
         Ok(self
             .get_published_checkpoint_record(org_info, &selector)
             .await?

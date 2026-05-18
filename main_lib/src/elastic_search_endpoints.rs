@@ -661,7 +661,7 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
     };
 
     let checkpoint_id = STATE_PROVIDER
-        .get_latest_checkpoint(&table_desc.name, None)
+        .get_active_servable_checkpoint(&table_desc.name)
         .await
         .map_err(|e| e.message)?;
     let Some(checkpoint_id) = checkpoint_id else {
