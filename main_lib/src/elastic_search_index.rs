@@ -278,7 +278,7 @@ pub(crate) async fn create_index_inner_with_doc_id(
                 Some(extension_file_path) => {
                     files.insert(
                         file_desc.file_path.clone(),
-                        vec!(ExtensionFile{ suffix: "_search_index".to_string(), location: extension_file_path.clone() }),
+                        vec!(ExtensionFile{ suffix: "search_index".to_string(), location: extension_file_path.clone() }),
                     );
                 },
                 None => (),
@@ -297,7 +297,7 @@ pub(crate) async fn create_index_inner_with_doc_id(
                 Some(extension_file_path) => {
                     files.insert(
                         file_desc.file_path.clone(),
-                        vec!(ExtensionFile{ suffix: "_search_index".to_string(), location: extension_file_path.clone() }),
+                        vec!(ExtensionFile{ suffix: "search_index".to_string(), location: extension_file_path.clone() }),
                     );
                 },
                 None => (),
