@@ -1013,6 +1013,36 @@ fn parse_sort_condition(
     sort_key: &str,
     values: &HashMap<String, Value>,
 ) -> Result<ServingPredicate, DynamoDbError> {
+    if let Some(rest) = segment.strip_prefix("begins_with") {
+        let args = rest.trim();
+        let args = args
+            .strip_prefix('(')
+            .and_then(|inner| inner.strip_suffix(')'))
+            .ok_or_else(|| DynamoDbError::validation("begins_with must use function syntax"))?;
+        let (field, value_token) = args.split_once(',').ok_or_else(|| {
+            DynamoDbError::validation("begins_with must include a sort key and value")
+        })?;
+        if field.trim() != sort_key {
+            return Err(DynamoDbError::validation(format!(
+                "Only sort key {} can appear after the partition condition",
+                sort_key
+            )));
+        }
+        let prefix = lookup_expression_value(value_token.trim(), values)?;
+        let prefix = prefix.as_str().ok_or_else(|| {
+            DynamoDbError::validation("begins_with requires a string AttributeValue")
+        })?;
+        return Ok(ServingPredicate {
+            field: sort_key.to_string(),
+            eq: None,
+            in_values: None,
+            gt: None,
+            gte: Some(json!(prefix)),
+            lt: next_string_prefix_upper_bound(prefix).map(|upper| json!(upper)),
+            lte: None,
+        });
+    }
+
     if let Some((left, right)) = segment.split_once(" BETWEEN ") {
         if left.trim() != sort_key {
             return Err(DynamoDbError::validation(format!(
@@ -1067,6 +1097,28 @@ fn parse_sort_condition(
     Err(DynamoDbError::validation(
         "Unsupported KeyConditionExpression form",
     ))
+}
+
+fn next_string_prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut chars = prefix.chars().collect::<Vec<_>>();
+    while let Some(last) = chars.pop() {
+        if let Some(next) = next_scalar(last) {
+            chars.push(next);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
+}
+
+fn next_scalar(value: char) -> Option<char> {
+    let codepoint = value as u32;
+    if codepoint == 0x10FFFF {
+        return None;
+    }
+    if codepoint == 0xD7FF {
+        return std::char::from_u32(0xE000);
+    }
+    std::char::from_u32(codepoint + 1)
 }
 
 fn apply_exclusive_start_key(
@@ -1443,6 +1495,30 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_query_begins_with_expression() {
+        let mut values = HashMap::new();
+        values.insert(":tenant".to_string(), json!({ "S": "acme" }));
+        values.insert(":prefix".to_string(), json!({ "S": "evt-" }));
+
+        let parsed = parse_key_condition_expression(
+            "tenant = :tenant AND begins_with(event_id, :prefix)",
+            &DynamoDbTableConfig {
+                partition_key: "tenant".to_string(),
+                sort_key: Some("event_id".to_string()),
+            },
+            None,
+            Some(&values),
+        )
+        .unwrap();
+
+        assert_eq!(parsed.partition_value, json!("acme"));
+        let filter = parsed.sort_filter.unwrap();
+        assert_eq!(filter.field, "event_id");
+        assert_eq!(filter.gte, Some(json!("evt-")));
+        assert_eq!(filter.lt, Some(json!("evt.")));
+    }
+
+    #[test]
     fn test_dynamodb_root_operations() {
         let test_server = TestServer::with_timeout(crate::router::router(true), 1000).unwrap();
         let dataset_path =
@@ -1538,11 +1614,13 @@ mod tests {
             &list_tables_response.read_utf8_body().unwrap(),
         )
         .unwrap();
-        assert!(list_tables_body["TableNames"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value == &json!(table_name)));
+        assert!(
+            list_tables_body["TableNames"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == &json!(table_name))
+        );
 
         let get_item_response = perform_dynamodb_request(
             &test_server,
