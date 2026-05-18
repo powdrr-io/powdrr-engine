@@ -1,14 +1,14 @@
 use crate::elastic_search_commands::{SqlCommand, UpdateByQueryCommand};
 use crate::elastic_search_common::{
-    execute_command, Command, CommandContext, ElasticSearchResponse, ParseError,
-    ResultGeneratorFuture,
+    Command, CommandContext, ElasticSearchResponse, ParseError, ResultGeneratorFuture,
+    execute_command,
 };
 use crate::elastic_search_datetime_parser;
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::elastic_search_responses::{
-    compare_query_result_hits_desc, AggregationResult, AverageAggregationResult,
-    FilterAggregationResult, QueryFailure, QueryResults, TermAggregationBucket,
-    TermAggregationResult,
+    AggregationResult, AverageAggregationResult, CardinalityAggregationResult,
+    FilterAggregationResult, HistogramAggregationBucket, HistogramAggregationResult, QueryFailure,
+    QueryResults, TermAggregationBucket, TermAggregationResult, compare_query_result_hits_desc,
 };
 use crate::peers::{
     CheckpointDescriptor, PrivateInvocation, PrivateSearchAggregationFilterSpec,
@@ -307,14 +307,11 @@ fn aggregation_legacy_path_reason(plan: &search_plan::AggregationPlan) -> Option
             "Missing aggregation `{}` currently uses the legacy SQL fanout path.",
             plan.name
         )),
-        search_plan::AggregationPlanSpec::DateHistogram(_) => Some(format!(
-            "Date histogram aggregation `{}` currently uses the legacy SQL fanout path.",
-            plan.name
-        )),
-        search_plan::AggregationPlanSpec::Cardinality(_) => Some(format!(
-            "Cardinality aggregation `{}` currently uses the legacy SQL fanout path.",
-            plan.name
-        )),
+        search_plan::AggregationPlanSpec::DateHistogram(histogram_plan) => histogram_plan
+            .sub_aggregations
+            .iter()
+            .find_map(aggregation_legacy_path_reason),
+        search_plan::AggregationPlanSpec::Cardinality(_) => None,
         search_plan::AggregationPlanSpec::Range(_) => Some(format!(
             "Range aggregation `{}` currently uses the legacy SQL fanout path.",
             plan.name
@@ -816,6 +813,22 @@ fn private_search_aggregation_spec(
                 field: avg_plan.field.clone(),
             })
         }
+        search_plan::AggregationPlanSpec::Cardinality(cardinality_plan) => {
+            Some(PrivateSearchAggregationSpec::Cardinality {
+                name: plan.name.clone(),
+                field: cardinality_plan.field.clone(),
+            })
+        }
+        search_plan::AggregationPlanSpec::DateHistogram(histogram_plan) => {
+            Some(PrivateSearchAggregationSpec::DateHistogram {
+                name: plan.name.clone(),
+                field: histogram_plan.field.clone(),
+                fixed_interval: histogram_plan.fixed_interval.clone(),
+                sub_aggregations: private_search_aggregation_specs(
+                    &histogram_plan.sub_aggregations,
+                )?,
+            })
+        }
         search_plan::AggregationPlanSpec::Filter(filter_plan) => {
             Some(PrivateSearchAggregationSpec::Filter {
                 name: plan.name.clone(),
@@ -874,6 +887,8 @@ fn typed_aggregation_name(spec: &PrivateSearchAggregationSpec) -> String {
     match spec {
         PrivateSearchAggregationSpec::Terms { name, .. } => name.clone(),
         PrivateSearchAggregationSpec::Average { name, .. } => name.clone(),
+        PrivateSearchAggregationSpec::Cardinality { name, .. } => name.clone(),
+        PrivateSearchAggregationSpec::DateHistogram { name, .. } => name.clone(),
         PrivateSearchAggregationSpec::Filter { name, .. } => name.clone(),
     }
 }
@@ -976,6 +991,8 @@ fn typed_aggregation_partial_name(partial: &PrivateSearchAggregationPartial) -> 
     match partial {
         PrivateSearchAggregationPartial::Terms { name, .. } => name.as_str(),
         PrivateSearchAggregationPartial::Average { name, .. } => name.as_str(),
+        PrivateSearchAggregationPartial::Cardinality { name, .. } => name.as_str(),
+        PrivateSearchAggregationPartial::DateHistogram { name, .. } => name.as_str(),
         PrivateSearchAggregationPartial::Filter { name, .. } => name.as_str(),
     }
 }
@@ -1033,6 +1050,57 @@ fn merge_typed_aggregation_partial(
                     merge_typed_aggregation_partials(vec![], sub_aggregations)
                 },
             })
+        }
+        PrivateSearchAggregationSpec::Cardinality { .. } => {
+            let value = partials
+                .iter()
+                .flat_map(|partial| match partial {
+                    PrivateSearchAggregationPartial::Cardinality { values, .. } => values.clone(),
+                    _ => vec![],
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .len() as u64;
+            AggregationResult::Cardinality(CardinalityAggregationResult {
+                value,
+                aggs: Default::default(),
+            })
+        }
+        PrivateSearchAggregationSpec::DateHistogram {
+            sub_aggregations, ..
+        } => {
+            let mut merged_buckets = std::collections::BTreeMap::<
+                i64,
+                (String, u64, Vec<Vec<PrivateSearchAggregationPartial>>),
+            >::new();
+            for partial in partials.iter() {
+                if let PrivateSearchAggregationPartial::DateHistogram { buckets, .. } = partial {
+                    for bucket in buckets.iter() {
+                        let entry = merged_buckets
+                            .entry(bucket.key)
+                            .or_insert_with(|| (bucket.key_as_string.clone(), 0, vec![]));
+                        entry.1 += bucket.doc_count;
+                        entry.2.push(bucket.sub_aggregations.clone());
+                    }
+                }
+            }
+
+            let buckets = merged_buckets
+                .into_iter()
+                .map(|(key, (key_as_string, doc_count, sub_partials_by_node))| {
+                    HistogramAggregationBucket {
+                        key,
+                        key_as_string,
+                        doc_count,
+                        aggs: if sub_aggregations.is_empty() {
+                            Default::default()
+                        } else {
+                            merge_typed_aggregation_partials(sub_partials_by_node, sub_aggregations)
+                        },
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            AggregationResult::Histogram(HistogramAggregationResult { buckets })
         }
         PrivateSearchAggregationSpec::Average { .. } => {
             let (sum, count) =
@@ -1268,6 +1336,22 @@ mod tests {
     }
 
     #[test]
+    fn test_multi_match_query_uses_typed_node_merge_path() {
+        let command = parse_search_command(
+            r#"{
+  "query": {
+    "multi_match": {
+      "query": "login",
+      "fields": ["message", "message.keyword"]
+    }
+  }
+}"#,
+        );
+
+        assert!(command.supports_typed_node_merge());
+    }
+
+    #[test]
     fn test_range_query_uses_typed_node_merge_path() {
         let command = parse_search_command(
             r#"{
@@ -1363,6 +1447,41 @@ mod tests {
       "filter": { "term": { "type": "tshirt" } },
       "aggs": {
         "avg_price": { "avg": { "field": "price" } }
+      }
+    }
+  }
+}"#,
+        );
+
+        assert!(command.supports_typed_node_merge());
+    }
+
+    #[test]
+    fn test_cardinality_aggregation_uses_typed_node_merge_path() {
+        let command = parse_search_command(
+            r#"{
+  "aggs": {
+    "distinct_messages": {
+      "cardinality": {
+        "field": "message"
+      }
+    }
+  }
+}"#,
+        );
+
+        assert!(command.supports_typed_node_merge());
+    }
+
+    #[test]
+    fn test_date_histogram_aggregation_uses_typed_node_merge_path() {
+        let command = parse_search_command(
+            r#"{
+  "aggs": {
+    "per_day": {
+      "date_histogram": {
+        "field": "@timestamp",
+        "fixed_interval": "1d"
       }
     }
   }

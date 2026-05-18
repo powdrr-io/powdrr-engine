@@ -1,12 +1,17 @@
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
+use chrono::{DateTime, SecondsFormat, Utc};
 use datafusion::arrow::array::RecordBatch;
 use datafusion::error::DataFusionError;
-use futures_util::future::try_join_all;
 use futures_util::StreamExt;
+use futures_util::future::try_join_all;
 use idgenerator::IdInstance;
 use prost::Message;
-use std::{error::Error, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+};
 
 use crate::data_access::{self, load_file_as_table};
 use crate::data_contract::{
@@ -14,12 +19,13 @@ use crate::data_contract::{
     TableMetadataCheckpoint,
 };
 use crate::elastic_search_index::create_index_inner;
-use crate::elastic_search_responses::{compare_query_result_hits_desc, QueryResultHit};
+use crate::elastic_search_responses::{QueryResultHit, compare_query_result_hits_desc};
 use crate::peers::{
     CheckpointDescriptor, PrivateCompactionInvocation, PrivateExtensionInvocation,
     PrivatePrefetchInvocation, PrivateSearchAggregationFilterSpec, PrivateSearchAggregationPartial,
-    PrivateSearchAggregationSpec, PrivateSearchInvocation, PrivateSearchResult,
-    PrivateSearchSortSpec, PrivateSearchTermsBucketPartial, PrivateSqlInvocation,
+    PrivateSearchAggregationSpec, PrivateSearchHistogramBucketPartial, PrivateSearchInvocation,
+    PrivateSearchResult, PrivateSearchSortSpec, PrivateSearchTermsBucketPartial,
+    PrivateSqlInvocation,
 };
 use crate::prefetch::warm_iceberg_checkpoints;
 use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema, SqlQuery};
@@ -742,9 +748,11 @@ mod tests {
         let error =
             get_extension_files(&vec!["es".to_string()], &checkpoint, &file_path).unwrap_err();
 
-        assert!(error
-            .message
-            .contains("missing published metadata for required extension es"));
+        assert!(
+            error
+                .message
+                .contains("missing published metadata for required extension es")
+        );
     }
 }
 
@@ -852,6 +860,59 @@ fn compute_search_aggregation_partial(
                 count,
             }
         }
+        PrivateSearchAggregationSpec::Cardinality { name, field } => {
+            let values = rows
+                .iter()
+                .filter_map(|row| extract_term_key(row, field))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            PrivateSearchAggregationPartial::Cardinality {
+                name: name.clone(),
+                values,
+            }
+        }
+        PrivateSearchAggregationSpec::DateHistogram {
+            name,
+            field,
+            fixed_interval,
+            sub_aggregations,
+        } => {
+            let Some(interval_ms) = parse_fixed_interval_millis(fixed_interval) else {
+                return PrivateSearchAggregationPartial::DateHistogram {
+                    name: name.clone(),
+                    buckets: vec![],
+                };
+            };
+
+            let mut buckets = BTreeMap::<i64, Vec<serde_json::Value>>::new();
+            for row in rows.iter() {
+                if let Some(timestamp_ms) = extract_timestamp_millis(row, field) {
+                    let bucket_key = timestamp_ms - timestamp_ms.rem_euclid(interval_ms);
+                    buckets.entry(bucket_key).or_default().push(row.clone());
+                }
+            }
+
+            let buckets = buckets
+                .into_iter()
+                .map(
+                    |(bucket_key, bucket_rows)| PrivateSearchHistogramBucketPartial {
+                        key: bucket_key,
+                        key_as_string: timestamp_millis_to_key_as_string(bucket_key),
+                        doc_count: bucket_rows.len() as u64,
+                        sub_aggregations: compute_search_aggregation_partials(
+                            &bucket_rows,
+                            sub_aggregations,
+                        ),
+                    },
+                )
+                .collect::<Vec<_>>();
+
+            PrivateSearchAggregationPartial::DateHistogram {
+                name: name.clone(),
+                buckets,
+            }
+        }
         PrivateSearchAggregationSpec::Terms {
             name,
             field,
@@ -929,6 +990,43 @@ fn extract_numeric_field(row: &serde_json::Value, field: &str) -> Option<f64> {
         .as_f64()
         .or_else(|| value.as_i64().map(|numeric| numeric as f64))
         .or_else(|| value.as_u64().map(|numeric| numeric as f64))
+}
+
+fn extract_timestamp_millis(row: &serde_json::Value, field: &str) -> Option<i64> {
+    let value = row.get(field)?;
+    if let Some(timestamp_ms) = value.as_i64() {
+        return Some(timestamp_ms);
+    }
+    if let Some(timestamp_ms) = value.as_u64() {
+        return i64::try_from(timestamp_ms).ok();
+    }
+    let timestamp = value.as_str()?;
+    DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .map(|datetime| datetime.with_timezone(&Utc).timestamp_millis())
+}
+
+fn parse_fixed_interval_millis(interval: &str) -> Option<i64> {
+    if interval.len() < 2 {
+        return None;
+    }
+    let (value, unit) = interval.split_at(interval.len() - 1);
+    let quantity = value.parse::<i64>().ok()?;
+    let multiplier = match unit {
+        "s" => 1_000,
+        "m" => 60 * 1_000,
+        "h" => 60 * 60 * 1_000,
+        "d" => 24 * 60 * 60 * 1_000,
+        "w" => 7 * 24 * 60 * 60 * 1_000,
+        _ => return None,
+    };
+    quantity.checked_mul(multiplier)
+}
+
+fn timestamp_millis_to_key_as_string(timestamp_ms: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(timestamp_ms)
+        .unwrap()
+        .to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 fn extract_term_key(row: &serde_json::Value, field: &str) -> Option<String> {

@@ -118,22 +118,23 @@ impl QueryResultHit {
             .get("_seq_no")
             .and_then(|value| value.as_u64())
             .unwrap_or_default();
-        let source_value = if let Some(source) = value_map.get("_source").and_then(|value| value.as_str()) {
-            // TODO: we are parsing the string into a value just to put it an object
-            // that will get serialized out again. That is lame. If we can get the serializer
-            // to look at a string but put it in like it is a Value, that would be better.
-            serde_json::from_str(source).unwrap()
-        } else if let Some(source) = value_map.get("_source") {
-            source.clone()
-        } else {
-            let mut source_map = value_map.clone();
-            source_map.remove("_id");
-            source_map.remove("_version");
-            source_map.remove("_seq_no");
-            source_map.remove("_source");
-            source_map.remove("score");
-            Value::Object(source_map)
-        };
+        let source_value =
+            if let Some(source) = value_map.get("_source").and_then(|value| value.as_str()) {
+                // TODO: we are parsing the string into a value just to put it an object
+                // that will get serialized out again. That is lame. If we can get the serializer
+                // to look at a string but put it in like it is a Value, that would be better.
+                serde_json::from_str(source).unwrap()
+            } else if let Some(source) = value_map.get("_source") {
+                source.clone()
+            } else {
+                let mut source_map = value_map.clone();
+                source_map.remove("_id");
+                source_map.remove("_version");
+                source_map.remove("_seq_no");
+                source_map.remove("_source");
+                source_map.remove("score");
+                Value::Object(source_map)
+            };
         QueryResultHit {
             _index: index.clone(),
             _id: id,
@@ -233,12 +234,8 @@ pub(crate) struct RangeAggregationBucket {
 
 #[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct HistogramAggregationBucket {
-    // TODO: this may not be correct
-    pub key: String,
-    pub from: u64,
-    pub from_as_string: String,
-    pub to: u64,
-    pub to_as_string: String,
+    pub key: i64,
+    pub key_as_string: String,
     pub doc_count: u64,
     #[serde(flatten)]
     pub aggs: HashMap<String, AggregationResult>,
@@ -467,7 +464,7 @@ impl UpdateByQuerySuccess {
 
 #[cfg(test)]
 mod tests {
-    use super::{compare_query_result_hits_desc, QueryResultHit};
+    use super::{QueryResultHit, compare_query_result_hits_desc};
     use serde_json::json;
 
     #[test]
