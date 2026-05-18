@@ -201,8 +201,6 @@ If you want a local query loop without running the HTTP engine, `powdrr-cli`
 can mirror Parquet files into a local cache and query them with the existing
 Elasticsearch JSON query path.
 
-Build a local cache:
-
 ```bash
 scripts/cargo-worktree.sh run -p powdrr-cli -- elastic build \
   --source /path/to/parquet-dir \
@@ -226,6 +224,33 @@ scripts/cargo-worktree.sh run -p powdrr-cli -- elastic query \
   --cache-dir /tmp/powdrr-search \
   --body '{"query":{"match":{"message":"failed"}}}'
 ```
+
+Current constraints:
+
+- the source data must expose a stable document id column
+- pass that column with `--doc-id-field` unless it is already `_id_seq_no`
+- for `s3://...` sources, the build step mirrors the source objects into the
+  local cache before query execution
+
+## Experimental Mongo Wire Listener
+
+The repo also contains an experimental MongoDB wire listener on top of the
+shared serving path.
+
+Start the engine with the Mongo listener enabled:
+
+```bash
+PORT=9200 MONGO_PORT=27017 scripts/cargo-worktree.sh run -p powdrr-io-engine --release
+```
+
+Current scope:
+
+- read-only
+- direct-connection clients
+- no auth
+- backed by tables with explicit `PUT /:table/_mongo/config`
+- intended for `hello`, `ping`, discovery, `find`, `getMore`, and
+  `killCursors`
 
 ## Useful Validation Commands
 
