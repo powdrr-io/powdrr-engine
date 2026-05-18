@@ -16,6 +16,7 @@ use datafusion::{
     error::DataFusionError,
     prelude::{DataFrame, ParquetReadOptions, SessionContext},
 };
+use futures::stream::{self, StreamExt};
 use futures_util::TryStreamExt;
 use iceberg::Catalog;
 use iceberg::arrow::ArrowFileReader;
@@ -42,9 +43,9 @@ use parquet_55::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet_55::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
 use parquet_55::file::statistics::Statistics;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::string::ToString;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use std::{path::Path, sync::Arc};
 #[cfg(target_os = "linux")]
@@ -59,6 +60,106 @@ const DEFAULT_ICEBERG_ENDPOINT_VALUE: &str = "http://localhost:8181";
 const S3_ACCESS_KEY_ID_VALUE: &str = "admin";
 const S3_SECRET_ACCESS_KEY_VALUE: &str = "password";
 const S3_REGION_VALUE: &str = "us-east-1";
+const PARQUET_ROW_GROUP_STATS_CACHE_MAX_ENTRIES: usize = 2048;
+const ICEBERG_ROW_GROUP_STATS_LOAD_PARALLELISM_MAX: usize = 16;
+
+#[derive(Default)]
+struct ParquetRowGroupStatsCache {
+    entries: HashMap<String, Vec<IcebergRowGroupStats>>,
+    access_order: VecDeque<String>,
+    max_entries: usize,
+}
+
+impl ParquetRowGroupStatsCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            access_order: VecDeque::new(),
+            max_entries,
+        }
+    }
+
+    fn get(&mut self, file_path: &str) -> Option<Vec<IcebergRowGroupStats>> {
+        let entry = self.entries.get(file_path).cloned()?;
+        self.touch(file_path);
+        Some(entry)
+    }
+
+    fn insert(&mut self, file_path: &str, row_groups: Vec<IcebergRowGroupStats>) {
+        self.entries.insert(file_path.to_string(), row_groups);
+        self.touch(file_path);
+        self.evict_if_needed();
+    }
+
+    fn remove(&mut self, file_path: &str) {
+        self.entries.remove(file_path);
+        self.access_order.retain(|existing| existing != file_path);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.access_order.clear();
+    }
+
+    fn touch(&mut self, file_path: &str) {
+        self.access_order.retain(|existing| existing != file_path);
+        self.access_order.push_back(file_path.to_string());
+    }
+
+    fn evict_if_needed(&mut self) {
+        while self.entries.len() > self.max_entries {
+            let Some(oldest) = self.access_order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+}
+
+static PARQUET_ROW_GROUP_STATS_CACHE: LazyLock<Mutex<ParquetRowGroupStatsCache>> =
+    LazyLock::new(|| {
+        Mutex::new(ParquetRowGroupStatsCache::new(
+            PARQUET_ROW_GROUP_STATS_CACHE_MAX_ENTRIES,
+        ))
+    });
+
+fn get_cached_parquet_row_group_stats(file_path: &str) -> Option<Vec<IcebergRowGroupStats>> {
+    PARQUET_ROW_GROUP_STATS_CACHE
+        .lock()
+        .unwrap()
+        .get(file_path)
+}
+
+fn cache_parquet_row_group_stats(file_path: &str, row_groups: &[IcebergRowGroupStats]) {
+    PARQUET_ROW_GROUP_STATS_CACHE
+        .lock()
+        .unwrap()
+        .insert(file_path, row_groups.to_vec());
+}
+
+fn invalidate_parquet_row_group_stats(file_path: &str) {
+    PARQUET_ROW_GROUP_STATS_CACHE
+        .lock()
+        .unwrap()
+        .remove(file_path);
+}
+
+fn clear_parquet_row_group_stats_cache() {
+    PARQUET_ROW_GROUP_STATS_CACHE.lock().unwrap().clear();
+}
+
+#[derive(Clone)]
+struct PendingIcebergFileStats {
+    file_path: String,
+    record_count: Option<u64>,
+    columns: Vec<IcebergColumnStats>,
+}
+
+fn iceberg_row_group_stats_load_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().clamp(4, ICEBERG_ROW_GROUP_STATS_LOAD_PARALLELISM_MAX))
+        .unwrap_or(8)
+}
 
 /// This code is lifted from the 'threadpool' example in the Datafusion repo.
 /// It is slightly modified to use the main Tokio runtime for CPU bound tasks
@@ -461,6 +562,7 @@ impl CacheTrackerActor {
                 self.related.clear();
                 self.lru_cache.clear();
                 self.top_level_to_delete.clear();
+                clear_parquet_row_group_stats_cache();
                 let _ = respond_to.send(());
             }
             CacheTrackerActorMessage::Reserve {
@@ -705,6 +807,7 @@ impl CacheTrackerActor {
                         Ok(_) => (),
                         Err(e) => panic!("Failed to delete file {}: {}", file_path, e),
                     }
+                    invalidate_parquet_row_group_stats(&file_path);
                 }
                 respond_to.send(()).expect("Failed to send response");
             }
@@ -1775,7 +1878,8 @@ async fn load_iceberg_file_stats(
     let manifest_list = current_snapshot
         .load_manifest_list(table.file_io(), table.metadata())
         .await?;
-    let mut file_stats = HashMap::new();
+    let current_schema = table.metadata().current_schema().clone();
+    let mut pending_file_stats = vec![];
 
     for manifest_file in manifest_list.entries().iter() {
         if manifest_file.content != ManifestContentType::Data {
@@ -1790,39 +1894,45 @@ async fn load_iceberg_file_stats(
             }
 
             let data_file = manifest_entry.data_file();
-            let row_groups = match load_parquet_row_group_stats(
-                table,
-                data_file.file_path(),
-                table.metadata().current_schema(),
-            )
-            .await
-            {
-                Ok(row_groups) => row_groups,
-                Err(error) => {
-                    tracing::warn!(
-                        "Unable to load parquet row-group stats for {}: {}",
-                        data_file.file_path(),
-                        error
-                    );
-                    vec![]
-                }
-            };
-            file_stats.insert(
-                data_file.file_path().to_string(),
-                IcebergFileStats {
-                    file_path: data_file.file_path().to_string(),
-                    record_count: Some(data_file.record_count()),
-                    columns: collect_iceberg_column_stats(
-                        data_file,
-                        table.metadata().current_schema(),
-                    ),
-                    row_groups,
-                },
-            );
+            pending_file_stats.push(PendingIcebergFileStats {
+                file_path: data_file.file_path().to_string(),
+                record_count: Some(data_file.record_count()),
+                columns: collect_iceberg_column_stats(data_file, &current_schema),
+            });
         }
     }
 
-    let mut file_stats = file_stats.into_values().collect::<Vec<_>>();
+    let concurrency = iceberg_row_group_stats_load_parallelism();
+    let mut file_stats = stream::iter(pending_file_stats.into_iter().map(|pending| {
+        let current_schema = current_schema.clone();
+        async move {
+            let row_groups =
+                match load_parquet_row_group_stats(table, &pending.file_path, &current_schema)
+                    .await
+                {
+                    Ok(row_groups) => row_groups,
+                    Err(error) => {
+                        tracing::warn!(
+                            "Unable to load parquet row-group stats for {}: {}",
+                            pending.file_path,
+                            error
+                        );
+                        vec![]
+                    }
+                };
+
+            IcebergFileStats {
+                file_path: pending.file_path,
+                record_count: pending.record_count,
+                columns: pending.columns,
+                row_groups,
+            }
+        }
+    }))
+    .buffer_unordered(concurrency)
+    .collect::<Vec<_>>()
+    .await;
+
     file_stats.sort_by(|left, right| left.file_path.cmp(&right.file_path));
     Ok(file_stats)
 }
@@ -1875,6 +1985,10 @@ async fn load_parquet_row_group_stats(
     file_path: &str,
     schema: &iceberg::spec::Schema,
 ) -> Result<Vec<IcebergRowGroupStats>, iceberg::Error> {
+    if let Some(row_groups) = get_cached_parquet_row_group_stats(file_path) {
+        return Ok(row_groups);
+    }
+
     let input_file = table.file_io().new_input(file_path).map_err(|error| {
         iceberg::Error::new(
             iceberg::ErrorKind::Unexpected,
@@ -1907,7 +2021,7 @@ async fn load_parquet_row_group_stats(
             .with_source(error)
         })?;
 
-    Ok(metadata
+    let row_groups = metadata
         .metadata()
         .row_groups()
         .iter()
@@ -1915,7 +2029,10 @@ async fn load_parquet_row_group_stats(
         .map(|(row_group_index, row_group)| {
             collect_parquet_row_group_stats(row_group_index, row_group, schema)
         })
-        .collect())
+        .collect::<Vec<_>>();
+    cache_parquet_row_group_stats(file_path, &row_groups);
+
+    Ok(row_groups)
 }
 
 fn collect_parquet_row_group_stats(
@@ -2097,4 +2214,57 @@ pub(crate) async fn commit_iceberg_transaction(
 
 pub(crate) fn s3_ingest_base_path() -> String {
     format!("{}/default/ingest", S3_BASE_PATH)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ParquetRowGroupStatsCache;
+    use crate::data_contract::{IcebergColumnStats, IcebergRowGroupStats};
+    use serde_json::Value;
+
+    fn sample_row_group_stats(index: usize) -> Vec<IcebergRowGroupStats> {
+        vec![IcebergRowGroupStats {
+            row_group_index: index,
+            record_count: Some(10),
+            compressed_bytes: 128,
+            page_index_present: true,
+            bloom_filter_present: false,
+            columns: vec![IcebergColumnStats {
+                field_id: 1,
+                field_name: "ts".to_string(),
+                null_count: Some(0),
+                lower_bound: Some(Value::from(index as i64)),
+                upper_bound: Some(Value::from(index as i64 + 9)),
+            }],
+        }]
+    }
+
+    #[test]
+    fn parquet_row_group_stats_cache_keeps_recent_entries() {
+        let mut cache = ParquetRowGroupStatsCache::new(2);
+        cache.insert("s3://warehouse/a.parquet", sample_row_group_stats(1));
+        cache.insert("s3://warehouse/b.parquet", sample_row_group_stats(2));
+
+        assert!(cache.get("s3://warehouse/a.parquet").is_some());
+
+        cache.insert("s3://warehouse/c.parquet", sample_row_group_stats(3));
+
+        assert!(cache.get("s3://warehouse/a.parquet").is_some());
+        assert!(cache.get("s3://warehouse/b.parquet").is_none());
+        assert!(cache.get("s3://warehouse/c.parquet").is_some());
+    }
+
+    #[test]
+    fn parquet_row_group_stats_cache_remove_and_clear() {
+        let mut cache = ParquetRowGroupStatsCache::new(4);
+        cache.insert("s3://warehouse/a.parquet", sample_row_group_stats(1));
+        cache.insert("s3://warehouse/b.parquet", sample_row_group_stats(2));
+
+        cache.remove("s3://warehouse/a.parquet");
+        assert!(cache.get("s3://warehouse/a.parquet").is_none());
+        assert!(cache.get("s3://warehouse/b.parquet").is_some());
+
+        cache.clear();
+        assert!(cache.get("s3://warehouse/b.parquet").is_none());
+    }
 }
