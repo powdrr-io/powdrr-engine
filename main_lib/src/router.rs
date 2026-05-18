@@ -1,4 +1,4 @@
-use crate::compaction::{CompactionCommand, compact_logs};
+use crate::compaction::{compact_logs, CompactionCommand};
 use crate::dynamodb_protocol;
 use crate::elastic_search_endpoints::AliasPathExtractor;
 use crate::elastic_search_endpoints::NameAliasPathExtractor;
@@ -23,21 +23,21 @@ use crate::test_api::test_v1_process_work;
 use crate::test_api::test_v1_set_testing_mode;
 use crate::test_api::test_v1_set_testing_processing_mode;
 use crate::{elastic_search_endpoints, elastic_search_lifetime_policy, lakehouse_serving};
-use futures::TryFutureExt;
 use futures::future;
+use futures::TryFutureExt;
 use futures_util::future::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
 use gotham::hyper::StatusCode;
-use gotham::hyper::{Body, body};
+use gotham::hyper::{body, Body};
 use gotham::middleware::Middleware;
 use gotham::mime;
 use gotham::pipeline::new_pipeline;
 use gotham::pipeline::single_pipeline;
 use gotham::prelude::NewMiddleware;
 use gotham::prelude::StaticResponseExtender;
-use gotham::router::Router;
 use gotham::router::builder::*;
+use gotham::router::Router;
 use gotham::state::FromState;
 use gotham::state::State;
 use gotham::state::StateData;
@@ -671,13 +671,14 @@ pub(crate) mod tests {
     use std::{env, str};
 
     use crate::data_contract::{
-        CreateTable, FileSetPayload, IcebergMetadata, SpeedboatMetadata, TableMetadataCheckpoint,
+        CreateTable, FileSetPayload, IcebergFileStats, IcebergMetadata, SpeedboatMetadata,
+        TableMetadataCheckpoint,
     };
     use crate::elastic_search_responses::{QueryResultTotal, QueryResults};
     use crate::lakehouse_serving::ServingConfigResponse;
     use crate::router::router;
     use crate::schema_massager::{
-        PowdrrDataType, PowdrrField, PowdrrSchema, extract_powdrr_schema_str,
+        extract_powdrr_schema_str, PowdrrDataType, PowdrrField, PowdrrSchema,
     };
     use crate::serving_plan::ServingQueryClassification;
     use crate::state_provider::STATE_PROVIDER;
@@ -700,6 +701,7 @@ pub(crate) mod tests {
         LazyLock::new(|| TestServer::with_timeout(router(true), 1000).unwrap());
 
     fn set_testing_and_processing_mode(test_server: &TestServer) {
+        crate::mongodb_protocol::reset_mongodb_cursor_state_for_tests();
         test_server
             .client()
             .put(
@@ -771,7 +773,11 @@ pub(crate) mod tests {
                 ),
                 column_names: vec![],
                 column_stats: vec![],
-                file_stats: vec![],
+                file_stats: vec![IcebergFileStats {
+                    file_path: format!("file://{}", parquet_path.display()),
+                    record_count: Some(2),
+                    columns: vec![],
+                }],
             }),
             speedboat_metadata: None,
             deletes_metadata: None,
@@ -1089,6 +1095,25 @@ pub(crate) mod tests {
         assert_eq!(response_obj["helloOk"], json!(true));
         assert_eq!(response_obj["readOnly"], json!(true));
         assert_eq!(response_obj["maxWireVersion"], json!(21));
+
+        let build_info_response = perform_mongo_command(
+            test_server,
+            "admin",
+            json!({
+                "buildInfo": 1,
+                "$db": "admin"
+            }),
+        );
+
+        assert_eq!(build_info_response.status(), 200);
+        let build_info_obj: Value =
+            serde_json::from_str(&build_info_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(build_info_obj["ok"], json!(1.0));
+        assert_eq!(
+            build_info_obj["gitVersion"],
+            json!("powdrr-mongo-http-bridge")
+        );
+        assert_eq!(build_info_obj["bits"], json!(64));
     }
 
     #[test]
@@ -1153,6 +1178,26 @@ pub(crate) mod tests {
         assert!(!first_batch
             .iter()
             .any(|entry| entry["name"] == json!("other")));
+
+        let name_only_response = perform_mongo_command(
+            test_server,
+            database,
+            json!({
+                "listCollections": 1,
+                "nameOnly": true,
+                "filter": { "name": "alpha" },
+                "$db": database
+            }),
+        );
+
+        assert_eq!(name_only_response.status(), 200);
+        let name_only_obj: Value =
+            serde_json::from_str(&name_only_response.read_utf8_body().unwrap()).unwrap();
+        let filtered_batch = name_only_obj["cursor"]["firstBatch"].as_array().unwrap();
+        assert_eq!(filtered_batch.len(), 1);
+        assert_eq!(filtered_batch[0]["name"], json!("alpha"));
+        assert_eq!(filtered_batch[0]["type"], json!("collection"));
+        assert!(filtered_batch[0].get("options").is_none());
     }
 
     #[test]
@@ -1187,6 +1232,119 @@ pub(crate) mod tests {
         assert!(databases
             .iter()
             .any(|entry| entry["name"] == json!(database)));
+    }
+
+    #[test]
+    fn test_mongodb_command_list_indexes_returns_default_id_index() {
+        let test_server = &*TEST_SERVER;
+        let table_name = "mongo_list_indexes_table";
+        let database = "mongo_list_indexes_db";
+        let collection = "logs_indexes";
+
+        set_testing_and_processing_mode(test_server);
+        let _temp_dir = add_mongo_parquet_checkpoint(test_server, table_name);
+        put_mongo_lookup_serving_config(test_server, table_name);
+        put_mongo_config_with_options(test_server, table_name, database, collection, true);
+
+        let response = perform_mongo_command(
+            test_server,
+            database,
+            json!({
+                "listIndexes": collection,
+                "$db": database
+            }),
+        );
+
+        assert_eq!(response.status(), 200);
+        let response_obj: Value =
+            serde_json::from_str(&response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(
+            response_obj["cursor"]["ns"],
+            json!(format!("{}.$cmd.listIndexes.{}", database, collection))
+        );
+        let first_batch = response_obj["cursor"]["firstBatch"].as_array().unwrap();
+        assert_eq!(first_batch.len(), 1);
+        assert_eq!(first_batch[0]["name"], json!("_id_"));
+        assert_eq!(first_batch[0]["key"], json!({ "_id": 1 }));
+        assert_eq!(
+            first_batch[0]["ns"],
+            json!(format!("{}.{}", database, collection))
+        );
+    }
+
+    #[test]
+    fn test_mongodb_command_stats_use_collection_metadata() {
+        let test_server = &*TEST_SERVER;
+        let database = "mongo_stats_db";
+
+        set_testing_and_processing_mode(test_server);
+        let _alpha_dir = add_mongo_parquet_checkpoint(test_server, "mongo_stats_alpha_table");
+        let _beta_dir = add_mongo_parquet_checkpoint(test_server, "mongo_stats_beta_table");
+        let _other_dir = add_mongo_parquet_checkpoint(test_server, "mongo_stats_other_table");
+
+        put_mongo_lookup_serving_config(test_server, "mongo_stats_alpha_table");
+        put_mongo_lookup_serving_config(test_server, "mongo_stats_beta_table");
+        put_mongo_lookup_serving_config(test_server, "mongo_stats_other_table");
+
+        put_mongo_config_with_options(
+            test_server,
+            "mongo_stats_alpha_table",
+            database,
+            "alpha",
+            true,
+        );
+        put_mongo_config_with_options(
+            test_server,
+            "mongo_stats_beta_table",
+            database,
+            "beta",
+            true,
+        );
+        put_mongo_config_with_options(
+            test_server,
+            "mongo_stats_other_table",
+            "mongo_stats_other_db",
+            "other",
+            true,
+        );
+
+        let coll_stats_response = perform_mongo_command(
+            test_server,
+            database,
+            json!({
+                "collStats": "alpha",
+                "$db": database
+            }),
+        );
+
+        assert_eq!(coll_stats_response.status(), 200);
+        let coll_stats_obj: Value =
+            serde_json::from_str(&coll_stats_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(coll_stats_obj["ns"], json!(format!("{}.alpha", database)));
+        assert_eq!(coll_stats_obj["count"], json!(2));
+        assert_eq!(coll_stats_obj["nindexes"], json!(1));
+        assert_eq!(coll_stats_obj["indexSizes"], json!({ "_id_": 0 }));
+        assert!(coll_stats_obj["storageSize"].as_u64().unwrap() > 0);
+        assert!(coll_stats_obj["avgObjSize"].as_f64().unwrap() > 0.0);
+
+        let db_stats_response = perform_mongo_command(
+            test_server,
+            database,
+            json!({
+                "dbStats": 1,
+                "$db": database
+            }),
+        );
+
+        assert_eq!(db_stats_response.status(), 200);
+        let db_stats_obj: Value =
+            serde_json::from_str(&db_stats_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(db_stats_obj["db"], json!(database));
+        assert_eq!(db_stats_obj["collections"], json!(2));
+        assert_eq!(db_stats_obj["objects"], json!(4));
+        assert_eq!(db_stats_obj["indexes"], json!(2));
+        assert!(db_stats_obj["storageSize"].as_u64().unwrap() > 0);
+        assert!(db_stats_obj["avgObjSize"].as_f64().unwrap() > 0.0);
     }
 
     #[test]
@@ -1317,6 +1475,125 @@ pub(crate) mod tests {
             serde_json::from_str(&kill_response.read_utf8_body().unwrap()).unwrap();
         assert_eq!(kill_obj["cursorsKilled"], json!([kill_cursor_id]));
         assert_eq!(kill_obj["cursorsNotFound"], json!([]));
+
+        let expiry_table = "mongo_logs_cursor_expiry";
+        let expiry_database = "mongo_cursor_expiry_db";
+        let expiry_collection = "logs_cursor_expiry";
+        let expiry_base_time_ms = 1_000_000;
+
+        set_testing_and_processing_mode(test_server);
+        crate::mongodb_protocol::set_mongodb_cursor_time_for_tests(Some(expiry_base_time_ms));
+        let _expiry_temp_dir = add_mongo_parquet_checkpoint(test_server, expiry_table);
+        put_mongo_cursor_serving_config(test_server, expiry_table);
+        put_mongo_config_with_options(
+            test_server,
+            expiry_table,
+            expiry_database,
+            expiry_collection,
+            true,
+        );
+
+        let expiry_find_response = perform_mongo_command(
+            test_server,
+            expiry_database,
+            json!({
+                "find": expiry_collection,
+                "sort": { "message": 1 },
+                "projection": { "message": 1 },
+                "limit": 2,
+                "batchSize": 1,
+                "$db": expiry_database
+            }),
+        );
+        let expiry_find_obj: Value =
+            serde_json::from_str(&expiry_find_response.read_utf8_body().unwrap()).unwrap();
+        let expiry_cursor_id = expiry_find_obj["cursor"]["id"].as_i64().unwrap();
+        assert!(expiry_cursor_id > 0);
+
+        crate::mongodb_protocol::set_mongodb_cursor_time_for_tests(Some(
+            expiry_base_time_ms
+                + crate::mongodb_protocol::mongodb_cursor_timeout_ms_for_tests()
+                + 1,
+        ));
+
+        let expiry_get_more_response = perform_mongo_command(
+            test_server,
+            expiry_database,
+            json!({
+                "getMore": expiry_cursor_id,
+                "collection": expiry_collection,
+                "$db": expiry_database
+            }),
+        );
+        assert_eq!(expiry_get_more_response.status(), 404);
+        let expiry_get_more_obj: Value =
+            serde_json::from_str(&expiry_get_more_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(expiry_get_more_obj["ok"], json!(0.0));
+        assert_eq!(expiry_get_more_obj["code"], json!(43));
+        assert_eq!(expiry_get_more_obj["codeName"], json!("CursorNotFound"));
+
+        let no_timeout_table = "mongo_logs_cursor_no_timeout";
+        let no_timeout_database = "mongo_cursor_no_timeout_db";
+        let no_timeout_collection = "logs_cursor_no_timeout";
+        let no_timeout_base_time_ms = 2_000_000;
+
+        set_testing_and_processing_mode(test_server);
+        crate::mongodb_protocol::set_mongodb_cursor_time_for_tests(Some(no_timeout_base_time_ms));
+        let _no_timeout_temp_dir = add_mongo_parquet_checkpoint(test_server, no_timeout_table);
+        put_mongo_cursor_serving_config(test_server, no_timeout_table);
+        put_mongo_config_with_options(
+            test_server,
+            no_timeout_table,
+            no_timeout_database,
+            no_timeout_collection,
+            true,
+        );
+
+        let no_timeout_find_response = perform_mongo_command(
+            test_server,
+            no_timeout_database,
+            json!({
+                "find": no_timeout_collection,
+                "sort": { "message": 1 },
+                "projection": { "message": 1 },
+                "limit": 2,
+                "batchSize": 1,
+                "noCursorTimeout": true,
+                "$db": no_timeout_database
+            }),
+        );
+        let no_timeout_find_obj: Value =
+            serde_json::from_str(&no_timeout_find_response.read_utf8_body().unwrap()).unwrap();
+        let no_timeout_cursor_id = no_timeout_find_obj["cursor"]["id"].as_i64().unwrap();
+        assert!(no_timeout_cursor_id > 0);
+
+        crate::mongodb_protocol::set_mongodb_cursor_time_for_tests(Some(
+            no_timeout_base_time_ms
+                + crate::mongodb_protocol::mongodb_cursor_timeout_ms_for_tests()
+                + 1,
+        ));
+
+        let no_timeout_get_more_response = perform_mongo_command(
+            test_server,
+            no_timeout_database,
+            json!({
+                "getMore": no_timeout_cursor_id,
+                "collection": no_timeout_collection,
+                "$db": no_timeout_database
+            }),
+        );
+        assert_eq!(no_timeout_get_more_response.status(), 200);
+        let no_timeout_get_more_obj: Value =
+            serde_json::from_str(&no_timeout_get_more_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(no_timeout_get_more_obj["cursor"]["id"], json!(0));
+        let no_timeout_next_batch = no_timeout_get_more_obj["cursor"]["nextBatch"]
+            .as_array()
+            .unwrap();
+        assert_eq!(no_timeout_next_batch.len(), 1);
+        assert_eq!(
+            no_timeout_next_batch[0]["message"],
+            json!("Login successful")
+        );
     }
 
     #[test]
@@ -1863,11 +2140,9 @@ pub(crate) mod tests {
             get_named_aliases_json["logs_archive"]["aliases"]["logs_alias"],
             json!({})
         );
-        assert!(
-            get_named_aliases_json["logs"]["aliases"]
-                .get("logs_secondary")
-                .is_none()
-        );
+        assert!(get_named_aliases_json["logs"]["aliases"]
+            .get("logs_secondary")
+            .is_none());
 
         let get_index_named_alias_response = test_server
             .client()
