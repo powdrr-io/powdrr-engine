@@ -22,6 +22,7 @@ use crate::peers::{
     PrivateSearchSortSpec, PrivateSearchTermsBucketPartial, PrivateSqlInvocation,
 };
 use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema, SqlQuery};
+use crate::search_executor::typed_sort_projection_name;
 use crate::search_runtime::batches_to_serde_value;
 use crate::state_provider::*;
 use crate::util::log_err;
@@ -582,13 +583,47 @@ fn search_sort_values_for_row(
                         .map(serde_json::Value::from)
                         .unwrap_or(serde_json::Value::Null)
                 } else {
-                    row.get(&sort.field)
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null)
+                    sort_value_for_field(row, &sort.field)
                 }
             })
             .collect(),
     )
+}
+
+fn sort_value_for_field(row: &serde_json::Value, field: &str) -> serde_json::Value {
+    let value_map = row.as_object().unwrap();
+    let projection_name = typed_sort_projection_name(field);
+    if let Some(value) = value_map.get(&projection_name) {
+        return value.clone();
+    }
+    if let Some(value) = value_map.get(field) {
+        return value.clone();
+    }
+
+    value_map
+        .get("_source")
+        .and_then(|source| sort_value_from_source(source, field))
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn sort_value_from_source(source: &serde_json::Value, field: &str) -> Option<serde_json::Value> {
+    let parsed_source = match source {
+        serde_json::Value::String(source) => {
+            serde_json::from_str::<serde_json::Value>(source).ok()?
+        }
+        other => other.clone(),
+    };
+
+    if let Some(value) = parsed_source.get(field) {
+        return Some(value.clone());
+    }
+
+    let mut current = &parsed_source;
+    for segment in field.split('.') {
+        current = current.get(segment)?;
+    }
+
+    Some(current.clone())
 }
 
 fn compare_query_result_hits_by_sort(

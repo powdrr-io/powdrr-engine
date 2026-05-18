@@ -575,6 +575,10 @@ pub fn router(include_test_apis: bool) -> Router {
             .with_path_extractor::<NameIdPathExtractor>()
             .to(elastic_search_endpoints::es_get_with_id);
         route
+            .head("/:name/_doc/:id")
+            .with_path_extractor::<NameIdPathExtractor>()
+            .to(elastic_search_endpoints::es_head_with_id);
+        route
             .delete("/:name/_doc/:id")
             .with_path_extractor::<NameIdPathExtractor>()
             .to(elastic_search_endpoints::es_delete_with_id);
@@ -1888,7 +1892,7 @@ pub(crate) mod tests {
                 serde_json::to_string(&TestProcessingMode {
                     state_mode: StateMode::Testing,
                     storage_mode: StorageMode::default(),
-                    cache_mode: CacheMode::Redis(None),
+                    cache_mode: CacheMode::Native,
                     peer_mode: PeerMode::SelfOnly,
                     indexing_mode: IndexingMode::Sync,
                     compaction_mode: CompactionMode::Disabled,
@@ -1965,6 +1969,37 @@ pub(crate) mod tests {
             }),
         )
         .unwrap();
+        futures::executor::block_on(
+            STATE_PROVIDER.upsert_table_metadata(&CreateTable {
+                name: "events_extra".to_string(),
+                tags: HashMap::from([(
+                    "_es_original".to_string(),
+                    json!({
+                        "mappings": {
+                            "properties": {
+                                "message": {
+                                    "type": "text"
+                                },
+                                "index_col": {
+                                    "type": "long"
+                                }
+                            }
+                        },
+                        "settings": {
+                            "index": {
+                                "number_of_shards": 1,
+                                "number_of_replicas": 0
+                            }
+                        }
+                    })
+                    .to_string(),
+                )]),
+                serving: None,
+                dynamodb: None,
+                mongodb: None,
+            }),
+        )
+        .unwrap();
 
         let checkpoint = TableMetadataCheckpoint {
             table_name: "logs".to_string(),
@@ -1991,6 +2026,36 @@ pub(crate) mod tests {
             .post(
                 "http://localhost/_test/v1/_add_checkpoint",
                 serde_json::to_string(&checkpoint).unwrap(),
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        let events_extra_checkpoint = TableMetadataCheckpoint {
+            table_name: "events_extra".to_string(),
+            original_checkpoint_id: None,
+            checkpoint_id: "events_extra_checkpoint_0".to_string(),
+            iceberg_metadata: None,
+            speedboat_metadata: Some(SpeedboatMetadata {
+                files: FileSetPayload::single(
+                    format!(
+                        "file://{}/tests/data/events_extra.json",
+                        env::current_dir().unwrap().to_str().unwrap()
+                    ),
+                    include_str!("../tests/data/events_extra.json").len() as u64,
+                    extract_powdrr_schema_str(include_str!("../tests/data/events_extra.json")),
+                ),
+            }),
+            deletes_metadata: None,
+            extension_metadata: HashMap::new(),
+            schema: PowdrrSchema::minimal(),
+        };
+
+        test_server
+            .client()
+            .post(
+                "http://localhost/_test/v1/_add_checkpoint",
+                serde_json::to_string(&events_extra_checkpoint).unwrap(),
                 mime::APPLICATION_JSON,
             )
             .perform()
@@ -2060,6 +2125,24 @@ pub(crate) mod tests {
         assert_eq!(
             get_settings_json["logs"]["settings"]["index"]["number_of_shards"],
             "2"
+        );
+
+        let get_wildcard_index_response = test_server
+            .client()
+            .get("http://localhost/logs*/_mapping")
+            .perform()
+            .unwrap();
+        assert_eq!(get_wildcard_index_response.status(), 200);
+        let get_wildcard_index_json: Value =
+            serde_json::from_str(&get_wildcard_index_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(
+            get_wildcard_index_json
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["logs".to_string(), "logs_archive".to_string()]
         );
 
         let cluster_health_response = test_server
@@ -2278,6 +2361,31 @@ pub(crate) mod tests {
             serde_json::from_str(&get_count_response.read_utf8_body().unwrap()).unwrap();
         assert_eq!(get_count_json["count"], 6);
 
+        let wildcard_count_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs,does-not-exist/_count?ignore_unavailable=true",
+                "{}",
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(wildcard_count_response.status(), 200);
+        let wildcard_count_json: Value =
+            serde_json::from_str(&wildcard_count_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(wildcard_count_json["count"], 6);
+
+        let missing_target_count_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs,does-not-exist/_count",
+                "{}",
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(missing_target_count_response.status(), 404);
+
         let filtered_count_response = test_server
             .client()
             .post(
@@ -2300,6 +2408,46 @@ pub(crate) mod tests {
             serde_json::from_str(&filtered_count_response.read_utf8_body().unwrap()).unwrap();
         assert_eq!(filtered_count_json["count"], 4);
 
+        let terms_query_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs/_search",
+                r#"{
+                  "query": {
+                    "terms": {
+                      "index_col": [2, 5]
+                    }
+                  }
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(terms_query_response.status(), 200);
+        let terms_query_json: Value =
+            serde_json::from_str(&terms_query_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(terms_query_json["hits"]["total"]["value"], 2);
+
+        let ids_query_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs/_search",
+                r#"{
+                  "query": {
+                    "ids": {
+                      "values": ["2", "5"]
+                    }
+                  }
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(ids_query_response.status(), 200);
+        let ids_query_json: Value =
+            serde_json::from_str(&ids_query_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(ids_query_json["hits"]["total"]["value"], 2);
+
         let mget_table_response = test_server
             .client()
             .post(
@@ -2321,6 +2469,28 @@ pub(crate) mod tests {
             "Login attempt failed"
         );
         assert_eq!(mget_table_json["docs"][1]["found"], false);
+
+        let mget_alias_response = test_server
+            .client()
+            .post(
+                "http://localhost/_mget",
+                r#"{
+                  "docs": [
+                    {"_index": "logs_secondary", "_id": "2"}
+                  ]
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(mget_alias_response.status(), 200);
+        let mget_alias_json: Value =
+            serde_json::from_str(&mget_alias_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(mget_alias_json["docs"][0]["found"], true);
+        assert_eq!(
+            mget_alias_json["docs"][0]["_source"]["message"],
+            "Login successful"
+        );
 
         let mget_global_response = test_server
             .client()
@@ -2367,6 +2537,49 @@ pub(crate) mod tests {
             2
         );
 
+        let wildcard_search_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs_secondary,does-not-exist/_search?ignore_unavailable=true",
+                "{}",
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(wildcard_search_response.status(), 200);
+        let wildcard_search_json: Value =
+            serde_json::from_str(&wildcard_search_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(wildcard_search_json["hits"]["total"]["value"], 6);
+
+        let wildcard_multi_index_search_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs*/_search",
+                r#"{
+                  "query": {
+                    "match": {
+                      "message": {
+                        "query": "Login"
+                      }
+                    }
+                  }
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(wildcard_multi_index_search_response.status(), 200);
+        let wildcard_multi_index_search_json: Value = serde_json::from_str(
+            &wildcard_multi_index_search_response
+                .read_utf8_body()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            wildcard_multi_index_search_json["hits"]["total"]["value"],
+            4
+        );
+
         let msearch_global_response = test_server
             .client()
             .post(
@@ -2388,6 +2601,208 @@ pub(crate) mod tests {
             msearch_global_json["responses"][1]["error"]["reason"],
             "Index does not exist"
         );
+
+        let wildcard_msearch_response = test_server
+            .client()
+            .post(
+                "http://localhost/_msearch?ignore_unavailable=true",
+                "{\"index\":\"logs*,does-not-exist\"}\n{\"query\":{\"match\":{\"message\":{\"query\":\"Login\"}}}}\n",
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(wildcard_msearch_response.status(), 200);
+        let wildcard_msearch_json: Value =
+            serde_json::from_str(&wildcard_msearch_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(
+            wildcard_msearch_json["responses"][0]["hits"]["total"]["value"],
+            4
+        );
+
+        let get_alias_doc_response = test_server
+            .client()
+            .get("http://localhost/logs_secondary/_doc/2")
+            .perform()
+            .unwrap();
+        assert_eq!(get_alias_doc_response.status(), 200);
+        let get_alias_doc_json: Value =
+            serde_json::from_str(&get_alias_doc_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(get_alias_doc_json["_id"], "2");
+        assert_eq!(get_alias_doc_json["_source"]["message"], "Login successful");
+
+        let head_alias_doc_response = test_server
+            .client()
+            .head("http://localhost/logs_secondary/_doc/2")
+            .perform()
+            .unwrap();
+        assert_eq!(head_alias_doc_response.status(), 200);
+
+        let missing_head_alias_doc_response = test_server
+            .client()
+            .head("http://localhost/logs_secondary/_doc/999")
+            .perform()
+            .unwrap();
+        assert_eq!(missing_head_alias_doc_response.status(), 404);
+
+        let sorted_search_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs/_search",
+                r#"{
+                  "size": 2,
+                  "sort": [
+                    {
+                      "index_col": {
+                        "order": "asc"
+                      }
+                    }
+                  ]
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(sorted_search_response.status(), 200);
+        let sorted_search_json: Value =
+            serde_json::from_str(&sorted_search_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(sorted_search_json["hits"]["hits"][0]["sort"], json!([1]));
+        assert_eq!(sorted_search_json["hits"]["hits"][1]["sort"], json!([2]));
+
+        let search_after_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs/_search",
+                r#"{
+                  "size": 2,
+                  "search_after": [2],
+                  "sort": [
+                    {
+                      "index_col": {
+                        "order": "asc"
+                      }
+                    }
+                  ]
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(search_after_response.status(), 200);
+        let search_after_json: Value =
+            serde_json::from_str(&search_after_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(search_after_json["hits"]["hits"][0]["sort"], json!([3]));
+        assert_eq!(search_after_json["hits"]["hits"][1]["sort"], json!([4]));
+
+        let multi_index_sorted_search_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs,events_extra/_search",
+                r#"{
+                  "size": 3,
+                  "sort": [
+                    {
+                      "index_col": {
+                        "order": "asc"
+                      }
+                    }
+                  ]
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(multi_index_sorted_search_response.status(), 200);
+        let multi_index_sorted_search_json: Value =
+            serde_json::from_str(&multi_index_sorted_search_response.read_utf8_body().unwrap())
+                .unwrap();
+        assert_eq!(
+            multi_index_sorted_search_json["hits"]["hits"][0]["_index"],
+            "events_extra"
+        );
+        assert_eq!(
+            multi_index_sorted_search_json["hits"]["hits"][0]["sort"],
+            json!([0])
+        );
+        assert_eq!(
+            multi_index_sorted_search_json["hits"]["hits"][1]["sort"],
+            json!([1])
+        );
+        assert_eq!(
+            multi_index_sorted_search_json["hits"]["hits"][2]["sort"],
+            json!([2])
+        );
+
+        let multi_index_search_after_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs,events_extra/_search",
+                r#"{
+                  "size": 2,
+                  "search_after": [6],
+                  "sort": [
+                    {
+                      "index_col": {
+                        "order": "asc"
+                      }
+                    }
+                  ]
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(multi_index_search_after_response.status(), 200);
+        let multi_index_search_after_json: Value =
+            serde_json::from_str(&multi_index_search_after_response.read_utf8_body().unwrap())
+                .unwrap();
+        assert_eq!(
+            multi_index_search_after_json["hits"]["hits"][0]["sort"],
+            json!([7])
+        );
+        assert_eq!(
+            multi_index_search_after_json["hits"]["hits"][1]["sort"],
+            json!([8])
+        );
+
+        let multi_index_avg_agg_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs,events_extra/_search",
+                r#"{
+                  "size": 0,
+                  "aggs": {
+                    "avg_index_col": {
+                      "avg": {
+                        "field": "index_col"
+                      }
+                    }
+                  }
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(multi_index_avg_agg_response.status(), 200);
+        let multi_index_avg_agg_json: Value =
+            serde_json::from_str(&multi_index_avg_agg_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(
+            multi_index_avg_agg_json["aggregations"]["avg_index_col"]["value"],
+            json!(4.0)
+        );
+
+        let invalid_search_after_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs/_search",
+                r#"{
+                  "size": 2,
+                  "search_after": [2]
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(invalid_search_after_response.status(), 400);
 
         let missing_index_response = test_server
             .client()
