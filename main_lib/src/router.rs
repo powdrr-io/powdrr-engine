@@ -372,12 +372,10 @@ pub fn router(include_test_apis: bool) -> Router {
             .to(elastic_search_endpoints::es_unsupported_get_pipeline);
         route
             .put("/_ingest/pipeline/:name")
-            .with_path_extractor::<NamePathExtractor>()
-            .to(elastic_search_endpoints::es_create_pipeline);
+            .to(elastic_search_endpoints::es_unsupported_create_pipeline);
         route
             .post("/_ingest/pipeline/:name")
-            .with_path_extractor::<NamePathExtractor>()
-            .to(elastic_search_endpoints::es_create_pipeline);
+            .to(elastic_search_endpoints::es_unsupported_create_pipeline);
         route
             .get("/_ingest/pipeline/_simulate")
             .to(elastic_search_endpoints::es_unsupported_get_pipeline_simulate);
@@ -389,8 +387,7 @@ pub fn router(include_test_apis: bool) -> Router {
             .to(elastic_search_endpoints::es_unsupported_get_pipeline_simulate);
         route
             .post("/_ingest/pipeline/:name/_simulate")
-            .with_path_extractor::<NamePathExtractor>()
-            .to(elastic_search_endpoints::es_simulate_named_pipeline);
+            .to(elastic_search_endpoints::es_unsupported_named_pipeline_simulate);
         route
             .post("/_search/scroll")
             .to(elastic_search_endpoints::es_unsupported_search_scroll);
@@ -587,8 +584,7 @@ pub fn router(include_test_apis: bool) -> Router {
             .to(elastic_search_endpoints::es_create_with_id);
         route
             .post("/:name/_doc/:id")
-            .with_path_extractor::<NameIdPathExtractor>()
-            .to(elastic_search_endpoints::es_update_with_id);
+            .to(elastic_search_endpoints::es_unsupported_update_api);
         route
             .post("/:name/_update/:id")
             .to(elastic_search_endpoints::es_unsupported_update_api);

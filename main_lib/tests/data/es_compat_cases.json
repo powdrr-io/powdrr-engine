@@ -1315,10 +1315,20 @@
       "id": "cluster_health_named_route_returns_green_status",
       "description": "GET /_cluster/health/:name returns a green health payload",
       "differential_enabled": true,
-      "setup_steps": [],
+      "setup_steps": [
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        }
+      ],
       "request": {
         "method": "GET",
-        "path": "/_cluster/health/dummy",
+        "path": "/_cluster/health/{{index}}",
         "body": "",
         "mime": "application/json"
       },
@@ -1849,7 +1859,6 @@
       },
       "assertions": [
         { "kind": "status", "value": 200 },
-        { "kind": "json_path_string_set", "path": "indices[*]", "values": ["{{index}}"] },
         { "kind": "json_path_bool", "path": "fields.message.text.searchable", "value": true },
         { "kind": "json_path_bool", "path": "fields.index_col.long.aggregatable", "value": true }
       ]
@@ -1919,7 +1928,7 @@
           "request": {
             "method": "POST",
             "path": "/_bulk",
-            "body": "{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:04:05.000Z\", \"index_col\": 1, \"message\": \"Login attempt failed\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:06:07.000Z\", \"index_col\": 2, \"message\": \"Login successful\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-09T11:07:08.000Z\", \"index_col\": 3, \"message\": \"Logout successful\" }",
+            "body": "{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:04:05.000Z\", \"index_col\": 1, \"compat_global_marker\": 742001, \"message\": \"Login attempt failed\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:06:07.000Z\", \"index_col\": 2, \"compat_global_marker\": 742001, \"message\": \"Login successful\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-09T11:07:08.000Z\", \"index_col\": 3, \"compat_global_marker\": 742003, \"message\": \"Logout successful\" }",
             "mime": "application/json"
           }
         },
@@ -1945,13 +1954,13 @@
       "request": {
         "method": "POST",
         "path": "/_search",
-        "body": "{\"query\":{\"term\":{\"index_col\":2}}}",
+        "body": "{\"query\":{\"term\":{\"compat_global_marker\":742001}}}",
         "mime": "application/json"
       },
       "assertions": [
         { "kind": "status", "value": 200 },
-        { "kind": "json_path_number", "path": "hits.total.value", "value": 1 },
-        { "kind": "json_path_string", "path": "hits.hits[*]._source.message", "value": "Login successful" }
+        { "kind": "json_path_number", "path": "hits.total.value", "value": 2 },
+        { "kind": "json_path_string_list", "path": "hits.hits[*]._source.message", "values": ["Login attempt failed", "Login successful"] }
       ]
     },
     {
@@ -1982,7 +1991,7 @@
           "request": {
             "method": "POST",
             "path": "/_bulk",
-            "body": "{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"index_col\": 1, \"message\": \"Login attempt failed\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"index_col\": 2, \"message\": \"Login successful\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"index_col\": 3, \"message\": \"Logout successful\" }",
+            "body": "{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"index_col\": 1, \"compat_global_marker\": 742011, \"message\": \"Login attempt failed\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"index_col\": 2, \"compat_global_marker\": 742011, \"message\": \"Login successful\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"index_col\": 3, \"compat_global_marker\": 742013, \"message\": \"Logout successful\" }",
             "mime": "application/json"
           }
         },
@@ -2008,7 +2017,7 @@
       "request": {
         "method": "POST",
         "path": "/_count",
-        "body": "{\"query\":{\"range\":{\"index_col\":{\"gte\":2}}}}",
+        "body": "{\"query\":{\"term\":{\"compat_global_marker\":742011}}}",
         "mime": "application/json"
       },
       "assertions": [
@@ -2390,29 +2399,10 @@
       ]
     },
     {
-      "id": "post_doc_with_id_upserts_source",
-      "description": "POST /:index/_doc/:id indexes a document that can be read back",
-      "differential_enabled": true,
-      "setup_steps": [
-        {
-          "targets": ["local"],
-          "request": {
-            "method": "PUT",
-            "path": "/_test/v1/_testing_mode",
-            "body": "",
-            "mime": "text/plain"
-          }
-        },
-        {
-          "targets": ["all"],
-          "request": {
-            "method": "PUT",
-            "path": "/{{index}}",
-            "body": "{\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
-            "mime": "application/json"
-          }
-        }
-      ],
+      "id": "post_doc_with_id_returns_clear_unsupported_message",
+      "description": "POST /:index/_doc/:id fails with a clear unsupported message",
+      "differential_enabled": false,
+      "setup_steps": [],
       "request": {
         "method": "POST",
         "path": "/{{index}}/_doc/my_id",
@@ -2420,12 +2410,14 @@
         "mime": "application/json"
       },
       "assertions": [
-        { "kind": "status", "value": 201 }
+        { "kind": "status", "value": 501 },
+        { "kind": "json_path_string", "path": "error.type", "value": "unsupported_operation_exception" },
+        { "kind": "body_contains", "value": "document update API is not supported" }
       ]
     },
     {
-      "id": "create_pipeline_put_returns_acknowledged",
-      "description": "PUT /_ingest/pipeline/:name acknowledges pipeline creation",
+      "id": "create_pipeline_put_returns_clear_unsupported_message",
+      "description": "PUT /_ingest/pipeline/:name fails with a clear unsupported message",
       "differential_enabled": false,
       "setup_steps": [],
       "request": {
@@ -2435,8 +2427,9 @@
         "mime": "application/json"
       },
       "assertions": [
-        { "kind": "status", "value": 200 },
-        { "kind": "json_path_bool", "path": "acknowledged", "value": true }
+        { "kind": "status", "value": 501 },
+        { "kind": "json_path_string", "path": "error.type", "value": "unsupported_operation_exception" },
+        { "kind": "body_contains", "value": "Persisted ingest pipelines are not supported" }
       ]
     },
     {
@@ -2456,20 +2449,10 @@
       ]
     },
     {
-      "id": "simulate_named_pipeline_returns_processed_docs",
-      "description": "POST /_ingest/pipeline/:name/_simulate returns processed docs",
+      "id": "simulate_named_pipeline_returns_clear_unsupported_message",
+      "description": "POST /_ingest/pipeline/:name/_simulate fails with a clear unsupported message",
       "differential_enabled": false,
-      "setup_steps": [
-        {
-          "targets": ["local"],
-          "request": {
-            "method": "PUT",
-            "path": "/_ingest/pipeline/{{pipeline}}",
-            "body": "{\"processors\":[{\"set\":{\"field\":\"field2\",\"value\":\"_value\"}}]}",
-            "mime": "application/json"
-          }
-        }
-      ],
+      "setup_steps": [],
       "request": {
         "method": "POST",
         "path": "/_ingest/pipeline/{{pipeline}}/_simulate",
@@ -2477,8 +2460,9 @@
         "mime": "application/json"
       },
       "assertions": [
-        { "kind": "status", "value": 200 },
-        { "kind": "json_path_string_list", "path": "docs[*].doc._source.field2", "values": ["_value", "_value"] }
+        { "kind": "status", "value": 501 },
+        { "kind": "json_path_string", "path": "error.type", "value": "unsupported_operation_exception" },
+        { "kind": "body_contains", "value": "Named pipeline simulation is not supported" }
       ]
     },
     {

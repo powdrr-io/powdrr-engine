@@ -391,12 +391,36 @@ pub fn es_unsupported_get_pipeline(state: State) -> Pin<Box<HandlerFuture>> {
     .boxed()
 }
 
+pub fn es_unsupported_create_pipeline(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_unsupported_create_pipeline");
+    async {
+        let res = unsupported_api_response(
+            &state,
+            "Persisted ingest pipelines are not supported. Use POST /_ingest/pipeline/_simulate for inline pipeline execution.",
+        );
+        Ok((state, res))
+    }
+    .boxed()
+}
+
 pub fn es_unsupported_get_pipeline_simulate(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_unsupported_get_pipeline_simulate");
     async {
         let res = unsupported_api_response(
             &state,
             "GET pipeline simulation is not supported. Use POST /_ingest/pipeline/_simulate or POST /_ingest/pipeline/{name}/_simulate.",
+        );
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_unsupported_named_pipeline_simulate(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_unsupported_named_pipeline_simulate");
+    async {
+        let res = unsupported_api_response(
+            &state,
+            "Named pipeline simulation is not supported because persisted ingest pipelines are not supported. Use POST /_ingest/pipeline/_simulate.",
         );
         Ok((state, res))
     }
@@ -2213,13 +2237,16 @@ pub fn es_search(mut state: State) -> Pin<Box<HandlerFuture>> {
             Err(_) => panic!("Oh no"),
         };
         let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
-        let response = match execute_search_response(None, &body_content, &query_string).await {
-            Ok(response) => response,
-            Err((status, message)) => {
-                let res = invalid_request_response(&state, status, &message);
-                return Ok((state, res));
-            }
-        };
+        let response =
+            match execute_search_response_for_target_expr(Some("*"), &body_content, &query_string)
+                .await
+            {
+                Ok(response) => response,
+                Err((status, message)) => {
+                    let res = invalid_request_response(&state, status, &message);
+                    return Ok((state, res));
+                }
+            };
         let res = response.generate_response(&state);
         Ok((state, res))
     }
@@ -2248,32 +2275,48 @@ pub fn es_count(mut state: State) -> Pin<Box<HandlerFuture>> {
             }
         };
 
-        let command = match elastic_search_parser::parse(None, &search_body, &query_string) {
-            Ok(c) => c,
-            Err(_) => {
-                let res = create_response(
-                    &state,
-                    StatusCode::BAD_REQUEST,
-                    mime::TEXT_PLAIN,
-                    "Bad request".to_string(),
-                );
+        let resolved_targets = match resolve_read_target_names(&[], &query_string).await {
+            Ok(targets) => targets,
+            Err((status, message)) => {
+                let res = invalid_request_response(&state, status, &message);
                 return Ok((state, res));
             }
         };
 
-        let count_result = match search_executor::execute_count_command(Arc::new(command)).await {
-            Ok(result) => result,
-            Err(response) => {
-                let res = response.generate_response(&state);
-                return Ok((state, res));
-            }
-        };
+        let mut total_hits = 0u64;
+        let mut total_shards = 0u32;
+        for target in resolved_targets {
+            let command =
+                match elastic_search_parser::parse(Some(target), &search_body, &query_string) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        let res = create_response(
+                            &state,
+                            StatusCode::BAD_REQUEST,
+                            mime::TEXT_PLAIN,
+                            "Bad request".to_string(),
+                        );
+                        return Ok((state, res));
+                    }
+                };
+
+            let count_result = match search_executor::execute_count_command(Arc::new(command)).await
+            {
+                Ok(result) => result,
+                Err(response) => {
+                    let res = response.generate_response(&state);
+                    return Ok((state, res));
+                }
+            };
+            total_hits += count_result.total_hits;
+            total_shards += count_result.num_shards;
+        }
 
         let count_response = CountResponse {
-            count: count_result.total_hits,
+            count: total_hits,
             _shards: QueryResultShards {
-                total: count_result.num_shards,
-                successful: count_result.num_shards,
+                total: total_shards,
+                successful: total_shards,
                 skipped: 0,
                 failed: 0,
             },
