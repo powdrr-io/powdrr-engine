@@ -105,7 +105,7 @@ pub struct DeletesMetadata {
     pub files: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ExtensionFile {
     pub suffix: String,
     pub location: String,
