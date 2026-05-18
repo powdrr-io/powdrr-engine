@@ -3,11 +3,11 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
 
-use futures::stream::{self, StreamExt};
 use futures::FutureExt;
+use futures::stream::{self, StreamExt};
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{body, Body};
+use gotham::hyper::{Body, body};
 use gotham::mime;
 use gotham::state::{FromState, State};
 use http::StatusCode;
@@ -16,8 +16,8 @@ use serde_json::Value;
 
 use crate::data_access::{self, execute_sql_async, load_files_as_table};
 use crate::data_contract::{
-    CreateTable, FileDescriptor, IcebergColumnStats, IcebergFileStats, ServingPattern,
-    ServingTableConfig, TableDescription, TableMetadataCheckpoint,
+    CreateTable, FileDescriptor, IcebergColumnStats, IcebergFileStats, IcebergRowGroupStats,
+    ServingPattern, ServingTableConfig, TableDescription, TableMetadataCheckpoint,
 };
 use crate::elastic_search_endpoints::NamePathExtractor;
 use crate::peers::CheckpointDescriptor;
@@ -42,6 +42,10 @@ pub struct ServingQueryResponse {
     pub reason: Option<String>,
     pub files_considered: usize,
     pub files_selected: usize,
+    #[serde(default)]
+    pub row_groups_considered: usize,
+    #[serde(default)]
+    pub row_groups_selected: usize,
     pub estimated_bytes: u64,
     #[serde(default)]
     pub sql: Option<String>,
@@ -74,6 +78,8 @@ struct ServingPlan {
     selected_files: Vec<FileDescriptor>,
     files_considered: usize,
     files_selected: usize,
+    row_groups_considered: usize,
+    row_groups_selected: usize,
     estimated_bytes: u64,
 }
 
@@ -81,6 +87,15 @@ struct ServingPlan {
 struct OrderedFileGroup {
     files: Vec<FileDescriptor>,
     best_case_sort_value: Value,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PrunedFileSelection {
+    selected_files: Vec<FileDescriptor>,
+    files_selected: usize,
+    row_groups_considered: usize,
+    row_groups_selected: usize,
+    estimated_bytes: u64,
 }
 
 pub fn get_serving_config(state: State) -> Pin<Box<HandlerFuture>> {
@@ -242,6 +257,8 @@ pub async fn execute_serving_query(
             reason: Some("Delete-aware serving is not implemented yet".to_string()),
             files_considered: context.files.len(),
             files_selected: 0,
+            row_groups_considered: 0,
+            row_groups_selected: 0,
             estimated_bytes: 0,
             sql: None,
             rows: vec![],
@@ -258,6 +275,8 @@ pub async fn execute_serving_query(
             reason: plan.reason,
             files_considered: plan.files_considered,
             files_selected: plan.files_selected,
+            row_groups_considered: plan.row_groups_considered,
+            row_groups_selected: plan.row_groups_selected,
             estimated_bytes: plan.estimated_bytes,
             sql: Some(plan.sql),
             rows: vec![],
@@ -273,6 +292,8 @@ pub async fn execute_serving_query(
             reason: plan.reason,
             files_considered: plan.files_considered,
             files_selected: plan.files_selected,
+            row_groups_considered: plan.row_groups_considered,
+            row_groups_selected: plan.row_groups_selected,
             estimated_bytes: plan.estimated_bytes,
             sql: Some(plan.sql),
             rows: vec![],
@@ -290,6 +311,8 @@ pub async fn execute_serving_query(
             ),
             files_considered: plan.files_considered,
             files_selected: plan.files_selected,
+            row_groups_considered: plan.row_groups_considered,
+            row_groups_selected: plan.row_groups_selected,
             estimated_bytes: plan.estimated_bytes,
             sql: Some(plan.sql),
             rows: vec![],
@@ -316,6 +339,8 @@ pub async fn execute_serving_query(
         reason: plan.reason,
         files_considered: plan.files_considered,
         files_selected: plan.files_selected,
+        row_groups_considered: plan.row_groups_considered,
+        row_groups_selected: plan.row_groups_selected,
         estimated_bytes: plan.estimated_bytes,
         sql: Some(plan.sql),
         rows,
@@ -427,12 +452,13 @@ fn plan_request(
             selected_files: vec![],
             files_considered: context.files.len(),
             files_selected: 0,
+            row_groups_considered: 0,
+            row_groups_selected: 0,
             estimated_bytes: 0,
         });
     }
 
-    let selected_files = prune_candidate_files(&context.files, &context.file_stats, request);
-    let estimated_bytes = selected_files.iter().map(|file| file.size).sum::<u64>();
+    let pruned = prune_candidate_files(&context.files, &context.file_stats, request);
 
     if let Some(pattern) = serving
         .patterns
@@ -445,10 +471,12 @@ fn plan_request(
             reason: None,
             limit,
             sql,
-            selected_files: selected_files.clone(),
+            selected_files: pruned.selected_files.clone(),
             files_considered: context.files.len(),
-            files_selected: selected_files.len(),
-            estimated_bytes,
+            files_selected: pruned.files_selected,
+            row_groups_considered: pruned.row_groups_considered,
+            row_groups_selected: pruned.row_groups_selected,
+            estimated_bytes: pruned.estimated_bytes,
         });
     }
 
@@ -458,10 +486,12 @@ fn plan_request(
         reason: Some("No declared serving pattern matched this query".to_string()),
         limit,
         sql,
-        selected_files: selected_files.clone(),
+        selected_files: pruned.selected_files.clone(),
         files_considered: context.files.len(),
-        files_selected: selected_files.len(),
-        estimated_bytes,
+        files_selected: pruned.files_selected,
+        row_groups_considered: pruned.row_groups_considered,
+        row_groups_selected: pruned.row_groups_selected,
+        estimated_bytes: pruned.estimated_bytes,
     })
 }
 
@@ -478,7 +508,7 @@ async fn execute_plan(
 
     if let Some(sort) = request.order_by.first() {
         if let Some(ordered_groups) =
-            ordered_file_groups_for_top_k(files, file_stats, &sort.field, sort.descending)
+            ordered_file_groups_for_top_k(files, file_stats, request, &sort.field, sort.descending)
         {
             return execute_ordered_top_k_plan(ordered_groups, request, sql, limit).await;
         }
@@ -578,18 +608,19 @@ fn serving_file_parallelism() -> usize {
 fn ordered_file_groups_for_top_k(
     files: &[FileDescriptor],
     file_stats: &HashMap<String, IcebergFileStats>,
+    request: &ServingRequestPlan,
     sort_field: &str,
     descending: bool,
 ) -> Option<Vec<OrderedFileGroup>> {
     let mut groups = group_files_by_schema(files)
         .into_iter()
         .map(|group| {
-            file_group_sort_bound(&group, file_stats, sort_field, descending).map(|bound| {
-                OrderedFileGroup {
+            file_group_sort_bound(&group, file_stats, request, sort_field, descending).map(
+                |bound| OrderedFileGroup {
                     files: group,
                     best_case_sort_value: bound,
-                }
-            })
+                },
+            )
         })
         .collect::<Option<Vec<_>>>()?;
 
@@ -606,13 +637,14 @@ fn ordered_file_groups_for_top_k(
 fn file_group_sort_bound(
     files: &[FileDescriptor],
     file_stats: &HashMap<String, IcebergFileStats>,
+    request: &ServingRequestPlan,
     sort_field: &str,
     descending: bool,
 ) -> Option<Value> {
     let mut best_bound: Option<Value> = None;
 
     for file in files {
-        let candidate = file_sort_bound(file, file_stats, sort_field, descending)?;
+        let candidate = file_sort_bound(file, file_stats, request, sort_field, descending)?;
         if best_bound
             .as_ref()
             .map(|best| compare_sort_values(&candidate, best, descending) == Ordering::Less)
@@ -628,16 +660,72 @@ fn file_group_sort_bound(
 fn file_sort_bound(
     file: &FileDescriptor,
     file_stats: &HashMap<String, IcebergFileStats>,
+    request: &ServingRequestPlan,
     sort_field: &str,
     descending: bool,
 ) -> Option<Value> {
     let stats = file_stats.get(&file.file_path)?;
+    if !stats.row_groups.is_empty() {
+        let matching_row_groups = stats
+            .row_groups
+            .iter()
+            .filter(|row_group| row_group_may_match_request(row_group, request))
+            .collect::<Vec<_>>();
+        if matching_row_groups.is_empty() {
+            return None;
+        }
+
+        let mut best_row_group_bound: Option<Value> = None;
+        for row_group in matching_row_groups.iter() {
+            let Some(candidate) = row_group_sort_bound(row_group, sort_field, descending) else {
+                return file_level_sort_bound(stats, sort_field, descending);
+            };
+            if best_row_group_bound
+                .as_ref()
+                .map(|best| compare_sort_values(&candidate, best, descending) == Ordering::Less)
+                .unwrap_or(true)
+            {
+                best_row_group_bound = Some(candidate);
+            }
+        }
+        return best_row_group_bound;
+    }
+
+    file_level_sort_bound(stats, sort_field, descending)
+}
+
+fn file_level_sort_bound(
+    stats: &IcebergFileStats,
+    sort_field: &str,
+    descending: bool,
+) -> Option<Value> {
     let column_stats = stats
         .columns
         .iter()
         .find(|stats| stats.field_name == sort_field)?;
 
     if column_is_all_null(column_stats, stats.record_count) {
+        return Some(Value::Null);
+    }
+
+    if descending {
+        column_stats.upper_bound.clone()
+    } else {
+        column_stats.lower_bound.clone()
+    }
+}
+
+fn row_group_sort_bound(
+    row_group: &IcebergRowGroupStats,
+    sort_field: &str,
+    descending: bool,
+) -> Option<Value> {
+    let column_stats = row_group
+        .columns
+        .iter()
+        .find(|stats| stats.field_name == sort_field)?;
+
+    if column_is_all_null(column_stats, row_group.record_count) {
         return Some(Value::Null);
     }
 
@@ -957,17 +1045,46 @@ fn prune_candidate_files(
     files: &[FileDescriptor],
     file_stats: &HashMap<String, IcebergFileStats>,
     request: &ServingRequestPlan,
-) -> Vec<FileDescriptor> {
-    files
-        .iter()
-        .filter(|file| {
-            file_stats
-                .get(&file.file_path)
-                .map(|stats| file_may_match_request(stats, request))
-                .unwrap_or(true)
-        })
-        .cloned()
-        .collect()
+) -> PrunedFileSelection {
+    let mut pruned = PrunedFileSelection::default();
+
+    for file in files.iter().cloned() {
+        let Some(stats) = file_stats.get(&file.file_path) else {
+            pruned.estimated_bytes += file.size;
+            pruned.files_selected += 1;
+            pruned.selected_files.push(file);
+            continue;
+        };
+
+        if stats.row_groups.is_empty() {
+            if file_may_match_request(stats, request) {
+                pruned.estimated_bytes += file.size;
+                pruned.files_selected += 1;
+                pruned.selected_files.push(file);
+            }
+            continue;
+        }
+
+        pruned.row_groups_considered += stats.row_groups.len();
+        let matching_row_groups = stats
+            .row_groups
+            .iter()
+            .filter(|row_group| row_group_may_match_request(row_group, request))
+            .collect::<Vec<_>>();
+        if matching_row_groups.is_empty() {
+            continue;
+        }
+
+        pruned.files_selected += 1;
+        pruned.row_groups_selected += matching_row_groups.len();
+        pruned.estimated_bytes += matching_row_groups
+            .iter()
+            .map(|row_group| row_group.compressed_bytes)
+            .sum::<u64>();
+        pruned.selected_files.push(file);
+    }
+
+    pruned
 }
 
 fn file_may_match_request(file_stats: &IcebergFileStats, request: &ServingRequestPlan) -> bool {
@@ -975,6 +1092,16 @@ fn file_may_match_request(file_stats: &IcebergFileStats, request: &ServingReques
         .filters
         .iter()
         .all(|predicate| predicate_may_match_file(file_stats, predicate))
+}
+
+fn row_group_may_match_request(
+    row_group_stats: &IcebergRowGroupStats,
+    request: &ServingRequestPlan,
+) -> bool {
+    request
+        .filters
+        .iter()
+        .all(|predicate| predicate_may_match_row_group(row_group_stats, predicate))
 }
 
 fn predicate_may_match_file(file_stats: &IcebergFileStats, predicate: &ServingPredicate) -> bool {
@@ -986,16 +1113,39 @@ fn predicate_may_match_file(file_stats: &IcebergFileStats, predicate: &ServingPr
         return true;
     };
 
+    predicate_may_match_stats(column_stats, file_stats.record_count, predicate)
+}
+
+fn predicate_may_match_row_group(
+    row_group_stats: &IcebergRowGroupStats,
+    predicate: &ServingPredicate,
+) -> bool {
+    let Some(column_stats) = row_group_stats
+        .columns
+        .iter()
+        .find(|stats| stats.field_name == predicate.field)
+    else {
+        return true;
+    };
+
+    predicate_may_match_stats(column_stats, row_group_stats.record_count, predicate)
+}
+
+fn predicate_may_match_stats(
+    column_stats: &IcebergColumnStats,
+    record_count: Option<u64>,
+    predicate: &ServingPredicate,
+) -> bool {
     if let Some(eq) = predicate.eq.as_ref() {
-        return equality_may_match(column_stats, file_stats.record_count, eq);
+        return equality_may_match(column_stats, record_count, eq);
     }
     if let Some(values) = predicate.in_values.as_ref() {
         return values
             .iter()
-            .any(|value| equality_may_match(column_stats, file_stats.record_count, value));
+            .any(|value| equality_may_match(column_stats, record_count, value));
     }
 
-    range_may_match(column_stats, file_stats.record_count, predicate)
+    range_may_match(column_stats, record_count, predicate)
 }
 
 fn equality_may_match(
@@ -1264,13 +1414,13 @@ impl ServingQueryError {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_sql, file_group_table_name, group_files_by_schema, ordered_file_groups_for_top_k,
-        plan_request, prune_candidate_files, remaining_groups_cannot_beat_kth_row,
-        request_matches_pattern, ServingExecutionContext,
+        ServingExecutionContext, build_sql, file_group_table_name, group_files_by_schema,
+        ordered_file_groups_for_top_k, plan_request, prune_candidate_files,
+        remaining_groups_cannot_beat_kth_row, request_matches_pattern,
     };
     use crate::data_contract::{
-        FileDescriptor, IcebergColumnStats, IcebergFileStats, ServingPattern, ServingTableConfig,
-        TableDescription, TableMetadataCheckpoint,
+        FileDescriptor, IcebergColumnStats, IcebergFileStats, IcebergRowGroupStats, ServingPattern,
+        ServingTableConfig, TableDescription, TableMetadataCheckpoint,
     };
     use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
     use crate::serving_plan::{
@@ -1375,6 +1525,23 @@ mod tests {
         IcebergFileStats {
             file_path: file_path.to_string(),
             record_count,
+            columns,
+            row_groups: vec![],
+        }
+    }
+
+    fn row_group_stats(
+        row_group_index: usize,
+        record_count: Option<u64>,
+        compressed_bytes: u64,
+        columns: Vec<IcebergColumnStats>,
+    ) -> IcebergRowGroupStats {
+        IcebergRowGroupStats {
+            row_group_index,
+            record_count,
+            compressed_bytes,
+            page_index_present: false,
+            bloom_filter_present: false,
             columns,
         }
     }
@@ -1497,6 +1664,8 @@ mod tests {
         assert_eq!(plan.classification, ServingQueryClassification::FastPath);
         assert_eq!(plan.files_considered, 2);
         assert_eq!(plan.files_selected, 1);
+        assert_eq!(plan.row_groups_considered, 0);
+        assert_eq!(plan.row_groups_selected, 0);
         assert_eq!(plan.estimated_bytes, 100);
         assert_eq!(
             plan.selected_files
@@ -1509,6 +1678,61 @@ mod tests {
 
     #[test]
     fn test_plan_request_prunes_files_for_range_query() {
+        let mut first = file_stats(
+            "file://first.parquet",
+            Some(20),
+            vec![column_stats(
+                "score",
+                Some(0),
+                Some(json!(0)),
+                Some(json!(100)),
+            )],
+        );
+        first.row_groups = vec![
+            row_group_stats(
+                0,
+                Some(10),
+                25,
+                vec![column_stats(
+                    "score",
+                    Some(0),
+                    Some(json!(0)),
+                    Some(json!(10)),
+                )],
+            ),
+            row_group_stats(
+                1,
+                Some(10),
+                25,
+                vec![column_stats(
+                    "score",
+                    Some(0),
+                    Some(json!(20)),
+                    Some(json!(30)),
+                )],
+            ),
+        ];
+        let mut second = file_stats(
+            "file://second.parquet",
+            Some(10),
+            vec![column_stats(
+                "score",
+                Some(0),
+                Some(json!(60)),
+                Some(json!(100)),
+            )],
+        );
+        second.row_groups = vec![row_group_stats(
+            0,
+            Some(10),
+            40,
+            vec![column_stats(
+                "score",
+                Some(0),
+                Some(json!(60)),
+                Some(json!(100)),
+            )],
+        )];
         let context = test_context(
             ServingTableConfig {
                 patterns: vec![ServingPattern {
@@ -1521,28 +1745,7 @@ mod tests {
                     projection: None,
                 }],
             },
-            vec![
-                file_stats(
-                    "file://first.parquet",
-                    Some(10),
-                    vec![column_stats(
-                        "score",
-                        Some(0),
-                        Some(json!(0)),
-                        Some(json!(10)),
-                    )],
-                ),
-                file_stats(
-                    "file://second.parquet",
-                    Some(10),
-                    vec![column_stats(
-                        "score",
-                        Some(0),
-                        Some(json!(60)),
-                        Some(json!(100)),
-                    )],
-                ),
-            ],
+            vec![first, second],
         );
         let request = ServingRequestPlan {
             select: None,
@@ -1565,7 +1768,9 @@ mod tests {
 
         assert_eq!(plan.classification, ServingQueryClassification::FastPath);
         assert_eq!(plan.files_selected, 1);
-        assert_eq!(plan.estimated_bytes, 200);
+        assert_eq!(plan.row_groups_considered, 3);
+        assert_eq!(plan.row_groups_selected, 1);
+        assert_eq!(plan.estimated_bytes, 40);
         assert_eq!(
             plan.selected_files
                 .iter()
@@ -1608,11 +1813,16 @@ mod tests {
 
         assert_eq!(
             selected_files
+                .selected_files
                 .iter()
                 .map(|file| file.file_path.as_str())
                 .collect::<Vec<_>>(),
             vec!["file://second.parquet"]
         );
+        assert_eq!(selected_files.files_selected, 1);
+        assert_eq!(selected_files.row_groups_considered, 0);
+        assert_eq!(selected_files.row_groups_selected, 0);
+        assert_eq!(selected_files.estimated_bytes, 200);
     }
 
     #[test]
@@ -1677,50 +1887,98 @@ mod tests {
                 size: 300,
             },
         ];
+        let mut first = file_stats(
+            "file://first.parquet",
+            Some(20),
+            vec![column_stats(
+                "score",
+                Some(0),
+                Some(json!(0)),
+                Some(json!(100)),
+            )],
+        );
+        first.row_groups = vec![
+            row_group_stats(
+                0,
+                Some(10),
+                25,
+                vec![
+                    column_stats("tenant", Some(0), Some(json!("acme")), Some(json!("acme"))),
+                    column_stats("score", Some(0), Some(json!(0)), Some(json!(20))),
+                ],
+            ),
+            row_group_stats(
+                1,
+                Some(10),
+                25,
+                vec![
+                    column_stats(
+                        "tenant",
+                        Some(0),
+                        Some(json!("omega")),
+                        Some(json!("omega")),
+                    ),
+                    column_stats("score", Some(0), Some(json!(90)), Some(json!(100))),
+                ],
+            ),
+        ];
+        let mut second = file_stats(
+            "file://second.parquet",
+            Some(10),
+            vec![column_stats(
+                "score",
+                Some(0),
+                Some(json!(10)),
+                Some(json!(80)),
+            )],
+        );
+        second.row_groups = vec![row_group_stats(
+            0,
+            Some(10),
+            40,
+            vec![
+                column_stats("tenant", Some(0), Some(json!("acme")), Some(json!("acme"))),
+                column_stats("score", Some(0), Some(json!(10)), Some(json!(80))),
+            ],
+        )];
         let file_stats = HashMap::from([
-            (
-                "file://first.parquet".to_string(),
-                file_stats(
-                    "file://first.parquet",
-                    Some(10),
-                    vec![column_stats(
-                        "score",
-                        Some(0),
-                        Some(json!(0)),
-                        Some(json!(40)),
-                    )],
-                ),
-            ),
-            (
-                "file://second.parquet".to_string(),
-                file_stats(
-                    "file://second.parquet",
-                    Some(10),
-                    vec![column_stats(
-                        "score",
-                        Some(0),
-                        Some(json!(10)),
-                        Some(json!(60)),
-                    )],
-                ),
-            ),
+            ("file://first.parquet".to_string(), first),
+            ("file://second.parquet".to_string(), second),
             (
                 "file://third.parquet".to_string(),
                 file_stats(
                     "file://third.parquet",
                     Some(10),
-                    vec![column_stats(
-                        "score",
-                        Some(0),
-                        Some(json!(70)),
-                        Some(json!(90)),
-                    )],
+                    vec![
+                        column_stats("tenant", Some(0), Some(json!("acme")), Some(json!("acme"))),
+                        column_stats("score", Some(0), Some(json!(70)), Some(json!(75))),
+                    ],
                 ),
             ),
         ]);
+        let request = ServingRequestPlan {
+            select: None,
+            filters: vec![ServingPredicate {
+                field: "tenant".to_string(),
+                eq: Some(json!("acme")),
+                in_values: None,
+                gt: None,
+                gte: None,
+                lt: None,
+                lte: None,
+            }],
+            order_by: vec![ServingSort {
+                field: "score".to_string(),
+                descending: true,
+            }],
+            limit: Some(10),
+            allow_slow_path: false,
+            explain: false,
+        };
 
-        let ordered_groups = ordered_file_groups_for_top_k(&files, &file_stats, "score", true)
-            .expect("score bounds should enable ordered top-k");
+        let ordered_groups =
+            ordered_file_groups_for_top_k(&files, &file_stats, &request, "score", true)
+                .expect("score bounds should enable ordered top-k");
 
         assert_eq!(
             ordered_groups[0]
@@ -1728,18 +1986,18 @@ mod tests {
                 .iter()
                 .map(|file| file.file_path.as_str())
                 .collect::<Vec<_>>(),
-            vec!["file://third.parquet"]
+            vec!["file://first.parquet", "file://second.parquet"]
         );
-        assert_eq!(ordered_groups[0].best_case_sort_value, json!(90));
+        assert_eq!(ordered_groups[0].best_case_sort_value, json!(80));
         assert_eq!(
             ordered_groups[1]
                 .files
                 .iter()
                 .map(|file| file.file_path.as_str())
                 .collect::<Vec<_>>(),
-            vec!["file://first.parquet", "file://second.parquet"]
+            vec!["file://third.parquet"]
         );
-        assert_eq!(ordered_groups[1].best_case_sort_value, json!(60));
+        assert_eq!(ordered_groups[1].best_case_sort_value, json!(75));
     }
 
     #[test]
@@ -1765,9 +2023,20 @@ mod tests {
                 file_stats("file://second.parquet", Some(10), vec![]),
             ),
         ]);
+        let request = ServingRequestPlan {
+            select: None,
+            filters: vec![],
+            order_by: vec![ServingSort {
+                field: "score".to_string(),
+                descending: true,
+            }],
+            limit: Some(10),
+            allow_slow_path: false,
+            explain: false,
+        };
 
         assert!(
-            ordered_file_groups_for_top_k(&files, &file_stats, "score", true).is_none(),
+            ordered_file_groups_for_top_k(&files, &file_stats, &request, "score", true).is_none(),
             "missing score bounds should fall back to the existing parallel path"
         );
     }
