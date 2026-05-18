@@ -66,10 +66,12 @@ fn elasticsearch_js_client_matches_read_only_subset() {
 
 async fn run_js_client_smoke() {
     let powdrr_server = PowdrrServer::spawn().await;
+    // Keep the marker within JavaScript's safe integer range because the
+    // official JS client serializes numeric query values as Number.
     let marker_seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_nanos() as i64;
+        .as_micros() as i64;
     let fixture = JsSmokeFixture {
         index: unique_name("js_client_smoke"),
         alias: unique_name("js_client_alias"),
