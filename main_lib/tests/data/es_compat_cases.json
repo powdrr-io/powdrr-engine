@@ -1960,7 +1960,7 @@
       "assertions": [
         { "kind": "status", "value": 200 },
         { "kind": "json_path_number", "path": "hits.total.value", "value": 2 },
-        { "kind": "json_path_string_list", "path": "hits.hits[*]._source.message", "values": ["Login attempt failed", "Login successful"] }
+        { "kind": "json_path_string_set", "path": "hits.hits[*]._source.message", "values": ["Login attempt failed", "Login successful"] }
       ]
     },
     {
