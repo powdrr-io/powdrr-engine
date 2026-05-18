@@ -8,7 +8,11 @@ use crate::data_contract::{
     SpeedboatCommitTableInfo, SpeedboatMetadata, TableDescription, TableMetadataCheckpoint,
 };
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
-use crate::metadata_store::{CheckpointUpdateRequest, ClaimedCleanupWorkItem, ClaimedCompactionWorkItem, ClaimedExtensionWorkItem, MetadataClaimKind, MetadataStore, PublishedCheckpointRecord, PublishedCheckpointSelector};
+use crate::metadata_store::{
+    CheckpointUpdateRequest, ClaimedCleanupWorkItem, ClaimedCompactionWorkItem,
+    ClaimedExtensionWorkItem, MetadataClaimKind, MetadataStore, PublishedCheckpointRecord,
+    PublishedCheckpointSelector,
+};
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
 use crate::schema_massager::PowdrrSchema;
@@ -94,6 +98,7 @@ impl EphemeralServiceImpl {
         extension_name: &String,
         metadata: &mut TableMetadataCheckpoint,
     ) -> (FileSetPayload, FileSetPayload) {
+        metadata.retain_current_extension_metadata();
         if !metadata.extension_metadata.contains_key(extension_name) {
             metadata
                 .extension_metadata
@@ -1014,41 +1019,85 @@ impl EphemeralServiceImpl {
 
 #[async_trait::async_trait]
 impl MetadataStore for EphemeralServiceImpl {
-    async fn queue_checkpoint_publication(&mut self, _request: &CheckpointUpdateRequest) -> Result<(), ServiceApiError> {
+    async fn queue_checkpoint_publication(
+        &mut self,
+        _request: &CheckpointUpdateRequest,
+    ) -> Result<(), ServiceApiError> {
         Ok(())
     }
 
-    async fn get_published_checkpoint_record(&mut self, org_info: &OrgInfo, selector: &PublishedCheckpointSelector) -> Result<Option<PublishedCheckpointRecord>, ServiceApiError> {
-        Ok(EphemeralServiceImpl::get_latest_committed_checkpoint(self, org_info, &selector.table_name, selector.extension.clone()).await?.map(|checkpoint_id|PublishedCheckpointRecord {
+    async fn get_published_checkpoint_record(
+        &mut self,
+        org_info: &OrgInfo,
+        selector: &PublishedCheckpointSelector,
+    ) -> Result<Option<PublishedCheckpointRecord>, ServiceApiError> {
+        Ok(EphemeralServiceImpl::get_latest_committed_checkpoint(
+            self,
+            org_info,
+            &selector.table_name,
+            selector.extension.clone(),
+        )
+        .await?
+        .map(|checkpoint_id| PublishedCheckpointRecord {
             selector: selector.clone(),
             checkpoint_id,
         }))
     }
 
-    async fn get_checkpoint_metadata(&mut self, org_info: &OrgInfo, checkpoint: &CheckpointDescriptor) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
+    async fn get_checkpoint_metadata(
+        &mut self,
+        org_info: &OrgInfo,
+        checkpoint: &CheckpointDescriptor,
+    ) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
         EphemeralServiceImpl::get_checkpoint(self, org_info, checkpoint).await
     }
 
-    async fn claim_extension_work_items(&mut self, org_info: &OrgInfo, extension_type: &String) -> Result<Vec<ClaimedExtensionWorkItem>, ServiceApiError> {
-        Ok(EphemeralServiceImpl::get_extension_work_items(self, org_info, extension_type).await?.into_iter().map(|work_item|ClaimedExtensionWorkItem {
-            claim: MetadataClaimKind::ProcessLocal,
-            work_item,
-        }).collect())
+    async fn claim_extension_work_items(
+        &mut self,
+        org_info: &OrgInfo,
+        extension_type: &String,
+    ) -> Result<Vec<ClaimedExtensionWorkItem>, ServiceApiError> {
+        Ok(
+            EphemeralServiceImpl::get_extension_work_items(self, org_info, extension_type)
+                .await?
+                .into_iter()
+                .map(|work_item| ClaimedExtensionWorkItem {
+                    claim: MetadataClaimKind::ProcessLocal,
+                    work_item,
+                })
+                .collect(),
+        )
     }
 
-    async fn claim_compaction_work_items(&mut self, org_info: &OrgInfo) -> Result<Vec<ClaimedCompactionWorkItem>, ServiceApiError> {
-        Ok(EphemeralServiceImpl::get_compaction_work_items(self, org_info).await?.into_iter().map(|(table_name, work_item)|ClaimedCompactionWorkItem {
-            claim: MetadataClaimKind::ProcessLocal,
-            table_name,
-            work_item,
-        }).collect())
+    async fn claim_compaction_work_items(
+        &mut self,
+        org_info: &OrgInfo,
+    ) -> Result<Vec<ClaimedCompactionWorkItem>, ServiceApiError> {
+        Ok(
+            EphemeralServiceImpl::get_compaction_work_items(self, org_info)
+                .await?
+                .into_iter()
+                .map(|(table_name, work_item)| ClaimedCompactionWorkItem {
+                    claim: MetadataClaimKind::ProcessLocal,
+                    table_name,
+                    work_item,
+                })
+                .collect(),
+        )
     }
 
-    async fn claim_cleanup_work_items(&mut self, org_info: &OrgInfo) -> Result<Vec<ClaimedCleanupWorkItem>, ServiceApiError> {
-        Ok(EphemeralServiceImpl::get_cleanup_work_items(self, org_info).await?.into_iter().map(|work_item|ClaimedCleanupWorkItem {
-            claim: MetadataClaimKind::ProcessLocal,
-            work_item,
-        }).collect())
+    async fn claim_cleanup_work_items(
+        &mut self,
+        org_info: &OrgInfo,
+    ) -> Result<Vec<ClaimedCleanupWorkItem>, ServiceApiError> {
+        Ok(EphemeralServiceImpl::get_cleanup_work_items(self, org_info)
+            .await?
+            .into_iter()
+            .map(|work_item| ClaimedCleanupWorkItem {
+                claim: MetadataClaimKind::ProcessLocal,
+                work_item,
+            })
+            .collect())
     }
 
     async fn advance_published_checkpoints(&mut self) -> Result<bool, ServiceApiError> {

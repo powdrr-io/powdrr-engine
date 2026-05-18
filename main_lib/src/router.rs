@@ -777,6 +777,7 @@ pub(crate) mod tests {
                     file_path: format!("file://{}", parquet_path.display()),
                     record_count: Some(2),
                     columns: vec![],
+                    row_groups: vec![],
                 }],
             }),
             speedboat_metadata: None,

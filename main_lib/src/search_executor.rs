@@ -1,13 +1,14 @@
 use crate::elastic_search_commands::{SqlCommand, UpdateByQueryCommand};
 use crate::elastic_search_common::{
-    Command, CommandContext, ElasticSearchResponse, ParseError, ResultGeneratorFuture,
-    execute_command,
+    execute_command, Command, CommandContext, ElasticSearchResponse, ParseError,
+    ResultGeneratorFuture,
 };
 use crate::elastic_search_datetime_parser;
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::elastic_search_responses::{
-    AggregationResult, AverageAggregationResult, FilterAggregationResult, QueryFailure,
-    QueryResults, TermAggregationBucket, TermAggregationResult, compare_query_result_hits_desc,
+    compare_query_result_hits_desc, AggregationResult, AverageAggregationResult,
+    FilterAggregationResult, QueryFailure, QueryResults, TermAggregationBucket,
+    TermAggregationResult,
 };
 use crate::peers::{
     CheckpointDescriptor, PrivateInvocation, PrivateSearchAggregationFilterSpec,
@@ -178,9 +179,8 @@ impl SearchCommand {
         &self,
         legacy_command: &SqlCommand,
     ) -> Vec<CheckpointDescriptor> {
-        let extension = legacy_command.calculate_score.then(|| "es".to_string());
         match STATE_PROVIDER
-            .get_latest_checkpoint(&legacy_command.table, extension)
+            .get_latest_servable_checkpoint(&legacy_command.table)
             .await
         {
             Ok(Some(checkpoint_id)) => {
