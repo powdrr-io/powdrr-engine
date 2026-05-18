@@ -18,7 +18,6 @@ use aws_config::{BehaviorVersion, Region};
 use aws_sdk_dynamodb::Client;
 use modyne::TestTableExt;
 use modyne::model::TransactWrite;
-use modyne::model::TransactWrite;
 use std::collections::{HashMap, HashSet};
 
 const LEASE_LENGTH_MS: i64 = 60 * 1000; // 1 minute
