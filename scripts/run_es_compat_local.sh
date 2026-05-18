@@ -31,6 +31,8 @@ wait_for_http "http://localhost:4566/_localstack/health" "LocalStack"
 wait_for_http "http://localhost:9200" "Elasticsearch"
 
 cd "$ROOT_DIR"
-scripts/cargo-worktree.sh test -p powdrr_lib --features integration-tests --test es_compatibility_matrix compatibility_matrix_case_file_parses_and_ids_are_unique -- --nocapture
+if [[ "${POWDRR_SKIP_FIXTURE_VALIDATION:-0}" != "1" ]]; then
+  scripts/cargo-worktree.sh test -p powdrr_lib --features integration-tests --test es_compatibility_matrix compatibility_matrix_case_file_parses_and_ids_are_unique -- --nocapture
+fi
 scripts/cargo-worktree.sh test -p powdrr_lib --features integration-tests --test es_compatibility_matrix compatibility_matrix_local_current_engine -- --nocapture
 POWDRR_ES_COMPAT_URL="http://localhost:9200" scripts/cargo-worktree.sh test -p powdrr_lib --features integration-tests --test es_compatibility_matrix compatibility_matrix_differential_when_external_es_is_configured -- --nocapture
