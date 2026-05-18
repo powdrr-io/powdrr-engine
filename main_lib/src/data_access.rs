@@ -18,26 +18,26 @@ use datafusion::{
 };
 use futures::stream::{self, StreamExt};
 use futures_util::TryStreamExt;
-use iceberg::Catalog;
 use iceberg::arrow::ArrowFileReader;
 use iceberg::io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY};
 use iceberg::spec::{DataContentType, DataFile, Literal, ManifestContentType, PrimitiveType, Type};
 use iceberg::table::Table;
 use iceberg::transaction::ApplyTransactionAction;
+use iceberg::Catalog;
 use iceberg::{NamespaceIdent, TableCreation, TableIdent};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use idgenerator::IdInstance;
 #[cfg(target_os = "linux")]
-use liquid_cache_parquet::LiquidCacheLocalBuilder;
-#[cfg(target_os = "linux")]
 use liquid_cache_parquet::storage::cache::squeeze_policies::Evict;
 #[cfg(target_os = "linux")]
 use liquid_cache_parquet::storage::cache_policies::LiquidPolicy;
+#[cfg(target_os = "linux")]
+use liquid_cache_parquet::LiquidCacheLocalBuilder;
 use lru_mem::{HeapSize, LruCache, TryInsertError};
 use object_store::client::SpawnedReqwestConnector;
 use object_store::{
-    ObjectStoreExt, PutPayload,
     aws::{AmazonS3, AmazonS3Builder},
+    ObjectStoreExt, PutPayload,
 };
 use parquet_55::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet_55::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
@@ -51,7 +51,7 @@ use std::{path::Path, sync::Arc};
 #[cfg(target_os = "linux")]
 use tempfile::TempDir;
 use tokio::runtime::Handle;
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinSet;
 use url::Url;
 
@@ -1748,6 +1748,10 @@ async fn load_parquet_files_as_table(
         ));
     }
 
+    if file_paths.len() == 1 {
+        return load_parquet_file_as_table(data_fusion_context, &file_paths[0], local_name).await;
+    }
+
     tracing::info!(
         "Loading {} PARQUET files into {}",
         file_paths.len(),
@@ -2478,7 +2482,11 @@ fn select_stat_bound<'a, T>(
     max: Option<&'a T>,
     lower_bound: bool,
 ) -> Option<&'a T> {
-    if lower_bound { min } else { max }
+    if lower_bound {
+        min
+    } else {
+        max
+    }
 }
 
 fn scalar_bool_to_json(value: bool) -> Option<serde_json::Value> {
@@ -2572,14 +2580,20 @@ pub(crate) fn s3_ingest_base_path() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        IcebergLibMetadata, IcebergTableMetadataCache, IcebergTableRowGroupStatsTracker,
-        ParquetRowGroupStatsCache,
+        drop, execute_sql_async, load_files_as_table, IcebergLibMetadata,
+        IcebergTableMetadataCache, IcebergTableRowGroupStatsTracker, ParquetRowGroupStatsCache,
+        RecordBatch,
     };
     use crate::data_contract::{IcebergColumnStats, IcebergRowGroupStats};
+    use datafusion::arrow::array::{Int64Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::parquet::arrow::ArrowWriter;
     use iceberg::spec::Schema;
     use serde_json::Value;
     use std::collections::HashSet;
+    use std::fs::File;
     use std::sync::Arc;
+    use tempfile::TempDir;
 
     fn sample_row_group_stats(index: usize) -> Vec<IcebergRowGroupStats> {
         vec![IcebergRowGroupStats {
@@ -2736,5 +2750,52 @@ mod tests {
 
         assert!(cache.get("default/logs", 10).is_none());
         assert!(cache.get("default/metrics", 11).is_some());
+    }
+
+    #[tokio::test]
+    async fn load_files_as_table_reads_single_local_parquet_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let parquet_path = temp_dir.path().join("single-file.parquet");
+
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            Field::new("tenant", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["acme", "globex"])),
+                Arc::new(Int64Array::from(vec![10_i64, 20_i64])),
+            ],
+        )
+        .unwrap();
+
+        let file = File::create(&parquet_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let table_name = "single_local_parquet_test".to_string();
+        let file_url = format!("file://{}", parquet_path.display());
+        load_files_as_table(&table_name, &vec![file_url], schema.as_ref())
+            .await
+            .unwrap();
+
+        let sql = format!("SELECT COUNT(*) AS count FROM {}", table_name);
+        let batches = execute_sql_async(&sql).await.unwrap();
+        let count = batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0)
+            })
+            .sum::<i64>();
+
+        assert_eq!(count, 2);
+        drop(&table_name).await;
     }
 }

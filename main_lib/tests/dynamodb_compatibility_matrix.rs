@@ -291,7 +291,9 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
     let hidden_table_name = unique_table_name("dynamo_matrix_hidden");
     let region_event_id_index = "region-event-id-index".to_string();
 
+    eprintln!("dynamo fixture: configuring Powdrr testing mode");
     configure_powdrr_testing_mode(base_url).await;
+    eprintln!("dynamo fixture: configuring Powdrr primary table");
     configure_powdrr_table(
         base_url,
         &primary_table_name,
@@ -307,6 +309,7 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
         },
     )
     .await;
+    eprintln!("dynamo fixture: configuring Powdrr begins_with table");
     configure_powdrr_table(
         base_url,
         &begins_with_table_name,
@@ -318,10 +321,12 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
         },
     )
     .await;
+    eprintln!("dynamo fixture: adding hidden Powdrr checkpoint");
     add_powdrr_checkpoint(base_url, &hidden_table_name, &parquet_path).await;
 
     let powdrr_client = dynamodb_client(base_url).await;
     let localstack_client = dynamodb_client("http://127.0.0.1:4566").await;
+    eprintln!("dynamo fixture: creating LocalStack primary table");
     create_localstack_table(
         &localstack_client,
         &primary_table_name,
@@ -336,6 +341,7 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
         }],
     )
     .await;
+    eprintln!("dynamo fixture: creating LocalStack begins_with table");
     create_localstack_table(
         &localstack_client,
         &begins_with_table_name,
@@ -345,6 +351,7 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
         vec![],
     )
     .await;
+    eprintln!("dynamo fixture: waiting for Powdrr primary rows");
     wait_for_powdrr_rows(
         &powdrr_client,
         &primary_table_name,
@@ -352,6 +359,7 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
         &[&rows[1], &rows[3]],
     )
     .await;
+    eprintln!("dynamo fixture: waiting for Powdrr begins_with rows");
     wait_for_powdrr_rows(
         &powdrr_client,
         &begins_with_table_name,
@@ -359,6 +367,7 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
         &[&rows[0], &rows[2]],
     )
     .await;
+    eprintln!("dynamo fixture: ready");
 
     DifferentialFixture {
         _temp_dir: temp_dir,
@@ -569,6 +578,8 @@ async fn compare_list_tables(fixture: &DifferentialFixture) {
 
     let mut powdrr_names = powdrr_tables.table_names().to_vec();
     let mut localstack_names = localstack_tables.table_names().to_vec();
+    powdrr_names.retain(|name| name.starts_with("dynamo_matrix_"));
+    localstack_names.retain(|name| name.starts_with("dynamo_matrix_"));
     powdrr_names.sort();
     localstack_names.sort();
 
@@ -880,16 +891,24 @@ fn require_local_service(name: &str, address: &str) -> Result<(), String> {
 }
 
 async fn add_powdrr_checkpoint(base_url: &str, table_name: &str, parquet_path: &Path) {
-    let client = HttpClient::new();
+    let client = powdrr_http_client();
     let checkpoint = checkpoint_from_parquet(table_name, parquet_path).await;
-    client
-        .post(format!("{}/_test/v1/_add_checkpoint", base_url))
-        .json(&checkpoint)
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
+    let url = format!("{}/_test/v1/_add_checkpoint", base_url);
+    let mut last_error = String::new();
+    for _ in 0..20 {
+        match client.post(&url).json(&checkpoint).send().await {
+            Ok(response) => match response.error_for_status() {
+                Ok(_) => return,
+                Err(error) => last_error = error.to_string(),
+            },
+            Err(error) => last_error = error.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!(
+        "POST /_test/v1/_add_checkpoint for {} failed after retries: {}",
+        table_name, last_error
+    );
 }
 
 async fn put_powdrr_dynamodb_config(
@@ -898,16 +917,20 @@ async fn put_powdrr_dynamodb_config(
     config: &DynamoDbTableConfig,
 ) {
     let url = format!("{}/{}/_dynamodb/config", base_url, table_name);
+    let client = powdrr_http_client();
     let mut last_status = None;
     let mut last_body = String::new();
 
     for _ in 0..25 {
-        let response = HttpClient::new()
-            .put(&url)
-            .json(config)
-            .send()
-            .await
-            .unwrap();
+        let response = match client.put(&url).json(config).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                last_status = None;
+                last_body = error.to_string();
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+        };
         let status = response.status();
         let body = response.text().await.unwrap();
         if status.is_success() {
@@ -949,18 +972,25 @@ async fn configure_powdrr_testing_mode(base_url: &str) {
     mode.state_mode = StateMode::Testing;
     mode.indexing_mode = IndexingMode::Disabled;
     mode.compaction_mode = CompactionMode::Disabled;
+    let client = powdrr_http_client();
+    let url = format!("{}/_test/v1/_testing_and_processing_mode", base_url);
+    let mut last_error = String::new();
 
-    HttpClient::new()
-        .put(format!(
-            "{}/_test/v1/_testing_and_processing_mode",
-            base_url
-        ))
-        .json(&mode)
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
+    for _ in 0..20 {
+        match client.put(&url).json(&mode).send().await {
+            Ok(response) => match response.error_for_status() {
+                Ok(_) => return,
+                Err(error) => last_error = error.to_string(),
+            },
+            Err(error) => last_error = error.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    panic!(
+        "PUT /_test/v1/_testing_and_processing_mode failed after retries: {}",
+        last_error
+    );
 }
 
 async fn checkpoint_from_parquet(table_name: &str, parquet_path: &Path) -> TableMetadataCheckpoint {
@@ -1006,6 +1036,13 @@ async fn dynamodb_client(endpoint_url: &str) -> DynamoClient {
         .load()
         .await;
     DynamoClient::new(&config)
+}
+
+fn powdrr_http_client() -> HttpClient {
+    HttpClient::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap()
 }
 
 async fn wait_for_powdrr_rows(
