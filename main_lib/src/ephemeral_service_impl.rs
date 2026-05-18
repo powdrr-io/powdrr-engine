@@ -1,16 +1,22 @@
-use std::collections::HashMap;
-use idgenerator::IdInstance;
-use crate::data_contract::{CleanupCommit, CleanupWorkItem, CompactionWorkItemTracker, CreateIndexTemplateBody, IcebergMetadata, OrgInfo, OrgSettings};
+use crate::data_contract::{
+    CleanupCommit, CleanupWorkItem, CompactionWorkItemTracker, CreateIndexTemplateBody,
+    IcebergMetadata, OrgInfo, OrgSettings,
+};
+use crate::data_contract::{
+    CompactionCommit, CompactionWorkItem, CreateTable, DeletesMetadata, ExtensionCommit,
+    ExtensionFile, ExtensionWorkItem, FileSetPayload, IcebergCommit, SpeedboatCommit,
+    SpeedboatCommitTableInfo, SpeedboatMetadata, TableDescription, TableMetadataCheckpoint,
+};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
+use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
 use crate::schema_massager::PowdrrSchema;
-use crate::data_contract::{CompactionCommit, CompactionWorkItem, CreateTable, DeletesMetadata, ExtensionCommit, ExtensionFile, ExtensionWorkItem, FileSetPayload, IcebergCommit, SpeedboatCommit, SpeedboatCommitTableInfo, SpeedboatMetadata, TableDescription, TableMetadataCheckpoint};
 use crate::state_provider::ServiceApiError;
-use crate::peers::{CheckpointDescriptor};
 use crate::test_api::TestProcessingMode;
+use idgenerator::IdInstance;
+use std::collections::HashMap;
 
 type CommittedCheckpoints = HashMap<String, String>;
-
 
 pub struct EphemeralServiceImpl {
     mode: TestProcessingMode,
@@ -33,7 +39,7 @@ pub struct EphemeralServiceImpl {
 
 impl EphemeralServiceImpl {
     pub fn new(mode: TestProcessingMode) -> Self {
-        EphemeralServiceImpl{
+        EphemeralServiceImpl {
             mode: mode,
             tables: HashMap::new(),
             table_aliases: HashMap::new(),
@@ -52,26 +58,45 @@ impl EphemeralServiceImpl {
         }
     }
 
-    fn checkpoints_needing_extension_work(&self, table_name: &String, extension_name: &String) -> Option<Vec<String>> {
-        self.checkpoints_needing_extension_work.get(&format!("{}_{}", table_name, extension_name)).cloned()
+    fn checkpoints_needing_extension_work(
+        &self,
+        table_name: &String,
+        extension_name: &String,
+    ) -> Option<Vec<String>> {
+        self.checkpoints_needing_extension_work
+            .get(&format!("{}_{}", table_name, extension_name))
+            .cloned()
     }
 
-    fn recent_file_extension_metadata(&self, table_name: &String, extension_name: &String, file_name: &String) -> Option<Vec<ExtensionFile>> {
-        self.recent_file_extension_metadata.get(&format!("{}_{}_{}", table_name, extension_name, file_name)).cloned()
+    fn recent_file_extension_metadata(
+        &self,
+        table_name: &String,
+        extension_name: &String,
+        file_name: &String,
+    ) -> Option<Vec<ExtensionFile>> {
+        self.recent_file_extension_metadata
+            .get(&format!("{}_{}_{}", table_name, extension_name, file_name))
+            .cloned()
     }
 
     fn add_recent_extension_files(&mut self, table_name: &String, commit: &ExtensionCommit) -> () {
         for (file_name, extension_files) in commit.files.iter() {
             self.recent_file_extension_metadata.insert(
                 format!("{}_{}_{}", table_name, commit.extension, file_name),
-                extension_files.clone()
+                extension_files.clone(),
             );
         }
     }
 
-    fn try_fill_checkpoint_extension_metadata(&mut self, extension_name: &String, metadata: &mut TableMetadataCheckpoint) -> (FileSetPayload, FileSetPayload) {
+    fn try_fill_checkpoint_extension_metadata(
+        &mut self,
+        extension_name: &String,
+        metadata: &mut TableMetadataCheckpoint,
+    ) -> (FileSetPayload, FileSetPayload) {
         if !metadata.extension_metadata.contains_key(extension_name) {
-            metadata.extension_metadata.insert(extension_name.clone(), HashMap::new());
+            metadata
+                .extension_metadata
+                .insert(extension_name.clone(), HashMap::new());
         }
 
         let extension_metadata = metadata.extension_metadata.get_mut(extension_name).unwrap();
@@ -80,48 +105,69 @@ impl EphemeralServiceImpl {
         match metadata.iceberg_metadata.as_ref() {
             Some(im) => {
                 for file_desc in im.files.as_file_tuples() {
-                    match self.recent_file_extension_metadata(&metadata.table_name, extension_name, &file_desc.file_path) {
+                    match self.recent_file_extension_metadata(
+                        &metadata.table_name,
+                        extension_name,
+                        &file_desc.file_path,
+                    ) {
                         Some(metadata) => {
                             extension_metadata.insert(file_desc.file_path.clone(), metadata);
-                        },
+                        }
                         None => {
                             iceberg_file_set.add(&file_desc);
                         }
                     }
                 }
-            },
-            None => ()
+            }
+            None => (),
         };
 
         let mut speedboat_file_set = FileSetPayload::new();
         match metadata.speedboat_metadata.as_ref() {
             Some(im) => {
                 for file_desc in im.files.as_file_tuples() {
-                    match self.recent_file_extension_metadata(&metadata.table_name, extension_name, &file_desc.file_path) {
+                    match self.recent_file_extension_metadata(
+                        &metadata.table_name,
+                        extension_name,
+                        &file_desc.file_path,
+                    ) {
                         Some(metadata) => {
                             extension_metadata.insert(file_desc.file_path.clone(), metadata);
-                        },
+                        }
                         None => {
                             speedboat_file_set.add(&file_desc);
                         }
                     }
                 }
-            },
-            None => ()
+            }
+            None => (),
         };
 
         (speedboat_file_set, iceberg_file_set)
     }
 
     #[allow(dead_code)]
-    fn set_latest_committed_checkpoint_id(&mut self, extension: Option<String>, table_name: &String, checkpoint_id: &String) -> () {
+    fn set_latest_committed_checkpoint_id(
+        &mut self,
+        extension: Option<String>,
+        table_name: &String,
+        checkpoint_id: &String,
+    ) -> () {
         if !self.latest_committed_checkpoint_id.contains_key(&extension) {
-            self.latest_committed_checkpoint_id.insert(extension.clone(), HashMap::new());
+            self.latest_committed_checkpoint_id
+                .insert(extension.clone(), HashMap::new());
         }
-        self.latest_committed_checkpoint_id.get_mut(&extension).unwrap().insert(table_name.clone(), checkpoint_id.clone());
+        self.latest_committed_checkpoint_id
+            .get_mut(&extension)
+            .unwrap()
+            .insert(table_name.clone(), checkpoint_id.clone());
     }
 
-    pub async fn add_checkpoint(&mut self, _org_info: &OrgInfo, metadata: &TableMetadataCheckpoint) -> Result<(), ServiceApiError> {
+    pub async fn add_checkpoint(
+        &mut self,
+        _org_info: &OrgInfo,
+        metadata: &TableMetadataCheckpoint,
+    ) -> Result<(), ServiceApiError> {
         // To make testing a little easier, we'll just magic up a table as necessary
         if !self.tables.contains_key(&metadata.table_name) {
             self.tables.insert(
@@ -131,17 +177,26 @@ impl EphemeralServiceImpl {
                     tags: Default::default(),
                     serving: None,
                     dynamodb: None,
-                }
+                    mongodb: None,
+                },
             );
         }
         let key = format!("{}_{}", &metadata.table_name, &metadata.checkpoint_id);
         if !self.checkpoints.contains_key(&key) {
             self.checkpoints.insert(key, metadata.clone());
         }
-        self.set_latest_committed_checkpoint_id(None, &metadata.table_name, &metadata.checkpoint_id);
+        self.set_latest_committed_checkpoint_id(
+            None,
+            &metadata.table_name,
+            &metadata.checkpoint_id,
+        );
         if metadata.extension_metadata.len() > 0 {
             for extension in metadata.extension_metadata.keys() {
-                self.set_latest_committed_checkpoint_id(Some(extension.clone()), &metadata.table_name, &metadata.checkpoint_id);
+                self.set_latest_committed_checkpoint_id(
+                    Some(extension.clone()),
+                    &metadata.table_name,
+                    &metadata.checkpoint_id,
+                );
             }
         } else {
             self.fill_extension_work_item(
@@ -149,8 +204,14 @@ impl EphemeralServiceImpl {
                 &"es".to_string(),
                 &metadata.checkpoint_id,
                 &metadata.schema,
-                metadata.speedboat_metadata.as_ref().map_or(&FileSetPayload::new(), |m|&m.files),
-                metadata.iceberg_metadata.as_ref().map_or(&FileSetPayload::new(), |m|&m.files)
+                metadata
+                    .speedboat_metadata
+                    .as_ref()
+                    .map_or(&FileSetPayload::new(), |m| &m.files),
+                metadata
+                    .iceberg_metadata
+                    .as_ref()
+                    .map_or(&FileSetPayload::new(), |m| &m.files),
             )
         }
         Ok(())
@@ -169,7 +230,10 @@ impl EphemeralServiceImpl {
             return;
         }
 
-        let es_work_items = self.extension_work_items.get_mut(&"es".to_string()).unwrap();
+        let es_work_items = self
+            .extension_work_items
+            .get_mut(&"es".to_string())
+            .unwrap();
         if !es_work_items.contains_key(table_name) {
             es_work_items.insert(
                 table_name.clone(),
@@ -179,81 +243,124 @@ impl EphemeralServiceImpl {
                     table_name: table_name.clone(),
                     table_schema: schema.clone(),
                     speedboat_files: speedboat_files.clone(),
-                    iceberg_files: iceberg_files.clone()
-                }
+                    iceberg_files: iceberg_files.clone(),
+                },
             );
         } else {
             let table_work_item = es_work_items.get_mut(table_name).unwrap();
             table_work_item.table_schema = schema.clone();
-            table_work_item.speedboat_files = table_work_item.speedboat_files.merge(speedboat_files);
+            table_work_item.speedboat_files =
+                table_work_item.speedboat_files.merge(speedboat_files);
             table_work_item.iceberg_files = table_work_item.iceberg_files.merge(&iceberg_files);
         }
         let key = format!("{}_{}", table_name, extension);
         if !self.checkpoints_needing_extension_work.contains_key(&key) {
-            self.checkpoints_needing_extension_work.insert(key, vec![checkpoint_id.clone()]);
+            self.checkpoints_needing_extension_work
+                .insert(key, vec![checkpoint_id.clone()]);
         } else {
-            self.checkpoints_needing_extension_work.get_mut(&key).unwrap().push(checkpoint_id.clone());
+            self.checkpoints_needing_extension_work
+                .get_mut(&key)
+                .unwrap()
+                .push(checkpoint_id.clone());
         }
     }
 
-    fn handle_compactions(&mut self, compactions: &Vec<String>, checkpoint: &mut TableMetadataCheckpoint) -> () {
+    fn handle_compactions(
+        &mut self,
+        compactions: &Vec<String>,
+        checkpoint: &mut TableMetadataCheckpoint,
+    ) -> () {
         // TODO: remove this method and use the one on TableMetadataCheckpoint
         for compaction in compactions {
             self.handle_compaction(&Some(compaction.clone()), checkpoint);
         }
     }
 
-    fn handle_compaction(&mut self, compaction: &Option<String>, checkpoint: &mut TableMetadataCheckpoint) -> () {
+    fn handle_compaction(
+        &mut self,
+        compaction: &Option<String>,
+        checkpoint: &mut TableMetadataCheckpoint,
+    ) -> () {
         // TODO: remove this method and use the one on TableMetadataCheckpoint
         if compaction.is_none() {
             return;
         }
 
-        let (_table_name, compaction_obj) = self.compactions.get(compaction.as_ref().unwrap()).unwrap();
+        let (_table_name, compaction_obj) =
+            self.compactions.get(compaction.as_ref().unwrap()).unwrap();
 
         match checkpoint.speedboat_metadata.as_mut() {
             Some(speedboat) => {
-                speedboat.files.remove(&compaction_obj.removed_speedboat_files);
-            },
-            None => ()
+                speedboat
+                    .files
+                    .remove(&compaction_obj.removed_speedboat_files);
+            }
+            None => (),
         };
 
         match checkpoint.deletes_metadata.as_mut() {
             Some(deletes) => {
-                deletes.files.retain(|x|!compaction_obj.removed_delete_files.contains(x));
-            },
-            None => ()
+                deletes
+                    .files
+                    .retain(|x| !compaction_obj.removed_delete_files.contains(x));
+            }
+            None => (),
         };
 
         for metadata in checkpoint.extension_metadata.values_mut() {
-            metadata.retain(|key, _|!compaction_obj.removed_speedboat_files.contains(key));
+            metadata.retain(|key, _| !compaction_obj.removed_speedboat_files.contains(key));
         }
     }
 
-    fn get_latest_committed_checkpoint_sync(&mut self, table_name: &String, extensions: Option<String>) -> Option<String> {
+    fn get_latest_committed_checkpoint_sync(
+        &mut self,
+        table_name: &String,
+        extensions: Option<String>,
+    ) -> Option<String> {
         let real_table_name = self.table_aliases.get(table_name).unwrap_or(table_name);
-        self.latest_committed_checkpoint_id.get(&extensions).map_or(None, |c| c.get(real_table_name).cloned())
+        self.latest_committed_checkpoint_id
+            .get(&extensions)
+            .map_or(None, |c| c.get(real_table_name).cloned())
     }
 
-    fn set_latest_committed_checkpoint(&mut self, table_name: &String, extensions: Option<String>, checkpoint_id: &String) {
+    fn set_latest_committed_checkpoint(
+        &mut self,
+        table_name: &String,
+        extensions: Option<String>,
+        checkpoint_id: &String,
+    ) {
         let real_table_name = self.table_aliases.get(table_name).unwrap_or(table_name);
-        if !self.latest_committed_checkpoint_id.contains_key(&extensions) {
-            self.latest_committed_checkpoint_id.insert(extensions.clone(), HashMap::new());
+        if !self
+            .latest_committed_checkpoint_id
+            .contains_key(&extensions)
+        {
+            self.latest_committed_checkpoint_id
+                .insert(extensions.clone(), HashMap::new());
         }
-        self.latest_committed_checkpoint_id.get_mut(&extensions).unwrap().insert(real_table_name.clone(), checkpoint_id.clone());
+        self.latest_committed_checkpoint_id
+            .get_mut(&extensions)
+            .unwrap()
+            .insert(real_table_name.clone(), checkpoint_id.clone());
     }
 
-    async fn speedboat_commit_type_commit(&mut self, table_info: &SpeedboatCommitTableInfo, compaction: &Option<String>) -> Result<(), ServiceApiError> {
-        let latest_checkpoint = match self.get_latest_committed_checkpoint_sync(&table_info.table_name, None) {
-            Some(checkpoint_id) => {
-                let key = format!("{}_{}", &table_info.table_name, checkpoint_id);
-                match self.checkpoints.get(&key) {
-                    Some(c) => c,
-                    None => panic!("Found latest checkpoint id but checkpoint missing = {}", key)
+    async fn speedboat_commit_type_commit(
+        &mut self,
+        table_info: &SpeedboatCommitTableInfo,
+        compaction: &Option<String>,
+    ) -> Result<(), ServiceApiError> {
+        let latest_checkpoint =
+            match self.get_latest_committed_checkpoint_sync(&table_info.table_name, None) {
+                Some(checkpoint_id) => {
+                    let key = format!("{}_{}", &table_info.table_name, checkpoint_id);
+                    match self.checkpoints.get(&key) {
+                        Some(c) => c,
+                        None => panic!(
+                            "Found latest checkpoint id but checkpoint missing = {}",
+                            key
+                        ),
+                    }
                 }
-            },
-            None => {
-                &TableMetadataCheckpoint {
+                None => &TableMetadataCheckpoint {
                     table_name: table_info.table_name.clone(),
                     original_checkpoint_id: None,
                     checkpoint_id: "".to_string(),
@@ -261,10 +368,9 @@ impl EphemeralServiceImpl {
                     speedboat_metadata: None,
                     deletes_metadata: None,
                     extension_metadata: HashMap::new(),
-                    schema: table_info.schema.as_ref().unwrap().clone()
-                }
-            },
-        };
+                    schema: table_info.schema.as_ref().unwrap().clone(),
+                },
+            };
 
         let new_checkpoint_id = IdInstance::next_id().to_string();
         let new_speedboat_metadata = match &latest_checkpoint.speedboat_metadata {
@@ -272,14 +378,12 @@ impl EphemeralServiceImpl {
                 files: FileSetPayload {
                     file_paths: table_info.files.clone(),
                     sizes: table_info.sizes.clone(),
-                    schemas: vec!(table_info.schema.as_ref().unwrap().clone()),
+                    schemas: vec![table_info.schema.as_ref().unwrap().clone()],
                     file_schemas: table_info.files.iter().map(|_| 0).collect(),
-                }
+                },
             },
-            Some(existing) => {
-                SpeedboatMetadata {
-                    files: existing.files.merge(&table_info.as_file_set_payload())
-                }
+            Some(existing) => SpeedboatMetadata {
+                files: existing.files.merge(&table_info.as_file_set_payload()),
             },
         };
 
@@ -290,7 +394,7 @@ impl EphemeralServiceImpl {
 
         let mut new_latest_checkpoint = TableMetadataCheckpoint {
             table_name: table_info.table_name.clone(),
-            original_checkpoint_id: None,            
+            original_checkpoint_id: None,
             checkpoint_id: new_checkpoint_id.clone(),
             iceberg_metadata: latest_checkpoint.iceberg_metadata.clone(),
             speedboat_metadata: Some(new_speedboat_metadata.clone()),
@@ -300,9 +404,13 @@ impl EphemeralServiceImpl {
         };
 
         self.handle_compaction(compaction, &mut new_latest_checkpoint);
-        let (speedboat_files, iceberg_files) = self.try_fill_checkpoint_extension_metadata(&"es".to_string(), &mut new_latest_checkpoint);
+        let (speedboat_files, iceberg_files) = self
+            .try_fill_checkpoint_extension_metadata(&"es".to_string(), &mut new_latest_checkpoint);
 
-        self.checkpoints.insert(format!("{}_{}", &table_info.table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
+        self.checkpoints.insert(
+            format!("{}_{}", &table_info.table_name, &new_checkpoint_id),
+            new_latest_checkpoint.clone(),
+        );
 
         self.fill_extension_work_item(
             &table_info.table_name,
@@ -310,7 +418,7 @@ impl EphemeralServiceImpl {
             &new_checkpoint_id,
             &merged_schema,
             &speedboat_files,
-            &iceberg_files
+            &iceberg_files,
         );
 
         self.set_latest_committed_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
@@ -319,7 +427,11 @@ impl EphemeralServiceImpl {
         Ok(())
     }
 
-    fn replace_and_delete_checkpoints(&mut self, compaction: &String, iceberg_metadata: &IcebergMetadata) -> CleanupWorkItem {
+    fn replace_and_delete_checkpoints(
+        &mut self,
+        compaction: &String,
+        iceberg_metadata: &IcebergMetadata,
+    ) -> CleanupWorkItem {
         let (table_name, compaction_obj) = self.compactions.get(compaction).unwrap();
 
         let checkpoint_key = format!("{}_{}", table_name, compaction_obj.checkpoint_id_to_replace);
@@ -337,9 +449,12 @@ impl EphemeralServiceImpl {
         match self.compaction_work_items.get(table_name) {
             Some(tracker) => {
                 assert!(tracker.in_progress);
-                assert_eq!(tracker.work_item.checkpoint_id_to_replace, compaction_obj.checkpoint_id_to_replace);
+                assert_eq!(
+                    tracker.work_item.checkpoint_id_to_replace,
+                    compaction_obj.checkpoint_id_to_replace
+                );
                 self.compaction_work_items.remove(table_name);
-            },
+            }
             None => {
                 panic!("Compaction work item missing = {}", table_name);
             }
@@ -348,14 +463,25 @@ impl EphemeralServiceImpl {
         CleanupWorkItem {
             id: IdInstance::next_id().to_string(),
             table_name: table_name.clone(),
-            files_to_delete: compaction_obj.removed_speedboat_files.iter().chain(compaction_obj.removed_delete_files.iter()).map(|x|x.clone()).collect(),
+            files_to_delete: compaction_obj
+                .removed_speedboat_files
+                .iter()
+                .chain(compaction_obj.removed_delete_files.iter())
+                .map(|x| x.clone())
+                .collect(),
         }
     }
 
     fn maybe_create_compaction_work_item(&mut self, checkpoint: &TableMetadataCheckpoint) -> () {
         // If we have a work item waiting, then we just wait for that to happen before creating a new one.
-        if self.compaction_work_items.contains_key(&checkpoint.table_name) {
-            self.not_compacted_checkpoint_ids.get_mut(&checkpoint.table_name).unwrap().push(checkpoint.checkpoint_id.clone());
+        if self
+            .compaction_work_items
+            .contains_key(&checkpoint.table_name)
+        {
+            self.not_compacted_checkpoint_ids
+                .get_mut(&checkpoint.table_name)
+                .unwrap()
+                .push(checkpoint.checkpoint_id.clone());
             return;
         }
 
@@ -367,33 +493,47 @@ impl EphemeralServiceImpl {
         // If the files in the speedboat metadata surpass the compaction threshold then make a work item
         let speedboat_files = &checkpoint.speedboat_metadata.as_ref().unwrap().files;
         let num_files_threshold = self.mode.compaction_mode.threshold();
-        let compact = speedboat_files.file_paths.len() as u64 >= num_files_threshold || speedboat_files.sizes.iter().sum::<u64>() > 30 * 1024 * 1024;
+        let compact = speedboat_files.file_paths.len() as u64 >= num_files_threshold
+            || speedboat_files.sizes.iter().sum::<u64>() > 30 * 1024 * 1024;
         if compact {
             self.compaction_work_items.insert(
                 checkpoint.table_name.clone(),
                 CompactionWorkItemTracker {
                     work_item: CompactionWorkItem::from_checkpoint(
                         checkpoint,
-                        self.not_compacted_checkpoint_ids.get(&checkpoint.table_name).as_ref().unwrap()
+                        self.not_compacted_checkpoint_ids
+                            .get(&checkpoint.table_name)
+                            .as_ref()
+                            .unwrap(),
                     ),
-                    in_progress: false
-                }
+                    in_progress: false,
+                },
             );
-            self.not_compacted_checkpoint_ids.get_mut(&checkpoint.table_name).unwrap().clear();
+            self.not_compacted_checkpoint_ids
+                .get_mut(&checkpoint.table_name)
+                .unwrap()
+                .clear();
         }
     }
 
-    async fn speedboat_commit_type_delete(&mut self, table_info: &SpeedboatCommitTableInfo, compaction: &Option<String>) -> Result<(), ServiceApiError> {
-        let latest_checkpoint = match self.get_latest_committed_checkpoint_sync(&table_info.table_name, None) {
-            Some(checkpoint_id) => {
-                let key = format!("{}_{}", &table_info.table_name, checkpoint_id);
-                match self.checkpoints.get(&key) {
-                    Some(c) => c,
-                    None => panic!("Found latest checkpoint id but checkpoint missing = {}", key)
+    async fn speedboat_commit_type_delete(
+        &mut self,
+        table_info: &SpeedboatCommitTableInfo,
+        compaction: &Option<String>,
+    ) -> Result<(), ServiceApiError> {
+        let latest_checkpoint =
+            match self.get_latest_committed_checkpoint_sync(&table_info.table_name, None) {
+                Some(checkpoint_id) => {
+                    let key = format!("{}_{}", &table_info.table_name, checkpoint_id);
+                    match self.checkpoints.get(&key) {
+                        Some(c) => c,
+                        None => panic!(
+                            "Found latest checkpoint id but checkpoint missing = {}",
+                            key
+                        ),
+                    }
                 }
-            },
-            None => {
-                &TableMetadataCheckpoint {
+                None => &TableMetadataCheckpoint {
                     table_name: table_info.table_name.clone(),
                     original_checkpoint_id: None,
                     checkpoint_id: "".to_string(),
@@ -402,9 +542,8 @@ impl EphemeralServiceImpl {
                     deletes_metadata: None,
                     extension_metadata: HashMap::new(),
                     schema: PowdrrSchema::minimal(),
-                }
-            },
-        };
+                },
+            };
 
         let new_checkpoint_id = IdInstance::next_id().to_string();
         let new_deletes_metadata = match &latest_checkpoint.deletes_metadata {
@@ -414,13 +553,14 @@ impl EphemeralServiceImpl {
             Some(existing) => {
                 let mut files = existing.files.clone();
                 files.extend(table_info.files.clone());
-                DeletesMetadata {
-                    files
-                }
+                DeletesMetadata { files }
             }
         };
 
-        tracing::info!("Delete commit has {} files", new_deletes_metadata.files.len());
+        tracing::info!(
+            "Delete commit has {} files",
+            new_deletes_metadata.files.len()
+        );
         for file in &new_deletes_metadata.files {
             tracing::info!("Delete file {}", file)
         }
@@ -438,17 +578,29 @@ impl EphemeralServiceImpl {
         self.handle_compaction(&compaction, &mut new_latest_checkpoint);
         self.try_fill_checkpoint_extension_metadata(&"es".to_string(), &mut new_latest_checkpoint);
 
-        self.checkpoints.insert(format!("{}_{}", &table_info.table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
+        self.checkpoints.insert(
+            format!("{}_{}", &table_info.table_name, &new_checkpoint_id),
+            new_latest_checkpoint.clone(),
+        );
         self.set_latest_committed_checkpoint(&table_info.table_name, None, &new_checkpoint_id);
         Ok(())
     }
 
-    fn get_checkpoint_sync(&self, table_name: &String, checkpoint_id: &String) -> Option<TableMetadataCheckpoint> {
+    fn get_checkpoint_sync(
+        &self,
+        table_name: &String,
+        checkpoint_id: &String,
+    ) -> Option<TableMetadataCheckpoint> {
         let key = format!("{}_{}", table_name, checkpoint_id);
         self.checkpoints.get(&key).cloned()
     }
 
-    fn add_coverage_for(&mut self, table_name: &String, checkpoint_id: &String, extension_commit: &ExtensionCommit) -> Option<String> {
+    fn add_coverage_for(
+        &mut self,
+        table_name: &String,
+        checkpoint_id: &String,
+        extension_commit: &ExtensionCommit,
+    ) -> Option<String> {
         let key = format!("{}_{}", table_name, checkpoint_id);
 
         let checkpoint = self.checkpoints.get_mut(&key).unwrap();
@@ -458,7 +610,10 @@ impl EphemeralServiceImpl {
         if checkpoint.fully_covered_for_extension(&extension_commit.extension) {
             let key = format!("{}_{}", table_name, extension_commit.extension);
             if self.checkpoints_needing_extension_work.contains_key(&key) {
-                self.checkpoints_needing_extension_work.get_mut(&key).unwrap().retain(|x|x != checkpoint_id);
+                self.checkpoints_needing_extension_work
+                    .get_mut(&key)
+                    .unwrap()
+                    .retain(|x| x != checkpoint_id);
             }
             Some(checkpoint_id.clone())
         } else {
@@ -470,40 +625,70 @@ impl EphemeralServiceImpl {
         Ok(self.tables.keys().cloned().collect())
     }
 
-    pub async fn create_table(&mut self, _org_info: &OrgInfo, create_table: &CreateTable) -> Result<bool, ServiceApiError> {
+    pub async fn create_table(
+        &mut self,
+        _org_info: &OrgInfo,
+        create_table: &CreateTable,
+    ) -> Result<bool, ServiceApiError> {
         match self.tables.get(&create_table.name) {
             Some(_) => {
-                self.tables.insert(create_table.name.clone(), TableDescription::from_create_table(create_table));
+                self.tables.insert(
+                    create_table.name.clone(),
+                    TableDescription::from_create_table(create_table),
+                );
             }
             None => {
-                self.tables.insert(create_table.name.clone(), TableDescription::from_create_table(create_table));
-                self.not_compacted_checkpoint_ids.insert(create_table.name.clone(), Vec::new());
+                self.tables.insert(
+                    create_table.name.clone(),
+                    TableDescription::from_create_table(create_table),
+                );
+                self.not_compacted_checkpoint_ids
+                    .insert(create_table.name.clone(), Vec::new());
             }
         }
         Ok(true)
     }
 
-    pub async fn describe_table(&mut self, _org_info: &OrgInfo, name: &String) -> Result<Option<TableDescription>, ServiceApiError> {
+    pub async fn describe_table(
+        &mut self,
+        _org_info: &OrgInfo,
+        name: &String,
+    ) -> Result<Option<TableDescription>, ServiceApiError> {
         let final_name = self.table_aliases.get(name).unwrap_or_else(|| name);
         match self.tables.get(final_name) {
             Some(d) => Ok(Some(d.clone())),
-            None => Ok(None)
+            None => Ok(None),
         }
     }
 
-    pub async fn add_alias(&mut self, _org_info: &OrgInfo, table_name: &String, alias: &String) -> Result<bool, ServiceApiError> {
+    pub async fn add_alias(
+        &mut self,
+        _org_info: &OrgInfo,
+        table_name: &String,
+        alias: &String,
+    ) -> Result<bool, ServiceApiError> {
         // TODO: check if something exists
         self.table_aliases.insert(alias.clone(), table_name.clone());
         Ok(true)
     }
 
-    pub async fn remove_alias(&mut self, _org_info: &OrgInfo, _table_name: &String, alias: &String) -> Result<bool, ServiceApiError> {
+    pub async fn remove_alias(
+        &mut self,
+        _org_info: &OrgInfo,
+        _table_name: &String,
+        alias: &String,
+    ) -> Result<bool, ServiceApiError> {
         // TODO: check if something exists
         self.table_aliases.remove(alias);
         Ok(true)
     }
 
-    pub async fn create_table_template(&mut self, _org_info: &OrgInfo, name: &String, template: &CreateIndexTemplateBody) -> Result<bool, ServiceApiError> {
+    pub async fn create_table_template(
+        &mut self,
+        _org_info: &OrgInfo,
+        name: &String,
+        template: &CreateIndexTemplateBody,
+    ) -> Result<bool, ServiceApiError> {
         match self.table_templates.get(name) {
             Some(_) => {
                 self.table_templates.remove(name);
@@ -517,14 +702,23 @@ impl EphemeralServiceImpl {
         }
     }
 
-    pub async fn describe_table_template(&mut self, _org_info: &OrgInfo, name: &String) -> Result<Option<CreateIndexTemplateBody>, ServiceApiError> {
+    pub async fn describe_table_template(
+        &mut self,
+        _org_info: &OrgInfo,
+        name: &String,
+    ) -> Result<Option<CreateIndexTemplateBody>, ServiceApiError> {
         match self.table_templates.get(name) {
             Some(d) => Ok(Some(d.clone())),
-            None => Ok(None)
+            None => Ok(None),
         }
     }
 
-    pub async fn create_pipeline(&mut self, _org_info: &OrgInfo, name: &String, pipeline: &PipelineDefinition) -> Result<bool, ServiceApiError> {
+    pub async fn create_pipeline(
+        &mut self,
+        _org_info: &OrgInfo,
+        name: &String,
+        pipeline: &PipelineDefinition,
+    ) -> Result<bool, ServiceApiError> {
         match self.pipelines.get(name) {
             Some(_) => panic!("Need to do a real error path now"),
             None => {
@@ -534,14 +728,23 @@ impl EphemeralServiceImpl {
         }
     }
 
-    pub async fn describe_pipeline(&mut self, _org_info: &OrgInfo, name: &String) -> Result<Option<PipelineDefinition>, ServiceApiError> {
+    pub async fn describe_pipeline(
+        &mut self,
+        _org_info: &OrgInfo,
+        name: &String,
+    ) -> Result<Option<PipelineDefinition>, ServiceApiError> {
         match self.pipelines.get(name) {
             Some(p) => Ok(Some(p.clone())),
-            None => Ok(None)
+            None => Ok(None),
         }
     }
 
-    pub async fn create_lifetime_policy(&mut self, _org_info: &OrgInfo, name: &String, policy: &ILMPolicyDefinition) -> Result<bool, ServiceApiError> {
+    pub async fn create_lifetime_policy(
+        &mut self,
+        _org_info: &OrgInfo,
+        name: &String,
+        policy: &ILMPolicyDefinition,
+    ) -> Result<bool, ServiceApiError> {
         match self.lifetime_policies.get(name) {
             Some(_) => panic!("Need to do a real error path now"),
             None => {
@@ -551,21 +754,33 @@ impl EphemeralServiceImpl {
         }
     }
 
-    pub async fn describe_lifetime_policy(&mut self, _org_info: &OrgInfo, name: &String) -> Result<Option<ILMPolicyDefinition>, ServiceApiError> {
+    pub async fn describe_lifetime_policy(
+        &mut self,
+        _org_info: &OrgInfo,
+        name: &String,
+    ) -> Result<Option<ILMPolicyDefinition>, ServiceApiError> {
         match self.lifetime_policies.get(name) {
             Some(p) => Ok(Some(p.clone())),
-            None => Ok(None)
+            None => Ok(None),
         }
     }
 
-
-    pub async fn speedboat_commit(&mut self, _org_info: &OrgInfo, commit: &SpeedboatCommit) -> Result<bool, ServiceApiError> {
-        assert!(commit.compaction.is_none(), "Speedboat commits do not yet support compactions");
+    pub async fn speedboat_commit(
+        &mut self,
+        _org_info: &OrgInfo,
+        commit: &SpeedboatCommit,
+    ) -> Result<bool, ServiceApiError> {
+        assert!(
+            commit.compaction.is_none(),
+            "Speedboat commits do not yet support compactions"
+        );
         for table_info in commit.type_files.iter() {
             if table_info.commit_type == "commit" || table_info.commit_type == "compact" {
-                self.speedboat_commit_type_commit(table_info, &commit.compaction).await?;
+                self.speedboat_commit_type_commit(table_info, &commit.compaction)
+                    .await?;
             } else if table_info.commit_type == "delete" {
-                self.speedboat_commit_type_delete(table_info, &commit.compaction).await?;
+                self.speedboat_commit_type_delete(table_info, &commit.compaction)
+                    .await?;
             } else {
                 panic!("Unknown Speedboat commit type")
             }
@@ -573,26 +788,32 @@ impl EphemeralServiceImpl {
         Ok(true)
     }
 
-    pub async fn iceberg_commit(&mut self, _org_info: &OrgInfo, table_name: &String, iceberg_commit: &IcebergCommit) -> Result<bool, ServiceApiError> {
+    pub async fn iceberg_commit(
+        &mut self,
+        _org_info: &OrgInfo,
+        table_name: &String,
+        iceberg_commit: &IcebergCommit,
+    ) -> Result<bool, ServiceApiError> {
         let latest_checkpoint = match self.get_latest_committed_checkpoint_sync(table_name, None) {
             Some(checkpoint_id) => {
                 let key = format!("{}_{}", table_name, checkpoint_id);
                 match self.checkpoints.get(&key) {
                     Some(c) => c,
-                    None => panic!("Found latest checkpoint id but checkpoint missing = {}", key)
+                    None => panic!(
+                        "Found latest checkpoint id but checkpoint missing = {}",
+                        key
+                    ),
                 }
-            },
-            None => {
-                &TableMetadataCheckpoint {
-                    table_name: table_name.clone(),
-                    original_checkpoint_id: None,
-                    checkpoint_id: "".to_string(),
-                    iceberg_metadata: None,
-                    speedboat_metadata: None,
-                    deletes_metadata: None,
-                    extension_metadata: HashMap::new(),
-                    schema: iceberg_commit.metadata.table_schema.clone()
-                }
+            }
+            None => &TableMetadataCheckpoint {
+                table_name: table_name.clone(),
+                original_checkpoint_id: None,
+                checkpoint_id: "".to_string(),
+                iceberg_metadata: None,
+                speedboat_metadata: None,
+                deletes_metadata: None,
+                extension_metadata: HashMap::new(),
+                schema: iceberg_commit.metadata.table_schema.clone(),
             },
         };
 
@@ -612,9 +833,13 @@ impl EphemeralServiceImpl {
             schema: merged_schema.clone(),
         };
         self.handle_compactions(&iceberg_commit.compactions, &mut new_latest_checkpoint);
-        let (speedboat_files, iceberg_files) = self.try_fill_checkpoint_extension_metadata(&"es".to_string(), &mut new_latest_checkpoint);
+        let (speedboat_files, iceberg_files) = self
+            .try_fill_checkpoint_extension_metadata(&"es".to_string(), &mut new_latest_checkpoint);
 
-        self.checkpoints.insert(format!("{}_{}", &table_name, &new_checkpoint_id), new_latest_checkpoint.clone());
+        self.checkpoints.insert(
+            format!("{}_{}", &table_name, &new_checkpoint_id),
+            new_latest_checkpoint.clone(),
+        );
         self.set_latest_committed_checkpoint(&table_name, None, &new_checkpoint_id);
 
         self.fill_extension_work_item(
@@ -623,22 +848,34 @@ impl EphemeralServiceImpl {
             &new_checkpoint_id,
             &merged_schema,
             &speedboat_files,
-            &iceberg_files
+            &iceberg_files,
         );
 
         for compaction in iceberg_commit.compactions.iter() {
-            let cleanup_work_item = self.replace_and_delete_checkpoints(compaction, &iceberg_commit.metadata);
+            let cleanup_work_item =
+                self.replace_and_delete_checkpoints(compaction, &iceberg_commit.metadata);
             self.cleanup_work_items.push(cleanup_work_item);
         }
 
         Ok(true)
     }
 
-    pub async fn extension_commit(&mut self, _org_info: &OrgInfo, table_name: &String, commit: &ExtensionCommit) -> Result<bool, ServiceApiError> {
-        let waiting_checkpoint_ids = self.checkpoints_needing_extension_work(table_name, &commit.extension).unwrap_or_else(|| vec!());
+    pub async fn extension_commit(
+        &mut self,
+        _org_info: &OrgInfo,
+        table_name: &String,
+        commit: &ExtensionCommit,
+    ) -> Result<bool, ServiceApiError> {
+        let waiting_checkpoint_ids = self
+            .checkpoints_needing_extension_work(table_name, &commit.extension)
+            .unwrap_or_else(|| vec![]);
         assert!(waiting_checkpoint_ids.len() > 0);
 
-        let removed_checkpoint_ids: Vec<String> = waiting_checkpoint_ids.iter().map(|x|self.add_coverage_for(table_name, x, commit)).flatten().collect();
+        let removed_checkpoint_ids: Vec<String> = waiting_checkpoint_ids
+            .iter()
+            .map(|x| self.add_coverage_for(table_name, x, commit))
+            .flatten()
+            .collect();
         assert!(removed_checkpoint_ids.len() > 0);
 
         let max_id = removed_checkpoint_ids.iter().max().unwrap();
@@ -648,42 +885,71 @@ impl EphemeralServiceImpl {
         match self.get_latest_committed_checkpoint_sync(table_name, Some("es".to_string())) {
             Some(latest) => {
                 if max_id > &latest {
-                    self.set_latest_committed_checkpoint(table_name, Some("es".to_string()), max_id);
+                    self.set_latest_committed_checkpoint(
+                        table_name,
+                        Some("es".to_string()),
+                        max_id,
+                    );
                 }
-            },
+            }
             None => {
                 self.set_latest_committed_checkpoint(table_name, Some("es".to_string()), max_id);
-            },
+            }
         };
         Ok(true)
     }
 
-    pub async fn compaction_commit(&mut self, _org_info: &OrgInfo, table_name: &String, commit: &CompactionCommit) -> Result<bool, ServiceApiError> {
+    pub async fn compaction_commit(
+        &mut self,
+        _org_info: &OrgInfo,
+        table_name: &String,
+        commit: &CompactionCommit,
+    ) -> Result<bool, ServiceApiError> {
         // NOTE: this just notes what the compactor is saying. We don't generate the new checkpoint
         // until we see an iceberg or speedboat commit with the new info.
-        self.compactions.insert(commit.compaction_id.clone(), (table_name.clone(), commit.clone()));
+        self.compactions.insert(
+            commit.compaction_id.clone(),
+            (table_name.clone(), commit.clone()),
+        );
         Ok(true)
     }
 
-    pub async fn cleanup_commit(&mut self, _org_info: &OrgInfo, _commit: &CleanupCommit) -> Result<bool, ServiceApiError> {
+    pub async fn cleanup_commit(
+        &mut self,
+        _org_info: &OrgInfo,
+        _commit: &CleanupCommit,
+    ) -> Result<bool, ServiceApiError> {
         Ok(true)
     }
 
-    pub async fn get_latest_committed_checkpoint(&mut self, _org_info: &OrgInfo, table_name: &String, extensions: Option<String>) -> Result<Option<String>, ServiceApiError> {
+    pub async fn get_latest_committed_checkpoint(
+        &mut self,
+        _org_info: &OrgInfo,
+        table_name: &String,
+        extensions: Option<String>,
+    ) -> Result<Option<String>, ServiceApiError> {
         Ok(self.get_latest_committed_checkpoint_sync(table_name, extensions))
     }
 
-    pub async fn get_checkpoint(&mut self, _org_info: &OrgInfo, snapshot: &CheckpointDescriptor) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
+    pub async fn get_checkpoint(
+        &mut self,
+        _org_info: &OrgInfo,
+        snapshot: &CheckpointDescriptor,
+    ) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
         match self.get_checkpoint_sync(&snapshot.table_name, &snapshot.checkpoint_id) {
             Some(v) => Ok(Some(v.clone())),
-            None => Ok(None)
+            None => Ok(None),
         }
     }
 
-    pub async fn get_extension_work_items(&mut self, _org_info: &OrgInfo, extension_type: &String) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {
+    pub async fn get_extension_work_items(
+        &mut self,
+        _org_info: &OrgInfo,
+        extension_type: &String,
+    ) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {
         if extension_type == "es" {
             // TODO: priority by index? allow index filtering?
-            let mut collected_work_items= vec!();
+            let mut collected_work_items = vec![];
             match self.extension_work_items.get_mut(extension_type) {
                 Some(items) => {
                     for (_, work_items) in items.iter_mut() {
@@ -692,17 +958,20 @@ impl EphemeralServiceImpl {
                             work_items.clear();
                         }
                     }
-                },
-                None => ()
+                }
+                None => (),
             };
             Ok(collected_work_items)
         } else {
-            Ok(vec!())
+            Ok(vec![])
         }
     }
 
-    pub async fn get_compaction_work_items(&mut self, _org_info: &OrgInfo) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
-        let mut work_items = vec!();
+    pub async fn get_compaction_work_items(
+        &mut self,
+        _org_info: &OrgInfo,
+    ) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
+        let mut work_items = vec![];
         for (table_name, compaction_tracker) in self.compaction_work_items.iter_mut() {
             if !compaction_tracker.in_progress {
                 tracing::info!("Returning compaction work item for {}", table_name);
@@ -713,7 +982,10 @@ impl EphemeralServiceImpl {
         Ok(work_items)
     }
 
-    pub async fn get_cleanup_work_items(&mut self, _org_info: &OrgInfo) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
+    pub async fn get_cleanup_work_items(
+        &mut self,
+        _org_info: &OrgInfo,
+    ) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
         let work_items = self.cleanup_work_items.clone();
         tracing::info!("Returning {} cleanup work items", work_items.len());
         self.cleanup_work_items.clear();
@@ -729,7 +1001,11 @@ impl EphemeralServiceImpl {
         Ok(())
     }
 
-    pub async fn lookup_org(&mut self, _access_key: &String, _secret_key: &String) -> Result<Option<OrgInfo>, ServiceApiError> {
+    pub async fn lookup_org(
+        &mut self,
+        _access_key: &String,
+        _secret_key: &String,
+    ) -> Result<Option<OrgInfo>, ServiceApiError> {
         // Ephemeral service doesn't track orgs
         Ok(None)
     }

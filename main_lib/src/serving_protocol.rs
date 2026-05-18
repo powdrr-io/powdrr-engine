@@ -16,6 +16,10 @@ pub struct MongoFindCommand {
     pub limit: Option<i64>,
     #[serde(default)]
     pub skip: Option<u64>,
+    #[serde(default, rename = "batchSize")]
+    pub batch_size: Option<i64>,
+    #[serde(default, rename = "singleBatch")]
+    pub single_batch: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -544,6 +548,8 @@ mod tests {
             sort: Some(json!({ "price": -1 })),
             limit: Some(25),
             skip: None,
+            batch_size: None,
+            single_batch: None,
         };
 
         assert_eq!(
@@ -599,6 +605,8 @@ mod tests {
             sort: None,
             limit: Some(0),
             skip: None,
+            batch_size: None,
+            single_batch: None,
         };
 
         assert_eq!(from_mongodb_find(&command).unwrap().select, None);
@@ -614,6 +622,8 @@ mod tests {
             sort: None,
             limit: None,
             skip: Some(5),
+            batch_size: None,
+            single_batch: None,
         };
 
         assert!(from_mongodb_find(&command)
@@ -631,6 +641,8 @@ mod tests {
             sort: None,
             limit: None,
             skip: None,
+            batch_size: None,
+            single_batch: None,
         };
 
         assert!(from_mongodb_find(&command)
