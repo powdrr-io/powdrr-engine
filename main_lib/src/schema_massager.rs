@@ -8,56 +8,14 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
-use std::ops::Deref;
 use std::sync::Arc;
 
-#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
-pub enum PowdrrDataType {
-    Array(Box<PowdrrDataType>),
-    Boolean,
-    Float,
-    Integer,
-    Null,
-    Object(Box<PowdrrSchema>),
-    String,
-}
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../shared/service_control_plane/schema_model.rs"
+));
 
 impl PowdrrDataType {
-    pub fn is_null(&self) -> bool {
-        match self {
-            PowdrrDataType::Null => true,
-            _ => false,
-        }
-    }
-
-    pub fn is_object(&self) -> bool {
-        match self {
-            PowdrrDataType::Object(_) => true,
-            _ => false,
-        }
-    }
-
-    pub fn as_object_schema(&self) -> Option<PowdrrSchema> {
-        match self {
-            PowdrrDataType::Object(schema) => Some(schema.deref().clone()),
-            _ => None,
-        }
-    }
-
-    pub fn is_array(&self) -> bool {
-        match self {
-            PowdrrDataType::Array(_) => true,
-            _ => false,
-        }
-    }
-
-    pub fn array_element_type(&self) -> PowdrrDataType {
-        match self {
-            PowdrrDataType::Array(element) => element.deref().clone(),
-            _ => panic!("Check to see that it is an array first."),
-        }
-    }
-
     pub fn to_sql_type(&self) -> String {
         match self {
             PowdrrDataType::Array(_) => todo!(),
@@ -96,12 +54,6 @@ impl PowdrrDataType {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
-pub struct PowdrrField {
-    pub name: String,
-    pub data_type: PowdrrDataType,
-}
-
 impl Display for PowdrrField {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_str(format!("{}: {:?}", &self.name, &self.data_type).as_str())?;
@@ -122,31 +74,7 @@ impl PowdrrField {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
-pub struct PowdrrSchema {
-    fields: Vec<PowdrrField>,
-}
-
 impl PowdrrSchema {
-    pub fn minimal() -> Self {
-        PowdrrSchema {
-            fields: vec!(
-                //PowdrrField { name: "_id".to_string(), data_type: PowdrrDataType::String },
-                //PowdrrField { name: "_id_seq_no".to_string(), data_type: PowdrrDataType::String },
-                //PowdrrField { name: "_seq_no".to_string(), data_type: PowdrrDataType::Integer },
-            ),
-        }
-    }
-
-    pub fn deletes() -> Self {
-        PowdrrSchema {
-            fields: vec![PowdrrField {
-                name: "_id_seq_no".to_string(),
-                data_type: PowdrrDataType::String,
-            }],
-        }
-    }
-
     pub fn from_iceberg(
         table_iceberg_schema: &Arc<iceberg::spec::Schema>,
         file_iceberg_schema: &Arc<iceberg::spec::Schema>,
@@ -216,25 +144,6 @@ impl PowdrrSchema {
             }
         }
         PowdrrSchema { fields }
-    }
-
-    pub fn from(fields: &Vec<PowdrrField>) -> Self {
-        let mut fields_clone = fields.clone();
-        fields_clone.sort_by(|a, b| a.name.partial_cmp(&b.name).unwrap());
-        PowdrrSchema {
-            fields: fields_clone,
-        }
-    }
-
-    pub fn fields(&self) -> &Vec<PowdrrField> {
-        &self.fields
-    }
-
-    pub fn to_map(&self) -> HashMap<String, PowdrrField> {
-        self.fields
-            .iter()
-            .map(|x| (x.name.clone(), x.clone()))
-            .collect::<HashMap<String, PowdrrField>>()
     }
 
     fn to_arrow_fields(&self) -> Vec<Field> {
@@ -496,7 +405,7 @@ impl SqlExpression {
                 return HashMap::from([(
                     prefix.clone(),
                     SqlExpression::Null(original_field.data_type.clone()),
-                )])
+                )]);
             }
             _ => {
                 return HashMap::from([(prefix.clone(), self.make_exploded_ref(prefix))]);
@@ -1183,7 +1092,9 @@ impl SqlQuery {
             .collect::<Vec<String>>()
             .join(", ");
         let limit = self.limit();
-        format!("SELECT {fields} FROM {{target_table}} t {joins} WHERE {filters} GROUP BY {group_by} ORDER BY {order_by} {limit}")
+        format!(
+            "SELECT {fields} FROM {{target_table}} t {joins} WHERE {filters} GROUP BY {group_by} ORDER BY {order_by} {limit}"
+        )
     }
 }
 
@@ -1275,7 +1186,7 @@ pub(crate) fn extract_powdrr_schema_option(value: &Option<Value>) -> PowdrrSchem
 #[cfg(test)]
 mod tests {
     use crate::schema_massager::{
-        extract_powdrr_schema, to_powdrr_schema, PowdrrSchema, SqlBuilder,
+        PowdrrSchema, SqlBuilder, extract_powdrr_schema, to_powdrr_schema,
     };
     use arrow_json::reader::infer_json_schema;
 

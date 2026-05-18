@@ -17,32 +17,14 @@ use crate::test_api::{
 use crate::{
     data_access, distributed_cache, peers::CheckpointDescriptor, pipeline::PipelineDefinition,
 };
-use std::error::Error;
-use std::fmt::{Display, Formatter};
 use tokio::sync::{mpsc, oneshot};
 
-#[derive(Debug, Clone)]
-pub struct ServiceApiError {
-    pub(crate) message: String,
-}
-
-impl Error for ServiceApiError {}
-
-impl Display for ServiceApiError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-unsafe impl Send for ServiceApiError {}
-unsafe impl Sync for ServiceApiError {}
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../shared/service_control_plane/service_api_error.rs"
+));
 
 impl ServiceApiError {
-    pub fn new(message: String) -> Self {
-        assert!(message.len() > 0, "Message must not be empty");
-        ServiceApiError { message }
-    }
-
     pub fn from_reqwest(error: reqwest::Error) -> Self {
         Self::new(format!("Reqwest: {}", error))
     }
