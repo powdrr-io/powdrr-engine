@@ -148,6 +148,111 @@ fn clear_parquet_row_group_stats_cache() {
     PARQUET_ROW_GROUP_STATS_CACHE.lock().unwrap().clear();
 }
 
+#[derive(Default)]
+struct IcebergTableRowGroupStatsTracker {
+    files_by_table: HashMap<String, HashSet<String>>,
+}
+
+impl IcebergTableRowGroupStatsTracker {
+    fn replace_files(&mut self, table_key: &str, current_files: HashSet<String>) -> Vec<String> {
+        let previous_files = self
+            .files_by_table
+            .insert(table_key.to_string(), current_files.clone())
+            .unwrap_or_default();
+        previous_files
+            .into_iter()
+            .filter(|file_path| !current_files.contains(file_path))
+            .collect()
+    }
+
+    fn remove_table(&mut self, table_key: &str) -> Vec<String> {
+        self.files_by_table
+            .remove(table_key)
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    }
+
+    fn remove_namespace(&mut self, namespace: &str) -> Vec<String> {
+        let namespace_prefix = format!("{}/", namespace);
+        let table_keys = self
+            .files_by_table
+            .keys()
+            .filter(|table_key| table_key.starts_with(&namespace_prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut removed_files = vec![];
+        for table_key in table_keys {
+            removed_files.extend(self.remove_table(&table_key));
+        }
+        removed_files
+    }
+
+    fn remove_file(&mut self, file_path: &str) {
+        self.files_by_table.retain(|_, files| {
+            files.remove(file_path);
+            !files.is_empty()
+        });
+    }
+
+    fn clear(&mut self) {
+        self.files_by_table.clear();
+    }
+}
+
+static ICEBERG_TABLE_ROW_GROUP_STATS_TRACKER: LazyLock<Mutex<IcebergTableRowGroupStatsTracker>> =
+    LazyLock::new(|| Mutex::new(IcebergTableRowGroupStatsTracker::default()));
+
+fn iceberg_table_key(namespace: &str, name: &str) -> String {
+    format!("{}/{}", namespace, name)
+}
+
+fn reconcile_iceberg_table_row_group_stats(
+    namespace: &str,
+    name: &str,
+    current_files: &HashSet<String>,
+) {
+    let removed_files = ICEBERG_TABLE_ROW_GROUP_STATS_TRACKER
+        .lock()
+        .unwrap()
+        .replace_files(&iceberg_table_key(namespace, name), current_files.clone());
+    for removed_file in removed_files {
+        invalidate_parquet_row_group_stats(&removed_file);
+    }
+}
+
+fn clear_iceberg_table_row_group_stats(namespace: &str, name: &str) {
+    let removed_files = ICEBERG_TABLE_ROW_GROUP_STATS_TRACKER
+        .lock()
+        .unwrap()
+        .remove_table(&iceberg_table_key(namespace, name));
+    for removed_file in removed_files {
+        invalidate_parquet_row_group_stats(&removed_file);
+    }
+}
+
+fn clear_iceberg_namespace_row_group_stats(namespace: &str) {
+    let removed_files = ICEBERG_TABLE_ROW_GROUP_STATS_TRACKER
+        .lock()
+        .unwrap()
+        .remove_namespace(namespace);
+    for removed_file in removed_files {
+        invalidate_parquet_row_group_stats(&removed_file);
+    }
+}
+
+fn remove_file_from_iceberg_table_row_group_stats(file_path: &str) {
+    ICEBERG_TABLE_ROW_GROUP_STATS_TRACKER
+        .lock()
+        .unwrap()
+        .remove_file(file_path);
+    invalidate_parquet_row_group_stats(file_path);
+}
+
+fn clear_iceberg_table_row_group_stats_tracker() {
+    ICEBERG_TABLE_ROW_GROUP_STATS_TRACKER.lock().unwrap().clear();
+}
+
 #[derive(Clone)]
 struct PendingIcebergFileStats {
     file_path: String,
@@ -563,6 +668,7 @@ impl CacheTrackerActor {
                 self.lru_cache.clear();
                 self.top_level_to_delete.clear();
                 clear_parquet_row_group_stats_cache();
+                clear_iceberg_table_row_group_stats_tracker();
                 let _ = respond_to.send(());
             }
             CacheTrackerActorMessage::Reserve {
@@ -807,7 +913,7 @@ impl CacheTrackerActor {
                         Ok(_) => (),
                         Err(e) => panic!("Failed to delete file {}: {}", file_path, e),
                     }
-                    invalidate_parquet_row_group_stats(&file_path);
+                    remove_file_from_iceberg_table_row_group_stats(&file_path);
                 }
                 respond_to.send(()).expect("Failed to send response");
             }
@@ -1669,7 +1775,11 @@ async fn drop_iceberg_table_worker(
         name: name.clone(),
     };
 
-    catalog.drop_table(&table_ident).await
+    let result = catalog.drop_table(&table_ident).await;
+    if result.is_ok() {
+        clear_iceberg_table_row_group_stats(namespace, name);
+    }
+    result
 }
 
 pub async fn drop_all_iceberg_tables(namespace: &String) -> Result<(), iceberg::Error> {
@@ -1688,6 +1798,7 @@ async fn drop_all_iceberg_tables_worker(
     for table_ident in all_tables.iter() {
         catalog.drop_table(table_ident).await?
     }
+    clear_iceberg_namespace_row_group_stats(namespace);
     Ok(())
 }
 
@@ -1816,6 +1927,11 @@ async fn load_iceberg_table_metadata_worker(
         }
     };
     let file_stats = load_iceberg_file_stats(&table, current_snapshot).await?;
+    let current_files = file_stats
+        .iter()
+        .map(|stats| stats.file_path.clone())
+        .collect::<HashSet<_>>();
+    reconcile_iceberg_table_row_group_stats(namespace, name, &current_files);
 
     let table_scan = match table.scan().select_all().build() {
         Ok(s) => s,
@@ -1932,7 +2048,6 @@ async fn load_iceberg_file_stats(
     .buffer_unordered(concurrency)
     .collect::<Vec<_>>()
     .await;
-
     file_stats.sort_by(|left, right| left.file_path.cmp(&right.file_path));
     Ok(file_stats)
 }
@@ -2218,9 +2333,10 @@ pub(crate) fn s3_ingest_base_path() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::ParquetRowGroupStatsCache;
+    use super::{IcebergTableRowGroupStatsTracker, ParquetRowGroupStatsCache};
     use crate::data_contract::{IcebergColumnStats, IcebergRowGroupStats};
     use serde_json::Value;
+    use std::collections::HashSet;
 
     fn sample_row_group_stats(index: usize) -> Vec<IcebergRowGroupStats> {
         vec![IcebergRowGroupStats {
@@ -2266,5 +2382,54 @@ mod tests {
 
         cache.clear();
         assert!(cache.get("s3://warehouse/b.parquet").is_none());
+    }
+
+    #[test]
+    fn iceberg_table_row_group_stats_tracker_reports_removed_files() {
+        let mut tracker = IcebergTableRowGroupStatsTracker::default();
+        let initial_files = HashSet::from([
+            "s3://warehouse/a.parquet".to_string(),
+            "s3://warehouse/b.parquet".to_string(),
+        ]);
+        let next_files = HashSet::from([
+            "s3://warehouse/b.parquet".to_string(),
+            "s3://warehouse/c.parquet".to_string(),
+        ]);
+
+        let first_removed = tracker.replace_files("default/logs", initial_files);
+        assert!(first_removed.is_empty());
+
+        let removed = tracker.replace_files("default/logs", next_files);
+        assert_eq!(removed, vec!["s3://warehouse/a.parquet".to_string()]);
+    }
+
+    #[test]
+    fn iceberg_table_row_group_stats_tracker_remove_namespace_clears_all_tables() {
+        let mut tracker = IcebergTableRowGroupStatsTracker::default();
+        tracker.replace_files(
+            "default/logs",
+            HashSet::from(["s3://warehouse/a.parquet".to_string()]),
+        );
+        tracker.replace_files(
+            "default/metrics",
+            HashSet::from(["s3://warehouse/b.parquet".to_string()]),
+        );
+        tracker.replace_files(
+            "other/logs",
+            HashSet::from(["s3://warehouse/c.parquet".to_string()]),
+        );
+
+        let mut removed = tracker.remove_namespace("default");
+        removed.sort();
+
+        assert_eq!(
+            removed,
+            vec![
+                "s3://warehouse/a.parquet".to_string(),
+                "s3://warehouse/b.parquet".to_string()
+            ]
+        );
+        assert_eq!(tracker.files_by_table.len(), 1);
+        assert!(tracker.files_by_table.contains_key("other/logs"));
     }
 }
