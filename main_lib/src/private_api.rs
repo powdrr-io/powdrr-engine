@@ -21,6 +21,7 @@ use crate::peers::{
     PrivateSearchAggregationSpec, PrivateSearchInvocation, PrivateSearchResult,
     PrivateSearchSortSpec, PrivateSearchTermsBucketPartial, PrivateSqlInvocation,
 };
+use crate::prefetch::warm_iceberg_checkpoints;
 use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema, SqlQuery};
 use crate::search_runtime::batches_to_serde_value;
 use crate::state_provider::*;
@@ -742,6 +743,17 @@ pub(crate) async fn prefetch_query(
     index: u64,
     num: u64,
 ) -> Result<DataQueryResult, PrivateApiError> {
+    if invocation.required_extensions.is_empty() {
+        match warm_iceberg_checkpoints(&invocation.checkpoints).await {
+            Ok(_) => {}
+            Err(error) => {
+                return Err(PrivateApiError {
+                    message: format!("Unable to warm iceberg metadata: {}", error),
+                });
+            }
+        }
+    }
+
     let required_files = match determine_required_files(
         &invocation.required_extensions,
         &invocation.checkpoints,
