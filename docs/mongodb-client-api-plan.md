@@ -46,6 +46,10 @@ This branch also adds the inverse Mongo read-path adapter:
   `MongoDbTableConfig` in
   [main_lib/src/data_contract.rs](../main_lib/src/data_contract.rs)
 - HTTP config endpoints at `GET` / `PUT /:table/_mongo/config`
+- an experimental Mongo wire listener at
+  [main_lib/src/mongodb_wire_protocol.rs](../main_lib/src/mongodb_wire_protocol.rs)
+  with runtime wiring in
+  [engine/src/main.rs](../engine/src/main.rs) behind `MONGO_PORT`
 
 That means we now have:
 
@@ -65,6 +69,8 @@ That means we now have:
   for `batchSize`-driven pagination on the HTTP debug surface
 - metadata-backed stats on the HTTP debug surface when the latest checkpoint
   exposes file counts and sizes
+- a minimal `OP_MSG` transport that can pass BSON command documents into the
+  existing Mongo command executor
 
 ## What The New Translator Supports
 
@@ -111,8 +117,21 @@ True compatibility requires:
 - `OP_MSG` request/response handling
 - likely `OP_COMPRESSED` handling for common driver configurations
 
-This should live in a dedicated server module or binary rather than being
-forced into the current HTTP router.
+Status:
+
+- **partially implemented**
+- `OP_MSG` request/response framing now exists in
+  [main_lib/src/mongodb_wire_protocol.rs](../main_lib/src/mongodb_wire_protocol.rs)
+- the listener can be started by setting `MONGO_PORT`
+- current transport is intentionally narrow:
+  - `OP_MSG` only
+  - no `OP_COMPRESSED`
+  - no auth / SASL
+  - BSON framing at the transport edge, but command execution still bridges
+    through the existing JSON-based command path
+
+This should keep living in a dedicated server module or binary rather than
+being forced into the current HTTP router.
 
 ### 2. Handshake and Topology Commands
 
@@ -124,8 +143,9 @@ Drivers will not begin with `find`. They first expect command responses such as:
 
 Status:
 
-- partially addressed for the HTTP debug surface only
-- **not** yet available over the Mongo wire protocol
+- available on both the HTTP debug surface and the new wire listener for the
+  current read-only command subset
+- still incomplete for broader driver expectations and future auth/session work
 
 The handshake response must advertise coherent values like:
 
@@ -153,6 +173,13 @@ This matters especially because BSON document field order is meaningful in some
 places, while JSON-object handling in the current repo is not a good transport
 substitute.
 
+Status:
+
+- wire transport now accepts and returns BSON documents
+- command execution still converts BSON documents into `serde_json::Value`
+  before planning and response shaping
+- typed BSON fidelity is therefore still incomplete
+
 ### 4. Cursor Lifecycle
 
 Real drivers expect cursor semantics, not just one-shot arrays.
@@ -167,6 +194,13 @@ Minimum read-path cursor support means:
 - stable cursor IDs and server-side cursor state
 
 The current `ServingRequestPlan` has `limit`, but no cursor or offset model.
+
+Status:
+
+- read-only cursor paging already exists for `find`, `getMore`, and
+  `killCursors`
+- cursor state is still process-local and in-memory
+- `skip` and richer cursor semantics are still unsupported
 
 ### 5. Collection / Database Mapping
 
@@ -352,6 +386,13 @@ Build a dedicated Mongo-facing server crate or module that:
 
 This should initially be read-only and single-node.
 
+Status:
+
+- now partially implemented in
+  [main_lib/src/mongodb_wire_protocol.rs](../main_lib/src/mongodb_wire_protocol.rs)
+- the remaining gaps are compression, richer command coverage, and a
+  BSON-native execution path instead of the current BSON -> JSON bridge
+
 ### Phase 4: Durable Cursor and Session Support
 
 Add:
@@ -388,16 +429,20 @@ The right first product slice is:
 That gives us a usable story for analytics-style or app-read traffic while
 keeping the optimizer and storage model aligned with the rest of the repo.
 
+The current wire listener is aimed at exactly that scope, with one extra
+constraint: use direct-connection no-auth clients only until the handshake and
+session story is more complete.
+
 ## Concrete Next Code Changes
 
-1. Harden the cursor layer so it is no longer process-local:
+1. Run a stock Mongo driver smoke test against the new wire listener and patch
+   whatever handshake/session envelope gaps it exposes first.
+2. Harden the cursor layer so it is no longer process-local:
    move the registry into storage that can survive restarts or leader changes.
-2. Add count-like read commands only if they can map cleanly into the same
+3. Add count-like read commands only if they can map cleanly into the same
    serving plan without creating a second execution path.
-3. Fill in only the remaining discovery commands that clearly unblock real
+4. Fill in only the remaining discovery commands that clearly unblock real
    clients, such as `count` or `countDocuments` equivalents and lightweight
    session/metadata envelopes.
-4. Create a dedicated Mongo wire server module or crate rather than extending
-   the current HTTP router directly.
-5. Use the existing HTTP bridge plus `_mongo/config` routes as the integration
-   seam while the TCP / BSON server is still under construction.
+5. Replace the current BSON -> JSON bridge with a more BSON-native execution
+   path once the initial driver smoke test is green.
