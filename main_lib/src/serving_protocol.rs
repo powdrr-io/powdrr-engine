@@ -20,6 +20,8 @@ pub struct MongoFindCommand {
     pub batch_size: Option<i64>,
     #[serde(default, rename = "singleBatch")]
     pub single_batch: Option<bool>,
+    #[serde(default, rename = "noCursorTimeout")]
+    pub no_cursor_timeout: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -550,6 +552,7 @@ mod tests {
             skip: None,
             batch_size: None,
             single_batch: None,
+            no_cursor_timeout: None,
         };
 
         assert_eq!(
@@ -607,6 +610,7 @@ mod tests {
             skip: None,
             batch_size: None,
             single_batch: None,
+            no_cursor_timeout: None,
         };
 
         assert_eq!(from_mongodb_find(&command).unwrap().select, None);
@@ -624,6 +628,7 @@ mod tests {
             skip: Some(5),
             batch_size: None,
             single_batch: None,
+            no_cursor_timeout: None,
         };
 
         assert!(from_mongodb_find(&command)
@@ -643,6 +648,7 @@ mod tests {
             skip: None,
             batch_size: None,
             single_batch: None,
+            no_cursor_timeout: None,
         };
 
         assert!(from_mongodb_find(&command)
