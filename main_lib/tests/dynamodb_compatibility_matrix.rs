@@ -345,6 +345,20 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
         vec![],
     )
     .await;
+    wait_for_powdrr_rows(
+        &powdrr_client,
+        &primary_table_name,
+        "ts",
+        &[&rows[1], &rows[3]],
+    )
+    .await;
+    wait_for_powdrr_rows(
+        &powdrr_client,
+        &begins_with_table_name,
+        "event_id",
+        &[&rows[0], &rows[2]],
+    )
+    .await;
 
     DifferentialFixture {
         _temp_dir: temp_dir,
@@ -992,6 +1006,47 @@ async fn dynamodb_client(endpoint_url: &str) -> DynamoClient {
         .load()
         .await;
     DynamoClient::new(&config)
+}
+
+async fn wait_for_powdrr_rows(
+    client: &DynamoClient,
+    table_name: &str,
+    sort_key_name: &str,
+    rows: &[&EventRow],
+) {
+    for _ in 0..20 {
+        let mut all_present = true;
+        for row in rows {
+            let key = serde_dynamo::aws_sdk_dynamodb_1::to_item(json!({
+                "tenant": row.tenant,
+                sort_key_name: match sort_key_name {
+                    "ts" => Value::from(row.ts),
+                    "event_id" => Value::from(row.event_id.clone()),
+                    other => panic!("unsupported sort key {}", other),
+                },
+            }))
+            .unwrap();
+            let output = client
+                .get_item()
+                .table_name(table_name)
+                .set_key(Some(key))
+                .send()
+                .await
+                .unwrap();
+            if output.item().is_none() {
+                all_present = false;
+                break;
+            }
+        }
+        if all_present {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!(
+        "Powdrr table {} did not become readable for sort key {} in time",
+        table_name, sort_key_name
+    );
 }
 
 async fn create_localstack_table(
