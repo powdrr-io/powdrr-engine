@@ -35,6 +35,12 @@ Some of the tests use shared data state so they must be run single threaded.
 RUST_BACKTRACE=1 scripts/cargo-worktree.sh test -- --nocapture --test-threads=1
 ```
 
+Run the DynamoDB SDK compatibility suite against the local dependency stack:
+
+```
+scripts/run_dynamodb_sdk_compat_local.sh
+```
+
 Run flamegraph
 
 ```

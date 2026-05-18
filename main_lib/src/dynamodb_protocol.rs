@@ -3,22 +3,24 @@ use std::pin::Pin;
 
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{body, Body};
+use gotham::hyper::{Body, body};
 use gotham::mime;
 use gotham::state::{FromState, State};
 use http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::data_contract::{
     CreateTable, DynamoDbTableConfig, ServingPattern, ServingTableConfig, TableDescription,
     TableMetadataCheckpoint,
 };
 use crate::elastic_search_endpoints::NamePathExtractor;
-use crate::lakehouse_serving::{execute_serving_query, ServingQueryError, ServingQueryResponse};
+use crate::lakehouse_serving::{ServingQueryError, ServingQueryResponse, execute_serving_query};
 use crate::peers::CheckpointDescriptor;
 use crate::schema_massager::{PowdrrDataType, PowdrrSchema};
-use crate::serving_plan::{ServingPredicate, ServingQueryClassification, ServingRequestPlan, ServingSort};
+use crate::serving_plan::{
+    ServingPredicate, ServingQueryClassification, ServingRequestPlan, ServingSort,
+};
 use crate::state_provider::STATE_PROVIDER;
 use futures_util::future::FutureExt;
 
@@ -88,7 +90,10 @@ pub struct DynamoDbConfigResponse {
 struct ListTablesResponse {
     #[serde(rename = "TableNames")]
     table_names: Vec<String>,
-    #[serde(rename = "LastEvaluatedTableName", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "LastEvaluatedTableName",
+        skip_serializing_if = "Option::is_none"
+    )]
     last_evaluated_table_name: Option<String>,
 }
 
@@ -229,10 +234,9 @@ pub fn get_dynamodb_config(state: State) -> Pin<Box<HandlerFuture>> {
         let path = NamePathExtractor::borrow_from(&state);
         let result = async {
             let description = load_table_description(&path.name).await?;
-            let config = description
-                .dynamodb
-                .clone()
-                .ok_or_else(|| DynamoDbError::resource_not_found("No DynamoDB config declared for table"))?;
+            let config = description.dynamodb.clone().ok_or_else(|| {
+                DynamoDbError::resource_not_found("No DynamoDB config declared for table")
+            })?;
             Ok::<_, DynamoDbError>(DynamoDbConfigResponse {
                 acknowledged: true,
                 table: description.name,
@@ -243,8 +247,11 @@ pub fn get_dynamodb_config(state: State) -> Pin<Box<HandlerFuture>> {
 
         match result {
             Ok(response) => {
-                let response =
-                    json_response(&state, StatusCode::OK, &serde_json::to_value(response).unwrap());
+                let response = json_response(
+                    &state,
+                    StatusCode::OK,
+                    &serde_json::to_value(response).unwrap(),
+                );
                 Ok((state, response))
             }
             Err(error) => {
@@ -268,7 +275,10 @@ pub fn put_dynamodb_config(mut state: State) -> Pin<Box<HandlerFuture>> {
         };
 
         let result = async {
-            let existing = STATE_PROVIDER.describe_table(&path).await.map_err(service_error)?;
+            let existing = STATE_PROVIDER
+                .describe_table(&path)
+                .await
+                .map_err(service_error)?;
             let tags = existing
                 .as_ref()
                 .map(|description| description.tags.clone())
@@ -300,8 +310,11 @@ pub fn put_dynamodb_config(mut state: State) -> Pin<Box<HandlerFuture>> {
 
         match result {
             Ok(response) => {
-                let response =
-                    json_response(&state, StatusCode::OK, &serde_json::to_value(response).unwrap());
+                let response = json_response(
+                    &state,
+                    StatusCode::OK,
+                    &serde_json::to_value(response).unwrap(),
+                );
                 Ok((state, response))
             }
             Err(error) => {
@@ -348,7 +361,7 @@ pub fn dynamodb_api(mut state: State) -> Pin<Box<HandlerFuture>> {
                     return Err(DynamoDbError::validation(format!(
                         "Unsupported x-amz-target {}",
                         target
-                    )))
+                    )));
                 }
             };
 
@@ -371,8 +384,9 @@ pub fn dynamodb_api(mut state: State) -> Pin<Box<HandlerFuture>> {
 }
 
 async fn handle_list_tables(payload: Value) -> Result<Value, DynamoDbError> {
-    let request = serde_json::from_value::<ListTablesRequest>(payload)
-        .map_err(|error| DynamoDbError::validation(format!("Invalid ListTables request: {}", error)))?;
+    let request = serde_json::from_value::<ListTablesRequest>(payload).map_err(|error| {
+        DynamoDbError::validation(format!("Invalid ListTables request: {}", error))
+    })?;
     let mut table_names = STATE_PROVIDER
         .get_all_iceberg_tables()
         .await
@@ -454,8 +468,9 @@ async fn handle_describe_table(payload: Value) -> Result<Value, DynamoDbError> {
 }
 
 async fn handle_get_item(payload: Value) -> Result<Value, DynamoDbError> {
-    let request = serde_json::from_value::<GetItemRequest>(payload)
-        .map_err(|error| DynamoDbError::validation(format!("Invalid GetItem request: {}", error)))?;
+    let request = serde_json::from_value::<GetItemRequest>(payload).map_err(|error| {
+        DynamoDbError::validation(format!("Invalid GetItem request: {}", error))
+    })?;
     let context = load_dynamodb_table_context(&request.table_name).await?;
     let key = parse_key_map(&request.key, &context.config)?;
     let projection = parse_projection_expression(
@@ -647,11 +662,9 @@ async fn execute_fast_path_query(
         .await
         .map_err(convert_serving_error)?;
     if response.classification != ServingQueryClassification::FastPath {
-        return Err(DynamoDbError::validation(
-            response
-                .reason
-                .unwrap_or_else(|| "Query did not qualify for the serving fast path".to_string()),
-        ));
+        return Err(DynamoDbError::validation(response.reason.unwrap_or_else(
+            || "Query did not qualify for the serving fast path".to_string(),
+        )));
     }
     Ok(response)
 }
@@ -665,7 +678,9 @@ fn convert_serving_error(error: ServingQueryError) -> DynamoDbError {
     DynamoDbError::new(error.status, type_name, error.message)
 }
 
-async fn load_dynamodb_table_context(table_name: &str) -> Result<DynamoDbTableContext, DynamoDbError> {
+async fn load_dynamodb_table_context(
+    table_name: &str,
+) -> Result<DynamoDbTableContext, DynamoDbError> {
     let description = load_table_description(table_name).await?;
     let config = description
         .dynamodb
@@ -684,7 +699,9 @@ async fn load_table_description(table_name: &str) -> Result<TableDescription, Dy
         .describe_table(&table_name.to_string())
         .await
         .map_err(service_error)?
-        .ok_or_else(|| DynamoDbError::resource_not_found(format!("Table {} was not found", table_name)))
+        .ok_or_else(|| {
+            DynamoDbError::resource_not_found(format!("Table {} was not found", table_name))
+        })
 }
 
 async fn load_table_schema(table_name: &str) -> Result<PowdrrSchema, DynamoDbError> {
@@ -714,7 +731,9 @@ async fn load_table_schema(table_name: &str) -> Result<PowdrrSchema, DynamoDbErr
     schema_from_checkpoint(&checkpoint)
 }
 
-fn schema_from_checkpoint(checkpoint: &TableMetadataCheckpoint) -> Result<PowdrrSchema, DynamoDbError> {
+fn schema_from_checkpoint(
+    checkpoint: &TableMetadataCheckpoint,
+) -> Result<PowdrrSchema, DynamoDbError> {
     if let Some(metadata) = checkpoint.iceberg_metadata.as_ref() {
         return Ok(metadata.table_schema.clone());
     }
@@ -726,7 +745,10 @@ fn schema_from_checkpoint(checkpoint: &TableMetadataCheckpoint) -> Result<Powdrr
     ))
 }
 
-fn validate_dynamodb_config(schema: &PowdrrSchema, config: &DynamoDbTableConfig) -> Result<(), DynamoDbError> {
+fn validate_dynamodb_config(
+    schema: &PowdrrSchema,
+    config: &DynamoDbTableConfig,
+) -> Result<(), DynamoDbError> {
     dynamodb_key_type(schema, &config.partition_key)?;
     if let Some(sort_key) = config.sort_key.as_ref() {
         if sort_key == &config.partition_key {
@@ -739,7 +761,10 @@ fn validate_dynamodb_config(schema: &PowdrrSchema, config: &DynamoDbTableConfig)
     Ok(())
 }
 
-fn dynamodb_key_type(schema: &PowdrrSchema, field_name: &str) -> Result<&'static str, DynamoDbError> {
+fn dynamodb_key_type(
+    schema: &PowdrrSchema,
+    field_name: &str,
+) -> Result<&'static str, DynamoDbError> {
     let schema_map = schema.to_map();
     let field = schema_map
         .get(field_name)
@@ -830,7 +855,9 @@ fn parse_target(headers: &HeaderMap) -> Result<String, DynamoDbError> {
 
 fn authenticate_request(headers: &HeaderMap) -> Result<DynamoDbRequestMeta, DynamoDbError> {
     let Some(auth_header) = headers.get(http::header::AUTHORIZATION) else {
-        return Ok(DynamoDbRequestMeta { _access_key_id: None });
+        return Ok(DynamoDbRequestMeta {
+            _access_key_id: None,
+        });
     };
     let auth = auth_header
         .to_str()
@@ -845,12 +872,15 @@ fn authenticate_request(headers: &HeaderMap) -> Result<DynamoDbRequestMeta, Dyna
     })
 }
 
-async fn parse_json_body<T: for<'de> Deserialize<'de>>(state: &mut State) -> Result<T, DynamoDbError> {
+async fn parse_json_body<T: for<'de> Deserialize<'de>>(
+    state: &mut State,
+) -> Result<T, DynamoDbError> {
     let bytes = body::to_bytes(Body::take_from(state))
         .await
         .map_err(|error| DynamoDbError::validation(format!("Failed to read body: {}", error)))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|error| DynamoDbError::validation(format!("Request body was not valid JSON: {}", error)))
+    serde_json::from_slice(&bytes).map_err(|error| {
+        DynamoDbError::validation(format!("Request body was not valid JSON: {}", error))
+    })
 }
 
 fn parse_projection_expression(
@@ -875,14 +905,12 @@ fn parse_key_map(
     let mut parsed = HashMap::new();
     parsed.insert(
         config.partition_key.clone(),
-        dynamodb_attr_to_json(
-            key.get(&config.partition_key).ok_or_else(|| {
-                DynamoDbError::validation(format!(
-                    "Key must include partition key {}",
-                    config.partition_key
-                ))
-            })?,
-        )?,
+        dynamodb_attr_to_json(key.get(&config.partition_key).ok_or_else(|| {
+            DynamoDbError::validation(format!(
+                "Key must include partition key {}",
+                config.partition_key
+            ))
+        })?)?,
     );
     if let Some(sort_key) = config.sort_key.as_ref() {
         parsed.insert(
@@ -963,7 +991,7 @@ fn parse_key_condition_expression(
         (None, Some(_)) => {
             return Err(DynamoDbError::validation(
                 "This table does not define a sort key",
-            ))
+            ));
         }
         (Some(sort_key), Some(segment)) => Some(parse_sort_condition(segment, sort_key, values)?),
     };
@@ -1099,7 +1127,10 @@ fn apply_exclusive_start_key(
     Ok(())
 }
 
-fn tighten_lower_bound(filter: &mut ServingPredicate, candidate: Value) -> Result<(), DynamoDbError> {
+fn tighten_lower_bound(
+    filter: &mut ServingPredicate,
+    candidate: Value,
+) -> Result<(), DynamoDbError> {
     if let Some(existing) = filter.gt.as_ref() {
         if compare_scalars(existing, &candidate)? != std::cmp::Ordering::Less {
             return Ok(());
@@ -1117,7 +1148,10 @@ fn tighten_lower_bound(filter: &mut ServingPredicate, candidate: Value) -> Resul
     Ok(())
 }
 
-fn tighten_upper_bound(filter: &mut ServingPredicate, candidate: Value) -> Result<(), DynamoDbError> {
+fn tighten_upper_bound(
+    filter: &mut ServingPredicate,
+    candidate: Value,
+) -> Result<(), DynamoDbError> {
     if let Some(existing) = filter.lt.as_ref() {
         if compare_scalars(existing, &candidate)? != std::cmp::Ordering::Greater {
             return Ok(());
@@ -1207,10 +1241,7 @@ fn item_to_key(
         key.insert(
             sort_key.clone(),
             item.get(sort_key).cloned().ok_or_else(|| {
-                DynamoDbError::internal(format!(
-                    "Response item was missing sort key {}",
-                    sort_key
-                ))
+                DynamoDbError::internal(format!("Response item was missing sort key {}", sort_key))
             })?,
         );
     }
@@ -1318,9 +1349,8 @@ fn compare_scalars(left: &Value, right: &Value) -> Result<std::cmp::Ordering, Dy
             let right = right
                 .as_f64()
                 .ok_or_else(|| DynamoDbError::validation("Right scalar was not numeric"))?;
-            left.partial_cmp(&right).ok_or_else(|| {
-                DynamoDbError::validation("Numeric comparison was not well-defined")
-            })
+            left.partial_cmp(&right)
+                .ok_or_else(|| DynamoDbError::validation("Numeric comparison was not well-defined"))
         }
         (Value::Bool(left), Value::Bool(right)) => Ok(left.cmp(right)),
         _ => Err(DynamoDbError::validation(
@@ -1343,10 +1373,7 @@ fn json_response(state: &State, status: StatusCode, body: &Value) -> gotham::hyp
     response
 }
 
-fn dynamodb_error_response(
-    state: &State,
-    error: DynamoDbError,
-) -> gotham::hyper::Response<Body> {
+fn dynamodb_error_response(state: &State, error: DynamoDbError) -> gotham::hyper::Response<Body> {
     json_response(
         state,
         error.status,
@@ -1360,7 +1387,9 @@ fn dynamodb_error_response(
 #[cfg(test)]
 mod tests {
     use super::{dynamodb_attr_to_json, json_to_dynamodb_attr, parse_key_condition_expression};
-    use crate::data_contract::{DynamoDbTableConfig, FileSetPayload, IcebergMetadata, TableMetadataCheckpoint};
+    use crate::data_contract::{
+        DynamoDbTableConfig, FileSetPayload, IcebergMetadata, TableMetadataCheckpoint,
+    };
     use crate::serving_dataset::read_parquet_documents;
     use gotham::mime;
     use gotham::test::TestServer;
@@ -1410,8 +1439,8 @@ mod tests {
     #[test]
     fn test_dynamodb_root_operations() {
         let test_server = TestServer::with_timeout(crate::router::router(true), 1000).unwrap();
-        let dataset_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/data/flights.parquet");
+        let dataset_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/flights.parquet");
         let dataset_path_string = dataset_path.display().to_string();
         let file_path = format!("file://{}", dataset_path.display());
         let file_size = fs::metadata(&dataset_path).unwrap().len();
@@ -1487,30 +1516,28 @@ mod tests {
             json!({ "TableName": table_name }),
         );
         assert_eq!(describe_response.status(), 200);
-        let describe_body = serde_json::from_str::<serde_json::Value>(
-            &describe_response.read_utf8_body().unwrap(),
-        )
-        .unwrap();
+        let describe_body =
+            serde_json::from_str::<serde_json::Value>(&describe_response.read_utf8_body().unwrap())
+                .unwrap();
         assert_eq!(
             describe_body["Table"]["KeySchema"][0]["AttributeName"],
             json!(partition_key)
         );
         assert_eq!(describe_body["Table"]["KeySchema"][0]["KeyType"], "HASH");
 
-        let list_tables_response = perform_dynamodb_request(
-            &test_server,
-            "ListTables",
-            json!({}),
-        );
+        let list_tables_response = perform_dynamodb_request(&test_server, "ListTables", json!({}));
         assert_eq!(list_tables_response.status(), 200);
-        let list_tables_body =
-            serde_json::from_str::<serde_json::Value>(&list_tables_response.read_utf8_body().unwrap())
-                .unwrap();
-        assert!(list_tables_body["TableNames"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value == &json!(table_name)));
+        let list_tables_body = serde_json::from_str::<serde_json::Value>(
+            &list_tables_response.read_utf8_body().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            list_tables_body["TableNames"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == &json!(table_name))
+        );
 
         let get_item_response = perform_dynamodb_request(
             &test_server,
@@ -1550,8 +1577,7 @@ mod tests {
         let query_status = query_response.status();
         let query_body_text = query_response.read_utf8_body().unwrap();
         assert_eq!(query_status, 200, "{}", query_body_text);
-        let query_body =
-            serde_json::from_str::<serde_json::Value>(&query_body_text).unwrap();
+        let query_body = serde_json::from_str::<serde_json::Value>(&query_body_text).unwrap();
         assert_eq!(query_body["Count"], 1);
         assert_eq!(
             dynamodb_attr_to_json(&query_body["Items"][0][partition_key.as_str()]).unwrap(),
