@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 const MANIFEST_FILE_NAME: &str = "manifest.json";
 const FILES_DIR_NAME: &str = "files";
+const ANALYZE_TABLE_NAME: &str = "__powdrr_cli_analysis__";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum LocalQueryLanguage {
@@ -61,6 +62,35 @@ pub struct LocalParquetQueryRequest {
 pub struct LocalQueryResponse {
     pub status_code: u16,
     pub body: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct LocalQueryAnalysisRequest {
+    pub language: LocalQueryLanguage,
+    pub body: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalQueryPerformanceClassification {
+    HighlyOptimized,
+    SupportedButProbablySlow,
+    Unsupported,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalQueryExecutionPath {
+    TypedNodeMerge,
+    LegacySqlFanout,
+    Unsupported,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalQueryPerformanceAnalysis {
+    pub classification: LocalQueryPerformanceClassification,
+    pub execution_path: LocalQueryExecutionPath,
+    pub reason: String,
 }
 
 #[derive(Debug)]
@@ -245,6 +275,50 @@ pub async fn query_local_parquet_cache(
         status_code: response.status.as_u16(),
         body: response.body,
     })
+}
+
+pub fn analyze_local_query(request: &LocalQueryAnalysisRequest) -> LocalQueryPerformanceAnalysis {
+    match request.language {
+        LocalQueryLanguage::ElasticsearchJson => {
+            match elastic_search_parser::parse_search_plan(
+                Some(ANALYZE_TABLE_NAME.to_string()),
+                &request.body,
+            )
+            .and_then(|plan| {
+                search_executor::search_plan_to_command(
+                    plan,
+                    &crate::elastic_search_endpoints::QueryStringSearch::new(),
+                )
+            }) {
+                Ok(command) => {
+                    let assessment = command.performance_assessment();
+                    match assessment.path {
+                        search_executor::SearchPerformancePath::TypedNodeMerge => {
+                            LocalQueryPerformanceAnalysis {
+                                classification:
+                                    LocalQueryPerformanceClassification::HighlyOptimized,
+                                execution_path: LocalQueryExecutionPath::TypedNodeMerge,
+                                reason: assessment.reason,
+                            }
+                        }
+                        search_executor::SearchPerformancePath::LegacySqlFanout => {
+                            LocalQueryPerformanceAnalysis {
+                                classification:
+                                    LocalQueryPerformanceClassification::SupportedButProbablySlow,
+                                execution_path: LocalQueryExecutionPath::LegacySqlFanout,
+                                reason: assessment.reason,
+                            }
+                        }
+                    }
+                }
+                Err(error) => LocalQueryPerformanceAnalysis {
+                    classification: LocalQueryPerformanceClassification::Unsupported,
+                    execution_path: LocalQueryExecutionPath::Unsupported,
+                    reason: error.to_string(),
+                },
+            }
+        }
+    }
 }
 
 fn prepare_cache_dir(cache_dir: &Path, replace: bool) -> Result<(), LocalCliError> {

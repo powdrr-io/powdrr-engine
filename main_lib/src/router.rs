@@ -1,10 +1,15 @@
 use crate::compaction::{compact_logs, CompactionCommand};
 use crate::dynamodb_protocol;
+use crate::elastic_search_endpoints::AliasPathExtractor;
 use crate::elastic_search_endpoints::NameIdPathExtractor;
+use crate::elastic_search_endpoints::NameAliasPathExtractor;
 use crate::elastic_search_endpoints::NamePathExtractor;
 use crate::elastic_search_endpoints::QueryStringAliases;
+use crate::elastic_search_endpoints::QueryStringClusterHealth;
 use crate::elastic_search_endpoints::QueryStringClusterSettings;
+use crate::elastic_search_endpoints::QueryStringFieldCaps;
 use crate::elastic_search_endpoints::QueryStringSearch;
+use crate::mongodb_protocol;
 use crate::peers::{
     PrivateCompactionInvocationExternal, PrivateExtensionInvocationExternal,
     PrivatePrefetchInvocationExternal, PrivateSearchInvocationExternal,
@@ -18,21 +23,21 @@ use crate::test_api::test_v1_process_work;
 use crate::test_api::test_v1_set_testing_mode;
 use crate::test_api::test_v1_set_testing_processing_mode;
 use crate::{elastic_search_endpoints, elastic_search_lifetime_policy, lakehouse_serving};
-use futures::TryFutureExt;
 use futures::future;
+use futures::TryFutureExt;
 use futures_util::future::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
 use gotham::hyper::StatusCode;
-use gotham::hyper::{Body, body};
+use gotham::hyper::{body, Body};
 use gotham::middleware::Middleware;
 use gotham::mime;
 use gotham::pipeline::new_pipeline;
 use gotham::pipeline::single_pipeline;
 use gotham::prelude::NewMiddleware;
 use gotham::prelude::StaticResponseExtender;
-use gotham::router::Router;
 use gotham::router::builder::*;
+use gotham::router::Router;
 use gotham::state::FromState;
 use gotham::state::State;
 use gotham::state::StateData;
@@ -386,6 +391,24 @@ pub fn router(include_test_apis: bool) -> Router {
             .with_query_string_extractor::<QueryStringClusterSettings>()
             .to(elastic_search_endpoints::es_cluster_settings);
         route
+            .get("/_cluster/health")
+            .with_query_string_extractor::<QueryStringClusterHealth>()
+            .to(elastic_search_endpoints::es_cluster_health);
+        route
+            .get("/_cluster/health/:name")
+            .with_query_string_extractor::<QueryStringClusterHealth>()
+            .with_path_extractor::<NamePathExtractor>()
+            .to(elastic_search_endpoints::es_cluster_health);
+        route.get("/_alias").to(elastic_search_endpoints::es_get_aliases);
+        route
+            .get("/_alias/:alias")
+            .with_path_extractor::<AliasPathExtractor>()
+            .to(elastic_search_endpoints::es_get_named_aliases);
+        route
+            .get("/_resolve/index/:name")
+            .with_path_extractor::<NamePathExtractor>()
+            .to(elastic_search_endpoints::es_resolve_index);
+        route
             .get("/:name")
             .with_path_extractor::<NamePathExtractor>()
             .to(elastic_search_endpoints::es_get_index);
@@ -397,6 +420,14 @@ pub fn router(include_test_apis: bool) -> Router {
             .get("/:name/_alias")
             .with_path_extractor::<NamePathExtractor>()
             .to(elastic_search_endpoints::es_get_index_aliases);
+        route
+            .get("/:name/_alias/:alias")
+            .with_path_extractor::<NameAliasPathExtractor>()
+            .to(elastic_search_endpoints::es_get_index_named_aliases);
+        route
+            .head("/:name/_alias/:alias")
+            .with_path_extractor::<NameAliasPathExtractor>()
+            .to(elastic_search_endpoints::es_head_index_alias);
         route
             .get("/:name/_settings")
             .with_path_extractor::<NamePathExtractor>()
@@ -426,6 +457,10 @@ pub fn router(include_test_apis: bool) -> Router {
             .with_path_extractor::<NamePathExtractor>()
             .to(lakehouse_serving::serve_query);
         route
+            .post("/:name/_mongo/find")
+            .with_path_extractor::<NamePathExtractor>()
+            .to(mongodb_protocol::mongodb_find);
+        route
             .get("/_index_template/:name")
             .with_path_extractor::<NamePathExtractor>()
             .to(elastic_search_endpoints::es_get_index_template);
@@ -438,9 +473,36 @@ pub fn router(include_test_apis: bool) -> Router {
             .with_path_extractor::<NamePathExtractor>()
             .to(elastic_search_endpoints::es_get_index_template);
         route
+            .get("/_search")
+            .with_query_string_extractor::<QueryStringSearch>()
+            .to(elastic_search_endpoints::es_search);
+        route
+            .get("/_field_caps")
+            .with_query_string_extractor::<QueryStringFieldCaps>()
+            .to(elastic_search_endpoints::es_field_caps);
+        route
+            .post("/_field_caps")
+            .with_query_string_extractor::<QueryStringFieldCaps>()
+            .to(elastic_search_endpoints::es_field_caps);
+        route
             .post("/_search")
             .with_query_string_extractor::<QueryStringSearch>()
             .to(elastic_search_endpoints::es_search);
+        route
+            .get("/:name/_search")
+            .with_query_string_extractor::<QueryStringSearch>()
+            .with_path_extractor::<NamePathExtractor>()
+            .to(elastic_search_endpoints::es_search_table);
+        route
+            .get("/:name/_field_caps")
+            .with_query_string_extractor::<QueryStringFieldCaps>()
+            .with_path_extractor::<NamePathExtractor>()
+            .to(elastic_search_endpoints::es_field_caps_index);
+        route
+            .post("/:name/_field_caps")
+            .with_query_string_extractor::<QueryStringFieldCaps>()
+            .with_path_extractor::<NamePathExtractor>()
+            .to(elastic_search_endpoints::es_field_caps_index);
         route
             .get("/_count")
             .with_query_string_extractor::<QueryStringSearch>()
@@ -585,7 +647,7 @@ pub(crate) mod tests {
     use crate::lakehouse_serving::ServingConfigResponse;
     use crate::router::router;
     use crate::schema_massager::{
-        PowdrrDataType, PowdrrField, PowdrrSchema, extract_powdrr_schema_str,
+        extract_powdrr_schema_str, PowdrrDataType, PowdrrField, PowdrrSchema,
     };
     use crate::serving_plan::ServingQueryClassification;
     use crate::state_provider::STATE_PROVIDER;
@@ -596,7 +658,7 @@ pub(crate) mod tests {
     use gotham::mime;
     use gotham::plain::test::AsyncTestServer;
     use gotham::test::TestServer;
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
 
     pub(crate) static TEST_SERVER: LazyLock<TestServer> =
         LazyLock::new(|| TestServer::with_timeout(router(true), 1000).unwrap());
@@ -739,6 +801,166 @@ pub(crate) mod tests {
             "title_top_n"
         );
         assert_eq!(response_obj["rows"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_mongodb_find_http_bridge_fast_path_query() {
+        let test_server = &*TEST_SERVER;
+
+        test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_testing_and_processing_mode",
+                serde_json::to_string(&TestProcessingMode {
+                    state_mode: StateMode::Testing,
+                    storage_mode: StorageMode::default(),
+                    cache_mode: CacheMode::Redis(None),
+                    peer_mode: PeerMode::SelfOnly,
+                    indexing_mode: IndexingMode::Disabled,
+                    compaction_mode: CompactionMode::Disabled,
+                    prefetch_mode: PrefetchMode::Disabled,
+                })
+                .unwrap(),
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        let schema = PowdrrSchema::from(&vec![
+            PowdrrField {
+                name: "_id_seq_no".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "snippet".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "searchTerms".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "title".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+        ]);
+
+        let file_path = format!(
+            "file://{}/tests/data/flights.parquet",
+            env::current_dir().unwrap().to_str().unwrap()
+        );
+
+        let checkpoint = TableMetadataCheckpoint {
+            table_name: "serve_flights_mongo".to_string(),
+            original_checkpoint_id: None,
+            checkpoint_id: "serve_checkpoint_mongo_0".to_string(),
+            iceberg_metadata: Some(IcebergMetadata {
+                table_schema: schema.clone(),
+                snapshot_id: Some("snapshot_mongo_1".to_string()),
+                files: FileSetPayload::single(file_path, 1, schema.clone()),
+                column_names: vec![],
+                column_stats: vec![],
+                file_stats: vec![],
+            }),
+            speedboat_metadata: None,
+            deletes_metadata: None,
+            extension_metadata: HashMap::new(),
+            schema: schema.clone(),
+        };
+
+        test_server
+            .client()
+            .post(
+                "http://localhost/_test/v1/_add_checkpoint",
+                serde_json::to_string(&checkpoint).unwrap(),
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        let config_response = test_server
+            .client()
+            .put(
+                "http://localhost/serve_flights_mongo/_serve/config",
+                r#"{
+                  "patterns": [
+                    {
+                      "name": "mongo_title_top_n",
+                      "order_field": "title",
+                      "descending": false,
+                      "max_limit": 10,
+                      "projection": ["title"]
+                    }
+                  ]
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(config_response.status(), 200);
+
+        let query_response = test_server
+            .client()
+            .post(
+                "http://localhost/serve_flights_mongo/_mongo/find",
+                json!({
+                    "find": "serve_flights_mongo",
+                    "projection": { "title": 1, "_id": 0 },
+                    "sort": { "title": 1 },
+                    "limit": 2
+                })
+                .to_string(),
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(query_response.status(), 200);
+        let response_obj: Value =
+            serde_json::from_str(&query_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(response_obj["ok"], json!(1.0));
+        assert_eq!(response_obj["cursor"]["id"], json!(0));
+        assert_eq!(
+            response_obj["cursor"]["ns"],
+            json!("powdrr.serve_flights_mongo")
+        );
+        assert_eq!(
+            response_obj["cursor"]["firstBatch"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            response_obj["cursor"]["firstBatch"][0]["title"].is_string(),
+            true
+        );
+    }
+
+    #[test]
+    fn test_mongodb_find_http_bridge_rejects_path_collection_mismatch() {
+        let test_server = &*TEST_SERVER;
+        let response = test_server
+            .client()
+            .post(
+                "http://localhost/serve_flights_mismatch/_mongo/find",
+                json!({
+                    "find": "other_collection",
+                    "limit": 1
+                })
+                .to_string(),
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(response.status(), 400);
+        let response_obj: Value =
+            serde_json::from_str(&response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(response_obj["ok"], json!(0.0));
+        assert_eq!(response_obj["code"], json!(2));
+        assert_eq!(response_obj["codeName"], json!("BadValue"));
     }
 
     #[test]
@@ -888,6 +1110,35 @@ pub(crate) mod tests {
             dynamodb: None,
         }))
         .unwrap();
+        futures::executor::block_on(STATE_PROVIDER.upsert_table_metadata(&CreateTable {
+            name: "logs_archive".to_string(),
+            tags: HashMap::from([(
+                "_es_original".to_string(),
+                json!({
+                    "aliases": {
+                        "logs_alias": {},
+                        "archive_alias": {}
+                    },
+                    "mappings": {
+                        "properties": {
+                            "index_col": {
+                                "type": "keyword"
+                            }
+                        }
+                    },
+                    "settings": {
+                        "index": {
+                            "number_of_shards": 1,
+                            "number_of_replicas": 0
+                        }
+                    }
+                })
+                .to_string(),
+            )]),
+            serving: None,
+            dynamodb: None,
+        }))
+        .unwrap();
 
         let checkpoint = TableMetadataCheckpoint {
             table_name: "logs".to_string(),
@@ -985,6 +1236,18 @@ pub(crate) mod tests {
             "2"
         );
 
+        let cluster_health_response = test_server
+            .client()
+            .get("http://localhost/_cluster/health")
+            .perform()
+            .unwrap();
+        assert_eq!(cluster_health_response.status(), 200);
+        let cluster_health_json: Value =
+            serde_json::from_str(&cluster_health_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(cluster_health_json["cluster_name"], "docker-cluster");
+        assert_eq!(cluster_health_json["status"], "green");
+        assert_eq!(cluster_health_json["number_of_nodes"], 1);
+
         let alias_update_response = test_server
             .client()
             .post(
@@ -1018,6 +1281,151 @@ pub(crate) mod tests {
             get_alias_json["logs"]["aliases"]["logs_secondary"],
             json!({})
         );
+
+        let get_global_aliases_response =
+            test_server.client().get("http://localhost/_alias").perform().unwrap();
+        assert_eq!(get_global_aliases_response.status(), 200);
+        let get_global_aliases_json: Value =
+            serde_json::from_str(&get_global_aliases_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(get_global_aliases_json["logs"]["aliases"]["logs_alias"], json!({}));
+        assert_eq!(
+            get_global_aliases_json["logs_archive"]["aliases"]["archive_alias"],
+            json!({})
+        );
+
+        let get_named_aliases_response = test_server
+            .client()
+            .get("http://localhost/_alias/logs_alias")
+            .perform()
+            .unwrap();
+        assert_eq!(get_named_aliases_response.status(), 200);
+        let get_named_aliases_json: Value =
+            serde_json::from_str(&get_named_aliases_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(get_named_aliases_json["logs"]["aliases"]["logs_alias"], json!({}));
+        assert_eq!(
+            get_named_aliases_json["logs_archive"]["aliases"]["logs_alias"],
+            json!({})
+        );
+        assert!(get_named_aliases_json["logs"]["aliases"]
+            .get("logs_secondary")
+            .is_none());
+
+        let get_index_named_alias_response = test_server
+            .client()
+            .get("http://localhost/logs/_alias/logs_secondary")
+            .perform()
+            .unwrap();
+        assert_eq!(get_index_named_alias_response.status(), 200);
+        let get_index_named_alias_json: Value =
+            serde_json::from_str(&get_index_named_alias_response.read_utf8_body().unwrap())
+                .unwrap();
+        assert_eq!(
+            get_index_named_alias_json["logs"]["aliases"]["logs_secondary"],
+            json!({})
+        );
+
+        let head_index_alias_response = test_server
+            .client()
+            .head("http://localhost/logs/_alias/logs_secondary")
+            .perform()
+            .unwrap();
+        assert_eq!(head_index_alias_response.status(), 200);
+
+        let missing_head_index_alias_response = test_server
+            .client()
+            .head("http://localhost/logs/_alias/does_not_exist")
+            .perform()
+            .unwrap();
+        assert_eq!(missing_head_index_alias_response.status(), 404);
+
+        let resolve_index_response = test_server
+            .client()
+            .get("http://localhost/_resolve/index/logs")
+            .perform()
+            .unwrap();
+        assert_eq!(resolve_index_response.status(), 200);
+        let resolve_index_json: Value =
+            serde_json::from_str(&resolve_index_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(resolve_index_json["indices"][0]["name"], "logs");
+        assert_eq!(resolve_index_json["indices"][0]["attributes"], json!(["open"]));
+        assert_eq!(
+            resolve_index_json["indices"][0]["aliases"],
+            json!(["logs_alias", "logs_secondary"])
+        );
+        assert_eq!(resolve_index_json["aliases"], json!([]));
+
+        let resolve_alias_response = test_server
+            .client()
+            .get("http://localhost/_resolve/index/logs_alias")
+            .perform()
+            .unwrap();
+        assert_eq!(resolve_alias_response.status(), 200);
+        let resolve_alias_json: Value =
+            serde_json::from_str(&resolve_alias_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(resolve_alias_json["indices"], json!([]));
+        assert_eq!(
+            resolve_alias_json["aliases"][0],
+            json!({
+                "name": "logs_alias",
+                "indices": ["logs", "logs_archive"]
+            })
+        );
+
+        let get_field_caps_response = test_server
+            .client()
+            .get("http://localhost/logs/_field_caps?fields=message,index_col")
+            .perform()
+            .unwrap();
+        assert_eq!(get_field_caps_response.status(), 200);
+        let get_field_caps_json: Value =
+            serde_json::from_str(&get_field_caps_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(get_field_caps_json["indices"], json!(["logs"]));
+        assert_eq!(
+            get_field_caps_json["fields"]["message"]["text"]["searchable"],
+            true
+        );
+        assert_eq!(
+            get_field_caps_json["fields"]["message"]["text"]["aggregatable"],
+            false
+        );
+        assert_eq!(
+            get_field_caps_json["fields"]["index_col"]["long"]["indices"],
+            json!(["logs"])
+        );
+
+        let post_field_caps_response = test_server
+            .client()
+            .post(
+                "http://localhost/_field_caps",
+                r#"{
+                  "fields": ["index_col"]
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(post_field_caps_response.status(), 200);
+        let post_field_caps_json: Value =
+            serde_json::from_str(&post_field_caps_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(post_field_caps_json["indices"], json!(["logs", "logs_archive"]));
+        assert_eq!(
+            post_field_caps_json["fields"]["index_col"]["long"]["indices"],
+            json!(["logs"])
+        );
+        assert_eq!(
+            post_field_caps_json["fields"]["index_col"]["keyword"]["indices"],
+            json!(["logs_archive"])
+        );
+
+        let get_search_response = test_server
+            .client()
+            .get("http://localhost/logs/_search")
+            .perform()
+            .unwrap();
+        assert_eq!(get_search_response.status(), 200);
+        let get_search_json: Value =
+            serde_json::from_str(&get_search_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(get_search_json["hits"]["total"]["value"], 6);
 
         let get_count_response = test_server
             .client()

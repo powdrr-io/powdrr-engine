@@ -10,7 +10,7 @@ use gotham::prelude::{DefineSingleRoute, DrawRoutes, FromState, StateData, Stati
 use gotham::router::{build_router, Router};
 use gotham::state::State;
 use serde::{Deserialize};
-use powdrr_lib::data_contract::ServiceMode;
+use powdrr_service_lib::data_contract::ServiceMode;
 use crate::service_impl_provider::SERVICE_IMPL;
 use crate::v1_handlers;
 

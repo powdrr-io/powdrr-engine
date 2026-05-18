@@ -17,7 +17,7 @@ use serde_json::{Map, Value, json};
 use crate::elastic_search_common::MIME_ES_JSON;
 use crate::util::{log_service_err, log_service_err_response};
 use crate::{
-    data_contract::{AliasInfo, CreateIndexBody, TableDescription},
+    data_contract::{AliasInfo, CreateIndexBody, PropertyInfo, TableDescription},
     elastic_search_cluster_info,
     elastic_search_commands::LookupById,
     elastic_search_common::{CommandContext, execute_command},
@@ -36,6 +36,17 @@ pub struct NamePathExtractor {
 pub struct NameIdPathExtractor {
     name: String,
     id: String,
+}
+
+#[derive(Deserialize, StateData, StaticResponseExtender)]
+pub struct AliasPathExtractor {
+    alias: String,
+}
+
+#[derive(Deserialize, StateData, StaticResponseExtender)]
+pub struct NameAliasPathExtractor {
+    name: String,
+    alias: String,
 }
 
 #[derive(Serialize)]
@@ -198,6 +209,66 @@ pub(crate) struct QueryStringClusterSettings {
     flat_settings: Option<bool>,
 }
 
+#[derive(Deserialize, StateData, StaticResponseExtender)]
+pub(crate) struct QueryStringClusterHealth {
+    #[allow(dead_code)]
+    level: Option<String>,
+    #[allow(dead_code)]
+    local: Option<bool>,
+    #[allow(dead_code)]
+    timeout: Option<String>,
+    #[allow(dead_code)]
+    wait_for_status: Option<String>,
+}
+
+#[derive(Deserialize, StateData, StaticResponseExtender)]
+pub(crate) struct QueryStringFieldCaps {
+    fields: Option<String>,
+    #[allow(dead_code)]
+    include_unmapped: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FieldCapsFieldsInput {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+#[derive(Deserialize, Default)]
+struct FieldCapsBody {
+    fields: Option<FieldCapsFieldsInput>,
+}
+
+#[derive(Serialize)]
+struct ClusterHealthResponse {
+    cluster_name: String,
+    status: String,
+    timed_out: bool,
+    number_of_nodes: u32,
+    number_of_data_nodes: u32,
+    active_primary_shards: u32,
+    active_shards: u32,
+    relocating_shards: u32,
+    initializing_shards: u32,
+    unassigned_shards: u32,
+    delayed_unassigned_shards: u32,
+    number_of_pending_tasks: u32,
+    number_of_in_flight_fetch: u32,
+    task_max_waiting_in_queue_millis: u32,
+    active_shards_percent_as_number: f64,
+}
+
+#[derive(Serialize, Clone)]
+struct FieldCapsTypeResponse {
+    #[serde(rename = "type")]
+    type_name: String,
+    searchable: bool,
+    aggregatable: bool,
+    metadata_field: bool,
+    indices: Vec<String>,
+}
+
 pub fn es_cluster_settings(mut state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_cluster_settings");
     async {
@@ -220,6 +291,38 @@ pub fn es_cluster_settings(mut state: State) -> Pin<Box<HandlerFuture>> {
                 elastic_search_cluster_info::CLUSTER_SETTINGS,
             )
         };
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_cluster_health(mut state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_cluster_health");
+    async {
+        let _query_string = QueryStringClusterHealth::take_from(&mut state);
+        let response = ClusterHealthResponse {
+            cluster_name: env::var("cluster.name").unwrap_or("docker-cluster".into()),
+            status: "green".to_string(),
+            timed_out: false,
+            number_of_nodes: 1,
+            number_of_data_nodes: 1,
+            active_primary_shards: 1,
+            active_shards: 1,
+            relocating_shards: 0,
+            initializing_shards: 0,
+            unassigned_shards: 0,
+            delayed_unassigned_shards: 0,
+            number_of_pending_tasks: 0,
+            number_of_in_flight_fetch: 0,
+            task_max_waiting_in_queue_millis: 0,
+            active_shards_percent_as_number: 100.0,
+        };
+        let res = create_response(
+            &state,
+            StatusCode::OK,
+            mime::APPLICATION_JSON,
+            serde_json::to_string(&response).unwrap(),
+        );
         Ok((state, res))
     }
     .boxed()
@@ -256,6 +359,222 @@ fn aliases_value(body: &CreateIndexBody) -> Value {
         .map(|(name, alias_info)| (name, alias_info_value(&alias_info)))
         .collect::<Map<String, Value>>();
     Value::Object(alias_map)
+}
+
+fn alias_names(body: &CreateIndexBody) -> Vec<String> {
+    let mut aliases = body
+        .aliases
+        .clone()
+        .unwrap_or_default()
+        .into_keys()
+        .collect::<Vec<_>>();
+    aliases.sort();
+    aliases
+}
+
+fn requested_parts(requested: &str) -> Vec<String> {
+    requested
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn requests_all(parts: &[String]) -> bool {
+    parts.is_empty() || parts.iter().any(|part| part == "*" || part == "_all")
+}
+
+fn matches_requested_value(value: &str, requested: &[String]) -> bool {
+    requests_all(requested) || requested.iter().any(|requested_value| requested_value == value)
+}
+
+async fn all_table_descriptions() -> Result<Vec<TableDescription>, crate::state_provider::ServiceApiError>
+{
+    let mut table_descriptions = Vec::new();
+    let mut table_names = STATE_PROVIDER.get_all_iceberg_tables().await?;
+    table_names.sort();
+
+    for table_name in table_names {
+        if let Some(table_desc) = STATE_PROVIDER.describe_table(&table_name).await? {
+            table_descriptions.push(table_desc);
+        }
+    }
+
+    Ok(table_descriptions)
+}
+
+async fn requested_table_descriptions(
+    requested_indices: &[String],
+) -> Result<Vec<TableDescription>, crate::state_provider::ServiceApiError> {
+    if requests_all(requested_indices) {
+        return all_table_descriptions().await;
+    }
+
+    let mut table_descriptions = Vec::new();
+
+    for table_name in requested_indices {
+        if let Some(table_desc) = STATE_PROVIDER.describe_table(table_name).await? {
+            table_descriptions.push(table_desc);
+        }
+    }
+
+    Ok(table_descriptions)
+}
+
+fn filtered_aliases_value(body: &CreateIndexBody, requested_aliases: &[String]) -> Value {
+    let aliases = body.aliases.clone().unwrap_or_default();
+    let alias_map = aliases
+        .into_iter()
+        .filter(|(name, _)| matches_requested_value(name, requested_aliases))
+        .map(|(name, alias_info)| (name, alias_info_value(&alias_info)))
+        .collect::<Map<String, Value>>();
+    Value::Object(alias_map)
+}
+
+async fn build_alias_response(
+    requested_indices: &[String],
+    requested_aliases: &[String],
+) -> Result<Map<String, Value>, crate::state_provider::ServiceApiError> {
+    let mut response = Map::new();
+    let table_descriptions = requested_table_descriptions(requested_indices).await?;
+
+    for table_desc in table_descriptions {
+        let body = parse_index_body(&table_desc);
+        let aliases = filtered_aliases_value(&body, requested_aliases);
+        if aliases.as_object().is_some_and(|aliases| !aliases.is_empty()) {
+            response.insert(table_desc.name.clone(), json!({ "aliases": aliases }));
+        }
+    }
+
+    Ok(response)
+}
+
+fn normalize_field_caps_fields(
+    query_string: &QueryStringFieldCaps,
+    body: &FieldCapsBody,
+) -> Vec<String> {
+    if let Some(fields) = &query_string.fields {
+        return requested_parts(fields);
+    }
+    match &body.fields {
+        Some(FieldCapsFieldsInput::Single(field)) => requested_parts(field),
+        Some(FieldCapsFieldsInput::Multiple(fields)) => fields
+            .iter()
+            .map(String::as_str)
+            .flat_map(requested_parts)
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+fn field_is_requested(field_name: &str, requested_fields: &[String]) -> bool {
+    requests_all(requested_fields) || requested_fields.iter().any(|requested| requested == field_name)
+}
+
+fn field_caps_for_type(type_name: &str) -> (bool, bool) {
+    match type_name {
+        "text" => (true, false),
+        "keyword" | "long" | "integer" | "short" | "byte" | "double" | "float"
+        | "half_float" | "scaled_float" | "unsigned_long" | "date" | "boolean" | "ip" => {
+            (true, true)
+        }
+        _ => (false, false),
+    }
+}
+
+fn add_field_caps_entry(
+    field_caps: &mut HashMap<String, HashMap<String, FieldCapsTypeResponse>>,
+    field_name: &str,
+    type_name: &str,
+    table_name: &str,
+) {
+    let (searchable, aggregatable) = field_caps_for_type(type_name);
+    let entry = field_caps
+        .entry(field_name.to_string())
+        .or_default()
+        .entry(type_name.to_string())
+        .or_insert_with(|| FieldCapsTypeResponse {
+            type_name: type_name.to_string(),
+            searchable,
+            aggregatable,
+            metadata_field: false,
+            indices: Vec::new(),
+        });
+    if !entry.indices.contains(&table_name.to_string()) {
+        entry.indices.push(table_name.to_string());
+        entry.indices.sort();
+    }
+}
+
+fn collect_field_caps_for_properties(
+    prefix: Option<&str>,
+    properties: &HashMap<String, PropertyInfo>,
+    requested_fields: &[String],
+    table_name: &str,
+    field_caps: &mut HashMap<String, HashMap<String, FieldCapsTypeResponse>>,
+) {
+    for (name, property) in properties {
+        let field_name = prefix
+            .map(|prefix| format!("{prefix}.{name}"))
+            .unwrap_or_else(|| name.clone());
+
+        if let Some(type_name) = property.type_name.as_deref() {
+            if field_is_requested(&field_name, requested_fields) {
+                add_field_caps_entry(field_caps, &field_name, type_name, table_name);
+            }
+        }
+
+        if let Some(subfields) = &property.fields {
+            collect_field_caps_for_properties(
+                Some(&field_name),
+                subfields,
+                requested_fields,
+                table_name,
+                field_caps,
+            );
+        }
+        if let Some(nested_properties) = &property.properties {
+            collect_field_caps_for_properties(
+                Some(&field_name),
+                nested_properties,
+                requested_fields,
+                table_name,
+                field_caps,
+            );
+        }
+    }
+}
+
+async fn field_caps_response(
+    requested_indices: &[String],
+    requested_fields: &[String],
+) -> Result<Value, crate::state_provider::ServiceApiError> {
+    let mut table_descriptions = requested_table_descriptions(requested_indices).await?;
+    table_descriptions.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut indices = Vec::new();
+    let mut field_caps = HashMap::<String, HashMap<String, FieldCapsTypeResponse>>::new();
+
+    for table_desc in table_descriptions {
+        let table_name = table_desc.name.clone();
+        let body = parse_index_body(&table_desc);
+        indices.push(table_name.clone());
+
+        if let Some(mappings) = body.mappings {
+            collect_field_caps_for_properties(
+                None,
+                &mappings.properties,
+                requested_fields,
+                &table_name,
+                &mut field_caps,
+            );
+        }
+    }
+
+    Ok(json!({
+        "indices": indices,
+        "fields": field_caps,
+    }))
 }
 
 fn normalize_settings_value(value: Value) -> Value {
@@ -312,6 +631,14 @@ fn count_body_as_search_body(body_content: &str) -> Result<String, String> {
             Ok(parsed_body.to_string())
         }
         None => Err("count body must be a JSON object".to_string()),
+    }
+}
+
+fn normalize_search_body(body_content: &str) -> String {
+    if body_content.trim().is_empty() {
+        "{}".to_string()
+    } else {
+        body_content.to_string()
     }
 }
 
@@ -388,25 +715,14 @@ pub fn es_get_index_aliases(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_get_index_aliases");
     async {
         let path_extractor = NamePathExtractor::borrow_from(&state);
-        let mut response = Map::new();
-
-        for table_name in path_extractor.name.to_string().split(",") {
-            let table_desc = match STATE_PROVIDER.describe_table(&table_name.to_string()).await {
-                Ok(td) => td,
-                Err(e) => {
-                    let res = log_service_err(e).generate_response(&state);
-                    return Ok((state, res));
-                }
-            };
-
-            if let Some(table_desc) = table_desc {
-                let body = parse_index_body(&table_desc);
-                response.insert(
-                    table_desc.name.clone(),
-                    json!({ "aliases": aliases_value(&body) }),
-                );
+        let requested_indices = requested_parts(&path_extractor.name);
+        let response = match build_alias_response(&requested_indices, &[]).await {
+            Ok(response) => response,
+            Err(e) => {
+                let res = log_service_err(e).generate_response(&state);
+                return Ok((state, res));
             }
-        }
+        };
 
         if response.is_empty() {
             let res = create_empty_response(&state, StatusCode::NOT_FOUND);
@@ -419,6 +735,116 @@ pub fn es_get_index_aliases(state: State) -> Pin<Box<HandlerFuture>> {
             mime::APPLICATION_JSON,
             Value::Object(response).to_string(),
         );
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_get_aliases(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_get_aliases");
+    async {
+        let response = match build_alias_response(&[], &[]).await {
+            Ok(response) => response,
+            Err(e) => {
+                let res = log_service_err(e).generate_response(&state);
+                return Ok((state, res));
+            }
+        };
+
+        if response.is_empty() {
+            let res = create_empty_response(&state, StatusCode::NOT_FOUND);
+            return Ok((state, res));
+        }
+
+        let res = create_response(
+            &state,
+            StatusCode::OK,
+            mime::APPLICATION_JSON,
+            Value::Object(response).to_string(),
+        );
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_get_named_aliases(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_get_named_aliases");
+    async {
+        let path_extractor = AliasPathExtractor::borrow_from(&state);
+        let requested_aliases = requested_parts(&path_extractor.alias);
+        let response = match build_alias_response(&[], &requested_aliases).await {
+            Ok(response) => response,
+            Err(e) => {
+                let res = log_service_err(e).generate_response(&state);
+                return Ok((state, res));
+            }
+        };
+
+        if response.is_empty() {
+            let res = create_empty_response(&state, StatusCode::NOT_FOUND);
+            return Ok((state, res));
+        }
+
+        let res = create_response(
+            &state,
+            StatusCode::OK,
+            mime::APPLICATION_JSON,
+            Value::Object(response).to_string(),
+        );
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_get_index_named_aliases(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_get_index_named_aliases");
+    async {
+        let path_extractor = NameAliasPathExtractor::borrow_from(&state);
+        let requested_indices = requested_parts(&path_extractor.name);
+        let requested_aliases = requested_parts(&path_extractor.alias);
+        let response = match build_alias_response(&requested_indices, &requested_aliases).await {
+            Ok(response) => response,
+            Err(e) => {
+                let res = log_service_err(e).generate_response(&state);
+                return Ok((state, res));
+            }
+        };
+
+        if response.is_empty() {
+            let res = create_empty_response(&state, StatusCode::NOT_FOUND);
+            return Ok((state, res));
+        }
+
+        let res = create_response(
+            &state,
+            StatusCode::OK,
+            mime::APPLICATION_JSON,
+            Value::Object(response).to_string(),
+        );
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_head_index_alias(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_head_index_alias");
+    async {
+        let path_extractor = NameAliasPathExtractor::borrow_from(&state);
+        let requested_indices = requested_parts(&path_extractor.name);
+        let requested_aliases = requested_parts(&path_extractor.alias);
+        let response = match build_alias_response(&requested_indices, &requested_aliases).await {
+            Ok(response) => response,
+            Err(e) => {
+                let res = log_service_err(e).generate_response(&state);
+                return Ok((state, res));
+            }
+        };
+
+        let res = if response.is_empty() {
+            create_empty_response(&state, StatusCode::NOT_FOUND)
+        } else {
+            create_empty_response(&state, StatusCode::OK)
+        };
         Ok((state, res))
     }
     .boxed()
@@ -519,6 +945,182 @@ pub fn es_get_index_template(state: State) -> Pin<Box<HandlerFuture>> {
             table_desc.map_or_else(|| "{}".to_string(), |x| serde_json::to_string(&x).unwrap());
 
         let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, response);
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_field_caps(mut state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_field_caps");
+    async {
+        let query_string = QueryStringFieldCaps::take_from(&mut state);
+        let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
+            Ok(vb) => vb,
+            Err(_) => panic!("Oh no"),
+        };
+        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+        let parsed_body = if body_content.trim().is_empty() {
+            FieldCapsBody::default()
+        } else {
+            match serde_json::from_str::<FieldCapsBody>(&body_content) {
+                Ok(body) => body,
+                Err(_) => {
+                    let res = create_response(
+                        &state,
+                        StatusCode::BAD_REQUEST,
+                        mime::TEXT_PLAIN,
+                        "Bad request".to_string(),
+                    );
+                    return Ok((state, res));
+                }
+            }
+        };
+        let requested_fields = normalize_field_caps_fields(&query_string, &parsed_body);
+        let response = match field_caps_response(&[], &requested_fields).await {
+            Ok(response) => response,
+            Err(e) => {
+                let res = log_service_err(e).generate_response(&state);
+                return Ok((state, res));
+            }
+        };
+
+        let res = create_response(
+            &state,
+            StatusCode::OK,
+            mime::APPLICATION_JSON,
+            response.to_string(),
+        );
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_field_caps_index(mut state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_field_caps_index");
+    async {
+        let path_extractor = NamePathExtractor::take_from(&mut state);
+        let query_string = QueryStringFieldCaps::take_from(&mut state);
+        let requested_indices = requested_parts(&path_extractor.name);
+        let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
+            Ok(vb) => vb,
+            Err(_) => panic!("Oh no"),
+        };
+        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+        let parsed_body = if body_content.trim().is_empty() {
+            FieldCapsBody::default()
+        } else {
+            match serde_json::from_str::<FieldCapsBody>(&body_content) {
+                Ok(body) => body,
+                Err(_) => {
+                    let res = create_response(
+                        &state,
+                        StatusCode::BAD_REQUEST,
+                        mime::TEXT_PLAIN,
+                        "Bad request".to_string(),
+                    );
+                    return Ok((state, res));
+                }
+            }
+        };
+        let requested_fields = normalize_field_caps_fields(&query_string, &parsed_body);
+        let response = match field_caps_response(&requested_indices, &requested_fields).await {
+            Ok(response) => response,
+            Err(e) => {
+                let res = log_service_err(e).generate_response(&state);
+                return Ok((state, res));
+            }
+        };
+
+        let res = create_response(
+            &state,
+            StatusCode::OK,
+            mime::APPLICATION_JSON,
+            response.to_string(),
+        );
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_resolve_index(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_resolve_index");
+    async {
+        let path_extractor = NamePathExtractor::borrow_from(&state);
+        let requested_names = requested_parts(&path_extractor.name);
+        let table_descriptions = match all_table_descriptions().await {
+            Ok(table_descriptions) => table_descriptions,
+            Err(e) => {
+                let res = log_service_err(e).generate_response(&state);
+                return Ok((state, res));
+            }
+        };
+
+        let mut indices = Vec::new();
+        let mut aliases_to_indices: HashMap<String, Vec<String>> = HashMap::new();
+
+        for table_desc in table_descriptions {
+            let body = parse_index_body(&table_desc);
+            let aliases = alias_names(&body);
+            let table_name = table_desc.name.clone();
+
+            if matches_requested_value(&table_name, &requested_names) {
+                indices.push(json!({
+                    "name": table_name,
+                    "aliases": aliases,
+                    "attributes": ["open"],
+                }));
+            }
+
+            for alias in alias_names(&body) {
+                if matches_requested_value(&alias, &requested_names) {
+                    aliases_to_indices
+                        .entry(alias)
+                        .or_default()
+                        .push(table_desc.name.clone());
+                }
+            }
+        }
+
+        let mut aliases = aliases_to_indices
+            .into_iter()
+            .map(|(name, mut indices)| {
+                indices.sort();
+                json!({
+                    "name": name,
+                    "indices": indices,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        indices.sort_by(|left, right| {
+            left["name"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(right["name"].as_str().unwrap_or_default())
+        });
+        aliases.sort_by(|left, right| {
+            left["name"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(right["name"].as_str().unwrap_or_default())
+        });
+
+        if indices.is_empty() && aliases.is_empty() {
+            let res = create_empty_response(&state, StatusCode::NOT_FOUND);
+            return Ok((state, res));
+        }
+
+        let res = create_response(
+            &state,
+            StatusCode::OK,
+            mime::APPLICATION_JSON,
+            json!({
+                "indices": indices,
+                "aliases": aliases,
+                "data_streams": [],
+            })
+            .to_string(),
+        );
         Ok((state, res))
     }
     .boxed()
@@ -928,7 +1530,7 @@ pub fn es_search(mut state: State) -> Pin<Box<HandlerFuture>> {
             Ok(vb) => vb,
             Err(_) => panic!("Oh no"),
         };
-        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+        let body_content = normalize_search_body(&String::from_utf8(valid_body.to_vec()).unwrap());
         let command = match elastic_search_parser::parse(None, &body_content, &query_string) {
             Ok(c) => c,
             Err(_) => {
@@ -1176,7 +1778,7 @@ pub fn es_search_table(mut state: State) -> Pin<Box<HandlerFuture>> {
                 return Ok((state, res));
             }
         };
-        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+        let body_content = normalize_search_body(&String::from_utf8(valid_body.to_vec()).unwrap());
         let command = match elastic_search_parser::parse(
             Some(table_desc.name),
             &body_content,

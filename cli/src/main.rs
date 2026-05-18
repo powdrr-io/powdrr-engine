@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use powdrr_lib::local_cli::{
-    build_local_parquet_cache, query_local_parquet_cache, LocalParquetBuildRequest,
-    LocalParquetQueryRequest, LocalQueryLanguage,
+    LocalParquetBuildRequest, LocalParquetQueryRequest, LocalQueryAnalysisRequest,
+    LocalQueryLanguage, analyze_local_query, build_local_parquet_cache, query_local_parquet_cache,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -29,6 +29,7 @@ struct ElasticCommand {
 enum ElasticSubcommand {
     Build(BuildArgs),
     Query(QueryArgs),
+    Analyze(AnalyzeArgs),
 }
 
 #[derive(Args)]
@@ -64,6 +65,16 @@ struct QueryArgs {
     rest_total_hits_as_int: Option<bool>,
 }
 
+#[derive(Args)]
+struct AnalyzeArgs {
+    #[arg(long, value_enum, default_value_t = QueryLanguageArg::EsJson)]
+    language: QueryLanguageArg,
+    #[arg(long)]
+    body: Option<String>,
+    #[arg(long)]
+    body_file: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -96,6 +107,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if response.status_code >= 400 {
                     std::process::exit(1);
                 }
+            }
+            ElasticSubcommand::Analyze(args) => {
+                let body = load_query_body(args.body, args.body_file)?;
+                let analysis = analyze_local_query(&LocalQueryAnalysisRequest {
+                    language: match args.language {
+                        QueryLanguageArg::EsJson => LocalQueryLanguage::ElasticsearchJson,
+                    },
+                    body,
+                });
+                println!("{}", serde_json::to_string_pretty(&analysis)?);
             }
         },
     }
