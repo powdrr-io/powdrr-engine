@@ -6,8 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
-use aws_sdk_dynamodb::client::Waiters;
 use aws_sdk_dynamodb::Client as DynamoClient;
+use aws_sdk_dynamodb::client::Waiters;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType, KeysAndAttributes,
     ScalarAttributeType, TableDescription, TableStatus,
@@ -96,12 +96,48 @@ async fn run_dynamodb_sdk_compat_test() {
     write_test_parquet(&parquet_path, &rows);
 
     let table_name = unique_table_name("dynamo_sdk_compat");
+    let begins_with_table_name = unique_table_name("dynamo_sdk_begins_with");
     let powdrr_server = PowdrrServer::spawn().await;
-    configure_powdrr_table(&powdrr_server.base_url, &table_name, &parquet_path).await;
+    configure_powdrr_testing_mode(&powdrr_server.base_url).await;
+    configure_powdrr_table(
+        &powdrr_server.base_url,
+        &table_name,
+        &parquet_path,
+        &DynamoDbTableConfig {
+            partition_key: "tenant".to_string(),
+            sort_key: Some("ts".to_string()),
+        },
+    )
+    .await;
+    configure_powdrr_table(
+        &powdrr_server.base_url,
+        &begins_with_table_name,
+        &parquet_path,
+        &DynamoDbTableConfig {
+            partition_key: "tenant".to_string(),
+            sort_key: Some("event_id".to_string()),
+        },
+    )
+    .await;
 
     let powdrr_client = dynamodb_client(&powdrr_server.base_url).await;
     let localstack_client = dynamodb_client("http://127.0.0.1:4566").await;
-    create_localstack_table(&localstack_client, &table_name, &rows).await;
+    create_localstack_table(
+        &localstack_client,
+        &table_name,
+        &rows,
+        "ts",
+        ScalarAttributeType::N,
+    )
+    .await;
+    create_localstack_table(
+        &localstack_client,
+        &begins_with_table_name,
+        &rows,
+        "event_id",
+        ScalarAttributeType::S,
+    )
+    .await;
 
     let powdrr_tables = powdrr_client.list_tables().limit(100).send().await.unwrap();
     assert!(
@@ -288,6 +324,77 @@ async fn run_dynamodb_sdk_compat_test() {
     );
     assert_eq!(powdrr_query_page_two.last_evaluated_key(), None);
     assert_eq!(localstack_query_page_two.last_evaluated_key(), None);
+
+    let expected_begins_with_page_one = vec![
+        json!({
+            "tenant": "acme",
+            "event_id": "evt-1",
+            "region": "us-east-1",
+            "ts": 10,
+        }),
+        json!({
+            "tenant": "acme",
+            "event_id": "evt-2",
+            "region": "us-west-2",
+            "ts": 20,
+        }),
+    ];
+    let powdrr_begins_with_page_one =
+        query_begins_with_page(&powdrr_client, &begins_with_table_name, None).await;
+    let localstack_begins_with_page_one =
+        query_begins_with_page(&localstack_client, &begins_with_table_name, None).await;
+    assert_eq!(
+        items_to_json(powdrr_begins_with_page_one.items()),
+        expected_begins_with_page_one
+    );
+    assert_eq!(
+        items_to_json(powdrr_begins_with_page_one.items()),
+        items_to_json(localstack_begins_with_page_one.items())
+    );
+    let expected_begins_with_last_key = json!({
+        "tenant": "acme",
+        "event_id": "evt-2",
+    });
+    let powdrr_begins_with_last_key =
+        optional_item_to_json(powdrr_begins_with_page_one.last_evaluated_key());
+    let localstack_begins_with_last_key =
+        optional_item_to_json(localstack_begins_with_page_one.last_evaluated_key());
+    assert_eq!(
+        powdrr_begins_with_last_key,
+        Some(expected_begins_with_last_key.clone())
+    );
+    assert_eq!(powdrr_begins_with_last_key, localstack_begins_with_last_key);
+
+    let expected_begins_with_page_two = vec![json!({
+        "tenant": "acme",
+        "event_id": "evt-3",
+        "region": "eu-central-1",
+        "ts": 30,
+    })];
+    let powdrr_begins_with_page_two = query_begins_with_page(
+        &powdrr_client,
+        &begins_with_table_name,
+        powdrr_begins_with_page_one.last_evaluated_key().cloned(),
+    )
+    .await;
+    let localstack_begins_with_page_two = query_begins_with_page(
+        &localstack_client,
+        &begins_with_table_name,
+        localstack_begins_with_page_one
+            .last_evaluated_key()
+            .cloned(),
+    )
+    .await;
+    assert_eq!(
+        items_to_json(powdrr_begins_with_page_two.items()),
+        expected_begins_with_page_two
+    );
+    assert_eq!(
+        items_to_json(powdrr_begins_with_page_two.items()),
+        items_to_json(localstack_begins_with_page_two.items())
+    );
+    assert_eq!(powdrr_begins_with_page_two.last_evaluated_key(), None);
+    assert_eq!(localstack_begins_with_page_two.last_evaluated_key(), None);
 }
 
 fn ensure_local_engine_dependencies() -> Result<(), String> {
@@ -305,23 +412,14 @@ fn require_local_service(name: &str, address: &str) -> Result<(), String> {
         .map_err(|error| format!("requires {} at {} ({})", name, address, error))
 }
 
-async fn configure_powdrr_table(base_url: &str, table_name: &str, parquet_path: &Path) {
+async fn configure_powdrr_table(
+    base_url: &str,
+    table_name: &str,
+    parquet_path: &Path,
+    config: &DynamoDbTableConfig,
+) {
     let client = HttpClient::new();
     let checkpoint = checkpoint_from_parquet(table_name, parquet_path).await;
-    let mut mode = TestProcessingMode::dynamo_testing(Some("http://127.0.0.1:4566".to_string()));
-    mode.indexing_mode = IndexingMode::Disabled;
-
-    client
-        .put(format!(
-            "{}/_test/v1/_testing_and_processing_mode",
-            base_url
-        ))
-        .json(&mode)
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
 
     client
         .post(format!("{}/_test/v1/_add_checkpoint", base_url))
@@ -334,10 +432,25 @@ async fn configure_powdrr_table(base_url: &str, table_name: &str, parquet_path: 
 
     client
         .put(format!("{}/{}/_dynamodb/config", base_url, table_name))
-        .json(&DynamoDbTableConfig {
-            partition_key: "tenant".to_string(),
-            sort_key: Some("ts".to_string()),
-        })
+        .json(config)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+}
+
+async fn configure_powdrr_testing_mode(base_url: &str) {
+    let client = HttpClient::new();
+    let mut mode = TestProcessingMode::dynamo_testing(Some("http://127.0.0.1:4566".to_string()));
+    mode.indexing_mode = IndexingMode::Disabled;
+
+    client
+        .put(format!(
+            "{}/_test/v1/_testing_and_processing_mode",
+            base_url
+        ))
+        .json(&mode)
         .send()
         .await
         .unwrap()
@@ -390,7 +503,13 @@ async fn dynamodb_client(endpoint_url: &str) -> DynamoClient {
     DynamoClient::new(&config)
 }
 
-async fn create_localstack_table(client: &DynamoClient, table_name: &str, rows: &[EventRow]) {
+async fn create_localstack_table(
+    client: &DynamoClient,
+    table_name: &str,
+    rows: &[EventRow],
+    sort_key_name: &str,
+    sort_key_type: ScalarAttributeType,
+) {
     let _ = client.delete_table().table_name(table_name).send().await;
 
     client
@@ -405,8 +524,8 @@ async fn create_localstack_table(client: &DynamoClient, table_name: &str, rows: 
         )
         .attribute_definitions(
             AttributeDefinition::builder()
-                .attribute_name("ts")
-                .attribute_type(ScalarAttributeType::N)
+                .attribute_name(sort_key_name)
+                .attribute_type(sort_key_type)
                 .build()
                 .unwrap(),
         )
@@ -419,7 +538,7 @@ async fn create_localstack_table(client: &DynamoClient, table_name: &str, rows: 
         )
         .key_schema(
             KeySchemaElement::builder()
-                .attribute_name("ts")
+                .attribute_name(sort_key_name)
                 .key_type(KeyType::Range)
                 .build()
                 .unwrap(),
@@ -465,6 +584,29 @@ async fn query_page(
         .expression_attribute_values(":start", AttributeValue::N("10".to_string()))
         .expression_attribute_values(":end", AttributeValue::N("30".to_string()))
         .projection_expression("#pk, #sk, event_id, #region")
+        .limit(2)
+        .scan_index_forward(true)
+        .set_exclusive_start_key(exclusive_start_key)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn query_begins_with_page(
+    client: &DynamoClient,
+    table_name: &str,
+    exclusive_start_key: Option<HashMap<String, AttributeValue>>,
+) -> aws_sdk_dynamodb::operation::query::QueryOutput {
+    client
+        .query()
+        .table_name(table_name)
+        .key_condition_expression("#pk = :pk AND begins_with(#sk, :prefix)")
+        .expression_attribute_names("#pk", "tenant")
+        .expression_attribute_names("#sk", "event_id")
+        .expression_attribute_names("#region", "region")
+        .expression_attribute_values(":pk", AttributeValue::S("acme".to_string()))
+        .expression_attribute_values(":prefix", AttributeValue::S("evt-".to_string()))
+        .projection_expression("#pk, #sk, #region, ts")
         .limit(2)
         .scan_index_forward(true)
         .set_exclusive_start_key(exclusive_start_key)
