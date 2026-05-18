@@ -205,6 +205,7 @@ struct SearchBody {
     pit: Option<PitInfo>,
     size: Option<u32>,
     from: Option<u32>,
+    search_after: Option<Vec<Value>>,
     seq_no_primary_term: Option<bool>,
     query: Option<Query>,
     aggs: Option<HashMap<String, AggSpec>>,
@@ -223,6 +224,8 @@ pub(crate) enum Query {
     Match(Match),
     Bool(Bool),
     Term(Term),
+    Terms(Terms),
+    Ids(Ids),
     Exists(Exists),
     SimpleQueryString(SimpleQueryString),
     Range(Range),
@@ -290,6 +293,21 @@ pub(crate) struct BoolBody {
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct Term {
     term: HashMap<String, Value>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct Terms {
+    terms: HashMap<String, Vec<Value>>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct Ids {
+    ids: IdsBody,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct IdsBody {
+    values: Vec<Value>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -408,8 +426,9 @@ fn to_search_plan(
         target,
         from: body.from.unwrap_or(0),
         size: body.size,
+        search_after: body.search_after.clone(),
         seq_no_primary_term: body.seq_no_primary_term,
-        query: body.query.as_ref().map(to_query_plan),
+        query: body.query.as_ref().map(to_query_plan).transpose()?,
         aggregations: aggs_to_plan(&body.aggs),
         sort: sort_section_to_plans(&body.sort),
     })
@@ -430,7 +449,7 @@ fn to_update_by_query_plan(
 
     Ok(search_plan::UpdateByQueryPlan {
         table: table_name,
-        query: to_query_plan(&body.query),
+        query: to_query_plan(&body.query)?,
         script: to_script_plan(&body.script),
         sort: sort_vec_to_plans(&body.sort),
         max_docs: body.max_docs,
@@ -446,7 +465,7 @@ fn to_script_plan(script: &ScriptBlock) -> search_plan::ScriptPlan {
     }
 }
 
-fn to_query_plan(query: &Query) -> search_plan::QueryPlan {
+fn to_query_plan(query: &Query) -> Result<search_plan::QueryPlan, ParseError> {
     match query {
         Query::Match(match_obj) => {
             let mut clauses = match_obj
@@ -458,39 +477,41 @@ fn to_query_plan(query: &Query) -> search_plan::QueryPlan {
                 })
                 .collect::<Vec<_>>();
             clauses.sort_by(|left, right| left.field.cmp(&right.field));
-            search_plan::QueryPlan::Match(search_plan::MatchPlan { clauses })
+            Ok(search_plan::QueryPlan::Match(search_plan::MatchPlan {
+                clauses,
+            }))
         }
-        Query::Bool(bool_obj) => search_plan::QueryPlan::Bool(search_plan::BoolPlan {
+        Query::Bool(bool_obj) => Ok(search_plan::QueryPlan::Bool(search_plan::BoolPlan {
             filter: bool_obj
                 ._bool
                 .filter
                 .as_vec()
                 .iter()
                 .map(to_query_plan)
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
             should: bool_obj
                 ._bool
                 .should
                 .as_vec()
                 .iter()
                 .map(to_query_plan)
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
             must: bool_obj
                 ._bool
                 .must
                 .as_vec()
                 .iter()
                 .map(to_query_plan)
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
             must_not: bool_obj
                 ._bool
                 .must_not
                 .as_vec()
                 .iter()
                 .map(to_query_plan)
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
             minimum_should_match: bool_obj._bool.minimum_should_match,
-        }),
+        })),
         Query::Term(term_obj) => {
             let mut clauses = term_obj
                 .term
@@ -501,11 +522,33 @@ fn to_query_plan(query: &Query) -> search_plan::QueryPlan {
                 })
                 .collect::<Vec<_>>();
             clauses.sort_by(|left, right| left.field.cmp(&right.field));
-            search_plan::QueryPlan::Term(search_plan::TermPlan { clauses })
+            Ok(search_plan::QueryPlan::Term(search_plan::TermPlan {
+                clauses,
+            }))
         }
-        Query::Exists(exists_obj) => search_plan::QueryPlan::Exists(search_plan::ExistsPlan {
+        Query::Terms(terms_obj) => {
+            let (field, values) = terms_obj.terms.iter().next().ok_or_else(|| ParseError {
+                message: "`terms` query requires exactly one field".to_string(),
+            })?;
+            if terms_obj.terms.len() != 1 {
+                return Err(ParseError {
+                    message: "`terms` query requires exactly one field".to_string(),
+                });
+            }
+            term_values_to_query_plan(
+                field.clone(),
+                values,
+                "`terms` query requires at least one value",
+            )
+        }
+        Query::Ids(ids_obj) => term_values_to_query_plan(
+            "_id".to_string(),
+            &ids_obj.ids.values,
+            "`ids` query requires at least one value",
+        ),
+        Query::Exists(exists_obj) => Ok(search_plan::QueryPlan::Exists(search_plan::ExistsPlan {
             field: exists_obj.exists.field.clone(),
-        }),
+        })),
         Query::Range(range_obj) => {
             let mut clauses = range_obj
                 .range
@@ -520,15 +563,49 @@ fn to_query_plan(query: &Query) -> search_plan::QueryPlan {
                 })
                 .collect::<Vec<_>>();
             clauses.sort_by(|left, right| left.field.cmp(&right.field));
-            search_plan::QueryPlan::Range(search_plan::RangePlan { clauses })
+            Ok(search_plan::QueryPlan::Range(search_plan::RangePlan {
+                clauses,
+            }))
         }
-        Query::SimpleQueryString(simple_query) => {
-            search_plan::QueryPlan::SimpleQueryString(search_plan::SimpleQueryStringPlan {
+        Query::SimpleQueryString(simple_query) => Ok(search_plan::QueryPlan::SimpleQueryString(
+            search_plan::SimpleQueryStringPlan {
                 query: simple_query.simple_query_string.query.clone(),
                 fields: simple_query.simple_query_string.fields.clone(),
                 default_operator: simple_query.simple_query_string.default_operator.clone(),
+            },
+        )),
+    }
+}
+
+fn term_values_to_query_plan(
+    field: String,
+    values: &[Value],
+    empty_message: &str,
+) -> Result<search_plan::QueryPlan, ParseError> {
+    let mut should = values
+        .iter()
+        .map(|value| {
+            search_plan::QueryPlan::Term(search_plan::TermPlan {
+                clauses: vec![search_plan::TermClausePlan {
+                    field: field.clone(),
+                    value: value.clone(),
+                }],
             })
-        }
+        })
+        .collect::<Vec<_>>();
+
+    match should.len() {
+        0 => Err(ParseError {
+            message: empty_message.to_string(),
+        }),
+        1 => Ok(should.pop().unwrap()),
+        _ => Ok(search_plan::QueryPlan::Bool(search_plan::BoolPlan {
+            filter: vec![],
+            should,
+            must: vec![],
+            must_not: vec![],
+            minimum_should_match: Some(1),
+        })),
     }
 }
 
@@ -769,6 +846,56 @@ mod tests {
                 assert_eq!(match_plan.clauses[0].query, "this is a test");
             }
             _ => panic!("Expected match plan"),
+        }
+    }
+
+    #[test]
+    fn test_parse_search_plan_terms() {
+        let plan = parse_search_plan(
+            Some("foo".to_string()),
+            &r#"
+{
+   "query": {
+     "terms": {
+       "index_col": [2, 5]
+     }
+   }
+}"#
+            .to_string(),
+        )
+        .unwrap();
+
+        match plan.query.unwrap() {
+            search_plan::QueryPlan::Bool(bool_plan) => {
+                assert_eq!(bool_plan.should.len(), 2);
+                assert_eq!(bool_plan.minimum_should_match, Some(1));
+            }
+            _ => panic!("Expected bool plan"),
+        }
+    }
+
+    #[test]
+    fn test_parse_search_plan_ids() {
+        let plan = parse_search_plan(
+            Some("foo".to_string()),
+            &r#"
+{
+   "query": {
+     "ids": {
+       "values": ["2", "5"]
+     }
+   }
+}"#
+            .to_string(),
+        )
+        .unwrap();
+
+        match plan.query.unwrap() {
+            search_plan::QueryPlan::Bool(bool_plan) => {
+                assert_eq!(bool_plan.should.len(), 2);
+                assert_eq!(bool_plan.minimum_should_match, Some(1));
+            }
+            _ => panic!("Expected bool plan"),
         }
     }
 

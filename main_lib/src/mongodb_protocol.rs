@@ -2,8 +2,8 @@ use std::{
     collections::{BTreeSet, HashMap},
     pin::Pin,
     sync::{
-        atomic::{AtomicI64, Ordering},
         LazyLock, Mutex,
+        atomic::{AtomicI64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -11,24 +11,24 @@ use std::{
 use futures_util::future::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{body, Body};
+use gotham::hyper::{Body, body};
 use gotham::mime;
 use gotham::prelude::StaticResponseExtender;
 use gotham::state::{FromState, State, StateData};
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::data_contract::{
     CreateTable, MongoDbTableConfig, TableDescription, TableMetadataCheckpoint,
 };
 use crate::elastic_search_endpoints::NamePathExtractor;
-use crate::lakehouse_serving::{execute_serving_query, ServingQueryError, ServingQueryResponse};
+use crate::lakehouse_serving::{ServingQueryError, ServingQueryResponse, execute_serving_query};
 use crate::peers::CheckpointDescriptor;
 use crate::schema_massager::{PowdrrDataType, PowdrrSchema};
 use crate::serving_plan::ServingQueryClassification;
-use crate::serving_protocol::{from_mongodb_find, MongoFindCommand, MongoProtocolError};
-use crate::state_provider::{ServiceApiError, STATE_PROVIDER};
+use crate::serving_protocol::{MongoFindCommand, MongoProtocolError, from_mongodb_find};
+use crate::state_provider::{STATE_PROVIDER, ServiceApiError};
 
 const MONGO_BAD_VALUE_CODE: i32 = 2;
 const MONGO_CURSOR_NOT_FOUND_CODE: i32 = 43;
@@ -93,7 +93,7 @@ struct MongoCommandErrorResponse {
 }
 
 #[derive(Debug)]
-struct MongoCommandError {
+pub(crate) struct MongoCommandError {
     status: StatusCode,
     code: i32,
     code_name: &'static str,
@@ -341,7 +341,7 @@ pub fn mongodb_find(mut state: State) -> Pin<Box<HandlerFuture>> {
     .boxed()
 }
 
-async fn execute_mongodb_command(
+pub(crate) async fn execute_mongodb_command(
     database: &str,
     payload: Value,
 ) -> Result<Value, MongoCommandError> {
@@ -357,6 +357,9 @@ async fn execute_mongodb_command(
         return Ok(build_mongodb_hello_response());
     }
     if command.contains_key("ping") {
+        return Ok(json!({ "ok": 1.0 }));
+    }
+    if command.contains_key("endSessions") {
         return Ok(json!({ "ok": 1.0 }));
     }
     if command.contains_key("buildInfo") {
@@ -396,8 +399,15 @@ async fn execute_mongodb_command(
     }
 
     Err(MongoCommandError::bad_value(
-        "Unsupported Mongo command. Supported commands: hello, ping, buildInfo, listCollections, listDatabases, listIndexes, collStats, dbStats, find, getMore, killCursors",
+        "Unsupported Mongo command. Supported commands: hello, ping, endSessions, buildInfo, listCollections, listDatabases, listIndexes, collStats, dbStats, find, getMore, killCursors",
     ))
+}
+
+pub(crate) async fn execute_mongodb_command_value(database: &str, payload: Value) -> Value {
+    match execute_mongodb_command(database, payload).await {
+        Ok(response) => response,
+        Err(error) => command_error_value(error),
+    }
 }
 
 async fn execute_mongodb_find_for_table(
@@ -432,19 +442,18 @@ async fn execute_mongodb_find_for_table(
 
 fn build_mongodb_hello_response() -> Value {
     json!({
-        "isWritablePrimary": false,
-        "ismaster": false,
+        "isWritablePrimary": true,
+        "ismaster": true,
         "secondary": false,
         "helloOk": true,
-        "isreplicaset": false,
         "maxBsonObjectSize": 16 * 1024 * 1024,
         "maxMessageSizeBytes": 48 * 1000 * 1000,
         "maxWriteBatchSize": 100000,
         "minWireVersion": 0,
         "maxWireVersion": 21,
         "logicalSessionTimeoutMinutes": 30,
+        "connectionId": 1,
         "readOnly": true,
-        "msg": "powdrr-mongo-http-bridge",
         "ok": 1.0
     })
 }
@@ -1452,15 +1461,19 @@ fn json_response<T: Serialize>(
     )
 }
 
+fn command_error_value(error: MongoCommandError) -> Value {
+    serde_json::to_value(command_error_response(&error)).unwrap()
+}
+
+fn command_error_response(error: &MongoCommandError) -> MongoCommandErrorResponse {
+    MongoCommandErrorResponse {
+        ok: 0.0,
+        errmsg: error.message.clone(),
+        code: error.code,
+        code_name: error.code_name,
+    }
+}
+
 fn json_error_response(state: &State, error: MongoCommandError) -> gotham::hyper::Response<Body> {
-    json_response(
-        state,
-        error.status,
-        &MongoCommandErrorResponse {
-            ok: 0.0,
-            errmsg: error.message,
-            code: error.code,
-            code_name: error.code_name,
-        },
-    )
+    json_response(state, error.status, &command_error_response(&error))
 }

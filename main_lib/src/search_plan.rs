@@ -5,6 +5,7 @@ pub struct SearchPlan {
     pub target: SearchTarget,
     pub from: u32,
     pub size: Option<u32>,
+    pub search_after: Option<Vec<Value>>,
     pub seq_no_primary_term: Option<bool>,
     pub query: Option<QueryPlan>,
     pub aggregations: Vec<AggregationPlan>,

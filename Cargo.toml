@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["benchmark", "cli", "engine", "engine_lib", "main_lib", "service", "service_lib"]
-default-members = ["cli", "engine", "main_lib", "service"]
+default-members = ["cli", "engine", "service"]
 
 
 [workspace.package]

@@ -9,8 +9,9 @@ use aws_credential_types::Credentials;
 use aws_sdk_dynamodb::Client as DynamoClient;
 use aws_sdk_dynamodb::client::Waiters;
 use aws_sdk_dynamodb::types::{
-    AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType, KeysAndAttributes,
-    ScalarAttributeType, TableDescription, TableStatus,
+    AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, KeySchemaElement,
+    KeyType, KeysAndAttributes, Projection, ProjectionType, ScalarAttributeType, TableDescription,
+    TableStatus,
 };
 use datafusion::arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -19,7 +20,8 @@ use datafusion::parquet::arrow::ArrowWriter;
 use futures_util::future;
 use gotham::bind_server;
 use powdrr_lib::data_contract::{
-    DynamoDbTableConfig, FileSetPayload, IcebergMetadata, TableMetadataCheckpoint,
+    DynamoDbGlobalSecondaryIndexConfig, DynamoDbTableConfig, FileSetPayload, IcebergMetadata,
+    TableMetadataCheckpoint,
 };
 use powdrr_lib::router::router;
 use powdrr_lib::serving_dataset::read_parquet_documents;
@@ -41,6 +43,14 @@ struct EventRow {
     region: String,
     active: bool,
     count: i64,
+}
+
+#[derive(Clone)]
+struct TestGlobalSecondaryIndex {
+    name: String,
+    partition_key: String,
+    partition_key_type: ScalarAttributeType,
+    sort_key: Option<(String, ScalarAttributeType)>,
 }
 
 struct PowdrrServer {
@@ -97,6 +107,7 @@ async fn run_dynamodb_sdk_compat_test() {
 
     let table_name = unique_table_name("dynamo_sdk_compat");
     let begins_with_table_name = unique_table_name("dynamo_sdk_begins_with");
+    let region_event_id_index = "region-event-id-index".to_string();
     let powdrr_server = PowdrrServer::spawn().await;
     configure_powdrr_testing_mode(&powdrr_server.base_url).await;
     configure_powdrr_table(
@@ -106,6 +117,11 @@ async fn run_dynamodb_sdk_compat_test() {
         &DynamoDbTableConfig {
             partition_key: "tenant".to_string(),
             sort_key: Some("ts".to_string()),
+            global_secondary_indexes: vec![DynamoDbGlobalSecondaryIndexConfig {
+                name: region_event_id_index.clone(),
+                partition_key: "region".to_string(),
+                sort_key: Some("event_id".to_string()),
+            }],
         },
     )
     .await;
@@ -116,6 +132,7 @@ async fn run_dynamodb_sdk_compat_test() {
         &DynamoDbTableConfig {
             partition_key: "tenant".to_string(),
             sort_key: Some("event_id".to_string()),
+            global_secondary_indexes: vec![],
         },
     )
     .await;
@@ -128,6 +145,12 @@ async fn run_dynamodb_sdk_compat_test() {
         &rows,
         "ts",
         ScalarAttributeType::N,
+        vec![TestGlobalSecondaryIndex {
+            name: region_event_id_index.clone(),
+            partition_key: "region".to_string(),
+            partition_key_type: ScalarAttributeType::S,
+            sort_key: Some(("event_id".to_string(), ScalarAttributeType::S)),
+        }],
     )
     .await;
     create_localstack_table(
@@ -136,6 +159,7 @@ async fn run_dynamodb_sdk_compat_test() {
         &rows,
         "event_id",
         ScalarAttributeType::S,
+        vec![],
     )
     .await;
 
@@ -325,6 +349,85 @@ async fn run_dynamodb_sdk_compat_test() {
     assert_eq!(powdrr_query_page_two.last_evaluated_key(), None);
     assert_eq!(localstack_query_page_two.last_evaluated_key(), None);
 
+    let powdrr_filter_page_one = query_with_filter_page(&powdrr_client, &table_name, None).await;
+    let localstack_filter_page_one =
+        query_with_filter_page(&localstack_client, &table_name, None).await;
+    let expected_filter_page_one = vec![json!({
+        "tenant": "acme",
+        "ts": 20,
+        "event_id": "evt-2",
+        "count": 2,
+    })];
+    assert_eq!(
+        items_to_json(powdrr_filter_page_one.items()),
+        expected_filter_page_one
+    );
+    assert_eq!(powdrr_filter_page_one.count(), 1);
+    assert_eq!(powdrr_filter_page_one.scanned_count(), 2);
+    assert_eq!(
+        items_to_json(powdrr_filter_page_one.items()),
+        items_to_json(localstack_filter_page_one.items())
+    );
+    assert_eq!(
+        powdrr_filter_page_one.count(),
+        localstack_filter_page_one.count()
+    );
+    assert_eq!(
+        powdrr_filter_page_one.scanned_count(),
+        localstack_filter_page_one.scanned_count()
+    );
+    let expected_filter_last_key = json!({
+        "tenant": "acme",
+        "ts": 20,
+    });
+    let powdrr_filter_last_key = optional_item_to_json(powdrr_filter_page_one.last_evaluated_key());
+    let localstack_filter_last_key =
+        optional_item_to_json(localstack_filter_page_one.last_evaluated_key());
+    assert_eq!(
+        powdrr_filter_last_key,
+        Some(expected_filter_last_key.clone())
+    );
+    assert_eq!(powdrr_filter_last_key, localstack_filter_last_key);
+
+    let powdrr_filter_page_two = query_with_filter_page(
+        &powdrr_client,
+        &table_name,
+        powdrr_filter_page_one.last_evaluated_key().cloned(),
+    )
+    .await;
+    let localstack_filter_page_two = query_with_filter_page(
+        &localstack_client,
+        &table_name,
+        localstack_filter_page_one.last_evaluated_key().cloned(),
+    )
+    .await;
+    let expected_filter_page_two = vec![json!({
+        "tenant": "acme",
+        "ts": 30,
+        "event_id": "evt-3",
+        "count": 3,
+    })];
+    assert_eq!(
+        items_to_json(powdrr_filter_page_two.items()),
+        expected_filter_page_two
+    );
+    assert_eq!(powdrr_filter_page_two.count(), 1);
+    assert_eq!(powdrr_filter_page_two.scanned_count(), 1);
+    assert_eq!(
+        items_to_json(powdrr_filter_page_two.items()),
+        items_to_json(localstack_filter_page_two.items())
+    );
+    assert_eq!(
+        powdrr_filter_page_two.count(),
+        localstack_filter_page_two.count()
+    );
+    assert_eq!(
+        powdrr_filter_page_two.scanned_count(),
+        localstack_filter_page_two.scanned_count()
+    );
+    assert_eq!(powdrr_filter_page_two.last_evaluated_key(), None);
+    assert_eq!(localstack_filter_page_two.last_evaluated_key(), None);
+
     let expected_begins_with_page_one = vec![
         json!({
             "tenant": "acme",
@@ -395,6 +498,30 @@ async fn run_dynamodb_sdk_compat_test() {
     );
     assert_eq!(powdrr_begins_with_page_two.last_evaluated_key(), None);
     assert_eq!(localstack_begins_with_page_two.last_evaluated_key(), None);
+
+    let powdrr_gsi_query =
+        query_region_index_page(&powdrr_client, &table_name, &region_event_id_index).await;
+    let localstack_gsi_query =
+        query_region_index_page(&localstack_client, &table_name, &region_event_id_index).await;
+    let expected_gsi_items = vec![
+        json!({
+            "tenant": "acme",
+            "region": "us-east-1",
+            "event_id": "evt-1",
+            "ts": 10,
+        }),
+        json!({
+            "tenant": "initech",
+            "region": "us-east-1",
+            "event_id": "evt-5",
+            "ts": 25,
+        }),
+    ];
+    assert_eq!(items_to_json(powdrr_gsi_query.items()), expected_gsi_items);
+    assert_eq!(
+        items_to_json(powdrr_gsi_query.items()),
+        items_to_json(localstack_gsi_query.items())
+    );
 }
 
 fn ensure_local_engine_dependencies() -> Result<(), String> {
@@ -509,10 +636,11 @@ async fn create_localstack_table(
     rows: &[EventRow],
     sort_key_name: &str,
     sort_key_type: ScalarAttributeType,
+    global_secondary_indexes: Vec<TestGlobalSecondaryIndex>,
 ) {
     let _ = client.delete_table().table_name(table_name).send().await;
 
-    client
+    let mut create_table = client
         .create_table()
         .table_name(table_name)
         .attribute_definitions(
@@ -525,7 +653,7 @@ async fn create_localstack_table(
         .attribute_definitions(
             AttributeDefinition::builder()
                 .attribute_name(sort_key_name)
-                .attribute_type(sort_key_type)
+                .attribute_type(sort_key_type.clone())
                 .build()
                 .unwrap(),
         )
@@ -543,10 +671,68 @@ async fn create_localstack_table(
                 .build()
                 .unwrap(),
         )
-        .billing_mode(BillingMode::PayPerRequest)
-        .send()
-        .await
-        .unwrap();
+        .billing_mode(BillingMode::PayPerRequest);
+
+    let mut declared_attributes = vec![
+        ("tenant".to_string(), ScalarAttributeType::S),
+        (sort_key_name.to_string(), sort_key_type),
+    ];
+    for index in global_secondary_indexes.iter() {
+        if !declared_attributes
+            .iter()
+            .any(|(name, _)| name == &index.partition_key)
+        {
+            create_table = create_table.attribute_definitions(
+                AttributeDefinition::builder()
+                    .attribute_name(index.partition_key.clone())
+                    .attribute_type(index.partition_key_type.clone())
+                    .build()
+                    .unwrap(),
+            );
+            declared_attributes.push((
+                index.partition_key.clone(),
+                index.partition_key_type.clone(),
+            ));
+        }
+        if let Some((sort_key, sort_key_type)) = index.sort_key.as_ref() {
+            if !declared_attributes.iter().any(|(name, _)| name == sort_key) {
+                create_table = create_table.attribute_definitions(
+                    AttributeDefinition::builder()
+                        .attribute_name(sort_key.clone())
+                        .attribute_type(sort_key_type.clone())
+                        .build()
+                        .unwrap(),
+                );
+                declared_attributes.push((sort_key.clone(), sort_key_type.clone()));
+            }
+        }
+        let mut gsi = GlobalSecondaryIndex::builder()
+            .index_name(index.name.clone())
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name(index.partition_key.clone())
+                    .key_type(KeyType::Hash)
+                    .build()
+                    .unwrap(),
+            )
+            .projection(
+                Projection::builder()
+                    .projection_type(ProjectionType::All)
+                    .build(),
+            );
+        if let Some((sort_key, _)) = index.sort_key.as_ref() {
+            gsi = gsi.key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name(sort_key.clone())
+                    .key_type(KeyType::Range)
+                    .build()
+                    .unwrap(),
+            );
+        }
+        create_table = create_table.global_secondary_indexes(gsi.build().unwrap());
+    }
+
+    create_table.send().await.unwrap();
 
     client
         .wait_until_table_exists()
@@ -615,6 +801,57 @@ async fn query_begins_with_page(
         .unwrap()
 }
 
+async fn query_with_filter_page(
+    client: &DynamoClient,
+    table_name: &str,
+    exclusive_start_key: Option<HashMap<String, AttributeValue>>,
+) -> aws_sdk_dynamodb::operation::query::QueryOutput {
+    client
+        .query()
+        .table_name(table_name)
+        .key_condition_expression("#pk = :pk AND #sk BETWEEN :start AND :end")
+        .filter_expression("#count IN (:two, :three) AND begins_with(#event_id, :prefix)")
+        .expression_attribute_names("#pk", "tenant")
+        .expression_attribute_names("#sk", "ts")
+        .expression_attribute_names("#count", "count")
+        .expression_attribute_names("#event_id", "event_id")
+        .expression_attribute_values(":pk", AttributeValue::S("acme".to_string()))
+        .expression_attribute_values(":start", AttributeValue::N("10".to_string()))
+        .expression_attribute_values(":end", AttributeValue::N("30".to_string()))
+        .expression_attribute_values(":two", AttributeValue::N("2".to_string()))
+        .expression_attribute_values(":three", AttributeValue::N("3".to_string()))
+        .expression_attribute_values(":prefix", AttributeValue::S("evt-".to_string()))
+        .projection_expression("#pk, #sk, #event_id, #count")
+        .limit(2)
+        .scan_index_forward(true)
+        .set_exclusive_start_key(exclusive_start_key)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn query_region_index_page(
+    client: &DynamoClient,
+    table_name: &str,
+    index_name: &str,
+) -> aws_sdk_dynamodb::operation::query::QueryOutput {
+    client
+        .query()
+        .table_name(table_name)
+        .index_name(index_name)
+        .key_condition_expression("#pk = :pk AND begins_with(#sk, :prefix)")
+        .expression_attribute_names("#pk", "region")
+        .expression_attribute_names("#sk", "event_id")
+        .expression_attribute_names("#tenant", "tenant")
+        .expression_attribute_values(":pk", AttributeValue::S("us-east-1".to_string()))
+        .expression_attribute_values(":prefix", AttributeValue::S("evt-".to_string()))
+        .projection_expression("#tenant, #pk, #sk, ts")
+        .scan_index_forward(true)
+        .send()
+        .await
+        .unwrap()
+}
+
 fn compare_table_descriptions(powdrr: &TableDescription, localstack: &TableDescription) {
     assert_eq!(powdrr.table_name(), localstack.table_name());
     assert_eq!(
@@ -646,6 +883,11 @@ fn compare_table_descriptions(powdrr: &TableDescription, localstack: &TableDescr
             .billing_mode_summary()
             .and_then(|summary| summary.billing_mode()),
     );
+    assert_eq!(
+        table_global_secondary_indexes(powdrr),
+        table_global_secondary_indexes(localstack),
+        "global secondary index mismatch"
+    );
 }
 
 fn table_key_schema(description: &TableDescription) -> Vec<(String, String)> {
@@ -674,6 +916,32 @@ fn table_attribute_definitions(description: &TableDescription) -> Vec<(String, S
         .collect::<Vec<_>>();
     definitions.sort();
     definitions
+}
+
+fn table_global_secondary_indexes(
+    description: &TableDescription,
+) -> Vec<(String, Vec<(String, String)>)> {
+    let mut indexes = description
+        .global_secondary_indexes()
+        .iter()
+        .map(|index| {
+            (
+                index.index_name().unwrap_or_default().to_string(),
+                index
+                    .key_schema()
+                    .iter()
+                    .map(|element| {
+                        (
+                            element.attribute_name().to_string(),
+                            element.key_type().as_str().to_string(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    indexes.sort_by(|left, right| left.0.cmp(&right.0));
+    indexes
 }
 
 fn batch_output_items(

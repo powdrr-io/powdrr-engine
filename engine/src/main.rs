@@ -13,6 +13,7 @@ use gotham::{
 use idgenerator::*;
 use rustls_pemfile::{certs, rsa_private_keys};
 use rustls_pki_types::PrivatePkcs1KeyDer;
+use tokio::net::TcpListener;
 
 /// Start a server and call the `Handler` we've defined above for each `Request` we receive.
 //
@@ -47,6 +48,15 @@ async fn run_server(mode: &OperatingMode) -> () {
     .unwrap();
 }
 
+async fn run_mongodb_wire_server(port: u32) -> () {
+    let addr = format!("0.0.0.0:{}", port);
+    let listener = TcpListener::bind(&addr).await.unwrap();
+    println!("Listening for MongoDB wire requests at {}", addr);
+    powdrr_engine_lib::mongodb_wire_protocol::serve_mongodb_wire(listener)
+        .await
+        .unwrap();
+}
+
 #[allow(dead_code)]
 async fn run_ssl_server() -> () {
     tracing_subscriber::fmt().init();
@@ -79,6 +89,12 @@ async fn main() -> () {
         let local_mode = mode.clone();
         tokio::runtime::Handle::current().spawn(async move {
             run_server(&local_mode).await;
+        });
+    }
+
+    if let Some(mongo_port) = mode.mongo_port {
+        tokio::runtime::Handle::current().spawn(async move {
+            run_mongodb_wire_server(mongo_port).await;
         });
     }
 
