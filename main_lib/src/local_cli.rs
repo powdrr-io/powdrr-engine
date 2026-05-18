@@ -260,6 +260,9 @@ pub async fn query_local_parquet_cache(
     let query_string = crate::elastic_search_endpoints::QueryStringSearch {
         allow_partial_search_results: None,
         sort: None,
+        ignore_unavailable: None,
+        allow_no_indices: None,
+        expand_wildcards: None,
         rest_total_hits_as_int: request.rest_total_hits_as_int,
     };
     let command = search_executor::search_plan_to_command_with_options(
