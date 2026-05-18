@@ -71,6 +71,22 @@ scripts/cargo-worktree.sh run --package powdrr-io-engine --release 9201
 scripts/cargo-worktree.sh run --package powdrr-benchmark
 ```
 
+## EXPERIMENTAL MONGO WIRE LISTENER
+
+Start the main service plus the experimental MongoDB wire listener:
+
+```
+PORT=9200 MONGO_PORT=27017 scripts/cargo-worktree.sh run --package powdrr-io-engine --release
+```
+
+Current scope:
+
+- read-only
+- direct-connection clients
+- no auth
+- backed by tables with explicit `PUT /:table/_mongo/config`
+- intended for `hello`, `ping`, discovery, and `find` / `getMore` / `killCursors`
+
 ## LOCAL ELASTIC CLI
 
 `powdrr-cli` includes an `elastic` mode that reuses the existing Powdrr
