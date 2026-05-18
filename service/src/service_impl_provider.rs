@@ -1,15 +1,15 @@
 use std::{error::Error};
 use std::fmt::{Display, Formatter};
-use powdrr_lib::data_contract::{CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody, LicenseType, OrgCreds, OrgInfo, OrgSettings, ServiceImplType, ServiceMode, TEST_ACCESS_KEY, TEST_SECRET_KEY};
-use powdrr_lib::elastic_search_lifetime_policy::ILMPolicyDefinition;
-use powdrr_lib::ephemeral_service_impl::EphemeralServiceImpl;
-use powdrr_lib::pipeline::PipelineDefinition;
-use powdrr_lib::data_contract::{CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
-use powdrr_lib::peers::CheckpointDescriptor;
+use powdrr_service_lib::data_contract::{CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody, LicenseType, OrgCreds, OrgInfo, OrgSettings, ServiceImplType, ServiceMode, TEST_ACCESS_KEY, TEST_SECRET_KEY};
+use powdrr_service_lib::elastic_search_lifetime_policy::ILMPolicyDefinition;
+use powdrr_service_lib::ephemeral_service_impl::EphemeralServiceImpl;
+use powdrr_service_lib::pipeline::PipelineDefinition;
+use powdrr_service_lib::data_contract::{CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
+use powdrr_service_lib::peers::CheckpointDescriptor;
 use tokio::sync::{mpsc, oneshot};
-use powdrr_lib::state_provider::ServiceApiError;
-use powdrr_lib::dynamodb_service_impl::DynamoDBServiceImpl;
-use powdrr_lib::test_api::TestProcessingMode;
+use powdrr_service_lib::state_provider::ServiceApiError;
+use powdrr_service_lib::dynamodb_service_impl::DynamoDBServiceImpl;
+use powdrr_service_lib::test_api::TestProcessingMode;
 
 
 #[derive(Debug, Clone)]

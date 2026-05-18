@@ -7,11 +7,11 @@ use gotham::hyper::{body, Body};
 use std::pin::Pin;
 use gotham::mime;
 use serde::Serialize;
-use powdrr_lib::data_contract::{AddAlias, CleanupCommit, CompactionCommit, CreateTable, ExtensionCommit, GetLatestCheckpoint, IcebergCommit, OrgInfo, OrgSettings, SpeedboatCommit, ACCESS_KEY_HEADER_KEY, SECRET_KEY_HEADER_KEY};
-use powdrr_lib::data_contract::CreateIndexTemplateBody;
-use powdrr_lib::elastic_search_lifetime_policy::ILMPolicyDefinition;
-use powdrr_lib::pipeline::PipelineDefinition;
-use powdrr_lib::peers::CheckpointDescriptor;
+use powdrr_service_lib::data_contract::{AddAlias, CleanupCommit, CompactionCommit, CreateTable, ExtensionCommit, GetLatestCheckpoint, IcebergCommit, OrgInfo, OrgSettings, SpeedboatCommit, ACCESS_KEY_HEADER_KEY, SECRET_KEY_HEADER_KEY};
+use powdrr_service_lib::data_contract::CreateIndexTemplateBody;
+use powdrr_service_lib::elastic_search_lifetime_policy::ILMPolicyDefinition;
+use powdrr_service_lib::pipeline::PipelineDefinition;
+use powdrr_service_lib::peers::CheckpointDescriptor;
 use crate::response::GenericResponse;
 use crate::router::NamePathExtractor;
 use crate::service_impl_provider::{ServiceImplError, SERVICE_IMPL};
@@ -330,7 +330,7 @@ mod tests {
     use gotham::hyper::{StatusCode};
     use gotham::mime;
     use gotham::test::TestServer;
-    use powdrr_lib::data_contract::{AddAlias, CreateTable, ServiceMode, TableDescription, ACCESS_KEY_HEADER_KEY, SECRET_KEY_HEADER_KEY, TEST_ACCESS_KEY, TEST_SECRET_KEY};
+    use powdrr_service_lib::data_contract::{AddAlias, CreateTable, ServiceMode, TableDescription, ACCESS_KEY_HEADER_KEY, SECRET_KEY_HEADER_KEY, TEST_ACCESS_KEY, TEST_SECRET_KEY};
     use crate::router::router;
 
     pub(crate) static TEST_SERVER: LazyLock<TestServer> = LazyLock::new(|| TestServer::with_timeout(router(true), 1000).unwrap());

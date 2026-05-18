@@ -5387,24 +5387,34 @@ dependencies = [
 name = "powdrr-io-service"
 version = "0.0.1"
 dependencies = [
- "aws-config",
- "aws-credential-types",
- "aws-sdk-dynamodb",
- "futures",
  "futures-util",
  "gotham",
  "idgenerator",
- "modyne",
- "modyne-derive",
- "paste",
- "powdrr_lib",
- "rustls-pemfile 2.2.0",
- "rustls-pki-types",
+ "powdrr-service-lib",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "powdrr-service-lib"
+version = "0.0.1"
+dependencies = [
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-dynamodb",
+ "chrono",
+ "idgenerator",
+ "minijinja",
+ "modyne",
+ "modyne-derive",
+ "paste",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
