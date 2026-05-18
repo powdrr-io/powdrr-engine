@@ -11,12 +11,14 @@ use gotham::{
     state::{FromState, State, StateData},
 };
 use http::StatusCode;
+use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::elastic_search_common::MIME_ES_JSON;
 use crate::util::{log_service_err, log_service_err_response};
 use crate::{
+    data_access,
     data_contract::{AliasInfo, CreateIndexBody, PropertyInfo, TableDescription},
     elastic_search_cluster_info,
     elastic_search_commands::LookupById,
@@ -24,6 +26,7 @@ use crate::{
     elastic_search_ingest, elastic_search_parser, elastic_search_pipeline,
     elastic_search_responses::QueryResultShards,
     search_executor,
+    search_runtime::df_to_serde_value,
     state_provider::STATE_PROVIDER,
 };
 
@@ -386,11 +389,14 @@ fn requests_all(parts: &[String]) -> bool {
 }
 
 fn matches_requested_value(value: &str, requested: &[String]) -> bool {
-    requests_all(requested) || requested.iter().any(|requested_value| requested_value == value)
+    requests_all(requested)
+        || requested
+            .iter()
+            .any(|requested_value| requested_value == value)
 }
 
-async fn all_table_descriptions() -> Result<Vec<TableDescription>, crate::state_provider::ServiceApiError>
-{
+async fn all_table_descriptions()
+-> Result<Vec<TableDescription>, crate::state_provider::ServiceApiError> {
     let mut table_descriptions = Vec::new();
     let mut table_names = STATE_PROVIDER.get_all_iceberg_tables().await?;
     table_names.sort();
@@ -422,6 +428,220 @@ async fn requested_table_descriptions(
     Ok(table_descriptions)
 }
 
+fn invalid_request_response(
+    state: &State,
+    status: StatusCode,
+    message: &str,
+) -> gotham::hyper::Response<Body> {
+    create_response(state, status, mime::TEXT_PLAIN, message.to_string())
+}
+
+async fn resolve_search_target_name(
+    target: Option<&str>,
+) -> Result<Option<String>, crate::state_provider::ServiceApiError> {
+    let Some(target) = target.map(str::trim).filter(|target| !target.is_empty()) else {
+        return Ok(None);
+    };
+
+    let requested = requested_parts(target);
+    if requests_all(&requested) {
+        return Ok(None);
+    }
+
+    if requested.len() != 1 {
+        return Ok(None);
+    }
+
+    Ok(STATE_PROVIDER
+        .describe_table(&requested[0])
+        .await?
+        .map(|table_desc| table_desc.name))
+}
+
+async fn execute_search_response(
+    target: Option<String>,
+    body_content: &str,
+    query_string: &QueryStringSearch,
+) -> Result<crate::elastic_search_common::ElasticSearchResponse, (StatusCode, String)> {
+    let body_content = normalize_search_body(body_content);
+    let command = match elastic_search_parser::parse(target, &body_content, query_string) {
+        Ok(command) => command,
+        Err(_) => {
+            return Err((StatusCode::BAD_REQUEST, "Bad request".to_string()));
+        }
+    };
+
+    Ok(search_executor::execute_search_command(CommandContext {}, Arc::new(command)).await)
+}
+
+async fn execute_search_response_for_target_expr(
+    target_expr: Option<&str>,
+    body_content: &str,
+    query_string: &QueryStringSearch,
+) -> Result<crate::elastic_search_common::ElasticSearchResponse, (StatusCode, String)> {
+    let target = match resolve_search_target_name(target_expr)
+        .await
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.message))?
+    {
+        Some(target) => Some(target),
+        None if target_expr.is_some() => {
+            let requested = requested_parts(target_expr.unwrap_or_default());
+            if !requested.is_empty() && !requests_all(&requested) {
+                return Err((StatusCode::NOT_FOUND, "Index does not exist".to_string()));
+            }
+            None
+        }
+        None => None,
+    };
+
+    execute_search_response(target, body_content, query_string).await
+}
+
+async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, String> {
+    let table_desc = STATE_PROVIDER
+        .describe_table(&index_name.to_string())
+        .await
+        .map_err(|e| e.message)?;
+
+    let Some(table_desc) = table_desc else {
+        return Ok(json!({
+            "_index": index_name,
+            "_id": doc_id,
+            "found": false,
+        }));
+    };
+
+    let checkpoint_id = STATE_PROVIDER
+        .get_latest_checkpoint(&table_desc.name, None)
+        .await
+        .map_err(|e| e.message)?;
+    let Some(checkpoint_id) = checkpoint_id else {
+        return Ok(json!({
+            "_index": table_desc.name,
+            "_id": doc_id,
+            "found": false,
+        }));
+    };
+
+    let checkpoint = STATE_PROVIDER
+        .get_checkpoint(crate::peers::CheckpointDescriptor::new(
+            table_desc.name.clone(),
+            checkpoint_id,
+        ))
+        .await
+        .map_err(|e| e.message)?;
+    let Some(checkpoint) = checkpoint else {
+        return Ok(json!({
+            "_index": table_desc.name,
+            "_id": doc_id,
+            "found": false,
+        }));
+    };
+
+    let mut local_tables = Vec::new();
+
+    if let Some(iceberg_metadata) = checkpoint.iceberg_metadata {
+        for file_descriptor in iceberg_metadata.files.as_file_tuples() {
+            let local_name = format!("mget_iceberg_{}", IdInstance::next_id());
+            data_access::load_file_as_table(
+                &local_name,
+                &file_descriptor.file_path,
+                true,
+                Some(file_descriptor.schema.to_arrow_schema()),
+            )
+            .await
+            .map_err(|e| e.message().to_string())?;
+            local_tables.push(local_name);
+        }
+    }
+
+    if let Some(speedboat_metadata) = checkpoint.speedboat_metadata {
+        for file_descriptor in speedboat_metadata.files.as_file_tuples() {
+            let local_name = format!("mget_speedboat_{}", IdInstance::next_id());
+            data_access::load_file_as_table(
+                &local_name,
+                &file_descriptor.file_path,
+                false,
+                Some(file_descriptor.schema.to_arrow_schema()),
+            )
+            .await
+            .map_err(|e| e.message().to_string())?;
+            local_tables.push(local_name);
+        }
+    }
+
+    if local_tables.is_empty() {
+        return Ok(json!({
+            "_index": table_desc.name,
+            "_id": doc_id,
+            "found": false,
+        }));
+    }
+
+    let escaped_doc_id = doc_id.replace('\'', "''");
+    let union_sql = local_tables
+        .iter()
+        .map(|table_name| format!("SELECT * FROM {table_name}"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let lookup_sql =
+        format!("SELECT * FROM ({union_sql}) AS docs WHERE _id = '{escaped_doc_id}' LIMIT 1");
+    let lookup_df = data_access::execute_sql(&lookup_sql)
+        .await
+        .map_err(|e| e.message().to_string())?;
+    let serde_result = df_to_serde_value(&lookup_df)
+        .await
+        .map_err(|e| e.message.clone())?;
+
+    for table_name in &local_tables {
+        data_access::drop(table_name).await;
+    }
+
+    let Some(value) = serde_result.values.first() else {
+        return Ok(json!({
+            "_index": table_desc.name,
+            "_id": doc_id,
+            "found": false,
+        }));
+    };
+
+    serde_json::to_value(
+        crate::elastic_search_responses::QueryResultHit::from_record(
+            &Some(table_desc.name.clone()),
+            value,
+            Some(true),
+        ),
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn parse_msearch_lines(body_content: &str) -> Result<Vec<(String, String)>, ()> {
+    let lines = body_content
+        .split_terminator('\n')
+        .map(|line| line.trim_end_matches('\r').to_string())
+        .collect::<Vec<_>>();
+
+    if lines.len() % 2 != 0 {
+        return Err(());
+    }
+
+    Ok(lines
+        .chunks(2)
+        .map(|chunk| (chunk[0].clone(), chunk[1].clone()))
+        .collect())
+}
+
+fn msearch_error_value(status: StatusCode, reason: String) -> Value {
+    serde_json::to_value(MultiSearchErrorItem {
+        error: MultiSearchErrorBody {
+            type_name: "illegal_argument_exception".to_string(),
+            reason,
+        },
+        status: status.as_u16(),
+    })
+    .unwrap()
+}
+
 fn filtered_aliases_value(body: &CreateIndexBody, requested_aliases: &[String]) -> Value {
     let aliases = body.aliases.clone().unwrap_or_default();
     let alias_map = aliases
@@ -442,7 +662,10 @@ async fn build_alias_response(
     for table_desc in table_descriptions {
         let body = parse_index_body(&table_desc);
         let aliases = filtered_aliases_value(&body, requested_aliases);
-        if aliases.as_object().is_some_and(|aliases| !aliases.is_empty()) {
+        if aliases
+            .as_object()
+            .is_some_and(|aliases| !aliases.is_empty())
+        {
             response.insert(table_desc.name.clone(), json!({ "aliases": aliases }));
         }
     }
@@ -469,16 +692,17 @@ fn normalize_field_caps_fields(
 }
 
 fn field_is_requested(field_name: &str, requested_fields: &[String]) -> bool {
-    requests_all(requested_fields) || requested_fields.iter().any(|requested| requested == field_name)
+    requests_all(requested_fields)
+        || requested_fields
+            .iter()
+            .any(|requested| requested == field_name)
 }
 
 fn field_caps_for_type(type_name: &str) -> (bool, bool) {
     match type_name {
         "text" => (true, false),
-        "keyword" | "long" | "integer" | "short" | "byte" | "double" | "float"
-        | "half_float" | "scaled_float" | "unsigned_long" | "date" | "boolean" | "ip" => {
-            (true, true)
-        }
+        "keyword" | "long" | "integer" | "short" | "byte" | "double" | "float" | "half_float"
+        | "scaled_float" | "unsigned_long" | "date" | "boolean" | "ip" => (true, true),
         _ => (false, false),
     }
 }
@@ -1521,6 +1745,68 @@ impl QueryStringSearch {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum MultiTargetInput {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl MultiTargetInput {
+    fn parts(&self) -> Vec<String> {
+        match self {
+            MultiTargetInput::Single(value) => requested_parts(value),
+            MultiTargetInput::Multiple(values) => values
+                .iter()
+                .map(String::as_str)
+                .flat_map(requested_parts)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+struct MultiSearchHeader {
+    index: Option<MultiTargetInput>,
+}
+
+#[derive(Deserialize)]
+struct MultiGetDocRequest {
+    #[serde(rename = "_index")]
+    index: Option<String>,
+    #[serde(rename = "_id")]
+    id: String,
+}
+
+#[derive(Default, Deserialize)]
+struct MultiGetRequest {
+    docs: Option<Vec<MultiGetDocRequest>>,
+    ids: Option<Vec<String>>,
+}
+
+#[derive(Serialize)]
+struct MultiSearchErrorBody {
+    #[serde(rename = "type")]
+    type_name: String,
+    reason: String,
+}
+
+#[derive(Serialize)]
+struct MultiSearchErrorItem {
+    error: MultiSearchErrorBody,
+    status: u16,
+}
+
+#[derive(Serialize)]
+struct MultiSearchResponse {
+    responses: Vec<Value>,
+}
+
+#[derive(Serialize)]
+struct MultiGetResponse {
+    docs: Vec<Value>,
+}
+
 /// Handler function for `POST` requests directed to `/_search`
 pub fn es_search(mut state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_search");
@@ -1530,21 +1816,14 @@ pub fn es_search(mut state: State) -> Pin<Box<HandlerFuture>> {
             Ok(vb) => vb,
             Err(_) => panic!("Oh no"),
         };
-        let body_content = normalize_search_body(&String::from_utf8(valid_body.to_vec()).unwrap());
-        let command = match elastic_search_parser::parse(None, &body_content, &query_string) {
-            Ok(c) => c,
-            Err(_) => {
-                let res = create_response(
-                    &state,
-                    StatusCode::BAD_REQUEST,
-                    mime::TEXT_PLAIN,
-                    "Bad request".to_string(),
-                );
+        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+        let response = match execute_search_response(None, &body_content, &query_string).await {
+            Ok(response) => response,
+            Err((status, message)) => {
+                let res = invalid_request_response(&state, status, &message);
                 return Ok((state, res));
             }
         };
-        let response =
-            search_executor::execute_search_command(CommandContext {}, Arc::new(command)).await;
         let res = response.generate_response(&state);
         Ok((state, res))
     }
@@ -1751,21 +2030,6 @@ pub fn es_search_table(mut state: State) -> Pin<Box<HandlerFuture>> {
         let path_extractor = NamePathExtractor::take_from(&mut state);
         let query_extractor = QueryStringSearch::take_from(&mut state);
         let table = path_extractor.name.to_string();
-        let table_desc = match STATE_PROVIDER.describe_table(&table).await {
-            Ok(td) => match td {
-                Some(td) => td,
-                None => {
-                    let res = create_response(
-                        &state,
-                        StatusCode::BAD_REQUEST,
-                        mime::TEXT_PLAIN,
-                        "Bad request".to_string(),
-                    );
-                    return Ok((state, res));
-                }
-            },
-            Err(e) => return Ok(log_service_err_response(e, state)),
-        };
         let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
             Ok(vb) => vb,
             Err(_) => {
@@ -1778,26 +2042,296 @@ pub fn es_search_table(mut state: State) -> Pin<Box<HandlerFuture>> {
                 return Ok((state, res));
             }
         };
-        let body_content = normalize_search_body(&String::from_utf8(valid_body.to_vec()).unwrap());
-        let command = match elastic_search_parser::parse(
-            Some(table_desc.name),
+        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+        let response = match execute_search_response_for_target_expr(
+            Some(&table),
             &body_content,
             &query_extractor,
-        ) {
-            Ok(c) => c,
-            Err(_e) => {
-                let res = create_response(
-                    &state,
-                    StatusCode::BAD_REQUEST,
-                    mime::TEXT_PLAIN,
-                    "Bad request".to_string(),
-                );
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err((status, message)) => {
+                let res = invalid_request_response(&state, status, &message);
                 return Ok((state, res));
             }
         };
-        let response =
-            search_executor::execute_search_command(CommandContext {}, Arc::new(command)).await;
         let res = response.generate_response(&state);
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_msearch(mut state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_msearch");
+    async {
+        let query_string = QueryStringSearch::take_from(&mut state);
+        let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
+            Ok(vb) => vb,
+            Err(_) => panic!("Oh no"),
+        };
+        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+        let requests = match parse_msearch_lines(&body_content) {
+            Ok(requests) => requests,
+            Err(_) => {
+                let res = invalid_request_response(&state, StatusCode::BAD_REQUEST, "Bad request");
+                return Ok((state, res));
+            }
+        };
+
+        let mut responses = Vec::with_capacity(requests.len());
+        for (header_line, body_line) in requests {
+            let header = if header_line.trim().is_empty() {
+                MultiSearchHeader::default()
+            } else {
+                match serde_json::from_str::<MultiSearchHeader>(&header_line) {
+                    Ok(header) => header,
+                    Err(_) => {
+                        responses.push(msearch_error_value(
+                            StatusCode::BAD_REQUEST,
+                            "Bad request".to_string(),
+                        ));
+                        continue;
+                    }
+                }
+            };
+
+            let target_expr = header.index.as_ref().and_then(|index| {
+                let parts = index.parts();
+                if parts.is_empty() {
+                    None
+                } else {
+                    Some(parts.join(","))
+                }
+            });
+
+            match execute_search_response_for_target_expr(
+                target_expr.as_deref(),
+                &body_line,
+                &query_string,
+            )
+            .await
+            {
+                Ok(response) => match serde_json::from_str::<Value>(&response.body) {
+                    Ok(value) => responses.push(value),
+                    Err(_) => responses.push(msearch_error_value(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "An error occurred".to_string(),
+                    )),
+                },
+                Err((status, message)) => responses.push(msearch_error_value(status, message)),
+            }
+        }
+
+        let res = create_response(
+            &state,
+            StatusCode::OK,
+            MIME_ES_JSON.clone(),
+            serde_json::to_string(&MultiSearchResponse { responses }).unwrap(),
+        );
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_msearch_table(mut state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_msearch_table");
+    async {
+        let path_extractor = NamePathExtractor::take_from(&mut state);
+        let table = path_extractor.name.to_string();
+        let query_string = QueryStringSearch::take_from(&mut state);
+        let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
+            Ok(vb) => vb,
+            Err(_) => panic!("Oh no"),
+        };
+        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+        let requests = match parse_msearch_lines(&body_content) {
+            Ok(requests) => requests,
+            Err(_) => {
+                let res = invalid_request_response(&state, StatusCode::BAD_REQUEST, "Bad request");
+                return Ok((state, res));
+            }
+        };
+
+        let mut responses = Vec::with_capacity(requests.len());
+        for (header_line, body_line) in requests {
+            let header = if header_line.trim().is_empty() {
+                MultiSearchHeader::default()
+            } else {
+                match serde_json::from_str::<MultiSearchHeader>(&header_line) {
+                    Ok(header) => header,
+                    Err(_) => {
+                        responses.push(msearch_error_value(
+                            StatusCode::BAD_REQUEST,
+                            "Bad request".to_string(),
+                        ));
+                        continue;
+                    }
+                }
+            };
+
+            let target_expr = header
+                .index
+                .as_ref()
+                .map(|index| index.parts().join(","))
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| table.clone());
+
+            match execute_search_response_for_target_expr(
+                Some(&target_expr),
+                &body_line,
+                &query_string,
+            )
+            .await
+            {
+                Ok(response) => match serde_json::from_str::<Value>(&response.body) {
+                    Ok(value) => responses.push(value),
+                    Err(_) => responses.push(msearch_error_value(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "An error occurred".to_string(),
+                    )),
+                },
+                Err((status, message)) => responses.push(msearch_error_value(status, message)),
+            }
+        }
+
+        let res = create_response(
+            &state,
+            StatusCode::OK,
+            MIME_ES_JSON.clone(),
+            serde_json::to_string(&MultiSearchResponse { responses }).unwrap(),
+        );
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_mget(mut state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_mget");
+    async {
+        let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
+            Ok(vb) => vb,
+            Err(_) => panic!("Oh no"),
+        };
+        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+        let request = match serde_json::from_str::<MultiGetRequest>(&body_content) {
+            Ok(request) => request,
+            Err(_) => {
+                let res = invalid_request_response(&state, StatusCode::BAD_REQUEST, "Bad request");
+                return Ok((state, res));
+            }
+        };
+
+        let mut docs = Vec::new();
+        if let Some(request_docs) = request.docs {
+            for request_doc in request_docs {
+                let Some(index_name) = request_doc.index.as_deref() else {
+                    let res =
+                        invalid_request_response(&state, StatusCode::BAD_REQUEST, "Bad request");
+                    return Ok((state, res));
+                };
+                match lookup_document_value(index_name, &request_doc.id).await {
+                    Ok(doc) => docs.push(doc),
+                    Err(message) => {
+                        let res = invalid_request_response(
+                            &state,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &message,
+                        );
+                        return Ok((state, res));
+                    }
+                }
+            }
+        } else {
+            let res = invalid_request_response(&state, StatusCode::BAD_REQUEST, "Bad request");
+            return Ok((state, res));
+        }
+
+        let res = create_response(
+            &state,
+            StatusCode::OK,
+            MIME_ES_JSON.clone(),
+            serde_json::to_string(&MultiGetResponse { docs }).unwrap(),
+        );
+        Ok((state, res))
+    }
+    .boxed()
+}
+
+pub fn es_mget_table(mut state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_mget_table");
+    async {
+        let path_extractor = NamePathExtractor::take_from(&mut state);
+        let target_expr = path_extractor.name;
+        let target = match resolve_search_target_name(Some(&target_expr))
+            .await
+            .map_err(|e| e.message)
+        {
+            Ok(Some(target)) => target,
+            Ok(None) => {
+                let res =
+                    invalid_request_response(&state, StatusCode::NOT_FOUND, "Index does not exist");
+                return Ok((state, res));
+            }
+            Err(message) => {
+                let res =
+                    invalid_request_response(&state, StatusCode::SERVICE_UNAVAILABLE, &message);
+                return Ok((state, res));
+            }
+        };
+
+        let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
+            Ok(vb) => vb,
+            Err(_) => panic!("Oh no"),
+        };
+        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+        let request = match serde_json::from_str::<MultiGetRequest>(&body_content) {
+            Ok(request) => request,
+            Err(_) => {
+                let res = invalid_request_response(&state, StatusCode::BAD_REQUEST, "Bad request");
+                return Ok((state, res));
+            }
+        };
+
+        let docs_to_lookup = if let Some(request_docs) = request.docs {
+            request_docs
+                .into_iter()
+                .map(|request_doc| MultiGetDocRequest {
+                    index: Some(request_doc.index.unwrap_or_else(|| target.clone())),
+                    id: request_doc.id,
+                })
+                .collect::<Vec<_>>()
+        } else if let Some(ids) = request.ids {
+            ids.into_iter()
+                .map(|id| MultiGetDocRequest {
+                    index: Some(target.clone()),
+                    id,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            let res = invalid_request_response(&state, StatusCode::BAD_REQUEST, "Bad request");
+            return Ok((state, res));
+        };
+
+        let mut docs = Vec::with_capacity(docs_to_lookup.len());
+        for request_doc in docs_to_lookup {
+            let index_name = request_doc.index.unwrap_or_else(|| target.clone());
+            match lookup_document_value(&index_name, &request_doc.id).await {
+                Ok(doc) => docs.push(doc),
+                Err(message) => {
+                    let res =
+                        invalid_request_response(&state, StatusCode::SERVICE_UNAVAILABLE, &message);
+                    return Ok((state, res));
+                }
+            }
+        }
+
+        let res = create_response(
+            &state,
+            StatusCode::OK,
+            MIME_ES_JSON.clone(),
+            serde_json::to_string(&MultiGetResponse { docs }).unwrap(),
+        );
         Ok((state, res))
     }
     .boxed()

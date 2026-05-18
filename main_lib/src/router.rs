@@ -1,4 +1,4 @@
-use crate::compaction::{compact_logs, CompactionCommand};
+use crate::compaction::{CompactionCommand, compact_logs};
 use crate::dynamodb_protocol;
 use crate::elastic_search_endpoints::AliasPathExtractor;
 use crate::elastic_search_endpoints::NameAliasPathExtractor;
@@ -23,21 +23,21 @@ use crate::test_api::test_v1_process_work;
 use crate::test_api::test_v1_set_testing_mode;
 use crate::test_api::test_v1_set_testing_processing_mode;
 use crate::{elastic_search_endpoints, elastic_search_lifetime_policy, lakehouse_serving};
-use futures::future;
 use futures::TryFutureExt;
+use futures::future;
 use futures_util::future::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
 use gotham::hyper::StatusCode;
-use gotham::hyper::{body, Body};
+use gotham::hyper::{Body, body};
 use gotham::middleware::Middleware;
 use gotham::mime;
 use gotham::pipeline::new_pipeline;
 use gotham::pipeline::single_pipeline;
 use gotham::prelude::NewMiddleware;
 use gotham::prelude::StaticResponseExtender;
-use gotham::router::builder::*;
 use gotham::router::Router;
+use gotham::router::builder::*;
 use gotham::state::FromState;
 use gotham::state::State;
 use gotham::state::StateData;
@@ -503,6 +503,11 @@ pub fn router(include_test_apis: bool) -> Router {
             .with_query_string_extractor::<QueryStringSearch>()
             .to(elastic_search_endpoints::es_search);
         route
+            .post("/_msearch")
+            .with_query_string_extractor::<QueryStringSearch>()
+            .to(elastic_search_endpoints::es_msearch);
+        route.post("/_mget").to(elastic_search_endpoints::es_mget);
+        route
             .get("/:name/_search")
             .with_query_string_extractor::<QueryStringSearch>()
             .with_path_extractor::<NamePathExtractor>()
@@ -530,6 +535,15 @@ pub fn router(include_test_apis: bool) -> Router {
             .with_query_string_extractor::<QueryStringSearch>()
             .with_path_extractor::<NamePathExtractor>()
             .to(elastic_search_endpoints::es_search_table);
+        route
+            .post("/:name/_msearch")
+            .with_query_string_extractor::<QueryStringSearch>()
+            .with_path_extractor::<NamePathExtractor>()
+            .to(elastic_search_endpoints::es_msearch_table);
+        route
+            .post("/:name/_mget")
+            .with_path_extractor::<NamePathExtractor>()
+            .to(elastic_search_endpoints::es_mget_table);
         route
             .get("/:name/_count")
             .with_query_string_extractor::<QueryStringSearch>()
@@ -663,7 +677,7 @@ pub(crate) mod tests {
     use crate::lakehouse_serving::ServingConfigResponse;
     use crate::router::router;
     use crate::schema_massager::{
-        extract_powdrr_schema_str, PowdrrDataType, PowdrrField, PowdrrSchema,
+        PowdrrDataType, PowdrrField, PowdrrSchema, extract_powdrr_schema_str,
     };
     use crate::serving_plan::ServingQueryClassification;
     use crate::state_provider::STATE_PROVIDER;
@@ -1849,9 +1863,11 @@ pub(crate) mod tests {
             get_named_aliases_json["logs_archive"]["aliases"]["logs_alias"],
             json!({})
         );
-        assert!(get_named_aliases_json["logs"]["aliases"]
-            .get("logs_secondary")
-            .is_none());
+        assert!(
+            get_named_aliases_json["logs"]["aliases"]
+                .get("logs_secondary")
+                .is_none()
+        );
 
         let get_index_named_alias_response = test_server
             .client()
@@ -2007,6 +2023,95 @@ pub(crate) mod tests {
         let filtered_count_json: Value =
             serde_json::from_str(&filtered_count_response.read_utf8_body().unwrap()).unwrap();
         assert_eq!(filtered_count_json["count"], 4);
+
+        let mget_table_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs/_mget",
+                r#"{
+                  "ids": ["1", "999"]
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(mget_table_response.status(), 200);
+        let mget_table_json: Value =
+            serde_json::from_str(&mget_table_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(mget_table_json["docs"][0]["found"], true);
+        assert_eq!(mget_table_json["docs"][0]["_id"], "1");
+        assert_eq!(
+            mget_table_json["docs"][0]["_source"]["message"],
+            "Login attempt failed"
+        );
+        assert_eq!(mget_table_json["docs"][1]["found"], false);
+
+        let mget_global_response = test_server
+            .client()
+            .post(
+                "http://localhost/_mget",
+                r#"{
+                  "docs": [
+                    {"_index": "logs", "_id": "2"},
+                    {"_index": "does-not-exist", "_id": "1"}
+                  ]
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(mget_global_response.status(), 200);
+        let mget_global_json: Value =
+            serde_json::from_str(&mget_global_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(mget_global_json["docs"][0]["found"], true);
+        assert_eq!(
+            mget_global_json["docs"][0]["_source"]["message"],
+            "Login successful"
+        );
+        assert_eq!(mget_global_json["docs"][1]["found"], false);
+
+        let msearch_table_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs/_msearch",
+                "{}\n{\"query\":{\"match\":{\"message\":{\"query\":\"Login\"}}}}\n{}\n{\"query\":{\"match\":{\"message\":{\"query\":\"Logout\"}}}}\n",
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(msearch_table_response.status(), 200);
+        let msearch_table_json: Value =
+            serde_json::from_str(&msearch_table_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(
+            msearch_table_json["responses"][0]["hits"]["total"]["value"],
+            4
+        );
+        assert_eq!(
+            msearch_table_json["responses"][1]["hits"]["total"]["value"],
+            2
+        );
+
+        let msearch_global_response = test_server
+            .client()
+            .post(
+                "http://localhost/_msearch",
+                "{\"index\":\"logs\"}\n{\"query\":{\"match\":{\"message\":{\"query\":\"Login\"}}}}\n{\"index\":\"does-not-exist\"}\n{}\n",
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(msearch_global_response.status(), 200);
+        let msearch_global_json: Value =
+            serde_json::from_str(&msearch_global_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(
+            msearch_global_json["responses"][0]["hits"]["total"]["value"],
+            4
+        );
+        assert_eq!(msearch_global_json["responses"][1]["status"], 404);
+        assert_eq!(
+            msearch_global_json["responses"][1]["error"]["reason"],
+            "Index does not exist"
+        );
 
         let missing_index_response = test_server
             .client()
