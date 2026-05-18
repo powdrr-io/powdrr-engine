@@ -1207,6 +1207,1407 @@
         { "kind": "json_path_number", "path": "aggregations.t_shirts.doc_count", "value": 2 },
         { "kind": "json_path_float", "path": "aggregations.t_shirts.avg_price.value", "value": 90.0, "tolerance": 0.000001 }
       ]
+    },
+    {
+      "id": "root_get_returns_basic_server_info",
+      "description": "GET / returns a basic Elasticsearch-compatible server info document",
+      "differential_enabled": true,
+      "setup_steps": [],
+      "request": {
+        "method": "GET",
+        "path": "/",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_string", "path": "tagline", "value": "You Know, for Search" },
+        { "kind": "json_path_string", "path": "version.number", "value": "8.7.1" },
+        { "kind": "json_path_exists", "path": "cluster_name" }
+      ]
+    },
+    {
+      "id": "root_head_returns_200",
+      "description": "HEAD / returns 200",
+      "differential_enabled": true,
+      "setup_steps": [],
+      "request": {
+        "method": "HEAD",
+        "path": "/",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 }
+      ]
+    },
+    {
+      "id": "nodes_returns_static_node_info",
+      "description": "GET /_nodes returns the local compatibility node payload",
+      "differential_enabled": false,
+      "setup_steps": [],
+      "request": {
+        "method": "GET",
+        "path": "/_nodes",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_string", "path": "nodes.M2BCY3K4RWCAIoe0ZNDj5w.version", "value": "8.7.1" },
+        { "kind": "json_path_string", "path": "nodes.M2BCY3K4RWCAIoe0ZNDj5w.http.publish_address", "value": "host.docker.internal:9200" }
+      ]
+    },
+    {
+      "id": "license_returns_basic_license",
+      "description": "GET /_license returns an active basic license payload",
+      "differential_enabled": false,
+      "setup_steps": [],
+      "request": {
+        "method": "GET",
+        "path": "/_license",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_string", "path": "license.type", "value": "basic" },
+        { "kind": "json_path_string", "path": "license.status", "value": "active" }
+      ]
+    },
+    {
+      "id": "xpack_returns_feature_listing",
+      "description": "GET /_xpack returns the local feature listing payload",
+      "differential_enabled": false,
+      "setup_steps": [],
+      "request": {
+        "method": "GET",
+        "path": "/_xpack",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_string", "path": "license.type", "value": "basic" },
+        { "kind": "json_path_bool", "path": "features.monitoring.enabled", "value": true },
+        { "kind": "json_path_exists", "path": "features.security" }
+      ]
+    },
+    {
+      "id": "cluster_settings_include_defaults_returns_defaults",
+      "description": "GET /_cluster/settings can include defaults without panicking",
+      "differential_enabled": true,
+      "setup_steps": [],
+      "request": {
+        "method": "GET",
+        "path": "/_cluster/settings?include_defaults=true",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_exists", "path": "persistent" },
+        { "kind": "json_path_exists", "path": "transient" },
+        { "kind": "json_path_exists", "path": "defaults" }
+      ]
+    },
+    {
+      "id": "cluster_health_named_route_returns_green_status",
+      "description": "GET /_cluster/health/:name returns a green health payload",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/_cluster/health/{{index}}",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_string", "path": "status", "value": "green" },
+        { "kind": "json_path_number", "path": "number_of_nodes", "value": 1 }
+      ]
+    },
+    {
+      "id": "search_scroll_returns_clear_unsupported_message",
+      "description": "POST /_search/scroll fails with a clear unsupported message",
+      "differential_enabled": false,
+      "setup_steps": [],
+      "request": {
+        "method": "POST",
+        "path": "/_search/scroll",
+        "body": "{\"scroll\":\"1m\",\"scroll_id\":\"abc\"}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 501 },
+        { "kind": "json_path_string", "path": "error.type", "value": "unsupported_operation_exception" },
+        { "kind": "body_contains", "value": "point in time plus search_after" }
+      ]
+    },
+    {
+      "id": "search_template_returns_clear_unsupported_message",
+      "description": "POST /_search/template fails with a clear unsupported message",
+      "differential_enabled": false,
+      "setup_steps": [],
+      "request": {
+        "method": "POST",
+        "path": "/_search/template",
+        "body": "{\"id\":\"template-id\"}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 501 },
+        { "kind": "json_path_string", "path": "error.type", "value": "unsupported_operation_exception" },
+        { "kind": "body_contains", "value": "search template API is not supported" }
+      ]
+    },
+    {
+      "id": "async_search_returns_clear_unsupported_message",
+      "description": "POST /_async_search fails with a clear unsupported message",
+      "differential_enabled": false,
+      "setup_steps": [],
+      "request": {
+        "method": "POST",
+        "path": "/_async_search",
+        "body": "{\"query\":{\"match_all\":{}}}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 501 },
+        { "kind": "json_path_string", "path": "error.type", "value": "unsupported_operation_exception" },
+        { "kind": "body_contains", "value": "async search API is not supported" }
+      ]
+    },
+    {
+      "id": "cat_indices_returns_clear_unsupported_message",
+      "description": "GET /_cat/indices fails with a clear unsupported message",
+      "differential_enabled": false,
+      "setup_steps": [],
+      "request": {
+        "method": "GET",
+        "path": "/_cat/indices",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 501 },
+        { "kind": "json_path_string", "path": "error.type", "value": "unsupported_operation_exception" },
+        { "kind": "body_contains", "value": "cat indices API is not supported" }
+      ]
+    },
+    {
+      "id": "cat_aliases_returns_clear_unsupported_message",
+      "description": "GET /_cat/aliases fails with a clear unsupported message",
+      "differential_enabled": false,
+      "setup_steps": [],
+      "request": {
+        "method": "GET",
+        "path": "/_cat/aliases",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 501 },
+        { "kind": "json_path_string", "path": "error.type", "value": "unsupported_operation_exception" },
+        { "kind": "body_contains", "value": "cat aliases API is not supported" }
+      ]
+    },
+    {
+      "id": "get_ingest_pipeline_returns_clear_unsupported_message",
+      "description": "GET /_ingest/pipeline/:name fails with a clear unsupported message",
+      "differential_enabled": false,
+      "setup_steps": [],
+      "request": {
+        "method": "GET",
+        "path": "/_ingest/pipeline/{{pipeline}}",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 501 },
+        { "kind": "json_path_string", "path": "error.type", "value": "unsupported_operation_exception" },
+        { "kind": "body_contains", "value": "Reading ingest pipeline definitions is not supported" }
+      ]
+    },
+    {
+      "id": "get_ingest_pipeline_simulate_returns_clear_unsupported_message",
+      "description": "GET /_ingest/pipeline/_simulate fails with a clear unsupported message",
+      "differential_enabled": false,
+      "setup_steps": [],
+      "request": {
+        "method": "GET",
+        "path": "/_ingest/pipeline/_simulate",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 501 },
+        { "kind": "json_path_string", "path": "error.type", "value": "unsupported_operation_exception" },
+        { "kind": "body_contains", "value": "GET pipeline simulation is not supported" }
+      ]
+    },
+    {
+      "id": "update_api_returns_clear_unsupported_message",
+      "description": "POST /:index/_update/:id fails with a clear unsupported message",
+      "differential_enabled": false,
+      "setup_steps": [],
+      "request": {
+        "method": "POST",
+        "path": "/{{index}}/_update/my_id",
+        "body": "{\"doc\":{\"message\":\"updated\"}}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 501 },
+        { "kind": "json_path_string", "path": "error.type", "value": "unsupported_operation_exception" },
+        { "kind": "body_contains", "value": "document update API is not supported" }
+      ]
+    },
+    {
+      "id": "head_index_returns_200_after_create",
+      "description": "HEAD /:index returns 200 after the index is created",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"aliases\":{\"{{alias}}\":{}},\"mappings\":{\"properties\":{\"message\":{\"type\":\"text\"},\"index_col\":{\"type\":\"long\"}}},\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "HEAD",
+        "path": "/{{index}}",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 }
+      ]
+    },
+    {
+      "id": "get_index_returns_aliases_mappings_and_settings",
+      "description": "GET /:index returns aliases, mappings, and settings",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"aliases\":{\"{{alias}}\":{}},\"mappings\":{\"properties\":{\"message\":{\"type\":\"text\"},\"index_col\":{\"type\":\"long\"}}},\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/{{index}}",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_exists", "path": "{{index}}.aliases.{{alias}}" },
+        { "kind": "json_path_string", "path": "{{index}}.mappings.properties.message.type", "value": "text" },
+        { "kind": "json_path_string", "path": "{{index}}.settings.index.number_of_shards", "value": "2" }
+      ]
+    },
+    {
+      "id": "get_index_settings_returns_stringified_values",
+      "description": "GET /:index/_settings returns normalized string settings",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/{{index}}/_settings",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_string", "path": "{{index}}.settings.index.number_of_shards", "value": "2" },
+        { "kind": "json_path_string", "path": "{{index}}.settings.index.number_of_replicas", "value": "1" }
+      ]
+    },
+    {
+      "id": "get_index_mapping_returns_properties",
+      "description": "GET /:index/_mapping returns the declared properties",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"mappings\":{\"properties\":{\"message\":{\"type\":\"text\"},\"index_col\":{\"type\":\"long\"}}}}",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/{{index}}/_mapping",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_string", "path": "{{index}}.mappings.properties.message.type", "value": "text" },
+        { "kind": "json_path_string", "path": "{{index}}.mappings.properties.index_col.type", "value": "long" }
+      ]
+    },
+    {
+      "id": "get_aliases_returns_alias_map",
+      "description": "GET /_alias returns the declared alias mapping",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"aliases\":{\"{{alias}}\":{}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/_alias",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_exists", "path": "{{index}}.aliases.{{alias}}" }
+      ]
+    },
+    {
+      "id": "get_index_aliases_returns_alias_map",
+      "description": "GET /:index/_alias returns the alias mapping for that index",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"aliases\":{\"{{alias}}\":{}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/{{index}}/_alias",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_exists", "path": "{{index}}.aliases.{{alias}}" }
+      ]
+    },
+    {
+      "id": "get_named_aliases_returns_alias_map",
+      "description": "GET /_alias/:alias returns the alias mapping",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"aliases\":{\"{{alias}}\":{}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/_alias/{{alias}}",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_exists", "path": "{{index}}.aliases.{{alias}}" }
+      ]
+    },
+    {
+      "id": "get_index_named_aliases_returns_alias_map",
+      "description": "GET /:index/_alias/:alias returns the filtered alias mapping",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"aliases\":{\"{{alias}}\":{}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/{{index}}/_alias/{{alias}}",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_exists", "path": "{{index}}.aliases.{{alias}}" }
+      ]
+    },
+    {
+      "id": "head_index_alias_returns_200_after_alias_create",
+      "description": "HEAD /:index/_alias/:alias returns 200 when the alias exists",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"aliases\":{\"{{alias}}\":{}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "HEAD",
+        "path": "/{{index}}/_alias/{{alias}}",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 }
+      ]
+    },
+    {
+      "id": "resolve_index_returns_indices_and_aliases",
+      "description": "GET /_resolve/index/:name returns matching indices and aliases",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"aliases\":{\"{{alias}}\":{}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/_resolve/index/{{alias}}",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_string_list", "path": "aliases[*].name", "values": ["{{alias}}"] },
+        { "kind": "json_path_string_list", "path": "aliases[*].indices[*]", "values": ["{{index}}"] }
+      ]
+    },
+    {
+      "id": "field_caps_global_returns_field_types",
+      "description": "GET /_field_caps returns searchable and aggregatable field types",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"mappings\":{\"properties\":{\"message\":{\"type\":\"text\"},\"index_col\":{\"type\":\"long\"}}}}",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/_field_caps?fields=message,index_col",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_bool", "path": "fields.message.text.searchable", "value": true },
+        { "kind": "json_path_bool", "path": "fields.index_col.long.aggregatable", "value": true }
+      ]
+    },
+    {
+      "id": "field_caps_index_returns_field_types",
+      "description": "POST /:index/_field_caps returns searchable and aggregatable field types",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"mappings\":{\"properties\":{\"message\":{\"type\":\"text\"},\"index_col\":{\"type\":\"long\"}}}}",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/{{index}}/_field_caps",
+        "body": "{\"fields\":[\"message\",\"index_col\"]}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_string_set", "path": "indices[*]", "values": ["{{index}}"] },
+        { "kind": "json_path_bool", "path": "fields.message.text.searchable", "value": true },
+        { "kind": "json_path_bool", "path": "fields.index_col.long.aggregatable", "value": true }
+      ]
+    },
+    {
+      "id": "global_search_returns_expected_hits",
+      "description": "POST /_search can search across all indices when the query narrows to the created index",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:04:05.000Z\", \"index_col\": 1, \"compat_global_marker\": 742001, \"message\": \"Login attempt failed\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-08T11:06:07.000Z\", \"index_col\": 2, \"compat_global_marker\": 742001, \"message\": \"Login successful\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"@timestamp\": \"2099-03-09T11:07:08.000Z\", \"index_col\": 3, \"compat_global_marker\": 742003, \"message\": \"Logout successful\" }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/_search",
+        "body": "{\"query\":{\"term\":{\"compat_global_marker\":742001}}}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number", "path": "hits.total.value", "value": 2 },
+        { "kind": "json_path_string_set", "path": "hits.hits[*]._source.message", "values": ["Login attempt failed", "Login successful"] }
+      ]
+    },
+    {
+      "id": "global_count_returns_filtered_doc_total",
+      "description": "POST /_count returns the filtered document total",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"index_col\": 1, \"compat_global_marker\": 742011, \"message\": \"Login attempt failed\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"index_col\": 2, \"compat_global_marker\": 742011, \"message\": \"Login successful\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"index_col\": 3, \"compat_global_marker\": 742013, \"message\": \"Logout successful\" }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/_count",
+        "body": "{\"query\":{\"term\":{\"compat_global_marker\":742011}}}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number", "path": "count", "value": 2 }
+      ]
+    },
+    {
+      "id": "table_count_returns_filtered_doc_total",
+      "description": "POST /:index/_count returns the filtered document total",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"index_col\": 1, \"message\": \"Login attempt failed\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"index_col\": 2, \"message\": \"Login successful\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"index_col\": 3, \"message\": \"Logout successful\" }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/{{index}}/_count",
+        "body": "{\"query\":{\"range\":{\"index_col\":{\"gte\":2}}}}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number", "path": "count", "value": 2 }
+      ]
+    },
+    {
+      "id": "head_existing_doc_returns_200",
+      "description": "HEAD /:index/_doc/:id returns 200 when the document exists",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_create/my_id",
+            "body": "{\"message\":\"hello\"}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "HEAD",
+        "path": "/{{index}}/_doc/my_id",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 }
+      ]
+    },
+    {
+      "id": "table_mget_returns_found_and_missing_docs",
+      "description": "POST /:index/_mget returns found and missing docs",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_create/my_id",
+            "body": "{\"message\":\"hello\"}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/{{index}}/_mget",
+        "body": "{\"ids\":[\"my_id\",\"missing\"]}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_string_list", "path": "docs[*]._id", "values": ["my_id", "missing"] },
+        { "kind": "json_path_bool_list", "path": "docs[*].found", "values": [true, false] }
+      ]
+    },
+    {
+      "id": "global_mget_returns_found_and_missing_docs",
+      "description": "POST /_mget returns found and missing docs",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_create/my_id",
+            "body": "{\"message\":\"hello\"}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/_mget",
+        "body": "{\"docs\":[{\"_index\":\"{{index}}\",\"_id\":\"my_id\"},{\"_index\":\"{{index}}\",\"_id\":\"missing\"}]}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_string_list", "path": "docs[*]._id", "values": ["my_id", "missing"] },
+        { "kind": "json_path_bool_list", "path": "docs[*].found", "values": [true, false] }
+      ]
+    },
+    {
+      "id": "table_msearch_returns_multiple_response_items",
+      "description": "POST /:index/_msearch returns multiple response items",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"index_col\": 1, \"message\": \"Login attempt failed\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"index_col\": 3, \"message\": \"Logout successful\" }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/{{index}}/_msearch",
+        "body": "{}\n{\"query\":{\"term\":{\"index_col\":1}}}\n{}\n{\"query\":{\"term\":{\"index_col\":3}}}\n",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number_list", "path": "responses[*].hits.total.value", "values": [1, 1] }
+      ]
+    },
+    {
+      "id": "global_msearch_returns_multiple_response_items",
+      "description": "POST /_msearch returns multiple response items",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"index_col\": 1, \"message\": \"Login attempt failed\" }\n{\"create\":{\"_index\":\"{{index}}\"}}\n{ \"index_col\": 3, \"message\": \"Logout successful\" }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/_msearch",
+        "body": "{\"index\":\"{{index}}\"}\n{\"query\":{\"term\":{\"index_col\":1}}}\n{\"index\":\"{{index}}\"}\n{\"query\":{\"term\":{\"index_col\":3}}}\n",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number_list", "path": "responses[*].hits.total.value", "values": [1, 1] }
+      ]
+    },
+    {
+      "id": "post_doc_with_id_returns_clear_unsupported_message",
+      "description": "POST /:index/_doc/:id fails with a clear unsupported message",
+      "differential_enabled": false,
+      "setup_steps": [],
+      "request": {
+        "method": "POST",
+        "path": "/{{index}}/_doc/my_id",
+        "body": "{\"message\":\"hello\"}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 501 },
+        { "kind": "json_path_string", "path": "error.type", "value": "unsupported_operation_exception" },
+        { "kind": "body_contains", "value": "document update API is not supported" }
+      ]
+    },
+    {
+      "id": "create_pipeline_put_returns_clear_unsupported_message",
+      "description": "PUT /_ingest/pipeline/:name fails with a clear unsupported message",
+      "differential_enabled": false,
+      "setup_steps": [],
+      "request": {
+        "method": "PUT",
+        "path": "/_ingest/pipeline/{{pipeline}}",
+        "body": "{\"processors\":[{\"set\":{\"field\":\"field2\",\"value\":\"_value\"}}]}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 501 },
+        { "kind": "json_path_string", "path": "error.type", "value": "unsupported_operation_exception" },
+        { "kind": "body_contains", "value": "Persisted ingest pipelines are not supported" }
+      ]
+    },
+    {
+      "id": "simulate_pipeline_returns_processed_docs",
+      "description": "POST /_ingest/pipeline/_simulate returns processed docs",
+      "differential_enabled": false,
+      "setup_steps": [],
+      "request": {
+        "method": "POST",
+        "path": "/_ingest/pipeline/_simulate",
+        "body": "{\"pipeline\":{\"processors\":[{\"set\":{\"field\":\"field2\",\"value\":\"_value\"}}]},\"docs\":[{\"_index\":\"index\",\"_id\":\"1\",\"_source\":{\"foo\":\"bar\"}},{\"_index\":\"index\",\"_id\":\"2\",\"_source\":{\"foo\":\"baz\"}}]}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_string_list", "path": "docs[*].doc._source.field2", "values": ["_value", "_value"] }
+      ]
+    },
+    {
+      "id": "simulate_named_pipeline_returns_clear_unsupported_message",
+      "description": "POST /_ingest/pipeline/:name/_simulate fails with a clear unsupported message",
+      "differential_enabled": false,
+      "setup_steps": [],
+      "request": {
+        "method": "POST",
+        "path": "/_ingest/pipeline/{{pipeline}}/_simulate",
+        "body": "{\"docs\":[{\"_index\":\"index\",\"_id\":\"1\",\"_source\":{\"foo\":\"bar\"}},{\"_index\":\"index\",\"_id\":\"2\",\"_source\":{\"foo\":\"baz\"}}]}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 501 },
+        { "kind": "json_path_string", "path": "error.type", "value": "unsupported_operation_exception" },
+        { "kind": "body_contains", "value": "Named pipeline simulation is not supported" }
+      ]
+    },
+    {
+      "id": "legacy_template_get_returns_stored_body",
+      "description": "GET /_template/:name returns the stored template body",
+      "differential_enabled": false,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_index_template/{{template}}",
+            "body": "{\"index_patterns\":[\"logs-*\"],\"template\":{\"settings\":{\"number_of_shards\":1},\"mappings\":{\"properties\":{\"message\":{\"type\":\"text\"}}}}}",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/_template/{{template}}",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_string_list", "path": "index_patterns[*]", "values": ["logs-*"] }
+      ]
+    },
+    {
+      "id": "component_template_get_returns_stored_body",
+      "description": "GET /_component_template/:name returns the stored template body",
+      "differential_enabled": false,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_component_template/{{component_template}}",
+            "body": "{\"template\":{\"settings\":{\"number_of_shards\":1},\"mappings\":{\"properties\":{\"message\":{\"type\":\"text\"}}}}}",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/_component_template/{{component_template}}",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_exists", "path": "template.settings.number_of_shards" }
+      ]
+    },
+    {
+      "id": "index_pit_returns_id",
+      "description": "POST /:index/_pit returns a point-in-time id payload",
+      "differential_enabled": false,
+      "setup_steps": [],
+      "request": {
+        "method": "POST",
+        "path": "/{{index}}/_pit?keep_alive=1m",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_exists", "path": "id" }
+      ]
+    },
+    {
+      "id": "delete_pit_returns_succeeded_payload",
+      "description": "DELETE /_pit returns a point-in-time deletion payload",
+      "differential_enabled": false,
+      "setup_steps": [],
+      "request": {
+        "method": "DELETE",
+        "path": "/_pit",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_bool", "path": "succeeded", "value": true },
+        { "kind": "json_path_number", "path": "num_freed", "value": 1 }
+      ]
+    },
+    {
+      "id": "ilm_policy_put_returns_acknowledged",
+      "description": "PUT /_ilm/policy/:name acknowledges policy creation",
+      "differential_enabled": false,
+      "setup_steps": [],
+      "request": {
+        "method": "PUT",
+        "path": "/_ilm/policy/{{policy}}",
+        "body": "{\"policy\":{\"phases\":{\"hot\":{\"actions\":{\"rollover\":{\"max_age\":\"1d\",\"max_primary_shard_size\":\"50gb\"}},\"min_age\":\"0ms\"}}}}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_bool", "path": "acknowledged", "value": true }
+      ]
+    },
+    {
+      "id": "ilm_policy_get_returns_empty_object_after_create",
+      "description": "GET /_ilm/policy/:name returns the current local placeholder payload",
+      "differential_enabled": false,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_ilm/policy/{{policy}}",
+            "body": "{\"policy\":{\"phases\":{\"hot\":{\"actions\":{\"rollover\":{\"max_age\":\"1d\",\"max_primary_shard_size\":\"50gb\"}},\"min_age\":\"0ms\"}}}}",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/_ilm/policy/{{policy}}",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "body_contains", "value": "{}" }
+      ]
+    },
+    {
+      "id": "monitoring_bulk_returns_ignored_true",
+      "description": "POST /_monitoring/bulk returns the local ignored payload",
+      "differential_enabled": false,
+      "setup_steps": [],
+      "request": {
+        "method": "POST",
+        "path": "/_monitoring/bulk",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_bool", "path": "ignored", "value": true },
+        { "kind": "json_path_bool", "path": "errors", "value": false }
+      ]
     }
   ]
 }
