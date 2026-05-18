@@ -105,7 +105,7 @@ pub struct DeletesMetadata {
     pub files: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ExtensionFile {
     pub suffix: String,
     pub location: String,
@@ -500,6 +500,8 @@ pub struct CreateTable {
     pub serving: Option<ServingTableConfig>,
     #[serde(default)]
     pub dynamodb: Option<DynamoDbTableConfig>,
+    #[serde(default)]
+    pub mongodb: Option<MongoDbTableConfig>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -510,6 +512,8 @@ pub struct TableDescription {
     pub serving: Option<ServingTableConfig>,
     #[serde(default)]
     pub dynamodb: Option<DynamoDbTableConfig>,
+    #[serde(default)]
+    pub mongodb: Option<MongoDbTableConfig>,
 }
 
 impl TableDescription {
@@ -519,6 +523,7 @@ impl TableDescription {
             tags: create_table.tags.clone(),
             serving: create_table.serving.clone(),
             dynamodb: create_table.dynamodb.clone(),
+            mongodb: create_table.mongodb.clone(),
         }
     }
 }
@@ -552,6 +557,20 @@ pub struct DynamoDbTableConfig {
     #[serde(default)]
     pub sort_key: Option<String>,
 }
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MongoDbIdConfig {
+    pub field: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MongoDbTableConfig {
+    pub enabled: bool,
+    pub database: String,
+    pub collection: String,
+    pub id: MongoDbIdConfig,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AddAlias {
     pub table_name: String,

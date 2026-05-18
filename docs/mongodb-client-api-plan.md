@@ -39,7 +39,13 @@ This branch also adds the inverse Mongo read-path adapter:
   [main_lib/src/serving_protocol.rs](../main_lib/src/serving_protocol.rs)
 - a temporary HTTP bridge at
   [main_lib/src/mongodb_protocol.rs](../main_lib/src/mongodb_protocol.rs)
-  exposed as `POST /:table/_mongo/find`
+  exposed as:
+  - `POST /:table/_mongo/find`
+  - `POST /_mongo/:database/_command`
+- table metadata for Mongo exposure and `_id` mapping via
+  `MongoDbTableConfig` in
+  [main_lib/src/data_contract.rs](../main_lib/src/data_contract.rs)
+- HTTP config endpoints at `GET` / `PUT /:table/_mongo/config`
 
 That means we now have:
 
@@ -48,6 +54,14 @@ That means we now have:
 - Dynamo-style inbound translation
 - Mongo-style inbound translation for a small `find` subset
 - an HTTP seam that can execute that subset against the shared serving engine
+- explicit database / collection exposure config
+- explicit `_id` backing-field config for Mongo-facing documents
+- a database-scoped command dispatcher for `hello`, `ping`,
+  `listCollections`, `listDatabases`, `find`, `getMore`, and `killCursors`
+- collection-to-table lookup through Mongo config instead of internal table
+  names on the command path
+- an in-memory read-only cursor registry for `batchSize`-driven pagination on
+  the HTTP debug surface
 
 ## What The New Translator Supports
 
@@ -65,13 +79,15 @@ Supported:
 - `_id: 0`
 - single-field or multi-field sort expressed as `1` / `-1`
 - positive `limit`
+- `batchSize`
+- `singleBatch`
 
 Rejected on purpose:
 
 - `skip`
 - exclusion projection other than `_id: 0`
 - `$or`, `$nor`, `$regex`, `$text`, `$elemMatch`, and other richer operators
-- cursor/session behavior
+- session behavior
 - writes
 - aggregation pipeline
 
@@ -101,6 +117,11 @@ Drivers will not begin with `find`. They first expect command responses such as:
 - `hello`
 - often `ping`
 - likely session-related envelope handling
+
+Status:
+
+- partially addressed for the HTTP debug surface only
+- **not** yet available over the Mongo wire protocol
 
 The handshake response must advertise coherent values like:
 
@@ -160,6 +181,12 @@ That mapping also needs:
 - `listCollections`
 - `dbStats` / `collStats` decisions, even if partially stubbed at first
 
+Status:
+
+- explicit `database.collection -> Powdrr table` config now exists
+- `listCollections` and `listDatabases` now exist on the HTTP debug surface
+- uniqueness is now enforced for enabled `database.collection` bindings
+
 ### 6. `_id` Semantics
 
 Mongo clients assume `_id` means something real.
@@ -210,9 +237,10 @@ Status:
 
 Next work inside this phase:
 
-- add table-level Mongo exposure config if needed
 - extend the translator with a few more safe operators only when the serving IR
   can preserve semantics
+- decide whether count-like read commands should compile into the same serving
+  path or stay out of scope until the wire server exists
 
 ### Phase 2: HTTP Debug Surface
 
@@ -226,10 +254,22 @@ Goal:
 Status:
 
 - now implemented as `POST /:table/_mongo/find`
-- command body still includes `find`, and the path name must match it
+- now also implemented as `POST /_mongo/:database/_command`
+- a table must opt in through `PUT /:table/_mongo/config`
+- the command `find` field must match the configured Mongo collection name
+- the database command path resolves `find` by configured
+  `database.collection`, not by internal table name
 - only fast-path serving queries are accepted; slow-path or rejected plans are
   returned as Mongo-shaped command errors
 - responses return `{ cursor: { id, ns, firstBatch }, ok: 1.0 }`
+- namespaces now come from configured `database.collection`, not the internal
+  Powdrr table name
+- `_id` is now backed by an explicit configured source field
+- `hello`, `ping`, `listCollections`, and `listDatabases` now return
+  Mongo-shaped command responses over HTTP
+- `find` now supports `batchSize` and `singleBatch`
+- `getMore` and `killCursors` now exist on the HTTP debug surface with
+  process-local in-memory cursor state
 
 Example request:
 
@@ -249,7 +289,7 @@ Example response shape:
 {
   "cursor": {
     "id": 0,
-    "ns": "powdrr.serve_flights",
+    "ns": "analytics.serve_flights",
     "firstBatch": [
       { "title": "..." }
     ]
@@ -263,24 +303,26 @@ Example error shape:
 ```json
 {
   "ok": 0.0,
-  "errmsg": "Path table serve_flights does not match Mongo find collection other_collection",
+  "errmsg": "Path table serve_flights_internal is exposed as Mongo collection serve_flights but request targeted other_collection",
   "code": 2,
   "codeName": "BadValue"
 }
 ```
 
-Known limitation in the current bridge:
+Current bridge constraints:
 
-- it does not synthesize or remap Mongo `_id` values yet
-- if the underlying serving result has no natural `_id`, the bridge currently
-  returns documents without inventing one
-- fixing that cleanly requires a table-level `_id` mapping contract, not just
-  HTTP response reshaping
+- only tables with explicit Mongo config are visible
+- only enabled configs are visible
+- `_id` must be backed by a configured source field in the table schema
+- only fast-path serving queries are currently executed
 
 Important:
 
 - this is **not** driver compatibility
 - it is only a development seam
+- the new `/_mongo/:database/_command` route is the closer approximation to
+  the eventual wire-protocol command model
+- cursor state is currently process-local and will not survive a restart
 
 ### Phase 3: Wire-Protocol Gateway
 
@@ -294,15 +336,14 @@ Build a dedicated Mongo-facing server crate or module that:
 
 This should initially be read-only and single-node.
 
-### Phase 4: Cursor and Session Support
+### Phase 4: Durable Cursor and Session Support
 
 Add:
 
-- cursor registry
-- `getMore`
-- `killCursors`
-- batch splitting
-- minimal session envelope handling
+- durable cursor registry
+- cursor expiry / cleanup
+- session envelope handling
+- batch splitting beyond the current in-memory debug implementation
 
 ### Phase 5: Expanded Surface
 
@@ -336,10 +377,12 @@ keeping the optimizer and storage model aligned with the rest of the repo.
 
 1. Keep expanding the read-only Mongo frontend around
    [main_lib/src/serving_protocol.rs](../main_lib/src/serving_protocol.rs).
-2. If we want an integration seam before the TCP gateway, add a temporary
-   Mongo-shaped HTTP route on top of
-   [main_lib/src/lakehouse_serving.rs](../main_lib/src/lakehouse_serving.rs).
-3. Add explicit table metadata for Mongo exposure and `_id` mapping, likely in
-   [main_lib/src/data_contract.rs](../main_lib/src/data_contract.rs).
+2. Harden the cursor layer so it is no longer process-local:
+   add expiry, cleanup, and a storage model that can survive restarts or
+   leader changes.
+3. Add count-like read commands only if they can map cleanly into the same
+   serving plan without creating a second execution path.
 4. Create a dedicated Mongo wire server module or crate rather than extending
    the current HTTP router directly.
+5. Use the existing HTTP bridge plus `_mongo/config` routes as the integration
+   seam while the TCP / BSON server is still under construction.

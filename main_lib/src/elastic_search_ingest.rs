@@ -5,7 +5,7 @@ use crate::data_contract::{
 };
 use crate::elastic_search_commands::LookupById;
 use crate::elastic_search_common::{
-    CommandContext, ElasticSearchResponse, MIME_ES_JSON, load_command_raw_result,
+    load_command_raw_result, CommandContext, ElasticSearchResponse, MIME_ES_JSON,
 };
 use crate::elastic_search_parser::UpdateBody;
 use crate::elastic_search_responses::{
@@ -15,16 +15,16 @@ use crate::elastic_search_storage_schema::{
     FullRecord, RecordDelete, RecordInput, SpeedboatCommitBuilder,
 };
 use crate::schema_massager::PowdrrSchema;
-use crate::search_runtime::{SerdeValueResult, df_to_serde_value};
-use crate::state_provider::{STATE_PROVIDER, ServiceApiError};
+use crate::search_runtime::{df_to_serde_value, SerdeValueResult};
+use crate::state_provider::{ServiceApiError, STATE_PROVIDER};
 use crate::util::{describe_table_log_error_then_none, log_err, log_service_err};
 use arrow_ipc::writer::StreamWriter;
 use arrow_json::LineDelimitedWriter;
 use datafusion::arrow::ipc::writer::FileWriter;
 use futures::FutureExt;
 use gotham::mime;
-use http::StatusCode;
 use http::header::LOCATION;
+use http::StatusCode;
 use idgenerator::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -310,6 +310,7 @@ pub(crate) async fn create_index(
             tags: HashMap::from([("_es_original".to_string(), serialized_body)]),
             serving: None,
             dynamodb: None,
+            mongodb: None,
         })
         .await
         .map_err(|e| IngestError::from_service_api_error(e))?;
@@ -372,6 +373,7 @@ where
             tags,
             serving: table_description.serving,
             dynamodb: table_description.dynamodb,
+            mongodb: table_description.mongodb,
         })
         .await
         .map_err(IngestError::from_service_api_error)?;

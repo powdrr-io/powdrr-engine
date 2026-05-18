@@ -1,13 +1,20 @@
-use std::collections::HashMap;
-use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
-use idgenerator::IdInstance;
-use modyne::{expr, keys, model::TransactWrite, projections, read_projection, Aggregate, Entity, EntityExt, Error, Item, ProjectionExt, QueryInput, QueryInputExt, Table};
-use modyne::expr::Filter;
-use crate::data_contract::{CleanupWorkItem, CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody, ExtensionCommit, ExtensionWorkItem, FileSetPayload, IcebergCommit, OrgInfo, OrgSettings, SpeedboatCommit, TableMetadataCheckpoint};
+use crate::data_contract::{
+    CleanupWorkItem, CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody,
+    ExtensionCommit, ExtensionWorkItem, FileSetPayload, IcebergCommit, OrgInfo, OrgSettings,
+    SpeedboatCommit, TableMetadataCheckpoint,
+};
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
-use crate::schema_massager::{PowdrrSchema};
+use crate::schema_massager::PowdrrSchema;
+use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
+use idgenerator::IdInstance;
+use modyne::expr::Filter;
+use modyne::{
+    expr, keys, model::TransactWrite, projections, read_projection, Aggregate, Entity, EntityExt,
+    Error, Item, ProjectionExt, QueryInput, QueryInputExt, Table,
+};
+use std::collections::HashMap;
 
 pub struct DynamoDbConnector {
     table_name: std::sync::Arc<str>,
@@ -40,7 +47,6 @@ impl Table for DynamoDbConnector {
     }
 }
 
-
 #[derive(Debug, modyne_derive::EntityDef, serde::Serialize, serde::Deserialize)]
 pub struct PowdrrEntity {
     pub type_name: String,
@@ -72,7 +78,8 @@ impl Entity for PowdrrEntity {
             type_name: &self.type_name,
             org_id: &self.org_id,
             entity_id: self.entity_id.clone(),
-        }).into()
+        })
+        .into()
     }
 }
 
@@ -114,16 +121,20 @@ impl Aggregate for PowdrrEntities {
 }
 
 impl DynamoDbConnector {
-    pub async fn fetch_entities(&self, org_id: &String, entity_type: &String, limit: Option<u32>) -> Result<PowdrrEntities, Error> {
-        let query = PowdrrEntityQuery{ entity_type, org_id };
+    pub async fn fetch_entities(
+        &self,
+        org_id: &String,
+        entity_type: &String,
+        limit: Option<u32>,
+    ) -> Result<PowdrrEntities, Error> {
+        let query = PowdrrEntityQuery {
+            entity_type,
+            org_id,
+        };
 
         let mut entities = PowdrrEntities::default();
 
-        let result = query
-            .query()
-            .set_limit(limit)
-            .execute(self)
-            .await?;
+        let result = query.query().set_limit(limit).execute(self).await?;
 
         entities.reduce(result.items.unwrap_or_default())?;
         Ok(entities)
@@ -135,7 +146,6 @@ pub struct CacheKey {
     name: String,
     org_id: String,
 }
-
 
 pub struct OrgIdNameInput<'a> {
     name: &'a String,
@@ -149,9 +159,7 @@ pub struct OrgIdEntityNameInput<'a> {
     name: &'a String,
 }
 
-
 const UNCLAIMED_TIME: i64 = 0; // The beginning of time
-
 
 #[derive(Debug, modyne_derive::EntityDef, serde::Serialize, serde::Deserialize, Clone)]
 pub struct PowdrrTracker {
@@ -160,7 +168,7 @@ pub struct PowdrrTracker {
     pub parent_entity: String,
     pub name: String,
     pub version: i64,
-    pub claimed_at: i64
+    pub claimed_at: i64,
 }
 
 impl Entity for PowdrrTracker {
@@ -169,7 +177,10 @@ impl Entity for PowdrrTracker {
     type IndexKeys = ();
 
     fn primary_key(input: Self::KeyInput<'_>) -> keys::Primary {
-        let common = format!("{}_TRACKER#{}#{}", input.entity_name, input.org_id, input.parent_entity);
+        let common = format!(
+            "{}_TRACKER#{}#{}",
+            input.entity_name, input.org_id, input.parent_entity
+        );
         keys::Primary {
             hash: common.clone(),
             range: input.name.clone(),
@@ -177,12 +188,13 @@ impl Entity for PowdrrTracker {
     }
 
     fn full_key(&self) -> keys::FullKey<keys::Primary, Self::IndexKeys> {
-        Self::primary_key(OrgIdEntityNameInput{
+        Self::primary_key(OrgIdEntityNameInput {
             entity_name: &self.entity_name,
             org_id: &self.org_id,
             parent_entity: &self.parent_entity,
             name: &self.name,
-        }).into()
+        })
+        .into()
     }
 }
 
@@ -197,7 +209,10 @@ impl QueryInput for PowdrrTrackerQuery {
     type Aggregate = PowdrrTrackerQueryResults;
 
     fn key_condition(&self) -> expr::KeyCondition<Self::Index> {
-        let key = format!("{}_TRACKER#{}#{}", self.entity_name, self.org_id, self.parent_entity);
+        let key = format!(
+            "{}_TRACKER#{}#{}",
+            self.entity_name, self.org_id, self.parent_entity
+        );
         expr::KeyCondition::in_partition(key)
     }
 }
@@ -213,7 +228,6 @@ projections! {
     }
 }
 
-
 impl Aggregate for PowdrrTrackerQueryResults {
     type Projections = PowdrrTrackerResultProjection;
 
@@ -225,7 +239,6 @@ impl Aggregate for PowdrrTrackerQueryResults {
         Ok(())
     }
 }
-
 
 macro_rules! powdrr_named_entity_core {
     ($entity_name:tt, $type_name:ident) => {
@@ -403,7 +416,6 @@ macro_rules! powdrr_named_cached_entity_core {
     }
 }
 
-
 macro_rules! powdrr_tracker {
     ($entity_name:tt) => {
         paste::item! {
@@ -555,7 +567,6 @@ macro_rules! powdrr_tracker {
     };
 }
 
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TableBody {
     pub tags: HashMap<String, String>,
@@ -563,6 +574,8 @@ pub struct TableBody {
     pub serving: Option<crate::data_contract::ServingTableConfig>,
     #[serde(default)]
     pub dynamodb: Option<crate::data_contract::DynamoDbTableConfig>,
+    #[serde(default)]
+    pub mongodb: Option<crate::data_contract::MongoDbTableConfig>,
 }
 
 impl TableBody {
@@ -572,6 +585,7 @@ impl TableBody {
             tags: HashMap::new(),
             serving: None,
             dynamodb: None,
+            mongodb: None,
         }
     }
 }
@@ -590,7 +604,7 @@ impl EntityVersionInfo {
             org_id: org_id.clone(),
             key: key.clone(),
             version: 0,
-            entity_id: entity_id.clone()
+            entity_id: entity_id.clone(),
         }
     }
 
@@ -601,7 +615,6 @@ impl EntityVersionInfo {
         }
     }
 }
-
 
 powdrr_named_entity!(alias, String);
 powdrr_named_entity!(powdrr_table, TableBody);
@@ -629,13 +642,11 @@ powdrr_tracker!(speedboat_commit_checkpointed);
 powdrr_tracker!(extension_commit_checkpointed);
 powdrr_tracker!(checkpoint_waiting_for_extension);
 
-
-
 impl DynamoDbConnector {
     fn latest_checkpoint_key(table_name: &String, extension: &Option<String>) -> String {
         match extension {
             Some(x) => format!("checkpoint#{}#{}", table_name, x),
-            None => format!("checkpoint#{}", table_name)
+            None => format!("checkpoint#{}", table_name),
         }
     }
 
@@ -649,36 +660,91 @@ impl DynamoDbConnector {
 
     const NO_WORK_ITEM: &'static str = "-1";
 
-    fn bump_version(transaction: TransactWrite, old: &EntityVersionInfo, new_entity_id: &String) -> TransactWrite {
-        let expression = expr::Update::new("SET entity.version = :plus_one, entity.entity_id = :new_id")
-            .value(":new_id", new_entity_id.clone())
-            .value(":plus_one", old.version + 1);
-        let condition = expr::Condition::new("entity.version = :old")
-            .value(":old", old.version);
+    fn bump_version(
+        transaction: TransactWrite,
+        old: &EntityVersionInfo,
+        new_entity_id: &String,
+    ) -> TransactWrite {
+        let expression =
+            expr::Update::new("SET entity.version = :plus_one, entity.entity_id = :new_id")
+                .value(":new_id", new_entity_id.clone())
+                .value(":plus_one", old.version + 1);
+        let condition = expr::Condition::new("entity.version = :old").value(":old", old.version);
 
-        transaction.operation(PowdrrNamedEntityVersionInfo::update(old.get_query()).expression(expression).condition(condition))
+        transaction.operation(
+            PowdrrNamedEntityVersionInfo::update(old.get_query())
+                .expression(expression)
+                .condition(condition),
+        )
     }
 
-    pub fn create_latest_core(&self, transaction: TransactWrite, entity: &EntityVersionInfo) -> TransactWrite {
+    pub fn create_latest_core(
+        &self,
+        transaction: TransactWrite,
+        entity: &EntityVersionInfo,
+    ) -> TransactWrite {
         self.private_create_latest_core(transaction, &entity.org_id, &entity.key, entity)
     }
 
-    pub async fn create_table_helper(&mut self, org_id: &String, table_name: &String, table_body: &TableBody) -> Result<bool, Error> {
+    pub async fn create_table_helper(
+        &mut self,
+        org_id: &String,
+        table_name: &String,
+        table_body: &TableBody,
+    ) -> Result<bool, Error> {
         let checkpoint = TableMetadataCheckpoint::new(
             table_name.clone(),
             IdInstance::next_id().to_string(),
             PowdrrSchema::minimal(),
         );
 
-        tracing::info!("Created checkpoint for table {}: {}", table_name, checkpoint.checkpoint_id);
+        tracing::info!(
+            "Created checkpoint for table {}: {}",
+            table_name,
+            checkpoint.checkpoint_id
+        );
 
         let mut transaction = TransactWrite::new();
-        transaction = self.private_create_powdrr_table_core(transaction, org_id, table_name, table_body);
-        transaction = self.private_create_checkpoint_core(transaction, org_id, &checkpoint.get_descriptor().full_name(), &checkpoint);
-        transaction = self.create_latest_core(transaction, &EntityVersionInfo::new(org_id, &Self::latest_checkpoint_key(table_name, &None), &checkpoint.get_descriptor().full_name()));
-        transaction = self.create_latest_core(transaction, &EntityVersionInfo::new(org_id, &Self::latest_checkpoint_key(table_name, &Some("es".to_string())), &checkpoint.get_descriptor().full_name()));
-        transaction = self.create_latest_core(transaction, &EntityVersionInfo::new(org_id, &Self::latest_extension_work_item_key(table_name, &"es".to_string()), &Self::NO_WORK_ITEM.to_owned()));
-        transaction = self.create_latest_core(transaction, &EntityVersionInfo::new(org_id, &Self::latest_compaction_work_item_key(table_name), &Self::NO_WORK_ITEM.to_owned()));
+        transaction =
+            self.private_create_powdrr_table_core(transaction, org_id, table_name, table_body);
+        transaction = self.private_create_checkpoint_core(
+            transaction,
+            org_id,
+            &checkpoint.get_descriptor().full_name(),
+            &checkpoint,
+        );
+        transaction = self.create_latest_core(
+            transaction,
+            &EntityVersionInfo::new(
+                org_id,
+                &Self::latest_checkpoint_key(table_name, &None),
+                &checkpoint.get_descriptor().full_name(),
+            ),
+        );
+        transaction = self.create_latest_core(
+            transaction,
+            &EntityVersionInfo::new(
+                org_id,
+                &Self::latest_checkpoint_key(table_name, &Some("es".to_string())),
+                &checkpoint.get_descriptor().full_name(),
+            ),
+        );
+        transaction = self.create_latest_core(
+            transaction,
+            &EntityVersionInfo::new(
+                org_id,
+                &Self::latest_extension_work_item_key(table_name, &"es".to_string()),
+                &Self::NO_WORK_ITEM.to_owned(),
+            ),
+        );
+        transaction = self.create_latest_core(
+            transaction,
+            &EntityVersionInfo::new(
+                org_id,
+                &Self::latest_compaction_work_item_key(table_name),
+                &Self::NO_WORK_ITEM.to_owned(),
+            ),
+        );
         self.commit_conditional_transaction(transaction).await
     }
 
@@ -688,20 +754,20 @@ impl DynamoDbConnector {
         input_speedboat_trackers: &Vec<PowdrrTracker>,
         new_checkpoint: &TableMetadataCheckpoint,
         compaction_latest: &Option<EntityVersionInfo>,
-        compaction_work_item: &Option<CompactionWorkItem>
+        compaction_work_item: &Option<CompactionWorkItem>,
     ) -> Result<bool, Error> {
         let mut transaction = TransactWrite::new();
 
         transaction = Self::bump_version(
             transaction,
             input_latest,
-            &new_checkpoint.get_descriptor().full_name()
+            &new_checkpoint.get_descriptor().full_name(),
         );
 
         for input_tracker in input_speedboat_trackers.iter() {
             transaction = DynamoDbConnector::mark_done_speedboat_commit_checkpointed_core(
                 transaction,
-                input_tracker
+                input_tracker,
             );
         }
         let checkpoint_obj = PowdrrNamedTableMetadataCheckpoint {
@@ -712,20 +778,38 @@ impl DynamoDbConnector {
         transaction = transaction.operation(checkpoint_obj.create());
 
         if !new_checkpoint.fully_covered_for_extension(&"es".to_string()) {
-            transaction = Self::create_checkpoint_waiting_for_extension_core(transaction, &input_latest.org_id, &new_checkpoint.table_name, &new_checkpoint.get_descriptor().full_name(), None)
+            transaction = Self::create_checkpoint_waiting_for_extension_core(
+                transaction,
+                &input_latest.org_id,
+                &new_checkpoint.table_name,
+                &new_checkpoint.get_descriptor().full_name(),
+                None,
+            )
         }
 
         if compaction_work_item.is_some() {
             assert!(compaction_latest.is_some());
             let compaction_work_item_id = compaction_work_item.as_ref().unwrap().id.clone();
-            transaction = self.private_create_compaction_work_item_core(transaction, &input_latest.org_id, &compaction_work_item_id, compaction_work_item.as_ref().unwrap());
-            transaction = Self::bump_version(transaction, compaction_latest.as_ref().unwrap(), &compaction_work_item_id);
+            transaction = self.private_create_compaction_work_item_core(
+                transaction,
+                &input_latest.org_id,
+                &compaction_work_item_id,
+                compaction_work_item.as_ref().unwrap(),
+            );
+            transaction = Self::bump_version(
+                transaction,
+                compaction_latest.as_ref().unwrap(),
+                &compaction_work_item_id,
+            );
         }
 
         self.commit_conditional_transaction(transaction).await
     }
 
-    pub async fn commit_conditional_transaction(&self, transaction: TransactWrite) -> Result<bool, Error> {
+    pub async fn commit_conditional_transaction(
+        &self,
+        transaction: TransactWrite,
+    ) -> Result<bool, Error> {
         match transaction.execute(self).await {
             Ok(_) => Ok(true),
             Err(e) => {
@@ -734,13 +818,14 @@ impl DynamoDbConnector {
                     match service_error {
                         TransactWriteItemsError::TransactionCanceledException(inner) => {
                             if inner.cancellation_reasons.is_some() {
-                                let cancellation_reasons = inner.cancellation_reasons.as_ref().unwrap();
+                                let cancellation_reasons =
+                                    inner.cancellation_reasons.as_ref().unwrap();
                                 let reasons = format!("{:?}", cancellation_reasons);
                                 println!("Transaction canceled: {}", reasons);
                                 //panic!("Transaction canceled: {}", reasons);
                             }
                         }
-                        _ => ()
+                        _ => (),
                     }
                     Ok(false)
                 } else {
@@ -750,7 +835,11 @@ impl DynamoDbConnector {
         }
     }
 
-    pub async fn commit_extension_work_item_taken(&self, old_entity_infos: &Vec<EntityVersionInfo>, new_entity_id: &String) -> Result<bool, Error> {
+    pub async fn commit_extension_work_item_taken(
+        &self,
+        old_entity_infos: &Vec<EntityVersionInfo>,
+        new_entity_id: &String,
+    ) -> Result<bool, Error> {
         if old_entity_infos.len() == 0 {
             return Ok(true);
         }
@@ -758,25 +847,24 @@ impl DynamoDbConnector {
         let mut transaction = TransactWrite::new();
 
         for entity_info in old_entity_infos.iter() {
-            transaction = Self::bump_version(
-                transaction,
-                entity_info,
-                new_entity_id
-            );
+            transaction = Self::bump_version(transaction, entity_info, new_entity_id);
             transaction = Self::create_extension_work_item_lease_core(
                 transaction,
                 &entity_info.org_id,
                 &entity_info.key,
                 &entity_info.entity_id,
-                Some(chrono::Utc::now().timestamp_millis())
+                Some(chrono::Utc::now().timestamp_millis()),
             );
-
         }
 
         self.commit_conditional_transaction(transaction).await
     }
 
-    pub async fn commit_compaction_work_item_taken(&self, old_entity_infos: &Vec<EntityVersionInfo>, new_entity_id: &String) -> Result<bool, Error> {
+    pub async fn commit_compaction_work_item_taken(
+        &self,
+        old_entity_infos: &Vec<EntityVersionInfo>,
+        new_entity_id: &String,
+    ) -> Result<bool, Error> {
         if old_entity_infos.len() == 0 {
             return Ok(true);
         }
@@ -784,25 +872,25 @@ impl DynamoDbConnector {
         let mut transaction = TransactWrite::new();
 
         for entity_info in old_entity_infos.iter() {
-            transaction = Self::bump_version(
-                transaction,
-                entity_info,
-                new_entity_id
-            );
+            transaction = Self::bump_version(transaction, entity_info, new_entity_id);
             transaction = Self::create_compaction_work_item_lease_core(
                 transaction,
                 &entity_info.org_id,
                 &entity_info.key,
                 &entity_info.entity_id,
-                Some(chrono::Utc::now().timestamp_millis())
+                Some(chrono::Utc::now().timestamp_millis()),
             );
-
         }
 
         self.commit_conditional_transaction(transaction).await
     }
 
-    pub async fn commit_speedboat(&self, org_id: &String, table_name: &String, commit: &SpeedboatCommit) -> Result<bool, Error> {
+    pub async fn commit_speedboat(
+        &self,
+        org_id: &String,
+        table_name: &String,
+        commit: &SpeedboatCommit,
+    ) -> Result<bool, Error> {
         // 1. Save the commit itself
         // 2. Save a tracker for creating a new checkpoint based on this commit
         // 3. Create either a new ES work item or update the existing one
@@ -812,9 +900,20 @@ impl DynamoDbConnector {
 
         let speedboat_commit_id = &IdInstance::next_id().to_string();
         // Step 1
-        transaction = self.private_create_speedboat_commit_core(transaction, org_id, speedboat_commit_id, commit);
+        transaction = self.private_create_speedboat_commit_core(
+            transaction,
+            org_id,
+            speedboat_commit_id,
+            commit,
+        );
         // Step 2
-        transaction = Self::create_speedboat_commit_checkpointed_core(transaction, org_id, table_name, speedboat_commit_id, None);
+        transaction = Self::create_speedboat_commit_checkpointed_core(
+            transaction,
+            org_id,
+            table_name,
+            speedboat_commit_id,
+            None,
+        );
 
         let latest_es_key = &Self::latest_extension_work_item_key(&table_name, &"es".to_string());
         let latest_es = self.describe_latest(org_id, latest_es_key).await?;
@@ -827,15 +926,27 @@ impl DynamoDbConnector {
                 table_name: table_name.to_string(),
                 table_schema: PowdrrSchema::minimal(),
                 speedboat_files: FileSetPayload::new(),
-                iceberg_files: FileSetPayload::new()
+                iceberg_files: FileSetPayload::new(),
             }
         } else {
-            self.describe_extension_work_item(&mut PowdrrNamedExtensionWorkItemCache::new(), org_id, &latest_es.as_ref().unwrap().entity_id).await?.unwrap()
+            self.describe_extension_work_item(
+                &mut PowdrrNamedExtensionWorkItemCache::new(),
+                org_id,
+                &latest_es.as_ref().unwrap().entity_id,
+            )
+            .await?
+            .unwrap()
         };
         work_item.id = new_es_id.clone();
         work_item.merge_speedboat(commit);
         // Step 3
-        transaction = self.cached_create_extension_work_item_core(transaction, &mut PowdrrNamedExtensionWorkItemCache::new(), org_id, &new_es_id, &work_item);
+        transaction = self.cached_create_extension_work_item_core(
+            transaction,
+            &mut PowdrrNamedExtensionWorkItemCache::new(),
+            org_id,
+            &new_es_id,
+            &work_item,
+        );
         // Step 4
         transaction = Self::bump_version(transaction, latest_es.as_ref().unwrap(), &new_es_id);
         // TODO: delete old id?
@@ -843,8 +954,13 @@ impl DynamoDbConnector {
         self.commit_conditional_transaction(transaction).await
     }
 
-    async fn gather_compactions(&self, org_id: &String, speedboat_commits: &Vec<SpeedboatCommit>, iceberg_commits: &Vec<IcebergCommit>) -> Result<HashMap<String, CompactionCommit>, Error> {
-        let mut compactions = vec!();
+    async fn gather_compactions(
+        &self,
+        org_id: &String,
+        speedboat_commits: &Vec<SpeedboatCommit>,
+        iceberg_commits: &Vec<IcebergCommit>,
+    ) -> Result<HashMap<String, CompactionCommit>, Error> {
+        let mut compactions = vec![];
         for speedboat_commit in speedboat_commits {
             if speedboat_commit.compaction.is_some() {
                 compactions.push(speedboat_commit.compaction.as_ref().unwrap().clone());
@@ -860,14 +976,25 @@ impl DynamoDbConnector {
         for compaction in compactions {
             compaction_commits.insert(
                 compaction.clone(),
-                self.describe_compaction(&mut PowdrrNamedCompactionCommitCache::new(), org_id, &compaction).await?.unwrap()
+                self.describe_compaction(
+                    &mut PowdrrNamedCompactionCommitCache::new(),
+                    org_id,
+                    &compaction,
+                )
+                .await?
+                .unwrap(),
             );
         }
 
         Ok(compaction_commits)
     }
 
-    pub async fn commit_iceberg(&self, org_id: &String, table_name: &String, commit: &IcebergCommit) -> Result<bool, Error> {
+    pub async fn commit_iceberg(
+        &self,
+        org_id: &String,
+        table_name: &String,
+        commit: &IcebergCommit,
+    ) -> Result<bool, Error> {
         // 1. Save the commit itself
         // 2. Save an updated checkpoint and bump the latest
         // 3. Create either a new ES work item or update the existing one
@@ -882,22 +1009,35 @@ impl DynamoDbConnector {
 
         let iceberg_commit_id = &IdInstance::next_id().to_string();
         // Step 1
-        transaction = self.private_create_iceberg_commit_core(transaction, org_id, iceberg_commit_id, commit);
+        transaction =
+            self.private_create_iceberg_commit_core(transaction, org_id, iceberg_commit_id, commit);
 
-        let latest_info = self.describe_latest(org_id, &Self::latest_checkpoint_key(table_name, &None)).await?.unwrap();
-        let latest_obj = self.describe_checkpoint(&mut PowdrrNamedTableMetadataCheckpointCache::new(), &org_id, &latest_info.entity_id).await?.unwrap();
+        let latest_info = self
+            .describe_latest(org_id, &Self::latest_checkpoint_key(table_name, &None))
+            .await?
+            .unwrap();
+        let latest_obj = self
+            .describe_checkpoint(
+                &mut PowdrrNamedTableMetadataCheckpointCache::new(),
+                &org_id,
+                &latest_info.entity_id,
+            )
+            .await?
+            .unwrap();
 
-        let compactions = self.gather_compactions(org_id,&vec!(), &vec!(commit.clone())).await?;
+        let compactions = self
+            .gather_compactions(org_id, &vec![], &vec![commit.clone()])
+            .await?;
 
-        let (new_checkpoint, _) = latest_obj.clone_and_apply(
-            &vec!(),
-            &vec!(commit.clone()),
-            &vec!(),
-            &compactions
-        );
+        let (new_checkpoint, _) =
+            latest_obj.clone_and_apply(&vec![], &vec![commit.clone()], &vec![], &compactions);
 
         // Step 2
-        transaction = Self::bump_version(transaction, &latest_info, &new_checkpoint.get_descriptor().full_name());
+        transaction = Self::bump_version(
+            transaction,
+            &latest_info,
+            &new_checkpoint.get_descriptor().full_name(),
+        );
         let checkpoint_obj = PowdrrNamedTableMetadataCheckpoint {
             name: new_checkpoint.get_descriptor().full_name(),
             org_id: org_id.clone(),
@@ -917,14 +1057,26 @@ impl DynamoDbConnector {
                 table_name: table_name.to_string(),
                 table_schema: PowdrrSchema::minimal(),
                 speedboat_files: FileSetPayload::new(),
-                iceberg_files: FileSetPayload::new()
+                iceberg_files: FileSetPayload::new(),
             }
         } else {
-            self.describe_extension_work_item(&mut PowdrrNamedExtensionWorkItemCache::new(), org_id, &latest_es.as_ref().unwrap().entity_id).await?.unwrap()
+            self.describe_extension_work_item(
+                &mut PowdrrNamedExtensionWorkItemCache::new(),
+                org_id,
+                &latest_es.as_ref().unwrap().entity_id,
+            )
+            .await?
+            .unwrap()
         };
         work_item.id = new_es_id.clone();
         work_item.merge_iceberg(commit);
-        transaction = self.cached_create_extension_work_item_core(transaction, &mut PowdrrNamedExtensionWorkItemCache::new(), org_id, &new_es_id, &work_item);
+        transaction = self.cached_create_extension_work_item_core(
+            transaction,
+            &mut PowdrrNamedExtensionWorkItemCache::new(),
+            org_id,
+            &new_es_id,
+            &work_item,
+        );
 
         // Step 4
         transaction = Self::bump_version(transaction, latest_es.as_ref().unwrap(), &new_es_id);
@@ -933,12 +1085,27 @@ impl DynamoDbConnector {
         // Step 5
         for (compaction_id, compaction_commit) in compactions.iter() {
             // Step 5a
-            let checkpoint_descriptor = CheckpointDescriptor::new(table_name.clone(), compaction_commit.checkpoint_id_to_replace.clone());
-            let mut cloned_checkpoint_to_replace = self.describe_checkpoint(&mut PowdrrNamedTableMetadataCheckpointCache::new(), &org_id, &checkpoint_descriptor.full_name()).await?.unwrap().clone();
+            let checkpoint_descriptor = CheckpointDescriptor::new(
+                table_name.clone(),
+                compaction_commit.checkpoint_id_to_replace.clone(),
+            );
+            let mut cloned_checkpoint_to_replace = self
+                .describe_checkpoint(
+                    &mut PowdrrNamedTableMetadataCheckpointCache::new(),
+                    &org_id,
+                    &checkpoint_descriptor.full_name(),
+                )
+                .await?
+                .unwrap()
+                .clone();
             cloned_checkpoint_to_replace.checkpoint_id = IdInstance::next_id().to_string();
-            cloned_checkpoint_to_replace.apply_compaction_for_replacement(compaction_commit, &commit.metadata);
-            assert!(cloned_checkpoint_to_replace.original_checkpoint_id.is_none());
-            cloned_checkpoint_to_replace.original_checkpoint_id = Some(compaction_commit.checkpoint_id_to_replace.clone());
+            cloned_checkpoint_to_replace
+                .apply_compaction_for_replacement(compaction_commit, &commit.metadata);
+            assert!(cloned_checkpoint_to_replace
+                .original_checkpoint_id
+                .is_none());
+            cloned_checkpoint_to_replace.original_checkpoint_id =
+                Some(compaction_commit.checkpoint_id_to_replace.clone());
 
             let checkpoint_obj = PowdrrNamedTableMetadataCheckpoint {
                 name: cloned_checkpoint_to_replace.get_descriptor().full_name(),
@@ -948,52 +1115,99 @@ impl DynamoDbConnector {
             transaction = transaction.operation(checkpoint_obj.create());
 
             if !new_checkpoint.fully_covered_for_extension(&"es".to_string()) {
-                transaction = Self::create_checkpoint_waiting_for_extension_core(transaction, org_id, &cloned_checkpoint_to_replace.table_name, &cloned_checkpoint_to_replace.get_descriptor().full_name(), None)
+                transaction = Self::create_checkpoint_waiting_for_extension_core(
+                    transaction,
+                    org_id,
+                    &cloned_checkpoint_to_replace.table_name,
+                    &cloned_checkpoint_to_replace.get_descriptor().full_name(),
+                    None,
+                )
             }
 
             // Step 5b
             // TODO: delete the listed checkpoints
 
             // Step 5c
-            let key = Self::latest_compaction_work_item_key(&cloned_checkpoint_to_replace.table_name);
-            transaction = Self::mark_done_compaction_work_item_lease_inner(transaction, org_id, &key, compaction_id, None);
+            let key =
+                Self::latest_compaction_work_item_key(&cloned_checkpoint_to_replace.table_name);
+            transaction = Self::mark_done_compaction_work_item_lease_inner(
+                transaction,
+                org_id,
+                &key,
+                compaction_id,
+                None,
+            );
 
             // Step 5d
             let cleanup_work_item = CleanupWorkItem {
                 id: IdInstance::next_id().to_string(),
                 table_name: cloned_checkpoint_to_replace.table_name.clone(),
-                files_to_delete: compaction_commit.removed_speedboat_files.iter().chain(compaction_commit.removed_delete_files.iter()).map(|x|x.clone()).collect(),
+                files_to_delete: compaction_commit
+                    .removed_speedboat_files
+                    .iter()
+                    .chain(compaction_commit.removed_delete_files.iter())
+                    .map(|x| x.clone())
+                    .collect(),
             };
             let cleanup_work_item_id = cleanup_work_item.id.clone();
-            transaction = self.cached_create_cleanup_work_item_core(transaction, &mut PowdrrNamedCleanupWorkItemCache::new(), org_id, &cleanup_work_item_id, &cleanup_work_item);
-            transaction = Self::create_cleanup_work_item_lease_core(transaction, org_id, &cloned_checkpoint_to_replace.table_name, &cleanup_work_item_id, None);
+            transaction = self.cached_create_cleanup_work_item_core(
+                transaction,
+                &mut PowdrrNamedCleanupWorkItemCache::new(),
+                org_id,
+                &cleanup_work_item_id,
+                &cleanup_work_item,
+            );
+            transaction = Self::create_cleanup_work_item_lease_core(
+                transaction,
+                org_id,
+                &cloned_checkpoint_to_replace.table_name,
+                &cleanup_work_item_id,
+                None,
+            );
         }
 
         self.commit_conditional_transaction(transaction).await
     }
 
-    pub async fn commit_extension_work_item_completed(&self, org_id: &String, table_name: &String, commit: &ExtensionCommit) -> Result<bool, Error> {
+    pub async fn commit_extension_work_item_completed(
+        &self,
+        org_id: &String,
+        table_name: &String,
+        commit: &ExtensionCommit,
+    ) -> Result<bool, Error> {
         let mut transaction = TransactWrite::new();
 
         let key = Self::latest_extension_work_item_key(table_name, &"es".to_string());
-        transaction = Self::mark_done_extension_work_item_lease_inner(transaction, org_id, &key, &commit.id, Some(0));
-        transaction = self.private_create_extension_commit_core(transaction, org_id, &commit.id, &commit);
-        transaction = Self::create_extension_commit_checkpointed_core(transaction, org_id, table_name, &commit.id, None);
+        transaction = Self::mark_done_extension_work_item_lease_inner(
+            transaction,
+            org_id,
+            &key,
+            &commit.id,
+            Some(0),
+        );
+        transaction =
+            self.private_create_extension_commit_core(transaction, org_id, &commit.id, &commit);
+        transaction = Self::create_extension_commit_checkpointed_core(
+            transaction,
+            org_id,
+            table_name,
+            &commit.id,
+            None,
+        );
 
         self.commit_conditional_transaction(transaction).await
     }
 }
 
-
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::data_contract::SpeedboatCommitTableInfo;
+    use crate::peers::CheckpointDescriptor;
+    use crate::schema_massager::PowdrrSchema;
     use aws_config::{BehaviorVersion, Region};
     use aws_sdk_dynamodb::Client;
-    use crate::data_contract::SpeedboatCommitTableInfo;
-    use crate::schema_massager::PowdrrSchema;
-    use super::*;
     use modyne::TestTableExt;
-    use crate::peers::CheckpointDescriptor;
 
     async fn create_connector() -> DynamoDbConnector {
         let config = aws_config::defaults(BehaviorVersion::latest())
@@ -1014,7 +1228,7 @@ mod tests {
             Ok(_) => (),
             Err(e) => {
                 panic!("{:?}", e)
-            },
+            }
         };
         connector
     }
@@ -1023,49 +1237,68 @@ mod tests {
     async fn test_basic_create_and_search() {
         let connector = create_connector().await;
 
-        match connector.create_powdrr_table(
-            &"dude".to_string(),
-            &"fresh".to_string(),
-            &TableBody {
-                tags: HashMap::from([("foo".to_string(), "bar".to_string())]),
-                serving: None,
-                dynamodb: None,
-            },
-        )
-        .await
+        match connector
+            .create_powdrr_table(
+                &"dude".to_string(),
+                &"fresh".to_string(),
+                &TableBody {
+                    tags: HashMap::from([("foo".to_string(), "bar".to_string())]),
+                    serving: None,
+                    dynamodb: None,
+                    mongodb: None,
+                },
+            )
+            .await
         {
             Ok(_) => (),
             Err(e) => {
                 panic!("{:?}", e)
-            },
+            }
         }
 
-        let result = connector.describe_powdrr_table(&"dude".to_string(), &"fresh".to_string()).await.unwrap();
+        let result = connector
+            .describe_powdrr_table(&"dude".to_string(), &"fresh".to_string())
+            .await
+            .unwrap();
         match result {
             Some(table) => {
                 assert_eq!(table.tags.get("foo").unwrap(), "bar");
-            },
+            }
             None => {
                 panic!("Table not found");
-            },
+            }
         }
 
-        match connector.create_latest(&"dude".to_string(), &"fake_table#es".to_string(), &EntityVersionInfo::new(&"dude".to_string(), &"fake_table#es".to_string(), &"-1".to_string())).await {
+        match connector
+            .create_latest(
+                &"dude".to_string(),
+                &"fake_table#es".to_string(),
+                &EntityVersionInfo::new(
+                    &"dude".to_string(),
+                    &"fake_table#es".to_string(),
+                    &"-1".to_string(),
+                ),
+            )
+            .await
+        {
             Ok(_) => (),
             Err(e) => {
                 panic!("{:?}", e)
-            },
+            }
         }
 
-        let result = connector.describe_latest(&"dude".to_string(), &"fake_table#es".to_string()).await.unwrap();
+        let result = connector
+            .describe_latest(&"dude".to_string(), &"fake_table#es".to_string())
+            .await
+            .unwrap();
         match result {
             Some(info) => {
                 assert_eq!(info.entity_id, "-1");
                 assert_eq!(info.version, 0);
-            },
+            }
             None => {
                 panic!("Not found");
-            },
+            }
         }
 
         let checkpoint = TableMetadataCheckpoint {
@@ -1076,28 +1309,36 @@ mod tests {
             speedboat_metadata: None,
             deletes_metadata: None,
             extension_metadata: Default::default(),
-            schema: PowdrrSchema::minimal()
+            schema: PowdrrSchema::minimal(),
         };
 
         let mut cache = PowdrrNamedTableMetadataCheckpointCache::new();
 
-        match connector.create_checkpoint(&mut cache, &"dude".to_string(), &"fresh".to_string(), &checkpoint).await {
+        match connector
+            .create_checkpoint(
+                &mut cache,
+                &"dude".to_string(),
+                &"fresh".to_string(),
+                &checkpoint,
+            )
+            .await
+        {
             Ok(_) => (),
             Err(e) => {
                 panic!("{:?}", e)
-            },
+            }
         }
 
-        let result = connector.describe_checkpoint(&mut cache, &"dude".to_string(), &"fresh".to_string()).await.unwrap();
+        let result = connector
+            .describe_checkpoint(&mut cache, &"dude".to_string(), &"fresh".to_string())
+            .await
+            .unwrap();
         match result {
-            Some(_table) => {
-                ()
-            },
+            Some(_table) => (),
             None => {
                 panic!("Table not found");
-            },
+            }
         }
-
     }
 
     #[tokio::test]
@@ -1117,9 +1358,20 @@ mod tests {
             compaction: Some("fake_compaction".to_string()),
         };
 
-        connector.create_speedboat_commit(&mut cache, &"fake_org".to_string(), &"fake_id".to_string(), &commit).await.unwrap();
+        connector
+            .create_speedboat_commit(
+                &mut cache,
+                &"fake_org".to_string(),
+                &"fake_id".to_string(),
+                &commit,
+            )
+            .await
+            .unwrap();
 
-        let found = connector.describe_speedboat_commit(&mut cache, &"fake_org".to_string(), &"fake_id".to_string()).await.unwrap();
+        let found = connector
+            .describe_speedboat_commit(&mut cache, &"fake_org".to_string(), &"fake_id".to_string())
+            .await
+            .unwrap();
         match found {
             Some(commit) => {
                 assert_eq!(commit.type_files.len(), 1);
@@ -1127,31 +1379,60 @@ mod tests {
                 assert_eq!(commit.type_files[0].table_name, "fake_table");
                 assert_eq!(commit.type_files[0].files.len(), 1);
                 assert_eq!(commit.type_files[0].files[0], "fake_file");
-            },
+            }
             None => {
                 panic!("Commit not found");
-            },
+            }
         };
 
-        connector.create_speedboat_commit_checkpointed(&"fake_org".to_string(), &"fake_table".to_string(), &"fake_id".to_string()).await.unwrap();
-        let trackers = connector.oldest_available_speedboat_commit_checkpointed(&"fake_org".to_string(), &"fake_table".to_string(), None, None).await.unwrap();
+        connector
+            .create_speedboat_commit_checkpointed(
+                &"fake_org".to_string(),
+                &"fake_table".to_string(),
+                &"fake_id".to_string(),
+            )
+            .await
+            .unwrap();
+        let trackers = connector
+            .oldest_available_speedboat_commit_checkpointed(
+                &"fake_org".to_string(),
+                &"fake_table".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(trackers.len(), 1);
 
-        let _ =
-            DynamoDbConnector::mark_done_speedboat_commit_checkpointed_core(TransactWrite::new(), &trackers[0])
-            .execute(&connector)
-            .await.unwrap();
+        let _ = DynamoDbConnector::mark_done_speedboat_commit_checkpointed_core(
+            TransactWrite::new(),
+            &trackers[0],
+        )
+        .execute(&connector)
+        .await
+        .unwrap();
 
-        let trackers_again = connector.oldest_available_speedboat_commit_checkpointed(&"fake_org".to_string(), &"fake_table".to_string(), None, None).await.unwrap();
+        let trackers_again = connector
+            .oldest_available_speedboat_commit_checkpointed(
+                &"fake_org".to_string(),
+                &"fake_table".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(trackers_again.len(), 0);
 
-        match DynamoDbConnector::mark_done_speedboat_commit_checkpointed_core(TransactWrite::new(), &trackers[0])
-            .execute(&connector)
-            .await {
+        match DynamoDbConnector::mark_done_speedboat_commit_checkpointed_core(
+            TransactWrite::new(),
+            &trackers[0],
+        )
+        .execute(&connector)
+        .await
+        {
             Ok(_) => panic!("Should have failed"),
-            Err(_) => ()
+            Err(_) => (),
         };
-
     }
 
     #[tokio::test]
@@ -1169,7 +1450,7 @@ mod tests {
             speedboat_metadata: None,
             deletes_metadata: None,
             extension_metadata: Default::default(),
-            schema: PowdrrSchema::minimal()
+            schema: PowdrrSchema::minimal(),
         };
 
         let speedboat_commit = SpeedboatCommit {
@@ -1180,50 +1461,124 @@ mod tests {
                 sizes: vec![100],
                 schema: Some(PowdrrSchema::minimal()),
             }],
-            compaction: None
+            compaction: None,
         };
 
-        connector.create_latest(&"fake_org".to_string(), &first_checkpoint.table_name, &EntityVersionInfo::new(&"fake_org".to_string(), &first_checkpoint.table_name, &first_checkpoint.checkpoint_id)).await.unwrap();
-        connector.create_checkpoint(&mut checkpoint_cache, &"fake_org".to_string(), &first_checkpoint.checkpoint_id, &first_checkpoint).await.unwrap();
-        connector.create_speedboat_commit(&mut speedboat_cache, &"fake_org".to_string(), &"fake_id".to_string(), &speedboat_commit).await.unwrap();
-        connector.create_speedboat_commit_checkpointed(&"fake_org".to_string(), &"fake_table".to_string(), &"fake_id".to_string()).await.unwrap();
+        connector
+            .create_latest(
+                &"fake_org".to_string(),
+                &first_checkpoint.table_name,
+                &EntityVersionInfo::new(
+                    &"fake_org".to_string(),
+                    &first_checkpoint.table_name,
+                    &first_checkpoint.checkpoint_id,
+                ),
+            )
+            .await
+            .unwrap();
+        connector
+            .create_checkpoint(
+                &mut checkpoint_cache,
+                &"fake_org".to_string(),
+                &first_checkpoint.checkpoint_id,
+                &first_checkpoint,
+            )
+            .await
+            .unwrap();
+        connector
+            .create_speedboat_commit(
+                &mut speedboat_cache,
+                &"fake_org".to_string(),
+                &"fake_id".to_string(),
+                &speedboat_commit,
+            )
+            .await
+            .unwrap();
+        connector
+            .create_speedboat_commit_checkpointed(
+                &"fake_org".to_string(),
+                &"fake_table".to_string(),
+                &"fake_id".to_string(),
+            )
+            .await
+            .unwrap();
 
-        let latest_speedboat_trackers = connector.oldest_available_speedboat_commit_checkpointed(&"fake_org".to_string(), &"fake_table".to_string(), None, None).await.unwrap();
+        let latest_speedboat_trackers = connector
+            .oldest_available_speedboat_commit_checkpointed(
+                &"fake_org".to_string(),
+                &"fake_table".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(latest_speedboat_trackers.len(), 1);
 
-        let latest_checkpoint_info = connector.describe_latest(&"fake_org".to_string(), &"fake_table".to_string()).await.unwrap().unwrap();
-        let latest_checkpoint = connector.describe_checkpoint(&mut checkpoint_cache, &"fake_org".to_string(), &latest_checkpoint_info.entity_id).await.unwrap().unwrap();
+        let latest_checkpoint_info = connector
+            .describe_latest(&"fake_org".to_string(), &"fake_table".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let latest_checkpoint = connector
+            .describe_checkpoint(
+                &mut checkpoint_cache,
+                &"fake_org".to_string(),
+                &latest_checkpoint_info.entity_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
 
-        let mut latest_speedboats = vec!();
+        let mut latest_speedboats = vec![];
         for speedboat_tracker in latest_speedboat_trackers.iter() {
-            latest_speedboats.push(connector.describe_speedboat_commit(&mut speedboat_cache, &"fake_org".to_string(), &speedboat_tracker.name).await.unwrap().unwrap());
+            latest_speedboats.push(
+                connector
+                    .describe_speedboat_commit(
+                        &mut speedboat_cache,
+                        &"fake_org".to_string(),
+                        &speedboat_tracker.name,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
         }
 
         let (new_checkpoint, changed) = latest_checkpoint.clone_and_apply(
             &latest_speedboats,
-            &vec!(),
-            &vec!(),
-            &HashMap::new()
+            &vec![],
+            &vec![],
+            &HashMap::new(),
         );
         assert!(changed);
 
-        match connector.commit_checkpoint(
-            &latest_checkpoint_info,
-            &latest_speedboat_trackers,
-            &new_checkpoint,
-            &None,
-            &None
-        ).await {
+        match connector
+            .commit_checkpoint(
+                &latest_checkpoint_info,
+                &latest_speedboat_trackers,
+                &new_checkpoint,
+                &None,
+                &None,
+            )
+            .await
+        {
             Ok(val) => {
                 assert!(val);
-            },
+            }
             Err(_e) => {
                 panic!("Test failed")
             }
         };
 
-        let new_latest = connector.describe_latest(&"fake_org".to_string(), &"fake_table".to_string()).await.unwrap().unwrap();
+        let new_latest = connector
+            .describe_latest(&"fake_org".to_string(), &"fake_table".to_string())
+            .await
+            .unwrap()
+            .unwrap();
         assert_ne!(new_latest.version, latest_checkpoint_info.version);
-        assert_eq!(CheckpointDescriptor::from_full_name(&new_latest.entity_id).checkpoint_id, new_checkpoint.checkpoint_id);
+        assert_eq!(
+            CheckpointDescriptor::from_full_name(&new_latest.entity_id).checkpoint_id,
+            new_checkpoint.checkpoint_id
+        );
     }
 }
