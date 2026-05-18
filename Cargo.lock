@@ -5382,6 +5382,7 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-dynamodb",
+ "bson",
  "chrono",
  "datafusion",
  "futures",

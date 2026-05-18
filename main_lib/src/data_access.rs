@@ -61,6 +61,7 @@ const S3_ACCESS_KEY_ID_VALUE: &str = "admin";
 const S3_SECRET_ACCESS_KEY_VALUE: &str = "password";
 const S3_REGION_VALUE: &str = "us-east-1";
 const PARQUET_ROW_GROUP_STATS_CACHE_MAX_ENTRIES: usize = 2048;
+const ICEBERG_TABLE_METADATA_CACHE_MAX_ENTRIES: usize = 256;
 const ICEBERG_ROW_GROUP_STATS_LOAD_PARALLELISM_MAX: usize = 16;
 
 #[derive(Default)]
@@ -83,6 +84,12 @@ impl ParquetRowGroupStatsCache {
         let entry = self.entries.get(file_path).cloned()?;
         self.touch(file_path);
         Some(entry)
+    }
+
+    fn cached_row_group_count(&self, file_path: &str) -> Option<usize> {
+        self.entries
+            .get(file_path)
+            .map(|row_groups| row_groups.len())
     }
 
     fn insert(&mut self, file_path: &str, row_groups: Vec<IcebergRowGroupStats>) {
@@ -123,11 +130,125 @@ static PARQUET_ROW_GROUP_STATS_CACHE: LazyLock<Mutex<ParquetRowGroupStatsCache>>
         ))
     });
 
+#[derive(Clone)]
+struct IcebergTableMetadataCacheEntry {
+    metadata: IcebergLibMetadata,
+}
+
+#[derive(Default)]
+struct IcebergTableMetadataCache {
+    entries: HashMap<String, IcebergTableMetadataCacheEntry>,
+    access_order: VecDeque<String>,
+    max_entries: usize,
+}
+
+impl IcebergTableMetadataCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            access_order: VecDeque::new(),
+            max_entries,
+        }
+    }
+
+    fn get(&mut self, table_key: &str, snapshot_id: i64) -> Option<IcebergLibMetadata> {
+        let entry = self.entries.get(table_key)?;
+        if entry.metadata.snapshot_id != snapshot_id {
+            return None;
+        }
+
+        let metadata = entry.metadata.clone();
+        self.touch(table_key);
+        Some(metadata)
+    }
+
+    fn contains(&self, table_key: &str, snapshot_id: i64) -> bool {
+        self.entries
+            .get(table_key)
+            .map(|entry| entry.metadata.snapshot_id == snapshot_id)
+            .unwrap_or(false)
+    }
+
+    fn insert(&mut self, table_key: &str, metadata: IcebergLibMetadata) {
+        self.entries.insert(
+            table_key.to_string(),
+            IcebergTableMetadataCacheEntry { metadata },
+        );
+        self.touch(table_key);
+        self.evict_if_needed();
+    }
+
+    fn remove(&mut self, table_key: &str) {
+        self.entries.remove(table_key);
+        self.access_order.retain(|existing| existing != table_key);
+    }
+
+    fn remove_namespace(&mut self, namespace: &str) {
+        let namespace_prefix = format!("{}/", namespace);
+        let table_keys = self
+            .entries
+            .keys()
+            .filter(|table_key| table_key.starts_with(&namespace_prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        for table_key in table_keys {
+            self.remove(&table_key);
+        }
+    }
+
+    fn invalidate_file(&mut self, file_path: &str) {
+        let table_keys = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry
+                    .metadata
+                    .files
+                    .iter()
+                    .any(|existing| existing == file_path)
+            })
+            .map(|(table_key, _)| table_key.clone())
+            .collect::<Vec<_>>();
+        for table_key in table_keys {
+            self.remove(&table_key);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.access_order.clear();
+    }
+
+    fn touch(&mut self, table_key: &str) {
+        self.access_order.retain(|existing| existing != table_key);
+        self.access_order.push_back(table_key.to_string());
+    }
+
+    fn evict_if_needed(&mut self) {
+        while self.entries.len() > self.max_entries {
+            let Some(oldest) = self.access_order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MetadataCacheCoverage {
+    pub files_cached: usize,
+    pub row_groups_cached: usize,
+}
+
+static ICEBERG_TABLE_METADATA_CACHE: LazyLock<Mutex<IcebergTableMetadataCache>> =
+    LazyLock::new(|| {
+        Mutex::new(IcebergTableMetadataCache::new(
+            ICEBERG_TABLE_METADATA_CACHE_MAX_ENTRIES,
+        ))
+    });
+
 fn get_cached_parquet_row_group_stats(file_path: &str) -> Option<Vec<IcebergRowGroupStats>> {
-    PARQUET_ROW_GROUP_STATS_CACHE
-        .lock()
-        .unwrap()
-        .get(file_path)
+    PARQUET_ROW_GROUP_STATS_CACHE.lock().unwrap().get(file_path)
 }
 
 fn cache_parquet_row_group_stats(file_path: &str, row_groups: &[IcebergRowGroupStats]) {
@@ -135,6 +256,20 @@ fn cache_parquet_row_group_stats(file_path: &str, row_groups: &[IcebergRowGroupS
         .lock()
         .unwrap()
         .insert(file_path, row_groups.to_vec());
+}
+
+pub(crate) fn cached_parquet_row_group_stats_coverage(
+    file_paths: &[String],
+) -> MetadataCacheCoverage {
+    let cache = PARQUET_ROW_GROUP_STATS_CACHE.lock().unwrap();
+    let mut coverage = MetadataCacheCoverage::default();
+    for file_path in file_paths {
+        if let Some(row_group_count) = cache.cached_row_group_count(file_path) {
+            coverage.files_cached += 1;
+            coverage.row_groups_cached += row_group_count;
+        }
+    }
+    coverage
 }
 
 fn invalidate_parquet_row_group_stats(file_path: &str) {
@@ -148,6 +283,185 @@ fn clear_parquet_row_group_stats_cache() {
     PARQUET_ROW_GROUP_STATS_CACHE.lock().unwrap().clear();
 }
 
+fn get_cached_iceberg_table_metadata(
+    namespace: &str,
+    name: &str,
+    snapshot_id: i64,
+) -> Option<IcebergLibMetadata> {
+    ICEBERG_TABLE_METADATA_CACHE
+        .lock()
+        .unwrap()
+        .get(&iceberg_table_key(namespace, name), snapshot_id)
+}
+
+fn cache_iceberg_table_metadata(namespace: &str, name: &str, metadata: &IcebergLibMetadata) {
+    let mut cached = metadata.clone();
+    cached.compactions.clear();
+    ICEBERG_TABLE_METADATA_CACHE
+        .lock()
+        .unwrap()
+        .insert(&iceberg_table_key(namespace, name), cached);
+}
+
+pub(crate) fn iceberg_table_metadata_cache_contains(
+    namespace: &str,
+    name: &str,
+    snapshot_id: i64,
+) -> bool {
+    ICEBERG_TABLE_METADATA_CACHE
+        .lock()
+        .unwrap()
+        .contains(&iceberg_table_key(namespace, name), snapshot_id)
+}
+
+fn invalidate_iceberg_table_metadata(namespace: &str, name: &str) {
+    ICEBERG_TABLE_METADATA_CACHE
+        .lock()
+        .unwrap()
+        .remove(&iceberg_table_key(namespace, name));
+}
+
+fn invalidate_iceberg_namespace_table_metadata(namespace: &str) {
+    ICEBERG_TABLE_METADATA_CACHE
+        .lock()
+        .unwrap()
+        .remove_namespace(namespace);
+}
+
+fn invalidate_iceberg_table_metadata_for_file(file_path: &str) {
+    ICEBERG_TABLE_METADATA_CACHE
+        .lock()
+        .unwrap()
+        .invalidate_file(file_path);
+}
+
+fn clear_iceberg_table_metadata_cache() {
+    ICEBERG_TABLE_METADATA_CACHE.lock().unwrap().clear();
+}
+
+#[cfg(test)]
+pub(crate) fn prime_parquet_row_group_stats_cache_for_test(
+    file_path: &str,
+    row_groups: &[IcebergRowGroupStats],
+) {
+    cache_parquet_row_group_stats(file_path, row_groups);
+}
+
+#[cfg(test)]
+pub(crate) fn reset_serving_metadata_caches_for_test() {
+    clear_parquet_row_group_stats_cache();
+    clear_iceberg_table_metadata_cache();
+    clear_iceberg_table_row_group_stats_tracker();
+}
+
+#[derive(Default)]
+struct IcebergTableRowGroupStatsTracker {
+    files_by_table: HashMap<String, HashSet<String>>,
+}
+
+impl IcebergTableRowGroupStatsTracker {
+    fn replace_files(&mut self, table_key: &str, current_files: HashSet<String>) -> Vec<String> {
+        let previous_files = self
+            .files_by_table
+            .insert(table_key.to_string(), current_files.clone())
+            .unwrap_or_default();
+        previous_files
+            .into_iter()
+            .filter(|file_path| !current_files.contains(file_path))
+            .collect()
+    }
+
+    fn remove_table(&mut self, table_key: &str) -> Vec<String> {
+        self.files_by_table
+            .remove(table_key)
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    }
+
+    fn remove_namespace(&mut self, namespace: &str) -> Vec<String> {
+        let namespace_prefix = format!("{}/", namespace);
+        let table_keys = self
+            .files_by_table
+            .keys()
+            .filter(|table_key| table_key.starts_with(&namespace_prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut removed_files = vec![];
+        for table_key in table_keys {
+            removed_files.extend(self.remove_table(&table_key));
+        }
+        removed_files
+    }
+
+    fn remove_file(&mut self, file_path: &str) {
+        self.files_by_table.retain(|_, files| {
+            files.remove(file_path);
+            !files.is_empty()
+        });
+    }
+
+    fn clear(&mut self) {
+        self.files_by_table.clear();
+    }
+}
+
+static ICEBERG_TABLE_ROW_GROUP_STATS_TRACKER: LazyLock<Mutex<IcebergTableRowGroupStatsTracker>> =
+    LazyLock::new(|| Mutex::new(IcebergTableRowGroupStatsTracker::default()));
+
+fn iceberg_table_key(namespace: &str, name: &str) -> String {
+    format!("{}/{}", namespace, name)
+}
+
+fn reconcile_iceberg_table_row_group_stats(
+    namespace: &str,
+    name: &str,
+    current_files: &HashSet<String>,
+) {
+    let removed_files = ICEBERG_TABLE_ROW_GROUP_STATS_TRACKER
+        .lock()
+        .unwrap()
+        .replace_files(&iceberg_table_key(namespace, name), current_files.clone());
+    for removed_file in removed_files {
+        invalidate_parquet_row_group_stats(&removed_file);
+    }
+}
+
+fn clear_iceberg_table_row_group_stats(namespace: &str, name: &str) {
+    let removed_files = ICEBERG_TABLE_ROW_GROUP_STATS_TRACKER
+        .lock()
+        .unwrap()
+        .remove_table(&iceberg_table_key(namespace, name));
+    for removed_file in removed_files {
+        invalidate_parquet_row_group_stats(&removed_file);
+    }
+}
+
+fn clear_iceberg_namespace_row_group_stats(namespace: &str) {
+    let removed_files = ICEBERG_TABLE_ROW_GROUP_STATS_TRACKER
+        .lock()
+        .unwrap()
+        .remove_namespace(namespace);
+    for removed_file in removed_files {
+        invalidate_parquet_row_group_stats(&removed_file);
+    }
+}
+
+fn remove_file_from_iceberg_table_row_group_stats(file_path: &str) {
+    ICEBERG_TABLE_ROW_GROUP_STATS_TRACKER
+        .lock()
+        .unwrap()
+        .remove_file(file_path);
+    invalidate_parquet_row_group_stats(file_path);
+}
+
+fn clear_iceberg_table_row_group_stats_tracker() {
+    ICEBERG_TABLE_ROW_GROUP_STATS_TRACKER
+        .lock()
+        .unwrap()
+        .clear();
+}
+
 #[derive(Clone)]
 struct PendingIcebergFileStats {
     file_path: String,
@@ -157,7 +471,11 @@ struct PendingIcebergFileStats {
 
 fn iceberg_row_group_stats_load_parallelism() -> usize {
     std::thread::available_parallelism()
-        .map(|parallelism| parallelism.get().clamp(4, ICEBERG_ROW_GROUP_STATS_LOAD_PARALLELISM_MAX))
+        .map(|parallelism| {
+            parallelism
+                .get()
+                .clamp(4, ICEBERG_ROW_GROUP_STATS_LOAD_PARALLELISM_MAX)
+        })
         .unwrap_or(8)
 }
 
@@ -563,6 +881,8 @@ impl CacheTrackerActor {
                 self.lru_cache.clear();
                 self.top_level_to_delete.clear();
                 clear_parquet_row_group_stats_cache();
+                clear_iceberg_table_metadata_cache();
+                clear_iceberg_table_row_group_stats_tracker();
                 let _ = respond_to.send(());
             }
             CacheTrackerActorMessage::Reserve {
@@ -807,7 +1127,8 @@ impl CacheTrackerActor {
                         Ok(_) => (),
                         Err(e) => panic!("Failed to delete file {}: {}", file_path, e),
                     }
-                    invalidate_parquet_row_group_stats(&file_path);
+                    remove_file_from_iceberg_table_row_group_stats(&file_path);
+                    invalidate_iceberg_table_metadata_for_file(&file_path);
                 }
                 respond_to.send(()).expect("Failed to send response");
             }
@@ -1669,7 +1990,12 @@ async fn drop_iceberg_table_worker(
         name: name.clone(),
     };
 
-    catalog.drop_table(&table_ident).await
+    let result = catalog.drop_table(&table_ident).await;
+    if result.is_ok() {
+        invalidate_iceberg_table_metadata(namespace, name);
+        clear_iceberg_table_row_group_stats(namespace, name);
+    }
+    result
 }
 
 pub async fn drop_all_iceberg_tables(namespace: &String) -> Result<(), iceberg::Error> {
@@ -1688,6 +2014,8 @@ async fn drop_all_iceberg_tables_worker(
     for table_ident in all_tables.iter() {
         catalog.drop_table(table_ident).await?
     }
+    invalidate_iceberg_namespace_table_metadata(namespace);
+    clear_iceberg_namespace_row_group_stats(namespace);
     Ok(())
 }
 
@@ -1752,6 +2080,42 @@ pub async fn load_iceberg_table_metadata(
         .await
 }
 
+fn collect_iceberg_compactions(
+    table: &Table,
+    last_snapshot_id: i64,
+) -> Result<Vec<String>, iceberg::Error> {
+    let snapshot_log = Vec::from_iter(table.metadata().history());
+    let mut compactions = vec![];
+    for snapshot_info in snapshot_log.iter().rev() {
+        let snapshot = match table.metadata().snapshot_by_id(snapshot_info.snapshot_id) {
+            Some(snapshot) => snapshot,
+            None => {
+                tracing::info!(
+                    "Unable to find iceberg snapshot {}",
+                    snapshot_info.snapshot_id
+                );
+                return Err(iceberg::Error::new(
+                    iceberg::ErrorKind::DataInvalid,
+                    format!(
+                        "Unable to find iceberg snapshot {}",
+                        snapshot_info.snapshot_id
+                    ),
+                ));
+            }
+        };
+
+        if snapshot_info.snapshot_id == last_snapshot_id {
+            break;
+        }
+
+        if let Some(compaction_id) = snapshot.summary().additional_properties.get("compaction") {
+            compactions.push(compaction_id.clone());
+        }
+    }
+
+    Ok(compactions)
+}
+
 async fn load_iceberg_table_metadata_worker(
     catalog: Arc<RestCatalog>,
     namespace: &String,
@@ -1775,36 +2139,7 @@ async fn load_iceberg_table_metadata_worker(
         }
     };
 
-    let snapshot_log = Vec::from_iter(table.metadata().history());
-    let mut compactions = vec![];
-    for snapshot_info in snapshot_log.iter().rev() {
-        let snapshot = match table.metadata().snapshot_by_id(snapshot_info.snapshot_id) {
-            Some(s) => s,
-            None => {
-                tracing::info!(
-                    "Unable to find iceberg snapshot {}",
-                    snapshot_info.snapshot_id
-                );
-                return Err(iceberg::Error::new(
-                    iceberg::ErrorKind::DataInvalid,
-                    format!(
-                        "Unable to find iceberg snapshot {}",
-                        snapshot_info.snapshot_id
-                    ),
-                ));
-            }
-        };
-
-        if snapshot_info.snapshot_id == last_snapshot_id {
-            break;
-        }
-
-        let summary = snapshot.summary();
-        match summary.additional_properties.get("compaction") {
-            Some(c) => compactions.push(c.clone()),
-            None => (),
-        };
-    }
+    let compactions = collect_iceberg_compactions(&table, last_snapshot_id)?;
 
     let current_snapshot = match table.metadata().current_snapshot() {
         Some(c) => c,
@@ -1815,7 +2150,20 @@ async fn load_iceberg_table_metadata_worker(
             ));
         }
     };
+
+    if let Some(mut metadata) =
+        get_cached_iceberg_table_metadata(namespace, name, current_snapshot.snapshot_id())
+    {
+        metadata.compactions = compactions;
+        return Ok(metadata);
+    }
+
     let file_stats = load_iceberg_file_stats(&table, current_snapshot).await?;
+    let current_files = file_stats
+        .iter()
+        .map(|stats| stats.file_path.clone())
+        .collect::<HashSet<_>>();
+    reconcile_iceberg_table_row_group_stats(namespace, name, &current_files);
 
     let table_scan = match table.scan().select_all().build() {
         Ok(s) => s,
@@ -1858,17 +2206,22 @@ async fn load_iceberg_table_metadata_worker(
         Err(e) => return Err(e),
     };
 
-    Ok(IcebergLibMetadata {
+    let metadata = IcebergLibMetadata {
         snapshot_id: current_snapshot.snapshot_id(),
         table_schema: table.metadata().current_schema().clone(),
         files: files,
         sizes: sizes,
         schemas: schemas,
-        compactions: compactions,
+        compactions: vec![],
         column_names: vec![],
         column_stats: vec![],
         file_stats,
-    })
+    };
+    cache_iceberg_table_metadata(namespace, name, &metadata);
+
+    let mut response = metadata.clone();
+    response.compactions = compactions;
+    Ok(response)
 }
 
 async fn load_iceberg_file_stats(
@@ -1903,36 +2256,36 @@ async fn load_iceberg_file_stats(
     }
 
     let concurrency = iceberg_row_group_stats_load_parallelism();
-    let mut file_stats = stream::iter(pending_file_stats.into_iter().map(|pending| {
-        let current_schema = current_schema.clone();
-        async move {
-            let row_groups =
-                match load_parquet_row_group_stats(table, &pending.file_path, &current_schema)
-                    .await
-                {
-                    Ok(row_groups) => row_groups,
-                    Err(error) => {
-                        tracing::warn!(
-                            "Unable to load parquet row-group stats for {}: {}",
-                            pending.file_path,
-                            error
-                        );
-                        vec![]
-                    }
-                };
+    let mut file_stats =
+        stream::iter(pending_file_stats.into_iter().map(|pending| {
+            let current_schema = current_schema.clone();
+            async move {
+                let row_groups =
+                    match load_parquet_row_group_stats(table, &pending.file_path, &current_schema)
+                        .await
+                    {
+                        Ok(row_groups) => row_groups,
+                        Err(error) => {
+                            tracing::warn!(
+                                "Unable to load parquet row-group stats for {}: {}",
+                                pending.file_path,
+                                error
+                            );
+                            vec![]
+                        }
+                    };
 
-            IcebergFileStats {
-                file_path: pending.file_path,
-                record_count: pending.record_count,
-                columns: pending.columns,
-                row_groups,
+                IcebergFileStats {
+                    file_path: pending.file_path,
+                    record_count: pending.record_count,
+                    columns: pending.columns,
+                    row_groups,
+                }
             }
-        }
-    }))
-    .buffer_unordered(concurrency)
-    .collect::<Vec<_>>()
-    .await;
-
+        }))
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
     file_stats.sort_by(|left, right| left.file_path.cmp(&right.file_path));
     Ok(file_stats)
 }
@@ -2218,9 +2571,15 @@ pub(crate) fn s3_ingest_base_path() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::ParquetRowGroupStatsCache;
+    use super::{
+        IcebergLibMetadata, IcebergTableMetadataCache, IcebergTableRowGroupStatsTracker,
+        ParquetRowGroupStatsCache,
+    };
     use crate::data_contract::{IcebergColumnStats, IcebergRowGroupStats};
+    use iceberg::spec::Schema;
     use serde_json::Value;
+    use std::collections::HashSet;
+    use std::sync::Arc;
 
     fn sample_row_group_stats(index: usize) -> Vec<IcebergRowGroupStats> {
         vec![IcebergRowGroupStats {
@@ -2237,6 +2596,27 @@ mod tests {
                 upper_bound: Some(Value::from(index as i64 + 9)),
             }],
         }]
+    }
+
+    fn sample_iceberg_metadata(snapshot_id: i64, file_paths: &[&str]) -> IcebergLibMetadata {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![])
+                .build()
+                .unwrap(),
+        );
+        IcebergLibMetadata {
+            snapshot_id,
+            table_schema: schema.clone(),
+            files: file_paths.iter().map(|path| path.to_string()).collect(),
+            sizes: file_paths.iter().map(|_| 128).collect(),
+            schemas: file_paths.iter().map(|_| schema.clone()).collect(),
+            compactions: vec![],
+            column_names: vec![],
+            column_stats: vec![],
+            file_stats: vec![],
+        }
     }
 
     #[test]
@@ -2266,5 +2646,95 @@ mod tests {
 
         cache.clear();
         assert!(cache.get("s3://warehouse/b.parquet").is_none());
+    }
+
+    #[test]
+    fn iceberg_table_row_group_stats_tracker_reports_removed_files() {
+        let mut tracker = IcebergTableRowGroupStatsTracker::default();
+        let initial_files = HashSet::from([
+            "s3://warehouse/a.parquet".to_string(),
+            "s3://warehouse/b.parquet".to_string(),
+        ]);
+        let next_files = HashSet::from([
+            "s3://warehouse/b.parquet".to_string(),
+            "s3://warehouse/c.parquet".to_string(),
+        ]);
+
+        let first_removed = tracker.replace_files("default/logs", initial_files);
+        assert!(first_removed.is_empty());
+
+        let removed = tracker.replace_files("default/logs", next_files);
+        assert_eq!(removed, vec!["s3://warehouse/a.parquet".to_string()]);
+    }
+
+    #[test]
+    fn iceberg_table_row_group_stats_tracker_remove_namespace_clears_all_tables() {
+        let mut tracker = IcebergTableRowGroupStatsTracker::default();
+        tracker.replace_files(
+            "default/logs",
+            HashSet::from(["s3://warehouse/a.parquet".to_string()]),
+        );
+        tracker.replace_files(
+            "default/metrics",
+            HashSet::from(["s3://warehouse/b.parquet".to_string()]),
+        );
+        tracker.replace_files(
+            "other/logs",
+            HashSet::from(["s3://warehouse/c.parquet".to_string()]),
+        );
+
+        let mut removed = tracker.remove_namespace("default");
+        removed.sort();
+
+        assert_eq!(
+            removed,
+            vec![
+                "s3://warehouse/a.parquet".to_string(),
+                "s3://warehouse/b.parquet".to_string()
+            ]
+        );
+        assert_eq!(tracker.files_by_table.len(), 1);
+        assert!(tracker.files_by_table.contains_key("other/logs"));
+    }
+
+    #[test]
+    fn iceberg_table_metadata_cache_replaces_stale_snapshot_per_table() {
+        let mut cache = IcebergTableMetadataCache::new(2);
+        cache.insert(
+            "default/logs",
+            sample_iceberg_metadata(10, &["s3://warehouse/a.parquet"]),
+        );
+
+        assert!(cache.contains("default/logs", 10));
+        assert!(cache.get("default/logs", 11).is_none());
+
+        cache.insert(
+            "default/logs",
+            sample_iceberg_metadata(11, &["s3://warehouse/b.parquet"]),
+        );
+
+        assert!(!cache.contains("default/logs", 10));
+        assert_eq!(
+            cache.get("default/logs", 11).unwrap().files,
+            vec!["s3://warehouse/b.parquet".to_string()]
+        );
+    }
+
+    #[test]
+    fn iceberg_table_metadata_cache_invalidates_entries_by_file() {
+        let mut cache = IcebergTableMetadataCache::new(4);
+        cache.insert(
+            "default/logs",
+            sample_iceberg_metadata(10, &["s3://warehouse/a.parquet"]),
+        );
+        cache.insert(
+            "default/metrics",
+            sample_iceberg_metadata(11, &["s3://warehouse/b.parquet"]),
+        );
+
+        cache.invalidate_file("s3://warehouse/a.parquet");
+
+        assert!(cache.get("default/logs", 10).is_none());
+        assert!(cache.get("default/metrics", 11).is_some());
     }
 }

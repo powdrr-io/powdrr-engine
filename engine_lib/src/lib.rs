@@ -60,6 +60,8 @@ mod leaderless_state_provider;
 pub mod metadata_store;
 #[path = "../../main_lib/src/mongodb_protocol.rs"]
 mod mongodb_protocol;
+#[path = "../../main_lib/src/mongodb_wire_protocol.rs"]
+pub mod mongodb_wire_protocol;
 #[path = "../../main_lib/src/painless_parser.rs"]
 mod painless_parser;
 pub mod peers;

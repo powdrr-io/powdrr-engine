@@ -95,7 +95,7 @@ impl LookupById {
 
     async fn current_target_snapshots(&self) -> Vec<CheckpointDescriptor> {
         let checkpoint_id = STATE_PROVIDER
-            .get_latest_servable_checkpoint(&self.table)
+            .get_active_servable_checkpoint(&self.table)
             .await
             .unwrap();
         match checkpoint_id {
@@ -273,7 +273,7 @@ impl SqlCommand {
 
     async fn current_target_snapshots(&self) -> Vec<CheckpointDescriptor> {
         let checkpoint_id = match STATE_PROVIDER
-            .get_latest_servable_checkpoint(&self.table)
+            .get_active_servable_checkpoint(&self.table)
             .await
         {
             Ok(c) => match c {

@@ -3,11 +3,11 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
 
-use futures::stream::{self, StreamExt};
 use futures::FutureExt;
+use futures::stream::{self, StreamExt};
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{body, Body};
+use gotham::hyper::{Body, body};
 use gotham::mime;
 use gotham::state::{FromState, State};
 use http::StatusCode;
@@ -48,6 +48,12 @@ pub struct ServingQueryResponse {
     pub row_groups_selected: usize,
     pub estimated_bytes: u64,
     #[serde(default)]
+    pub metadata_snapshot_cached: bool,
+    #[serde(default)]
+    pub metadata_files_cached: usize,
+    #[serde(default)]
+    pub metadata_row_groups_cached: usize,
+    #[serde(default)]
     pub sql: Option<String>,
     #[serde(default)]
     pub rows: Vec<Value>,
@@ -67,6 +73,7 @@ struct ServingExecutionContext {
     files: Vec<FileDescriptor>,
     file_stats: HashMap<String, IcebergFileStats>,
     snapshot_id: Option<String>,
+    metadata_snapshot_cached: bool,
 }
 
 struct ServingPlan {
@@ -81,6 +88,9 @@ struct ServingPlan {
     row_groups_considered: usize,
     row_groups_selected: usize,
     estimated_bytes: u64,
+    metadata_snapshot_cached: bool,
+    metadata_files_cached: usize,
+    metadata_row_groups_cached: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -96,6 +106,8 @@ struct PrunedFileSelection {
     row_groups_considered: usize,
     row_groups_selected: usize,
     estimated_bytes: u64,
+    metadata_files_cached: usize,
+    metadata_row_groups_cached: usize,
 }
 
 pub fn get_serving_config(state: State) -> Pin<Box<HandlerFuture>> {
@@ -260,6 +272,9 @@ pub async fn execute_serving_query(
             row_groups_considered: 0,
             row_groups_selected: 0,
             estimated_bytes: 0,
+            metadata_snapshot_cached: context.metadata_snapshot_cached,
+            metadata_files_cached: 0,
+            metadata_row_groups_cached: 0,
             sql: None,
             rows: vec![],
         });
@@ -278,6 +293,9 @@ pub async fn execute_serving_query(
             row_groups_considered: plan.row_groups_considered,
             row_groups_selected: plan.row_groups_selected,
             estimated_bytes: plan.estimated_bytes,
+            metadata_snapshot_cached: plan.metadata_snapshot_cached,
+            metadata_files_cached: plan.metadata_files_cached,
+            metadata_row_groups_cached: plan.metadata_row_groups_cached,
             sql: Some(plan.sql),
             rows: vec![],
         });
@@ -295,6 +313,9 @@ pub async fn execute_serving_query(
             row_groups_considered: plan.row_groups_considered,
             row_groups_selected: plan.row_groups_selected,
             estimated_bytes: plan.estimated_bytes,
+            metadata_snapshot_cached: plan.metadata_snapshot_cached,
+            metadata_files_cached: plan.metadata_files_cached,
+            metadata_row_groups_cached: plan.metadata_row_groups_cached,
             sql: Some(plan.sql),
             rows: vec![],
         });
@@ -314,6 +335,9 @@ pub async fn execute_serving_query(
             row_groups_considered: plan.row_groups_considered,
             row_groups_selected: plan.row_groups_selected,
             estimated_bytes: plan.estimated_bytes,
+            metadata_snapshot_cached: plan.metadata_snapshot_cached,
+            metadata_files_cached: plan.metadata_files_cached,
+            metadata_row_groups_cached: plan.metadata_row_groups_cached,
             sql: Some(plan.sql),
             rows: vec![],
         });
@@ -342,6 +366,9 @@ pub async fn execute_serving_query(
         row_groups_considered: plan.row_groups_considered,
         row_groups_selected: plan.row_groups_selected,
         estimated_bytes: plan.estimated_bytes,
+        metadata_snapshot_cached: plan.metadata_snapshot_cached,
+        metadata_files_cached: plan.metadata_files_cached,
+        metadata_row_groups_cached: plan.metadata_row_groups_cached,
         sql: Some(plan.sql),
         rows,
     })
@@ -367,7 +394,7 @@ async fn load_serving_context(
     };
 
     let checkpoint_id = match STATE_PROVIDER
-        .get_latest_servable_checkpoint(&description.name)
+        .get_active_servable_checkpoint(&description.name)
         .await
     {
         Ok(Some(checkpoint_id)) => checkpoint_id,
@@ -424,6 +451,14 @@ async fn load_serving_context(
         .cloned()
         .map(|stats| (stats.file_path.clone(), stats))
         .collect();
+    let metadata_snapshot_cached = iceberg_metadata
+        .snapshot_id
+        .as_ref()
+        .and_then(|snapshot_id| snapshot_id.parse::<i64>().ok())
+        .map(|snapshot_id| {
+            data_access::iceberg_table_metadata_cache_contains("default", table_name, snapshot_id)
+        })
+        .unwrap_or(false);
     Ok(ServingExecutionContext {
         description,
         schema: iceberg_metadata.table_schema.clone(),
@@ -431,6 +466,7 @@ async fn load_serving_context(
         checkpoint,
         files,
         file_stats,
+        metadata_snapshot_cached,
     })
 }
 
@@ -455,6 +491,9 @@ fn plan_request(
             row_groups_considered: 0,
             row_groups_selected: 0,
             estimated_bytes: 0,
+            metadata_snapshot_cached: context.metadata_snapshot_cached,
+            metadata_files_cached: 0,
+            metadata_row_groups_cached: 0,
         });
     }
 
@@ -477,6 +516,9 @@ fn plan_request(
             row_groups_considered: pruned.row_groups_considered,
             row_groups_selected: pruned.row_groups_selected,
             estimated_bytes: pruned.estimated_bytes,
+            metadata_snapshot_cached: context.metadata_snapshot_cached,
+            metadata_files_cached: pruned.metadata_files_cached,
+            metadata_row_groups_cached: pruned.metadata_row_groups_cached,
         });
     }
 
@@ -492,6 +534,9 @@ fn plan_request(
         row_groups_considered: pruned.row_groups_considered,
         row_groups_selected: pruned.row_groups_selected,
         estimated_bytes: pruned.estimated_bytes,
+        metadata_snapshot_cached: context.metadata_snapshot_cached,
+        metadata_files_cached: pruned.metadata_files_cached,
+        metadata_row_groups_cached: pruned.metadata_row_groups_cached,
     })
 }
 
@@ -1052,6 +1097,7 @@ fn prune_candidate_files(
         let Some(stats) = file_stats.get(&file.file_path) else {
             pruned.estimated_bytes += file.size;
             pruned.files_selected += 1;
+            record_metadata_cache_coverage(&mut pruned, &file.file_path);
             pruned.selected_files.push(file);
             continue;
         };
@@ -1060,6 +1106,7 @@ fn prune_candidate_files(
             if file_may_match_request(stats, request) {
                 pruned.estimated_bytes += file.size;
                 pruned.files_selected += 1;
+                record_metadata_cache_coverage(&mut pruned, &file.file_path);
                 pruned.selected_files.push(file);
             }
             continue;
@@ -1081,10 +1128,17 @@ fn prune_candidate_files(
             .iter()
             .map(|row_group| row_group.compressed_bytes)
             .sum::<u64>();
+        record_metadata_cache_coverage(&mut pruned, &file.file_path);
         pruned.selected_files.push(file);
     }
 
     pruned
+}
+
+fn record_metadata_cache_coverage(pruned: &mut PrunedFileSelection, file_path: &str) {
+    let coverage = data_access::cached_parquet_row_group_stats_coverage(&[file_path.to_string()]);
+    pruned.metadata_files_cached += coverage.files_cached;
+    pruned.metadata_row_groups_cached += coverage.row_groups_cached;
 }
 
 fn file_may_match_request(file_stats: &IcebergFileStats, request: &ServingRequestPlan) -> bool {
@@ -1414,9 +1468,12 @@ impl ServingQueryError {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_sql, file_group_table_name, group_files_by_schema, ordered_file_groups_for_top_k,
-        plan_request, prune_candidate_files, remaining_groups_cannot_beat_kth_row,
-        request_matches_pattern, ServingExecutionContext,
+        ServingExecutionContext, build_sql, file_group_table_name, group_files_by_schema,
+        ordered_file_groups_for_top_k, plan_request, prune_candidate_files,
+        remaining_groups_cannot_beat_kth_row, request_matches_pattern,
+    };
+    use crate::data_access::{
+        prime_parquet_row_group_stats_cache_for_test, reset_serving_metadata_caches_for_test,
     };
     use crate::data_contract::{
         FileDescriptor, IcebergColumnStats, IcebergFileStats, IcebergRowGroupStats, ServingPattern,
@@ -1499,6 +1556,7 @@ mod tests {
                 .map(|stats| (stats.file_path.clone(), stats))
                 .collect(),
             snapshot_id: Some("snapshot_1".to_string()),
+            metadata_snapshot_cached: false,
         }
     }
 
@@ -1778,6 +1836,85 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["file://second.parquet"]
         );
+    }
+
+    #[test]
+    fn test_plan_request_reports_cached_row_group_metadata_coverage() {
+        reset_serving_metadata_caches_for_test();
+
+        let cached_row_groups = vec![row_group_stats(
+            0,
+            Some(10),
+            25,
+            vec![column_stats(
+                "tenant",
+                Some(0),
+                Some(json!("acme")),
+                Some(json!("acme")),
+            )],
+        )];
+        prime_parquet_row_group_stats_cache_for_test("file://first.parquet", &cached_row_groups);
+
+        let mut first = file_stats(
+            "file://first.parquet",
+            Some(10),
+            vec![column_stats(
+                "tenant",
+                Some(0),
+                Some(json!("acme")),
+                Some(json!("acme")),
+            )],
+        );
+        first.row_groups = cached_row_groups;
+        let context = test_context(
+            ServingTableConfig {
+                patterns: vec![ServingPattern {
+                    name: "tenant_lookup".to_string(),
+                    eq_fields: vec!["tenant".to_string()],
+                    range_field: None,
+                    order_field: None,
+                    descending: false,
+                    max_limit: Some(25),
+                    projection: None,
+                }],
+            },
+            vec![
+                first,
+                file_stats(
+                    "file://second.parquet",
+                    Some(10),
+                    vec![column_stats(
+                        "tenant",
+                        Some(0),
+                        Some(json!("omega")),
+                        Some(json!("omega")),
+                    )],
+                ),
+            ],
+        );
+        let request = ServingRequestPlan {
+            select: None,
+            filters: vec![ServingPredicate {
+                field: "tenant".to_string(),
+                eq: Some(json!("acme")),
+                in_values: None,
+                gt: None,
+                gte: None,
+                lt: None,
+                lte: None,
+            }],
+            order_by: vec![],
+            limit: Some(10),
+            allow_slow_path: false,
+            explain: false,
+        };
+
+        let plan = plan_request(&context, &request).unwrap();
+
+        assert_eq!(plan.metadata_files_cached, 1);
+        assert_eq!(plan.metadata_row_groups_cached, 1);
+
+        reset_serving_metadata_caches_for_test();
     }
 
     #[test]

@@ -26,6 +26,7 @@ use crate::state_provider::STATE_PROVIDER;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::future::try_join_all;
+use serde_json::Value;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -126,6 +127,19 @@ pub(crate) struct CountCommandResult {
     pub num_shards: u32,
 }
 
+struct TypedSearchSourceResults {
+    peer_results: Vec<crate::peers::PrivateSearchResult>,
+    num_shards: u32,
+}
+
+pub(crate) fn typed_sort_projection_name(field: &str) -> String {
+    let normalized = field
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>();
+    format!("__powdrr_sort_{normalized}")
+}
+
 impl SearchCommand {
     #[allow(dead_code)]
     pub(crate) fn execution_plan(&self) -> &SearchExecutionPlan {
@@ -163,12 +177,17 @@ impl SearchCommand {
     async fn private_search_invocation(&self) -> Option<PrivateSearchInvocation> {
         let legacy_command = self.legacy_sql_command()?;
         let checkpoints = self.current_target_snapshots(legacy_command).await;
+        let size = if self.logical_plan.search_after.is_some() {
+            usize::MAX
+        } else {
+            self.execution_plan.merge.from as usize + self.execution_plan.merge.size
+        };
         Some(PrivateSearchInvocation {
             sql: legacy_command.sql.clone(),
             required_extensions: legacy_command.required_extensions(),
             checkpoints,
             table: legacy_command.table.clone(),
-            size: self.execution_plan.merge.from as usize + self.execution_plan.merge.size,
+            size,
             calculate_score: legacy_command.calculate_score,
             aggregations: self.typed_aggregation_specs.clone().unwrap_or_default(),
             sorts: self.typed_sort_specs.clone(),
@@ -180,7 +199,7 @@ impl SearchCommand {
         legacy_command: &SqlCommand,
     ) -> Vec<CheckpointDescriptor> {
         match STATE_PROVIDER
-            .get_latest_servable_checkpoint(&legacy_command.table)
+            .get_active_servable_checkpoint(&legacy_command.table)
             .await
         {
             Ok(Some(checkpoint_id)) => {
@@ -217,6 +236,10 @@ fn typed_node_merge_reason(result_order: SearchResultOrder) -> String {
 }
 
 fn legacy_sql_fanout_reason(command: &SearchCommand) -> String {
+    if command.logical_plan.search_after.is_some() {
+        return "Queries using `search_after` currently require the typed sorted path.".to_string();
+    }
+
     if let Some(reason) = command
         .logical_plan
         .aggregations
@@ -358,29 +381,81 @@ pub(crate) async fn execute_search_command(
     context: CommandContext,
     command: Arc<SearchCommand>,
 ) -> ElasticSearchResponse {
-    let result_order = match command.execution_strategy {
-        SearchExecutionStrategy::LegacySqlFanout => return execute_command(context, command).await,
+    match command.execution_strategy {
+        SearchExecutionStrategy::LegacySqlFanout => execute_command(context, command).await,
+        SearchExecutionStrategy::TypedNodeMerge(_) => {
+            execute_multi_target_search_commands(context, vec![command]).await
+        }
+    }
+}
+
+pub(crate) async fn execute_multi_target_search_commands(
+    context: CommandContext,
+    commands: Vec<Arc<SearchCommand>>,
+) -> ElasticSearchResponse {
+    let Some(first_command) = commands.first().cloned() else {
+        return QueryResults::empty(50, 0, None, true).to_response();
+    };
+
+    let result_order = match first_command.execution_strategy {
+        SearchExecutionStrategy::LegacySqlFanout => {
+            if commands.len() > 1 {
+                return QueryFailure {
+                    message:
+                        "Multi-target query requires a legacy merge path that is not yet supported"
+                            .to_string(),
+                }
+                .to_response();
+            }
+            return execute_command(context, first_command).await;
+        }
         SearchExecutionStrategy::TypedNodeMerge(result_order) => result_order,
     };
 
+    if commands
+        .iter()
+        .any(|command| command.execution_strategy != first_command.execution_strategy)
+    {
+        return QueryFailure {
+            message: "Multi-target query mix requires the legacy path and is not yet supported"
+                .to_string(),
+        }
+        .to_response();
+    }
+
+    let command_results = match try_join_all(
+        commands
+            .iter()
+            .cloned()
+            .map(execute_typed_search_source_results),
+    )
+    .await
+    {
+        Ok(results) => results,
+        Err(response) => return response,
+    };
+
+    build_typed_search_response(&first_command, &command_results, result_order)
+}
+
+async fn execute_typed_search_source_results(
+    command: Arc<SearchCommand>,
+) -> Result<TypedSearchSourceResults, ElasticSearchResponse> {
     let invocation = match command.private_search_invocation().await {
         Some(invocation) => invocation,
-        None => return execute_command(context, command).await,
+        None => {
+            return Err(QueryFailure {
+                message: "Typed search invocation is not available for this command".to_string(),
+            }
+            .to_response());
+        }
     };
 
     if invocation.checkpoints.is_empty() {
-        let total_hits_complex = command
-            .legacy_sql_command()
-            .map(|legacy| !legacy.query_params.rest_total_hits_as_int.unwrap_or(false))
-            .unwrap_or(true);
-        let aggregations = command.typed_aggregation_specs.as_ref().and_then(|specs| {
-            if specs.is_empty() {
-                None
-            } else {
-                Some(merge_typed_aggregation_partials(vec![], specs))
-            }
+        return Ok(TypedSearchSourceResults {
+            peer_results: vec![],
+            num_shards: 1,
         });
-        return QueryResults::empty(50, 1, aggregations, total_hits_complex).to_response();
     }
 
     let peer_clients = STATE_PROVIDER.get_peer_clients().await;
@@ -392,22 +467,44 @@ pub(crate) async fn execute_search_command(
     let peer_results = match try_join_all(peer_calls).await {
         Ok(results) => results,
         Err(e) => {
-            return QueryFailure {
+            return Err(QueryFailure {
                 message: format!("{:?}", e),
             }
-            .to_response();
+            .to_response());
         }
     };
 
-    let total_hits: usize = peer_results.iter().map(|result| result.total_hits).sum();
-    let aggregation_partials = peer_results
+    Ok(TypedSearchSourceResults {
+        peer_results,
+        num_shards: num_peers as u32,
+    })
+}
+
+fn build_typed_search_response(
+    command: &SearchCommand,
+    command_results: &[TypedSearchSourceResults],
+    result_order: SearchResultOrder,
+) -> ElasticSearchResponse {
+    let total_num_shards = command_results
         .iter()
+        .map(|result| result.num_shards)
+        .sum::<u32>();
+    let total_hits: usize = command_results
+        .iter()
+        .flat_map(|result| result.peer_results.iter())
+        .map(|result| result.total_hits)
+        .sum();
+    let aggregation_partials = command_results
+        .iter()
+        .flat_map(|result| result.peer_results.iter())
         .map(|result| result.aggregations.clone())
         .collect::<Vec<_>>();
-    let mut hits = peer_results
-        .into_iter()
-        .flat_map(|result| result.hits.into_iter())
+    let mut hits = command_results
+        .iter()
+        .flat_map(|result| result.peer_results.iter())
+        .flat_map(|result| result.hits.clone().into_iter())
         .collect::<Vec<_>>();
+
     match result_order {
         SearchResultOrder::ScoreDesc => hits.sort_by(compare_query_result_hits_desc),
         SearchResultOrder::ExplicitSort => hits.sort_by(|left, right| {
@@ -415,6 +512,16 @@ pub(crate) async fn execute_search_command(
         }),
         SearchResultOrder::PeerConcat => {}
     }
+
+    let hits = match apply_search_after(
+        hits,
+        command.logical_plan.search_after.as_deref(),
+        result_order,
+        &command.typed_sort_specs,
+    ) {
+        Ok(hits) => hits,
+        Err(message) => return QueryFailure { message }.to_response(),
+    };
 
     let from = command.execution_plan.merge.from as usize;
     let size = command.execution_plan.merge.size;
@@ -435,13 +542,13 @@ pub(crate) async fn execute_search_command(
     });
 
     if total_hits == 0 {
-        return QueryResults::empty(50, num_peers as u32, aggregations, total_hits_complex)
+        return QueryResults::empty(50, total_num_shards, aggregations, total_hits_complex)
             .to_response();
     }
 
     QueryResults::success(
         50,
-        num_peers as u32,
+        total_num_shards,
         total_hits,
         match result_order {
             SearchResultOrder::ScoreDesc => paged_hits.first().and_then(|hit| hit._score),
@@ -537,6 +644,8 @@ pub(crate) fn search_plan_to_command_with_options(
         typed_sort_specs.as_ref(),
     );
 
+    validate_search_after(&plan, query, typed_sort_specs.as_ref(), execution_strategy)?;
+
     Ok(SearchCommand {
         logical_plan: plan,
         execution_plan,
@@ -545,6 +654,58 @@ pub(crate) fn search_plan_to_command_with_options(
         typed_sort_specs: typed_sort_specs.unwrap_or_default(),
         backend: SearchBackend::LegacySql(backend),
     })
+}
+
+fn validate_search_after(
+    plan: &search_plan::SearchPlan,
+    query: &QueryStringSearch,
+    typed_sort_specs: Option<&Vec<PrivateSearchSortSpec>>,
+    execution_strategy: SearchExecutionStrategy,
+) -> Result<(), ParseError> {
+    let Some(search_after) = plan.search_after.as_ref() else {
+        return Ok(());
+    };
+
+    if plan.from != 0 {
+        return Err(ParseError {
+            message: "`search_after` does not support `from`".to_string(),
+        });
+    }
+
+    if query.sort.is_some() {
+        return Err(ParseError {
+            message: "`search_after` requires request-body sort, not query-string sort".to_string(),
+        });
+    }
+
+    let Some(typed_sort_specs) = typed_sort_specs else {
+        return Err(ParseError {
+            message: "`search_after` requires an explicit supported sort".to_string(),
+        });
+    };
+
+    if typed_sort_specs.is_empty() || plan.sort.is_empty() {
+        return Err(ParseError {
+            message: "`search_after` requires an explicit sort".to_string(),
+        });
+    }
+
+    if search_after.len() != typed_sort_specs.len() {
+        return Err(ParseError {
+            message: "`search_after` must include one value per sort field".to_string(),
+        });
+    }
+
+    if !matches!(
+        execution_strategy,
+        SearchExecutionStrategy::TypedNodeMerge(SearchResultOrder::ExplicitSort)
+    ) {
+        return Err(ParseError {
+            message: "`search_after` is only supported on typed sorted searches".to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 fn choose_execution_strategy(
@@ -766,6 +927,51 @@ fn compare_sort_values(left: &serde_json::Value, right: &serde_json::Value) -> s
     }
 }
 
+fn compare_hit_to_search_after(
+    hit: &crate::elastic_search_responses::QueryResultHit,
+    search_after: &[Value],
+    sorts: &[PrivateSearchSortSpec],
+) -> std::cmp::Ordering {
+    let hit_values = hit.sort.as_deref().unwrap_or(&[]);
+    for (index, sort) in sorts.iter().enumerate() {
+        let hit_value = hit_values.get(index).unwrap_or(&serde_json::Value::Null);
+        let search_after_value = search_after.get(index).unwrap_or(&serde_json::Value::Null);
+        let ordering = compare_sort_values(hit_value, search_after_value);
+        let ordering = if sort.descending {
+            ordering.reverse()
+        } else {
+            ordering
+        };
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+
+    std::cmp::Ordering::Equal
+}
+
+fn apply_search_after(
+    hits: Vec<crate::elastic_search_responses::QueryResultHit>,
+    search_after: Option<&[Value]>,
+    result_order: SearchResultOrder,
+    sorts: &[PrivateSearchSortSpec],
+) -> Result<Vec<crate::elastic_search_responses::QueryResultHit>, String> {
+    let Some(search_after) = search_after else {
+        return Ok(hits);
+    };
+
+    if !matches!(result_order, SearchResultOrder::ExplicitSort) {
+        return Err("`search_after` requires explicit sort".to_string());
+    }
+
+    Ok(hits
+        .into_iter()
+        .filter(|hit| {
+            compare_hit_to_search_after(hit, search_after, sorts) == std::cmp::Ordering::Greater
+        })
+        .collect())
+}
+
 fn typed_aggregation_partial_name(partial: &PrivateSearchAggregationPartial) -> &str {
     match partial {
         PrivateSearchAggregationPartial::Terms { name, .. } => name.as_str(),
@@ -891,6 +1097,8 @@ fn compile_legacy_sql_command(
         apply_query_plan(&mut builder, query_plan)?;
     }
 
+    append_sort_projection_fields(&mut builder, &plan.sort);
+
     let table_name = match &plan.target {
         search_plan::SearchTarget::Table(table_name) => table_name,
         search_plan::SearchTarget::Pit(pit) => &pit.id,
@@ -905,6 +1113,38 @@ fn compile_legacy_sql_command(
         aggs,
         query_params: query.clone(),
     })
+}
+
+fn append_sort_projection_fields(builder: &mut SqlBuilder, sorts: &[search_plan::SortPlan]) {
+    for sort in sorts {
+        let field = match sort {
+            search_plan::SortPlan::Bare(field) => field,
+            search_plan::SortPlan::Field { field, script, .. } => {
+                if script.is_some() {
+                    continue;
+                }
+                field
+            }
+        };
+
+        if field == "_score" {
+            continue;
+        }
+
+        let projection_name = typed_sort_projection_name(field);
+        if builder
+            .fields
+            .iter()
+            .any(|expr| expr.name == projection_name)
+        {
+            continue;
+        }
+
+        builder.fields.push(FieldExpression {
+            name: projection_name,
+            expression: SqlExpression::FieldRef("t".to_string(), field.clone()),
+        });
+    }
 }
 
 fn create_execution_plan(
@@ -951,6 +1191,9 @@ pub(crate) fn update_by_query_plan_to_command(
             query_params: QueryStringSearch {
                 allow_partial_search_results: None,
                 sort: None,
+                ignore_unavailable: None,
+                allow_no_indices: None,
+                expand_wildcards: None,
                 rest_total_hits_as_int: None,
             },
         },
@@ -969,6 +1212,7 @@ fn script_plan_to_script_block(plan: &search_plan::ScriptPlan) -> ScriptBlock {
 #[cfg(test)]
 mod tests {
     use super::SearchCommand;
+    use crate::elastic_search_common::ParseError;
     use crate::elastic_search_endpoints::QueryStringSearch;
     use crate::elastic_search_parser;
     use crate::peers::PrivateSearchSortSpec;
@@ -979,6 +1223,14 @@ mod tests {
 
     fn parse_search_command_with_query(body: &str, query: QueryStringSearch) -> SearchCommand {
         elastic_search_parser::parse(Some("logs".to_string()), &body.to_string(), &query).unwrap()
+    }
+
+    fn parse_search_command_result(body: &str) -> Result<SearchCommand, ParseError> {
+        elastic_search_parser::parse(
+            Some("logs".to_string()),
+            &body.to_string(),
+            &QueryStringSearch::new(),
+        )
     }
 
     #[test]
@@ -1039,6 +1291,36 @@ mod tests {
   "query": {
     "term": {
       "index_col": 2
+    }
+  }
+}"#,
+        );
+
+        assert!(command.supports_typed_node_merge());
+    }
+
+    #[test]
+    fn test_terms_query_uses_typed_node_merge_path() {
+        let command = parse_search_command(
+            r#"{
+  "query": {
+    "terms": {
+      "index_col": [2, 5]
+    }
+  }
+}"#,
+        );
+
+        assert!(command.supports_typed_node_merge());
+    }
+
+    #[test]
+    fn test_ids_query_uses_typed_node_merge_path() {
+        let command = parse_search_command(
+            r#"{
+  "query": {
+    "ids": {
+      "values": ["2", "5"]
     }
   }
 }"#,
@@ -1115,6 +1397,42 @@ mod tests {
     }
 
     #[test]
+    fn test_search_after_requires_explicit_sort() {
+        let error = parse_search_command_result(
+            r#"{
+  "search_after": [2]
+}"#,
+        )
+        .err()
+        .unwrap();
+
+        assert_eq!(error.message, "`search_after` requires an explicit sort");
+    }
+
+    #[test]
+    fn test_search_after_requires_matching_sort_arity() {
+        let error = parse_search_command_result(
+            r#"{
+  "search_after": [2, 3],
+  "sort": [
+    {
+      "index_col": {
+        "order": "asc"
+      }
+    }
+  ]
+}"#,
+        )
+        .err()
+        .unwrap();
+
+        assert_eq!(
+            error.message,
+            "`search_after` must include one value per sort field"
+        );
+    }
+
+    #[test]
     fn test_unsupported_aggregation_stays_on_legacy_path() {
         let command = parse_search_command(
             r#"{
@@ -1169,6 +1487,9 @@ mod tests {
             QueryStringSearch {
                 allow_partial_search_results: None,
                 sort: Some("index_col:asc".to_string()),
+                ignore_unavailable: None,
+                allow_no_indices: None,
+                expand_wildcards: None,
                 rest_total_hits_as_int: None,
             },
         );

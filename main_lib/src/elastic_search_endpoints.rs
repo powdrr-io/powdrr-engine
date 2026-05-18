@@ -21,10 +21,9 @@ use crate::{
     data_access,
     data_contract::{AliasInfo, CreateIndexBody, PropertyInfo, TableDescription},
     elastic_search_cluster_info,
-    elastic_search_commands::LookupById,
     elastic_search_common::{execute_command, CommandContext},
     elastic_search_ingest, elastic_search_parser, elastic_search_pipeline,
-    elastic_search_responses::QueryResultShards,
+    elastic_search_responses::{QueryResultShards, QueryResults},
     search_executor,
     search_runtime::df_to_serde_value,
     state_provider::STATE_PROVIDER,
@@ -388,11 +387,46 @@ fn requests_all(parts: &[String]) -> bool {
     parts.is_empty() || parts.iter().any(|part| part == "*" || part == "_all")
 }
 
+fn wildcard_matches(pattern: &str, value: &str) -> bool {
+    let pattern_chars = pattern.chars().collect::<Vec<_>>();
+    let value_chars = value.chars().collect::<Vec<_>>();
+    let mut pattern_index = 0usize;
+    let mut value_index = 0usize;
+    let mut last_star_index = None;
+    let mut last_match_index = 0usize;
+
+    while value_index < value_chars.len() {
+        if pattern_index < pattern_chars.len()
+            && (pattern_chars[pattern_index] == '?'
+                || pattern_chars[pattern_index] == value_chars[value_index])
+        {
+            pattern_index += 1;
+            value_index += 1;
+        } else if pattern_index < pattern_chars.len() && pattern_chars[pattern_index] == '*' {
+            last_star_index = Some(pattern_index);
+            pattern_index += 1;
+            last_match_index = value_index;
+        } else if let Some(star_index) = last_star_index {
+            pattern_index = star_index + 1;
+            last_match_index += 1;
+            value_index = last_match_index;
+        } else {
+            return false;
+        }
+    }
+
+    while pattern_index < pattern_chars.len() && pattern_chars[pattern_index] == '*' {
+        pattern_index += 1;
+    }
+
+    pattern_index == pattern_chars.len()
+}
+
 fn matches_requested_value(value: &str, requested: &[String]) -> bool {
     requests_all(requested)
         || requested
             .iter()
-            .any(|requested_value| requested_value == value)
+            .any(|requested_value| wildcard_matches(requested_value, value))
 }
 
 async fn all_table_descriptions(
@@ -413,19 +447,104 @@ async fn all_table_descriptions(
 async fn requested_table_descriptions(
     requested_indices: &[String],
 ) -> Result<Vec<TableDescription>, crate::state_provider::ServiceApiError> {
-    if requests_all(requested_indices) {
-        return all_table_descriptions().await;
-    }
+    let all_descriptions = all_table_descriptions().await?;
+    let resolved_names =
+        resolved_target_names_from_descriptions(requested_indices, &all_descriptions);
+    Ok(all_descriptions
+        .into_iter()
+        .filter(|table_desc| resolved_names.contains(&table_desc.name))
+        .collect())
+}
 
-    let mut table_descriptions = Vec::new();
+fn matching_target_names(
+    requested_value: &str,
+    table_descriptions: &[TableDescription],
+) -> Vec<String> {
+    let mut matches = table_descriptions
+        .iter()
+        .filter(|table_desc| wildcard_matches(requested_value, &table_desc.name))
+        .map(|table_desc| table_desc.name.clone())
+        .collect::<Vec<_>>();
 
-    for table_name in requested_indices {
-        if let Some(table_desc) = STATE_PROVIDER.describe_table(table_name).await? {
-            table_descriptions.push(table_desc);
+    for table_desc in table_descriptions {
+        let body = parse_index_body(table_desc);
+        if alias_names(&body)
+            .iter()
+            .any(|alias_name| wildcard_matches(requested_value, alias_name))
+        {
+            matches.push(table_desc.name.clone());
         }
     }
 
-    Ok(table_descriptions)
+    matches.sort();
+    matches.dedup();
+    matches
+}
+
+fn resolved_target_names_from_descriptions(
+    requested_indices: &[String],
+    table_descriptions: &[TableDescription],
+) -> Vec<String> {
+    if requests_all(requested_indices) {
+        let mut all_names = table_descriptions
+            .iter()
+            .map(|table_desc| table_desc.name.clone())
+            .collect::<Vec<_>>();
+        all_names.sort();
+        all_names.dedup();
+        return all_names;
+    }
+
+    let mut resolved = requested_indices
+        .iter()
+        .flat_map(|requested_value| matching_target_names(requested_value, table_descriptions))
+        .collect::<Vec<_>>();
+    resolved.sort();
+    resolved.dedup();
+    resolved
+}
+
+async fn resolve_read_target_names(
+    requested_indices: &[String],
+    query_string: &QueryStringSearch,
+) -> Result<Vec<String>, (StatusCode, String)> {
+    let table_descriptions = all_table_descriptions()
+        .await
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.message))?;
+    let mut resolved = Vec::new();
+    let mut unresolved = Vec::new();
+
+    if requests_all(requested_indices) {
+        resolved = resolved_target_names_from_descriptions(requested_indices, &table_descriptions);
+    } else {
+        for requested_value in requested_indices {
+            let matches = matching_target_names(requested_value, &table_descriptions);
+            if matches.is_empty() {
+                unresolved.push(requested_value.clone());
+            } else {
+                resolved.extend(matches);
+            }
+        }
+        resolved.sort();
+        resolved.dedup();
+    }
+
+    let ignore_unavailable = query_string.ignore_unavailable.unwrap_or(false);
+    let allow_no_indices = query_string.allow_no_indices.unwrap_or(false);
+
+    if !unresolved.is_empty() && !ignore_unavailable && !allow_no_indices {
+        return Err((StatusCode::NOT_FOUND, "Index does not exist".to_string()));
+    }
+
+    if resolved.is_empty()
+        && !requests_all(requested_indices)
+        && !allow_no_indices
+        && !ignore_unavailable
+    {
+        return Err((StatusCode::NOT_FOUND, "Index does not exist".to_string()));
+    }
+
+    Ok(resolved)
 }
 
 fn invalid_request_response(
@@ -436,26 +555,43 @@ fn invalid_request_response(
     create_response(state, status, mime::TEXT_PLAIN, message.to_string())
 }
 
-async fn resolve_search_target_name(
+async fn resolve_single_read_target_name(
     target: Option<&str>,
-) -> Result<Option<String>, crate::state_provider::ServiceApiError> {
+    query_string: &QueryStringSearch,
+) -> Result<Option<String>, (StatusCode, String)> {
     let Some(target) = target.map(str::trim).filter(|target| !target.is_empty()) else {
         return Ok(None);
     };
 
     let requested = requested_parts(target);
-    if requests_all(&requested) {
+    let resolved = resolve_read_target_names(&requested, query_string).await?;
+    if resolved.len() != 1 {
         return Ok(None);
     }
 
-    if requested.len() != 1 {
+    Ok(resolved.into_iter().next())
+}
+
+async fn resolve_document_target_name(
+    target: &str,
+) -> Result<Option<String>, (StatusCode, String)> {
+    let requested = requested_parts(target);
+    if requested.is_empty() {
         return Ok(None);
     }
 
-    Ok(STATE_PROVIDER
-        .describe_table(&requested[0])
-        .await?
-        .map(|table_desc| table_desc.name))
+    let table_descriptions = all_table_descriptions()
+        .await
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.message))?;
+    let resolved = resolved_target_names_from_descriptions(&requested, &table_descriptions);
+    match resolved.as_slice() {
+        [] => Ok(None),
+        [target] => Ok(Some(target.clone())),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "Index expression must resolve to exactly one index".to_string(),
+        )),
+    }
 }
 
 async fn execute_search_response(
@@ -479,22 +615,35 @@ async fn execute_search_response_for_target_expr(
     body_content: &str,
     query_string: &QueryStringSearch,
 ) -> Result<crate::elastic_search_common::ElasticSearchResponse, (StatusCode, String)> {
-    let target = match resolve_search_target_name(target_expr)
-        .await
-        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.message))?
-    {
-        Some(target) => Some(target),
-        None if target_expr.is_some() => {
-            let requested = requested_parts(target_expr.unwrap_or_default());
-            if !requested.is_empty() && !requests_all(&requested) {
-                return Err((StatusCode::NOT_FOUND, "Index does not exist".to_string()));
-            }
-            None
-        }
-        None => None,
+    let Some(target_expr) = target_expr else {
+        return execute_search_response(None, body_content, query_string).await;
     };
 
-    execute_search_response(target, body_content, query_string).await
+    let requested = requested_parts(target_expr);
+    let resolved = resolve_read_target_names(&requested, query_string).await?;
+    match resolved.as_slice() {
+        [] => {
+            let total_hits_complex = !query_string.rest_total_hits_as_int.unwrap_or(false);
+            Ok(QueryResults::empty(0, 0, None, total_hits_complex).to_response())
+        }
+        [target] => execute_search_response(Some(target.clone()), body_content, query_string).await,
+        _ => {
+            let normalized_body = normalize_search_body(body_content);
+            let commands = resolved
+                .into_iter()
+                .map(|target| {
+                    elastic_search_parser::parse(Some(target), &normalized_body, query_string)
+                        .map(Arc::new)
+                        .map_err(|_| (StatusCode::BAD_REQUEST, "Bad request".to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(
+                search_executor::execute_multi_target_search_commands(CommandContext {}, commands)
+                    .await,
+            )
+        }
+    }
 }
 
 async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, String> {
@@ -512,7 +661,7 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
     };
 
     let checkpoint_id = STATE_PROVIDER
-        .get_latest_servable_checkpoint(&table_desc.name)
+        .get_active_servable_checkpoint(&table_desc.name)
         .await
         .map_err(|e| e.message)?;
     let Some(checkpoint_id) = checkpoint_id else {
@@ -539,6 +688,7 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
     };
 
     let mut local_tables = Vec::new();
+    let mut delete_local_tables = Vec::new();
 
     if let Some(iceberg_metadata) = checkpoint.iceberg_metadata {
         for file_descriptor in iceberg_metadata.files.as_file_tuples() {
@@ -570,6 +720,28 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
         }
     }
 
+    if let Some(deletes_metadata) = checkpoint.deletes_metadata {
+        let delete_schema = crate::schema_massager::PowdrrSchema::from(&vec![
+            crate::schema_massager::PowdrrField {
+                name: "_id_seq_no".to_string(),
+                data_type: crate::schema_massager::PowdrrDataType::String,
+            },
+        ]);
+
+        for delete_file_path in deletes_metadata.files {
+            let local_name = format!("mget_delete_{}", IdInstance::next_id());
+            data_access::load_file_as_table(
+                &local_name,
+                &delete_file_path,
+                false,
+                Some(delete_schema.to_arrow_schema()),
+            )
+            .await
+            .map_err(|e| e.message().to_string())?;
+            delete_local_tables.push(local_name);
+        }
+    }
+
     if local_tables.is_empty() {
         return Ok(json!({
             "_index": table_desc.name,
@@ -584,8 +756,12 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
         .map(|table_name| format!("SELECT * FROM {table_name}"))
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
-    let lookup_sql =
-        format!("SELECT * FROM ({union_sql}) AS docs WHERE _id = '{escaped_doc_id}' LIMIT 1");
+    let deletes_table_name = create_document_lookup_deletes_table(&delete_local_tables).await?;
+    let lookup_sql = format!(
+        "SELECT docs.* FROM ({union_sql}) AS docs \
+         LEFT JOIN {deletes_table_name} dt ON dt._id_seq_no = docs._id_seq_no \
+         WHERE docs._id = '{escaped_doc_id}' AND dt._id_seq_no IS NULL LIMIT 1"
+    );
     let lookup_df = data_access::execute_sql(&lookup_sql)
         .await
         .map_err(|e| e.message().to_string())?;
@@ -596,6 +772,10 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
     for table_name in &local_tables {
         data_access::drop(table_name).await;
     }
+    for table_name in &delete_local_tables {
+        data_access::drop(table_name).await;
+    }
+    data_access::drop(&deletes_table_name).await;
 
     let Some(value) = serde_result.values.first() else {
         return Ok(json!({
@@ -613,6 +793,25 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
         ),
     )
     .map_err(|e| e.to_string())
+}
+
+async fn create_document_lookup_deletes_table(local_names: &[String]) -> Result<String, String> {
+    let table_name = format!("mget_all_deletes_{}", IdInstance::next_id());
+    let ddl_stmt = if local_names.is_empty() {
+        "select null as _id_seq_no".to_string()
+    } else {
+        let union_selects = local_names
+            .iter()
+            .map(|table_name| format!("select * from {table_name}"))
+            .collect::<Vec<_>>()
+            .join(" union all ");
+        format!("select * from ({union_selects})")
+    };
+
+    data_access::create_table(&table_name, &ddl_stmt)
+        .await
+        .map_err(|e| e.message().to_string())?;
+    Ok(table_name)
 }
 
 fn parse_msearch_lines(body_content: &str) -> Result<Vec<(String, String)>, ()> {
@@ -877,20 +1076,18 @@ pub fn es_get_index(state: State) -> Pin<Box<HandlerFuture>> {
     async {
         let path_extractor = NamePathExtractor::borrow_from(&state);
         let mut response = Map::new();
-
-        for table_name in path_extractor.name.to_string().split(",") {
-            let table_desc = match STATE_PROVIDER.describe_table(&table_name.to_string()).await {
-                Ok(td) => td,
-                Err(e) => {
-                    let res = log_service_err(e).generate_response(&state);
-                    return Ok((state, res));
-                }
-            };
-
-            if let Some(table_desc) = table_desc {
-                let body = parse_index_body(&table_desc);
-                response.insert(table_desc.name.clone(), index_info_value(&body));
+        let requested_indices = requested_parts(&path_extractor.name);
+        let table_descriptions = match requested_table_descriptions(&requested_indices).await {
+            Ok(table_descriptions) => table_descriptions,
+            Err(e) => {
+                let res = log_service_err(e).generate_response(&state);
+                return Ok((state, res));
             }
+        };
+
+        for table_desc in table_descriptions {
+            let body = parse_index_body(&table_desc);
+            response.insert(table_desc.name.clone(), index_info_value(&body));
         }
 
         if response.is_empty() {
@@ -913,23 +1110,19 @@ pub fn es_head_index(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_get_index");
     async {
         let path_extractor = NamePathExtractor::borrow_from(&state);
-
-        for table_name in path_extractor.name.to_string().split(",") {
-            let table_desc = match STATE_PROVIDER.describe_table(&table_name.to_string()).await {
-                Ok(td) => td,
-                Err(e) => {
-                    let res = log_service_err(e).generate_response(&state);
-                    return Ok((state, res));
-                }
-            };
-            let res = if table_desc.is_none() {
-                create_empty_response(&state, StatusCode::NOT_FOUND)
-            } else {
-                create_empty_response(&state, StatusCode::OK)
-            };
-            return Ok((state, res));
-        }
-        let res = create_empty_response(&state, StatusCode::NOT_FOUND);
+        let requested_indices = requested_parts(&path_extractor.name);
+        let table_descriptions = match requested_table_descriptions(&requested_indices).await {
+            Ok(table_descriptions) => table_descriptions,
+            Err(e) => {
+                let res = log_service_err(e).generate_response(&state);
+                return Ok((state, res));
+            }
+        };
+        let res = if table_descriptions.is_empty() {
+            create_empty_response(&state, StatusCode::NOT_FOUND)
+        } else {
+            create_empty_response(&state, StatusCode::OK)
+        };
         Ok((state, res))
     }
     .boxed()
@@ -1079,23 +1272,21 @@ pub fn es_get_index_settings(state: State) -> Pin<Box<HandlerFuture>> {
     async {
         let path_extractor = NamePathExtractor::borrow_from(&state);
         let mut response = Map::new();
-
-        for table_name in path_extractor.name.to_string().split(",") {
-            let table_desc = match STATE_PROVIDER.describe_table(&table_name.to_string()).await {
-                Ok(td) => td,
-                Err(e) => {
-                    let res = log_service_err(e).generate_response(&state);
-                    return Ok((state, res));
-                }
-            };
-
-            if let Some(table_desc) = table_desc {
-                let body = parse_index_body(&table_desc);
-                response.insert(
-                    table_desc.name.clone(),
-                    json!({ "settings": settings_value(&body) }),
-                );
+        let requested_indices = requested_parts(&path_extractor.name);
+        let table_descriptions = match requested_table_descriptions(&requested_indices).await {
+            Ok(table_descriptions) => table_descriptions,
+            Err(e) => {
+                let res = log_service_err(e).generate_response(&state);
+                return Ok((state, res));
             }
+        };
+
+        for table_desc in table_descriptions {
+            let body = parse_index_body(&table_desc);
+            response.insert(
+                table_desc.name.clone(),
+                json!({ "settings": settings_value(&body) }),
+            );
         }
 
         if response.is_empty() {
@@ -1119,23 +1310,21 @@ pub fn es_get_index_mapping(state: State) -> Pin<Box<HandlerFuture>> {
     async {
         let path_extractor = NamePathExtractor::borrow_from(&state);
         let mut response = Map::new();
-
-        for table_name in path_extractor.name.to_string().split(",") {
-            let table_desc = match STATE_PROVIDER.describe_table(&table_name.to_string()).await {
-                Ok(td) => td,
-                Err(e) => {
-                    let res = log_service_err(e).generate_response(&state);
-                    return Ok((state, res));
-                }
-            };
-
-            if let Some(table_desc) = table_desc {
-                let body = parse_index_body(&table_desc);
-                response.insert(
-                    table_desc.name.clone(),
-                    json!({ "mappings": mappings_value(&body) }),
-                );
+        let requested_indices = requested_parts(&path_extractor.name);
+        let table_descriptions = match requested_table_descriptions(&requested_indices).await {
+            Ok(table_descriptions) => table_descriptions,
+            Err(e) => {
+                let res = log_service_err(e).generate_response(&state);
+                return Ok((state, res));
             }
+        };
+
+        for table_desc in table_descriptions {
+            let body = parse_index_body(&table_desc);
+            response.insert(
+                table_desc.name.clone(),
+                json!({ "mappings": mappings_value(&body) }),
+            );
         }
 
         if response.is_empty() {
@@ -1418,21 +1607,104 @@ pub fn es_get_with_id(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_get_with_id");
     async {
         let path_extractor = NameIdPathExtractor::borrow_from(&state);
-        let index_name = path_extractor.name.to_string();
+        let requested_index = path_extractor.name.to_string();
         let doc_id = path_extractor.id.to_string();
+        let index_name = match resolve_single_read_target_name(
+            Some(&requested_index),
+            &QueryStringSearch::new(),
+        )
+        .await
+        {
+            Ok(Some(index_name)) => index_name,
+            Ok(None) => {
+                let res = create_empty_response(&state, StatusCode::NOT_FOUND);
+                return Ok((state, res));
+            }
+            Err((status, message)) => {
+                let res = invalid_request_response(&state, status, &message);
+                return Ok((state, res));
+            }
+        };
         let table_desc = match STATE_PROVIDER.describe_table(&index_name).await {
             Ok(td) => td,
             Err(e) => return Ok(log_service_err_response(e, state)),
         };
         match table_desc {
-            Some(td) => {
-                let command = LookupById::new(&td.name, &vec![doc_id]);
-                let response = execute_command(CommandContext {}, Arc::new(command)).await;
-                let res = response.generate_response(&state);
+            Some(_) => match lookup_document_value(&index_name, &doc_id).await {
+                Ok(doc) => {
+                    let found = doc
+                        .get("found")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(true);
+                    let status = if found {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::NOT_FOUND
+                    };
+                    let res = create_response(
+                        &state,
+                        status,
+                        MIME_ES_JSON.clone(),
+                        serde_json::to_string(&doc).unwrap(),
+                    );
+                    Ok((state, res))
+                }
+                Err(message) => {
+                    let res =
+                        invalid_request_response(&state, StatusCode::SERVICE_UNAVAILABLE, &message);
+                    Ok((state, res))
+                }
+            },
+            None => {
+                let res = create_empty_response(&state, StatusCode::NOT_FOUND);
                 Ok((state, res))
             }
-            None => {
-                panic!("Table not found");
+        }
+    }
+    .boxed()
+}
+
+pub fn es_head_with_id(state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_head_with_id");
+    async {
+        let path_extractor = NameIdPathExtractor::borrow_from(&state);
+        let requested_index = path_extractor.name.to_string();
+        let doc_id = path_extractor.id.to_string();
+        let index_name = match resolve_single_read_target_name(
+            Some(&requested_index),
+            &QueryStringSearch::new(),
+        )
+        .await
+        {
+            Ok(Some(index_name)) => index_name,
+            Ok(None) => {
+                let res = create_empty_response(&state, StatusCode::NOT_FOUND);
+                return Ok((state, res));
+            }
+            Err((status, message)) => {
+                let res = invalid_request_response(&state, status, &message);
+                return Ok((state, res));
+            }
+        };
+
+        match lookup_document_value(&index_name, &doc_id).await {
+            Ok(doc) => {
+                let found = doc
+                    .get("found")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true);
+                let status = if found {
+                    StatusCode::OK
+                } else {
+                    StatusCode::NOT_FOUND
+                };
+                let res = create_empty_response(&state, status);
+                Ok((state, res))
+            }
+            Err(message) => {
+                let res =
+                    invalid_request_response(&state, StatusCode::SERVICE_UNAVAILABLE, &message);
+                Ok((state, res))
             }
         }
     }
@@ -1731,6 +2003,10 @@ pub(crate) struct QueryStringSearch {
     pub allow_partial_search_results: Option<bool>,
     #[allow(dead_code)]
     pub sort: Option<String>,
+    pub ignore_unavailable: Option<bool>,
+    pub allow_no_indices: Option<bool>,
+    #[allow(dead_code)]
+    pub expand_wildcards: Option<String>,
     pub rest_total_hits_as_int: Option<bool>,
 }
 
@@ -1740,6 +2016,9 @@ impl QueryStringSearch {
         QueryStringSearch {
             allow_partial_search_results: None,
             sort: None,
+            ignore_unavailable: None,
+            allow_no_indices: None,
+            expand_wildcards: None,
             rest_total_hits_as_int: None,
         }
     }
@@ -1898,22 +2177,7 @@ pub fn es_count_table(mut state: State) -> Pin<Box<HandlerFuture>> {
     async {
         let path_extractor = NamePathExtractor::take_from(&mut state);
         let query_string = QueryStringSearch::take_from(&mut state);
-        let table = path_extractor.name.to_string();
-        let table_desc = match STATE_PROVIDER.describe_table(&table).await {
-            Ok(td) => match td {
-                Some(td) => td,
-                None => {
-                    let res = create_response(
-                        &state,
-                        StatusCode::BAD_REQUEST,
-                        mime::TEXT_PLAIN,
-                        "Bad request".to_string(),
-                    );
-                    return Ok((state, res));
-                }
-            },
-            Err(e) => return Ok(log_service_err_response(e, state)),
-        };
+        let requested_indices = requested_parts(&path_extractor.name);
         let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
             Ok(vb) => vb,
             Err(_) => panic!("Oh no"),
@@ -1931,35 +2195,48 @@ pub fn es_count_table(mut state: State) -> Pin<Box<HandlerFuture>> {
                 return Ok((state, res));
             }
         };
-        let command = match elastic_search_parser::parse(
-            Some(table_desc.name),
-            &search_body,
-            &query_string,
-        ) {
-            Ok(c) => c,
-            Err(_) => {
-                let res = create_response(
-                    &state,
-                    StatusCode::BAD_REQUEST,
-                    mime::TEXT_PLAIN,
-                    "Bad request".to_string(),
-                );
-                return Ok((state, res));
-            }
-        };
-        let count_result = match search_executor::execute_count_command(Arc::new(command)).await {
-            Ok(result) => result,
-            Err(response) => {
-                let res = response.generate_response(&state);
-                return Ok((state, res));
-            }
-        };
+        let resolved_targets =
+            match resolve_read_target_names(&requested_indices, &query_string).await {
+                Ok(targets) => targets,
+                Err((status, message)) => {
+                    let res = invalid_request_response(&state, status, &message);
+                    return Ok((state, res));
+                }
+            };
+
+        let mut total_hits = 0u64;
+        let mut total_shards = 0u32;
+        for target in resolved_targets {
+            let command =
+                match elastic_search_parser::parse(Some(target), &search_body, &query_string) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        let res = create_response(
+                            &state,
+                            StatusCode::BAD_REQUEST,
+                            mime::TEXT_PLAIN,
+                            "Bad request".to_string(),
+                        );
+                        return Ok((state, res));
+                    }
+                };
+            let count_result = match search_executor::execute_count_command(Arc::new(command)).await
+            {
+                Ok(result) => result,
+                Err(response) => {
+                    let res = response.generate_response(&state);
+                    return Ok((state, res));
+                }
+            };
+            total_hits += count_result.total_hits;
+            total_shards += count_result.num_shards;
+        }
 
         let count_response = CountResponse {
-            count: count_result.total_hits,
+            count: total_hits,
             _shards: QueryResultShards {
-                total: count_result.num_shards,
-                successful: count_result.num_shards,
+                total: total_shards,
+                successful: total_shards,
                 skipped: 0,
                 failed: 0,
             },
@@ -2230,7 +2507,23 @@ pub fn es_mget(mut state: State) -> Pin<Box<HandlerFuture>> {
                         invalid_request_response(&state, StatusCode::BAD_REQUEST, "Bad request");
                     return Ok((state, res));
                 };
-                match lookup_document_value(index_name, &request_doc.id).await {
+                let resolved_target = match resolve_document_target_name(index_name).await {
+                    Ok(Some(target)) => target,
+                    Ok(None) => {
+                        docs.push(json!({
+                            "_index": index_name,
+                            "_id": request_doc.id,
+                            "found": false,
+                        }));
+                        continue;
+                    }
+                    Err((status, message)) => {
+                        let res = invalid_request_response(&state, status, &message);
+                        return Ok((state, res));
+                    }
+                };
+
+                match lookup_document_value(&resolved_target, &request_doc.id).await {
                     Ok(doc) => docs.push(doc),
                     Err(message) => {
                         let res = invalid_request_response(
@@ -2263,22 +2556,24 @@ pub fn es_mget_table(mut state: State) -> Pin<Box<HandlerFuture>> {
     async {
         let path_extractor = NamePathExtractor::take_from(&mut state);
         let target_expr = path_extractor.name;
-        let target = match resolve_search_target_name(Some(&target_expr))
-            .await
-            .map_err(|e| e.message)
-        {
-            Ok(Some(target)) => target,
-            Ok(None) => {
-                let res =
-                    invalid_request_response(&state, StatusCode::NOT_FOUND, "Index does not exist");
-                return Ok((state, res));
-            }
-            Err(message) => {
-                let res =
-                    invalid_request_response(&state, StatusCode::SERVICE_UNAVAILABLE, &message);
-                return Ok((state, res));
-            }
-        };
+        let target =
+            match resolve_single_read_target_name(Some(&target_expr), &QueryStringSearch::new())
+                .await
+            {
+                Ok(Some(target)) => target,
+                Ok(None) => {
+                    let res = invalid_request_response(
+                        &state,
+                        StatusCode::BAD_REQUEST,
+                        "Index expression must resolve to exactly one index",
+                    );
+                    return Ok((state, res));
+                }
+                Err((status, message)) => {
+                    let res = invalid_request_response(&state, status, &message);
+                    return Ok((state, res));
+                }
+            };
 
         let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
             Ok(vb) => vb,
@@ -2316,7 +2611,22 @@ pub fn es_mget_table(mut state: State) -> Pin<Box<HandlerFuture>> {
         let mut docs = Vec::with_capacity(docs_to_lookup.len());
         for request_doc in docs_to_lookup {
             let index_name = request_doc.index.unwrap_or_else(|| target.clone());
-            match lookup_document_value(&index_name, &request_doc.id).await {
+            let resolved_target = match resolve_document_target_name(&index_name).await {
+                Ok(Some(target)) => target,
+                Ok(None) => {
+                    docs.push(json!({
+                        "_index": index_name,
+                        "_id": request_doc.id,
+                        "found": false,
+                    }));
+                    continue;
+                }
+                Err((status, message)) => {
+                    let res = invalid_request_response(&state, status, &message);
+                    return Ok((state, res));
+                }
+            };
+            match lookup_document_value(&resolved_target, &request_doc.id).await {
                 Ok(doc) => docs.push(doc),
                 Err(message) => {
                     let res =

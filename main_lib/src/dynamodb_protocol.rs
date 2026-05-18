@@ -799,7 +799,7 @@ async fn load_table_description(table_name: &str) -> Result<TableDescription, Dy
 
 async fn load_table_schema(table_name: &str) -> Result<PowdrrSchema, DynamoDbError> {
     let checkpoint_id = STATE_PROVIDER
-        .get_latest_servable_checkpoint(&table_name.to_string())
+        .get_active_servable_checkpoint(&table_name.to_string())
         .await
         .map_err(service_error)?
         .ok_or_else(|| {

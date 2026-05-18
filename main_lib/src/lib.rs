@@ -30,6 +30,7 @@ mod leaderless_state_provider;
 pub mod local_cli;
 pub mod metadata_store;
 mod mongodb_protocol;
+pub mod mongodb_wire_protocol;
 mod painless_parser;
 pub mod peers;
 pub mod pipeline;
