@@ -13,6 +13,7 @@ It has two jobs:
 The backing test artifacts are:
 
 - fixture corpus: `main_lib/tests/data/es_compat_cases.json`
+- route coverage manifest: `main_lib/tests/data/es_api_coverage_manifest.json`
 - local and differential harness: `main_lib/tests/es_compatibility_matrix.rs`
 
 ## How To Read This Matrix
@@ -25,7 +26,19 @@ The backing test artifacts are:
   Elasticsearch instance when `POWDRR_ES_COMPAT_URL` is set, and the harness
   compares the normalized assertion-defined result projection between Powdrr
   and Elasticsearch.
-- `Planned` means the behavior is in scope but not yet fixture-backed.
+- `Local Only Contract` means the fixture is intentionally pinned to the
+  current Powdrr behavior because the route is useful but not yet
+  Elasticsearch-identical.
+- `Unsupported Contract` means the route is intentionally present only to fail
+  with a checked, explicit error payload.
+
+The manifest file turns this into an enforceable surface contract:
+
+- every routed `es_*` handler in `main_lib/src/router.rs` must appear in the
+  manifest
+- every manifest entry must reference at least one fixture id
+- differential handlers may only reference `differential_enabled: true` cases
+- local-only and unsupported handlers may only reference local-only fixtures
 
 ## Automated Now
 
@@ -48,21 +61,36 @@ The backing test artifacts are:
 | Index metadata | `PUT /_aliases` allows subsequent search via alias name | `alias_update_allows_search_via_alias_name` | Yes | Yes | Covers alias routing even though `GET /_alias` is still stubbed |
 | Templates | `HEAD /_index_template/:name` returns `200` after create | `index_template_head_returns_200_after_create` | Yes | Yes | Captures template existence checks |
 | Templates | `GET /_index_template/:name` returns the stored body | `index_template_get_returns_stored_body` | Yes | No | Current local shape differs from Elasticsearch's wrapped response |
+| Probes | `GET /` and `HEAD /` return Elasticsearch-style probe responses | `root_get_returns_basic_server_info`, `root_head_returns_200` | Yes | Yes | Covers direct client product checks |
+| Cluster | `GET /_cluster/settings` and `GET /_cluster/health/:name` return compatibility payloads | `cluster_settings_include_defaults_returns_defaults`, `cluster_health_named_route_returns_green_status` | Yes | Yes | Also guards against regressions like the old `flat_settings` panic |
+| Metadata | index, alias, mapping, settings, resolve-index, and field-caps routes are fixture-backed | `head_index_returns_200_after_create` and related ids | Yes | Yes | The route manifest points each handler to its exact fixture ids |
+| Batch reads | `_mget` and `_msearch` are covered on both global and index-scoped routes | `table_mget_returns_found_and_missing_docs` and related ids | Yes | Yes | Keeps batched client read flows stable |
+| Document lifecycle | `HEAD /:index/_doc/:id` returns `200` for existing docs | `head_existing_doc_returns_200` | Yes | Yes | Complements existing GET and DELETE coverage |
+| Local-only admin | nodes, license, xpack, PIT, pipeline simulation, ILM, monitoring bulk | manifest-backed local-only fixtures | Yes | No | Useful for clients, but not yet frozen against real Elasticsearch |
+| Unsupported | scroll, search template, async search, cat APIs, GET pipeline, `_update/:id` | manifest-backed unsupported fixtures | Yes | No | Every such route must now fail with a clear checked error payload |
 | Aggregations | `terms` aggregation over string fields returns expected bucket keys and doc counts | `terms_aggregation_returns_expected_bucket_keys_and_counts` | Yes | No | Current local behavior depends on aggregating over analyzed text fields, which Elasticsearch rejects without exact-field mapping or fielddata |
 | Aggregations | `avg` plus filtered sub-aggregation returns expected metric values | `avg_and_filter_subaggregation_return_expected_values` | Yes | Yes | Uses exact alphanumeric string terms to avoid analyzed-text drift between Powdrr and Elasticsearch |
 
+## Surface Rules
+
+Every routed ES handler must fit one of three buckets:
+
+1. exact enough to run differentially against real Elasticsearch
+2. intentionally local-only, with the current response contract pinned
+3. intentionally unsupported, with a clear error payload
+
+If a new route lands without being added to the manifest and fixture corpus,
+the manifest coverage test fails.
+
 ## Planned Next
 
-| Area | Behavior | Status | Existing Source Reference | Notes |
-|---|---|---|---|---|
-| Index metadata | `GET /:name/_alias` response shape | Planned | `main_lib/src/elastic_search_endpoints.rs` | Endpoint currently returns `{}` and needs real compatibility work |
-| Templates | wrapped `GET /_index_template/:name` Elasticsearch response shape | Planned | `main_lib/src/elastic_search_endpoints.rs` | Local GET is intentionally tracked as current behavior, not full ES compatibility |
-| Templates | `_component_template` flows | Planned | `main_lib/src/router.rs` | Good next metadata-surface expansion |
-| Aggregations | `missing`, `cardinality`, `date_histogram`, and range-bucket responses | Planned | `main_lib/src/elastic_search_parser.rs` | Next aggregation slice after terms/filter/avg |
-| Search | multi-term `simple_query_string` semantics | Planned | `main_lib/src/elastic_search_parser.rs` | Current engine does not yet match Elasticsearch for richer query-string semantics |
-| Topology | multi-shard single-node search | Planned | `benchmark/src/main.rs` | Needed before engine swap |
-| Topology | node-local merge plus controller merge | Planned | New engine work | Migration-critical |
-| Performance | single-node ingest/query baseline | Planned | `benchmark/src/main.rs` | Baseline before replacing execution path |
+The next compatibility additions should focus on remaining differential drift:
+
+1. richer DSL: `terms`, `ids`, `multi_match`, and narrower `query_string`
+2. more aggregation parity: `missing`, `cardinality`, `date_histogram`, range buckets
+3. official client smoke tests for JS, Python, and Go
+4. broader multi-index differential coverage
+5. explicit unsupported contracts for any remaining ambiguous write/admin routes
 
 ## Differential Test Mode
 
