@@ -3,9 +3,12 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="$ROOT_DIR/tests/es_compat/docker-compose.yml"
+REUSE_EXISTING_STACK="${REUSE_EXISTING_STACK:-0}"
 
 cleanup() {
-  docker compose -f "$COMPOSE_FILE" down -v
+  if [[ "$REUSE_EXISTING_STACK" != "1" ]]; then
+    docker compose -f "$COMPOSE_FILE" down -v
+  fi
 }
 
 wait_for_http() {
@@ -37,7 +40,9 @@ wait_for_tcp() {
 
 trap cleanup EXIT
 
-docker compose -f "$COMPOSE_FILE" up -d
+if [[ "$REUSE_EXISTING_STACK" != "1" ]]; then
+  docker compose -f "$COMPOSE_FILE" up -d
+fi
 
 wait_for_tcp "127.0.0.1" "6379" "Redis"
 wait_for_http "http://localhost:9000/minio/health/live" "MinIO"

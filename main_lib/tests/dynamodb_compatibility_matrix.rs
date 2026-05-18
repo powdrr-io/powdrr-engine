@@ -1014,7 +1014,7 @@ async fn wait_for_powdrr_rows(
     sort_key_name: &str,
     rows: &[&EventRow],
 ) {
-    for _ in 0..20 {
+    for _ in 0..60 {
         let mut all_present = true;
         for row in rows {
             let key = serde_dynamo::aws_sdk_dynamodb_1::to_item(json!({
@@ -1041,7 +1041,7 @@ async fn wait_for_powdrr_rows(
         if all_present {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
     panic!(
         "Powdrr table {} did not become readable for sort key {} in time",
