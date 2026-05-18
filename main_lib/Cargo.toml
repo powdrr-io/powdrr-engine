@@ -81,3 +81,8 @@ required-features = ["integration-tests"]
 name = "dynamodb_sdk_compat"
 path = "tests/dynamodb_sdk_compat.rs"
 required-features = ["integration-tests"]
+
+[[test]]
+name = "elasticsearch_js_client_compat"
+path = "tests/elasticsearch_js_client_compat.rs"
+required-features = ["integration-tests"]

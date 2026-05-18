@@ -48,3 +48,5 @@ if [[ "${POWDRR_SKIP_FIXTURE_VALIDATION:-0}" != "1" ]]; then
 fi
 scripts/cargo-worktree.sh test -p powdrr_lib --features integration-tests --test es_compatibility_matrix compatibility_matrix_local_current_engine -- --nocapture
 POWDRR_ES_COMPAT_URL="http://localhost:9200" scripts/cargo-worktree.sh test -p powdrr_lib --features integration-tests --test es_compatibility_matrix compatibility_matrix_differential_when_external_es_is_configured -- --nocapture
+npm --prefix tests/es_js_client ci
+scripts/cargo-worktree.sh test -p powdrr_lib --features integration-tests --test elasticsearch_js_client_compat -- --nocapture
