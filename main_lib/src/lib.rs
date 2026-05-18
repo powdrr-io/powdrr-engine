@@ -28,6 +28,7 @@ mod expression_evaluator;
 pub mod lakehouse_serving;
 mod leaderless_state_provider;
 pub mod local_cli;
+pub mod metadata_store;
 mod mongodb_protocol;
 mod painless_parser;
 pub mod peers;

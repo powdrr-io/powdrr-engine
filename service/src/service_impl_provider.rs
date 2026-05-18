@@ -3,6 +3,7 @@ use std::fmt::{Display, Formatter};
 use powdrr_service_lib::data_contract::{CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody, LicenseType, OrgCreds, OrgInfo, OrgSettings, ServiceImplType, ServiceMode, TEST_ACCESS_KEY, TEST_SECRET_KEY};
 use powdrr_service_lib::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use powdrr_service_lib::ephemeral_service_impl::EphemeralServiceImpl;
+use powdrr_service_lib::metadata_store::MetadataStore;
 use powdrr_service_lib::pipeline::PipelineDefinition;
 use powdrr_service_lib::data_contract::{CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint};
 use powdrr_service_lib::peers::CheckpointDescriptor;
@@ -319,6 +320,15 @@ macro_rules! state_provider_func_impl {
     };
 }
 
+macro_rules! metadata_store_func_impl {
+    ($self:expr, $func:ident($($args:tt),*)) => {
+        match $self {
+            ServiceImpl::Ephemeral(eph) => MetadataStore::$func(eph, $($args),*).await.map_err(|e|ServiceImplError::from(e)),
+            ServiceImpl::DynamoDb(dynamo) => MetadataStore::$func(dynamo, $($args),*).await.map_err(|e|ServiceImplError::from(e)),
+        }
+    };
+}
+
 
 impl ServiceImpl {
     async fn add_checkpoint(&mut self, org_info: &OrgInfo, checkpoint: &TableMetadataCheckpoint) -> () {
@@ -391,27 +401,27 @@ impl ServiceImpl {
     }    
 
     pub async fn get_latest_committed_checkpoint(&mut self, org_info: &OrgInfo, table_name: &String, extensions: Option<String>) -> Result<Option<String>, ServiceImplError> {
-        state_provider_func_impl!(self, get_latest_committed_checkpoint(org_info, table_name, extensions))
+        metadata_store_func_impl!(self, get_latest_committed_checkpoint(org_info, table_name, extensions))
     }
 
     pub async fn get_checkpoint(&mut self, org_info: &OrgInfo, snapshot: &CheckpointDescriptor) -> Result<Option<TableMetadataCheckpoint>, ServiceImplError> {
-        state_provider_func_impl!(self, get_checkpoint(org_info, snapshot))
+        metadata_store_func_impl!(self, get_checkpoint(org_info, snapshot))
     }
 
     pub async fn get_extension_work_items(&mut self, org_info: &OrgInfo, extension_type: &String) -> Result<Vec<ExtensionWorkItem>, ServiceImplError> {
-        state_provider_func_impl!(self, get_extension_work_items(org_info, extension_type))
+        metadata_store_func_impl!(self, get_extension_work_items(org_info, extension_type))
     }
 
     pub async fn get_compaction_work_items(&mut self, org_info: &OrgInfo) -> Result<Vec<(String, CompactionWorkItem)>, ServiceImplError> {
-        state_provider_func_impl!(self, get_compaction_work_items(org_info))
+        metadata_store_func_impl!(self, get_compaction_work_items(org_info))
     }
 
     pub async fn get_cleanup_work_items(&mut self, org_info: &OrgInfo) -> Result<Vec<CleanupWorkItem>, ServiceImplError> {
-        state_provider_func_impl!(self, get_cleanup_work_items(org_info))
+        metadata_store_func_impl!(self, get_cleanup_work_items(org_info))
     }
 
     pub async fn update_all_checkpoints(&mut self) -> Result<bool, ServiceImplError> {
-        state_provider_func_impl!(self, update_all_checkpoints())
+        metadata_store_func_impl!(self, update_all_checkpoints())
     }
 
     pub async fn create_org(&mut self, settings: &OrgSettings) -> Result<(), ServiceImplError> {
