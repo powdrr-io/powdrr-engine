@@ -2,8 +2,6 @@ use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use gotham::mime;
 use gotham::plain::test::AsyncTestServer;
-use k8s_openapi::api::core::v1::Pod;
-use kube::Api;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Formatter};
@@ -27,7 +25,7 @@ pub struct FieldFileFilterDescriptor {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct FileFilterDescriptor {
-    pub able_name: String, // Field name to list of (operator, value)
+    pub able_name: String,
     pub filters: Vec<FieldFileFilterDescriptor>,
 }
 
@@ -270,8 +268,8 @@ pub(crate) struct RemotePeer {
 impl RemotePeer {
     #[allow(dead_code)]
     pub fn new(address: String) -> Self {
-        RemotePeer {
-            address: address,
+        Self {
+            address,
             client: reqwest::Client::new(),
         }
     }
@@ -298,21 +296,21 @@ impl PeerClient for RemotePeer {
             num,
         };
 
-        let resp = self
+        let response = self
             .client
             .post(format!("http://{}/_private/v1/_sql", self.address))
             .json(&invocation_obj)
             .send()
             .await;
 
-        match resp {
-            Ok(res) => {
-                assert!(res.status().is_success());
-                let body = res.bytes().await.unwrap();
+        match response {
+            Ok(response) => {
+                assert!(response.status().is_success());
+                let body = response.bytes().await.unwrap();
                 Ok(result_to_record_batch(serde_json::from_slice(&body).unwrap()).await)
             }
-            Err(e) => Err(PeerClientError {
-                message: format!("Error: {}", e),
+            Err(error) => Err(PeerClientError {
+                message: format!("Error: {}", error),
             }),
         }
     }
@@ -329,21 +327,21 @@ impl PeerClient for RemotePeer {
             num,
         };
 
-        let resp = self
+        let response = self
             .client
             .post(format!("http://{}/_private/v1/_search", self.address))
             .json(&invocation_obj)
             .send()
             .await;
 
-        match resp {
-            Ok(res) => {
-                assert!(res.status().is_success());
-                let body = res.bytes().await.unwrap();
+        match response {
+            Ok(response) => {
+                assert!(response.status().is_success());
+                let body = response.bytes().await.unwrap();
                 Ok(serde_json::from_slice(&body).unwrap())
             }
-            Err(e) => Err(PeerClientError {
-                message: format!("Error: {}", e),
+            Err(error) => Err(PeerClientError {
+                message: format!("Error: {}", error),
             }),
         }
     }
@@ -360,21 +358,21 @@ impl PeerClient for RemotePeer {
             num,
         };
 
-        let resp = self
+        let response = self
             .client
             .post(format!("http://{}/_private/v1/_compact", self.address))
             .json(&invocation_obj)
             .send()
             .await;
 
-        match resp {
-            Ok(res) => {
-                assert!(res.status().is_success());
-                let body = res.bytes().await.unwrap();
+        match response {
+            Ok(response) => {
+                assert!(response.status().is_success());
+                let body = response.bytes().await.unwrap();
                 Ok(result_to_record_batch(serde_json::from_slice(&body).unwrap()).await)
             }
-            Err(e) => Err(PeerClientError {
-                message: format!("Error: {}", e),
+            Err(error) => Err(PeerClientError {
+                message: format!("Error: {}", error),
             }),
         }
     }
@@ -391,21 +389,21 @@ impl PeerClient for RemotePeer {
             num,
         };
 
-        let resp = self
+        let response = self
             .client
             .post(format!("http://{}/_private/v1/_extension", self.address))
             .json(&invocation_obj)
             .send()
             .await;
 
-        match resp {
-            Ok(res) => {
-                assert!(res.status().is_success());
-                let body = res.bytes().await.unwrap();
+        match response {
+            Ok(response) => {
+                assert!(response.status().is_success());
+                let body = response.bytes().await.unwrap();
                 Ok(serde_json::from_slice(&body).unwrap())
             }
-            Err(e) => Err(PeerClientError {
-                message: format!("Error: {}", e),
+            Err(error) => Err(PeerClientError {
+                message: format!("Error: {}", error),
             }),
         }
     }
@@ -422,20 +420,20 @@ impl PeerClient for RemotePeer {
             num,
         };
 
-        let resp = self
+        let response = self
             .client
             .post(format!("http://{}/_private/v1/_prefetch", self.address))
             .json(&invocation_obj)
             .send()
             .await;
 
-        match resp {
-            Ok(res) => {
-                assert!(res.status().is_success());
+        match response {
+            Ok(response) => {
+                assert!(response.status().is_success());
                 Ok(())
             }
-            Err(e) => Err(PeerClientError {
-                message: format!("Error: {}", e),
+            Err(error) => Err(PeerClientError {
+                message: format!("Error: {}", error),
             }),
         }
     }
@@ -444,7 +442,7 @@ impl PeerClient for RemotePeer {
         &self,
         invocation: &CompactionCommand,
     ) -> Result<Option<CompactionResponse>, PeerClientError> {
-        let res = self
+        let response = self
             .client
             .post(format!(
                 "http://{}/_private/v1/_compact_leader",
@@ -455,40 +453,12 @@ impl PeerClient for RemotePeer {
             .await
             .unwrap();
 
-        assert!(res.status().is_success());
+        assert!(response.status().is_success());
 
-        let body = res.bytes().await.unwrap();
+        let body = response.bytes().await.unwrap();
         let response = serde_json::from_slice(&body).unwrap();
         Ok(Some(response))
     }
-
-    /*
-    async fn private_metadata(&self, invocation: &PrivateMetadataInvocation) -> Result<String, PeerClientError> {
-        let address = &self.address;
-        let body = serde_json::to_string(invocation);
-        match body {
-            Ok(b) => {
-                let resp = futures::executor::block_on(self.client.post(format!("{address}/_private/v1/_metadata"))
-                .header("Content-Type", "application/json")
-                .body(b)
-                .send());
-                match resp {
-                    Ok(r) => {
-                        let text = futures::executor::block_on(r.text());
-                        match text {
-                            Ok(t) => Ok(t),
-                            Err(e) => Err(PeerClientError{ message: "Error".to_string() }),
-                        }
-                    },
-                    Err(e) => Err(PeerClientError{ message: "Error".to_string() })
-                }
-            },
-            Err(e) => {
-                Err(PeerClientError{ message: "Error".to_string() })
-            }
-        }
-    }
-    */
 }
 
 #[derive(Clone)]
@@ -505,7 +475,7 @@ impl Debug for TestingRemotePeer {
 impl TestingRemotePeer {
     #[allow(dead_code)]
     pub fn new(server: AsyncTestServer) -> Self {
-        TestingRemotePeer { server }
+        Self { server }
     }
 }
 
@@ -529,14 +499,9 @@ impl PeerClient for TestingRemotePeer {
             index,
             num,
         };
-        let body = match serde_json::to_string(&invocation_obj) {
-            Ok(b) => b,
-            Err(_) => {
-                panic!("Malformed request")
-            }
-        };
+        let body = serde_json::to_string(&invocation_obj).unwrap();
 
-        let resp = self
+        let response = self
             .server
             .client()
             .post("http://localhost/_private/v1/_sql")
@@ -545,14 +510,14 @@ impl PeerClient for TestingRemotePeer {
             .perform()
             .await;
 
-        match resp {
-            Ok(res) => {
-                assert!(res.status().is_success());
-                let body = res.read_body().await.unwrap();
+        match response {
+            Ok(response) => {
+                assert!(response.status().is_success());
+                let body = response.read_body().await.unwrap();
                 Ok(result_to_record_batch(serde_json::from_slice(&body).unwrap()).await)
             }
-            Err(e) => Err(PeerClientError {
-                message: format!("Error: {}", e),
+            Err(error) => Err(PeerClientError {
+                message: format!("Error: {}", error),
             }),
         }
     }
@@ -568,14 +533,9 @@ impl PeerClient for TestingRemotePeer {
             index,
             num,
         };
-        let body = match serde_json::to_string(&invocation_obj) {
-            Ok(b) => b,
-            Err(_) => {
-                panic!("Malformed request")
-            }
-        };
+        let body = serde_json::to_string(&invocation_obj).unwrap();
 
-        let resp = self
+        let response = self
             .server
             .client()
             .post("http://localhost/_private/v1/_search")
@@ -584,14 +544,14 @@ impl PeerClient for TestingRemotePeer {
             .perform()
             .await;
 
-        match resp {
-            Ok(res) => {
-                assert!(res.status().is_success());
-                let body = res.read_body().await.unwrap();
+        match response {
+            Ok(response) => {
+                assert!(response.status().is_success());
+                let body = response.read_body().await.unwrap();
                 Ok(serde_json::from_slice(&body).unwrap())
             }
-            Err(e) => Err(PeerClientError {
-                message: format!("Error: {}", e),
+            Err(error) => Err(PeerClientError {
+                message: format!("Error: {}", error),
             }),
         }
     }
@@ -607,14 +567,9 @@ impl PeerClient for TestingRemotePeer {
             index,
             num,
         };
-        let body = match serde_json::to_string(&invocation_obj) {
-            Ok(b) => b,
-            Err(_) => {
-                panic!("Malformed request")
-            }
-        };
+        let body = serde_json::to_string(&invocation_obj).unwrap();
 
-        let resp = self
+        let response = self
             .server
             .client()
             .post("http://localhost/_private/v1/_compact")
@@ -623,14 +578,14 @@ impl PeerClient for TestingRemotePeer {
             .perform()
             .await;
 
-        match resp {
-            Ok(res) => {
-                assert!(res.status().is_success());
-                let body = res.read_body().await.unwrap();
+        match response {
+            Ok(response) => {
+                assert!(response.status().is_success());
+                let body = response.read_body().await.unwrap();
                 Ok(result_to_record_batch(serde_json::from_slice(&body).unwrap()).await)
             }
-            Err(e) => Err(PeerClientError {
-                message: format!("Error: {}", e),
+            Err(error) => Err(PeerClientError {
+                message: format!("Error: {}", error),
             }),
         }
     }
@@ -646,14 +601,9 @@ impl PeerClient for TestingRemotePeer {
             index,
             num,
         };
-        let body = match serde_json::to_string(&invocation_obj) {
-            Ok(b) => b,
-            Err(_) => {
-                panic!("Malformed request")
-            }
-        };
+        let body = serde_json::to_string(&invocation_obj).unwrap();
 
-        let resp = self
+        let response = self
             .server
             .client()
             .post("http://localhost/_private/v1/_extension")
@@ -662,14 +612,14 @@ impl PeerClient for TestingRemotePeer {
             .perform()
             .await;
 
-        match resp {
-            Ok(res) => {
-                assert!(res.status().is_success());
-                let body = res.read_body().await.unwrap();
+        match response {
+            Ok(response) => {
+                assert!(response.status().is_success());
+                let body = response.read_body().await.unwrap();
                 Ok(serde_json::from_slice(&body).unwrap())
             }
-            Err(e) => Err(PeerClientError {
-                message: format!("Error: {}", e),
+            Err(error) => Err(PeerClientError {
+                message: format!("Error: {}", error),
             }),
         }
     }
@@ -685,14 +635,9 @@ impl PeerClient for TestingRemotePeer {
             index,
             num,
         };
-        let body = match serde_json::to_string(&invocation_obj) {
-            Ok(b) => b,
-            Err(_) => {
-                panic!("Malformed request")
-            }
-        };
+        let body = serde_json::to_string(&invocation_obj).unwrap();
 
-        let resp = self
+        let response = self
             .server
             .client()
             .post("http://localhost/_private/v1/_prefetch")
@@ -701,13 +646,13 @@ impl PeerClient for TestingRemotePeer {
             .perform()
             .await;
 
-        match resp {
-            Ok(res) => {
-                assert!(res.status().is_success());
+        match response {
+            Ok(response) => {
+                assert!(response.status().is_success());
                 Ok(())
             }
-            Err(e) => Err(PeerClientError {
-                message: format!("Error: {}", e),
+            Err(error) => Err(PeerClientError {
+                message: format!("Error: {}", error),
             }),
         }
     }
@@ -716,7 +661,7 @@ impl PeerClient for TestingRemotePeer {
         &self,
         invocation: &CompactionCommand,
     ) -> Result<Option<CompactionResponse>, PeerClientError> {
-        let res = self
+        let response = self
             .server
             .client()
             .post("http://localhost/_private/v1/_compact_leader")
@@ -726,41 +671,14 @@ impl PeerClient for TestingRemotePeer {
             .await
             .unwrap();
 
-        assert!(res.status().is_success());
+        assert!(response.status().is_success());
 
-        let response_bytes = res.read_body().await.unwrap();
+        let response_bytes = response.read_body().await.unwrap();
         let response_str = String::from_utf8(response_bytes).unwrap();
 
         let response = serde_json::from_str::<CompactionResponse>(response_str.as_str()).unwrap();
         Ok(Some(response))
     }
-    /*
-    async fn private_metadata(&self, invocation: &PrivateMetadataInvocation) -> Result<String, PeerClientError> {
-        let address = &self.address;
-        let body = serde_json::to_string(invocation);
-        match body {
-            Ok(b) => {
-                let resp = futures::executor::block_on(self.client.post(format!("{address}/_private/v1/_metadata"))
-                .header("Content-Type", "application/json")
-                .body(b)
-                .send());
-                match resp {
-                    Ok(r) => {
-                        let text = futures::executor::block_on(r.text());
-                        match text {
-                            Ok(t) => Ok(t),
-                            Err(e) => Err(PeerClientError{ message: "Error".to_string() }),
-                        }
-                    },
-                    Err(e) => Err(PeerClientError{ message: "Error".to_string() })
-                }
-            },
-            Err(e) => {
-                Err(PeerClientError{ message: "Error".to_string() })
-            }
-        }
-    }
-    */
 }
 
 pub struct PeerProvider {
@@ -779,23 +697,20 @@ impl PeerProvider {
     fn create_clients(mode: &PeerModeType) -> Vec<Box<dyn PeerClient>> {
         match mode {
             PeerModeType::SelfOnly => {
-                let peers: Vec<Box<dyn PeerClient>> =
-                    vec![Box::new(SelfPeer::new(CompactionMode::Disabled))];
-                peers
+                vec![Box::new(SelfPeer::new(CompactionMode::Disabled))]
             }
             PeerModeType::Remote(addresses) => {
                 let mut addresses = addresses.clone();
                 addresses.sort_unstable();
-                let mut peers: Vec<Box<dyn PeerClient>> = vec![];
-                for address in addresses.iter() {
-                    peers.push(Box::new(RemotePeer::new(address.clone())))
-                }
-                peers
+                addresses
+                    .iter()
+                    .map(|address| {
+                        Box::new(RemotePeer::new(address.clone())) as Box<dyn PeerClient>
+                    })
+                    .collect()
             }
             PeerModeType::Testing(server) => {
-                let peers: Vec<Box<dyn PeerClient>> =
-                    vec![Box::new(TestingRemotePeer::new(server.clone()))];
-                peers
+                vec![Box::new(TestingRemotePeer::new(server.clone()))]
             }
         }
     }
@@ -818,68 +733,11 @@ pub async fn get_docker_peer_ips() -> Vec<String> {
             return vec![];
         }
     };
+
     service_names
         .split(',')
-        .map(|x| x.to_string())
-        .collect::<Vec<String>>()
-}
-
-pub async fn get_kubernetes_peer_ips() -> Vec<String> {
-    let pod_name = match std::env::var("HOSTNAME") {
-        Ok(name) => name,
-        Err(_) => {
-            tracing::error!("HOSTNAME is not set");
-            return vec![];
-        }
-    };
-
-    let client = kube::Client::try_default().await.unwrap();
-    let pods: Api<Pod> = Api::default_namespaced(client.clone());
-
-    // find the app label of the own pod
-    let own_pod = pods.get_metadata(&pod_name).await.unwrap();
-    let app_label = own_pod
-        .metadata
-        .labels
-        .unwrap()
-        .get("app")
-        .unwrap()
-        .to_string();
-
-    // get all pods with app label
-    let pods = pods.list(&Default::default()).await.unwrap();
-    let pods = pods
-        .items
-        .iter()
-        .filter(|pod| pod.metadata.labels.as_ref().unwrap().get("app").unwrap() == &app_label);
-
-    let mut ips: Vec<String> = vec![];
-    for pod in pods {
-        tracing::warn!("Pod: {:?}", pod.metadata.name);
-        let pod_status = match pod.status.as_ref() {
-            Some(status) => status,
-            None => {
-                tracing::error!("Pod status is None for pod: {:?}", pod.metadata.name);
-                continue;
-            }
-        };
-
-        let pod_ip = match pod_status.pod_ip.as_ref() {
-            Some(ip) => ip,
-            None => {
-                tracing::error!("Pod IP is None for pod: {:?}", pod.metadata.name);
-                continue;
-            }
-        };
-
-        ips.push(pod_ip.clone());
-    }
-
-    //filter duplicate IPs
-    ips.sort_unstable();
-    ips.dedup();
-
-    return ips;
+        .map(|service_name| service_name.to_string())
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -889,7 +747,7 @@ pub struct SelfPeer {
 
 impl SelfPeer {
     pub fn new(compaction_mode: CompactionMode) -> Self {
-        SelfPeer {
+        Self {
             compaction_mode: compaction_mode.clone(),
         }
     }
@@ -912,8 +770,10 @@ impl PeerClient for SelfPeer {
     ) -> Result<Vec<RecordBatch>, PeerClientError> {
         let query_result = data_query(invocation, index, num).await;
         match query_result {
-            Ok(qr) => Ok(result_to_record_batch(qr.result).await),
-            Err(e) => Err(PeerClientError { message: e.message }),
+            Ok(query_result) => Ok(result_to_record_batch(query_result.result).await),
+            Err(error) => Err(PeerClientError {
+                message: error.message,
+            }),
         }
     }
 
@@ -925,7 +785,9 @@ impl PeerClient for SelfPeer {
     ) -> Result<PrivateSearchResult, PeerClientError> {
         match crate::private_api::search_query(invocation, index, num).await {
             Ok(result) => Ok(result),
-            Err(e) => Err(PeerClientError { message: e.message }),
+            Err(error) => Err(PeerClientError {
+                message: error.message,
+            }),
         }
     }
 
@@ -937,8 +799,10 @@ impl PeerClient for SelfPeer {
     ) -> Result<Vec<RecordBatch>, PeerClientError> {
         let query_result = compaction_query(invocation, index, num).await;
         match query_result {
-            Ok(qr) => Ok(result_to_record_batch(qr.result).await),
-            Err(e) => Err(PeerClientError { message: e.message }),
+            Ok(query_result) => Ok(result_to_record_batch(query_result.result).await),
+            Err(error) => Err(PeerClientError {
+                message: error.message,
+            }),
         }
     }
 
@@ -950,7 +814,9 @@ impl PeerClient for SelfPeer {
     ) -> Result<ExtensionFileMetadata, PeerClientError> {
         match extension_query(invocation, index, num).await {
             Ok(result) => Ok(result),
-            Err(e) => Err(PeerClientError { message: e.message }),
+            Err(error) => Err(PeerClientError {
+                message: error.message,
+            }),
         }
     }
 
@@ -962,7 +828,9 @@ impl PeerClient for SelfPeer {
     ) -> Result<(), PeerClientError> {
         match prefetch_query(invocation, index, num).await {
             Ok(_) => Ok(()),
-            Err(e) => Err(PeerClientError { message: e.message }),
+            Err(error) => Err(PeerClientError {
+                message: error.message,
+            }),
         }
     }
 
@@ -971,7 +839,7 @@ impl PeerClient for SelfPeer {
         invocation: &CompactionCommand,
     ) -> Result<Option<CompactionResponse>, PeerClientError> {
         match &self.compaction_mode {
-            CompactionMode::Async(_num_files_threshold) => {
+            CompactionMode::Async(_threshold) => {
                 match compact_logs(Arc::new(invocation.clone())).await {
                     Ok(success) => {
                         if success.status == 200 {
@@ -982,28 +850,22 @@ impl PeerClient for SelfPeer {
                             })
                         }
                     }
-                    Err(e) => Err(PeerClientError {
-                        message: e.to_string(),
+                    Err(error) => Err(PeerClientError {
+                        message: error.to_string(),
                     }),
                 }
             }
             CompactionMode::External(compaction_leader) => {
                 let client = Client::new();
-
-                let res = match client
+                let response = client
                     .post(format!("{}/_private/v1/_compact_leader", compaction_leader))
                     .body(serde_json::to_string(&invocation).unwrap())
                     .send()
                     .await
-                {
-                    Ok(res) => res,
-                    Err(e) => panic!("Error: {}", e),
-                };
+                    .unwrap();
 
-                assert!(res.status().is_success());
-
-                let response_str = res.text().await.unwrap().clone();
-
+                assert!(response.status().is_success());
+                let response_str = response.text().await.unwrap();
                 let response =
                     serde_json::from_str::<CompactionResponse>(response_str.as_str()).unwrap();
                 Ok(Some(response))

@@ -198,9 +198,8 @@ impl SearchCommand {
         &self,
         legacy_command: &SqlCommand,
     ) -> Vec<CheckpointDescriptor> {
-        let extension = legacy_command.calculate_score.then(|| "es".to_string());
         match STATE_PROVIDER
-            .get_latest_checkpoint(&legacy_command.table, extension)
+            .get_latest_servable_checkpoint(&legacy_command.table)
             .await
         {
             Ok(Some(checkpoint_id)) => {

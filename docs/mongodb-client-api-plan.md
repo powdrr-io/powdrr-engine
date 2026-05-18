@@ -57,11 +57,14 @@ That means we now have:
 - explicit database / collection exposure config
 - explicit `_id` backing-field config for Mongo-facing documents
 - a database-scoped command dispatcher for `hello`, `ping`,
-  `listCollections`, `listDatabases`, `find`, `getMore`, and `killCursors`
+  `buildInfo`, `listCollections`, `listDatabases`, `listIndexes`,
+  `collStats`, `dbStats`, `find`, `getMore`, and `killCursors`
 - collection-to-table lookup through Mongo config instead of internal table
   names on the command path
-- an in-memory read-only cursor registry for `batchSize`-driven pagination on
-  the HTTP debug surface
+- an in-memory read-only cursor registry with inactivity timeout and cleanup
+  for `batchSize`-driven pagination on the HTTP debug surface
+- metadata-backed stats on the HTTP debug surface when the latest checkpoint
+  exposes file counts and sizes
 
 ## What The New Translator Supports
 
@@ -81,6 +84,7 @@ Supported:
 - positive `limit`
 - `batchSize`
 - `singleBatch`
+- `noCursorTimeout`
 
 Rejected on purpose:
 
@@ -185,7 +189,11 @@ Status:
 
 - explicit `database.collection -> Powdrr table` config now exists
 - `listCollections` and `listDatabases` now exist on the HTTP debug surface
+- `listIndexes`, `collStats`, and `dbStats` now exist on the HTTP debug
+  surface
 - uniqueness is now enforced for enabled `database.collection` bindings
+- metadata-backed stats are best-effort and may return `null` counts when the
+  latest checkpoint does not carry file-level record counts
 
 ### 6. `_id` Semantics
 
@@ -267,9 +275,16 @@ Status:
 - `_id` is now backed by an explicit configured source field
 - `hello`, `ping`, `listCollections`, and `listDatabases` now return
   Mongo-shaped command responses over HTTP
-- `find` now supports `batchSize` and `singleBatch`
+- `buildInfo` now returns a stable bridge identity response over HTTP
+- `listIndexes` now returns the Mongo-facing `_id_` index for configured
+  collections
+- `listCollections` now supports `nameOnly: true` and simple `filter.name`
+- `collStats` and `dbStats` now return metadata-derived storage and document
+  stats when the latest checkpoint includes file statistics
+- `find` now supports `batchSize`, `singleBatch`, and `noCursorTimeout`
 - `getMore` and `killCursors` now exist on the HTTP debug surface with
   process-local in-memory cursor state
+- inactive cursors now expire automatically and return `CursorNotFound`
 
 Example request:
 
@@ -322,7 +337,8 @@ Important:
 - it is only a development seam
 - the new `/_mongo/:database/_command` route is the closer approximation to
   the eventual wire-protocol command model
-- cursor state is currently process-local and will not survive a restart
+- cursor state is currently process-local and will not survive a restart or
+  failover, even though it now has inactivity timeout / cleanup behavior
 
 ### Phase 3: Wire-Protocol Gateway
 
@@ -341,7 +357,6 @@ This should initially be read-only and single-node.
 Add:
 
 - durable cursor registry
-- cursor expiry / cleanup
 - session envelope handling
 - batch splitting beyond the current in-memory debug implementation
 
@@ -375,13 +390,13 @@ keeping the optimizer and storage model aligned with the rest of the repo.
 
 ## Concrete Next Code Changes
 
-1. Keep expanding the read-only Mongo frontend around
-   [main_lib/src/serving_protocol.rs](../main_lib/src/serving_protocol.rs).
-2. Harden the cursor layer so it is no longer process-local:
-   add expiry, cleanup, and a storage model that can survive restarts or
-   leader changes.
-3. Add count-like read commands only if they can map cleanly into the same
+1. Harden the cursor layer so it is no longer process-local:
+   move the registry into storage that can survive restarts or leader changes.
+2. Add count-like read commands only if they can map cleanly into the same
    serving plan without creating a second execution path.
+3. Fill in only the remaining discovery commands that clearly unblock real
+   clients, such as `count` or `countDocuments` equivalents and lightweight
+   session/metadata envelopes.
 4. Create a dedicated Mongo wire server module or crate rather than extending
    the current HTTP router directly.
 5. Use the existing HTTP bridge plus `_mongo/config` routes as the integration

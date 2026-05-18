@@ -1,12 +1,18 @@
 mod configuration;
 
-use std::{env, io::{self, BufReader}};
+use std::{
+    env,
+    io::{self, BufReader},
+};
 
-use gotham::{anyhow, rustls::{Certificate, PrivateKey, ServerConfig}};
+use crate::configuration::{OperatingMode, get_operating_mode, perform_updates};
+use gotham::{
+    anyhow,
+    rustls::{Certificate, PrivateKey, ServerConfig},
+};
 use idgenerator::*;
 use rustls_pemfile::{certs, rsa_private_keys};
 use rustls_pki_types::PrivatePkcs1KeyDer;
-use crate::configuration::{get_operating_mode, perform_updates, OperatingMode};
 
 /// Start a server and call the `Handler` we've defined above for each `Request` we receive.
 //
@@ -17,7 +23,8 @@ fn build_config() -> anyhow::Result<ServerConfig> {
     let certs = certs(&mut cert_file)
         .map(|result| result.map(|der| Certificate(der.to_vec())))
         .collect::<Result<_, _>>()?;
-    let keys: Vec<Result<PrivatePkcs1KeyDer, io::Error>> = rsa_private_keys(&mut key_file).collect();
+    let keys: Vec<Result<PrivatePkcs1KeyDer, io::Error>> =
+        rsa_private_keys(&mut key_file).collect();
     let intermediate = keys.get(0).unwrap().as_ref().unwrap();
 
     let key = PrivateKey(intermediate.secret_pkcs1_der().to_vec());
@@ -28,34 +35,42 @@ fn build_config() -> anyhow::Result<ServerConfig> {
         .map_err(Into::into)
 }
 
-
 async fn run_server(mode: &OperatingMode) -> () {
     tracing_subscriber::fmt().init();
     let addr = format!("0.0.0.0:{}", mode.port);
     println!("Listening for requests at http://{}", addr);
-    gotham::init_server(addr, powdrr_lib::router::router(mode.testing_enabled)).await.unwrap();
+    gotham::init_server(
+        addr,
+        powdrr_engine_lib::router::router(mode.testing_enabled),
+    )
+    .await
+    .unwrap();
 }
-
 
 #[allow(dead_code)]
 async fn run_ssl_server() -> () {
     tracing_subscriber::fmt().init();
     let addr = "0.0.0.0:9200";
     println!("Listening for requests at https://{}", addr);
-    gotham::start_with_tls(addr, powdrr_lib::router::router(true), build_config().unwrap()).unwrap();
+    gotham::start_with_tls(
+        addr,
+        powdrr_engine_lib::router::router(true),
+        build_config().unwrap(),
+    )
+    .unwrap();
 }
-
 
 #[tokio::main]
 async fn main() -> () {
     let args: Vec<String> = env::args().collect();
     rustls::crypto::ring::default_provider()
-        .install_default().unwrap();
+        .install_default()
+        .unwrap();
 
     let options = IdGeneratorOptions::new().worker_id(1).worker_id_bit_len(6);
     match IdInstance::init(options) {
         Ok(_) => (),
-        Err(_) => panic!("What happened?")
+        Err(_) => panic!("What happened?"),
     }
 
     let mode = get_operating_mode(&args);

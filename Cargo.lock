@@ -5370,12 +5370,62 @@ dependencies = [
 ]
 
 [[package]]
+name = "powdrr-engine-lib"
+version = "0.0.1"
+dependencies = [
+ "arrow-array 55.1.0",
+ "arrow-flight",
+ "arrow-ipc 55.1.0",
+ "arrow-ipc 58.3.0",
+ "arrow-json",
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-dynamodb",
+ "chrono",
+ "datafusion",
+ "futures",
+ "futures-util",
+ "gotham",
+ "http 0.2.12",
+ "iceberg",
+ "iceberg-catalog-rest",
+ "idgenerator",
+ "lazy_static",
+ "liquid-cache-datafusion-local",
+ "lru-mem",
+ "minijinja",
+ "modyne",
+ "modyne-derive",
+ "object_store",
+ "parquet 55.1.0",
+ "paste",
+ "prost",
+ "redis",
+ "reqwest",
+ "rustls-pemfile 2.2.0",
+ "rustls-pki-types",
+ "serde",
+ "serde_arrow",
+ "serde_dynamo",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "ttl_cache",
+ "url",
+ "url-escape",
+ "uuid-b64",
+]
+
+[[package]]
 name = "powdrr-io-engine"
 version = "0.0.1"
 dependencies = [
  "gotham",
  "idgenerator",
- "powdrr_lib",
+ "powdrr-engine-lib",
  "rustls 0.23.28",
  "rustls-pemfile 2.2.0",
  "rustls-pki-types",

@@ -5,6 +5,7 @@ use std::{
         atomic::{AtomicI64, Ordering},
         LazyLock, Mutex,
     },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use futures_util::future::FutureExt;
@@ -30,11 +31,15 @@ use crate::serving_protocol::{from_mongodb_find, MongoFindCommand, MongoProtocol
 use crate::state_provider::{ServiceApiError, STATE_PROVIDER};
 
 const MONGO_BAD_VALUE_CODE: i32 = 2;
+const MONGO_CURSOR_NOT_FOUND_CODE: i32 = 43;
 const MONGO_NAMESPACE_NOT_FOUND_CODE: i32 = 26;
 const MONGO_INTERNAL_ERROR_CODE: i32 = 1;
+const MONGO_CURSOR_TIMEOUT_MS: i64 = 10 * 60 * 1000;
 static MONGO_CURSOR_IDS: AtomicI64 = AtomicI64::new(1);
 static MONGO_CURSORS: LazyLock<Mutex<HashMap<i64, MongoCursorState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(test)]
+static MONGO_TEST_CURSOR_NOW_MS: LazyLock<Mutex<Option<i64>>> = LazyLock::new(|| Mutex::new(None));
 
 #[derive(Deserialize, StateData, StaticResponseExtender)]
 pub struct MongoDatabasePathExtractor {
@@ -68,6 +73,14 @@ struct MongoCursorState {
     database: String,
     collection: String,
     remaining_rows: Vec<Value>,
+    no_cursor_timeout: bool,
+    expires_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MongoCollectionMetadataStats {
+    storage_size_bytes: u64,
+    document_count: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -103,6 +116,15 @@ impl MongoCommandError {
             code: MONGO_NAMESPACE_NOT_FOUND_CODE,
             code_name: "NamespaceNotFound",
             message: message.into(),
+        }
+    }
+
+    fn cursor_not_found(cursor_id: i64) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: MONGO_CURSOR_NOT_FOUND_CODE,
+            code_name: "CursorNotFound",
+            message: format!("Mongo cursor {} was not found or expired", cursor_id),
         }
     }
 
@@ -337,11 +359,23 @@ async fn execute_mongodb_command(
     if command.contains_key("ping") {
         return Ok(json!({ "ok": 1.0 }));
     }
+    if command.contains_key("buildInfo") {
+        return Ok(build_mongodb_build_info_response());
+    }
     if command.contains_key("listCollections") {
-        return list_mongodb_collections(database).await;
+        return list_mongodb_collections(database, command).await;
     }
     if command.contains_key("listDatabases") {
         return list_mongodb_databases().await;
+    }
+    if command.contains_key("listIndexes") {
+        return execute_mongodb_list_indexes(database, command).await;
+    }
+    if command.contains_key("collStats") {
+        return execute_mongodb_coll_stats(database, command).await;
+    }
+    if command.contains_key("dbStats") {
+        return execute_mongodb_db_stats(database, command).await;
     }
     if command.contains_key("getMore") {
         return execute_mongodb_get_more(database, command);
@@ -362,7 +396,7 @@ async fn execute_mongodb_command(
     }
 
     Err(MongoCommandError::bad_value(
-        "Unsupported Mongo command. Supported commands: hello, ping, listCollections, listDatabases, find, getMore, killCursors",
+        "Unsupported Mongo command. Supported commands: hello, ping, buildInfo, listCollections, listDatabases, listIndexes, collStats, dbStats, find, getMore, killCursors",
     ))
 }
 
@@ -415,11 +449,37 @@ fn build_mongodb_hello_response() -> Value {
     })
 }
 
-async fn list_mongodb_collections(database: &str) -> Result<Value, MongoCommandError> {
+fn build_mongodb_build_info_response() -> Value {
+    json!({
+        "version": "0.0.1-powdrr",
+        "gitVersion": "powdrr-mongo-http-bridge",
+        "modules": [],
+        "allocator": "system",
+        "javascriptEngine": "none",
+        "maxBsonObjectSize": 16 * 1024 * 1024,
+        "bits": 64,
+        "debug": true,
+        "ok": 1.0
+    })
+}
+
+async fn list_mongodb_collections(
+    database: &str,
+    command: &Map<String, Value>,
+) -> Result<Value, MongoCommandError> {
     let bindings = list_mongodb_bindings().await?;
+    let name_only = optional_bool(command, "nameOnly")?.unwrap_or(false);
+    let filter_name = list_collections_filter_name(command)?;
     let mut collections = bindings
         .into_iter()
-        .filter(|binding| binding.config.enabled && binding.config.database == database)
+        .filter(|binding| {
+            binding.config.enabled
+                && binding.config.database == database
+                && filter_name
+                    .as_ref()
+                    .map(|name| binding.config.collection == *name)
+                    .unwrap_or(true)
+        })
         .collect::<Vec<_>>();
     collections.sort_by(|left, right| left.config.collection.cmp(&right.config.collection));
 
@@ -430,18 +490,25 @@ async fn list_mongodb_collections(database: &str) -> Result<Value, MongoCommandE
             "firstBatch": collections
                 .into_iter()
                 .map(|binding| {
-                    json!({
-                        "name": binding.config.collection,
-                        "type": "collection",
-                        "options": {},
-                        "info": {
-                            "readOnly": true
-                        },
-                        "idIndex": {
-                            "name": "_id_",
-                            "key": { "_id": 1 }
-                        }
-                    })
+                    if name_only {
+                        json!({
+                            "name": binding.config.collection,
+                            "type": "collection"
+                        })
+                    } else {
+                        json!({
+                            "name": binding.config.collection,
+                            "type": "collection",
+                            "options": {},
+                            "info": {
+                                "readOnly": true
+                            },
+                            "idIndex": {
+                                "name": "_id_",
+                                "key": { "_id": 1 }
+                            }
+                        })
+                    }
                 })
                 .collect::<Vec<_>>()
         },
@@ -478,6 +545,112 @@ async fn list_mongodb_databases() -> Result<Value, MongoCommandError> {
     }))
 }
 
+async fn execute_mongodb_list_indexes(
+    database: &str,
+    command: &Map<String, Value>,
+) -> Result<Value, MongoCommandError> {
+    let collection = required_string(command, "listIndexes")?;
+    let binding = load_mongodb_collection_binding(database, collection).await?;
+    let namespace = format!("{}.{}", binding.config.database, binding.config.collection);
+
+    Ok(json!({
+        "cursor": {
+            "id": 0,
+            "ns": format!("{}.$cmd.listIndexes.{}", database, collection),
+            "firstBatch": [
+                {
+                    "v": 2,
+                    "key": { "_id": 1 },
+                    "name": "_id_",
+                    "ns": namespace
+                }
+            ]
+        },
+        "ok": 1.0
+    }))
+}
+
+async fn execute_mongodb_coll_stats(
+    database: &str,
+    command: &Map<String, Value>,
+) -> Result<Value, MongoCommandError> {
+    let collection = required_string(command, "collStats")?;
+    let scale_factor = command_scale_factor(command)?;
+    let binding = load_mongodb_collection_binding(database, collection).await?;
+    let metadata_stats = load_mongodb_collection_metadata_stats(&binding.table_name).await?;
+    let namespace = format!("{}.{}", binding.config.database, binding.config.collection);
+    let scaled_storage_size = scale_size(metadata_stats.storage_size_bytes, scale_factor);
+    let avg_obj_size = metadata_stats.document_count.map(|document_count| {
+        if document_count == 0 {
+            0.0
+        } else {
+            metadata_stats.storage_size_bytes as f64 / document_count as f64
+        }
+    });
+
+    Ok(json!({
+        "ns": namespace,
+        "count": metadata_stats.document_count,
+        "size": scaled_storage_size,
+        "storageSize": scaled_storage_size,
+        "avgObjSize": avg_obj_size,
+        "nindexes": 1,
+        "totalIndexSize": 0,
+        "indexSizes": { "_id_": 0 },
+        "scaleFactor": scale_factor,
+        "ok": 1.0
+    }))
+}
+
+async fn execute_mongodb_db_stats(
+    database: &str,
+    command: &Map<String, Value>,
+) -> Result<Value, MongoCommandError> {
+    let scale_factor = command_scale_factor(command)?;
+    let bindings = list_mongodb_bindings().await?;
+    let enabled_bindings = bindings
+        .into_iter()
+        .filter(|binding| binding.config.enabled && binding.config.database == database)
+        .collect::<Vec<_>>();
+
+    let mut total_storage_size_bytes = 0u64;
+    let mut total_document_count = Some(0u64);
+    for binding in enabled_bindings.iter() {
+        let metadata_stats = load_mongodb_collection_metadata_stats(&binding.table_name).await?;
+        total_storage_size_bytes =
+            total_storage_size_bytes.saturating_add(metadata_stats.storage_size_bytes);
+        total_document_count = match (total_document_count, metadata_stats.document_count) {
+            (Some(current_total), Some(document_count)) => {
+                Some(current_total.saturating_add(document_count))
+            }
+            _ => None,
+        };
+    }
+
+    let scaled_storage_size = scale_size(total_storage_size_bytes, scale_factor);
+    let avg_obj_size = total_document_count.map(|document_count| {
+        if document_count == 0 {
+            0.0
+        } else {
+            total_storage_size_bytes as f64 / document_count as f64
+        }
+    });
+
+    Ok(json!({
+        "db": database,
+        "collections": enabled_bindings.len(),
+        "views": 0,
+        "objects": total_document_count,
+        "avgObjSize": avg_obj_size,
+        "dataSize": scaled_storage_size,
+        "storageSize": scaled_storage_size,
+        "indexes": enabled_bindings.len(),
+        "indexSize": 0,
+        "scaleFactor": scale_factor,
+        "ok": 1.0
+    }))
+}
+
 fn build_mongodb_find_response(
     namespace: String,
     command: &MongoFindCommand,
@@ -489,6 +662,7 @@ fn build_mongodb_find_response(
         .map(validate_positive_batch_size)
         .transpose()?;
     let single_batch = command.single_batch.unwrap_or(false);
+    let no_cursor_timeout = command.no_cursor_timeout.unwrap_or(false);
 
     match batch_size {
         Some(batch_size) if batch_size < rows.len() => {
@@ -502,6 +676,11 @@ fn build_mongodb_find_response(
                     database: config.database.clone(),
                     collection: config.collection.clone(),
                     remaining_rows,
+                    no_cursor_timeout,
+                    expires_at_ms: next_cursor_expiry_ms(
+                        no_cursor_timeout,
+                        current_cursor_time_ms(),
+                    ),
                 })?
             };
             Ok(MongoFindResponse {
@@ -537,6 +716,7 @@ fn register_mongo_cursor(cursor: MongoCursorState) -> Result<i64, MongoCommandEr
     let mut cursors = MONGO_CURSORS
         .lock()
         .map_err(|_| MongoCommandError::internal("Mongo cursor registry lock is poisoned"))?;
+    prune_expired_mongo_cursors(&mut cursors, current_cursor_time_ms());
     cursors.insert(cursor_id, cursor);
     Ok(cursor_id)
 }
@@ -553,12 +733,14 @@ fn execute_mongodb_get_more(
         .transpose()?
         .map(validate_positive_batch_size)
         .transpose()?;
+    let now_ms = current_cursor_time_ms();
     let mut cursors = MONGO_CURSORS
         .lock()
         .map_err(|_| MongoCommandError::internal("Mongo cursor registry lock is poisoned"))?;
-    let mut cursor = cursors.remove(&cursor_id).ok_or_else(|| {
-        MongoCommandError::namespace_not_found(format!("Mongo cursor {} was not found", cursor_id))
-    })?;
+    prune_expired_mongo_cursors(&mut cursors, now_ms);
+    let mut cursor = cursors
+        .remove(&cursor_id)
+        .ok_or_else(|| MongoCommandError::cursor_not_found(cursor_id))?;
 
     if cursor.database != database || cursor.collection != collection {
         let actual_database = cursor.database.clone();
@@ -580,6 +762,7 @@ fn execute_mongodb_get_more(
     let response_cursor_id = if cursor.remaining_rows.is_empty() {
         0
     } else {
+        cursor.expires_at_ms = next_cursor_expiry_ms(cursor.no_cursor_timeout, now_ms);
         cursors.insert(cursor_id, cursor);
         cursor_id
     };
@@ -617,6 +800,7 @@ fn execute_mongodb_kill_cursors(
     let mut cursors = MONGO_CURSORS
         .lock()
         .map_err(|_| MongoCommandError::internal("Mongo cursor registry lock is poisoned"))?;
+    prune_expired_mongo_cursors(&mut cursors, current_cursor_time_ms());
     for cursor_id in cursor_ids {
         match cursors.remove(&cursor_id) {
             Some(cursor) if cursor.database == database && cursor.collection == collection => {
@@ -639,6 +823,44 @@ fn execute_mongodb_kill_cursors(
     }))
 }
 
+fn prune_expired_mongo_cursors(cursors: &mut HashMap<i64, MongoCursorState>, now_ms: i64) {
+    cursors.retain(|_, cursor| !mongo_cursor_expired(cursor, now_ms));
+}
+
+fn mongo_cursor_expired(cursor: &MongoCursorState, now_ms: i64) -> bool {
+    cursor
+        .expires_at_ms
+        .map(|expires_at_ms| now_ms >= expires_at_ms)
+        .unwrap_or(false)
+}
+
+fn next_cursor_expiry_ms(no_cursor_timeout: bool, now_ms: i64) -> Option<i64> {
+    if no_cursor_timeout {
+        None
+    } else {
+        Some(now_ms + MONGO_CURSOR_TIMEOUT_MS)
+    }
+}
+
+fn current_cursor_time_ms() -> i64 {
+    #[cfg(test)]
+    {
+        if let Some(now_ms) = MONGO_TEST_CURSOR_NOW_MS
+            .lock()
+            .expect("Mongo cursor test clock lock poisoned")
+            .as_ref()
+            .copied()
+        {
+            return now_ms;
+        }
+    }
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_millis() as i64
+}
+
 fn validate_positive_batch_size(batch_size: i64) -> Result<usize, MongoCommandError> {
     if batch_size <= 0 {
         return Err(MongoCommandError::bad_value(
@@ -647,6 +869,64 @@ fn validate_positive_batch_size(batch_size: i64) -> Result<usize, MongoCommandEr
     }
     usize::try_from(batch_size)
         .map_err(|_| MongoCommandError::bad_value("Mongo batchSize is too large"))
+}
+
+fn list_collections_filter_name(
+    command: &Map<String, Value>,
+) -> Result<Option<String>, MongoCommandError> {
+    let Some(filter) = command.get("filter") else {
+        return Ok(None);
+    };
+    let filter = filter.as_object().ok_or_else(|| {
+        MongoCommandError::bad_value("Mongo listCollections filter must be a document")
+    })?;
+    match filter.get("name") {
+        None => Ok(None),
+        Some(name) => name
+            .as_str()
+            .map(|name| Some(name.to_string()))
+            .ok_or_else(|| {
+                MongoCommandError::bad_value(
+                    "Mongo listCollections filter field name must be a string",
+                )
+            }),
+    }
+}
+
+fn optional_bool(
+    command: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<bool>, MongoCommandError> {
+    match command.get(field) {
+        None => Ok(None),
+        Some(value) => value.as_bool().map(Some).ok_or_else(|| {
+            MongoCommandError::bad_value(format!("Mongo command field {} must be a boolean", field))
+        }),
+    }
+}
+
+fn command_scale_factor(command: &Map<String, Value>) -> Result<u64, MongoCommandError> {
+    match command.get("scale") {
+        None => Ok(1),
+        Some(value) => {
+            let scale_factor = value_as_i64(value)?;
+            if scale_factor <= 0 {
+                return Err(MongoCommandError::bad_value(
+                    "Mongo command field scale must be a positive integer",
+                ));
+            }
+            u64::try_from(scale_factor)
+                .map_err(|_| MongoCommandError::bad_value("Mongo command field scale is too large"))
+        }
+    }
+}
+
+fn scale_size(size: u64, scale_factor: u64) -> u64 {
+    if scale_factor <= 1 {
+        size
+    } else {
+        size / scale_factor
+    }
 }
 
 fn required_string<'a>(
@@ -689,6 +969,7 @@ fn rewrite_mongodb_find_command(
         skip: command.skip,
         batch_size: command.batch_size,
         single_batch: command.single_batch,
+        no_cursor_timeout: command.no_cursor_timeout,
     })
 }
 
@@ -953,6 +1234,36 @@ async fn validate_mongodb_namespace_uniqueness(
     Ok(())
 }
 
+async fn load_mongodb_collection_metadata_stats(
+    table_name: &str,
+) -> Result<MongoCollectionMetadataStats, MongoCommandError> {
+    let Some(checkpoint) = load_latest_table_checkpoint(table_name).await? else {
+        return Ok(MongoCollectionMetadataStats::default());
+    };
+    let Some(iceberg_metadata) = checkpoint.iceberg_metadata.as_ref() else {
+        return Ok(MongoCollectionMetadataStats::default());
+    };
+
+    let storage_size_bytes = iceberg_metadata.files.sizes.iter().copied().sum::<u64>();
+    let document_count = if iceberg_metadata.file_stats.is_empty() {
+        None
+    } else {
+        iceberg_metadata
+            .file_stats
+            .iter()
+            .try_fold(0u64, |running_total, file_stats| {
+                file_stats
+                    .record_count
+                    .map(|record_count| running_total.saturating_add(record_count))
+            })
+    };
+
+    Ok(MongoCollectionMetadataStats {
+        storage_size_bytes,
+        document_count,
+    })
+}
+
 async fn load_table_description(table_name: &str) -> Result<TableDescription, MongoCommandError> {
     STATE_PROVIDER
         .describe_table(&table_name.to_string())
@@ -961,6 +1272,26 @@ async fn load_table_description(table_name: &str) -> Result<TableDescription, Mo
         .ok_or_else(|| {
             MongoCommandError::namespace_not_found(format!("Table {} was not found", table_name))
         })
+}
+
+async fn load_latest_table_checkpoint(
+    table_name: &str,
+) -> Result<Option<TableMetadataCheckpoint>, MongoCommandError> {
+    let checkpoint_id = STATE_PROVIDER
+        .get_latest_servable_checkpoint(&table_name.to_string())
+        .await
+        .map_err(service_error)?;
+    let Some(checkpoint_id) = checkpoint_id else {
+        return Ok(None);
+    };
+
+    STATE_PROVIDER
+        .get_checkpoint(CheckpointDescriptor::new(
+            table_name.to_string(),
+            checkpoint_id,
+        ))
+        .await
+        .map_err(service_error)
 }
 
 fn validate_command_database(
@@ -982,9 +1313,33 @@ fn validate_command_database(
     }
 }
 
+#[cfg(test)]
+pub(crate) fn reset_mongodb_cursor_state_for_tests() {
+    MONGO_CURSOR_IDS.store(1, Ordering::Relaxed);
+    MONGO_CURSORS
+        .lock()
+        .expect("Mongo cursor registry lock poisoned")
+        .clear();
+    *MONGO_TEST_CURSOR_NOW_MS
+        .lock()
+        .expect("Mongo cursor test clock lock poisoned") = None;
+}
+
+#[cfg(test)]
+pub(crate) fn set_mongodb_cursor_time_for_tests(now_ms: Option<i64>) {
+    *MONGO_TEST_CURSOR_NOW_MS
+        .lock()
+        .expect("Mongo cursor test clock lock poisoned") = now_ms;
+}
+
+#[cfg(test)]
+pub(crate) fn mongodb_cursor_timeout_ms_for_tests() -> i64 {
+    MONGO_CURSOR_TIMEOUT_MS
+}
+
 async fn load_table_schema(table_name: &str) -> Result<PowdrrSchema, MongoCommandError> {
     let checkpoint_id = STATE_PROVIDER
-        .get_latest_checkpoint(&table_name.to_string(), None)
+        .get_latest_servable_checkpoint(&table_name.to_string())
         .await
         .map_err(service_error)?
         .ok_or_else(|| {

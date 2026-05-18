@@ -4,21 +4,26 @@ use crate::data_contract::{
     SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription, TableMetadataCheckpoint,
 };
 use crate::dynamodb::{
-    DynamoDbConnector, PowdrrNamedCleanupWorkItemCache, PowdrrNamedCompactionCommitCache,
-    PowdrrNamedCompactionWorkItemCache, PowdrrNamedExtensionCommitCache,
-    PowdrrNamedExtensionWorkItemCache, PowdrrNamedIcebergCommitCache, PowdrrNamedOrgInfoCache,
-    PowdrrNamedSpeedboatCommitCache, PowdrrNamedTableMetadataCheckpointCache, TableBody,
+    DynamoDbConnector, EntityVersionInfo, PowdrrNamedCleanupWorkItemCache,
+    PowdrrNamedCompactionCommitCache, PowdrrNamedCompactionWorkItemCache,
+    PowdrrNamedExtensionCommitCache, PowdrrNamedExtensionWorkItemCache,
+    PowdrrNamedIcebergCommitCache, PowdrrNamedOrgInfoCache, PowdrrNamedSpeedboatCommitCache,
+    PowdrrNamedTableMetadataCheckpointCache, TableBody,
 };
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
-use crate::metadata_store::{CheckpointUpdateRequest, ClaimedCleanupWorkItem, ClaimedCompactionWorkItem, ClaimedExtensionWorkItem, MetadataClaimKind, MetadataStore, PublishedCheckpointRecord, PublishedCheckpointSelector};
+use crate::metadata_store::{
+    CheckpointUpdateRequest, ClaimedCleanupWorkItem, ClaimedCompactionWorkItem,
+    ClaimedExtensionWorkItem, MetadataClaimKind, MetadataStore, PublishedCheckpointRecord,
+    PublishedCheckpointSelector,
+};
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
 use crate::state_provider::ServiceApiError;
 use crate::test_api::{StateMode, TestProcessingMode};
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_dynamodb::Client;
-use modyne::model::TransactWrite;
 use modyne::TestTableExt;
+use modyne::model::TransactWrite;
 use std::collections::{HashMap, HashSet};
 
 const LEASE_LENGTH_MS: i64 = 60 * 1000; // 1 minute
@@ -40,7 +45,6 @@ pub struct DynamoDBServiceImpl {
     extension_work_item_cache: PowdrrNamedExtensionWorkItemCache,
     compaction_work_item_cache: PowdrrNamedCompactionWorkItemCache,
     org_cache: PowdrrNamedOrgInfoCache,
-    update_cache: Vec<(String, String)>,
 }
 
 static MANAGEMENT_ORG_ID: &'static str = "MANAGEMENT_ORG";
@@ -96,7 +100,6 @@ impl DynamoDBServiceImpl {
             extension_work_item_cache: PowdrrNamedExtensionWorkItemCache::new(),
             compaction_work_item_cache: PowdrrNamedCompactionWorkItemCache::new(),
             org_cache: PowdrrNamedOrgInfoCache::new(),
-            update_cache: Vec::new(),
         }
     }
 
@@ -119,18 +122,72 @@ impl DynamoDBServiceImpl {
         format!("compaction_work_item#{}", table_name)
     }
 
+    fn checkpoint_publication_request_key(org_id: &String, table_name: &String) -> String {
+        format!("checkpoint_publication_request#{}#{}", org_id, table_name)
+    }
+
+    fn parse_checkpoint_publication_request_key(key: &String) -> Option<(String, String)> {
+        let raw = key.strip_prefix("checkpoint_publication_request#")?;
+        let (org_id, table_name) = raw.split_once('#')?;
+        Some((org_id.to_string(), table_name.to_string()))
+    }
+
     const NO_WORK_ITEM: &'static str = "-1";
 
-    fn enqueue_checkpoint_update(&mut self, org_id: &String, table_name: &String) -> () {
-        if !self
-            .update_cache
-            .iter()
-            .any(|(cached_org_id, cached_table_name)| {
-                cached_org_id == org_id && cached_table_name == table_name
-            })
-        {
-            self.update_cache.push((org_id.clone(), table_name.clone()));
+    async fn checkpoint_publication_requests(
+        &mut self,
+    ) -> Result<Vec<EntityVersionInfo>, ServiceApiError> {
+        let entities = self
+            .connector
+            .fetch_entities(&MANAGEMENT_ORG_ID.to_string(), &"latest".to_string(), None)
+            .await
+            .map_err(from_modyne)?;
+
+        let mut requests = vec![];
+        for entity in entities.entities.iter() {
+            if !entity
+                .entity_id
+                .starts_with("checkpoint_publication_request#")
+            {
+                continue;
+            }
+
+            let request = self
+                .connector
+                .describe_latest(&MANAGEMENT_ORG_ID.to_string(), &entity.entity_id)
+                .await
+                .map_err(from_modyne)?;
+            if let Some(request) = request {
+                if request.entity_id != Self::NO_WORK_ITEM {
+                    requests.push(request);
+                }
+            }
         }
+
+        Ok(requests)
+    }
+
+    async fn checkpoint_publication_still_pending(
+        &mut self,
+        org_id: &String,
+        table_name: &String,
+    ) -> Result<bool, ServiceApiError> {
+        if !self
+            .connector
+            .oldest_available_speedboat_commit_checkpointed(org_id, table_name, Some(1), None)
+            .await
+            .map_err(from_modyne)?
+            .is_empty()
+        {
+            return Ok(true);
+        }
+
+        Ok(!self
+            .connector
+            .oldest_available_checkpoint_waiting_for_extension(org_id, table_name, Some(1), None)
+            .await
+            .map_err(from_modyne)?
+            .is_empty())
     }
 
     pub async fn add_checkpoint(
@@ -138,17 +195,13 @@ impl DynamoDBServiceImpl {
         org_info: &OrgInfo,
         metadata: &TableMetadataCheckpoint,
     ) -> Result<(), ServiceApiError> {
-        self.create_table(
-            org_info,
-            &CreateTable {
-                name: metadata.table_name.clone(),
-                tags: Default::default(),
-                serving: None,
-                dynamodb: None,
-                mongodb: None,
-            },
-        )
-        .await?;
+        self.create_table(org_info, &CreateTable {
+            name: metadata.table_name.clone(),
+            tags: Default::default(),
+            serving: None,
+            dynamodb: None,
+            mongodb: None,
+        }).await?;
         if metadata.speedboat_metadata.is_some() {
             self.speedboat_commit(
                 org_info,
@@ -232,6 +285,25 @@ impl DynamoDBServiceImpl {
             .map_err(from_modyne)
     }
 
+    pub async fn upsert_table_metadata(
+        &mut self,
+        org_info: &OrgInfo,
+        create_table: &CreateTable,
+    ) -> Result<bool, ServiceApiError> {
+        self.connector
+            .upsert_table_helper(
+                &org_info.org_id.to_string(),
+                &create_table.name,
+                &TableBody {
+                    tags: create_table.tags.clone(),
+                    serving: create_table.serving.clone(),
+                    dynamodb: create_table.dynamodb.clone(),
+                    mongodb: create_table.mongodb.clone(),
+                },
+            )
+            .await
+            .map_err(from_modyne)
+    }
     pub async fn describe_table(
         &mut self,
         org_info: &OrgInfo,
@@ -399,7 +471,14 @@ impl DynamoDBServiceImpl {
             .await
             .map_err(from_modyne)?;
         if retval {
-            MetadataStore::queue_checkpoint_publication(self, &CheckpointUpdateRequest::new(org_info.org_id.clone(), commit.type_files[0].table_name.clone())).await?;
+            MetadataStore::queue_checkpoint_publication(
+                self,
+                &CheckpointUpdateRequest::new(
+                    org_info.org_id.clone(),
+                    commit.type_files[0].table_name.clone(),
+                ),
+            )
+            .await?;
         }
         Ok(retval)
     }
@@ -469,7 +548,11 @@ impl DynamoDBServiceImpl {
             .await
             .map_err(from_modyne)?;
         if retval {
-            MetadataStore::queue_checkpoint_publication(self, &CheckpointUpdateRequest::new(org_info.org_id.clone(), table_name.clone())).await?;
+            MetadataStore::queue_checkpoint_publication(
+                self,
+                &CheckpointUpdateRequest::new(org_info.org_id.clone(), table_name.clone()),
+            )
+            .await?;
         }
         Ok(retval)
     }
@@ -486,7 +569,11 @@ impl DynamoDBServiceImpl {
             .await
             .map_err(from_modyne)?;
         if retval {
-            MetadataStore::queue_checkpoint_publication(self, &CheckpointUpdateRequest::new(org_info.org_id.clone(), table_name.clone())).await?;
+            MetadataStore::queue_checkpoint_publication(
+                self,
+                &CheckpointUpdateRequest::new(org_info.org_id.clone(), table_name.clone()),
+            )
+            .await?;
         }
         Ok(retval)
     }
@@ -796,11 +883,38 @@ impl DynamoDBServiceImpl {
 
     pub async fn update_all_checkpoints(&mut self) -> Result<bool, ServiceApiError> {
         let mut work_done = false;
-        for (org_id, table_name) in self.update_cache.clone().iter() {
-            work_done = work_done | self.update_standard_checkpoint(org_id, table_name).await?;
-            work_done = work_done | self.update_extension_checkpoint(org_id, table_name).await?;
+        for request in self.checkpoint_publication_requests().await?.iter() {
+            let (org_id, table_name) =
+                match Self::parse_checkpoint_publication_request_key(&request.key) {
+                    Some(parsed) => parsed,
+                    None => continue,
+                };
+
+            work_done = work_done
+                | self
+                    .update_standard_checkpoint(&org_id, &table_name)
+                    .await?;
+            work_done = work_done
+                | self
+                    .update_extension_checkpoint(&org_id, &table_name)
+                    .await?;
+
+            if !self
+                .checkpoint_publication_still_pending(&org_id, &table_name)
+                .await?
+            {
+                let transaction = DynamoDbConnector::bump_version(
+                    TransactWrite::new(),
+                    request,
+                    &Self::NO_WORK_ITEM.to_string(),
+                );
+                let _ = self
+                    .connector
+                    .commit_conditional_transaction(transaction)
+                    .await
+                    .map_err(from_modyne)?;
+            }
         }
-        self.update_cache.clear();
         Ok(work_done)
     }
 
@@ -1071,42 +1185,115 @@ impl DynamoDBServiceImpl {
 
 #[async_trait::async_trait]
 impl MetadataStore for DynamoDBServiceImpl {
-    async fn queue_checkpoint_publication(&mut self, request: &CheckpointUpdateRequest) -> Result<(), ServiceApiError> {
-        self.enqueue_checkpoint_update(&request.org_id, &request.table_name);
+    async fn queue_checkpoint_publication(
+        &mut self,
+        request: &CheckpointUpdateRequest,
+    ) -> Result<(), ServiceApiError> {
+        let management_org_id = MANAGEMENT_ORG_ID.to_string();
+        let key = Self::checkpoint_publication_request_key(&request.org_id, &request.table_name);
+
+        match self
+            .connector
+            .describe_latest(&management_org_id, &key)
+            .await
+            .map_err(from_modyne)?
+        {
+            Some(existing) => {
+                let transaction =
+                    DynamoDbConnector::bump_version(TransactWrite::new(), &existing, &key);
+                let _ = self
+                    .connector
+                    .commit_conditional_transaction(transaction)
+                    .await
+                    .map_err(from_modyne)?;
+            }
+            None => {
+                let _ = self
+                    .connector
+                    .create_latest(
+                        &management_org_id,
+                        &key,
+                        &EntityVersionInfo::new(&management_org_id, &key, &key),
+                    )
+                    .await
+                    .map_err(from_modyne)?;
+            }
+        }
         Ok(())
     }
 
-    async fn get_published_checkpoint_record(&mut self, org_info: &OrgInfo, selector: &PublishedCheckpointSelector) -> Result<Option<PublishedCheckpointRecord>, ServiceApiError> {
-        Ok(DynamoDBServiceImpl::get_latest_committed_checkpoint(self, org_info, &selector.table_name, selector.extension.clone()).await?.map(|checkpoint_id|PublishedCheckpointRecord {
+    async fn get_published_checkpoint_record(
+        &mut self,
+        org_info: &OrgInfo,
+        selector: &PublishedCheckpointSelector,
+    ) -> Result<Option<PublishedCheckpointRecord>, ServiceApiError> {
+        Ok(DynamoDBServiceImpl::get_latest_committed_checkpoint(
+            self,
+            org_info,
+            &selector.table_name,
+            selector.extension.clone(),
+        )
+        .await?
+        .map(|checkpoint_id| PublishedCheckpointRecord {
             selector: selector.clone(),
             checkpoint_id,
         }))
     }
 
-    async fn get_checkpoint_metadata(&mut self, org_info: &OrgInfo, checkpoint: &CheckpointDescriptor) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
+    async fn get_checkpoint_metadata(
+        &mut self,
+        org_info: &OrgInfo,
+        checkpoint: &CheckpointDescriptor,
+    ) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
         DynamoDBServiceImpl::get_checkpoint(self, org_info, checkpoint).await
     }
 
-    async fn claim_extension_work_items(&mut self, org_info: &OrgInfo, extension_type: &String) -> Result<Vec<ClaimedExtensionWorkItem>, ServiceApiError> {
-        Ok(DynamoDBServiceImpl::get_extension_work_items(self, org_info, extension_type).await?.into_iter().map(|work_item|ClaimedExtensionWorkItem {
-            claim: MetadataClaimKind::Leased,
-            work_item,
-        }).collect())
+    async fn claim_extension_work_items(
+        &mut self,
+        org_info: &OrgInfo,
+        extension_type: &String,
+    ) -> Result<Vec<ClaimedExtensionWorkItem>, ServiceApiError> {
+        Ok(
+            DynamoDBServiceImpl::get_extension_work_items(self, org_info, extension_type)
+                .await?
+                .into_iter()
+                .map(|work_item| ClaimedExtensionWorkItem {
+                    claim: MetadataClaimKind::Leased,
+                    work_item,
+                })
+                .collect(),
+        )
     }
 
-    async fn claim_compaction_work_items(&mut self, org_info: &OrgInfo) -> Result<Vec<ClaimedCompactionWorkItem>, ServiceApiError> {
-        Ok(DynamoDBServiceImpl::get_compaction_work_items(self, org_info).await?.into_iter().map(|(table_name, work_item)|ClaimedCompactionWorkItem {
-            claim: MetadataClaimKind::Leased,
-            table_name,
-            work_item,
-        }).collect())
+    async fn claim_compaction_work_items(
+        &mut self,
+        org_info: &OrgInfo,
+    ) -> Result<Vec<ClaimedCompactionWorkItem>, ServiceApiError> {
+        Ok(
+            DynamoDBServiceImpl::get_compaction_work_items(self, org_info)
+                .await?
+                .into_iter()
+                .map(|(table_name, work_item)| ClaimedCompactionWorkItem {
+                    claim: MetadataClaimKind::Leased,
+                    table_name,
+                    work_item,
+                })
+                .collect(),
+        )
     }
 
-    async fn claim_cleanup_work_items(&mut self, org_info: &OrgInfo) -> Result<Vec<ClaimedCleanupWorkItem>, ServiceApiError> {
-        Ok(DynamoDBServiceImpl::get_cleanup_work_items(self, org_info).await?.into_iter().map(|work_item|ClaimedCleanupWorkItem {
-            claim: MetadataClaimKind::Leased,
-            work_item,
-        }).collect())
+    async fn claim_cleanup_work_items(
+        &mut self,
+        org_info: &OrgInfo,
+    ) -> Result<Vec<ClaimedCleanupWorkItem>, ServiceApiError> {
+        Ok(DynamoDBServiceImpl::get_cleanup_work_items(self, org_info)
+            .await?
+            .into_iter()
+            .map(|work_item| ClaimedCleanupWorkItem {
+                claim: MetadataClaimKind::Leased,
+                work_item,
+            })
+            .collect())
     }
 
     async fn advance_published_checkpoints(&mut self) -> Result<bool, ServiceApiError> {
@@ -1179,12 +1366,24 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            service_impl.update_cache.clone(),
-            vec![(org_info.org_id.clone(), table_name.clone())]
-        );
+        let request_key =
+            DynamoDBServiceImpl::checkpoint_publication_request_key(&org_info.org_id, &table_name);
+        let mut request = service_impl
+            .connector
+            .describe_latest(&MANAGEMENT_ORG_ID.to_string(), &request_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.entity_id, request_key);
+
         assert!(!service_impl.update_all_checkpoints().await.unwrap());
-        assert!(service_impl.update_cache.is_empty());
+        request = service_impl
+            .connector
+            .describe_latest(&MANAGEMENT_ORG_ID.to_string(), &request_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.entity_id, request_key);
 
         let work_items = service_impl
             .get_extension_work_items(&org_info, &"es".to_string())
@@ -1213,12 +1412,22 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            service_impl.update_cache.clone(),
-            vec![(org_info.org_id.clone(), table_name.clone())]
-        );
+        request = service_impl
+            .connector
+            .describe_latest(&MANAGEMENT_ORG_ID.to_string(), &request_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.entity_id, request_key);
 
         assert!(service_impl.update_all_checkpoints().await.unwrap());
+        request = service_impl
+            .connector
+            .describe_latest(&MANAGEMENT_ORG_ID.to_string(), &request_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.entity_id, DynamoDBServiceImpl::NO_WORK_ITEM);
 
         let latest_extension_checkpoint = service_impl
             .get_latest_committed_checkpoint(&org_info, &table_name, Some("es".to_string()))

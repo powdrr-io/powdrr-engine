@@ -1,20 +1,20 @@
-use std::pin::Pin;
-use std::time::Duration;
+use crate::checkpoint_updater::ensure_checkpoint_updater_started;
+use crate::service_impl_provider::SERVICE_IMPL;
+use crate::v1_handlers;
 use futures_util::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
 use gotham::hyper::{body, Body, StatusCode};
 use gotham::mime;
 use gotham::pipeline::{new_pipeline, single_pipeline};
-use gotham::prelude::{DefineSingleRoute, DrawRoutes, FromState, StateData, StaticResponseExtender};
+use gotham::prelude::{
+    DefineSingleRoute, DrawRoutes, FromState, StateData, StaticResponseExtender,
+};
 use gotham::router::{build_router, Router};
 use gotham::state::State;
-use serde::{Deserialize};
 use powdrr_service_lib::data_contract::ServiceMode;
-use crate::service_impl_provider::SERVICE_IMPL;
-use crate::v1_handlers;
-
-
+use serde::Deserialize;
+use std::pin::Pin;
 
 #[derive(Deserialize, StateData, StaticResponseExtender)]
 pub struct NamePathExtractor {
@@ -36,48 +36,68 @@ pub fn router(include_test_apis: bool) -> Router {
         route.scope("/api", |route| {
             route.scope("/v1", |route| {
                 route.post("/create_table").to(v1_handlers::create_table);
-                route.get("/describe_table/:name")
+                route
+                    .get("/describe_table/:name")
                     .with_path_extractor::<NamePathExtractor>()
                     .to(v1_handlers::describe_table);
                 route.post("/add_alias").to(v1_handlers::add_alias);
                 route.post("/remove_alias").to(v1_handlers::remove_alias);
-                route.post("/create_table_template/:name")
+                route
+                    .post("/create_table_template/:name")
                     .with_path_extractor::<NamePathExtractor>()
                     .to(v1_handlers::create_table_template);
-                route.get("/describe_table_template/:name")
+                route
+                    .get("/describe_table_template/:name")
                     .with_path_extractor::<NamePathExtractor>()
                     .to(v1_handlers::describe_table_template);
-                route.post("/create_pipeline/:name")
+                route
+                    .post("/create_pipeline/:name")
                     .with_path_extractor::<NamePathExtractor>()
                     .to(v1_handlers::create_pipeline);
-                route.get("/describe_pipeline/:name")
+                route
+                    .get("/describe_pipeline/:name")
                     .with_path_extractor::<NamePathExtractor>()
                     .to(v1_handlers::describe_pipeline);
-                route.post("/create_lifetime_policy/:name")
+                route
+                    .post("/create_lifetime_policy/:name")
                     .with_path_extractor::<NamePathExtractor>()
                     .to(v1_handlers::create_lifetime_policy);
-                route.post("/describe_lifetime_policy/:name")
+                route
+                    .post("/describe_lifetime_policy/:name")
                     .with_path_extractor::<NamePathExtractor>()
                     .to(v1_handlers::describe_lifetime_policy);
-                route.post("/speedboat_commit").to(v1_handlers::speedboat_commit);
-                route.post("/iceberg_commit/:name")
+                route
+                    .post("/speedboat_commit")
+                    .to(v1_handlers::speedboat_commit);
+                route
+                    .post("/iceberg_commit/:name")
                     .with_path_extractor::<NamePathExtractor>()
                     .to(v1_handlers::iceberg_commit);
-                route.post("/extension_commit/:name")
+                route
+                    .post("/extension_commit/:name")
                     .with_path_extractor::<NamePathExtractor>()
                     .to(v1_handlers::extension_commit);
-                route.post("/compaction_commit/:name")
+                route
+                    .post("/compaction_commit/:name")
                     .with_path_extractor::<NamePathExtractor>()
                     .to(v1_handlers::compaction_commit);
-                route.post("/cleanup_commit")
+                route
+                    .post("/cleanup_commit")
                     .to(v1_handlers::cleanup_commit);
-                route.get("/get_latest_checkpoint").to(v1_handlers::get_latest_checkpoint);
+                route
+                    .get("/get_latest_checkpoint")
+                    .to(v1_handlers::get_latest_checkpoint);
                 route.get("/get_checkpoint").to(v1_handlers::get_checkpoint);
-                route.get("/get_extension_work_items/:name")
+                route
+                    .get("/get_extension_work_items/:name")
                     .with_path_extractor::<NamePathExtractor>()
                     .to(v1_handlers::get_extension_work_items);
-                route.get("/get_compaction_work_items").to(v1_handlers::get_compaction_work_items);
-                route.get("/get_cleanup_work_items").to(v1_handlers::get_cleanup_work_items);
+                route
+                    .get("/get_compaction_work_items")
+                    .to(v1_handlers::get_compaction_work_items);
+                route
+                    .get("/get_cleanup_work_items")
+                    .to(v1_handlers::get_cleanup_work_items);
             })
         });
         route.scope("/management", |route| {
@@ -93,29 +113,8 @@ pub fn router(include_test_apis: bool) -> Router {
                 })
             });
         }
-
     })
 }
-
-
-fn do_update_checkpoint_work_for_forever(wait_time_ms: u64) -> impl Future<Output = ()> {
-    async move {
-        let mut work_done;
-        loop {
-            match SERVICE_IMPL.update_all_checkpoints().await {
-                Ok(checkpoint_work_done) => work_done = checkpoint_work_done,
-                Err(e) => {
-                    tracing::error!("Error updating checkpoints: {}", e);
-                    work_done = false;
-                }
-            };
-            if !work_done {
-                tokio::time::sleep(Duration::from_millis(wait_time_ms)).await;
-            }
-        }
-    }
-}
-
 
 pub fn set_mode(mut state: State) -> Pin<Box<HandlerFuture>> {
     async move {
@@ -129,7 +128,7 @@ pub fn set_mode(mut state: State) -> Pin<Box<HandlerFuture>> {
             Err(_) => panic!("This should not happen"),
         };
 
-        tokio::spawn(do_update_checkpoint_work_for_forever(1000));
+        ensure_checkpoint_updater_started();
         match SERVICE_IMPL.set_mode(invocation_obj).await {
             Ok(_) => {
                 let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "OK");
@@ -137,6 +136,6 @@ pub fn set_mode(mut state: State) -> Pin<Box<HandlerFuture>> {
             }
             Err(_) => panic!("Oh no"),
         }
-
-    }.boxed()
+    }
+    .boxed()
 }

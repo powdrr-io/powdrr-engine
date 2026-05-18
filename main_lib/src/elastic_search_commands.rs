@@ -95,7 +95,7 @@ impl LookupById {
 
     async fn current_target_snapshots(&self) -> Vec<CheckpointDescriptor> {
         let checkpoint_id = STATE_PROVIDER
-            .get_latest_checkpoint(&self.table, None)
+            .get_latest_servable_checkpoint(&self.table)
             .await
             .unwrap();
         match checkpoint_id {
@@ -191,7 +191,7 @@ impl SqlCommand {
                     Err(e) => {
                         return Err(CommandError {
                             message: e.to_string(),
-                        })
+                        });
                     }
                 };
 
@@ -200,7 +200,7 @@ impl SqlCommand {
                 Err(e) => {
                     return Err(CommandError {
                         message: e.to_string(),
-                    })
+                    });
                 }
             };
 
@@ -220,7 +220,7 @@ impl SqlCommand {
                     Err(e) => {
                         return Err(CommandError {
                             message: e.to_string(),
-                        })
+                        });
                     }
                 };
             let records_with_term = num_records_with_term as f64;
@@ -244,7 +244,7 @@ impl SqlCommand {
                 Err(e) => {
                     return Err(CommandError {
                         message: e.to_string(),
-                    })
+                    });
                 }
             };
             Ok(None)
@@ -272,12 +272,8 @@ impl SqlCommand {
     }
 
     async fn current_target_snapshots(&self) -> Vec<CheckpointDescriptor> {
-        let extension = match self.calculate_score {
-            true => Some("es".to_string()),
-            false => None,
-        };
         let checkpoint_id = match STATE_PROVIDER
-            .get_latest_checkpoint(&self.table, extension)
+            .get_latest_servable_checkpoint(&self.table)
             .await
         {
             Ok(c) => match c {
@@ -324,7 +320,7 @@ impl Command for SqlCommand {
                         aggs,
                         !query_params.rest_total_hits_as_int.unwrap_or_else(|| false),
                     )
-                    .await)
+                    .await);
                 }
             };
             let created_table_name =
@@ -342,7 +338,7 @@ impl Command for SqlCommand {
                     Err(e) => {
                         return Err(CommandError {
                             message: e.to_string(),
-                        })
+                        });
                     }
                 };
             let num_records = batches.iter().map(|x| x.num_rows()).sum::<usize>();
@@ -553,7 +549,7 @@ impl Command for UpdateByQueryCommand {
                 Err(e) => {
                     return Err(CommandError {
                         message: e.to_string(),
-                    })
+                    });
                 }
             };
 

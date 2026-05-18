@@ -11,8 +11,8 @@ use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use idgenerator::IdInstance;
 use modyne::expr::Filter;
 use modyne::{
-    expr, keys, model::TransactWrite, projections, read_projection, Aggregate, Entity, EntityExt,
-    Error, Item, ProjectionExt, QueryInput, QueryInputExt, Table,
+    Aggregate, Entity, EntityExt, Error, Item, ProjectionExt, QueryInput, QueryInputExt, Table,
+    expr, keys, model::TransactWrite, projections, read_projection,
 };
 use std::collections::HashMap;
 
@@ -660,7 +660,7 @@ impl DynamoDbConnector {
 
     const NO_WORK_ITEM: &'static str = "-1";
 
-    fn bump_version(
+    pub(crate) fn bump_version(
         transaction: TransactWrite,
         old: &EntityVersionInfo,
         new_entity_id: &String,
@@ -744,6 +744,27 @@ impl DynamoDbConnector {
                 &Self::latest_compaction_work_item_key(table_name),
                 &Self::NO_WORK_ITEM.to_owned(),
             ),
+        );
+        self.commit_conditional_transaction(transaction).await
+    }
+
+    pub async fn upsert_table_helper(
+        &mut self,
+        org_id: &String,
+        table_name: &String,
+        table_body: &TableBody,
+    ) -> Result<bool, Error> {
+        if self.describe_powdrr_table(org_id, table_name).await?.is_none() {
+            return self.create_table_helper(org_id, table_name, table_body).await;
+        }
+
+        let expression = expr::Update::new("SET entity = :entity").value(":entity", table_body);
+        let transaction = TransactWrite::new().operation(
+            PowdrrNamedTableBody::update(OrgIdNameInput {
+                org_id,
+                name: table_name,
+            })
+            .expression(expression),
         );
         self.commit_conditional_transaction(transaction).await
     }
@@ -1044,6 +1065,15 @@ impl DynamoDbConnector {
             entity: new_checkpoint.clone(),
         };
         transaction = transaction.operation(checkpoint_obj.create());
+        if !new_checkpoint.fully_covered_for_extension(&"es".to_string()) {
+            transaction = Self::create_checkpoint_waiting_for_extension_core(
+                transaction,
+                org_id,
+                &new_checkpoint.table_name,
+                &new_checkpoint.get_descriptor().full_name(),
+                None,
+            );
+        }
 
         // Step 3
         let latest_es_key = &Self::latest_extension_work_item_key(&table_name, &"es".to_string());
@@ -1101,9 +1131,11 @@ impl DynamoDbConnector {
             cloned_checkpoint_to_replace.checkpoint_id = IdInstance::next_id().to_string();
             cloned_checkpoint_to_replace
                 .apply_compaction_for_replacement(compaction_commit, &commit.metadata);
-            assert!(cloned_checkpoint_to_replace
-                .original_checkpoint_id
-                .is_none());
+            assert!(
+                cloned_checkpoint_to_replace
+                    .original_checkpoint_id
+                    .is_none()
+            );
             cloned_checkpoint_to_replace.original_checkpoint_id =
                 Some(compaction_commit.checkpoint_id_to_replace.clone());
 

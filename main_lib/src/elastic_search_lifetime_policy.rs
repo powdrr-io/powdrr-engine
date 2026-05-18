@@ -1,74 +1,23 @@
-use std::collections::HashMap;
-use std::pin::Pin;
-use futures_util::FutureExt;
-use gotham::handler::HandlerFuture;
-use gotham::helpers::http::response::create_response;
-use gotham::hyper::{body, Body};
-use gotham::mime;
-use gotham::prelude::FromState;
-use gotham::state::State;
-use http::StatusCode;
-use serde::{Deserialize, Serialize};
 use crate::elastic_search_common::MIME_ES_JSON;
 use crate::elastic_search_endpoints::NamePathExtractor;
 use crate::elastic_search_responses::{ErrorDetails, SingleDocCreateFailedResult};
 use crate::state_provider::STATE_PROVIDER;
 use crate::util::log_service_err_response;
+use futures_util::FutureExt;
+use gotham::handler::HandlerFuture;
+use gotham::helpers::http::response::create_response;
+use gotham::hyper::{Body, body};
+use gotham::mime;
+use gotham::prelude::FromState;
+use gotham::state::State;
+use http::StatusCode;
+use std::collections::HashMap;
+use std::pin::Pin;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ILMPolicyDeleteAction {}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ILMPolicyDelete {
-    pub min_age: String,
-    pub actions: ILMPolicyActions,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ILMPolicyRolloverAction {
-    pub max_size: Option<String>,
-    pub max_age: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ILMPolicyActions {
-    pub rollover: Option<ILMPolicyRolloverAction>,
-    pub delete: Option<ILMPolicyDeleteAction>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ILMPolicyHot {
-    pub actions: ILMPolicyActions,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ILMPolicyPhases {
-    pub hot: Option<ILMPolicyHot>,
-    pub delete: Option<ILMPolicyDelete>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ILMPolicyMeta {
-    pub managed: bool,
-    pub index_patterns: Option<Vec<String>>,
-    pub version: Option<i64>,
-    pub created_by: Option<String>,
-    pub updated_by: Option<String>,
-    pub description: Option<String>,
-    pub generation: Option<i64>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ILMPolicyPolicy {
-    pub _meta: Option<ILMPolicyMeta>,
-    pub phases: ILMPolicyPhases,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ILMPolicyDefinition {
-    pub policy: ILMPolicyPolicy,
-}
-
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../shared/service_control_plane/ilm_policy.rs"
+));
 
 pub fn es_get_ilm_policy(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_get_ilm_policy");
@@ -80,9 +29,14 @@ pub fn es_get_ilm_policy(state: State) -> Pin<Box<HandlerFuture>> {
         match STATE_PROVIDER.describe_lifetime_policy(&table).await {
             Ok(lp) => match lp {
                 Some(_) => {
-                    let res = create_response(&state, StatusCode::OK, mime::APPLICATION_JSON, "{}".to_string());
+                    let res = create_response(
+                        &state,
+                        StatusCode::OK,
+                        mime::APPLICATION_JSON,
+                        "{}".to_string(),
+                    );
                     Ok((state, res))
-                },
+                }
                 None => {
                     let response = SingleDocCreateFailedResult {
                         error: ErrorDetails::single_cause(
@@ -94,16 +48,20 @@ pub fn es_get_ilm_policy(state: State) -> Pin<Box<HandlerFuture>> {
                         ),
                         status: 404,
                     };
-                    let res = create_response(&state, StatusCode::NOT_FOUND, mime::APPLICATION_JSON, serde_json::to_string(&response).unwrap());
+                    let res = create_response(
+                        &state,
+                        StatusCode::NOT_FOUND,
+                        mime::APPLICATION_JSON,
+                        serde_json::to_string(&response).unwrap(),
+                    );
                     Ok((state, res))
                 }
             },
-            Err(e) => return Ok(log_service_err_response(e, state))
+            Err(e) => return Ok(log_service_err_response(e, state)),
         }
-
-    }.boxed()
+    }
+    .boxed()
 }
-
 
 pub fn es_post_ilm_policy(mut state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_post_ilm_policy");
@@ -125,14 +83,20 @@ pub fn es_post_ilm_policy(mut state: State) -> Pin<Box<HandlerFuture>> {
 
         match STATE_PROVIDER.create_lifetime_policy(&table, &policy).await {
             Ok(_) => (),
-            Err(e) => return Ok(log_service_err_response(e, state))
+            Err(e) => return Ok(log_service_err_response(e, state)),
         };
 
         let response = HashMap::from([("acknowledged", true)]);
 
-        let res = create_response(&state, StatusCode::OK, MIME_ES_JSON.clone(), serde_json::to_string(&response).unwrap());
+        let res = create_response(
+            &state,
+            StatusCode::OK,
+            MIME_ES_JSON.clone(),
+            serde_json::to_string(&response).unwrap(),
+        );
         Ok((state, res))
-    }.boxed()
+    }
+    .boxed()
 }
 
 pub fn es_post_monitoring_bulk(state: State) -> Pin<Box<HandlerFuture>> {
@@ -147,15 +111,14 @@ pub fn es_post_monitoring_bulk(state: State) -> Pin<Box<HandlerFuture>> {
 
         let res = create_response(&state, StatusCode::OK, MIME_ES_JSON.clone(), response_str);
         Ok((state, res))
-    }.boxed()
+    }
+    .boxed()
 }
-
-
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use super::*;
+    use std::fs;
 
     #[test]
     fn test_parse_ilm_body() {
@@ -168,7 +131,10 @@ mod tests {
                 let error = format!("{}", e);
                 let error_str = error.as_str();
                 println!("{}", error_str);
-                let _ = fs::write("/Users/gregory/code/powdrr-engine/main_lib/output.txt", error);
+                let _ = fs::write(
+                    "/Users/gregory/code/powdrr-engine/main_lib/output.txt",
+                    error,
+                );
                 panic!("nope");
             }
         }
@@ -181,10 +147,12 @@ mod tests {
                 let error = format!("{}", e);
                 let error_str = error.as_str();
                 println!("{}", error_str);
-                let _ = fs::write("/Users/gregory/code/powdrr-engine/main_lib/output.txt", error);
+                let _ = fs::write(
+                    "/Users/gregory/code/powdrr-engine/main_lib/output.txt",
+                    error,
+                );
                 panic!("nope");
             }
         }
-
     }
 }
