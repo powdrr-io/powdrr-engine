@@ -7,6 +7,10 @@ publish = false
 readme = "README.md"
 version.workspace = true
 edition.workspace = true
+autotests = false
+
+[features]
+integration-tests = []
 
 
 [dependencies]
@@ -19,6 +23,7 @@ async-trait = "0.1.88"
 aws-config = "1.8.3"
 aws-credential-types = "1.2.4"
 aws-sdk-dynamodb = "1.86.0"
+bson = "2.15.0"
 chrono = "0.4.41"
 datafusion = "53.1.0"
 futures = "0.3.31"
@@ -47,7 +52,7 @@ serde_arrow = { version = "0.14.1", features = ["arrow-58"] }
 serde_dynamo = "4.2.14"
 serde_json = "1.0.140"
 tempfile = "3.20.0"
-tokio = { version = "1.0", features = ["rt-multi-thread"] }
+tokio = { version = "1.0", features = ["io-util", "net", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 ttl_cache = "0.5.1"
@@ -60,4 +65,24 @@ lazy_static = "1.5.0"
 liquid-cache-parquet = { package = "liquid-cache-datafusion-local", git = "https://github.com/XiangpengHao/liquid-cache", rev = "4597d1d1c434100031b00bd743c91d0c70b334d9" }
 
 [dev-dependencies]
+mongodb = "3.3.0"
 reqwest = { version = "0.12.14", default-features = false, features = ["json", "blocking", "rustls-tls"] }
+
+[[test]]
+name = "local_cli_analyze"
+path = "tests/local_cli_analyze.rs"
+
+[[test]]
+name = "es_compatibility_matrix"
+path = "tests/es_compatibility_matrix.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "dynamodb_sdk_compat"
+path = "tests/dynamodb_sdk_compat.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "dynamodb_compatibility_matrix"
+path = "tests/dynamodb_compatibility_matrix.rs"
+required-features = ["integration-tests"]
