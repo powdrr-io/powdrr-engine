@@ -24,6 +24,8 @@ include!(concat!(
     "/../shared/service_control_plane/service_api_error.rs"
 ));
 
+const DEFAULT_SERVABLE_EXTENSION: &str = "es";
+
 impl ServiceApiError {
     pub fn from_reqwest(error: reqwest::Error) -> Self {
         Self::new(format!("Reqwest: {}", error))
@@ -944,6 +946,19 @@ impl StateProviderHandle {
         )
     }
 
+    pub async fn get_latest_servable_checkpoint(
+        &self,
+        table_name: &String,
+    ) -> Result<Option<String>, ServiceApiError> {
+        match self
+            .get_latest_checkpoint(table_name, Some(DEFAULT_SERVABLE_EXTENSION.to_string()))
+            .await?
+        {
+            Some(checkpoint_id) => Ok(Some(checkpoint_id)),
+            None => self.get_latest_checkpoint(table_name, None).await,
+        }
+    }
+
     pub async fn get_checkpoint(
         &self,
         checkpoint: CheckpointDescriptor,
@@ -1020,3 +1035,180 @@ impl StateProviderHandle {
 
 pub static STATE_PROVIDER: std::sync::LazyLock<StateProviderHandle> =
     std::sync::LazyLock::new(|| StateProviderHandle::new());
+
+#[cfg(test)]
+mod tests {
+    use super::STATE_PROVIDER;
+    use crate::data_contract::{
+        ExtensionCommit, ExtensionFile, FileSetPayload, IcebergCommit, IcebergMetadata,
+    };
+    use crate::schema_massager::PowdrrSchema;
+    use crate::test_api::{
+        CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode, StorageMode,
+        TestProcessingMode,
+    };
+    use idgenerator::{IdGeneratorOptions, IdInstance};
+    use std::collections::HashMap;
+    use std::sync::Once;
+
+    static TEST_IDS_INITIALIZED: Once = Once::new();
+
+    fn initialize_ids() {
+        TEST_IDS_INITIALIZED.call_once(|| {
+            let options = IdGeneratorOptions::new().worker_id(1).worker_id_bit_len(6);
+            let _ = IdInstance::init(options);
+        });
+    }
+
+    fn ephemeral_test_mode() -> TestProcessingMode {
+        TestProcessingMode {
+            state_mode: StateMode::Ephemeral,
+            storage_mode: StorageMode::default(),
+            cache_mode: CacheMode::Redis(None),
+            peer_mode: PeerMode::SelfOnly,
+            indexing_mode: IndexingMode::Disabled,
+            compaction_mode: CompactionMode::Disabled,
+            prefetch_mode: PrefetchMode::Disabled,
+        }
+    }
+
+    fn iceberg_commit_for(file_path: &str, snapshot_id: &str) -> IcebergCommit {
+        let schema = PowdrrSchema::minimal();
+        IcebergCommit {
+            metadata: IcebergMetadata {
+                table_schema: schema.clone(),
+                snapshot_id: Some(snapshot_id.to_string()),
+                files: FileSetPayload::single(file_path.to_string(), 1, schema),
+                column_names: vec![],
+                column_stats: vec![],
+                file_stats: vec![],
+            },
+            deletes_table_info: None,
+            compactions: vec![],
+        }
+    }
+
+    fn extension_commit_for(id: &str, file_path: &str, location: &str) -> ExtensionCommit {
+        ExtensionCommit {
+            id: id.to_string(),
+            extension: "es".to_string(),
+            files: HashMap::from([(
+                file_path.to_string(),
+                vec![ExtensionFile {
+                    suffix: "search_index".to_string(),
+                    location: location.to_string(),
+                }],
+            )]),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_latest_servable_checkpoint_falls_back_and_prefers_extension_frontier() {
+        initialize_ids();
+
+        STATE_PROVIDER
+            .set_testing_mode(&ephemeral_test_mode())
+            .await;
+
+        let table_name = "servable_logs".to_string();
+        let first_file = "s3://bucket/logs/first.parquet";
+        let second_file = "s3://bucket/logs/second.parquet";
+
+        STATE_PROVIDER
+            .iceberg_commit(&table_name, &iceberg_commit_for(first_file, "snapshot_1"))
+            .await
+            .unwrap();
+
+        let first_checkpoint = STATE_PROVIDER
+            .get_latest_checkpoint(&table_name, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            STATE_PROVIDER
+                .get_latest_checkpoint(&table_name, Some("es".to_string()))
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            STATE_PROVIDER
+                .get_latest_servable_checkpoint(&table_name)
+                .await
+                .unwrap(),
+            Some(first_checkpoint.clone())
+        );
+
+        STATE_PROVIDER
+            .extension_commit(
+                &table_name,
+                &extension_commit_for("ext_1", first_file, "s3://bucket/logs/first.search"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            STATE_PROVIDER
+                .get_latest_checkpoint(&table_name, Some("es".to_string()))
+                .await
+                .unwrap(),
+            Some(first_checkpoint.clone())
+        );
+        assert_eq!(
+            STATE_PROVIDER
+                .get_latest_servable_checkpoint(&table_name)
+                .await
+                .unwrap(),
+            Some(first_checkpoint.clone())
+        );
+
+        STATE_PROVIDER
+            .iceberg_commit(&table_name, &iceberg_commit_for(second_file, "snapshot_2"))
+            .await
+            .unwrap();
+
+        let second_checkpoint = STATE_PROVIDER
+            .get_latest_checkpoint(&table_name, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(second_checkpoint, first_checkpoint);
+        assert_eq!(
+            STATE_PROVIDER
+                .get_latest_checkpoint(&table_name, Some("es".to_string()))
+                .await
+                .unwrap(),
+            Some(first_checkpoint.clone())
+        );
+        assert_eq!(
+            STATE_PROVIDER
+                .get_latest_servable_checkpoint(&table_name)
+                .await
+                .unwrap(),
+            Some(first_checkpoint.clone())
+        );
+
+        STATE_PROVIDER
+            .extension_commit(
+                &table_name,
+                &extension_commit_for("ext_2", second_file, "s3://bucket/logs/second.search"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            STATE_PROVIDER
+                .get_latest_checkpoint(&table_name, Some("es".to_string()))
+                .await
+                .unwrap(),
+            Some(second_checkpoint.clone())
+        );
+        assert_eq!(
+            STATE_PROVIDER
+                .get_latest_servable_checkpoint(&table_name)
+                .await
+                .unwrap(),
+            Some(second_checkpoint)
+        );
+    }
+}

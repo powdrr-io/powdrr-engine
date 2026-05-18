@@ -4,7 +4,7 @@ use crate::test_api::TestProcessingMode;
 use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -282,6 +282,7 @@ impl TableMetadataCheckpoint {
         self.schema
             .merge_from(&self.iceberg_metadata.as_mut().unwrap().table_schema);
         self.apply_compactions(&iceberg_commit.compactions, compactions_lookup);
+        self.retain_current_extension_metadata();
 
         true
     }
@@ -331,8 +332,6 @@ impl TableMetadataCheckpoint {
                 .files
                 .retain(|x| !compaction.removed_delete_files.contains(x));
         }
-        self.extension_metadata
-            .retain(|key, _| !compaction.removed_speedboat_files.contains(key));
         let file_payload = iceberg_metadata.files.select(&compaction.parquet_file_name);
         let file_stats = iceberg_metadata.select_file_stats(&compaction.parquet_file_name);
         if self.iceberg_metadata.is_none() {
@@ -357,6 +356,7 @@ impl TableMetadataCheckpoint {
                 }
             }
         }
+        self.retain_current_extension_metadata();
     }
 
     fn get_removed_files(
@@ -382,19 +382,15 @@ impl TableMetadataCheckpoint {
     }
 
     pub fn fully_covered_for_extension(&self, extension_name: &String) -> bool {
-        let total_num_files = self
-            .speedboat_metadata
-            .as_ref()
-            .map_or(0, |x| x.files.file_paths.len())
-            + self
-                .iceberg_metadata
-                .as_ref()
-                .map_or(0, |x| x.files.file_paths.len());
+        let current_file_paths = self.current_file_paths();
+        let total_num_files = current_file_paths.len();
 
-        let total_num_extension_files = self
-            .extension_metadata
-            .get(extension_name)
-            .map_or(0, |x| x.len());
+        let total_num_extension_files =
+            self.extension_metadata.get(extension_name).map_or(0, |x| {
+                x.keys()
+                    .filter(|file_path| current_file_paths.contains(*file_path))
+                    .count()
+            });
 
         let size_check_method = total_num_files == total_num_extension_files;
 
@@ -404,6 +400,13 @@ impl TableMetadataCheckpoint {
         );
 
         size_check_method
+    }
+
+    pub fn retain_current_extension_metadata(&mut self) {
+        let current_file_paths = self.current_file_paths();
+        for metadata in self.extension_metadata.values_mut() {
+            metadata.retain(|file_path, _| current_file_paths.contains(file_path));
+        }
     }
 
     fn validate_fully_covered_for_extension(&self, extension_name: &String) -> bool {
@@ -435,6 +438,20 @@ impl TableMetadataCheckpoint {
         };
 
         true
+    }
+
+    fn current_file_paths(&self) -> HashSet<String> {
+        let mut file_paths = HashSet::new();
+
+        if let Some(iceberg_metadata) = &self.iceberg_metadata {
+            file_paths.extend(iceberg_metadata.files.file_paths.iter().cloned());
+        }
+
+        if let Some(speedboat_metadata) = &self.speedboat_metadata {
+            file_paths.extend(speedboat_metadata.files.file_paths.iter().cloned());
+        }
+
+        file_paths
     }
 
     pub fn add_coverage(&mut self, extension_commit: &ExtensionCommit) -> bool {

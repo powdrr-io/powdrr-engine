@@ -98,6 +98,7 @@ impl EphemeralServiceImpl {
         extension_name: &String,
         metadata: &mut TableMetadataCheckpoint,
     ) -> (FileSetPayload, FileSetPayload) {
+        metadata.retain_current_extension_metadata();
         if !metadata.extension_metadata.contains_key(extension_name) {
             metadata
                 .extension_metadata
@@ -1072,15 +1073,17 @@ impl MetadataStore for EphemeralServiceImpl {
         &mut self,
         org_info: &OrgInfo,
     ) -> Result<Vec<ClaimedCompactionWorkItem>, ServiceApiError> {
-        Ok(EphemeralServiceImpl::get_compaction_work_items(self, org_info)
-            .await?
-            .into_iter()
-            .map(|(table_name, work_item)| ClaimedCompactionWorkItem {
-                claim: MetadataClaimKind::ProcessLocal,
-                table_name,
-                work_item,
-            })
-            .collect())
+        Ok(
+            EphemeralServiceImpl::get_compaction_work_items(self, org_info)
+                .await?
+                .into_iter()
+                .map(|(table_name, work_item)| ClaimedCompactionWorkItem {
+                    claim: MetadataClaimKind::ProcessLocal,
+                    table_name,
+                    work_item,
+                })
+                .collect(),
+        )
     }
 
     async fn claim_cleanup_work_items(
