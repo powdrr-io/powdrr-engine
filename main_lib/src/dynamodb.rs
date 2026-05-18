@@ -574,6 +574,8 @@ pub struct TableBody {
     pub serving: Option<crate::data_contract::ServingTableConfig>,
     #[serde(default)]
     pub dynamodb: Option<crate::data_contract::DynamoDbTableConfig>,
+    #[serde(default)]
+    pub mongodb: Option<crate::data_contract::MongoDbTableConfig>,
 }
 
 impl TableBody {
@@ -583,6 +585,7 @@ impl TableBody {
             tags: HashMap::new(),
             serving: None,
             dynamodb: None,
+            mongodb: None,
         }
     }
 }
@@ -1119,11 +1122,9 @@ impl DynamoDbConnector {
             cloned_checkpoint_to_replace.checkpoint_id = IdInstance::next_id().to_string();
             cloned_checkpoint_to_replace
                 .apply_compaction_for_replacement(compaction_commit, &commit.metadata);
-            assert!(
-                cloned_checkpoint_to_replace
-                    .original_checkpoint_id
-                    .is_none()
-            );
+            assert!(cloned_checkpoint_to_replace
+                .original_checkpoint_id
+                .is_none());
             cloned_checkpoint_to_replace.original_checkpoint_id =
                 Some(compaction_commit.checkpoint_id_to_replace.clone());
 
@@ -1265,6 +1266,7 @@ mod tests {
                     tags: HashMap::from([("foo".to_string(), "bar".to_string())]),
                     serving: None,
                     dynamodb: None,
+                    mongodb: None,
                 },
             )
             .await

@@ -287,12 +287,18 @@ pub fn put_dynamodb_config(mut state: State) -> Pin<Box<HandlerFuture>> {
             let schema = load_table_schema(&path).await?;
             validate_dynamodb_config(&schema, &body)?;
 
-            let existing_serving = existing.and_then(|description| description.serving);
+            let existing_serving = existing
+                .as_ref()
+                .and_then(|description| description.serving.clone());
+            let existing_mongodb = existing
+                .as_ref()
+                .and_then(|description| description.mongodb.clone());
             let request = CreateTable {
                 name: path.clone(),
                 tags,
                 serving: Some(merge_dynamodb_serving_patterns(existing_serving, &body)),
                 dynamodb: Some(body.clone()),
+                mongodb: existing_mongodb,
             };
 
             STATE_PROVIDER
@@ -1532,13 +1538,11 @@ mod tests {
             &list_tables_response.read_utf8_body().unwrap(),
         )
         .unwrap();
-        assert!(
-            list_tables_body["TableNames"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value == &json!(table_name))
-        );
+        assert!(list_tables_body["TableNames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == &json!(table_name)));
 
         let get_item_response = perform_dynamodb_request(
             &test_server,

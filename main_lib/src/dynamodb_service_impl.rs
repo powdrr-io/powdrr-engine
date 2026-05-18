@@ -18,6 +18,7 @@ use aws_config::{BehaviorVersion, Region};
 use aws_sdk_dynamodb::Client;
 use modyne::TestTableExt;
 use modyne::model::TransactWrite;
+use modyne::model::TransactWrite;
 use std::collections::{HashMap, HashSet};
 
 const LEASE_LENGTH_MS: i64 = 60 * 1000; // 1 minute
@@ -121,7 +122,13 @@ impl DynamoDBServiceImpl {
     const NO_WORK_ITEM: &'static str = "-1";
 
     fn enqueue_checkpoint_update(&mut self, org_id: &String, table_name: &String) -> () {
-        if !self.update_cache.iter().any(|(cached_org_id, cached_table_name)| cached_org_id == org_id && cached_table_name == table_name) {
+        if !self
+            .update_cache
+            .iter()
+            .any(|(cached_org_id, cached_table_name)| {
+                cached_org_id == org_id && cached_table_name == table_name
+            })
+        {
             self.update_cache.push((org_id.clone(), table_name.clone()));
         }
     }
@@ -136,6 +143,7 @@ impl DynamoDBServiceImpl {
             tags: Default::default(),
             serving: None,
             dynamodb: None,
+            mongodb: None,
         }).await?;
         if metadata.speedboat_metadata.is_some() {
             self.speedboat_commit(
@@ -185,7 +193,19 @@ impl DynamoDBServiceImpl {
     }
 
     pub async fn get_all_iceberg_tables(&mut self) -> Result<Vec<String>, ServiceApiError> {
-        todo!()
+        let org_id = MANAGEMENT_ORG_ID.to_string();
+        let entity_type = "powdrr_table".to_string();
+        let mut table_names = self
+            .connector
+            .fetch_entities(&org_id, &entity_type, None)
+            .await
+            .map_err(from_modyne)?
+            .entities
+            .into_iter()
+            .map(|entity| entity.entity_id)
+            .collect::<Vec<_>>();
+        table_names.sort();
+        Ok(table_names)
     }
 
     pub async fn create_table(
@@ -201,6 +221,7 @@ impl DynamoDBServiceImpl {
                     tags: create_table.tags.clone(),
                     serving: create_table.serving.clone(),
                     dynamodb: create_table.dynamodb.clone(),
+                    mongodb: create_table.mongodb.clone(),
                 },
             )
             .await
@@ -220,12 +241,12 @@ impl DynamoDBServiceImpl {
                     tags: create_table.tags.clone(),
                     serving: create_table.serving.clone(),
                     dynamodb: create_table.dynamodb.clone(),
+                    mongodb: create_table.mongodb.clone(),
                 },
             )
             .await
             .map_err(from_modyne)
     }
-
     pub async fn describe_table(
         &mut self,
         org_info: &OrgInfo,
@@ -241,6 +262,7 @@ impl DynamoDBServiceImpl {
                     tags: x.tags.clone(),
                     serving: x.serving.clone(),
                     dynamodb: x.dynamodb.clone(),
+                    mongodb: x.mongodb.clone(),
                 })
             })
             .map_err(from_modyne)?;
@@ -265,6 +287,7 @@ impl DynamoDBServiceImpl {
                                 tags: x.tags.clone(),
                                 serving: x.serving.clone(),
                                 dynamodb: x.dynamodb.clone(),
+                                mongodb: x.mongodb.clone(),
                             })
                         })
                         .map_err(from_modyne),
@@ -1064,7 +1087,7 @@ impl DynamoDBServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_contract::{FileSetPayload, IcebergMetadata, ExtensionFile, LicenseType};
+    use crate::data_contract::{ExtensionFile, FileSetPayload, IcebergMetadata, LicenseType};
     use crate::schema_massager::PowdrrSchema;
     use std::collections::HashMap;
 
@@ -1094,48 +1117,112 @@ mod tests {
         let table_name = "iceberg_snapshot_table".to_string();
         let file_path = "s3://warehouse/table/data-0001.parquet".to_string();
 
-        service_impl.create_table(&org_info, &CreateTable {
-            name: table_name.clone(),
-            tags: HashMap::new(),
-            serving: None,
-            dynamodb: None,
-        }).await.unwrap();
+        service_impl
+            .create_table(
+                &org_info,
+                &CreateTable {
+                    name: table_name.clone(),
+                    tags: HashMap::new(),
+                    serving: None,
+                    dynamodb: None,
+                    mongodb: None,
+                },
+            )
+            .await
+            .unwrap();
 
-        let initial_extension_checkpoint = service_impl.get_latest_committed_checkpoint(&org_info, &table_name, Some("es".to_string())).await.unwrap().unwrap();
+        let initial_extension_checkpoint = service_impl
+            .get_latest_committed_checkpoint(&org_info, &table_name, Some("es".to_string()))
+            .await
+            .unwrap()
+            .unwrap();
 
-        service_impl.iceberg_commit(&org_info, &table_name, &IcebergCommit {
-            metadata: iceberg_metadata(&file_path, "1"),
-            deletes_table_info: None,
-            compactions: vec![],
-        }).await.unwrap();
-        assert_eq!(service_impl.update_cache.clone(), vec![(org_info.org_id.clone(), table_name.clone())]);
+        service_impl
+            .iceberg_commit(
+                &org_info,
+                &table_name,
+                &IcebergCommit {
+                    metadata: iceberg_metadata(&file_path, "1"),
+                    deletes_table_info: None,
+                    compactions: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service_impl.update_cache.clone(),
+            vec![(org_info.org_id.clone(), table_name.clone())]
+        );
         assert!(!service_impl.update_all_checkpoints().await.unwrap());
         assert!(service_impl.update_cache.is_empty());
 
-        let work_items = service_impl.get_extension_work_items(&org_info, &"es".to_string()).await.unwrap();
+        let work_items = service_impl
+            .get_extension_work_items(&org_info, &"es".to_string())
+            .await
+            .unwrap();
         assert_eq!(work_items.len(), 1);
         let work_item = work_items.first().unwrap();
-        assert_eq!(work_item.iceberg_files.file_paths.clone(), vec![file_path.clone()]);
+        assert_eq!(
+            work_item.iceberg_files.file_paths.clone(),
+            vec![file_path.clone()]
+        );
 
         let extension_files = vec![ExtensionFile {
             suffix: "search_index".to_string(),
             location: "s3://warehouse/table/data-0001.search_index.parquet".to_string(),
         }];
-        service_impl.extension_commit(&org_info, &table_name, &ExtensionCommit {
-            id: work_item.id.clone(),
-            extension: "es".to_string(),
-            files: HashMap::from([(file_path.clone(), extension_files.clone())]),
-        }).await.unwrap();
-        assert_eq!(service_impl.update_cache.clone(), vec![(org_info.org_id.clone(), table_name.clone())]);
+        service_impl
+            .extension_commit(
+                &org_info,
+                &table_name,
+                &ExtensionCommit {
+                    id: work_item.id.clone(),
+                    extension: "es".to_string(),
+                    files: HashMap::from([(file_path.clone(), extension_files.clone())]),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service_impl.update_cache.clone(),
+            vec![(org_info.org_id.clone(), table_name.clone())]
+        );
 
         assert!(service_impl.update_all_checkpoints().await.unwrap());
 
-        let latest_extension_checkpoint = service_impl.get_latest_committed_checkpoint(&org_info, &table_name, Some("es".to_string())).await.unwrap().unwrap();
+        let latest_extension_checkpoint = service_impl
+            .get_latest_committed_checkpoint(&org_info, &table_name, Some("es".to_string()))
+            .await
+            .unwrap()
+            .unwrap();
         assert_ne!(latest_extension_checkpoint, initial_extension_checkpoint);
 
-        let checkpoint = service_impl.get_checkpoint(&org_info, &CheckpointDescriptor::new(table_name.clone(), latest_extension_checkpoint)).await.unwrap().unwrap();
+        let checkpoint = service_impl
+            .get_checkpoint(
+                &org_info,
+                &CheckpointDescriptor::new(table_name.clone(), latest_extension_checkpoint),
+            )
+            .await
+            .unwrap()
+            .unwrap();
         assert!(checkpoint.fully_covered_for_extension(&"es".to_string()));
-        assert_eq!(checkpoint.iceberg_metadata.as_ref().unwrap().snapshot_id.as_deref(), Some("1"));
-        assert_eq!(checkpoint.extension_metadata.get("es").unwrap().get(&file_path).unwrap(), &extension_files);
+        assert_eq!(
+            checkpoint
+                .iceberg_metadata
+                .as_ref()
+                .unwrap()
+                .snapshot_id
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            checkpoint
+                .extension_metadata
+                .get("es")
+                .unwrap()
+                .get(&file_path)
+                .unwrap(),
+            &extension_files
+        );
     }
 }
