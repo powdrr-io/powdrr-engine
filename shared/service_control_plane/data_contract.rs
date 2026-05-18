@@ -67,12 +67,29 @@ pub struct IcebergColumnStats {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct IcebergRowGroupStats {
+    pub row_group_index: usize,
+    #[serde(default)]
+    pub record_count: Option<u64>,
+    #[serde(default)]
+    pub compressed_bytes: u64,
+    #[serde(default)]
+    pub page_index_present: bool,
+    #[serde(default)]
+    pub bloom_filter_present: bool,
+    #[serde(default)]
+    pub columns: Vec<IcebergColumnStats>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct IcebergFileStats {
     pub file_path: String,
     #[serde(default)]
     pub record_count: Option<u64>,
     #[serde(default)]
     pub columns: Vec<IcebergColumnStats>,
+    #[serde(default)]
+    pub row_groups: Vec<IcebergRowGroupStats>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

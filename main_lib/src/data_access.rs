@@ -1,4 +1,4 @@
-use crate::data_contract::{IcebergColumnStats, IcebergFileStats};
+use crate::data_contract::{IcebergColumnStats, IcebergFileStats, IcebergRowGroupStats};
 use crate::elastic_search_ingest::JSON_MODE;
 use crate::util::log_err;
 use datafusion::arrow::datatypes::Schema;
@@ -18,8 +18,9 @@ use datafusion::{
 };
 use futures_util::TryStreamExt;
 use iceberg::Catalog;
+use iceberg::arrow::ArrowFileReader;
 use iceberg::io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY};
-use iceberg::spec::{DataContentType, DataFile, Literal, ManifestContentType, Type};
+use iceberg::spec::{DataContentType, DataFile, Literal, ManifestContentType, PrimitiveType, Type};
 use iceberg::table::Table;
 use iceberg::transaction::ApplyTransactionAction;
 use iceberg::{NamespaceIdent, TableCreation, TableIdent};
@@ -37,6 +38,9 @@ use object_store::{
     ObjectStoreExt, PutPayload,
     aws::{AmazonS3, AmazonS3Builder},
 };
+use parquet_55::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use parquet_55::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
+use parquet_55::file::statistics::Statistics;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::string::ToString;
@@ -826,13 +830,13 @@ impl CacheTrackerActor {
         let schema = records.get(0).unwrap().schema();
         let concated = match arrow::compute::concat_batches(&records[0].schema(), records) {
             Ok(batch) => batch,
-                Err(e) => {
-                    return {
-                        tracing::error!("Failed to concat_batches: {}", e);
-                        log_err(DataFusionError::ArrowError(Box::new(e), None))
-                    };
-                }
-            };
+            Err(e) => {
+                return {
+                    tracing::error!("Failed to concat_batches: {}", e);
+                    log_err(DataFusionError::ArrowError(Box::new(e), None))
+                };
+            }
+        };
         let table = match datafusion::datasource::MemTable::try_new(schema, vec![vec![concated]]) {
             Ok(t) => Arc::new(t),
             Err(e) => {
@@ -1786,6 +1790,23 @@ async fn load_iceberg_file_stats(
             }
 
             let data_file = manifest_entry.data_file();
+            let row_groups = match load_parquet_row_group_stats(
+                table,
+                data_file.file_path(),
+                table.metadata().current_schema(),
+            )
+            .await
+            {
+                Ok(row_groups) => row_groups,
+                Err(error) => {
+                    tracing::warn!(
+                        "Unable to load parquet row-group stats for {}: {}",
+                        data_file.file_path(),
+                        error
+                    );
+                    vec![]
+                }
+            };
             file_stats.insert(
                 data_file.file_path().to_string(),
                 IcebergFileStats {
@@ -1795,6 +1816,7 @@ async fn load_iceberg_file_stats(
                         data_file,
                         table.metadata().current_schema(),
                     ),
+                    row_groups,
                 },
             );
         }
@@ -1846,6 +1868,161 @@ fn collect_iceberg_column_stats(
 
     column_stats.sort_by(|left, right| left.field_name.cmp(&right.field_name));
     column_stats
+}
+
+async fn load_parquet_row_group_stats(
+    table: &Table,
+    file_path: &str,
+    schema: &iceberg::spec::Schema,
+) -> Result<Vec<IcebergRowGroupStats>, iceberg::Error> {
+    let input_file = table.file_io().new_input(file_path).map_err(|error| {
+        iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            format!("Unable to open parquet file {}", file_path),
+        )
+        .with_source(error)
+    })?;
+    let file_metadata = input_file.metadata().await.map_err(|error| {
+        iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            format!("Unable to stat parquet file {}", file_path),
+        )
+        .with_source(error)
+    })?;
+    let reader = input_file.reader().await.map_err(|error| {
+        iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            format!("Unable to create parquet reader for {}", file_path),
+        )
+        .with_source(error)
+    })?;
+    let mut reader = ArrowFileReader::new(file_metadata, reader);
+    let metadata = ArrowReaderMetadata::load_async(&mut reader, ArrowReaderOptions::new())
+        .await
+        .map_err(|error| {
+            iceberg::Error::new(
+                iceberg::ErrorKind::Unexpected,
+                format!("Unable to read parquet metadata for {}", file_path),
+            )
+            .with_source(error)
+        })?;
+
+    Ok(metadata
+        .metadata()
+        .row_groups()
+        .iter()
+        .enumerate()
+        .map(|(row_group_index, row_group)| {
+            collect_parquet_row_group_stats(row_group_index, row_group, schema)
+        })
+        .collect())
+}
+
+fn collect_parquet_row_group_stats(
+    row_group_index: usize,
+    row_group: &RowGroupMetaData,
+    schema: &iceberg::spec::Schema,
+) -> IcebergRowGroupStats {
+    let mut columns = row_group
+        .columns()
+        .iter()
+        .filter_map(|column| collect_parquet_column_stats(column, schema))
+        .collect::<Vec<_>>();
+    columns.sort_by(|left, right| left.field_name.cmp(&right.field_name));
+
+    IcebergRowGroupStats {
+        row_group_index,
+        record_count: u64::try_from(row_group.num_rows()).ok(),
+        compressed_bytes: u64::try_from(row_group.compressed_size()).unwrap_or_default(),
+        page_index_present: row_group.columns().iter().any(|column| {
+            column.column_index_offset().is_some() && column.offset_index_offset().is_some()
+        }),
+        bloom_filter_present: row_group
+            .columns()
+            .iter()
+            .any(|column| column.bloom_filter_offset().is_some()),
+        columns,
+    }
+}
+
+fn collect_parquet_column_stats(
+    column: &ColumnChunkMetaData,
+    schema: &iceberg::spec::Schema,
+) -> Option<IcebergColumnStats> {
+    let field_name = column.column_path().string();
+    let field = schema.field_by_name(&field_name)?;
+    let statistics = column.statistics()?;
+    let field_type = field.field_type.as_ref();
+    let null_count = statistics.null_count_opt();
+    let lower_bound = parquet_stat_to_json_value(statistics, field_type, true);
+    let upper_bound = parquet_stat_to_json_value(statistics, field_type, false);
+
+    if null_count.is_none() && lower_bound.is_none() && upper_bound.is_none() {
+        return None;
+    }
+
+    Some(IcebergColumnStats {
+        field_id: field.id,
+        field_name,
+        null_count,
+        lower_bound,
+        upper_bound,
+    })
+}
+
+fn parquet_stat_to_json_value(
+    statistics: &Statistics,
+    field_type: &Type,
+    lower_bound: bool,
+) -> Option<serde_json::Value> {
+    match (field_type.as_primitive_type()?, statistics) {
+        (PrimitiveType::Boolean, Statistics::Boolean(typed)) => scalar_bool_to_json(
+            *select_stat_bound(typed.min_opt(), typed.max_opt(), lower_bound)?,
+        ),
+        (PrimitiveType::Int, Statistics::Int32(typed)) => Some(serde_json::Value::from(i64::from(
+            *select_stat_bound(typed.min_opt(), typed.max_opt(), lower_bound)?,
+        ))),
+        (PrimitiveType::Long, Statistics::Int64(typed)) => Some(serde_json::Value::from(
+            *select_stat_bound(typed.min_opt(), typed.max_opt(), lower_bound)?,
+        )),
+        (PrimitiveType::Float, Statistics::Float(typed)) => scalar_f64_to_json(f64::from(
+            *select_stat_bound(typed.min_opt(), typed.max_opt(), lower_bound)?,
+        )),
+        (PrimitiveType::Double, Statistics::Double(typed)) => scalar_f64_to_json(
+            *select_stat_bound(typed.min_opt(), typed.max_opt(), lower_bound)?,
+        ),
+        (PrimitiveType::String, Statistics::ByteArray(typed)) => parquet_bytes_to_json_string(
+            select_stat_bound(typed.min_opt(), typed.max_opt(), lower_bound)?.data(),
+        ),
+        (PrimitiveType::String, Statistics::FixedLenByteArray(typed)) => {
+            parquet_bytes_to_json_string(
+                select_stat_bound(typed.min_opt(), typed.max_opt(), lower_bound)?.data(),
+            )
+        }
+        _ => None,
+    }
+}
+
+fn select_stat_bound<'a, T>(
+    min: Option<&'a T>,
+    max: Option<&'a T>,
+    lower_bound: bool,
+) -> Option<&'a T> {
+    if lower_bound { min } else { max }
+}
+
+fn scalar_bool_to_json(value: bool) -> Option<serde_json::Value> {
+    Some(serde_json::Value::Bool(value))
+}
+
+fn scalar_f64_to_json(value: f64) -> Option<serde_json::Value> {
+    serde_json::Number::from_f64(value).map(serde_json::Value::Number)
+}
+
+fn parquet_bytes_to_json_string(bytes: &[u8]) -> Option<serde_json::Value> {
+    String::from_utf8(bytes.to_vec())
+        .ok()
+        .map(serde_json::Value::String)
 }
 
 fn datum_to_json_value(
