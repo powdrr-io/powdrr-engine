@@ -688,6 +688,7 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
     };
 
     let mut local_tables = Vec::new();
+    let mut delete_local_tables = Vec::new();
 
     if let Some(iceberg_metadata) = checkpoint.iceberg_metadata {
         for file_descriptor in iceberg_metadata.files.as_file_tuples() {
@@ -719,6 +720,28 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
         }
     }
 
+    if let Some(deletes_metadata) = checkpoint.deletes_metadata {
+        let delete_schema = crate::schema_massager::PowdrrSchema::from(&vec![
+            crate::schema_massager::PowdrrField {
+                name: "_id_seq_no".to_string(),
+                data_type: crate::schema_massager::PowdrrDataType::String,
+            },
+        ]);
+
+        for delete_file_path in deletes_metadata.files {
+            let local_name = format!("mget_delete_{}", IdInstance::next_id());
+            data_access::load_file_as_table(
+                &local_name,
+                &delete_file_path,
+                false,
+                Some(delete_schema.to_arrow_schema()),
+            )
+            .await
+            .map_err(|e| e.message().to_string())?;
+            delete_local_tables.push(local_name);
+        }
+    }
+
     if local_tables.is_empty() {
         return Ok(json!({
             "_index": table_desc.name,
@@ -733,8 +756,12 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
         .map(|table_name| format!("SELECT * FROM {table_name}"))
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
-    let lookup_sql =
-        format!("SELECT * FROM ({union_sql}) AS docs WHERE _id = '{escaped_doc_id}' LIMIT 1");
+    let deletes_table_name = create_document_lookup_deletes_table(&delete_local_tables).await?;
+    let lookup_sql = format!(
+        "SELECT docs.* FROM ({union_sql}) AS docs \
+         LEFT JOIN {deletes_table_name} dt ON dt._id_seq_no = docs._id_seq_no \
+         WHERE docs._id = '{escaped_doc_id}' AND dt._id_seq_no IS NULL LIMIT 1"
+    );
     let lookup_df = data_access::execute_sql(&lookup_sql)
         .await
         .map_err(|e| e.message().to_string())?;
@@ -745,6 +772,10 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
     for table_name in &local_tables {
         data_access::drop(table_name).await;
     }
+    for table_name in &delete_local_tables {
+        data_access::drop(table_name).await;
+    }
+    data_access::drop(&deletes_table_name).await;
 
     let Some(value) = serde_result.values.first() else {
         return Ok(json!({
@@ -762,6 +793,25 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
         ),
     )
     .map_err(|e| e.to_string())
+}
+
+async fn create_document_lookup_deletes_table(local_names: &[String]) -> Result<String, String> {
+    let table_name = format!("mget_all_deletes_{}", IdInstance::next_id());
+    let ddl_stmt = if local_names.is_empty() {
+        "select null as _id_seq_no".to_string()
+    } else {
+        let union_selects = local_names
+            .iter()
+            .map(|table_name| format!("select * from {table_name}"))
+            .collect::<Vec<_>>()
+            .join(" union all ");
+        format!("select * from ({union_selects})")
+    };
+
+    data_access::create_table(&table_name, &ddl_stmt)
+        .await
+        .map_err(|e| e.message().to_string())?;
+    Ok(table_name)
 }
 
 fn parse_msearch_lines(body_content: &str) -> Result<Vec<(String, String)>, ()> {
