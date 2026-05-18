@@ -712,7 +712,7 @@ async fn load_table_description(table_name: &str) -> Result<TableDescription, Dy
 
 async fn load_table_schema(table_name: &str) -> Result<PowdrrSchema, DynamoDbError> {
     let checkpoint_id = STATE_PROVIDER
-        .get_latest_servable_checkpoint(&table_name.to_string())
+        .get_active_servable_checkpoint(&table_name.to_string())
         .await
         .map_err(service_error)?
         .ok_or_else(|| {
@@ -1614,13 +1614,11 @@ mod tests {
             &list_tables_response.read_utf8_body().unwrap(),
         )
         .unwrap();
-        assert!(
-            list_tables_body["TableNames"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value == &json!(table_name))
-        );
+        assert!(list_tables_body["TableNames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == &json!(table_name)));
 
         let get_item_response = perform_dynamodb_request(
             &test_server,

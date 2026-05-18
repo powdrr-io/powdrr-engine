@@ -1278,7 +1278,7 @@ async fn load_latest_table_checkpoint(
     table_name: &str,
 ) -> Result<Option<TableMetadataCheckpoint>, MongoCommandError> {
     let checkpoint_id = STATE_PROVIDER
-        .get_latest_servable_checkpoint(&table_name.to_string())
+        .get_active_servable_checkpoint(&table_name.to_string())
         .await
         .map_err(service_error)?;
     let Some(checkpoint_id) = checkpoint_id else {
@@ -1339,7 +1339,7 @@ pub(crate) fn mongodb_cursor_timeout_ms_for_tests() -> i64 {
 
 async fn load_table_schema(table_name: &str) -> Result<PowdrrSchema, MongoCommandError> {
     let checkpoint_id = STATE_PROVIDER
-        .get_latest_servable_checkpoint(&table_name.to_string())
+        .get_active_servable_checkpoint(&table_name.to_string())
         .await
         .map_err(service_error)?
         .ok_or_else(|| {

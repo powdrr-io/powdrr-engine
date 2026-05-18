@@ -367,7 +367,7 @@ async fn load_serving_context(
     };
 
     let checkpoint_id = match STATE_PROVIDER
-        .get_latest_servable_checkpoint(&description.name)
+        .get_active_servable_checkpoint(&description.name)
         .await
     {
         Ok(Some(checkpoint_id)) => checkpoint_id,

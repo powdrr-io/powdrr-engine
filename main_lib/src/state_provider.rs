@@ -946,7 +946,7 @@ impl StateProviderHandle {
         )
     }
 
-    pub async fn get_latest_servable_checkpoint(
+    pub async fn get_active_servable_checkpoint(
         &self,
         table_name: &String,
     ) -> Result<Option<String>, ServiceApiError> {
@@ -956,6 +956,29 @@ impl StateProviderHandle {
         {
             Some(checkpoint_id) => Ok(Some(checkpoint_id)),
             None => self.get_latest_checkpoint(table_name, None).await,
+        }
+    }
+
+    pub async fn get_latest_servable_checkpoint(
+        &self,
+        table_name: &String,
+    ) -> Result<Option<String>, ServiceApiError> {
+        self.get_active_servable_checkpoint(table_name).await
+    }
+
+    pub async fn get_target_servable_checkpoint(
+        &self,
+        table_name: &String,
+    ) -> Result<Option<String>, ServiceApiError> {
+        match self
+            .get_latest_target_checkpoint(table_name, Some(DEFAULT_SERVABLE_EXTENSION.to_string()))
+            .await?
+        {
+            Some(checkpoint_id) => Ok(Some(checkpoint_id)),
+            None => match self.get_latest_target_checkpoint(table_name, None).await? {
+                Some(checkpoint_id) => Ok(Some(checkpoint_id)),
+                None => self.get_active_servable_checkpoint(table_name).await,
+            },
         }
     }
 
@@ -1042,6 +1065,7 @@ mod tests {
     use crate::data_contract::{
         ExtensionCommit, ExtensionFile, FileSetPayload, IcebergCommit, IcebergMetadata,
     };
+    use crate::peers::CheckpointDescriptor;
     use crate::schema_massager::PowdrrSchema;
     use crate::test_api::{
         CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode, StorageMode,
@@ -1103,7 +1127,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_latest_servable_checkpoint_falls_back_and_prefers_extension_frontier() {
+    async fn get_active_servable_checkpoint_falls_back_and_prefers_extension_frontier() {
         initialize_ids();
 
         STATE_PROVIDER
@@ -1133,7 +1157,7 @@ mod tests {
         );
         assert_eq!(
             STATE_PROVIDER
-                .get_latest_servable_checkpoint(&table_name)
+                .get_active_servable_checkpoint(&table_name)
                 .await
                 .unwrap(),
             Some(first_checkpoint.clone())
@@ -1156,7 +1180,7 @@ mod tests {
         );
         assert_eq!(
             STATE_PROVIDER
-                .get_latest_servable_checkpoint(&table_name)
+                .get_active_servable_checkpoint(&table_name)
                 .await
                 .unwrap(),
             Some(first_checkpoint.clone())
@@ -1182,7 +1206,7 @@ mod tests {
         );
         assert_eq!(
             STATE_PROVIDER
-                .get_latest_servable_checkpoint(&table_name)
+                .get_active_servable_checkpoint(&table_name)
                 .await
                 .unwrap(),
             Some(first_checkpoint.clone())
@@ -1205,7 +1229,41 @@ mod tests {
         );
         assert_eq!(
             STATE_PROVIDER
-                .get_latest_servable_checkpoint(&table_name)
+                .get_target_servable_checkpoint(&table_name)
+                .await
+                .unwrap(),
+            Some(second_checkpoint.clone())
+        );
+        assert_eq!(
+            STATE_PROVIDER
+                .get_active_servable_checkpoint(&table_name)
+                .await
+                .unwrap(),
+            Some(second_checkpoint.clone())
+        );
+
+        let target_checkpoint = "prefetched-cutover-checkpoint".to_string();
+        STATE_PROVIDER
+            .set_prefetch_checkpoints(
+                &vec![CheckpointDescriptor::new(
+                    table_name.clone(),
+                    target_checkpoint.clone(),
+                )],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            STATE_PROVIDER
+                .get_target_servable_checkpoint(&table_name)
+                .await
+                .unwrap(),
+            Some(target_checkpoint)
+        );
+        assert_eq!(
+            STATE_PROVIDER
+                .get_active_servable_checkpoint(&table_name)
                 .await
                 .unwrap(),
             Some(second_checkpoint)
