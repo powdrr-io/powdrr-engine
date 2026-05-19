@@ -195,13 +195,17 @@ impl DynamoDBServiceImpl {
         org_info: &OrgInfo,
         metadata: &TableMetadataCheckpoint,
     ) -> Result<(), ServiceApiError> {
-        self.create_table(org_info, &CreateTable {
-            name: metadata.table_name.clone(),
-            tags: Default::default(),
-            serving: None,
-            dynamodb: None,
-            mongodb: None,
-        }).await?;
+        self.create_table(
+            org_info,
+            &CreateTable {
+                name: metadata.table_name.clone(),
+                tags: Default::default(),
+                serving: None,
+                dynamodb: None,
+                mongodb: None,
+            },
+        )
+        .await?;
         if metadata.speedboat_metadata.is_some() {
             self.speedboat_commit(
                 org_info,
@@ -1188,7 +1192,11 @@ impl DynamoDBServiceImpl {
     ) -> Result<Option<String>, ServiceApiError> {
         let entities = self
             .connector
-            .fetch_entities(&MANAGEMENT_ORG_ID.to_string(), &"org_settings".to_string(), None)
+            .fetch_entities(
+                &MANAGEMENT_ORG_ID.to_string(),
+                &"org_settings".to_string(),
+                None,
+            )
             .await
             .map_err(from_modyne)?;
         let mut matched_secret = None;
@@ -1356,8 +1364,11 @@ mod tests {
             table_schema: schema.clone(),
             snapshot_id: Some(snapshot_id.to_string()),
             files: FileSetPayload::single(file_path.clone(), 128, schema),
+            partition_spec: vec![],
+            sort_order: vec![],
             column_names: vec![],
             column_stats: vec![],
+            access_artifacts: vec![],
             file_stats: vec![],
         }
     }

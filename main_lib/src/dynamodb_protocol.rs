@@ -15,12 +15,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::data_access::{self, execute_sql_async, load_files_as_table};
 use crate::data_contract::{
     CreateTable, DynamoDbGlobalSecondaryIndexConfig, DynamoDbLocalSecondaryIndexConfig,
     DynamoDbTableConfig, FileDescriptor, ServingPattern, ServingTableConfig, TableDescription,
     TableMetadataCheckpoint,
 };
-use crate::data_access::{self, execute_sql_async, load_files_as_table};
 use crate::elastic_search_endpoints::NamePathExtractor;
 use crate::lakehouse_serving::{ServingQueryError, ServingQueryResponse, execute_serving_query};
 use crate::peers::CheckpointDescriptor;
@@ -1030,9 +1030,9 @@ async fn handle_query(payload: Value) -> Result<Value, DynamoDbError> {
         vec![]
     } else {
         projected_rows
-        .into_iter()
-        .map(|row| json_row_to_dynamodb_item(&row))
-        .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|row| json_row_to_dynamodb_item(&row))
+            .collect::<Result<Vec<_>, _>>()?
     };
     Ok(serde_json::to_value(QueryResponse {
         items: rows,
@@ -1215,7 +1215,9 @@ async fn load_table_schema(table_name: &str) -> Result<PowdrrSchema, DynamoDbErr
     schema_from_checkpoint(&checkpoint)
 }
 
-async fn load_active_checkpoint(table_name: &str) -> Result<TableMetadataCheckpoint, DynamoDbError> {
+async fn load_active_checkpoint(
+    table_name: &str,
+) -> Result<TableMetadataCheckpoint, DynamoDbError> {
     let checkpoint_id = STATE_PROVIDER
         .get_active_servable_checkpoint(&table_name.to_string())
         .await
@@ -1718,9 +1720,8 @@ fn parse_sigv4_authorization(auth: &str) -> Result<ParsedSigV4Authorization, Dyn
     }
     let credential = credential
         .ok_or_else(|| DynamoDbError::auth("Authorization header did not contain a Credential"))?;
-    let signed_headers = signed_headers.ok_or_else(|| {
-        DynamoDbError::auth("Authorization header did not contain SignedHeaders")
-    })?;
+    let signed_headers = signed_headers
+        .ok_or_else(|| DynamoDbError::auth("Authorization header did not contain SignedHeaders"))?;
     let signature = signature
         .ok_or_else(|| DynamoDbError::auth("Authorization header did not contain Signature"))?;
     let credential_parts = credential.split('/').collect::<Vec<_>>();
@@ -1760,10 +1761,7 @@ fn require_header_ascii(headers: &HeaderMap, name: &str) -> Result<String, Dynam
         .map_err(|_| DynamoDbError::auth(format!("Header {} was not valid ASCII", name)))
 }
 
-fn optional_header_ascii(
-    headers: &HeaderMap,
-    name: &str,
-) -> Result<Option<String>, DynamoDbError> {
+fn optional_header_ascii(headers: &HeaderMap, name: &str) -> Result<Option<String>, DynamoDbError> {
     headers
         .get(name)
         .map(|value| {
@@ -1812,7 +1810,10 @@ fn sigv4_signature(
     let k_region = hmac_sha256(&k_date, region.as_bytes())?;
     let k_service = hmac_sha256(&k_region, service.as_bytes())?;
     let k_signing = hmac_sha256(&k_service, b"aws4_request")?;
-    Ok(hex_encode(&hmac_sha256(&k_signing, string_to_sign.as_bytes())?))
+    Ok(hex_encode(&hmac_sha256(
+        &k_signing,
+        string_to_sign.as_bytes(),
+    )?))
 }
 
 fn validate_sigv4_request_time(
@@ -3883,6 +3884,8 @@ mod tests {
                 table_schema: dataset.schema.clone(),
                 snapshot_id: Some("snapshot_1".to_string()),
                 files: FileSetPayload::single(file_path, file_size, dataset.schema.clone()),
+                partition_spec: vec![],
+                sort_order: vec![],
                 column_names: dataset
                     .schema
                     .fields()
@@ -3890,6 +3893,7 @@ mod tests {
                     .map(|field| field.name.clone())
                     .collect(),
                 column_stats: vec![],
+                access_artifacts: vec![],
                 file_stats: vec![],
             }),
             speedboat_metadata: None,

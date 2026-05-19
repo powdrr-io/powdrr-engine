@@ -1,4 +1,7 @@
-use crate::data_contract::{IcebergColumnStats, IcebergFileStats, IcebergRowGroupStats};
+use crate::data_contract::{
+    IcebergAccessArtifact, IcebergColumnStats, IcebergFileStats, IcebergPartitionField,
+    IcebergPartitionValue, IcebergRowGroupStats, IcebergSortField,
+};
 use crate::elastic_search_ingest::JSON_MODE;
 use crate::util::log_err;
 use datafusion::arrow::datatypes::Schema;
@@ -68,6 +71,12 @@ const S3_REGION_VALUE: &str = "us-east-1";
 const PARQUET_ROW_GROUP_STATS_CACHE_MAX_ENTRIES: usize = 2048;
 const ICEBERG_TABLE_METADATA_CACHE_MAX_ENTRIES: usize = 256;
 const ICEBERG_ROW_GROUP_STATS_LOAD_PARALLELISM_MAX: usize = 16;
+const ACCESS_ARTIFACT_KIND_BLOOM_FILTER: &str = "bloom-filter";
+const ACCESS_ARTIFACT_KIND_FILE_STATS: &str = "file-stats";
+const ACCESS_ARTIFACT_KIND_PAGE_INDEX: &str = "page-index";
+const ACCESS_ARTIFACT_KIND_PARTITION_SPEC: &str = "partition-spec";
+const ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS: &str = "row-group-stats";
+const ACCESS_ARTIFACT_KIND_SORT_ORDER: &str = "sort-order";
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const SERVING_LIQUID_CACHE_DIR_ENV_VAR: &str = "POWDRR_SERVING_CACHE_DIR";
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -364,6 +373,14 @@ pub(crate) fn reset_serving_metadata_caches_for_test() {
     clear_iceberg_table_metadata_cache();
     clear_iceberg_table_row_group_stats_tracker();
     clear_serving_bulk_cache_warmup();
+    clear_serving_cache_manager_operation();
+}
+
+pub(crate) fn evict_serving_metadata_for_files(file_paths: &[String]) {
+    for file_path in file_paths {
+        remove_file_from_iceberg_table_row_group_stats(file_path);
+        invalidate_iceberg_table_metadata_for_file(file_path);
+    }
 }
 
 #[derive(Default)]
@@ -474,11 +491,218 @@ fn clear_iceberg_table_row_group_stats_tracker() {
         .clear();
 }
 
+fn collect_iceberg_partition_spec(table: &Table) -> Vec<IcebergPartitionField> {
+    let schema = table.metadata().current_schema();
+    let mut partition_fields = table
+        .metadata()
+        .default_partition_spec()
+        .fields()
+        .iter()
+        .filter_map(|field| {
+            let source_field_name = schema.name_by_field_id(field.source_id)?.to_string();
+            Some(IcebergPartitionField {
+                source_field_id: field.source_id,
+                source_field_name,
+                field_id: field.field_id,
+                field_name: field.name.clone(),
+                transform: field.transform.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    partition_fields.sort_by(|left, right| left.field_id.cmp(&right.field_id));
+    partition_fields
+}
+
+fn collect_iceberg_sort_order(table: &Table) -> Vec<IcebergSortField> {
+    let schema = table.metadata().current_schema();
+    let mut sort_fields = table
+        .metadata()
+        .default_sort_order()
+        .fields
+        .iter()
+        .filter_map(|field| {
+            let source_field_name = schema.name_by_field_id(field.source_id)?.to_string();
+            Some(IcebergSortField {
+                source_field_id: field.source_id,
+                source_field_name,
+                transform: field.transform.to_string(),
+                descending: matches!(field.direction, iceberg::spec::SortDirection::Descending),
+                nulls_first: matches!(field.null_order, iceberg::spec::NullOrder::First),
+            })
+        })
+        .collect::<Vec<_>>();
+    sort_fields.sort_by(|left, right| left.source_field_id.cmp(&right.source_field_id));
+    sort_fields
+}
+
+fn collect_iceberg_partition_values(
+    data_file: &DataFile,
+    partition_spec: &iceberg::spec::PartitionSpec,
+    schema: &iceberg::spec::Schema,
+) -> Vec<IcebergPartitionValue> {
+    let partition_fields = data_file.partition().fields();
+    let mut values = partition_spec
+        .fields()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, field)| {
+            let source_field = schema.field_by_id(field.source_id)?;
+            let source_field_name = schema.name_by_field_id(field.source_id)?.to_string();
+            let partition_type = field
+                .transform
+                .result_type(source_field.field_type.as_ref())
+                .ok()?;
+            let value = partition_fields
+                .get(index)
+                .and_then(|value| value.as_ref())
+                .and_then(|value| value.clone().try_into_json(&partition_type).ok());
+            Some(IcebergPartitionValue {
+                source_field_name,
+                field_name: field.name.clone(),
+                transform: field.transform.to_string(),
+                value,
+            })
+        })
+        .collect::<Vec<_>>();
+    values.sort_by(|left, right| left.field_name.cmp(&right.field_name));
+    values
+}
+
+fn collect_iceberg_access_artifacts(
+    partition_spec: &[IcebergPartitionField],
+    sort_order: &[IcebergSortField],
+    file_stats: &[IcebergFileStats],
+) -> Vec<IcebergAccessArtifact> {
+    let mut artifacts = Vec::new();
+    let mut tracked_names = HashSet::new();
+
+    let mut add_artifact = |artifact: IcebergAccessArtifact| {
+        if tracked_names.insert(artifact.name.clone()) {
+            artifacts.push(artifact);
+        }
+    };
+
+    let stat_fields = file_stats
+        .iter()
+        .flat_map(|stats| stats.columns.iter().map(|column| column.field_name.clone()))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if !stat_fields.is_empty() {
+        add_artifact(IcebergAccessArtifact {
+            name: ACCESS_ARTIFACT_KIND_FILE_STATS.to_string(),
+            kind: ACCESS_ARTIFACT_KIND_FILE_STATS.to_string(),
+            fields: stat_fields.clone(),
+            exact: false,
+            supports_eq: true,
+            supports_range: true,
+            supports_order: false,
+        });
+    }
+
+    let row_group_fields = file_stats
+        .iter()
+        .flat_map(|stats| {
+            stats
+                .row_groups
+                .iter()
+                .flat_map(|row_group| {
+                    row_group
+                        .columns
+                        .iter()
+                        .map(|column| column.field_name.clone())
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if !row_group_fields.is_empty() {
+        add_artifact(IcebergAccessArtifact {
+            name: ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS.to_string(),
+            kind: ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS.to_string(),
+            fields: row_group_fields.clone(),
+            exact: false,
+            supports_eq: true,
+            supports_range: true,
+            supports_order: false,
+        });
+    }
+
+    if file_stats.iter().any(|stats| {
+        stats
+            .row_groups
+            .iter()
+            .any(|row_group| row_group.page_index_present)
+    }) {
+        add_artifact(IcebergAccessArtifact {
+            name: ACCESS_ARTIFACT_KIND_PAGE_INDEX.to_string(),
+            kind: ACCESS_ARTIFACT_KIND_PAGE_INDEX.to_string(),
+            fields: row_group_fields.clone(),
+            exact: false,
+            supports_eq: true,
+            supports_range: true,
+            supports_order: false,
+        });
+    }
+
+    if file_stats.iter().any(|stats| {
+        stats
+            .row_groups
+            .iter()
+            .any(|row_group| row_group.bloom_filter_present)
+    }) {
+        add_artifact(IcebergAccessArtifact {
+            name: ACCESS_ARTIFACT_KIND_BLOOM_FILTER.to_string(),
+            kind: ACCESS_ARTIFACT_KIND_BLOOM_FILTER.to_string(),
+            fields: row_group_fields.clone(),
+            exact: false,
+            supports_eq: true,
+            supports_range: false,
+            supports_order: false,
+        });
+    }
+
+    for field in partition_spec {
+        add_artifact(IcebergAccessArtifact {
+            name: format!(
+                "{}:{}",
+                ACCESS_ARTIFACT_KIND_PARTITION_SPEC, field.field_name
+            ),
+            kind: ACCESS_ARTIFACT_KIND_PARTITION_SPEC.to_string(),
+            fields: vec![field.source_field_name.clone()],
+            exact: field.transform == "identity",
+            supports_eq: true,
+            supports_range: field.transform == "identity",
+            supports_order: false,
+        });
+    }
+
+    for field in sort_order {
+        add_artifact(IcebergAccessArtifact {
+            name: format!(
+                "{}:{}",
+                ACCESS_ARTIFACT_KIND_SORT_ORDER, field.source_field_name
+            ),
+            kind: ACCESS_ARTIFACT_KIND_SORT_ORDER.to_string(),
+            fields: vec![field.source_field_name.clone()],
+            exact: false,
+            supports_eq: false,
+            supports_range: false,
+            supports_order: true,
+        });
+    }
+
+    artifacts.sort_by(|left, right| left.name.cmp(&right.name));
+    artifacts
+}
+
 #[derive(Clone)]
 struct PendingIcebergFileStats {
     file_path: String,
     record_count: Option<u64>,
     columns: Vec<IcebergColumnStats>,
+    partition_values: Vec<IcebergPartitionValue>,
 }
 
 fn iceberg_row_group_stats_load_parallelism() -> usize {
@@ -642,6 +866,30 @@ pub struct ServingBulkCacheWarmupStats {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServingCacheManagerOperationStats {
+    #[serde(default)]
+    pub table: String,
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
+    #[serde(default)]
+    pub warmed_files: usize,
+    #[serde(default)]
+    pub evicted_files: usize,
+    #[serde(default)]
+    pub targeted_ranges: usize,
+    #[serde(default)]
+    pub matched_patterns: Vec<String>,
+    #[serde(default)]
+    pub matched_artifacts: Vec<String>,
+    #[serde(default)]
+    pub metadata_refreshed: bool,
+    #[serde(default)]
+    pub bulk_cache_flushed: bool,
+    #[serde(default)]
+    pub bulk_cache_reset: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServingBulkCacheStats {
     #[serde(default)]
     pub enabled: bool,
@@ -651,6 +899,8 @@ pub struct ServingBulkCacheStats {
     pub memory_usage_bytes: u64,
     #[serde(default)]
     pub disk_usage_bytes: u64,
+    #[serde(default)]
+    pub last_manager_operation: Option<ServingCacheManagerOperationStats>,
     #[serde(default)]
     pub last_warmup: Option<ServingBulkCacheWarmupStats>,
 }
@@ -668,6 +918,9 @@ static SERVING_LIQUID_CACHE_RUNTIME: LazyLock<Mutex<Option<ServingLiquidCacheRun
 
 static LAST_SERVING_BULK_CACHE_WARMUP: LazyLock<Mutex<Option<ServingBulkCacheWarmupStats>>> =
     LazyLock::new(|| Mutex::new(None));
+static LAST_SERVING_CACHE_MANAGER_OPERATION: LazyLock<
+    Mutex<Option<ServingCacheManagerOperationStats>>,
+> = LazyLock::new(|| Mutex::new(None));
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn resolve_serving_liquid_cache_location(
@@ -767,8 +1020,16 @@ fn current_serving_bulk_cache_warmup() -> Option<ServingBulkCacheWarmupStats> {
     LAST_SERVING_BULK_CACHE_WARMUP.lock().unwrap().clone()
 }
 
+fn current_serving_cache_manager_operation() -> Option<ServingCacheManagerOperationStats> {
+    LAST_SERVING_CACHE_MANAGER_OPERATION.lock().unwrap().clone()
+}
+
 fn clear_serving_bulk_cache_warmup() {
     LAST_SERVING_BULK_CACHE_WARMUP.lock().unwrap().take();
+}
+
+fn clear_serving_cache_manager_operation() {
+    LAST_SERVING_CACHE_MANAGER_OPERATION.lock().unwrap().take();
 }
 
 pub(crate) fn record_serving_bulk_cache_warmup(stats: ServingBulkCacheWarmupStats) {
@@ -778,8 +1039,16 @@ pub(crate) fn record_serving_bulk_cache_warmup(stats: ServingBulkCacheWarmupStat
         .replace(stats);
 }
 
+pub(crate) fn record_serving_cache_manager_operation(stats: ServingCacheManagerOperationStats) {
+    LAST_SERVING_CACHE_MANAGER_OPERATION
+        .lock()
+        .unwrap()
+        .replace(stats);
+}
+
 pub(crate) fn serving_bulk_cache_stats() -> ServingBulkCacheStats {
     let last_warmup = current_serving_bulk_cache_warmup();
+    let last_manager_operation = current_serving_cache_manager_operation();
     #[cfg(target_os = "linux")]
     {
         if let Some(runtime) = current_serving_liquid_cache_runtime() {
@@ -788,12 +1057,14 @@ pub(crate) fn serving_bulk_cache_stats() -> ServingBulkCacheStats {
                 persistent: true,
                 memory_usage_bytes: runtime.cache.memory_usage_bytes() as u64,
                 disk_usage_bytes: runtime.cache.disk_usage_bytes() as u64,
+                last_manager_operation,
                 last_warmup,
             };
         }
     }
 
     ServingBulkCacheStats {
+        last_manager_operation,
         last_warmup,
         ..ServingBulkCacheStats::default()
     }
@@ -914,10 +1185,13 @@ pub struct IcebergLibMetadata {
     pub sizes: Vec<u64>,
     pub schemas: Vec<Arc<iceberg::spec::Schema>>,
     pub compactions: Vec<String>,
+    pub partition_spec: Vec<IcebergPartitionField>,
+    pub sort_order: Vec<IcebergSortField>,
     pub column_names: Vec<String>,
     // per file, per column lower and upper bounds
     // TODO: this needs to be generalized to support bloom filters
     pub column_stats: Vec<(String, String)>,
+    pub access_artifacts: Vec<IcebergAccessArtifact>,
     pub file_stats: Vec<IcebergFileStats>,
 }
 
@@ -1138,6 +1412,7 @@ impl CacheTrackerActor {
                 clear_iceberg_table_metadata_cache();
                 clear_iceberg_table_row_group_stats_tracker();
                 clear_serving_bulk_cache_warmup();
+                clear_serving_cache_manager_operation();
                 let _ = respond_to.send(());
             }
             CacheTrackerActorMessage::Reserve {
@@ -2473,7 +2748,11 @@ async fn load_iceberg_table_metadata_worker(
         return Ok(metadata);
     }
 
+    let partition_spec = collect_iceberg_partition_spec(&table);
+    let sort_order = collect_iceberg_sort_order(&table);
     let file_stats = load_iceberg_file_stats(&table, current_snapshot).await?;
+    let access_artifacts =
+        collect_iceberg_access_artifacts(&partition_spec, &sort_order, &file_stats);
     let current_files = file_stats
         .iter()
         .map(|stats| stats.file_path.clone())
@@ -2528,8 +2807,11 @@ async fn load_iceberg_table_metadata_worker(
         sizes: sizes,
         schemas: schemas,
         compactions: vec![],
+        partition_spec,
+        sort_order,
         column_names: vec![],
         column_stats: vec![],
+        access_artifacts,
         file_stats,
     };
     cache_iceberg_table_metadata(namespace, name, &metadata);
@@ -2547,6 +2829,7 @@ async fn load_iceberg_file_stats(
         .load_manifest_list(table.file_io(), table.metadata())
         .await?;
     let current_schema = table.metadata().current_schema().clone();
+    let current_partition_spec = table.metadata().default_partition_spec().clone();
     let mut pending_file_stats = vec![];
 
     for manifest_file in manifest_list.entries().iter() {
@@ -2566,6 +2849,11 @@ async fn load_iceberg_file_stats(
                 file_path: data_file.file_path().to_string(),
                 record_count: Some(data_file.record_count()),
                 columns: collect_iceberg_column_stats(data_file, &current_schema),
+                partition_values: collect_iceberg_partition_values(
+                    data_file,
+                    current_partition_spec.as_ref(),
+                    &current_schema,
+                ),
             });
         }
     }
@@ -2594,6 +2882,7 @@ async fn load_iceberg_file_stats(
                     file_path: pending.file_path,
                     record_count: pending.record_count,
                     columns: pending.columns,
+                    partition_values: pending.partition_values,
                     row_groups,
                 }
             }
@@ -2936,8 +3225,11 @@ mod tests {
             sizes: file_paths.iter().map(|_| 128).collect(),
             schemas: file_paths.iter().map(|_| schema.clone()).collect(),
             compactions: vec![],
+            partition_spec: vec![],
+            sort_order: vec![],
             column_names: vec![],
             column_stats: vec![],
+            access_artifacts: vec![],
             file_stats: vec![],
         }
     }
