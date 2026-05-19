@@ -103,6 +103,16 @@ pub enum PrivateSearchAggregationSpec {
         name: String,
         field: String,
     },
+    Cardinality {
+        name: String,
+        field: String,
+    },
+    DateHistogram {
+        name: String,
+        field: String,
+        fixed_interval: String,
+        sub_aggregations: Vec<PrivateSearchAggregationSpec>,
+    },
     Filter {
         name: String,
         filter: PrivateSearchAggregationFilterSpec,
@@ -126,6 +136,14 @@ pub enum PrivateSearchAggregationPartial {
         sum: f64,
         count: u64,
     },
+    Cardinality {
+        name: String,
+        values: Vec<String>,
+    },
+    DateHistogram {
+        name: String,
+        buckets: Vec<PrivateSearchHistogramBucketPartial>,
+    },
     Filter {
         name: String,
         doc_count: u64,
@@ -136,6 +154,14 @@ pub enum PrivateSearchAggregationPartial {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PrivateSearchTermsBucketPartial {
     pub key: String,
+    pub doc_count: u64,
+    pub sub_aggregations: Vec<PrivateSearchAggregationPartial>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PrivateSearchHistogramBucketPartial {
+    pub key: i64,
+    pub key_as_string: String,
     pub doc_count: u64,
     pub sub_aggregations: Vec<PrivateSearchAggregationPartial>,
 }

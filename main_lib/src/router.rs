@@ -1922,7 +1922,7 @@ pub(crate) mod tests {
                 serde_json::to_string(&TestProcessingMode {
                     state_mode: StateMode::Testing,
                     storage_mode: StorageMode::default(),
-                    cache_mode: CacheMode::Native,
+                    cache_mode: CacheMode::Redis(None),
                     peer_mode: PeerMode::SelfOnly,
                     indexing_mode: IndexingMode::Sync,
                     compaction_mode: CompactionMode::Disabled,
@@ -2480,6 +2480,27 @@ pub(crate) mod tests {
             serde_json::from_str(&ids_query_response.read_utf8_body().unwrap()).unwrap();
         assert_eq!(ids_query_json["hits"]["total"]["value"], 2);
 
+        let multi_match_query_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs,_events_does_not_exist/_search?ignore_unavailable=true",
+                r#"{
+                  "query": {
+                    "multi_match": {
+                      "query": "Login",
+                      "fields": ["message"]
+                    }
+                  }
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(multi_match_query_response.status(), 200);
+        let multi_match_query_json: Value =
+            serde_json::from_str(&multi_match_query_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(multi_match_query_json["hits"]["total"]["value"], 4);
+
         let mget_table_response = test_server
             .client()
             .post(
@@ -2821,6 +2842,83 @@ pub(crate) mod tests {
             multi_index_avg_agg_json["aggregations"]["avg_index_col"]["value"],
             json!(4.0)
         );
+
+        let multi_index_cardinality_agg_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs,events_extra/_search",
+                r#"{
+                  "size": 0,
+                  "aggs": {
+                    "distinct_messages": {
+                      "cardinality": {
+                        "field": "message"
+                      }
+                    }
+                  }
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(multi_index_cardinality_agg_response.status(), 200);
+        let multi_index_cardinality_agg_json: Value = serde_json::from_str(
+            &multi_index_cardinality_agg_response
+                .read_utf8_body()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            multi_index_cardinality_agg_json["aggregations"]["distinct_messages"]["value"],
+            json!(9)
+        );
+
+        let multi_index_date_histogram_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs,events_extra/_search",
+                r#"{
+                  "size": 0,
+                  "aggs": {
+                    "per_day": {
+                      "date_histogram": {
+                        "field": "@timestamp",
+                        "fixed_interval": "1d"
+                      }
+                    }
+                  }
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(multi_index_date_histogram_response.status(), 200);
+        let multi_index_date_histogram_json: Value = serde_json::from_str(
+            &multi_index_date_histogram_response
+                .read_utf8_body()
+                .unwrap(),
+        )
+        .unwrap();
+        let histogram_buckets =
+            multi_index_date_histogram_json["aggregations"]["per_day"]["buckets"]
+                .as_array()
+                .unwrap();
+        assert_eq!(histogram_buckets.len(), 5);
+        assert_eq!(
+            histogram_buckets[0]["key_as_string"],
+            json!("2099-03-07T00:00:00.000Z")
+        );
+        assert_eq!(histogram_buckets[0]["doc_count"], json!(1));
+        assert_eq!(
+            histogram_buckets[1]["key_as_string"],
+            json!("2099-03-08T00:00:00.000Z")
+        );
+        assert_eq!(histogram_buckets[1]["doc_count"], json!(4));
+        assert_eq!(
+            histogram_buckets[2]["key_as_string"],
+            json!("2099-03-09T00:00:00.000Z")
+        );
+        assert_eq!(histogram_buckets[2]["doc_count"], json!(2));
 
         let invalid_search_after_response = test_server
             .client()

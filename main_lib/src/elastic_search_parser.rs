@@ -2,7 +2,7 @@ use crate::elastic_search_commands::UpdateByQueryCommand;
 use crate::elastic_search_common::ParseError;
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::search_executor::{
-    search_plan_to_command, update_by_query_plan_to_command, SearchCommand,
+    SearchCommand, search_plan_to_command, update_by_query_plan_to_command,
 };
 use crate::search_plan;
 use crate::search_runtime::ScriptBlock;
@@ -222,6 +222,7 @@ struct PitInfo {
 #[serde(untagged)]
 pub(crate) enum Query {
     Match(Match),
+    MultiMatch(MultiMatch),
     Bool(Bool),
     Term(Term),
     Terms(Terms),
@@ -235,6 +236,17 @@ pub(crate) enum Query {
 pub(crate) struct Match {
     #[serde(rename = "match")]
     _match: HashMap<String, FieldMatch>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct MultiMatch {
+    multi_match: MultiMatchBody,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct MultiMatchBody {
+    query: String,
+    fields: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -480,6 +492,40 @@ fn to_query_plan(query: &Query) -> Result<search_plan::QueryPlan, ParseError> {
             Ok(search_plan::QueryPlan::Match(search_plan::MatchPlan {
                 clauses,
             }))
+        }
+        Query::MultiMatch(multi_match) => {
+            if multi_match.multi_match.fields.is_empty() {
+                return Err(ParseError {
+                    message: "`multi_match` query requires at least one field".to_string(),
+                });
+            }
+
+            let mut should = multi_match
+                .multi_match
+                .fields
+                .iter()
+                .map(|field| {
+                    search_plan::QueryPlan::Match(search_plan::MatchPlan {
+                        clauses: vec![search_plan::MatchClausePlan {
+                            field: field.clone(),
+                            query: multi_match.multi_match.query.clone(),
+                        }],
+                    })
+                })
+                .collect::<Vec<_>>();
+            should.sort_by(|left, right| format!("{left:?}").cmp(&format!("{right:?}")));
+
+            if should.len() == 1 {
+                Ok(should.pop().unwrap())
+            } else {
+                Ok(search_plan::QueryPlan::Bool(search_plan::BoolPlan {
+                    filter: vec![],
+                    should,
+                    must: vec![],
+                    must_not: vec![],
+                    minimum_should_match: Some(1),
+                }))
+            }
         }
         Query::Bool(bool_obj) => Ok(search_plan::QueryPlan::Bool(search_plan::BoolPlan {
             filter: bool_obj
@@ -781,10 +827,10 @@ fn to_field_term(body: &FieldMatch) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{to_command, SearchBody};
+    use super::{SearchBody, to_command};
     use crate::elastic_search_endpoints::QueryStringSearch;
     use crate::elastic_search_parser::{
-        parse, parse_search_plan, parse_update_by_query_plan, UpdateByQueryBody,
+        UpdateByQueryBody, parse, parse_search_plan, parse_update_by_query_plan,
     };
     use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
     use crate::search_plan;
@@ -858,6 +904,32 @@ mod tests {
    "query": {
      "terms": {
        "index_col": [2, 5]
+     }
+   }
+}"#
+            .to_string(),
+        )
+        .unwrap();
+
+        match plan.query.unwrap() {
+            search_plan::QueryPlan::Bool(bool_plan) => {
+                assert_eq!(bool_plan.should.len(), 2);
+                assert_eq!(bool_plan.minimum_should_match, Some(1));
+            }
+            _ => panic!("Expected bool plan"),
+        }
+    }
+
+    #[test]
+    fn test_parse_search_plan_multi_match() {
+        let plan = parse_search_plan(
+            Some("foo".to_string()),
+            &r#"
+{
+   "query": {
+     "multi_match": {
+       "query": "login",
+       "fields": ["message", "message.keyword"]
      }
    }
 }"#
