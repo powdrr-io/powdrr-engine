@@ -159,11 +159,14 @@ bash scripts/run_serving_bench_local.sh
 That script:
 
 - starts local Elasticsearch and MongoDB containers
+- starts local Redis
+- starts a real `powdrr-io-engine` process on a dedicated local port
 - runs focused serving-path tests
 - benchmarks equivalent Powdrr, Elasticsearch, and Mongo query shapes
 
 This is the quickest way to see the protocol-neutral serving layer compared
-against familiar systems.
+against familiar systems with Powdrr measured over a real external HTTP server
+rather than an in-process test harness.
 
 ### Run The Servers
 
