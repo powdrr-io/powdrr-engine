@@ -753,6 +753,18 @@ fn insert_record(
     buffer.insert(&RecordInput::new(doc_id, version, doc, status));
 }
 
+fn primary_operation<'a>(
+    operations: &'a [OperationResult],
+) -> Result<&'a OperationResult, IngestError> {
+    operations
+        .iter()
+        .find(|operation| operation.result != "delete")
+        .or_else(|| operations.first())
+        .ok_or_else(|| IngestError {
+            message: "Mutation commit returned no operations".to_string(),
+        })
+}
+
 fn replace_record(
     buffer: &mut SpeedboatCommitBuilder,
     existing_doc: &FullRecord,
@@ -939,10 +951,7 @@ async fn index_single_worker(
             };
 
             let result = buffer.commit().await?;
-            assert!(
-                !result.operations.is_empty(),
-                "single-document index commit must return at least one operation"
-            );
+            let primary_operation = primary_operation(&result.operations)?;
             let headers = vec![(
                 LOCATION,
                 format!(
@@ -954,7 +963,7 @@ async fn index_single_worker(
             Ok(ElasticSearchResponse {
                 status,
                 mime: MIME_ES_JSON.clone(),
-                body: serde_json::to_string(&result.operations[0]).unwrap(),
+                body: serde_json::to_string(primary_operation).unwrap(),
                 headers,
             })
         }
@@ -1043,7 +1052,7 @@ async fn update_single_worker(
     )?;
 
     let result = buffer.commit().await?;
-    assert_eq!(result.operations.len(), 1);
+    let primary_operation = primary_operation(&result.operations)?;
     let headers = vec![(
         LOCATION,
         format!(
@@ -1058,7 +1067,7 @@ async fn update_single_worker(
             UpdateOutcome::Updated => StatusCode::OK,
         },
         mime: MIME_ES_JSON.clone(),
-        body: serde_json::to_string(&result.operations[0]).unwrap(),
+        body: serde_json::to_string(primary_operation).unwrap(),
         headers: headers,
     })
 }
