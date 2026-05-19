@@ -980,6 +980,7 @@ async fn handle_query(payload: Value) -> Result<Value, DynamoDbError> {
         query_requested_projection(requested_projection.as_ref(), select_mode),
         &filter_expression,
         &query_target.key_schema,
+        &context.schema,
     );
 
     let response = execute_fast_path_query(
@@ -1082,6 +1083,7 @@ async fn handle_scan(payload: Value) -> Result<Value, DynamoDbError> {
         query_requested_projection(requested_projection.as_ref(), select_mode),
         &filter_expression,
         &order_fields,
+        &context.schema,
     );
     let exclusive_start_key = request
         .exclusive_start_key
@@ -2004,6 +2006,7 @@ fn query_select_fields(
     requested_projection: Option<&Vec<String>>,
     filter_expression: &ParsedFilterExpression,
     key_schema: &DynamoDbKeySchemaConfig,
+    schema: &PowdrrSchema,
 ) -> Option<Vec<String>> {
     let Some(requested_projection) = requested_projection.cloned() else {
         return None;
@@ -2014,7 +2017,7 @@ fn query_select_fields(
         append_selected_field(&mut fields, sort_key);
     }
     for field in filter_expression.filter_fields.iter() {
-        append_selected_field(&mut fields, field);
+        append_selected_field_if_in_schema(&mut fields, field, schema);
     }
     Some(fields)
 }
@@ -2023,6 +2026,7 @@ fn scan_select_fields(
     requested_projection: Option<&Vec<String>>,
     filter_expression: &ParsedFilterExpression,
     order_fields: &[String],
+    schema: &PowdrrSchema,
 ) -> Option<Vec<String>> {
     let Some(requested_projection) = requested_projection.cloned() else {
         return None;
@@ -2032,7 +2036,7 @@ fn scan_select_fields(
         append_selected_field(&mut fields, field);
     }
     for field in filter_expression.filter_fields.iter() {
-        append_selected_field(&mut fields, field);
+        append_selected_field_if_in_schema(&mut fields, field, schema);
     }
     Some(fields)
 }
@@ -2040,6 +2044,16 @@ fn scan_select_fields(
 fn append_selected_field(fields: &mut Vec<String>, field_name: &str) {
     if !fields.iter().any(|field| field == field_name) {
         fields.push(field_name.to_string());
+    }
+}
+
+fn append_selected_field_if_in_schema(
+    fields: &mut Vec<String>,
+    field_name: &str,
+    schema: &PowdrrSchema,
+) {
+    if schema.to_map().contains_key(field_name) {
+        append_selected_field(fields, field_name);
     }
 }
 
@@ -3631,11 +3645,12 @@ mod tests {
     use super::{
         apply_filter_expression, dynamodb_attr_to_json, json_to_dynamodb_attr,
         parse_filter_expression, parse_key_condition_expression, primary_key_schema,
-        sha256_hex, sigv4_signature,
+        query_select_fields, sha256_hex, sigv4_signature,
     };
     use crate::data_contract::{
         DynamoDbTableConfig, FileSetPayload, IcebergMetadata, TableMetadataCheckpoint,
     };
+    use crate::schema_massager::extract_powdrr_schema;
     use crate::serving_dataset::read_parquet_documents;
     use crate::test_api::{CompactionMode, IndexingMode, StateMode, TestProcessingMode};
     use chrono::Utc;
@@ -3763,6 +3778,52 @@ mod tests {
         )
         .unwrap();
         assert!(not_matched.is_empty());
+    }
+
+    #[test]
+    fn test_query_select_fields_skips_filter_fields_missing_from_schema() {
+        let schema = extract_powdrr_schema(&json!({
+            "tenant": "acme",
+            "ts": 10,
+            "event_id": "evt-1",
+            "region": "us"
+        }));
+        let values = HashMap::new();
+        let parsed = parse_filter_expression(
+            Some(
+                &"attribute_not_exists(deleted_at) AND attribute_exists(region)".to_string(),
+            ),
+            None,
+            Some(&values),
+        )
+        .unwrap();
+
+        let projection = query_select_fields(
+            Some(&vec![
+                "tenant".to_string(),
+                "ts".to_string(),
+                "event_id".to_string(),
+            ]),
+            &parsed,
+            &primary_key_schema(&DynamoDbTableConfig {
+                partition_key: "tenant".to_string(),
+                sort_key: Some("ts".to_string()),
+                local_secondary_indexes: vec![],
+                global_secondary_indexes: vec![],
+            }),
+            &schema,
+        )
+        .unwrap();
+
+        assert_eq!(
+            projection,
+            vec![
+                "tenant".to_string(),
+                "ts".to_string(),
+                "event_id".to_string(),
+                "region".to_string(),
+            ]
+        );
     }
 
     #[test]
