@@ -693,8 +693,8 @@ pub(crate) mod tests {
     use std::{env, str};
 
     use crate::data_contract::{
-        CreateTable, FileSetPayload, IcebergFileStats, IcebergMetadata, SpeedboatMetadata,
-        TableMetadataCheckpoint,
+        CreateTable, DeletesMetadata, FileSetPayload, IcebergFileStats, IcebergMetadata,
+        SpeedboatMetadata, TableMetadataCheckpoint,
     };
     use crate::elastic_search_responses::{QueryResultTotal, QueryResults};
     use crate::lakehouse_serving::ServingConfigResponse;
@@ -757,6 +757,30 @@ pub(crate) mod tests {
                     "Login attempt failed",
                     "Login successful",
                 ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let file = fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    fn write_serving_delete_test_parquet(path: &Path) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_id_seq_no", DataType::Utf8, false),
+            Field::new("snippet", DataType::Utf8, false),
+            Field::new("searchTerms", DataType::Utf8, false),
+            Field::new("title", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["doc_1_1", "doc_2_1", "doc_3_1"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["s1", "s2", "s3"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["term-a", "term-b", "term-c"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["alpha", "bravo", "charlie"])) as ArrayRef,
             ],
         )
         .unwrap();
@@ -1051,6 +1075,130 @@ pub(crate) mod tests {
             "title_top_n"
         );
         assert_eq!(response_obj["rows"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_serving_query_honors_delete_metadata() {
+        let test_server = &*TEST_SERVER;
+
+        set_testing_and_processing_mode(test_server);
+
+        let schema = PowdrrSchema::from(&vec![
+            PowdrrField {
+                name: "_id_seq_no".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "snippet".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "searchTerms".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "title".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+        ]);
+
+        let temp_dir = TempDir::new().unwrap();
+        let parquet_path = temp_dir.path().join("serve_flights_with_deletes.parquet");
+        write_serving_delete_test_parquet(&parquet_path);
+        let delete_path = temp_dir
+            .path()
+            .join("serve_flights_with_deletes.delete.json");
+        fs::write(&delete_path, "{\"_id_seq_no\":\"doc_1_1\"}\n").unwrap();
+        let file_path = format!("file://{}", parquet_path.display());
+
+        let checkpoint = TableMetadataCheckpoint {
+            table_name: "serve_flights_with_deletes".to_string(),
+            original_checkpoint_id: None,
+            checkpoint_id: "serve_checkpoint_with_deletes_0".to_string(),
+            iceberg_metadata: Some(IcebergMetadata {
+                table_schema: schema.clone(),
+                snapshot_id: Some("snapshot_with_deletes_1".to_string()),
+                files: FileSetPayload::single(
+                    file_path,
+                    fs::metadata(&parquet_path).unwrap().len(),
+                    schema.clone(),
+                ),
+                column_names: vec![],
+                column_stats: vec![],
+                file_stats: vec![],
+            }),
+            speedboat_metadata: None,
+            deletes_metadata: Some(DeletesMetadata {
+                files: vec![format!("file://{}", delete_path.display())],
+            }),
+            extension_metadata: HashMap::new(),
+            schema: schema.clone(),
+        };
+
+        test_server
+            .client()
+            .post(
+                "http://localhost/_test/v1/_add_checkpoint",
+                serde_json::to_string(&checkpoint).unwrap(),
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        let config_response = test_server
+            .client()
+            .put(
+                "http://localhost/serve_flights_with_deletes/_serve/config",
+                r#"{
+                  "patterns": [
+                    {
+                      "name": "title_top_n",
+                      "order_field": "title",
+                      "descending": false,
+                      "max_limit": 10,
+                      "projection": ["title"]
+                    }
+                  ]
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(config_response.status(), 200);
+
+        let query_response = test_server
+            .client()
+            .post(
+                "http://localhost/serve_flights_with_deletes/_serve",
+                r#"{
+                  "select": ["title"],
+                  "order_by": [{ "field": "title", "descending": false }],
+                  "limit": 2
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(query_response.status(), 200);
+        let response_obj: serde_json::Value =
+            serde_json::from_str(&query_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ServingQueryClassification>(
+                response_obj["classification"].clone()
+            )
+            .unwrap(),
+            ServingQueryClassification::FastPath
+        );
+        assert_eq!(
+            response_obj["matched_pattern"].as_str().unwrap(),
+            "title_top_n"
+        );
+        let rows = response_obj["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["title"], json!("bravo"));
+        assert_eq!(rows[1]["title"], json!("charlie"));
     }
 
     #[test]
