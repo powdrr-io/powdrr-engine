@@ -29,9 +29,9 @@ use iceberg::{NamespaceIdent, TableCreation, TableIdent};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use idgenerator::IdInstance;
 #[cfg(target_os = "linux")]
-use liquid_cache_parquet::LiquidCacheLocalBuilder;
+use liquid_cache_datafusion::cache::LiquidCacheParquetRef;
 #[cfg(target_os = "linux")]
-use liquid_cache_parquet::LiquidCacheParquetRef;
+use liquid_cache_parquet::LiquidCacheLocalBuilder;
 #[cfg(target_os = "linux")]
 use liquid_cache_parquet::storage::cache::squeeze_policies::Evict;
 #[cfg(target_os = "linux")]
