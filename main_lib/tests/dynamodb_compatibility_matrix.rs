@@ -12,18 +12,21 @@ use aws_sdk_dynamodb::client::Waiters;
 use aws_sdk_dynamodb::operation::query::QueryOutput;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, KeySchemaElement,
-    KeyType, KeysAndAttributes, Projection, ProjectionType, ScalarAttributeType, Select,
-    TableDescription, TableStatus,
+    KeyType, KeysAndAttributes, LocalSecondaryIndex, Projection, ProjectionType,
+    ReturnConsumedCapacity, ScalarAttributeType, Select, TableDescription, TableStatus,
 };
+use chrono::Utc;
 use datafusion::arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::parquet::arrow::ArrowWriter;
 use futures_util::future;
 use gotham::bind_server;
+use hmac::{Hmac, Mac};
 use powdrr_lib::data_contract::{
-    DynamoDbGlobalSecondaryIndexConfig, DynamoDbTableConfig, FileSetPayload, IcebergMetadata,
-    LicenseType, OrgCreds, OrgSettings, TableMetadataCheckpoint,
+    DynamoDbGlobalSecondaryIndexConfig, DynamoDbLocalSecondaryIndexConfig, DynamoDbTableConfig,
+    FileSetPayload, IcebergMetadata, LicenseType, OrgCreds, OrgSettings,
+    TableMetadataCheckpoint,
 };
 use powdrr_lib::router::router;
 use powdrr_lib::serving_dataset::read_parquet_documents;
@@ -34,6 +37,7 @@ use powdrr_lib::test_api::{
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -150,6 +154,13 @@ struct TestGlobalSecondaryIndex {
     sort_key: Option<(String, ScalarAttributeType)>,
 }
 
+#[derive(Clone)]
+struct TestLocalSecondaryIndex {
+    name: String,
+    sort_key: String,
+    sort_key_type: ScalarAttributeType,
+}
+
 struct PowdrrServer {
     base_url: String,
     task: JoinHandle<()>,
@@ -185,6 +196,7 @@ struct DifferentialFixture {
     begins_with_table_name: String,
     hidden_table_name: String,
     region_event_id_index: String,
+    tenant_count_index: String,
 }
 
 #[test]
@@ -243,6 +255,7 @@ fn compatibility_matrix_wire_contract_locally() {
         .unwrap();
     runtime.block_on(async {
         let server = PowdrrServer::spawn().await;
+        register_powdrr_test_org().await;
         let fixture = match ensure_local_engine_dependencies() {
             Ok(()) => Some(build_differential_fixture(&server.base_url).await),
             Err(reason) => {
@@ -255,6 +268,7 @@ fn compatibility_matrix_wire_contract_locally() {
         };
 
         assert_unsupported_operations_explicit(&server.base_url).await;
+        assert_auth_errors_explicit(&server.base_url).await;
         assert_parser_rejections_explicit(&server.base_url).await;
         if let Some(fixture) = fixture {
             assert_stateful_query_errors(&server.base_url, &fixture.primary_table_name).await;
@@ -296,6 +310,7 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
     let begins_with_table_name = unique_table_name("dynamo_matrix_begins_with");
     let hidden_table_name = unique_table_name("dynamo_matrix_hidden");
     let region_event_id_index = "region-event-id-index".to_string();
+    let tenant_count_index = "tenant-count-index".to_string();
 
     eprintln!("dynamo fixture: configuring Powdrr testing mode");
     configure_powdrr_testing_mode(base_url).await;
@@ -308,6 +323,10 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
         &DynamoDbTableConfig {
             partition_key: "tenant".to_string(),
             sort_key: Some("ts".to_string()),
+            local_secondary_indexes: vec![DynamoDbLocalSecondaryIndexConfig {
+                name: tenant_count_index.clone(),
+                sort_key: "count".to_string(),
+            }],
             global_secondary_indexes: vec![DynamoDbGlobalSecondaryIndexConfig {
                 name: region_event_id_index.clone(),
                 partition_key: "region".to_string(),
@@ -324,6 +343,7 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
         &DynamoDbTableConfig {
             partition_key: "tenant".to_string(),
             sort_key: Some("event_id".to_string()),
+            local_secondary_indexes: vec![],
             global_secondary_indexes: vec![],
         },
     )
@@ -340,6 +360,11 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
         &rows,
         "ts",
         ScalarAttributeType::N,
+        vec![TestLocalSecondaryIndex {
+            name: tenant_count_index.clone(),
+            sort_key: "count".to_string(),
+            sort_key_type: ScalarAttributeType::N,
+        }],
         vec![TestGlobalSecondaryIndex {
             name: region_event_id_index.clone(),
             partition_key: "region".to_string(),
@@ -355,6 +380,7 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
         &rows,
         "event_id",
         ScalarAttributeType::S,
+        vec![],
         vec![],
     )
     .await;
@@ -385,6 +411,7 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
         begins_with_table_name,
         hidden_table_name,
         region_event_id_index,
+        tenant_count_index,
     }
 }
 
@@ -416,6 +443,21 @@ async fn assert_unsupported_operations_explicit(base_url: &str) {
     }
 }
 
+async fn assert_auth_errors_explicit(base_url: &str) {
+    let response = HttpClient::new()
+        .post(format!("{}/", base_url.trim_end_matches('/')))
+        .header("content-type", "application/json")
+        .header("x-amz-target", "DynamoDB_20120810.ListTables")
+        .body("{}".to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 403);
+    let body = serde_json::from_str::<Value>(&response.text().await.unwrap()).unwrap();
+    assert_eq!(body["__type"], json!("UnrecognizedClientException"));
+    assert_eq!(body["message"], json!("Missing Authorization header"));
+}
+
 async fn assert_parser_rejections_explicit(base_url: &str) {
     let table_name = "parser_only_table".to_string();
     let explicit_error_cases = vec![
@@ -428,48 +470,6 @@ async fn assert_parser_rejections_explicit(base_url: &str) {
             "DescribeTable",
             json!({
                 "TableName": table_name,
-                "ReturnConsumedCapacity": "TOTAL"
-            }),
-            "unknown field `ReturnConsumedCapacity`",
-        ),
-        (
-            "GetItem",
-            json!({
-                "TableName": table_name,
-                "Key": {
-                    "tenant": { "S": "acme" },
-                    "ts": { "N": "10" }
-                },
-                "ReturnConsumedCapacity": "TOTAL"
-            }),
-            "unknown field `ReturnConsumedCapacity`",
-        ),
-        (
-            "BatchGetItem",
-            json!({
-                "RequestItems": {
-                    table_name.clone(): {
-                        "Keys": [{
-                            "tenant": { "S": "acme" },
-                            "ts": { "N": "10" }
-                        }]
-                    }
-                },
-                "ReturnConsumedCapacity": "TOTAL"
-            }),
-            "unknown field `ReturnConsumedCapacity`",
-        ),
-        (
-            "Query",
-            json!({
-                "TableName": table_name,
-                "KeyConditionExpression": "#pk = :pk",
-                "ExpressionAttributeNames": {
-                    "#pk": "tenant"
-                },
-                "ExpressionAttributeValues": {
-                    ":pk": { "S": "acme" }
-                },
                 "ReturnConsumedCapacity": "TOTAL"
             }),
             "unknown field `ReturnConsumedCapacity`",
@@ -511,17 +511,19 @@ async fn assert_stateful_query_errors(base_url: &str, table_name: &str) {
                 "ExpressionAttributeNames": {
                     "#pk": "tenant",
                     "#sk": "ts",
-                    "#region": "region"
+                    "#region": "region",
+                    "#count": "count"
                 },
                 "ExpressionAttributeValues": {
                     ":pk": { "S": "acme" },
                     ":start": { "N": "10" },
                     ":end": { "N": "30" },
-                    ":prefix": { "S": "us" }
+                    ":prefix": { "S": "us" },
+                    ":threshold": { "N": "2" }
                 },
-                "FilterExpression": "contains(#region, :prefix)"
+                "FilterExpression": "contains(#region, :prefix) OR NOT #count > :threshold"
             }),
-            "Unsupported FilterExpression clause contains(region, :prefix)",
+            "",
         ),
         (
             "Query",
@@ -540,30 +542,78 @@ async fn assert_stateful_query_errors(base_url: &str, table_name: &str) {
             }),
             "Unsupported KeyConditionExpression form",
         ),
+        (
+            "Query",
+            json!({
+                "TableName": table_name,
+                "KeyConditionExpression": "#pk = :pk",
+                "ExpressionAttributeNames": {
+                    "#pk": "tenant"
+                },
+                "ExpressionAttributeValues": {
+                    ":pk": { "S": "acme" }
+                },
+                "ReturnConsumedCapacity": "MAYBE"
+            }),
+            "Unsupported ReturnConsumedCapacity value MAYBE",
+        ),
+        (
+            "Scan",
+            json!({
+                "TableName": table_name,
+                "ProjectionExpression": "tenant",
+                "Select": "COUNT"
+            }),
+            "ProjectionExpression can only be used when Select is SPECIFIC_ATTRIBUTES",
+        ),
+        (
+            "Query",
+            json!({
+                "TableName": table_name,
+                "IndexName": "region-event-id-index",
+                "ConsistentRead": true,
+                "KeyConditionExpression": "#pk = :pk",
+                "ExpressionAttributeNames": {
+                    "#pk": "region"
+                },
+                "ExpressionAttributeValues": {
+                    ":pk": { "S": "us-east-1" }
+                }
+            }),
+            "Consistent reads are not supported on global secondary indexes",
+        ),
     ];
 
     for (operation, body, expected_message_fragment) in explicit_error_cases {
         let response = raw_dynamodb_request(base_url, operation, &body).await;
-        assert_eq!(
-            response.status, 400,
-            "{} should fail explicitly, got status {} body {}",
-            operation, response.status, response.body
-        );
-        assert_eq!(
-            response.body["__type"],
-            json!("ValidationException"),
-            "{} should return ValidationException, got {}",
-            operation,
-            response.body
-        );
-        let message = response.body["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains(expected_message_fragment),
-            "{} should surface '{}', got '{}'",
-            operation,
-            expected_message_fragment,
-            message
-        );
+        if expected_message_fragment.is_empty() {
+            assert_eq!(
+                response.status, 200,
+                "{} should now be supported, got status {} body {}",
+                operation, response.status, response.body
+            );
+        } else {
+            assert_eq!(
+                response.status, 400,
+                "{} should fail explicitly, got status {} body {}",
+                operation, response.status, response.body
+            );
+            assert_eq!(
+                response.body["__type"],
+                json!("ValidationException"),
+                "{} should return ValidationException, got {}",
+                operation,
+                response.body
+            );
+            let message = response.body["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains(expected_message_fragment),
+                "{} should surface '{}', got '{}'",
+                operation,
+                expected_message_fragment,
+                message
+            );
+        }
     }
 }
 
@@ -1267,6 +1317,117 @@ async fn compare_query_operation(fixture: &DifferentialFixture) {
         })],
     );
 
+    let powdrr_gsi_capacity = query_region_index_page_with_capacity(
+        &fixture.powdrr_client,
+        &fixture.primary_table_name,
+        &fixture.region_event_id_index,
+    )
+    .await;
+    assert!(
+        powdrr_gsi_capacity
+            .consumed_capacity()
+            .and_then(|capacity| capacity.global_secondary_indexes())
+            .and_then(|indexes| indexes.get(&fixture.region_event_id_index))
+            .is_some()
+    );
+
+    let powdrr_lsi = query_local_index_page(
+        &fixture.powdrr_client,
+        &fixture.primary_table_name,
+        &fixture.tenant_count_index,
+    )
+    .await;
+    let localstack_lsi = query_local_index_page(
+        &fixture.localstack_client,
+        &fixture.primary_table_name,
+        &fixture.tenant_count_index,
+    )
+    .await;
+    compare_query_page_outputs(
+        &powdrr_lsi,
+        &localstack_lsi,
+        vec![
+            json!({
+                "tenant": "acme",
+                "count": 2,
+                "event_id": "evt-2",
+                "ts": 20,
+            }),
+            json!({
+                "tenant": "acme",
+                "count": 3,
+                "event_id": "evt-3",
+                "ts": 30,
+            }),
+        ],
+    );
+    assert!(
+        powdrr_lsi
+            .consumed_capacity()
+            .and_then(|capacity| capacity.local_secondary_indexes())
+            .and_then(|indexes| indexes.get(&fixture.tenant_count_index))
+            .is_some()
+    );
+
+    let powdrr_or_filter =
+        query_with_or_not_filter_page(&fixture.powdrr_client, &fixture.primary_table_name).await;
+    let localstack_or_filter = query_with_or_not_filter_page(
+        &fixture.localstack_client,
+        &fixture.primary_table_name,
+    )
+    .await;
+    compare_query_page_outputs(
+        &powdrr_or_filter,
+        &localstack_or_filter,
+        vec![
+            json!({
+                "tenant": "acme",
+                "ts": 20,
+                "event_id": "evt-2",
+                "region": "us-west-2",
+                "active": false,
+            }),
+            json!({
+                "tenant": "acme",
+                "ts": 30,
+                "event_id": "evt-3",
+                "region": "eu-central-1",
+                "active": true,
+            }),
+        ],
+    );
+
+    let powdrr_attribute_filter = query_with_attribute_meta_filter_page(
+        &fixture.powdrr_client,
+        &fixture.primary_table_name,
+    )
+    .await;
+    let localstack_attribute_filter = query_with_attribute_meta_filter_page(
+        &fixture.localstack_client,
+        &fixture.primary_table_name,
+    )
+    .await;
+    compare_query_page_outputs(
+        &powdrr_attribute_filter,
+        &localstack_attribute_filter,
+        vec![
+            json!({
+                "tenant": "acme",
+                "ts": 20,
+                "event_id": "evt-2",
+                "region": "us-west-2",
+                "count": 2,
+            }),
+            json!({
+                "tenant": "acme",
+                "ts": 30,
+                "event_id": "evt-3",
+                "region": "eu-central-1",
+                "count": 3,
+            }),
+        ],
+    );
+
     let powdrr_count = query_count_page(&fixture.powdrr_client, &fixture.primary_table_name).await;
     let localstack_count =
         query_count_page(&fixture.localstack_client, &fixture.primary_table_name).await;
@@ -1361,6 +1522,18 @@ async fn compare_scan_operation(fixture: &DifferentialFixture) {
     assert_eq!(powdrr_count.count(), localstack_count.count());
     assert_eq!(powdrr_count.scanned_count(), localstack_count.scanned_count());
     assert_eq!(powdrr_count.items().len(), 0);
+
+    let powdrr_count_with_capacity = scan_count_page_with_capacity(
+        &fixture.powdrr_client,
+        &fixture.primary_table_name,
+    )
+    .await;
+    assert_eq!(
+        powdrr_count_with_capacity
+            .consumed_capacity()
+            .and_then(|capacity| capacity.table_name()),
+        Some(fixture.primary_table_name.as_str())
+    );
 }
 
 fn compare_query_page_outputs(
@@ -1660,6 +1833,7 @@ async fn create_localstack_table(
     rows: &[EventRow],
     sort_key_name: &str,
     sort_key_type: ScalarAttributeType,
+    local_secondary_indexes: Vec<TestLocalSecondaryIndex>,
     global_secondary_indexes: Vec<TestGlobalSecondaryIndex>,
 ) {
     let _ = client.delete_table().table_name(table_name).send().await;
@@ -1701,6 +1875,45 @@ async fn create_localstack_table(
         ("tenant".to_string(), ScalarAttributeType::S),
         (sort_key_name.to_string(), sort_key_type),
     ];
+    for index in local_secondary_indexes.iter() {
+        if !declared_attributes
+            .iter()
+            .any(|(name, _)| name == &index.sort_key)
+        {
+            create_table = create_table.attribute_definitions(
+                AttributeDefinition::builder()
+                    .attribute_name(index.sort_key.clone())
+                    .attribute_type(index.sort_key_type.clone())
+                    .build()
+                    .unwrap(),
+            );
+            declared_attributes.push((index.sort_key.clone(), index.sort_key_type.clone()));
+        }
+        let lsi = LocalSecondaryIndex::builder()
+            .index_name(index.name.clone())
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name("tenant")
+                    .key_type(KeyType::Hash)
+                    .build()
+                    .unwrap(),
+            )
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name(index.sort_key.clone())
+                    .key_type(KeyType::Range)
+                    .build()
+                    .unwrap(),
+            )
+            .projection(
+                Projection::builder()
+                    .projection_type(ProjectionType::All)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        create_table = create_table.local_secondary_indexes(lsi);
+    }
     for index in global_secondary_indexes.iter() {
         if !declared_attributes
             .iter()
@@ -1779,10 +1992,53 @@ async fn create_localstack_table(
 }
 
 async fn raw_dynamodb_request(base_url: &str, operation: &str, body: &Value) -> HttpResponseRecord {
+    let body_text = serde_json::to_string(body).unwrap();
+    let target = format!("DynamoDB_20120810.{}", operation);
+    let amz_date = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let credential_date = Utc::now().format("%Y%m%d").to_string();
+    let parsed_base_url = Url::parse(base_url).unwrap();
+    let host = match parsed_base_url.port() {
+        Some(port) => format!("{}:{}", parsed_base_url.host_str().unwrap(), port),
+        None => parsed_base_url.host_str().unwrap().to_string(),
+    };
+    let payload_hash = sha256_hex(body_text.as_bytes());
+    let signed_headers = "content-type;host;x-amz-date;x-amz-target";
+    let canonical_request = format!(
+        "POST\n/\n\ncontent-type:{}\nhost:{}\nx-amz-date:{}\nx-amz-target:{}\n\n{}\n{}",
+        "application/json",
+        host,
+        amz_date,
+        target,
+        signed_headers,
+        payload_hash
+    );
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{}/us-east-1/dynamodb/aws4_request\n{}",
+        amz_date,
+        credential_date,
+        sha256_hex(canonical_request.as_bytes())
+    );
+    let signature = sigv4_signature(
+        "test",
+        &credential_date,
+        "us-east-1",
+        "dynamodb",
+        &string_to_sign,
+    );
     let response = HttpClient::new()
         .post(format!("{}/", base_url.trim_end_matches('/')))
-        .header("x-amz-target", format!("DynamoDB_20120810.{}", operation))
-        .json(body)
+        .header("content-type", "application/json")
+        .header("host", host)
+        .header("x-amz-date", amz_date)
+        .header("x-amz-target", target)
+        .header(
+            "Authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=test/{}/us-east-1/dynamodb/aws4_request,SignedHeaders={},Signature={}",
+                credential_date, signed_headers, signature
+            ),
+        )
+        .body(body_text)
         .send()
         .await
         .unwrap();
@@ -1792,6 +2048,42 @@ async fn raw_dynamodb_request(base_url: &str, operation: &str, body: &Value) -> 
         status,
         body: serde_json::from_str(&body).unwrap_or_else(|_| json!({ "raw": body })),
     }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut sha = Sha256::new();
+    sha.update(bytes);
+    hex_encode(&sha.finalize())
+}
+
+fn sigv4_signature(
+    secret_access_key: &str,
+    credential_date: &str,
+    region: &str,
+    service: &str,
+    string_to_sign: &str,
+) -> String {
+    let secret = format!("AWS4{}", secret_access_key);
+    let k_date = hmac_sha256(secret.as_bytes(), credential_date.as_bytes());
+    let k_region = hmac_sha256(&k_date, region.as_bytes());
+    let k_service = hmac_sha256(&k_region, service.as_bytes());
+    let k_signing = hmac_sha256(&k_service, b"aws4_request");
+    hex_encode(&hmac_sha256(&k_signing, string_to_sign.as_bytes()))
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> Vec<u8> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+    mac.update(message);
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
+        encoded.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap());
+    }
+    encoded
 }
 
 struct HttpResponseRecord {
@@ -1991,6 +2283,102 @@ async fn query_region_index_page(
         .unwrap()
 }
 
+async fn query_region_index_page_with_capacity(
+    client: &DynamoClient,
+    table_name: &str,
+    index_name: &str,
+) -> QueryOutput {
+    client
+        .query()
+        .table_name(table_name)
+        .index_name(index_name)
+        .key_condition_expression("#pk = :pk AND begins_with(#sk, :prefix)")
+        .expression_attribute_names("#pk", "region")
+        .expression_attribute_names("#sk", "event_id")
+        .expression_attribute_names("#tenant", "tenant")
+        .expression_attribute_values(":pk", AttributeValue::S("us-east-1".to_string()))
+        .expression_attribute_values(":prefix", AttributeValue::S("evt-".to_string()))
+        .projection_expression("#tenant, #pk, #sk, ts")
+        .return_consumed_capacity(ReturnConsumedCapacity::Indexes)
+        .scan_index_forward(true)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn query_local_index_page(
+    client: &DynamoClient,
+    table_name: &str,
+    index_name: &str,
+) -> QueryOutput {
+    client
+        .query()
+        .table_name(table_name)
+        .index_name(index_name)
+        .consistent_read(true)
+        .key_condition_expression("#pk = :pk AND #sk BETWEEN :start AND :end")
+        .expression_attribute_names("#pk", "tenant")
+        .expression_attribute_names("#sk", "count")
+        .expression_attribute_names("#event", "event_id")
+        .expression_attribute_values(":pk", AttributeValue::S("acme".to_string()))
+        .expression_attribute_values(":start", AttributeValue::N("2".to_string()))
+        .expression_attribute_values(":end", AttributeValue::N("3".to_string()))
+        .projection_expression("#pk, #sk, #event, ts")
+        .return_consumed_capacity(ReturnConsumedCapacity::Indexes)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn query_with_or_not_filter_page(client: &DynamoClient, table_name: &str) -> QueryOutput {
+    client
+        .query()
+        .table_name(table_name)
+        .key_condition_expression("#pk = :pk AND #sk BETWEEN :start AND :end")
+        .filter_expression("contains(#region, :prefix) OR NOT #active = :active")
+        .expression_attribute_names("#pk", "tenant")
+        .expression_attribute_names("#sk", "ts")
+        .expression_attribute_names("#region", "region")
+        .expression_attribute_names("#active", "active")
+        .expression_attribute_values(":pk", AttributeValue::S("acme".to_string()))
+        .expression_attribute_values(":start", AttributeValue::N("10".to_string()))
+        .expression_attribute_values(":end", AttributeValue::N("30".to_string()))
+        .expression_attribute_values(":prefix", AttributeValue::S("eu".to_string()))
+        .expression_attribute_values(":active", AttributeValue::Bool(true))
+        .projection_expression("#pk, #sk, event_id, #region, #active")
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn query_with_attribute_meta_filter_page(
+    client: &DynamoClient,
+    table_name: &str,
+) -> QueryOutput {
+    client
+        .query()
+        .table_name(table_name)
+        .key_condition_expression("#pk = :pk AND #sk BETWEEN :start AND :end")
+        .filter_expression(
+            "attribute_exists(#region) AND attribute_not_exists(deleted_at) AND attribute_type(#region, :type) AND size(event_id) > :min_size AND #count >= :min_count",
+        )
+        .expression_attribute_names("#pk", "tenant")
+        .expression_attribute_names("#sk", "ts")
+        .expression_attribute_names("#region", "region")
+        .expression_attribute_names("#count", "count")
+        .expression_attribute_names("#event", "event_id")
+        .expression_attribute_values(":pk", AttributeValue::S("acme".to_string()))
+        .expression_attribute_values(":start", AttributeValue::N("10".to_string()))
+        .expression_attribute_values(":end", AttributeValue::N("30".to_string()))
+        .expression_attribute_values(":type", AttributeValue::S("S".to_string()))
+        .expression_attribute_values(":min_size", AttributeValue::N("4".to_string()))
+        .expression_attribute_values(":min_count", AttributeValue::N("2".to_string()))
+        .projection_expression("#pk, #sk, #event, #region, #count")
+        .send()
+        .await
+        .unwrap()
+}
+
 async fn query_count_page(client: &DynamoClient, table_name: &str) -> QueryOutput {
     client
         .query()
@@ -2045,6 +2433,23 @@ async fn scan_count_page(
         .expression_attribute_values(":active", AttributeValue::Bool(true))
         .filter_expression("#active = :active")
         .select(Select::Count)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn scan_count_page_with_capacity(
+    client: &DynamoClient,
+    table_name: &str,
+) -> aws_sdk_dynamodb::operation::scan::ScanOutput {
+    client
+        .scan()
+        .table_name(table_name)
+        .expression_attribute_names("#active", "active")
+        .expression_attribute_values(":active", AttributeValue::Bool(true))
+        .filter_expression("#active = :active")
+        .select(Select::Count)
+        .return_consumed_capacity(ReturnConsumedCapacity::Total)
         .send()
         .await
         .unwrap()
@@ -2120,6 +2525,11 @@ fn compare_table_descriptions(powdrr: &TableDescription, localstack: &TableDescr
         table_global_secondary_indexes(localstack),
         "global secondary index mismatch"
     );
+    assert_eq!(
+        table_local_secondary_indexes(powdrr),
+        table_local_secondary_indexes(localstack),
+        "local secondary index mismatch"
+    );
 }
 
 fn table_key_schema(description: &TableDescription) -> Vec<(String, String)> {
@@ -2155,6 +2565,32 @@ fn table_global_secondary_indexes(
 ) -> Vec<(String, Vec<(String, String)>)> {
     let mut indexes = description
         .global_secondary_indexes()
+        .iter()
+        .map(|index| {
+            (
+                index.index_name().unwrap_or_default().to_string(),
+                index
+                    .key_schema()
+                    .iter()
+                    .map(|element| {
+                        (
+                            element.attribute_name().to_string(),
+                            element.key_type().as_str().to_string(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    indexes.sort_by(|left, right| left.0.cmp(&right.0));
+    indexes
+}
+
+fn table_local_secondary_indexes(
+    description: &TableDescription,
+) -> Vec<(String, Vec<(String, String)>)> {
+    let mut indexes = description
+        .local_secondary_indexes()
         .iter()
         .map(|index| {
             (

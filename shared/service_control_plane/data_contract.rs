@@ -594,10 +594,18 @@ pub struct DynamoDbGlobalSecondaryIndexConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct DynamoDbLocalSecondaryIndexConfig {
+    pub name: String,
+    pub sort_key: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct DynamoDbTableConfig {
     pub partition_key: String,
     #[serde(default)]
     pub sort_key: Option<String>,
+    #[serde(default)]
+    pub local_secondary_indexes: Vec<DynamoDbLocalSecondaryIndexConfig>,
     #[serde(default)]
     pub global_secondary_indexes: Vec<DynamoDbGlobalSecondaryIndexConfig>,
 }
