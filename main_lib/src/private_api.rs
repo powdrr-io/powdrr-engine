@@ -8,7 +8,7 @@ use futures_util::future::try_join_all;
 use idgenerator::IdInstance;
 use prost::Message;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     error::Error,
     fmt,
 };
@@ -20,6 +20,10 @@ use crate::data_contract::{
 };
 use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_responses::{QueryResultHit, compare_query_result_hits_desc};
+use crate::lakehouse_serving::{
+    ServingCacheManagerPlan, build_serving_cache_manager_plan,
+    default_serving_cache_manager_request, execute_serving_cache_manager_plan,
+};
 use crate::peers::{
     CheckpointDescriptor, PrivateCompactionInvocation, PrivateExactConstraintGroup,
     PrivateExtensionInvocation, PrivatePrefetchInvocation, PrivateSearchAggregationFilterSpec,
@@ -141,25 +145,43 @@ async fn determine_required_files(
         });
     }
 
+    let table_metadata = load_checkpoint_table_metadata(checkpoints).await?;
+    required_files_from_table_metadata(required_extensions, &table_metadata, index, num)
+}
+
+async fn load_checkpoint_table_metadata(
+    checkpoints: &Vec<CheckpointDescriptor>,
+) -> Result<TableMetadataCheckpoint, PrivateApiError> {
+    if checkpoints.len() != 1 {
+        return Err(PrivateApiError {
+            message: "Only read for one table at a time please.".to_string(),
+        });
+    }
+
     let target_checkpoint = &checkpoints[0];
-    let table_metadata = match STATE_PROVIDER
+    match STATE_PROVIDER
         .get_checkpoint(target_checkpoint.clone())
         .await
     {
         Ok(tmc) => match tmc {
-            Some(tmc) => tmc,
+            Some(tmc) => Ok(tmc),
             None => panic!(
                 "The table metadata was not found for a known checkpoint: {}",
                 target_checkpoint
             ),
         },
-        Err(_e) => {
-            return log_err(PrivateApiError {
-                message: "Error calling get checkpoint".to_string(),
-            });
-        }
-    };
+        Err(_e) => log_err(PrivateApiError {
+            message: "Error calling get checkpoint".to_string(),
+        }),
+    }
+}
 
+fn required_files_from_table_metadata(
+    required_extensions: &Vec<String>,
+    table_metadata: &TableMetadataCheckpoint,
+    index: u64,
+    num: u64,
+) -> Result<RequiredFiles, PrivateApiError> {
     // TODO: add logic to select the iceberg and speedboat files for this host.
 
     let filtered_iceberg_files = filter_iceberg(&table_metadata.iceberg_metadata, index, num);
@@ -184,10 +206,87 @@ async fn determine_required_files(
         speedboat_file_extensions,
         delete_files: table_metadata
             .deletes_metadata
-            .map_or_else(|| vec![], |d| d.files.clone()),
+            .as_ref()
+            .map_or_else(Vec::new, |d| d.files.clone()),
     })
 }
 
+async fn narrow_prefetch_files_for_serving_warmup(
+    required_files: &mut RequiredFiles,
+    table_metadata: &TableMetadataCheckpoint,
+) -> Option<ServingCacheManagerPlan> {
+    if required_files.iceberg_files.is_empty() {
+        return None;
+    }
+
+    let description = match STATE_PROVIDER
+        .describe_table(&table_metadata.table_name)
+        .await
+    {
+        Ok(Some(description)) => description,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(
+                "Skipping serving warmup narrowing for {}: {}",
+                table_metadata.table_name,
+                error
+            );
+            return None;
+        }
+    };
+    let Some(serving) = description.serving.as_ref() else {
+        return None;
+    };
+    let Some(iceberg_metadata) = table_metadata.iceberg_metadata.as_ref() else {
+        return None;
+    };
+    let file_stats = iceberg_metadata
+        .file_stats
+        .iter()
+        .map(|stats| (stats.file_path.clone(), stats.clone()))
+        .collect::<HashMap<_, _>>();
+    let manager_request = default_serving_cache_manager_request(serving);
+    let warmup_plan = build_serving_cache_manager_plan(
+        &manager_request,
+        serving,
+        &required_files.iceberg_files,
+        &file_stats,
+        &iceberg_metadata.sort_order,
+        &iceberg_metadata.access_artifacts,
+    );
+    if warmup_plan.warm_files.is_empty() {
+        return None;
+    }
+
+    let selected_paths = warmup_plan
+        .warm_files
+        .iter()
+        .map(|file| file.file_path.clone())
+        .collect::<BTreeSet<_>>();
+    let initial_selected = required_files.iceberg_files.len();
+    let iceberg_files = std::mem::take(&mut required_files.iceberg_files);
+    let iceberg_file_extensions = std::mem::take(&mut required_files.iceberg_file_extensions);
+    for (file, extensions) in iceberg_files
+        .into_iter()
+        .zip(iceberg_file_extensions.into_iter())
+    {
+        if selected_paths.contains(&file.file_path) {
+            required_files.iceberg_files.push(file);
+            required_files.iceberg_file_extensions.push(extensions);
+        }
+    }
+
+    tracing::info!(
+        matched_patterns = ?warmup_plan.matched_patterns,
+        matched_artifacts = ?warmup_plan.matched_artifacts,
+        estimated_bytes = warmup_plan.estimated_warm_bytes,
+        "Prefetch narrowed serving warmup for {} to {}/{} parquet files",
+        table_metadata.table_name,
+        required_files.iceberg_files.len(),
+        initial_selected
+    );
+    Some(warmup_plan)
+}
 fn generate_required_files(
     invocation: &PrivateCompactionInvocation,
     index: u64,
@@ -1162,22 +1261,86 @@ pub(crate) async fn prefetch_query(
         }
     }
 
-    let required_files = match determine_required_files(
+    let table_metadata = match load_checkpoint_table_metadata(&invocation.checkpoints).await {
+        Ok(metadata) => metadata,
+        Err(e) => return log_err(e),
+    };
+    let mut required_files = match required_files_from_table_metadata(
         &invocation.required_extensions,
-        &invocation.checkpoints,
+        &table_metadata,
         index,
         num,
-    )
-    .await
-    {
+    ) {
         Ok(rf) => rf,
         Err(e) => return log_err(e),
     };
-
-    let result = data_query_worker(&SqlQuery::dummy(), &required_files, false).await?;
+    let files_considered = required_files.iceberg_files.len();
+    let targeted_warmup_plan = if invocation.required_extensions.is_empty() {
+        narrow_prefetch_files_for_serving_warmup(&mut required_files, &table_metadata).await
+    } else {
+        None
+    };
+    let result = if let Some(plan) = targeted_warmup_plan.as_ref() {
+        execute_serving_cache_manager_plan(plan, &required_files.delete_files)
+            .await
+            .map_err(|error| PrivateApiError {
+                message: error.message,
+            })?;
+        DataQueryResult {
+            num: 0,
+            result: vec![],
+        }
+    } else {
+        data_query_worker(&SqlQuery::dummy(), &required_files, false).await?
+    };
     data_access::flush_serving_bulk_cache()
         .await
         .map_err(|message| PrivateApiError { message })?;
+    let snapshot_id = table_metadata
+        .iceberg_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.snapshot_id.clone());
+    if let Some(plan) = targeted_warmup_plan.as_ref() {
+        data_access::record_serving_cache_manager_operation(
+            data_access::ServingCacheManagerOperationStats {
+                table: table_metadata.table_name.clone(),
+                snapshot_id: snapshot_id.clone(),
+                warmed_files: plan.warm_files.len(),
+                evicted_files: plan.files_to_evict.len(),
+                targeted_ranges: plan.targeted_ranges,
+                matched_patterns: plan.matched_patterns.clone(),
+                matched_artifacts: plan.matched_artifacts.clone(),
+                metadata_refreshed: plan.metadata_refreshed,
+                bulk_cache_flushed: true,
+                bulk_cache_reset: plan.bulk_cache_reset,
+            },
+        );
+    }
+    data_access::record_serving_bulk_cache_warmup(data_access::ServingBulkCacheWarmupStats {
+        table: table_metadata.table_name,
+        snapshot_id,
+        targeted: targeted_warmup_plan.is_some(),
+        matched_patterns: targeted_warmup_plan
+            .as_ref()
+            .map(|plan| plan.matched_patterns.clone())
+            .unwrap_or_default(),
+        shaped_queries: targeted_warmup_plan
+            .as_ref()
+            .map(|plan| plan.warmup_steps.len())
+            .unwrap_or(0),
+        files_considered,
+        files_selected: required_files.iceberg_files.len(),
+        estimated_bytes: targeted_warmup_plan
+            .as_ref()
+            .map(|plan| plan.estimated_warm_bytes)
+            .unwrap_or_else(|| {
+                required_files
+                    .iceberg_files
+                    .iter()
+                    .map(|file| file.size)
+                    .sum()
+            }),
+    });
     Ok(result)
 }
 

@@ -1364,8 +1364,11 @@ mod tests {
             table_schema: schema.clone(),
             snapshot_id: Some(snapshot_id.to_string()),
             files: FileSetPayload::single(file_path.clone(), 128, schema),
+            partition_spec: vec![],
+            sort_order: vec![],
             column_names: vec![],
             column_stats: vec![],
+            access_artifacts: vec![],
             file_stats: vec![],
         }
     }
