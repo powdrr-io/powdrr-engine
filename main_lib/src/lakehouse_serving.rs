@@ -11,13 +11,14 @@ use gotham::hyper::{Body, body};
 use gotham::mime;
 use gotham::state::{FromState, State};
 use http::StatusCode;
+use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::data_access::{self, execute_sql_async, load_files_as_table};
 use crate::data_contract::{
     CreateTable, FileDescriptor, IcebergColumnStats, IcebergFileStats, IcebergRowGroupStats,
-    ServingPattern, ServingTableConfig, TableDescription, TableMetadataCheckpoint,
+    ServingPattern, ServingTableConfig, TableDescription,
 };
 use crate::elastic_search_endpoints::NamePathExtractor;
 use crate::peers::CheckpointDescriptor;
@@ -74,9 +75,9 @@ pub struct ServingConfigResponse {
 
 struct ServingExecutionContext {
     description: TableDescription,
-    checkpoint: TableMetadataCheckpoint,
     schema: PowdrrSchema,
     files: Vec<FileDescriptor>,
+    delete_files: Vec<String>,
     file_stats: HashMap<String, IcebergFileStats>,
     snapshot_id: Option<String>,
     metadata_snapshot_cached: bool,
@@ -265,35 +266,6 @@ pub async fn execute_serving_query(
     validate_request(&request, &context.schema)?;
     let bulk_cache = data_access::serving_bulk_cache_stats();
 
-    if context
-        .checkpoint
-        .deletes_metadata
-        .as_ref()
-        .map(|deletes| !deletes.files.is_empty())
-        .unwrap_or(false)
-    {
-        return Ok(ServingQueryResponse {
-            table: context.description.name,
-            classification: ServingQueryClassification::Rejected,
-            matched_pattern: None,
-            snapshot_id: context.snapshot_id,
-            reason: Some("Delete-aware serving is not implemented yet".to_string()),
-            files_considered: context.files.len(),
-            files_selected: 0,
-            row_groups_considered: 0,
-            row_groups_selected: 0,
-            estimated_bytes: 0,
-            metadata_snapshot_cached: context.metadata_snapshot_cached,
-            metadata_files_cached: 0,
-            metadata_row_groups_cached: 0,
-            page_index_row_groups_selected: 0,
-            bloom_filter_row_groups_selected: 0,
-            bulk_cache,
-            sql: None,
-            rows: vec![],
-        });
-    }
-
     let plan = plan_request(&context, &request)?;
     if request.explain {
         return Ok(ServingQueryResponse {
@@ -368,6 +340,7 @@ pub async fn execute_serving_query(
 
     let mut rows = execute_plan(
         &plan.selected_files,
+        &context.delete_files,
         &context.file_stats,
         &request,
         &plan.sql,
@@ -472,6 +445,11 @@ async fn load_serving_context(
     };
 
     let files = iceberg_metadata.files.as_file_tuples();
+    let delete_files = checkpoint
+        .deletes_metadata
+        .as_ref()
+        .map(|metadata| metadata.files.clone())
+        .unwrap_or_default();
     let file_stats = iceberg_metadata
         .file_stats
         .iter()
@@ -490,8 +468,8 @@ async fn load_serving_context(
         description,
         schema: iceberg_metadata.table_schema.clone(),
         snapshot_id: iceberg_metadata.snapshot_id.clone(),
-        checkpoint,
         files,
+        delete_files,
         file_stats,
         metadata_snapshot_cached,
     })
@@ -503,7 +481,7 @@ fn plan_request(
 ) -> Result<ServingPlan, ServingQueryError> {
     let serving = context.description.serving.clone().unwrap_or_default();
     let limit = request.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-    let sql = build_sql("{table}", request, limit)?;
+    let sql = build_sql("{table}", request, limit, !context.delete_files.is_empty())?;
 
     if !request_supported(request) {
         return Ok(ServingPlan {
@@ -575,6 +553,7 @@ fn plan_request(
 
 async fn execute_plan(
     files: &[FileDescriptor],
+    delete_files: &[String],
     file_stats: &HashMap<String, IcebergFileStats>,
     request: &ServingRequestPlan,
     sql: &str,
@@ -588,15 +567,17 @@ async fn execute_plan(
         if let Some(ordered_groups) =
             ordered_file_groups_for_top_k(files, file_stats, request, &sort.field, sort.descending)
         {
-            return execute_ordered_top_k_plan(ordered_groups, request, sql, limit).await;
+            return execute_ordered_top_k_plan(ordered_groups, delete_files, request, sql, limit)
+                .await;
         }
     }
 
-    execute_parallel_plan(files, request, sql, limit).await
+    execute_parallel_plan(files, delete_files, request, sql, limit).await
 }
 
 async fn execute_parallel_plan(
     files: &[FileDescriptor],
+    delete_files: &[String],
     request: &ServingRequestPlan,
     sql: &str,
     limit: usize,
@@ -605,11 +586,18 @@ async fn execute_parallel_plan(
     let sql_template = sql.to_string();
     let file_groups = group_files_by_schema(files);
     let concurrency = file_groups.len().clamp(1, serving_file_parallelism());
-    let mut results = stream::iter(file_groups.into_iter().map(|files| {
-        let local_sql_template = sql_template.clone();
-        async move { execute_file_group_plan(files, &local_sql_template).await }
-    }))
-    .buffer_unordered(concurrency);
+    let delete_files = delete_files.to_vec();
+    let mut results =
+        stream::iter(
+            file_groups.into_iter().map(|files| {
+                let local_sql_template = sql_template.clone();
+                let local_delete_files = delete_files.clone();
+                async move {
+                    execute_file_group_plan(files, &local_sql_template, &local_delete_files).await
+                }
+            }),
+        )
+        .buffer_unordered(concurrency);
 
     while let Some(result) = results.next().await {
         merge_rows(&mut rows, result?, request, limit);
@@ -620,6 +608,7 @@ async fn execute_parallel_plan(
 
 async fn execute_ordered_top_k_plan(
     file_groups: Vec<OrderedFileGroup>,
+    delete_files: &[String],
     request: &ServingRequestPlan,
     sql: &str,
     limit: usize,
@@ -629,9 +618,10 @@ async fn execute_ordered_top_k_plan(
         return Ok(rows);
     };
     let mut file_groups = file_groups.into_iter().peekable();
+    let delete_files = delete_files.to_vec();
 
     while let Some(file_group) = file_groups.next() {
-        let new_rows = execute_file_group_plan(file_group.files, sql).await?;
+        let new_rows = execute_file_group_plan(file_group.files, sql, &delete_files).await?;
         merge_rows(&mut rows, new_rows, request, limit);
 
         if let Some(next_group) = file_groups.peek() {
@@ -835,14 +825,22 @@ fn remaining_groups_cannot_beat_kth_row(
 async fn execute_file_group_plan(
     files: Vec<FileDescriptor>,
     sql_template: &str,
+    delete_files: &[String],
 ) -> Result<Vec<Value>, ServingQueryError> {
     let local_name = file_group_table_name(&files);
+    let deletes_table_name = format!("serving_deletes_{}", IdInstance::next_id());
+    let delete_local_tables = delete_files
+        .iter()
+        .map(|_| format!("serving_delete_file_{}", IdInstance::next_id()))
+        .collect::<Vec<_>>();
     let file_paths = files
         .iter()
         .map(|file| file.file_path.clone())
         .collect::<Vec<_>>();
     let total_size = files.iter().map(|file| file.size).sum::<u64>();
     data_access::reserve(&local_name, total_size, vec![]).await;
+    let mut created_delete_tables = vec![];
+    let mut deletes_union_created = false;
     let result = async {
         load_files_as_table(&local_name, &file_paths, &files[0].schema.to_arrow_schema())
             .await
@@ -850,7 +848,35 @@ async fn execute_file_group_plan(
                 ServingQueryError::new(StatusCode::SERVICE_UNAVAILABLE, &error.to_string())
             })?;
 
-        let local_sql = sql_template.replace("{table}", &local_name);
+        if !delete_files.is_empty() {
+            let delete_schema = PowdrrSchema::deletes().to_arrow_schema();
+            for (local_delete_table, delete_file_path) in
+                delete_local_tables.iter().zip(delete_files.iter())
+            {
+                data_access::load_file_as_table(
+                    local_delete_table,
+                    delete_file_path,
+                    false,
+                    Some(delete_schema.clone()),
+                )
+                .await
+                .map_err(|error| {
+                    ServingQueryError::new(StatusCode::SERVICE_UNAVAILABLE, &error.to_string())
+                })?;
+                created_delete_tables.push(local_delete_table.clone());
+            }
+            let deletes_sql = create_serving_deletes_table_sql(&delete_local_tables);
+            data_access::create_table(&deletes_table_name, &deletes_sql)
+                .await
+                .map_err(|error| {
+                    ServingQueryError::new(StatusCode::SERVICE_UNAVAILABLE, &error.to_string())
+                })?;
+            deletes_union_created = true;
+        }
+
+        let local_sql = sql_template
+            .replace("{table}", &local_name)
+            .replace("{deletes_table}", &deletes_table_name);
         let batches = execute_sql_async(&local_sql).await.map_err(|error| {
             ServingQueryError::new(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string())
         })?;
@@ -860,8 +886,27 @@ async fn execute_file_group_plan(
         Ok::<Vec<Value>, ServingQueryError>(serde_result.values)
     }
     .await;
+    for table_name in &created_delete_tables {
+        data_access::drop(table_name).await;
+    }
+    if deletes_union_created {
+        data_access::drop(&deletes_table_name).await;
+    }
     data_access::release(&local_name).await;
     result
+}
+
+fn create_serving_deletes_table_sql(local_names: &[String]) -> String {
+    if local_names.is_empty() {
+        "select null as _id_seq_no".to_string()
+    } else {
+        let union_selects = local_names
+            .iter()
+            .map(|table_name| format!("select * from {table_name}"))
+            .collect::<Vec<_>>()
+            .join(" union all ");
+        format!("select * from ({union_selects})")
+    }
 }
 
 fn group_files_by_schema(files: &[FileDescriptor]) -> Vec<Vec<FileDescriptor>> {
@@ -1357,6 +1402,7 @@ fn build_sql(
     table_name: &str,
     request: &ServingRequestPlan,
     limit: usize,
+    include_delete_filter: bool,
 ) -> Result<String, ServingQueryError> {
     let select = match normalized_select(request.select.clone()) {
         Some(select_fields) => select_fields
@@ -1364,15 +1410,25 @@ fn build_sql(
             .map(|field| format!("\"{}\"", escape_identifier(field)))
             .collect::<Vec<_>>()
             .join(", "),
-        None => "*".to_string(),
+        None => {
+            if include_delete_filter {
+                "t.*".to_string()
+            } else {
+                "*".to_string()
+            }
+        }
     };
 
-    let where_clauses = request
+    let mut where_clauses = request
         .filters
         .iter()
         .map(sql_for_filter)
         .collect::<Result<Vec<_>, _>>()?;
     let mut sql = format!("SELECT {} FROM {} t", select, table_name);
+    if include_delete_filter {
+        sql.push_str(" LEFT JOIN {deletes_table} dt ON dt._id_seq_no = t.\"_id_seq_no\"");
+        where_clauses.push("dt._id_seq_no IS NULL".to_string());
+    }
     if !where_clauses.is_empty() {
         sql.push_str(&format!(" WHERE {}", where_clauses.join(" AND ")));
     }
@@ -1530,7 +1586,7 @@ mod tests {
     };
     use crate::data_contract::{
         FileDescriptor, IcebergColumnStats, IcebergFileStats, IcebergRowGroupStats, ServingPattern,
-        ServingTableConfig, TableDescription, TableMetadataCheckpoint,
+        ServingTableConfig, TableDescription,
     };
     use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
     use crate::serving_plan::{
@@ -1597,13 +1653,9 @@ mod tests {
                 dynamodb: None,
                 mongodb: None,
             },
-            checkpoint: TableMetadataCheckpoint::new(
-                "events".to_string(),
-                "checkpoint_1".to_string(),
-                schema.clone(),
-            ),
             schema: schema.clone(),
             files: test_files(&schema),
+            delete_files: vec![],
             file_stats: file_stats
                 .into_iter()
                 .map(|stats| (stats.file_path.clone(), stats))
@@ -1681,6 +1733,7 @@ mod tests {
                 explain: false,
             },
             5,
+            false,
         )
         .unwrap();
 
