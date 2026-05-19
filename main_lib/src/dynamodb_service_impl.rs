@@ -22,8 +22,8 @@ use crate::state_provider::ServiceApiError;
 use crate::test_api::{StateMode, TestProcessingMode};
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_dynamodb::Client;
-use modyne::TestTableExt;
 use modyne::model::TransactWrite;
+use modyne::TestTableExt;
 use std::collections::{HashMap, HashSet};
 
 const LEASE_LENGTH_MS: i64 = 60 * 1000; // 1 minute
@@ -195,13 +195,17 @@ impl DynamoDBServiceImpl {
         org_info: &OrgInfo,
         metadata: &TableMetadataCheckpoint,
     ) -> Result<(), ServiceApiError> {
-        self.create_table(org_info, &CreateTable {
-            name: metadata.table_name.clone(),
-            tags: Default::default(),
-            serving: None,
-            dynamodb: None,
-            mongodb: None,
-        }).await?;
+        self.create_table(
+            org_info,
+            &CreateTable {
+                name: metadata.table_name.clone(),
+                tags: Default::default(),
+                serving: None,
+                dynamodb: None,
+                mongodb: None,
+            },
+        )
+        .await?;
         if metadata.speedboat_metadata.is_some() {
             self.speedboat_commit(
                 org_info,
@@ -209,6 +213,7 @@ impl DynamoDBServiceImpl {
                     type_files: vec![SpeedboatCommitTableInfo {
                         commit_type: "commit".to_string(),
                         table_name: metadata.table_name.clone(),
+                        segments: vec![],
                         files: metadata
                             .speedboat_metadata
                             .as_ref()
@@ -1188,7 +1193,11 @@ impl DynamoDBServiceImpl {
     ) -> Result<Option<String>, ServiceApiError> {
         let entities = self
             .connector
-            .fetch_entities(&MANAGEMENT_ORG_ID.to_string(), &"org_settings".to_string(), None)
+            .fetch_entities(
+                &MANAGEMENT_ORG_ID.to_string(),
+                &"org_settings".to_string(),
+                None,
+            )
             .await
             .map_err(from_modyne)?;
         let mut matched_secret = None;
