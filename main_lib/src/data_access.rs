@@ -1712,8 +1712,13 @@ async fn load_parquet_file_as_table(
             }
         }
     } else {
+        let local_file_path = if file_path.starts_with("file://") {
+            file_path.trim_start_matches("file://")
+        } else {
+            file_path.as_str()
+        };
         let result = data_fusion_context
-            .register_parquet(local_name, file_path, ParquetReadOptions::new())
+            .register_parquet(local_name, local_file_path, ParquetReadOptions::new())
             .await;
         match result {
             Err(e) => {
