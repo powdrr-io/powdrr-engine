@@ -7,6 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
+use aws_sdk_dynamodb::Client as DynamoClient;
 use aws_sdk_dynamodb::client::Waiters;
 use aws_sdk_dynamodb::operation::query::QueryOutput;
 use aws_sdk_dynamodb::types::{
@@ -14,7 +15,6 @@ use aws_sdk_dynamodb::types::{
     KeyType, KeysAndAttributes, Projection, ProjectionType, ScalarAttributeType, TableDescription,
     TableStatus,
 };
-use aws_sdk_dynamodb::Client as DynamoClient;
 use datafusion::arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -32,7 +32,7 @@ use powdrr_lib::test_api::{
 };
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -579,12 +579,16 @@ async fn compare_list_tables(fixture: &DifferentialFixture) {
         .await
         .unwrap();
 
-    let mut powdrr_names = powdrr_tables.table_names().to_vec();
-    let mut localstack_names = localstack_tables.table_names().to_vec();
-    powdrr_names.retain(|name| name.starts_with("dynamo_matrix_"));
-    localstack_names.retain(|name| name.starts_with("dynamo_matrix_"));
-    powdrr_names.sort();
-    localstack_names.sort();
+    let mut powdrr_all_names = powdrr_tables.table_names().to_vec();
+    let mut localstack_all_names = localstack_tables.table_names().to_vec();
+    powdrr_all_names.sort();
+    localstack_all_names.sort();
+    let powdrr_names = fixture_table_names(powdrr_tables.table_names());
+    let localstack_names = fixture_table_names(localstack_tables.table_names());
+    let expected_names = fixture_table_names(&[
+        fixture.primary_table_name.clone(),
+        fixture.begins_with_table_name.clone(),
+    ]);
 
     assert!(
         !powdrr_names
@@ -594,7 +598,67 @@ async fn compare_list_tables(fixture: &DifferentialFixture) {
         fixture.hidden_table_name,
         powdrr_names
     );
-    assert_eq!(powdrr_names, localstack_names);
+    assert_eq!(powdrr_names, expected_names);
+    for expected_name in expected_names.iter() {
+        assert!(
+            localstack_names.iter().any(|name| name == expected_name),
+            "LocalStack ListTables did not include expected fixture table {}; tables={:?}",
+            expected_name,
+            localstack_names
+        );
+    }
+
+    let powdrr_first_page = list_tables_page(
+        &fixture.powdrr_client,
+        Some(1),
+        predecessor_table_name(&powdrr_all_names, &expected_names[0]),
+    )
+    .await;
+    let localstack_first_page = list_tables_page(
+        &fixture.localstack_client,
+        Some(1),
+        predecessor_table_name(&localstack_all_names, &expected_names[0]),
+    )
+    .await;
+    assert_eq!(
+        powdrr_first_page.table_names(),
+        &[expected_names[0].clone()],
+        "Powdrr ListTables first page should preserve Dynamo ordering"
+    );
+    assert_eq!(
+        powdrr_first_page.table_names(),
+        localstack_first_page.table_names()
+    );
+    assert_eq!(
+        powdrr_first_page.last_evaluated_table_name(),
+        localstack_first_page.last_evaluated_table_name()
+    );
+
+    let powdrr_second_page = list_tables_page(
+        &fixture.powdrr_client,
+        Some(1),
+        predecessor_table_name(&powdrr_all_names, &expected_names[1]),
+    )
+    .await;
+    let localstack_second_page = list_tables_page(
+        &fixture.localstack_client,
+        Some(1),
+        predecessor_table_name(&localstack_all_names, &expected_names[1]),
+    )
+    .await;
+    assert_eq!(
+        powdrr_second_page.table_names(),
+        &[expected_names[1].clone()],
+        "Powdrr ListTables second page should honor ExclusiveStartTableName"
+    );
+    assert_eq!(
+        powdrr_second_page.table_names(),
+        localstack_second_page.table_names()
+    );
+    assert_eq!(
+        powdrr_second_page.last_evaluated_table_name(),
+        localstack_second_page.last_evaluated_table_name()
+    );
 }
 
 async fn compare_describe_table(fixture: &DifferentialFixture) {
@@ -615,6 +679,25 @@ async fn compare_describe_table(fixture: &DifferentialFixture) {
     compare_table_descriptions(
         powdrr_description.table().unwrap(),
         localstack_description.table().unwrap(),
+    );
+
+    let powdrr_begins_with_description = fixture
+        .powdrr_client
+        .describe_table()
+        .table_name(&fixture.begins_with_table_name)
+        .send()
+        .await
+        .unwrap();
+    let localstack_begins_with_description = fixture
+        .localstack_client
+        .describe_table()
+        .table_name(&fixture.begins_with_table_name)
+        .send()
+        .await
+        .unwrap();
+    compare_table_descriptions(
+        powdrr_begins_with_description.table().unwrap(),
+        localstack_begins_with_description.table().unwrap(),
     );
 }
 
@@ -653,6 +736,26 @@ async fn compare_get_item(fixture: &DifferentialFixture) {
     let localstack_json = optional_item_to_json(localstack_get_item.item());
     assert_eq!(powdrr_json, Some(expected_get_item));
     assert_eq!(powdrr_json, localstack_json);
+
+    let missing_key = primary_key_item_from_parts("acme", json!(999));
+    let powdrr_missing = fixture
+        .powdrr_client
+        .get_item()
+        .table_name(&fixture.primary_table_name)
+        .set_key(Some(missing_key.clone()))
+        .send()
+        .await
+        .unwrap();
+    let localstack_missing = fixture
+        .localstack_client
+        .get_item()
+        .table_name(&fixture.primary_table_name)
+        .set_key(Some(missing_key))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(powdrr_missing.item(), None);
+    assert_eq!(powdrr_missing.item(), localstack_missing.item());
 }
 
 async fn compare_batch_get_item(fixture: &DifferentialFixture) {
@@ -709,6 +812,109 @@ async fn compare_batch_get_item(fixture: &DifferentialFixture) {
         normalize_item_list(batch_output_items(
             &localstack_output,
             &fixture.primary_table_name
+        ))
+    );
+
+    let multi_table_output = fixture
+        .powdrr_client
+        .batch_get_item()
+        .request_items(
+            fixture.primary_table_name.clone(),
+            KeysAndAttributes::builder()
+                .set_keys(Some(vec![
+                    primary_key_item(&fixture.rows[0]),
+                    primary_key_item_from_parts("acme", json!(999)),
+                ]))
+                .projection_expression("tenant, ts, event_id")
+                .build()
+                .unwrap(),
+        )
+        .request_items(
+            fixture.begins_with_table_name.clone(),
+            KeysAndAttributes::builder()
+                .set_keys(Some(vec![string_sort_key_item(
+                    &fixture.rows[2].tenant,
+                    "event_id",
+                    &fixture.rows[2].event_id,
+                )]))
+                .projection_expression("tenant, event_id, #region")
+                .expression_attribute_names("#region", "region")
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let localstack_multi_table_output = fixture
+        .localstack_client
+        .batch_get_item()
+        .request_items(
+            fixture.primary_table_name.clone(),
+            KeysAndAttributes::builder()
+                .set_keys(Some(vec![
+                    primary_key_item(&fixture.rows[0]),
+                    primary_key_item_from_parts("acme", json!(999)),
+                ]))
+                .projection_expression("tenant, ts, event_id")
+                .build()
+                .unwrap(),
+        )
+        .request_items(
+            fixture.begins_with_table_name.clone(),
+            KeysAndAttributes::builder()
+                .set_keys(Some(vec![string_sort_key_item(
+                    &fixture.rows[2].tenant,
+                    "event_id",
+                    &fixture.rows[2].event_id,
+                )]))
+                .projection_expression("tenant, event_id, #region")
+                .expression_attribute_names("#region", "region")
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        normalize_item_list(batch_output_items(
+            &multi_table_output,
+            &fixture.primary_table_name
+        )),
+        normalize_item_list(vec![json!({
+            "tenant": "acme",
+            "ts": 10,
+            "event_id": "evt-1",
+        })])
+    );
+    assert_eq!(
+        normalize_item_list(batch_output_items(
+            &multi_table_output,
+            &fixture.primary_table_name
+        )),
+        normalize_item_list(batch_output_items(
+            &localstack_multi_table_output,
+            &fixture.primary_table_name
+        ))
+    );
+    assert_eq!(
+        normalize_item_list(batch_output_items(
+            &multi_table_output,
+            &fixture.begins_with_table_name
+        )),
+        normalize_item_list(vec![json!({
+            "tenant": "acme",
+            "event_id": "evt-3",
+            "region": "eu-central-1",
+        })])
+    );
+    assert_eq!(
+        normalize_item_list(batch_output_items(
+            &multi_table_output,
+            &fixture.begins_with_table_name
+        )),
+        normalize_item_list(batch_output_items(
+            &localstack_multi_table_output,
+            &fixture.begins_with_table_name
         ))
     );
 }
@@ -787,12 +993,35 @@ async fn compare_query_operation(fixture: &DifferentialFixture) {
                 "ts": 10,
             }),
             json!({
-                "tenant": "acme",
+                    "tenant": "acme",
                 "event_id": "evt-2",
                 "region": "us-west-2",
                 "ts": 20,
             }),
         ]),
+    );
+
+    let powdrr_begins_with_second_page = query_begins_with_page(
+        &fixture.powdrr_client,
+        &fixture.begins_with_table_name,
+        powdrr_begins_with.last_evaluated_key().cloned(),
+    )
+    .await;
+    let localstack_begins_with_second_page = query_begins_with_page(
+        &fixture.localstack_client,
+        &fixture.begins_with_table_name,
+        localstack_begins_with.last_evaluated_key().cloned(),
+    )
+    .await;
+    compare_query_page_outputs(
+        &powdrr_begins_with_second_page,
+        &localstack_begins_with_second_page,
+        vec![json!({
+            "tenant": "acme",
+            "event_id": "evt-3",
+            "region": "eu-central-1",
+            "ts": 30,
+        })],
     );
 
     let powdrr_filtered =
@@ -837,26 +1066,200 @@ async fn compare_query_operation(fixture: &DifferentialFixture) {
         })]),
     );
 
+    let powdrr_filtered_projection = query_with_filter_projection_page(
+        &fixture.powdrr_client,
+        &fixture.primary_table_name,
+        None,
+    )
+    .await;
+    let localstack_filtered_projection = query_with_filter_projection_page(
+        &fixture.localstack_client,
+        &fixture.primary_table_name,
+        None,
+    )
+    .await;
+    compare_query_page_outputs(
+        &powdrr_filtered_projection,
+        &localstack_filtered_projection,
+        vec![json!({
+            "event_id": "evt-2",
+        })],
+    );
+
+    let powdrr_filtered_projection_second_page = query_with_filter_projection_page(
+        &fixture.powdrr_client,
+        &fixture.primary_table_name,
+        powdrr_filtered_projection.last_evaluated_key().cloned(),
+    )
+    .await;
+    let localstack_filtered_projection_second_page = query_with_filter_projection_page(
+        &fixture.localstack_client,
+        &fixture.primary_table_name,
+        localstack_filtered_projection.last_evaluated_key().cloned(),
+    )
+    .await;
+    compare_query_page_outputs(
+        &powdrr_filtered_projection_second_page,
+        &localstack_filtered_projection_second_page,
+        vec![json!({
+            "event_id": "evt-3",
+        })],
+    );
+
+    let powdrr_descending =
+        query_descending_page(&fixture.powdrr_client, &fixture.primary_table_name, None).await;
+    let localstack_descending = query_descending_page(
+        &fixture.localstack_client,
+        &fixture.primary_table_name,
+        None,
+    )
+    .await;
+    compare_query_page_outputs(
+        &powdrr_descending,
+        &localstack_descending,
+        vec![
+            json!({
+                "tenant": "acme",
+                "ts": 30,
+                "event_id": "evt-3",
+                "region": "eu-central-1",
+            }),
+            json!({
+                "tenant": "acme",
+                "ts": 20,
+                "event_id": "evt-2",
+                "region": "us-west-2",
+            }),
+        ],
+    );
+
+    let powdrr_descending_second_page = query_descending_page(
+        &fixture.powdrr_client,
+        &fixture.primary_table_name,
+        powdrr_descending.last_evaluated_key().cloned(),
+    )
+    .await;
+    let localstack_descending_second_page = query_descending_page(
+        &fixture.localstack_client,
+        &fixture.primary_table_name,
+        localstack_descending.last_evaluated_key().cloned(),
+    )
+    .await;
+    compare_query_page_outputs(
+        &powdrr_descending_second_page,
+        &localstack_descending_second_page,
+        vec![json!({
+            "tenant": "acme",
+            "ts": 10,
+            "event_id": "evt-1",
+            "region": "us-east-1",
+        })],
+    );
+
+    let powdrr_exact = query_exact_page(&fixture.powdrr_client, &fixture.primary_table_name).await;
+    let localstack_exact =
+        query_exact_page(&fixture.localstack_client, &fixture.primary_table_name).await;
+    compare_query_page_outputs(
+        &powdrr_exact,
+        &localstack_exact,
+        vec![json!({
+            "tenant": "acme",
+            "ts": 20,
+            "event_id": "evt-2",
+        })],
+    );
+
+    let powdrr_empty = query_empty_page(&fixture.powdrr_client, &fixture.primary_table_name).await;
+    let localstack_empty =
+        query_empty_page(&fixture.localstack_client, &fixture.primary_table_name).await;
+    compare_query_page_outputs(&powdrr_empty, &localstack_empty, vec![]);
+
     let powdrr_gsi = query_region_index_page(
         &fixture.powdrr_client,
         &fixture.primary_table_name,
         &fixture.region_event_id_index,
+        None,
+        None,
     )
     .await;
     let localstack_gsi = query_region_index_page(
         &fixture.localstack_client,
         &fixture.primary_table_name,
         &fixture.region_event_id_index,
+        None,
+        None,
     )
     .await;
     compare_query_page_outputs(
         &powdrr_gsi,
         &localstack_gsi,
+        vec![
+            json!({
+                "tenant": "acme",
+                "region": "us-east-1",
+                "event_id": "evt-1",
+                "ts": 10,
+            }),
+            json!({
+                "tenant": "initech",
+                "region": "us-east-1",
+                "event_id": "evt-5",
+                "ts": 25,
+            }),
+        ],
+    );
+
+    let powdrr_gsi_first_page = query_region_index_page(
+        &fixture.powdrr_client,
+        &fixture.primary_table_name,
+        &fixture.region_event_id_index,
+        Some(1),
+        None,
+    )
+    .await;
+    let localstack_gsi_first_page = query_region_index_page(
+        &fixture.localstack_client,
+        &fixture.primary_table_name,
+        &fixture.region_event_id_index,
+        Some(1),
+        None,
+    )
+    .await;
+    compare_query_page_outputs(
+        &powdrr_gsi_first_page,
+        &localstack_gsi_first_page,
         vec![json!({
             "tenant": "acme",
             "region": "us-east-1",
             "event_id": "evt-1",
             "ts": 10,
+        })],
+    );
+
+    let powdrr_gsi_second_page = query_region_index_page(
+        &fixture.powdrr_client,
+        &fixture.primary_table_name,
+        &fixture.region_event_id_index,
+        Some(1),
+        powdrr_gsi_first_page.last_evaluated_key().cloned(),
+    )
+    .await;
+    let localstack_gsi_second_page = query_region_index_page(
+        &fixture.localstack_client,
+        &fixture.primary_table_name,
+        &fixture.region_event_id_index,
+        Some(1),
+        localstack_gsi_first_page.last_evaluated_key().cloned(),
+    )
+    .await;
+    compare_query_page_outputs(
+        &powdrr_gsi_second_page,
+        &localstack_gsi_second_page,
+        vec![json!({
+            "tenant": "initech",
+            "region": "us-east-1",
+            "event_id": "evt-5",
+            "ts": 25,
         })],
     );
 }
@@ -866,8 +1269,8 @@ fn compare_query_page_outputs(
     localstack: &QueryOutput,
     expected_items: Vec<Value>,
 ) {
-    let powdrr_items = normalize_item_list(items_to_json(powdrr.items()));
-    let localstack_items = normalize_item_list(items_to_json(localstack.items()));
+    let powdrr_items = items_to_json(powdrr.items());
+    let localstack_items = items_to_json(localstack.items());
     assert_eq!(powdrr_items, expected_items);
     assert_eq!(powdrr_items, localstack_items);
     assert_eq!(powdrr.count(), localstack.count());
@@ -1342,12 +1745,101 @@ async fn query_with_filter_page(
         .unwrap()
 }
 
+async fn query_with_filter_projection_page(
+    client: &DynamoClient,
+    table_name: &str,
+    exclusive_start_key: Option<HashMap<String, AttributeValue>>,
+) -> QueryOutput {
+    client
+        .query()
+        .table_name(table_name)
+        .key_condition_expression("#pk = :pk AND #sk BETWEEN :start AND :end")
+        .filter_expression("#count IN (:two, :three) AND begins_with(#event_id, :prefix)")
+        .expression_attribute_names("#pk", "tenant")
+        .expression_attribute_names("#sk", "ts")
+        .expression_attribute_names("#count", "count")
+        .expression_attribute_names("#event_id", "event_id")
+        .expression_attribute_values(":pk", AttributeValue::S("acme".to_string()))
+        .expression_attribute_values(":start", AttributeValue::N("10".to_string()))
+        .expression_attribute_values(":end", AttributeValue::N("30".to_string()))
+        .expression_attribute_values(":two", AttributeValue::N("2".to_string()))
+        .expression_attribute_values(":three", AttributeValue::N("3".to_string()))
+        .expression_attribute_values(":prefix", AttributeValue::S("evt-".to_string()))
+        .projection_expression("#event_id")
+        .limit(2)
+        .scan_index_forward(true)
+        .set_exclusive_start_key(exclusive_start_key)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn query_descending_page(
+    client: &DynamoClient,
+    table_name: &str,
+    exclusive_start_key: Option<HashMap<String, AttributeValue>>,
+) -> QueryOutput {
+    client
+        .query()
+        .table_name(table_name)
+        .key_condition_expression("#pk = :pk AND #sk BETWEEN :start AND :end")
+        .expression_attribute_names("#pk", "tenant")
+        .expression_attribute_names("#sk", "ts")
+        .expression_attribute_names("#region", "region")
+        .expression_attribute_values(":pk", AttributeValue::S("acme".to_string()))
+        .expression_attribute_values(":start", AttributeValue::N("10".to_string()))
+        .expression_attribute_values(":end", AttributeValue::N("30".to_string()))
+        .projection_expression("#pk, #sk, event_id, #region")
+        .limit(2)
+        .scan_index_forward(false)
+        .set_exclusive_start_key(exclusive_start_key)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn query_exact_page(client: &DynamoClient, table_name: &str) -> QueryOutput {
+    client
+        .query()
+        .table_name(table_name)
+        .key_condition_expression("#pk = :pk AND #sk = :sk")
+        .expression_attribute_names("#pk", "tenant")
+        .expression_attribute_names("#sk", "ts")
+        .expression_attribute_names("#event_id", "event_id")
+        .expression_attribute_values(":pk", AttributeValue::S("acme".to_string()))
+        .expression_attribute_values(":sk", AttributeValue::N("20".to_string()))
+        .projection_expression("#pk, #sk, #event_id")
+        .limit(5)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn query_empty_page(client: &DynamoClient, table_name: &str) -> QueryOutput {
+    client
+        .query()
+        .table_name(table_name)
+        .key_condition_expression("#pk = :pk AND #sk BETWEEN :start AND :end")
+        .expression_attribute_names("#pk", "tenant")
+        .expression_attribute_names("#sk", "ts")
+        .expression_attribute_values(":pk", AttributeValue::S("acme".to_string()))
+        .expression_attribute_values(":start", AttributeValue::N("100".to_string()))
+        .expression_attribute_values(":end", AttributeValue::N("200".to_string()))
+        .projection_expression("#pk, #sk, event_id")
+        .limit(5)
+        .send()
+        .await
+        .unwrap()
+}
+
 async fn query_region_index_page(
     client: &DynamoClient,
     table_name: &str,
     index_name: &str,
+    limit: Option<i32>,
+    exclusive_start_key: Option<HashMap<String, AttributeValue>>,
 ) -> QueryOutput {
-    client
+    let mut request = client
         .query()
         .table_name(table_name)
         .index_name(index_name)
@@ -1358,7 +1850,28 @@ async fn query_region_index_page(
         .expression_attribute_values(":pk", AttributeValue::S("us-east-1".to_string()))
         .expression_attribute_values(":prefix", AttributeValue::S("evt-".to_string()))
         .projection_expression("#tenant, #pk, #sk, ts")
-        .scan_index_forward(true)
+        .scan_index_forward(true);
+    if let Some(limit) = limit {
+        request = request.limit(limit);
+    }
+    request
+        .set_exclusive_start_key(exclusive_start_key)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn list_tables_page(
+    client: &DynamoClient,
+    limit: Option<i32>,
+    exclusive_start_table_name: Option<String>,
+) -> aws_sdk_dynamodb::operation::list_tables::ListTablesOutput {
+    let mut request = client.list_tables();
+    if let Some(limit) = limit {
+        request = request.limit(limit);
+    }
+    request
+        .set_exclusive_start_table_name(exclusive_start_table_name)
         .send()
         .await
         .unwrap()
@@ -1494,6 +2007,24 @@ fn normalize_item_list(items: Vec<Value>) -> Vec<Value> {
     keyed.into_iter().map(|(_, item)| item).collect()
 }
 
+fn fixture_table_names(table_names: &[String]) -> Vec<String> {
+    let mut fixture_tables = table_names
+        .iter()
+        .filter(|name| name.starts_with("dynamo_matrix_"))
+        .cloned()
+        .collect::<Vec<_>>();
+    fixture_tables.sort();
+    fixture_tables
+}
+
+fn predecessor_table_name(table_names: &[String], target: &str) -> Option<String> {
+    table_names
+        .iter()
+        .position(|name| name == target)
+        .and_then(|index| index.checked_sub(1))
+        .map(|index| table_names[index].clone())
+}
+
 fn item_sort_key(item: &Value) -> (String, String, i64) {
     let object = item.as_object().unwrap();
     let tenant = object
@@ -1511,9 +2042,25 @@ fn item_sort_key(item: &Value) -> (String, String, i64) {
 }
 
 fn primary_key_item(row: &EventRow) -> HashMap<String, AttributeValue> {
+    primary_key_item_from_parts(&row.tenant, json!(row.ts))
+}
+
+fn primary_key_item_from_parts(tenant: &str, ts: Value) -> HashMap<String, AttributeValue> {
     serde_dynamo::aws_sdk_dynamodb_1::to_item(json!({
-        "tenant": row.tenant.clone(),
-        "ts": row.ts,
+        "tenant": tenant,
+        "ts": ts,
+    }))
+    .unwrap()
+}
+
+fn string_sort_key_item(
+    tenant: &str,
+    sort_key_name: &str,
+    sort_key_value: &str,
+) -> HashMap<String, AttributeValue> {
+    serde_dynamo::aws_sdk_dynamodb_1::to_item(json!({
+        "tenant": tenant,
+        sort_key_name: sort_key_value,
     }))
     .unwrap()
 }
@@ -1551,6 +2098,14 @@ fn fixture_rows() -> Vec<EventRow> {
             region: "ap-southeast-2".to_string(),
             active: true,
             count: 4,
+        },
+        EventRow {
+            tenant: "initech".to_string(),
+            ts: 25,
+            event_id: "evt-5".to_string(),
+            region: "us-east-1".to_string(),
+            active: false,
+            count: 5,
         },
     ]
 }

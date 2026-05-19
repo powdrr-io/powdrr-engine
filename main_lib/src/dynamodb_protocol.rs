@@ -3,19 +3,19 @@ use std::pin::Pin;
 
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{body, Body};
+use gotham::hyper::{Body, body};
 use gotham::mime;
 use gotham::state::{FromState, State};
 use http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::data_contract::{
     CreateTable, DynamoDbGlobalSecondaryIndexConfig, DynamoDbTableConfig, ServingPattern,
     ServingTableConfig, TableDescription, TableMetadataCheckpoint,
 };
 use crate::elastic_search_endpoints::NamePathExtractor;
-use crate::lakehouse_serving::{execute_serving_query, ServingQueryError, ServingQueryResponse};
+use crate::lakehouse_serving::{ServingQueryError, ServingQueryResponse, execute_serving_query};
 use crate::peers::CheckpointDescriptor;
 use crate::schema_massager::{PowdrrDataType, PowdrrSchema};
 use crate::serving_plan::{
@@ -633,6 +633,7 @@ async fn handle_query(payload: Value) -> Result<Value, DynamoDbError> {
     let request = serde_json::from_value::<QueryRequest>(payload)
         .map_err(|error| DynamoDbError::validation(format!("Invalid Query request: {}", error)))?;
     let context = load_dynamodb_table_context(&request.table_name).await?;
+    let table_key_schema = primary_key_schema(&context.config);
     let (query_key_schema, unique_lookup) =
         query_target_key_schema(&context.config, request.index_name.as_deref())?;
     let requested_projection = parse_projection_expression(
@@ -674,6 +675,7 @@ async fn handle_query(payload: Value) -> Result<Value, DynamoDbError> {
         apply_exclusive_start_key(
             &mut key_filters,
             &query_key_schema,
+            &table_key_schema,
             ascending,
             exclusive_start_key,
         )?;
@@ -720,9 +722,21 @@ async fn handle_query(payload: Value) -> Result<Value, DynamoDbError> {
 
     let mut evaluated_rows = response.rows;
     let last_evaluated_key = if evaluated_rows.len() > page_limit {
-        let key = row_to_key(&evaluated_rows[page_limit - 1], &query_key_schema)?;
+        let key = row_to_key(
+            &evaluated_rows[page_limit - 1],
+            &query_key_schema,
+            &table_key_schema,
+        )?;
         evaluated_rows.truncate(page_limit);
         Some(key)
+    } else if evaluated_rows.len() == page_limit && !sort_is_exact_eq && !unique_lookup {
+        Some(row_to_key(
+            evaluated_rows
+                .last()
+                .ok_or_else(|| DynamoDbError::internal("Expected a row at page boundary"))?,
+            &query_key_schema,
+            &table_key_schema,
+        )?)
     } else {
         None
     };
@@ -1640,6 +1654,7 @@ fn next_scalar(value: char) -> Option<char> {
 fn apply_exclusive_start_key(
     filters: &mut Vec<ServingPredicate>,
     key_schema: &DynamoDbKeySchemaConfig,
+    table_key_schema: &DynamoDbKeySchemaConfig,
     ascending: bool,
     exclusive_start_key: &Map<String, Value>,
 ) -> Result<(), DynamoDbError> {
@@ -1647,7 +1662,8 @@ fn apply_exclusive_start_key(
         Some(sort_key) => sort_key,
         None => return Ok(()),
     };
-    let parsed_key = parse_key_map(exclusive_start_key, key_schema)?;
+    let parsed_key =
+        parse_exclusive_start_key_map(exclusive_start_key, key_schema, table_key_schema)?;
     let partition_value = parsed_key
         .get(&key_schema.partition_key)
         .ok_or_else(|| DynamoDbError::validation("ExclusiveStartKey was missing partition key"))?;
@@ -1800,29 +1816,87 @@ fn json_row_to_dynamodb_item(row: &Value) -> Result<Map<String, Value>, DynamoDb
 fn row_to_key(
     row: &Value,
     key_schema: &DynamoDbKeySchemaConfig,
+    table_key_schema: &DynamoDbKeySchemaConfig,
 ) -> Result<Map<String, Value>, DynamoDbError> {
     let object = row
         .as_object()
         .ok_or_else(|| DynamoDbError::internal("Serving query returned a non-object row"))?;
     let mut key = Map::new();
+    append_key_to_map(&mut key, object, &key_schema.partition_key, "partition")?;
+    if let Some(sort_key) = key_schema.sort_key.as_ref() {
+        append_key_to_map(&mut key, object, sort_key, "sort")?;
+    }
+    if table_key_schema.partition_key != key_schema.partition_key {
+        append_key_to_map(
+            &mut key,
+            object,
+            &table_key_schema.partition_key,
+            "table partition",
+        )?;
+    }
+    if let Some(sort_key) = table_key_schema.sort_key.as_ref() {
+        if key_schema.sort_key.as_ref() != Some(sort_key) {
+            append_key_to_map(&mut key, object, sort_key, "table sort")?;
+        }
+    }
+    Ok(key)
+}
+
+fn append_key_to_map(
+    key: &mut Map<String, Value>,
+    object: &Map<String, Value>,
+    field_name: &str,
+    label: &str,
+) -> Result<(), DynamoDbError> {
+    if key.contains_key(field_name) {
+        return Ok(());
+    }
     key.insert(
-        key_schema.partition_key.clone(),
-        json_to_dynamodb_attr(object.get(&key_schema.partition_key).ok_or_else(|| {
+        field_name.to_string(),
+        json_to_dynamodb_attr(object.get(field_name).ok_or_else(|| {
             DynamoDbError::internal(format!(
-                "Response item was missing partition key {}",
-                key_schema.partition_key
+                "Response item was missing {} key {}",
+                label, field_name
             ))
         })?)?,
     );
-    if let Some(sort_key) = key_schema.sort_key.as_ref() {
-        key.insert(
-            sort_key.clone(),
-            json_to_dynamodb_attr(object.get(sort_key).ok_or_else(|| {
-                DynamoDbError::internal(format!("Response item was missing sort key {}", sort_key))
-            })?)?,
-        );
+    Ok(())
+}
+
+fn parse_exclusive_start_key_map(
+    key: &Map<String, Value>,
+    query_key_schema: &DynamoDbKeySchemaConfig,
+    table_key_schema: &DynamoDbKeySchemaConfig,
+) -> Result<HashMap<String, Value>, DynamoDbError> {
+    let mut field_names = vec![query_key_schema.partition_key.clone()];
+    if let Some(sort_key) = query_key_schema.sort_key.as_ref() {
+        field_names.push(sort_key.clone());
     }
-    Ok(key)
+    if table_key_schema.partition_key != query_key_schema.partition_key {
+        field_names.push(table_key_schema.partition_key.clone());
+    }
+    if let Some(sort_key) = table_key_schema.sort_key.as_ref() {
+        if query_key_schema.sort_key.as_ref() != Some(sort_key) {
+            field_names.push(sort_key.clone());
+        }
+    }
+
+    let mut parsed = HashMap::new();
+    for field_name in field_names.iter() {
+        let Some(value) = key.get(field_name) else {
+            return Err(DynamoDbError::validation(format!(
+                "ExclusiveStartKey was missing key field {}",
+                field_name
+            )));
+        };
+        parsed.insert(field_name.clone(), dynamodb_attr_to_json(value)?);
+    }
+    if key.len() != parsed.len() {
+        return Err(DynamoDbError::validation(
+            "ExclusiveStartKey contained attributes that are not part of the table or index key schema",
+        ));
+    }
+    Ok(parsed)
 }
 
 fn apply_filter_predicates(
@@ -2386,17 +2460,16 @@ mod tests {
             &list_tables_response.read_utf8_body().unwrap(),
         )
         .unwrap();
-        assert!(list_tables_body["TableNames"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value == &json!(table_name)));
-
-        let list_tables_unknown_field_response = perform_dynamodb_request(
-            &test_server,
-            "ListTables",
-            json!({ "UnknownField": true }),
+        assert!(
+            list_tables_body["TableNames"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == &json!(table_name))
         );
+
+        let list_tables_unknown_field_response =
+            perform_dynamodb_request(&test_server, "ListTables", json!({ "UnknownField": true }));
         assert_eq!(
             list_tables_unknown_field_response.status(),
             400,
