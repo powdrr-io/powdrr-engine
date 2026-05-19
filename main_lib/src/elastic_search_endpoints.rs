@@ -427,18 +427,6 @@ pub fn es_unsupported_named_pipeline_simulate(state: State) -> Pin<Box<HandlerFu
     .boxed()
 }
 
-pub fn es_unsupported_update_api(state: State) -> Pin<Box<HandlerFuture>> {
-    tracing::info!("es_unsupported_update_api");
-    async {
-        let res = unsupported_api_response(
-            &state,
-            "The document update API is not supported. Use document indexing with POST /{index}/_doc/{id} or update_by_query.",
-        );
-        Ok((state, res))
-    }
-    .boxed()
-}
-
 pub fn es_cluster_health(mut state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_cluster_health");
     async {
