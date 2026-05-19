@@ -94,3 +94,27 @@ POWDRR_SERVE_BENCH_RELEASE=0 bash scripts/run_serving_bench_local.sh
 This is not a write benchmark and it is not an ES-compatibility benchmark. It
 is a serving-path latency benchmark for bounded document-serving workloads over
 lakehouse data using protocols clients already know.
+
+## Elasticsearch Workload Benchmark
+
+The compatibility workload benchmark is separate from the serving benchmark. It
+replays selected differential `logs-*` fixture cases from
+`main_lib/tests/data/es_compat_cases.json` against:
+
+- an in-process Powdrr HTTP server
+- a real Elasticsearch node
+
+This is the right benchmark when you want relative latency for the actual
+read-only ES workload slice, including:
+
+- filtered `query_string`
+- wildcard multi-index `search_after`
+- `date_histogram` with empty-bucket options
+- `terms` with missing-bucket and `_key` ordering
+- nested bucket and metric aggregations
+
+Local run:
+
+```bash
+bash scripts/run_es_workload_bench_local.sh
+```

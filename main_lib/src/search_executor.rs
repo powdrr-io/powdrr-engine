@@ -12,8 +12,9 @@ use crate::elastic_search_responses::{
 };
 use crate::peers::{
     CheckpointDescriptor, PrivateInvocation, PrivateSearchAggregationFilterSpec,
-    PrivateSearchAggregationPartial, PrivateSearchAggregationSpec, PrivateSearchInvocation,
-    PrivateSearchSortSpec,
+    PrivateSearchAggregationPartial, PrivateSearchAggregationSpec,
+    PrivateSearchDateHistogramExtendedBoundsSpec, PrivateSearchInvocation, PrivateSearchSortSpec,
+    PrivateSearchTermsOrderSpec,
 };
 use crate::schema_massager::{FieldExpression, SqlBuilder, SqlExpression};
 use crate::search_plan;
@@ -24,7 +25,7 @@ use crate::search_runtime::{
 };
 use crate::state_provider::STATE_PROVIDER;
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, SecondsFormat, Utc};
 use futures::future::try_join_all;
 use serde_json::Value;
 use std::pin::Pin;
@@ -794,6 +795,8 @@ fn private_search_aggregation_spec(
                 name: plan.name.clone(),
                 field: terms_plan.field.clone(),
                 size: terms_plan.size,
+                order: private_search_terms_order(terms_plan.order.as_ref()),
+                missing: terms_plan.missing.clone(),
                 sub_aggregations: private_search_aggregation_specs(&terms_plan.sub_aggregations)?,
             })
         }
@@ -814,6 +817,13 @@ fn private_search_aggregation_spec(
                 name: plan.name.clone(),
                 field: histogram_plan.field.clone(),
                 fixed_interval: histogram_plan.fixed_interval.clone(),
+                min_doc_count: histogram_plan.min_doc_count,
+                extended_bounds: histogram_plan.extended_bounds.as_ref().map(|bounds| {
+                    PrivateSearchDateHistogramExtendedBoundsSpec {
+                        min: bounds.min.clone(),
+                        max: bounds.max.clone(),
+                    }
+                }),
                 sub_aggregations: private_search_aggregation_specs(
                     &histogram_plan.sub_aggregations,
                 )?,
@@ -827,6 +837,20 @@ fn private_search_aggregation_spec(
             })
         }
         _ => None,
+    }
+}
+
+fn private_search_terms_order(
+    order: Option<&search_plan::TermsOrderPlan>,
+) -> Option<PrivateSearchTermsOrderSpec> {
+    match order {
+        Some(search_plan::TermsOrderPlan::CountAsc) => Some(PrivateSearchTermsOrderSpec::CountAsc),
+        Some(search_plan::TermsOrderPlan::CountDesc) => {
+            Some(PrivateSearchTermsOrderSpec::CountDesc)
+        }
+        Some(search_plan::TermsOrderPlan::KeyAsc) => Some(PrivateSearchTermsOrderSpec::KeyAsc),
+        Some(search_plan::TermsOrderPlan::KeyDesc) => Some(PrivateSearchTermsOrderSpec::KeyDesc),
+        None => None,
     }
 }
 
@@ -994,6 +1018,7 @@ fn merge_typed_aggregation_partial(
     match spec {
         PrivateSearchAggregationSpec::Terms {
             size,
+            order,
             sub_aggregations,
             ..
         } => {
@@ -1028,10 +1053,7 @@ fn merge_typed_aggregation_partial(
                 )
                 .collect::<Vec<_>>();
             buckets.sort_by(|left, right| {
-                right
-                    .doc_count
-                    .cmp(&left.doc_count)
-                    .then_with(|| left.key.cmp(&right.key))
+                compare_terms_aggregation_buckets(left, right, order.as_ref())
             });
             buckets.truncate(size.unwrap_or(10) as usize);
 
@@ -1057,7 +1079,11 @@ fn merge_typed_aggregation_partial(
             })
         }
         PrivateSearchAggregationSpec::DateHistogram {
-            sub_aggregations, ..
+            fixed_interval,
+            min_doc_count,
+            extended_bounds,
+            sub_aggregations,
+            ..
         } => {
             let mut merged_buckets = std::collections::BTreeMap::<
                 i64,
@@ -1075,7 +1101,7 @@ fn merge_typed_aggregation_partial(
                 }
             }
 
-            let buckets = merged_buckets
+            let mut buckets = merged_buckets
                 .into_iter()
                 .map(|(key, (key_as_string, doc_count, sub_partials_by_node))| {
                     HistogramAggregationBucket {
@@ -1090,6 +1116,11 @@ fn merge_typed_aggregation_partial(
                     }
                 })
                 .collect::<Vec<_>>();
+
+            if min_doc_count.unwrap_or(0) == 0 {
+                buckets =
+                    fill_empty_histogram_buckets(buckets, fixed_interval, extended_bounds.as_ref());
+            }
 
             AggregationResult::Histogram(HistogramAggregationResult { buckets })
         }
@@ -1132,6 +1163,124 @@ fn merge_typed_aggregation_partial(
             })
         }
     }
+}
+
+fn compare_terms_aggregation_buckets(
+    left: &TermAggregationBucket,
+    right: &TermAggregationBucket,
+    order: Option<&PrivateSearchTermsOrderSpec>,
+) -> std::cmp::Ordering {
+    match order.unwrap_or(&PrivateSearchTermsOrderSpec::CountDesc) {
+        PrivateSearchTermsOrderSpec::CountAsc => left
+            .doc_count
+            .cmp(&right.doc_count)
+            .then_with(|| left.key.cmp(&right.key)),
+        PrivateSearchTermsOrderSpec::CountDesc => right
+            .doc_count
+            .cmp(&left.doc_count)
+            .then_with(|| left.key.cmp(&right.key)),
+        PrivateSearchTermsOrderSpec::KeyAsc => left.key.cmp(&right.key),
+        PrivateSearchTermsOrderSpec::KeyDesc => right.key.cmp(&left.key),
+    }
+}
+
+fn fill_empty_histogram_buckets(
+    buckets: Vec<HistogramAggregationBucket>,
+    fixed_interval: &str,
+    extended_bounds: Option<&PrivateSearchDateHistogramExtendedBoundsSpec>,
+) -> Vec<HistogramAggregationBucket> {
+    let Some(interval_ms) = parse_histogram_fixed_interval_millis(fixed_interval) else {
+        return buckets;
+    };
+    if buckets.is_empty() && extended_bounds.is_none() {
+        return buckets;
+    }
+
+    let mut buckets_by_key = buckets
+        .into_iter()
+        .map(|bucket| (bucket.key, bucket))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let observed_start = buckets_by_key.keys().next().copied();
+    let observed_end = buckets_by_key.keys().next_back().copied();
+    let extended_start =
+        extended_bounds.and_then(|bounds| histogram_bound_to_bucket_key(&bounds.min, interval_ms));
+    let extended_end =
+        extended_bounds.and_then(|bounds| histogram_bound_to_bucket_key(&bounds.max, interval_ms));
+
+    let start = match (observed_start, extended_start) {
+        (Some(observed), Some(extended)) => observed.min(extended),
+        (Some(observed), None) => observed,
+        (None, Some(extended)) => extended,
+        (None, None) => return vec![],
+    };
+    let end = match (observed_end, extended_end) {
+        (Some(observed), Some(extended)) => observed.max(extended),
+        (Some(observed), None) => observed,
+        (None, Some(extended)) => extended,
+        (None, None) => return vec![],
+    };
+
+    let mut filled = Vec::new();
+    let mut cursor = start;
+    while cursor <= end {
+        if let Some(bucket) = buckets_by_key.remove(&cursor) {
+            filled.push(bucket);
+        } else {
+            filled.push(HistogramAggregationBucket {
+                key: cursor,
+                key_as_string: timestamp_millis_to_key_as_string(cursor),
+                doc_count: 0,
+                aggs: Default::default(),
+            });
+        }
+        let Some(next_cursor) = cursor.checked_add(interval_ms) else {
+            break;
+        };
+        cursor = next_cursor;
+    }
+    filled
+}
+
+fn parse_histogram_fixed_interval_millis(interval: &str) -> Option<i64> {
+    if interval.len() < 2 {
+        return None;
+    }
+    let (value, unit) = interval.split_at(interval.len() - 1);
+    let quantity = value.parse::<i64>().ok()?;
+    let multiplier = match unit {
+        "s" => 1_000,
+        "m" => 60 * 1_000,
+        "h" => 60 * 60 * 1_000,
+        "d" => 24 * 60 * 60 * 1_000,
+        "w" => 7 * 24 * 60 * 60 * 1_000,
+        _ => return None,
+    };
+    quantity.checked_mul(multiplier)
+}
+
+fn histogram_bound_to_bucket_key(value: &Value, interval_ms: i64) -> Option<i64> {
+    let timestamp_ms = histogram_bound_to_timestamp_millis(value)?;
+    Some(timestamp_ms - timestamp_ms.rem_euclid(interval_ms))
+}
+
+fn histogram_bound_to_timestamp_millis(value: &Value) -> Option<i64> {
+    if let Some(timestamp_ms) = value.as_i64() {
+        return Some(timestamp_ms);
+    }
+    if let Some(timestamp_ms) = value.as_u64() {
+        return i64::try_from(timestamp_ms).ok();
+    }
+    let timestamp = value.as_str()?;
+    DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .map(|datetime| datetime.with_timezone(&Utc).timestamp_millis())
+}
+
+fn timestamp_millis_to_key_as_string(timestamp_ms: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(timestamp_ms)
+        .unwrap()
+        .to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 fn compile_legacy_sql_command(
@@ -1343,6 +1492,23 @@ mod tests {
     }
 
     #[test]
+    fn test_query_string_query_uses_typed_node_merge_path() {
+        let command = parse_search_command(
+            r#"{
+  "query": {
+    "query_string": {
+      "query": "service:auth AND Login",
+      "fields": ["message"],
+      "default_operator": "OR"
+    }
+  }
+}"#,
+        );
+
+        assert!(command.supports_typed_node_merge());
+    }
+
+    #[test]
     fn test_range_query_uses_typed_node_merge_path() {
         let command = parse_search_command(
             r#"{
@@ -1483,6 +1649,29 @@ mod tests {
     }
 
     #[test]
+    fn test_date_histogram_options_use_typed_node_merge_path() {
+        let command = parse_search_command(
+            r#"{
+  "aggs": {
+    "per_day": {
+      "date_histogram": {
+        "field": "@timestamp",
+        "fixed_interval": "1d",
+        "min_doc_count": 0,
+        "extended_bounds": {
+          "min": "2099-03-07T00:00:00.000Z",
+          "max": "2099-03-10T00:00:00.000Z"
+        }
+      }
+    }
+  }
+}"#,
+        );
+
+        assert!(command.supports_typed_node_merge());
+    }
+
+    #[test]
     fn test_terms_subaggregation_uses_typed_node_merge_path() {
         let command = parse_search_command(
             r#"{
@@ -1497,6 +1686,28 @@ mod tests {
             "field": "index_col"
           }
         }
+      }
+    }
+  }
+}"#,
+        );
+
+        assert!(command.supports_typed_node_merge());
+    }
+
+    #[test]
+    fn test_terms_order_and_missing_use_typed_node_merge_path() {
+        let command = parse_search_command(
+            r#"{
+  "aggs": {
+    "by_service": {
+      "terms": {
+        "field": "service",
+        "size": 10,
+        "order": {
+          "_key": "asc"
+        },
+        "missing": "unknown"
       }
     }
   }

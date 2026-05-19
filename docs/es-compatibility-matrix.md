@@ -52,6 +52,7 @@ The manifest file turns this into an enforceable surface contract:
 | Search | `range` query on `@timestamp` returns expected hits | `range_query_on_timestamp_returns_expected_hits` | Yes | Yes | Important for future shard-pruning and doc-values work |
 | Search | `simple_query_string` with a single term returns the expected hits | `simple_query_string_with_and_operator_returns_expected_hit` | Yes | Yes | Freezes the currently working parser path before engine swap |
 | Search | `multi_match` over `logs-*` returns the expected multi-index hits | `logs_wildcard_multi_match_returns_expected_hits` | Yes | Yes | First workload-level multi-index text search contract |
+| Search | restricted `query_string` over `logs-*` returns the expected field-filtered hit set | `logs_wildcard_query_string_returns_expected_hits` | Yes | Yes | First differential contract for fielded `OR` query-string log filters |
 | Search | field sort returns hits in descending numeric order | `field_sort_returns_expected_descending_hit_order` | Yes | Yes | Covers the typed node-local/controller merge path for explicit sorts |
 | Search | wildcard multi-index sorted pagination with `search_after` returns the expected next page | `logs_wildcard_search_after_returns_expected_hits` | Yes | Yes | Freezes the current typed wildcard merge path |
 | Search | zero-hit query on an existing index returns zero total hits | `zero_hit_query_on_existing_index_returns_zero_total` | Yes | Yes | Guards empty-result behavior |
@@ -72,8 +73,10 @@ The manifest file turns this into an enforceable surface contract:
 | Unsupported | scroll, search template, async search, cat APIs, GET pipeline, `_update/:id` | manifest-backed unsupported fixtures | Yes | No | Every such route must now fail with a clear checked error payload |
 | Aggregations | `terms` aggregation over string fields returns expected bucket keys and doc counts | `terms_aggregation_returns_expected_bucket_keys_and_counts` | Yes | No | Current local behavior depends on aggregating over analyzed text fields, which Elasticsearch rejects without exact-field mapping or fielddata |
 | Aggregations | `avg` plus filtered sub-aggregation returns expected metric values | `avg_and_filter_subaggregation_return_expected_values` | Yes | Yes | Uses exact alphanumeric string terms to avoid analyzed-text drift between Powdrr and Elasticsearch |
+| Aggregations | `date_histogram` with `min_doc_count` and `extended_bounds` over `logs-*` returns empty boundary and gap buckets | `logs_wildcard_date_histogram_with_bounds_returns_expected_buckets` | Yes | Yes | Freezes empty-bucket generation on the typed histogram merge path |
 | Aggregations | `date_histogram` over `logs-*` returns expected per-day buckets | `logs_wildcard_date_histogram_returns_expected_buckets` | Yes | Yes | First differential workload histogram contract |
 | Aggregations | `cardinality` over `logs-*` returns the expected distinct value count | `logs_wildcard_cardinality_returns_expected_value` | Yes | Yes | Uses exact merge semantics in the typed path |
+| Aggregations | `terms` over `logs-*` respects `_key` ordering and the configured missing bucket | `logs_wildcard_terms_order_and_missing_return_expected_buckets` | Yes | Yes | Pins the new terms bucket ordering and missing-value behavior |
 | Aggregations | `terms` with per-bucket `avg` sub-aggregations over `logs-*` returns the expected merged buckets | `logs_wildcard_terms_subaggregation_returns_expected_buckets` | Yes | Yes | First differential contract for typed bucket sub-aggregation merge |
 
 ## Surface Rules
@@ -94,11 +97,11 @@ The next compatibility additions should focus on remaining differential drift:
 The broader workload milestone for that next phase is documented in
 `docs/es-log-workload-plan.md`.
 
-1. narrower `query_string` support for the logs workload
-2. more aggregation parity: `missing`, range buckets, and bucket-level sub-aggregations
+1. broader `query_string` parity beyond the restricted logs workload subset
+2. more aggregation parity: range buckets, richer bucket ordering, and remaining dashboard options
 3. official client smoke tests for Python and Go
 4. broader multi-index differential coverage beyond the first `logs-*` workload
-5. explicit unsupported contracts for any remaining ambiguous write/admin routes
+5. exact workload benchmarks for the saved-search and dashboard fixture set
 
 ## Differential Test Mode
 
@@ -106,6 +109,12 @@ For a full local differential run, use the dedicated compatibility stack:
 
 ```bash
 bash scripts/run_es_compat_local.sh
+```
+
+For the workload latency comparison against real Elasticsearch, use:
+
+```bash
+bash scripts/run_es_workload_bench_local.sh
 ```
 
 That script starts Redis, MinIO, the Iceberg REST catalog, LocalStack, and a

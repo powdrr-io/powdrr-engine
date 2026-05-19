@@ -2920,6 +2920,86 @@ pub(crate) mod tests {
         );
         assert_eq!(histogram_buckets[2]["doc_count"], json!(2));
 
+        let multi_index_query_string_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs,events_extra/_search",
+                r#"{
+                  "sort": [
+                    {
+                      "index_col": {
+                        "order": "asc"
+                      }
+                    }
+                  ],
+                  "query": {
+                    "query_string": {
+                      "query": "Archive OR logout",
+                      "fields": ["message"],
+                      "default_operator": "OR"
+                    }
+                  }
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(multi_index_query_string_response.status(), 200);
+        let multi_index_query_string_json: Value =
+            serde_json::from_str(&multi_index_query_string_response.read_utf8_body().unwrap())
+                .unwrap();
+        assert_eq!(
+            multi_index_query_string_json["hits"]["hits"][0]["_source"]["message"],
+            json!("Archive login pending")
+        );
+        assert_eq!(
+            multi_index_query_string_json["hits"]["hits"][1]["_source"]["message"],
+            json!("Logout successful")
+        );
+
+        let bounded_histogram_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs,events_extra/_search",
+                r#"{
+                  "size": 0,
+                  "aggs": {
+                    "per_day": {
+                      "date_histogram": {
+                        "field": "@timestamp",
+                        "fixed_interval": "1d",
+                        "min_doc_count": 0,
+                        "extended_bounds": {
+                          "min": "2099-03-06T00:00:00.000Z",
+                          "max": "2099-03-12T00:00:00.000Z"
+                        }
+                      }
+                    }
+                  }
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(bounded_histogram_response.status(), 200);
+        let bounded_histogram_json: Value =
+            serde_json::from_str(&bounded_histogram_response.read_utf8_body().unwrap()).unwrap();
+        let bounded_histogram_buckets =
+            bounded_histogram_json["aggregations"]["per_day"]["buckets"]
+                .as_array()
+                .unwrap();
+        assert_eq!(bounded_histogram_buckets.len(), 7);
+        assert_eq!(
+            bounded_histogram_buckets[0]["key_as_string"],
+            json!("2099-03-06T00:00:00.000Z")
+        );
+        assert_eq!(bounded_histogram_buckets[0]["doc_count"], json!(0));
+        assert_eq!(
+            bounded_histogram_buckets[6]["key_as_string"],
+            json!("2099-03-12T00:00:00.000Z")
+        );
+        assert_eq!(bounded_histogram_buckets[6]["doc_count"], json!(0));
+
         let multi_index_terms_subagg_response = test_server
             .client()
             .post(
@@ -2957,6 +3037,44 @@ pub(crate) mod tests {
         assert_eq!(terms_buckets[0]["key"], json!("true"));
         assert_eq!(terms_buckets[0]["doc_count"], json!(9));
         assert_eq!(terms_buckets[0]["avg_index_col"]["value"], json!(4.0));
+
+        let ordered_terms_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs,events_extra/_search",
+                r#"{
+                  "size": 0,
+                  "aggs": {
+                    "by_message": {
+                      "terms": {
+                        "field": "message",
+                        "size": 3,
+                        "order": {
+                          "_key": "asc"
+                        }
+                      }
+                    }
+                  }
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(ordered_terms_response.status(), 200);
+        let ordered_terms_json: Value =
+            serde_json::from_str(&ordered_terms_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(
+            ordered_terms_json["aggregations"]["by_message"]["buckets"][0]["key"],
+            json!("Archive login complete")
+        );
+        assert_eq!(
+            ordered_terms_json["aggregations"]["by_message"]["buckets"][1]["key"],
+            json!("Archive login pending")
+        );
+        assert_eq!(
+            ordered_terms_json["aggregations"]["by_message"]["buckets"][2]["key"],
+            json!("Archive logout successful")
+        );
 
         let invalid_search_after_response = test_server
             .client()
