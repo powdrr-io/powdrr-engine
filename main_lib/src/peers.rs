@@ -6,6 +6,7 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::Api;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::{error::Error, fmt::Display};
@@ -97,6 +98,8 @@ pub enum PrivateSearchAggregationSpec {
         name: String,
         field: String,
         size: Option<u32>,
+        order: Option<PrivateSearchTermsOrderSpec>,
+        missing: Option<Value>,
         sub_aggregations: Vec<PrivateSearchAggregationSpec>,
     },
     Average {
@@ -111,6 +114,8 @@ pub enum PrivateSearchAggregationSpec {
         name: String,
         field: String,
         fixed_interval: String,
+        min_doc_count: Option<u64>,
+        extended_bounds: Option<PrivateSearchDateHistogramExtendedBoundsSpec>,
         sub_aggregations: Vec<PrivateSearchAggregationSpec>,
     },
     Filter {
@@ -118,6 +123,20 @@ pub enum PrivateSearchAggregationSpec {
         filter: PrivateSearchAggregationFilterSpec,
         sub_aggregations: Vec<PrivateSearchAggregationSpec>,
     },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum PrivateSearchTermsOrderSpec {
+    CountAsc,
+    CountDesc,
+    KeyAsc,
+    KeyDesc,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PrivateSearchDateHistogramExtendedBoundsSpec {
+    pub min: Value,
+    pub max: Value,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

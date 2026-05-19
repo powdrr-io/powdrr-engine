@@ -25,7 +25,7 @@ use crate::peers::{
     PrivatePrefetchInvocation, PrivateSearchAggregationFilterSpec, PrivateSearchAggregationPartial,
     PrivateSearchAggregationSpec, PrivateSearchHistogramBucketPartial, PrivateSearchInvocation,
     PrivateSearchResult, PrivateSearchSortSpec, PrivateSearchTermsBucketPartial,
-    PrivateSqlInvocation,
+    PrivateSearchTermsOrderSpec, PrivateSqlInvocation,
 };
 use crate::prefetch::warm_iceberg_checkpoints;
 use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema, SqlQuery};
@@ -880,6 +880,8 @@ fn compute_search_aggregation_partial(
             name,
             field,
             fixed_interval,
+            min_doc_count: _,
+            extended_bounds: _,
             sub_aggregations,
         } => {
             let Some(interval_ms) = parse_fixed_interval_millis(fixed_interval) else {
@@ -920,12 +922,16 @@ fn compute_search_aggregation_partial(
         PrivateSearchAggregationSpec::Terms {
             name,
             field,
-            size,
+            size: _,
+            order,
+            missing,
             sub_aggregations,
         } => {
             let mut buckets = std::collections::HashMap::<String, Vec<serde_json::Value>>::new();
             for row in rows.iter() {
-                if let Some(key) = extract_term_key(row, field) {
+                if let Some(key) = extract_term_key(row, field)
+                    .or_else(|| missing.as_ref().and_then(render_missing_term_key))
+                {
                     buckets.entry(key).or_default().push(row.clone());
                 }
             }
@@ -941,13 +947,8 @@ fn compute_search_aggregation_partial(
                     key,
                 })
                 .collect::<Vec<_>>();
-            bucket_partials.sort_by(|left, right| {
-                right
-                    .doc_count
-                    .cmp(&left.doc_count)
-                    .then_with(|| left.key.cmp(&right.key))
-            });
-            bucket_partials.truncate(size.unwrap_or(10) as usize);
+            bucket_partials
+                .sort_by(|left, right| compare_terms_bucket_partials(left, right, order.as_ref()));
 
             PrivateSearchAggregationPartial::Terms {
                 name: name.clone(),
@@ -1025,6 +1026,35 @@ fn parse_fixed_interval_millis(interval: &str) -> Option<i64> {
         _ => return None,
     };
     quantity.checked_mul(multiplier)
+}
+
+fn render_missing_term_key(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .map(|text| text.to_string())
+        .or_else(|| value.as_i64().map(|numeric| numeric.to_string()))
+        .or_else(|| value.as_u64().map(|numeric| numeric.to_string()))
+        .or_else(|| value.as_f64().map(|numeric| numeric.to_string()))
+        .or_else(|| value.as_bool().map(|boolean| boolean.to_string()))
+}
+
+fn compare_terms_bucket_partials(
+    left: &PrivateSearchTermsBucketPartial,
+    right: &PrivateSearchTermsBucketPartial,
+    order: Option<&PrivateSearchTermsOrderSpec>,
+) -> std::cmp::Ordering {
+    match order.unwrap_or(&PrivateSearchTermsOrderSpec::CountDesc) {
+        PrivateSearchTermsOrderSpec::CountAsc => left
+            .doc_count
+            .cmp(&right.doc_count)
+            .then_with(|| left.key.cmp(&right.key)),
+        PrivateSearchTermsOrderSpec::CountDesc => right
+            .doc_count
+            .cmp(&left.doc_count)
+            .then_with(|| left.key.cmp(&right.key)),
+        PrivateSearchTermsOrderSpec::KeyAsc => left.key.cmp(&right.key),
+        PrivateSearchTermsOrderSpec::KeyDesc => right.key.cmp(&left.key),
+    }
 }
 
 fn timestamp_millis_to_key_as_string(timestamp_ms: i64) -> String {

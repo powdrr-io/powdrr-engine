@@ -132,8 +132,18 @@ pub enum AggregationPlanSpec {
 pub struct TermsAggregationPlan {
     pub field: String,
     pub size: Option<u32>,
+    pub order: Option<TermsOrderPlan>,
+    pub missing: Option<Value>,
     pub show_term_doc_count_error: bool,
     pub sub_aggregations: Vec<AggregationPlan>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TermsOrderPlan {
+    CountAsc,
+    CountDesc,
+    KeyAsc,
+    KeyDesc,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -160,7 +170,15 @@ pub enum AggregationFilterPlan {
 pub struct DateHistogramAggregationPlan {
     pub field: String,
     pub fixed_interval: String,
+    pub min_doc_count: Option<u64>,
+    pub extended_bounds: Option<DateHistogramExtendedBoundsPlan>,
     pub sub_aggregations: Vec<AggregationPlan>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DateHistogramExtendedBoundsPlan {
+    pub min: Value,
+    pub max: Value,
 }
 
 #[derive(Clone, Debug, PartialEq)]
