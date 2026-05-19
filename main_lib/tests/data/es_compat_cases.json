@@ -1011,6 +1011,92 @@
       ]
     },
     {
+      "id": "logs_wildcard_terms_subaggregation_returns_expected_buckets",
+      "description": "A terms aggregation with a metric sub-aggregation over logs-* returns the expected buckets",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/logs-{{index}}",
+            "body": "{\"mappings\":{\"properties\":{\"@timestamp\":{\"type\":\"date\"},\"service\":{\"type\":\"keyword\"},\"index_col\":{\"type\":\"long\"}}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/logs-{{other_index}}",
+            "body": "{\"mappings\":{\"properties\":{\"@timestamp\":{\"type\":\"date\"},\"service\":{\"type\":\"keyword\"},\"index_col\":{\"type\":\"long\"}}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"logs-{{index}}\",\"_id\":\"doc-1\"}}\n{\"@timestamp\":\"2099-03-08T11:04:05.000Z\",\"index_col\":1,\"service\":\"auth\"}\n{\"create\":{\"_index\":\"logs-{{index}}\",\"_id\":\"doc-2\"}}\n{\"@timestamp\":\"2099-03-09T11:07:08.000Z\",\"index_col\":2,\"service\":\"api\"}\n{\"create\":{\"_index\":\"logs-{{other_index}}\",\"_id\":\"doc-3\"}}\n{\"@timestamp\":\"2099-03-08T13:06:07.000Z\",\"index_col\":6,\"service\":\"api\"}\n{\"create\":{\"_index\":\"logs-{{other_index}}\",\"_id\":\"doc-4\"}}\n{\"@timestamp\":\"2099-03-09T15:08:09.000Z\",\"index_col\":8,\"service\":\"billing\"}\n",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/logs-{{index}}*/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/logs-{{index}}*/_search",
+        "body": "{\"size\":0,\"aggs\":{\"by_service\":{\"terms\":{\"field\":\"service\",\"size\":10},\"aggs\":{\"avg_index_col\":{\"avg\":{\"field\":\"index_col\"}}}}}}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        {
+          "kind": "json_path_string_list",
+          "path": "aggregations.by_service.buckets[*].key",
+          "values": ["api", "auth", "billing"]
+        },
+        {
+          "kind": "json_path_number_list",
+          "path": "aggregations.by_service.buckets[*].doc_count",
+          "values": [2, 1, 1]
+        },
+        {
+          "kind": "json_path_float_list",
+          "path": "aggregations.by_service.buckets[*].avg_index_col.value",
+          "values": [4.0, 1.0, 8.0],
+          "tolerance": 0.000001
+        }
+      ]
+    },
+    {
       "id": "zero_hit_query_on_existing_index_returns_zero_total",
       "description": "A query that matches nothing on an existing index reports zero hits",
       "differential_enabled": true,

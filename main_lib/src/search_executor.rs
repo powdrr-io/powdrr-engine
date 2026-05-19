@@ -277,16 +277,10 @@ fn legacy_sql_fanout_reason(command: &SearchCommand) -> String {
 
 fn aggregation_legacy_path_reason(plan: &search_plan::AggregationPlan) -> Option<String> {
     match &plan.spec {
-        search_plan::AggregationPlanSpec::Terms(terms_plan) => {
-            if terms_plan.sub_aggregations.is_empty() {
-                None
-            } else {
-                Some(format!(
-                    "Terms aggregation `{}` has sub-aggregations, which currently use the legacy SQL fanout path.",
-                    plan.name
-                ))
-            }
-        }
+        search_plan::AggregationPlanSpec::Terms(terms_plan) => terms_plan
+            .sub_aggregations
+            .iter()
+            .find_map(aggregation_legacy_path_reason),
         search_plan::AggregationPlanSpec::Average(_) => None,
         search_plan::AggregationPlanSpec::Filter(filter_plan) => {
             if !matches!(
@@ -800,11 +794,7 @@ fn private_search_aggregation_spec(
                 name: plan.name.clone(),
                 field: terms_plan.field.clone(),
                 size: terms_plan.size,
-                sub_aggregations: if terms_plan.sub_aggregations.is_empty() {
-                    vec![]
-                } else {
-                    return None;
-                },
+                sub_aggregations: private_search_aggregation_specs(&terms_plan.sub_aggregations)?,
             })
         }
         search_plan::AggregationPlanSpec::Average(avg_plan) => {
@@ -1026,9 +1016,14 @@ fn merge_typed_aggregation_partial(
             let mut buckets = merged_buckets
                 .into_iter()
                 .map(
-                    |(key, (doc_count, _sub_partials_by_node))| TermAggregationBucket {
+                    |(key, (doc_count, sub_partials_by_node))| TermAggregationBucket {
                         key,
                         doc_count,
+                        aggs: if sub_aggregations.is_empty() {
+                            Default::default()
+                        } else {
+                            merge_typed_aggregation_partials(sub_partials_by_node, sub_aggregations)
+                        },
                     },
                 )
                 .collect::<Vec<_>>();
@@ -1044,11 +1039,7 @@ fn merge_typed_aggregation_partial(
                 doc_count_error_upper_bound: 0,
                 sum_other_doc_count: 0,
                 buckets,
-                aggs: if sub_aggregations.is_empty() {
-                    Default::default()
-                } else {
-                    merge_typed_aggregation_partials(vec![], sub_aggregations)
-                },
+                aggs: Default::default(),
             })
         }
         PrivateSearchAggregationSpec::Cardinality { .. } => {
@@ -1492,6 +1483,30 @@ mod tests {
     }
 
     #[test]
+    fn test_terms_subaggregation_uses_typed_node_merge_path() {
+        let command = parse_search_command(
+            r#"{
+  "aggs": {
+    "by_service": {
+      "terms": {
+        "field": "service"
+      },
+      "aggs": {
+        "avg_index_col": {
+          "avg": {
+            "field": "index_col"
+          }
+        }
+      }
+    }
+  }
+}"#,
+        );
+
+        assert!(command.supports_typed_node_merge());
+    }
+
+    #[test]
     fn test_request_body_field_sort_uses_typed_node_merge_path() {
         let command = parse_search_command(
             r#"{
@@ -1562,6 +1577,33 @@ mod tests {
         "ranges": [
           { "from": "0", "to": "100" }
         ]
+      }
+    }
+  }
+}"#,
+        );
+
+        assert!(!command.supports_typed_node_merge());
+    }
+
+    #[test]
+    fn test_terms_subaggregation_with_unsupported_nested_range_stays_on_legacy_path() {
+        let command = parse_search_command(
+            r#"{
+  "aggs": {
+    "by_service": {
+      "terms": {
+        "field": "service"
+      },
+      "aggs": {
+        "price_ranges": {
+          "range": {
+            "field": "price",
+            "ranges": [
+              { "from": "0", "to": "100" }
+            ]
+          }
+        }
       }
     }
   }

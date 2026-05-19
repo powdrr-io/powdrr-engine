@@ -74,6 +74,7 @@ The manifest file turns this into an enforceable surface contract:
 | Aggregations | `avg` plus filtered sub-aggregation returns expected metric values | `avg_and_filter_subaggregation_return_expected_values` | Yes | Yes | Uses exact alphanumeric string terms to avoid analyzed-text drift between Powdrr and Elasticsearch |
 | Aggregations | `date_histogram` over `logs-*` returns expected per-day buckets | `logs_wildcard_date_histogram_returns_expected_buckets` | Yes | Yes | First differential workload histogram contract |
 | Aggregations | `cardinality` over `logs-*` returns the expected distinct value count | `logs_wildcard_cardinality_returns_expected_value` | Yes | Yes | Uses exact merge semantics in the typed path |
+| Aggregations | `terms` with per-bucket `avg` sub-aggregations over `logs-*` returns the expected merged buckets | `logs_wildcard_terms_subaggregation_returns_expected_buckets` | Yes | Yes | First differential contract for typed bucket sub-aggregation merge |
 
 ## Surface Rules
 

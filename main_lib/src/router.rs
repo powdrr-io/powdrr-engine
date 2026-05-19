@@ -2920,6 +2920,44 @@ pub(crate) mod tests {
         );
         assert_eq!(histogram_buckets[2]["doc_count"], json!(2));
 
+        let multi_index_terms_subagg_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs,events_extra/_search",
+                r#"{
+                  "size": 0,
+                  "aggs": {
+                    "by_boolean": {
+                      "terms": {
+                        "field": "boolean",
+                        "size": 10
+                      },
+                      "aggs": {
+                        "avg_index_col": {
+                          "avg": {
+                            "field": "index_col"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(multi_index_terms_subagg_response.status(), 200);
+        let multi_index_terms_subagg_json: Value =
+            serde_json::from_str(&multi_index_terms_subagg_response.read_utf8_body().unwrap())
+                .unwrap();
+        let terms_buckets = multi_index_terms_subagg_json["aggregations"]["by_boolean"]["buckets"]
+            .as_array()
+            .unwrap();
+        assert_eq!(terms_buckets.len(), 1);
+        assert_eq!(terms_buckets[0]["key"], json!("true"));
+        assert_eq!(terms_buckets[0]["doc_count"], json!(9));
+        assert_eq!(terms_buckets[0]["avg_index_col"]["value"], json!(4.0));
+
         let invalid_search_after_response = test_server
             .client()
             .post(
