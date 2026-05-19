@@ -8,7 +8,7 @@ use futures_util::future::try_join_all;
 use idgenerator::IdInstance;
 use prost::Message;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     error::Error,
     fmt,
 };
@@ -20,6 +20,7 @@ use crate::data_contract::{
 };
 use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_responses::{QueryResultHit, compare_query_result_hits_desc};
+use crate::lakehouse_serving::{ServingWarmupPlan, build_serving_warmup_plan};
 use crate::peers::{
     CheckpointDescriptor, PrivateCompactionInvocation, PrivateExtensionInvocation,
     PrivatePrefetchInvocation, PrivateSearchAggregationFilterSpec, PrivateSearchAggregationPartial,
@@ -84,6 +85,11 @@ struct FilteredFiles {
     all_files_count: usize,
 }
 
+struct DeterminedRequiredFiles {
+    required_files: RequiredFiles,
+    table_metadata: TableMetadataCheckpoint,
+}
+
 fn filter_iceberg(
     iceberg_metadata: &Option<IcebergMetadata>,
     index: u64,
@@ -131,7 +137,7 @@ async fn determine_required_files(
     checkpoints: &Vec<CheckpointDescriptor>,
     index: u64,
     num: u64,
-) -> Result<RequiredFiles, PrivateApiError> {
+) -> Result<DeterminedRequiredFiles, PrivateApiError> {
     if required_extensions.len() > 1 || checkpoints.len() != 1 {
         return Err(PrivateApiError {
             message: "Only read for one table at a time please.".to_string(),
@@ -171,18 +177,88 @@ async fn determine_required_files(
         .iter()
         .map(|f| get_extension_files(required_extensions, &table_metadata, &f.file_path))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(RequiredFiles {
-        table_schema: table_metadata.schema.clone(),
-        iceberg_files: filtered_iceberg_files.files.clone(),
-        all_iceberg_files_count: filtered_iceberg_files.all_files_count,
-        iceberg_file_extensions,
-        speedboat_files: filtered_speedboat_files.files.clone(),
-        all_speedboat_files_count: filtered_speedboat_files.all_files_count,
-        speedboat_file_extensions,
-        delete_files: table_metadata
-            .deletes_metadata
-            .map_or_else(|| vec![], |d| d.files.clone()),
+    Ok(DeterminedRequiredFiles {
+        required_files: RequiredFiles {
+            table_schema: table_metadata.schema.clone(),
+            iceberg_files: filtered_iceberg_files.files.clone(),
+            all_iceberg_files_count: filtered_iceberg_files.all_files_count,
+            iceberg_file_extensions,
+            speedboat_files: filtered_speedboat_files.files.clone(),
+            all_speedboat_files_count: filtered_speedboat_files.all_files_count,
+            speedboat_file_extensions,
+            delete_files: table_metadata
+                .deletes_metadata
+                .as_ref()
+                .map_or_else(Vec::new, |d| d.files.clone()),
+        },
+        table_metadata,
     })
+}
+
+async fn narrow_prefetch_files_for_serving_warmup(
+    required_files: &mut RequiredFiles,
+    table_metadata: &TableMetadataCheckpoint,
+) -> Option<ServingWarmupPlan> {
+    if required_files.iceberg_files.is_empty() {
+        return None;
+    }
+
+    let description = match STATE_PROVIDER
+        .describe_table(&table_metadata.table_name)
+        .await
+    {
+        Ok(Some(description)) => description,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(
+                "Skipping serving warmup narrowing for {}: {}",
+                table_metadata.table_name,
+                error
+            );
+            return None;
+        }
+    };
+    let Some(serving) = description.serving.as_ref() else {
+        return None;
+    };
+    let Some(iceberg_metadata) = table_metadata.iceberg_metadata.as_ref() else {
+        return None;
+    };
+    let file_stats = iceberg_metadata
+        .file_stats
+        .iter()
+        .map(|stats| (stats.file_path.clone(), stats.clone()))
+        .collect::<HashMap<_, _>>();
+    let warmup_plan =
+        build_serving_warmup_plan(serving, &required_files.iceberg_files, &file_stats)?;
+
+    let selected_paths = warmup_plan
+        .selected_files
+        .iter()
+        .map(|file| file.file_path.clone())
+        .collect::<BTreeSet<_>>();
+    let initial_selected = required_files.iceberg_files.len();
+    let iceberg_files = std::mem::take(&mut required_files.iceberg_files);
+    let iceberg_file_extensions = std::mem::take(&mut required_files.iceberg_file_extensions);
+    for (file, extensions) in iceberg_files
+        .into_iter()
+        .zip(iceberg_file_extensions.into_iter())
+    {
+        if selected_paths.contains(&file.file_path) {
+            required_files.iceberg_files.push(file);
+            required_files.iceberg_file_extensions.push(extensions);
+        }
+    }
+
+    tracing::info!(
+        matched_patterns = ?warmup_plan.matched_patterns,
+        estimated_bytes = warmup_plan.estimated_bytes,
+        "Prefetch narrowed serving warmup for {} to {}/{} parquet files",
+        table_metadata.table_name,
+        required_files.iceberg_files.len(),
+        initial_selected
+    );
+    Some(warmup_plan)
 }
 
 fn generate_required_files(
@@ -445,7 +521,7 @@ pub(crate) async fn data_query(
         });
     }
 
-    let required_files = match determine_required_files(
+    let determined_files = match determine_required_files(
         &invocation.required_extensions,
         &invocation.checkpoints,
         index,
@@ -456,6 +532,7 @@ pub(crate) async fn data_query(
         Ok(rf) => rf,
         Err(e) => return log_err(e),
     };
+    let required_files = determined_files.required_files;
 
     let parquet_size = required_files
         .iceberg_files
@@ -485,7 +562,7 @@ pub(crate) async fn search_query(
         });
     }
 
-    let required_files = match determine_required_files(
+    let determined_files = match determine_required_files(
         &invocation.required_extensions,
         &invocation.checkpoints,
         index,
@@ -496,6 +573,7 @@ pub(crate) async fn search_query(
         Ok(rf) => rf,
         Err(e) => return log_err(e),
     };
+    let required_files = determined_files.required_files;
 
     let parquet_size = required_files
         .iceberg_files
@@ -797,7 +875,7 @@ pub(crate) async fn prefetch_query(
         }
     }
 
-    let required_files = match determine_required_files(
+    let mut determined_files = match determine_required_files(
         &invocation.required_extensions,
         &invocation.checkpoints,
         index,
@@ -808,11 +886,41 @@ pub(crate) async fn prefetch_query(
         Ok(rf) => rf,
         Err(e) => return log_err(e),
     };
+    let files_considered = determined_files.required_files.iceberg_files.len();
+    let targeted_warmup_plan = if invocation.required_extensions.is_empty() {
+        narrow_prefetch_files_for_serving_warmup(
+            &mut determined_files.required_files,
+            &determined_files.table_metadata,
+        )
+        .await
+    } else {
+        None
+    };
+    let required_files = determined_files.required_files;
 
     let result = data_query_worker(&SqlQuery::dummy(), &required_files, false).await?;
     data_access::flush_serving_bulk_cache()
         .await
         .map_err(|message| PrivateApiError { message })?;
+    data_access::record_serving_bulk_cache_warmup(data_access::ServingBulkCacheWarmupStats {
+        table: determined_files.table_metadata.table_name,
+        snapshot_id: determined_files
+            .table_metadata
+            .iceberg_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.snapshot_id.clone()),
+        targeted: targeted_warmup_plan.is_some(),
+        matched_patterns: targeted_warmup_plan
+            .map(|plan| plan.matched_patterns)
+            .unwrap_or_default(),
+        files_considered,
+        files_selected: required_files.iceberg_files.len(),
+        estimated_bytes: required_files
+            .iceberg_files
+            .iter()
+            .map(|file| file.size)
+            .sum(),
+    });
     Ok(result)
 }
 

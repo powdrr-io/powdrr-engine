@@ -363,6 +363,7 @@ pub(crate) fn reset_serving_metadata_caches_for_test() {
     clear_parquet_row_group_stats_cache();
     clear_iceberg_table_metadata_cache();
     clear_iceberg_table_row_group_stats_tracker();
+    clear_serving_bulk_cache_warmup();
 }
 
 #[derive(Default)]
@@ -621,6 +622,24 @@ struct ServingLiquidCacheLocation {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServingBulkCacheWarmupStats {
+    #[serde(default)]
+    pub table: String,
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
+    #[serde(default)]
+    pub targeted: bool,
+    #[serde(default)]
+    pub matched_patterns: Vec<String>,
+    #[serde(default)]
+    pub files_considered: usize,
+    #[serde(default)]
+    pub files_selected: usize,
+    #[serde(default)]
+    pub estimated_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServingBulkCacheStats {
     #[serde(default)]
     pub enabled: bool,
@@ -630,6 +649,8 @@ pub struct ServingBulkCacheStats {
     pub memory_usage_bytes: u64,
     #[serde(default)]
     pub disk_usage_bytes: u64,
+    #[serde(default)]
+    pub last_warmup: Option<ServingBulkCacheWarmupStats>,
 }
 
 #[cfg(target_os = "linux")]
@@ -641,6 +662,9 @@ struct ServingLiquidCacheRuntime {
 
 #[cfg(target_os = "linux")]
 static SERVING_LIQUID_CACHE_RUNTIME: LazyLock<Mutex<Option<ServingLiquidCacheRuntime>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+static LAST_SERVING_BULK_CACHE_WARMUP: LazyLock<Mutex<Option<ServingBulkCacheWarmupStats>>> =
     LazyLock::new(|| Mutex::new(None));
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -737,7 +761,23 @@ fn current_serving_liquid_cache_runtime() -> Option<ServingLiquidCacheRuntime> {
     SERVING_LIQUID_CACHE_RUNTIME.lock().unwrap().clone()
 }
 
+fn current_serving_bulk_cache_warmup() -> Option<ServingBulkCacheWarmupStats> {
+    LAST_SERVING_BULK_CACHE_WARMUP.lock().unwrap().clone()
+}
+
+fn clear_serving_bulk_cache_warmup() {
+    LAST_SERVING_BULK_CACHE_WARMUP.lock().unwrap().take();
+}
+
+pub(crate) fn record_serving_bulk_cache_warmup(stats: ServingBulkCacheWarmupStats) {
+    LAST_SERVING_BULK_CACHE_WARMUP
+        .lock()
+        .unwrap()
+        .replace(stats);
+}
+
 pub(crate) fn serving_bulk_cache_stats() -> ServingBulkCacheStats {
+    let last_warmup = current_serving_bulk_cache_warmup();
     #[cfg(target_os = "linux")]
     {
         if let Some(runtime) = current_serving_liquid_cache_runtime() {
@@ -746,11 +786,15 @@ pub(crate) fn serving_bulk_cache_stats() -> ServingBulkCacheStats {
                 persistent: true,
                 memory_usage_bytes: runtime.cache.memory_usage_bytes() as u64,
                 disk_usage_bytes: runtime.cache.disk_usage_bytes() as u64,
+                last_warmup,
             };
         }
     }
 
-    ServingBulkCacheStats::default()
+    ServingBulkCacheStats {
+        last_warmup,
+        ..ServingBulkCacheStats::default()
+    }
 }
 
 pub(crate) async fn flush_serving_bulk_cache() -> Result<(), String> {
@@ -1091,6 +1135,7 @@ impl CacheTrackerActor {
                 clear_parquet_row_group_stats_cache();
                 clear_iceberg_table_metadata_cache();
                 clear_iceberg_table_row_group_stats_tracker();
+                clear_serving_bulk_cache_warmup();
                 let _ = respond_to.send(());
             }
             CacheTrackerActorMessage::Reserve {
@@ -2841,8 +2886,9 @@ pub(crate) fn s3_ingest_base_path() -> String {
 mod tests {
     use super::{
         IcebergLibMetadata, IcebergTableMetadataCache, IcebergTableRowGroupStatsTracker,
-        ParquetRowGroupStatsCache, RecordBatch, drop, execute_sql_async, load_files_as_table,
-        resolve_serving_liquid_cache_location, serving_session_config,
+        ParquetRowGroupStatsCache, RecordBatch, ServingBulkCacheWarmupStats, drop,
+        execute_sql_async, load_files_as_table, record_serving_bulk_cache_warmup,
+        resolve_serving_liquid_cache_location, serving_bulk_cache_stats, serving_session_config,
     };
     use crate::data_contract::{IcebergColumnStats, IcebergRowGroupStats};
     use datafusion::arrow::array::{Int64Array, StringArray};
@@ -2907,6 +2953,37 @@ mod tests {
         assert!(cache.get("s3://warehouse/a.parquet").is_some());
         assert!(cache.get("s3://warehouse/b.parquet").is_none());
         assert!(cache.get("s3://warehouse/c.parquet").is_some());
+    }
+
+    #[test]
+    fn serving_bulk_cache_stats_exposes_last_warmup_summary() {
+        super::clear_serving_bulk_cache_warmup();
+        record_serving_bulk_cache_warmup(ServingBulkCacheWarmupStats {
+            table: "events".to_string(),
+            snapshot_id: Some("snapshot_1".to_string()),
+            targeted: true,
+            matched_patterns: vec!["top_scores".to_string()],
+            files_considered: 8,
+            files_selected: 2,
+            estimated_bytes: 300,
+        });
+
+        let stats = serving_bulk_cache_stats();
+
+        assert_eq!(
+            stats.last_warmup,
+            Some(ServingBulkCacheWarmupStats {
+                table: "events".to_string(),
+                snapshot_id: Some("snapshot_1".to_string()),
+                targeted: true,
+                matched_patterns: vec!["top_scores".to_string()],
+                files_considered: 8,
+                files_selected: 2,
+                estimated_bytes: 300,
+            })
+        );
+
+        super::clear_serving_bulk_cache_warmup();
     }
 
     #[test]
