@@ -1639,6 +1639,7 @@ mod tests {
                     upper_bound: Some(serde_json::Value::from(200_i64)),
                 },
             ],
+            partition_values: vec![],
             row_groups: vec![],
         };
 
