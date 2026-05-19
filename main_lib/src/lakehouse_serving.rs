@@ -3,11 +3,11 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
 
-use futures::stream::{self, StreamExt};
 use futures::FutureExt;
+use futures::stream::{self, StreamExt};
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{body, Body};
+use gotham::hyper::{Body, body};
 use gotham::mime;
 use gotham::state::{FromState, State};
 use http::StatusCode;
@@ -57,6 +57,8 @@ pub struct ServingQueryResponse {
     pub page_index_row_groups_selected: usize,
     #[serde(default)]
     pub bloom_filter_row_groups_selected: usize,
+    #[serde(default)]
+    pub bulk_cache: data_access::ServingBulkCacheStats,
     #[serde(default)]
     pub sql: Option<String>,
     #[serde(default)]
@@ -261,6 +263,7 @@ pub async fn execute_serving_query(
 ) -> Result<ServingQueryResponse, ServingQueryError> {
     let context = load_serving_context(table_name).await?;
     validate_request(&request, &context.schema)?;
+    let bulk_cache = data_access::serving_bulk_cache_stats();
 
     if context
         .checkpoint
@@ -285,6 +288,7 @@ pub async fn execute_serving_query(
             metadata_row_groups_cached: 0,
             page_index_row_groups_selected: 0,
             bloom_filter_row_groups_selected: 0,
+            bulk_cache,
             sql: None,
             rows: vec![],
         });
@@ -308,6 +312,7 @@ pub async fn execute_serving_query(
             metadata_row_groups_cached: plan.metadata_row_groups_cached,
             page_index_row_groups_selected: plan.page_index_row_groups_selected,
             bloom_filter_row_groups_selected: plan.bloom_filter_row_groups_selected,
+            bulk_cache,
             sql: Some(plan.sql),
             rows: vec![],
         });
@@ -330,6 +335,7 @@ pub async fn execute_serving_query(
             metadata_row_groups_cached: plan.metadata_row_groups_cached,
             page_index_row_groups_selected: plan.page_index_row_groups_selected,
             bloom_filter_row_groups_selected: plan.bloom_filter_row_groups_selected,
+            bulk_cache,
             sql: Some(plan.sql),
             rows: vec![],
         });
@@ -354,6 +360,7 @@ pub async fn execute_serving_query(
             metadata_row_groups_cached: plan.metadata_row_groups_cached,
             page_index_row_groups_selected: plan.page_index_row_groups_selected,
             bloom_filter_row_groups_selected: plan.bloom_filter_row_groups_selected,
+            bulk_cache,
             sql: Some(plan.sql),
             rows: vec![],
         });
@@ -370,6 +377,7 @@ pub async fn execute_serving_query(
     if request.order_by.is_empty() {
         rows.truncate(plan.limit);
     }
+    let bulk_cache = data_access::serving_bulk_cache_stats();
 
     Ok(ServingQueryResponse {
         table: context.description.name,
@@ -387,6 +395,7 @@ pub async fn execute_serving_query(
         metadata_row_groups_cached: plan.metadata_row_groups_cached,
         page_index_row_groups_selected: plan.page_index_row_groups_selected,
         bloom_filter_row_groups_selected: plan.bloom_filter_row_groups_selected,
+        bulk_cache,
         sql: Some(plan.sql),
         rows,
     })
@@ -1512,9 +1521,9 @@ impl ServingQueryError {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_sql, file_group_table_name, group_files_by_schema, ordered_file_groups_for_top_k,
-        plan_request, prune_candidate_files, remaining_groups_cannot_beat_kth_row,
-        request_matches_pattern, ServingExecutionContext,
+        ServingExecutionContext, build_sql, file_group_table_name, group_files_by_schema,
+        ordered_file_groups_for_top_k, plan_request, prune_candidate_files,
+        remaining_groups_cannot_beat_kth_row, request_matches_pattern,
     };
     use crate::data_access::{
         prime_parquet_row_group_stats_cache_for_test, reset_serving_metadata_caches_for_test,

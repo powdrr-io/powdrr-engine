@@ -5598,6 +5598,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "lazy_static",
+ "liquid-cache-datafusion",
  "liquid-cache-datafusion-local",
  "lru-mem",
  "minijinja",
