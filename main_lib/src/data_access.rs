@@ -632,6 +632,8 @@ pub struct ServingBulkCacheWarmupStats {
     #[serde(default)]
     pub matched_patterns: Vec<String>,
     #[serde(default)]
+    pub shaped_queries: usize,
+    #[serde(default)]
     pub files_considered: usize,
     #[serde(default)]
     pub files_selected: usize,
@@ -2963,6 +2965,7 @@ mod tests {
             snapshot_id: Some("snapshot_1".to_string()),
             targeted: true,
             matched_patterns: vec!["top_scores".to_string()],
+            shaped_queries: 1,
             files_considered: 8,
             files_selected: 2,
             estimated_bytes: 300,
@@ -2977,6 +2980,7 @@ mod tests {
                 snapshot_id: Some("snapshot_1".to_string()),
                 targeted: true,
                 matched_patterns: vec!["top_scores".to_string()],
+                shaped_queries: 1,
                 files_considered: 8,
                 files_selected: 2,
                 estimated_bytes: 300,
