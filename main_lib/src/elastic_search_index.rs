@@ -1,7 +1,7 @@
 use crate::data_access::load_file_as_table;
 use crate::data_contract::{ExtensionFileMetadata, ExtensionWorkItem, FileDescriptor};
 use crate::elastic_search_common::call_peers;
-use crate::elastic_table_validation::{validate_elastic_table_files, ElasticTableValidationError};
+use crate::elastic_table_validation::{ElasticTableValidationError, validate_elastic_table_files};
 use crate::peers::{PrivateExtensionInvocation, PrivateInvocation, PrivateInvocationResult};
 use crate::schema_massager::PowdrrSchema;
 use crate::state_provider::STATE_PROVIDER;
@@ -58,6 +58,27 @@ fn is_string_type(data_type: &DataType) -> bool {
         || data_type.equals_datatype(&DataType::LargeUtf8)
 }
 
+fn is_exact_index_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8View
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+    )
+}
+
 async fn drop_all(tables: &Vec<String>) -> () {
     for table in tables {
         data_access::drop(table).await;
@@ -90,7 +111,7 @@ async fn create_index_worker(
         |field_name| format!("SELECT {doc_id_field_name_local} as doc_id, '{field_name}' as field_name, {new_local_name}.\"{field_name}\" as field_value from {new_local_name}")
     ).collect();
 
-    if field_normalization_queries.len() == 0 {
+    if field_normalization_queries.is_empty() {
         return Err(IndexError::new(format!(
             "Table {} has no searchable top-level string columns besides {}",
             new_local_name, doc_id_field_name
@@ -193,6 +214,59 @@ async fn create_index_worker(
     Ok(())
 }
 
+async fn create_exact_index_worker(
+    table_name: &String,
+    doc_id_field_name: &String,
+    target_file_path: &String,
+) -> Result<(), IndexError> {
+    let new_local_name = table_name;
+    let doc_id_field_name_local = doc_id_field_name;
+
+    let raw_table = match execute_sql(&format!("select * from {new_local_name}").to_string()).await
+    {
+        Err(e) => return Err(IndexError::from(e)),
+        Ok(rt) => rt,
+    };
+
+    let exact_fields: Vec<&String> = raw_table
+        .schema()
+        .iter()
+        .filter(|c| is_exact_index_type(c.1.data_type()) && c.1.name() != doc_id_field_name)
+        .map(|c| c.1.name())
+        .collect();
+
+    if exact_fields.is_empty() {
+        return Ok(());
+    }
+
+    let field_queries: Vec<String> = exact_fields
+        .iter()
+        .map(|field_name| {
+            format!(
+                "SELECT {doc_id_field_name_local} as doc_id, '{field_name}' as field_name, CAST({new_local_name}.\"{field_name}\" as string) as field_value FROM {new_local_name} WHERE {new_local_name}.\"{field_name}\" IS NOT NULL"
+            )
+        })
+        .collect();
+
+    let union_query = field_queries.join(" UNION ALL ");
+    let exact_table = match execute_sql(&union_query).await {
+        Err(e) => return Err(IndexError::from(e)),
+        Ok(table) => table,
+    };
+
+    match exact_table
+        .write_parquet(
+            target_file_path,
+            DataFrameWriteOptions::new().with_single_file_output(true),
+            None,
+        )
+        .await
+    {
+        Err(e) => Err(IndexError::from(e)),
+        Ok(_) => Ok(()),
+    }
+}
+
 pub(crate) async fn create_index_jsonl(
     file_path: &String,
     doc_id_field_name: &String,
@@ -227,6 +301,50 @@ pub(crate) async fn create_index_jsonl(
     };
 
     match create_index_worker(&top_level_name, doc_id_field_name, &target_file_path).await {
+        Ok(_) => (),
+        Err(e) => {
+            data_access::release(&top_level_name).await;
+            return Err(e);
+        }
+    }
+
+    data_access::release(&top_level_name).await;
+    Ok(Some(target_file_path))
+}
+
+pub(crate) async fn create_exact_index_jsonl(
+    file_path: &String,
+    doc_id_field_name: &String,
+    schema: &PowdrrSchema,
+) -> Result<Option<String>, IndexError> {
+    let target_file_path = add_file_suffix(
+        file_path,
+        &"exact_index".to_string(),
+        Some(&".parquet".to_string()),
+    );
+    if file_exists(&target_file_path).await {
+        return Ok(None);
+    }
+
+    let top_level_name = data_access::path_to_table_name(file_path);
+    data_access::reserve(&top_level_name, 1000, vec![]).await;
+
+    let result = data_access::load_file_as_table(
+        &top_level_name,
+        file_path,
+        false,
+        Some(schema.to_arrow_schema()),
+    )
+    .await;
+    match result {
+        Err(e) => {
+            data_access::release(&top_level_name).await;
+            return Err(IndexError::from(e));
+        }
+        Ok(_) => (),
+    };
+
+    match create_exact_index_worker(&top_level_name, doc_id_field_name, &target_file_path).await {
         Ok(_) => (),
         Err(e) => {
             data_access::release(&top_level_name).await;
@@ -275,6 +393,42 @@ pub(crate) async fn create_index_parquet(
     Ok(Some(target_file_path))
 }
 
+pub(crate) async fn create_exact_index_parquet(
+    file_path: &String,
+    doc_id_field_name: &String,
+) -> Result<Option<String>, IndexError> {
+    let target_file_path = add_file_suffix(
+        file_path,
+        &"exact_index".to_string(),
+        Some(&".parquet".to_string()),
+    );
+    if file_exists(&target_file_path).await {
+        return Ok(None);
+    }
+
+    let top_level_name = data_access::path_to_table_name(file_path);
+    data_access::reserve(&top_level_name, 1000, vec![]).await;
+
+    let result = load_file_as_table(&top_level_name, file_path, true, None).await;
+    match result {
+        Err(e) => {
+            data_access::release(&top_level_name).await;
+            return Err(IndexError::from(e));
+        }
+        Ok(_) => (),
+    };
+
+    match create_exact_index_worker(&top_level_name, doc_id_field_name, &target_file_path).await {
+        Ok(_) => (),
+        Err(e) => {
+            data_access::release(&top_level_name).await;
+            return Err(e);
+        }
+    }
+    data_access::release(&top_level_name).await;
+    Ok(Some(target_file_path))
+}
+
 pub(crate) async fn create_index(work_item: &ExtensionWorkItem) -> Result<(), IndexError> {
     let invocation = PrivateInvocation::Extension(PrivateExtensionInvocation {
         extension_name: work_item.extension_type.clone(),
@@ -298,7 +452,7 @@ pub(crate) async fn create_index(work_item: &ExtensionWorkItem) -> Result<(), In
         Err(e) => {
             return Err(IndexError {
                 message: e.message.clone(),
-            })
+            });
         }
     };
 
@@ -324,7 +478,7 @@ pub(crate) async fn create_index(work_item: &ExtensionWorkItem) -> Result<(), In
         Err(e) => {
             return Err(IndexError {
                 message: format!("{}", e),
-            })
+            });
         }
     }
 
@@ -351,13 +505,13 @@ pub(crate) async fn create_index_inner_with_doc_id(
         match create_index_parquet(&file_desc.file_path, doc_id_field_name).await {
             Ok(output) => match output {
                 Some(extension_file_path) => {
-                    files.insert(
-                        file_desc.file_path.clone(),
-                        vec![ExtensionFile {
+                    files
+                        .entry(file_desc.file_path.clone())
+                        .or_insert_with(Vec::new)
+                        .push(ExtensionFile {
                             suffix: "search_index".to_string(),
                             location: extension_file_path.clone(),
-                        }],
-                    );
+                        });
                 }
                 None => (),
             },
@@ -368,25 +522,69 @@ pub(crate) async fn create_index_inner_with_doc_id(
                 )));
             }
         }
+
+        match create_exact_index_parquet(&file_desc.file_path, doc_id_field_name).await {
+            Ok(output) => match output {
+                Some(extension_file_path) => {
+                    files
+                        .entry(file_desc.file_path.clone())
+                        .or_insert_with(Vec::new)
+                        .push(ExtensionFile {
+                            suffix: "exact_index".to_string(),
+                            location: extension_file_path.clone(),
+                        });
+                }
+                None => (),
+            },
+            Err(e) => {
+                return Err(IndexError::new(format!(
+                    "Failed to build exact elastic sidecar for {}: {}",
+                    file_desc.file_path, e
+                )));
+            }
+        }
     }
 
     for file_desc in speedboat_files {
         match create_index_jsonl(&file_desc.file_path, doc_id_field_name, &file_desc.schema).await {
             Ok(output) => match output {
                 Some(extension_file_path) => {
-                    files.insert(
-                        file_desc.file_path.clone(),
-                        vec![ExtensionFile {
+                    files
+                        .entry(file_desc.file_path.clone())
+                        .or_insert_with(Vec::new)
+                        .push(ExtensionFile {
                             suffix: "search_index".to_string(),
                             location: extension_file_path.clone(),
-                        }],
-                    );
+                        });
                 }
                 None => (),
             },
             Err(e) => {
                 return Err(IndexError::new(format!(
                     "Failed to build elastic sidecar for {}: {}",
+                    file_desc.file_path, e
+                )));
+            }
+        }
+
+        match create_exact_index_jsonl(&file_desc.file_path, doc_id_field_name, &file_desc.schema)
+            .await
+        {
+            Ok(output) => match output {
+                Some(extension_file_path) => {
+                    files
+                        .entry(file_desc.file_path.clone())
+                        .or_insert_with(Vec::new)
+                        .push(ExtensionFile {
+                            suffix: "exact_index".to_string(),
+                            location: extension_file_path.clone(),
+                        });
+                }
+                None => (),
+            },
+            Err(e) => {
+                return Err(IndexError::new(format!(
+                    "Failed to build exact elastic sidecar for {}: {}",
                     file_desc.file_path, e
                 )));
             }
