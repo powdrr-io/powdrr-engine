@@ -19,40 +19,44 @@ use datafusion::{
 };
 use futures::stream::{self, StreamExt};
 use futures_util::TryStreamExt;
+use iceberg::Catalog;
 use iceberg::arrow::ArrowFileReader;
 use iceberg::io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY};
 use iceberg::spec::{DataContentType, DataFile, Literal, ManifestContentType, PrimitiveType, Type};
 use iceberg::table::Table;
 use iceberg::transaction::ApplyTransactionAction;
-use iceberg::Catalog;
 use iceberg::{NamespaceIdent, TableCreation, TableIdent};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use idgenerator::IdInstance;
 #[cfg(target_os = "linux")]
+use liquid_cache_parquet::LiquidCacheLocalBuilder;
+#[cfg(target_os = "linux")]
+use liquid_cache_parquet::LiquidCacheParquetRef;
+#[cfg(target_os = "linux")]
 use liquid_cache_parquet::storage::cache::squeeze_policies::Evict;
 #[cfg(target_os = "linux")]
 use liquid_cache_parquet::storage::cache_policies::LiquidPolicy;
-#[cfg(target_os = "linux")]
-use liquid_cache_parquet::LiquidCacheLocalBuilder;
 use lru_mem::{HeapSize, LruCache, TryInsertError};
 use object_store::client::SpawnedReqwestConnector;
 use object_store::{
-    aws::{AmazonS3, AmazonS3Builder},
     ObjectStoreExt, PutPayload,
+    aws::{AmazonS3, AmazonS3Builder},
 };
 use parquet_55::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet_55::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
 use parquet_55::file::statistics::Statistics;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::string::ToString;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
-use std::{path::Path, sync::Arc};
-#[cfg(target_os = "linux")]
-use tempfile::TempDir;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinSet;
 use url::Url;
 
@@ -64,6 +68,12 @@ const S3_REGION_VALUE: &str = "us-east-1";
 const PARQUET_ROW_GROUP_STATS_CACHE_MAX_ENTRIES: usize = 2048;
 const ICEBERG_TABLE_METADATA_CACHE_MAX_ENTRIES: usize = 256;
 const ICEBERG_ROW_GROUP_STATS_LOAD_PARALLELISM_MAX: usize = 16;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const SERVING_LIQUID_CACHE_DIR_ENV_VAR: &str = "POWDRR_SERVING_CACHE_DIR";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const SERVING_LIQUID_CACHE_ROOT_DIR_NAME: &str = "powdrr-engine";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const SERVING_LIQUID_CACHE_NAMESPACE_DIR_NAME: &str = "serving-liquid-cache";
 
 #[derive(Default)]
 struct ParquetRowGroupStatsCache {
@@ -602,26 +612,212 @@ fn create_store(address: &String) -> Arc<AmazonS3> {
 
 const S3_BASE_PATH: &str = "s3://warehouse";
 
-#[cfg(target_os = "linux")]
-fn create_session(file_store: Arc<AmazonS3>) -> SessionContext {
-    let config = serving_session_config();
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ServingLiquidCacheLocation {
+    root_dir: PathBuf,
+    namespace: String,
+    cache_dir: PathBuf,
+}
 
-    let temp_dir = TempDir::new().unwrap();
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServingBulkCacheStats {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub persistent: bool,
+    #[serde(default)]
+    pub memory_usage_bytes: u64,
+    #[serde(default)]
+    pub disk_usage_bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct ServingLiquidCacheRuntime {
+    location: ServingLiquidCacheLocation,
+    cache: LiquidCacheParquetRef,
+}
+
+#[cfg(target_os = "linux")]
+static SERVING_LIQUID_CACHE_RUNTIME: LazyLock<Mutex<Option<ServingLiquidCacheRuntime>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn resolve_serving_liquid_cache_location(
+    explicit_root: Option<PathBuf>,
+    xdg_cache_home: Option<PathBuf>,
+    home_dir: Option<PathBuf>,
+    temp_dir: PathBuf,
+    bucket_name: &str,
+    s3_endpoint: &str,
+) -> ServingLiquidCacheLocation {
+    let root_dir = explicit_root.unwrap_or_else(|| {
+        xdg_cache_home
+            .map(|path| path.join(SERVING_LIQUID_CACHE_ROOT_DIR_NAME))
+            .or_else(|| {
+                home_dir.map(|path| path.join(".cache").join(SERVING_LIQUID_CACHE_ROOT_DIR_NAME))
+            })
+            .unwrap_or_else(|| temp_dir.join(SERVING_LIQUID_CACHE_ROOT_DIR_NAME))
+            .join(SERVING_LIQUID_CACHE_NAMESPACE_DIR_NAME)
+    });
+    let scope = format!("{bucket_name}@{s3_endpoint}");
+    let namespace = format!(
+        "{}-{:016x}",
+        sanitize_cache_namespace_component(bucket_name),
+        stable_cache_namespace_hash(&scope)
+    );
+    let cache_dir = root_dir.join(&namespace);
+
+    ServingLiquidCacheLocation {
+        root_dir,
+        namespace,
+        cache_dir,
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn current_serving_liquid_cache_location(
+    bucket_name: &str,
+    s3_endpoint: &str,
+) -> ServingLiquidCacheLocation {
+    resolve_serving_liquid_cache_location(
+        std::env::var_os(SERVING_LIQUID_CACHE_DIR_ENV_VAR).map(PathBuf::from),
+        std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+        std::env::temp_dir(),
+        bucket_name,
+        s3_endpoint,
+    )
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn stable_cache_namespace_hash(value: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn sanitize_cache_namespace_component(value: &str) -> String {
+    let mut sanitized = String::new();
+    let mut last_was_separator = false;
+
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            sanitized.push(character.to_ascii_lowercase());
+            last_was_separator = false;
+            continue;
+        }
+
+        if !last_was_separator && !sanitized.is_empty() {
+            sanitized.push('-');
+            last_was_separator = true;
+        }
+    }
+
+    let trimmed = sanitized.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "cache".to_string()
+    } else {
+        trimmed
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_serving_liquid_cache_runtime(runtime: ServingLiquidCacheRuntime) {
+    SERVING_LIQUID_CACHE_RUNTIME
+        .lock()
+        .unwrap()
+        .replace(runtime);
+}
+
+#[cfg(target_os = "linux")]
+fn current_serving_liquid_cache_runtime() -> Option<ServingLiquidCacheRuntime> {
+    SERVING_LIQUID_CACHE_RUNTIME.lock().unwrap().clone()
+}
+
+pub(crate) fn serving_bulk_cache_stats() -> ServingBulkCacheStats {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(runtime) = current_serving_liquid_cache_runtime() {
+            return ServingBulkCacheStats {
+                enabled: true,
+                persistent: true,
+                memory_usage_bytes: runtime.cache.memory_usage_bytes() as u64,
+                disk_usage_bytes: runtime.cache.disk_usage_bytes() as u64,
+            };
+        }
+    }
+
+    ServingBulkCacheStats::default()
+}
+
+pub(crate) async fn flush_serving_bulk_cache() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(runtime) = current_serving_liquid_cache_runtime() else {
+            return Ok(());
+        };
+
+        let before_memory = runtime.cache.memory_usage_bytes();
+        let before_disk = runtime.cache.disk_usage_bytes();
+        runtime.cache.flush_data().await.map_err(|_| {
+            format!(
+                "Failed to flush serving LiquidCache data to {}",
+                runtime.location.cache_dir.display()
+            )
+        })?;
+        tracing::info!(
+            cache_dir = %runtime.location.cache_dir.display(),
+            cache_namespace = runtime.location.namespace,
+            memory_before_bytes = before_memory,
+            disk_before_bytes = before_disk,
+            memory_after_bytes = runtime.cache.memory_usage_bytes(),
+            disk_after_bytes = runtime.cache.disk_usage_bytes(),
+            "Flushed serving LiquidCache data to disk"
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn create_session(file_store: Arc<AmazonS3>, s3_endpoint: &str) -> SessionContext {
+    let config = serving_session_config();
+    let cache_location = current_serving_liquid_cache_location("warehouse", s3_endpoint);
+    std::fs::create_dir_all(&cache_location.cache_dir).unwrap_or_else(|error| {
+        panic!(
+            "Failed to create serving LiquidCache directory {}: {}",
+            cache_location.cache_dir.display(),
+            error
+        )
+    });
+    tracing::info!(
+        cache_dir = %cache_location.cache_dir.display(),
+        cache_namespace = cache_location.namespace,
+        "Using persistent serving LiquidCache directory"
+    );
 
     let build_cache = async {
         LiquidCacheLocalBuilder::new()
             .with_max_memory_bytes(10 * 1024 * 1024 * 1024) // 10GB
-            .with_cache_dir(temp_dir.path().to_path_buf())
+            .with_cache_dir(cache_location.cache_dir.clone())
             .with_cache_policy(Box::new(LiquidPolicy::new()))
             .with_squeeze_policy(Box::new(Evict))
             .build(config)
             .await
     };
 
-    let (ctx, _) = match tokio::task::block_in_place(|| Handle::current().block_on(build_cache)) {
+    let (ctx, cache) = match tokio::task::block_in_place(|| Handle::current().block_on(build_cache))
+    {
         Ok(ctx) => ctx,
         Err(e) => panic!("Failed to create session: {}", e),
     };
+    set_serving_liquid_cache_runtime(ServingLiquidCacheRuntime {
+        location: cache_location.clone(),
+        cache,
+    });
 
     //let ctx = SessionContext::new_with_config(config);
 
@@ -633,7 +829,7 @@ fn create_session(file_store: Arc<AmazonS3>) -> SessionContext {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn create_session(file_store: Arc<AmazonS3>) -> SessionContext {
+fn create_session(file_store: Arc<AmazonS3>, _s3_endpoint: &str) -> SessionContext {
     let config = serving_session_config();
     let ctx = SessionContext::new_with_config(config);
     let s3_url = Url::parse(S3_BASE_PATH).unwrap();
@@ -810,7 +1006,7 @@ impl CacheTrackerActor {
             top_level_to_delete: vec![],
             existing_tables: vec![],
             s3_file_store: file_store.clone(),
-            data_fusion_context: create_session(file_store),
+            data_fusion_context: create_session(file_store, DEFAULT_S3_ENDPOINT_VALUE),
             rest_catalog: Arc::new(RestCatalog::new(get_iceberg_catalog_config(
                 &DEFAULT_ICEBERG_ENDPOINT_VALUE.to_string(),
                 &DEFAULT_S3_ENDPOINT_VALUE.to_string(),
@@ -874,8 +1070,14 @@ impl CacheTrackerActor {
                     .len()
                         > 0
                 );
+                if let Err(error) = flush_serving_bulk_cache().await {
+                    tracing::warn!(
+                        error = %error,
+                        "Failed to flush serving LiquidCache before rebuilding session"
+                    );
+                }
                 self.s3_file_store = create_store(&endpoint);
-                self.data_fusion_context = create_session(self.s3_file_store.clone());
+                self.data_fusion_context = create_session(self.s3_file_store.clone(), &endpoint);
                 self.rest_catalog = Arc::new(RestCatalog::new(get_iceberg_catalog_config(
                     &iceberg_rest_endpont,
                     &endpoint,
@@ -2544,11 +2746,7 @@ fn select_stat_bound<'a, T>(
     max: Option<&'a T>,
     lower_bound: bool,
 ) -> Option<&'a T> {
-    if lower_bound {
-        min
-    } else {
-        max
-    }
+    if lower_bound { min } else { max }
 }
 
 fn scalar_bool_to_json(value: bool) -> Option<serde_json::Value> {
@@ -2642,9 +2840,9 @@ pub(crate) fn s3_ingest_base_path() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        drop, execute_sql_async, load_files_as_table, serving_session_config, IcebergLibMetadata,
-        IcebergTableMetadataCache, IcebergTableRowGroupStatsTracker, ParquetRowGroupStatsCache,
-        RecordBatch,
+        IcebergLibMetadata, IcebergTableMetadataCache, IcebergTableRowGroupStatsTracker,
+        ParquetRowGroupStatsCache, RecordBatch, drop, execute_sql_async, load_files_as_table,
+        resolve_serving_liquid_cache_location, serving_session_config,
     };
     use crate::data_contract::{IcebergColumnStats, IcebergRowGroupStats};
     use datafusion::arrow::array::{Int64Array, StringArray};
@@ -2654,6 +2852,7 @@ mod tests {
     use serde_json::Value;
     use std::collections::HashSet;
     use std::fs::File;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -2869,5 +3068,92 @@ mod tests {
 
         assert_eq!(count, 2);
         drop(&table_name).await;
+    }
+
+    #[test]
+    fn serving_liquid_cache_location_prefers_explicit_root() {
+        let location = resolve_serving_liquid_cache_location(
+            Some(PathBuf::from("/var/cache/powdrr-serving")),
+            Some(PathBuf::from("/xdg-cache")),
+            Some(PathBuf::from("/home/tester")),
+            PathBuf::from("/tmp"),
+            "warehouse",
+            "http://localhost:9000",
+        );
+
+        assert_eq!(
+            location.root_dir,
+            PathBuf::from("/var/cache/powdrr-serving")
+        );
+        assert!(
+            location
+                .cache_dir
+                .starts_with(PathBuf::from("/var/cache/powdrr-serving"))
+        );
+    }
+
+    #[test]
+    fn serving_liquid_cache_location_uses_xdg_then_home_then_temp() {
+        let xdg_location = resolve_serving_liquid_cache_location(
+            None,
+            Some(PathBuf::from("/xdg-cache")),
+            Some(PathBuf::from("/home/tester")),
+            PathBuf::from("/tmp"),
+            "warehouse",
+            "http://localhost:9000",
+        );
+        assert_eq!(
+            xdg_location.root_dir,
+            PathBuf::from("/xdg-cache/powdrr-engine/serving-liquid-cache")
+        );
+
+        let home_location = resolve_serving_liquid_cache_location(
+            None,
+            None,
+            Some(PathBuf::from("/home/tester")),
+            PathBuf::from("/tmp"),
+            "warehouse",
+            "http://localhost:9000",
+        );
+        assert_eq!(
+            home_location.root_dir,
+            PathBuf::from("/home/tester/.cache/powdrr-engine/serving-liquid-cache")
+        );
+
+        let temp_location = resolve_serving_liquid_cache_location(
+            None,
+            None,
+            None,
+            PathBuf::from("/tmp"),
+            "warehouse",
+            "http://localhost:9000",
+        );
+        assert_eq!(
+            temp_location.root_dir,
+            PathBuf::from("/tmp/powdrr-engine/serving-liquid-cache")
+        );
+    }
+
+    #[test]
+    fn serving_liquid_cache_location_namespaces_by_backing_store() {
+        let first = resolve_serving_liquid_cache_location(
+            Some(PathBuf::from("/var/cache/powdrr-serving")),
+            None,
+            None,
+            PathBuf::from("/tmp"),
+            "warehouse",
+            "http://localhost:9000",
+        );
+        let second = resolve_serving_liquid_cache_location(
+            Some(PathBuf::from("/var/cache/powdrr-serving")),
+            None,
+            None,
+            PathBuf::from("/tmp"),
+            "warehouse",
+            "http://localhost:9001",
+        );
+
+        assert_ne!(first.namespace, second.namespace);
+        assert_ne!(first.cache_dir, second.cache_dir);
     }
 }

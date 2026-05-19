@@ -809,7 +809,11 @@ pub(crate) async fn prefetch_query(
         Err(e) => return log_err(e),
     };
 
-    data_query_worker(&SqlQuery::dummy(), &required_files, false).await
+    let result = data_query_worker(&SqlQuery::dummy(), &required_files, false).await?;
+    data_access::flush_serving_bulk_cache()
+        .await
+        .map_err(|message| PrivateApiError { message })?;
+    Ok(result)
 }
 
 fn log_required_files(
