@@ -573,6 +573,16 @@ impl CPURuntime {
 static CPU_RUNTIME: std::sync::LazyLock<CPURuntime> =
     std::sync::LazyLock::new(|| CPURuntime::try_new().unwrap());
 
+fn serving_session_config() -> SessionConfig {
+    let options = ConfigOptions::default();
+    let mut config = SessionConfig::from(options)
+        .with_parquet_pruning(true)
+        .with_parquet_bloom_filter_pruning(true)
+        .with_parquet_page_index_pruning(true);
+    config.options_mut().execution.parquet.pushdown_filters = true;
+    config
+}
+
 fn create_store(address: &String) -> Arc<AmazonS3> {
     let io_runtime = Handle::current();
     let s3_file_system: object_store::aws::AmazonS3 = AmazonS3Builder::new()
@@ -593,11 +603,7 @@ const S3_BASE_PATH: &str = "s3://warehouse";
 
 #[cfg(target_os = "linux")]
 fn create_session(file_store: Arc<AmazonS3>) -> SessionContext {
-    let options = ConfigOptions::default();
-    // UNCOMMENT TO ENABLE 'SHOW TABLES'
-    //options.set("datafusion.catalog.information_schema", "true").unwrap();
-
-    let config = SessionConfig::from(options);
+    let config = serving_session_config();
 
     let temp_dir = TempDir::new().unwrap();
 
@@ -627,8 +633,7 @@ fn create_session(file_store: Arc<AmazonS3>) -> SessionContext {
 
 #[cfg(not(target_os = "linux"))]
 fn create_session(file_store: Arc<AmazonS3>) -> SessionContext {
-    let options = ConfigOptions::default();
-    let config = SessionConfig::from(options);
+    let config = serving_session_config();
     let ctx = SessionContext::new_with_config(config);
     let s3_url = Url::parse(S3_BASE_PATH).unwrap();
 
@@ -2587,7 +2592,7 @@ mod tests {
     use super::{
         drop, execute_sql_async, load_files_as_table, IcebergLibMetadata,
         IcebergTableMetadataCache, IcebergTableRowGroupStatsTracker, ParquetRowGroupStatsCache,
-        RecordBatch,
+        RecordBatch, serving_session_config,
     };
     use crate::data_contract::{IcebergColumnStats, IcebergRowGroupStats};
     use datafusion::arrow::array::{Int64Array, StringArray};
@@ -2665,6 +2670,16 @@ mod tests {
 
         cache.clear();
         assert!(cache.get("s3://warehouse/b.parquet").is_none());
+    }
+
+    #[test]
+    fn serving_session_config_enables_parquet_filter_pushdown() {
+        let config = serving_session_config();
+
+        assert!(config.parquet_pruning());
+        assert!(config.parquet_bloom_filter_pruning());
+        assert!(config.parquet_page_index_pruning());
+        assert!(config.options().execution.parquet.pushdown_filters);
     }
 
     #[test]
