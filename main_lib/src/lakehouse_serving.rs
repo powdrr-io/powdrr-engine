@@ -29,6 +29,8 @@ use crate::state_provider::STATE_PROVIDER;
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 const MAX_IN_VALUES: usize = 32;
+const MAX_WARMUP_FILE_GROUPS_PER_PATTERN: usize = 2;
+const MAX_WARMUP_FILES: usize = 8;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ServingQueryResponse {
@@ -99,6 +101,13 @@ struct ServingPlan {
     metadata_row_groups_cached: usize,
     page_index_row_groups_selected: usize,
     bloom_filter_row_groups_selected: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ServingWarmupPlan {
+    pub matched_patterns: Vec<String>,
+    pub selected_files: Vec<FileDescriptor>,
+    pub estimated_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -712,6 +721,87 @@ fn ordered_file_groups_for_top_k(
     Some(groups)
 }
 
+pub(crate) fn select_serving_warmup_files(
+    serving: &ServingTableConfig,
+    files: &[FileDescriptor],
+    file_stats: &HashMap<String, IcebergFileStats>,
+) -> Vec<FileDescriptor> {
+    build_serving_warmup_plan(serving, files, file_stats)
+        .map(|plan| plan.selected_files)
+        .unwrap_or_default()
+}
+
+pub(crate) fn build_serving_warmup_plan(
+    serving: &ServingTableConfig,
+    files: &[FileDescriptor],
+    file_stats: &HashMap<String, IcebergFileStats>,
+) -> Option<ServingWarmupPlan> {
+    let mut selected = vec![];
+    let mut seen_paths = HashSet::new();
+    let mut matched_patterns = vec![];
+    let mut estimated_bytes = 0;
+
+    for pattern in serving.patterns.iter() {
+        let Some((request, limit)) = warmup_request_for_pattern(pattern) else {
+            continue;
+        };
+        if !request_matches_pattern(&request, pattern, limit) {
+            continue;
+        }
+        let pruned = prune_candidate_files(files, file_stats, &request);
+        let Some(sort) = request.order_by.first() else {
+            continue;
+        };
+        let Some(ordered_groups) = ordered_file_groups_for_top_k(
+            &pruned.selected_files,
+            file_stats,
+            &request,
+            &sort.field,
+            sort.descending,
+        ) else {
+            continue;
+        };
+        let mut pattern_selected = false;
+
+        for group in ordered_groups
+            .into_iter()
+            .take(MAX_WARMUP_FILE_GROUPS_PER_PATTERN)
+        {
+            for file in group.files {
+                if seen_paths.insert(file.file_path.clone()) {
+                    estimated_bytes += file.size;
+                    selected.push(file);
+                    pattern_selected = true;
+                    if selected.len() >= MAX_WARMUP_FILES {
+                        if pattern_selected {
+                            matched_patterns.push(pattern.name.clone());
+                        }
+                        return Some(ServingWarmupPlan {
+                            matched_patterns,
+                            selected_files: selected,
+                            estimated_bytes,
+                        });
+                    }
+                }
+            }
+        }
+
+        if pattern_selected {
+            matched_patterns.push(pattern.name.clone());
+        }
+    }
+
+    if selected.is_empty() {
+        None
+    } else {
+        Some(ServingWarmupPlan {
+            matched_patterns,
+            selected_files: selected,
+            estimated_bytes,
+        })
+    }
+}
+
 fn file_group_sort_bound(
     files: &[FileDescriptor],
     file_stats: &HashMap<String, IcebergFileStats>,
@@ -1119,6 +1209,32 @@ fn request_matches_pattern(
     true
 }
 
+fn warmup_request_for_pattern(pattern: &ServingPattern) -> Option<(ServingRequestPlan, usize)> {
+    let order_field = pattern.order_field.as_ref()?;
+    if !pattern.eq_fields.is_empty() || pattern.range_field.is_some() {
+        return None;
+    }
+
+    let limit = pattern
+        .max_limit
+        .unwrap_or(DEFAULT_LIMIT as u64)
+        .clamp(1, MAX_LIMIT as u64) as usize;
+    Some((
+        ServingRequestPlan {
+            select: pattern.projection.clone(),
+            filters: vec![],
+            order_by: vec![crate::serving_plan::ServingSort {
+                field: order_field.clone(),
+                descending: pattern.descending,
+            }],
+            limit: Some(limit),
+            allow_slow_path: false,
+            explain: false,
+        },
+        limit,
+    ))
+}
+
 fn prune_candidate_files(
     files: &[FileDescriptor],
     file_stats: &HashMap<String, IcebergFileStats>,
@@ -1521,9 +1637,9 @@ impl ServingQueryError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ServingExecutionContext, build_sql, file_group_table_name, group_files_by_schema,
-        ordered_file_groups_for_top_k, plan_request, prune_candidate_files,
-        remaining_groups_cannot_beat_kth_row, request_matches_pattern,
+        ServingExecutionContext, build_serving_warmup_plan, build_sql, file_group_table_name,
+        group_files_by_schema, ordered_file_groups_for_top_k, plan_request, prune_candidate_files,
+        remaining_groups_cannot_beat_kth_row, request_matches_pattern, select_serving_warmup_files,
     };
     use crate::data_access::{
         prime_parquet_row_group_stats_cache_for_test, reset_serving_metadata_caches_for_test,
@@ -2306,6 +2422,233 @@ mod tests {
         assert!(
             ordered_file_groups_for_top_k(&files, &file_stats, &request, "score", true).is_none(),
             "missing score bounds should fall back to the existing parallel path"
+        );
+    }
+
+    #[test]
+    fn test_select_serving_warmup_files_prefers_order_only_patterns() {
+        let schema = test_schema();
+        let files = vec![
+            FileDescriptor {
+                file_path: "file://first.parquet".to_string(),
+                schema: schema.clone(),
+                size: 100,
+            },
+            FileDescriptor {
+                file_path: "file://second.parquet".to_string(),
+                schema,
+                size: 200,
+            },
+        ];
+        let file_stats = HashMap::from([
+            (
+                "file://first.parquet".to_string(),
+                file_stats(
+                    "file://first.parquet",
+                    Some(10),
+                    vec![column_stats(
+                        "score",
+                        Some(0),
+                        Some(json!(0)),
+                        Some(json!(50)),
+                    )],
+                ),
+            ),
+            (
+                "file://second.parquet".to_string(),
+                file_stats(
+                    "file://second.parquet",
+                    Some(10),
+                    vec![column_stats(
+                        "score",
+                        Some(0),
+                        Some(json!(60)),
+                        Some(json!(100)),
+                    )],
+                ),
+            ),
+        ]);
+        let selected = select_serving_warmup_files(
+            &ServingTableConfig {
+                patterns: vec![ServingPattern {
+                    name: "top_scores".to_string(),
+                    eq_fields: vec![],
+                    range_field: None,
+                    order_field: Some("score".to_string()),
+                    descending: true,
+                    max_limit: Some(10),
+                    projection: None,
+                }],
+            },
+            &files,
+            &file_stats,
+        );
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|file| file.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["file://second.parquet", "file://first.parquet"]
+        );
+    }
+
+    #[test]
+    fn test_select_serving_warmup_files_skips_patterns_that_need_filters() {
+        let schema = test_schema();
+        let files = test_files(&schema);
+        let file_stats = HashMap::from([
+            (
+                "file://first.parquet".to_string(),
+                file_stats(
+                    "file://first.parquet",
+                    Some(10),
+                    vec![column_stats(
+                        "score",
+                        Some(0),
+                        Some(json!(0)),
+                        Some(json!(40)),
+                    )],
+                ),
+            ),
+            (
+                "file://second.parquet".to_string(),
+                file_stats(
+                    "file://second.parquet",
+                    Some(10),
+                    vec![column_stats(
+                        "score",
+                        Some(0),
+                        Some(json!(60)),
+                        Some(json!(100)),
+                    )],
+                ),
+            ),
+        ]);
+        let selected = select_serving_warmup_files(
+            &ServingTableConfig {
+                patterns: vec![ServingPattern {
+                    name: "tenant_scores".to_string(),
+                    eq_fields: vec!["tenant".to_string()],
+                    range_field: None,
+                    order_field: Some("score".to_string()),
+                    descending: true,
+                    max_limit: Some(10),
+                    projection: None,
+                }],
+            },
+            &files,
+            &file_stats,
+        );
+
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn test_select_serving_warmup_files_skips_missing_sort_bounds() {
+        let schema = test_schema();
+        let files = test_files(&schema);
+        let file_stats = HashMap::from([(
+            "file://first.parquet".to_string(),
+            file_stats(
+                "file://first.parquet",
+                Some(10),
+                vec![column_stats(
+                    "score",
+                    Some(0),
+                    Some(json!(0)),
+                    Some(json!(40)),
+                )],
+            ),
+        )]);
+        let selected = select_serving_warmup_files(
+            &ServingTableConfig {
+                patterns: vec![ServingPattern {
+                    name: "top_scores".to_string(),
+                    eq_fields: vec![],
+                    range_field: None,
+                    order_field: Some("score".to_string()),
+                    descending: true,
+                    max_limit: Some(10),
+                    projection: None,
+                }],
+            },
+            &files,
+            &file_stats,
+        );
+
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn test_build_serving_warmup_plan_reports_patterns_and_estimated_bytes() {
+        let schema = test_schema();
+        let files = vec![
+            FileDescriptor {
+                file_path: "file://first.parquet".to_string(),
+                schema: schema.clone(),
+                size: 100,
+            },
+            FileDescriptor {
+                file_path: "file://second.parquet".to_string(),
+                schema,
+                size: 200,
+            },
+        ];
+        let file_stats = HashMap::from([
+            (
+                "file://first.parquet".to_string(),
+                file_stats(
+                    "file://first.parquet",
+                    Some(10),
+                    vec![column_stats(
+                        "score",
+                        Some(0),
+                        Some(json!(0)),
+                        Some(json!(50)),
+                    )],
+                ),
+            ),
+            (
+                "file://second.parquet".to_string(),
+                file_stats(
+                    "file://second.parquet",
+                    Some(10),
+                    vec![column_stats(
+                        "score",
+                        Some(0),
+                        Some(json!(60)),
+                        Some(json!(100)),
+                    )],
+                ),
+            ),
+        ]);
+
+        let plan = build_serving_warmup_plan(
+            &ServingTableConfig {
+                patterns: vec![ServingPattern {
+                    name: "top_scores".to_string(),
+                    eq_fields: vec![],
+                    range_field: None,
+                    order_field: Some("score".to_string()),
+                    descending: true,
+                    max_limit: Some(10),
+                    projection: None,
+                }],
+            },
+            &files,
+            &file_stats,
+        )
+        .expect("order-only pattern should produce a warmup plan");
+
+        assert_eq!(plan.matched_patterns, vec!["top_scores"]);
+        assert_eq!(plan.estimated_bytes, 300);
+        assert_eq!(
+            plan.selected_files
+                .iter()
+                .map(|file| file.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["file://second.parquet", "file://first.parquet"]
         );
     }
 
