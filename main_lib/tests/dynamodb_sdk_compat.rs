@@ -6,13 +6,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
-use aws_sdk_dynamodb::Client as DynamoClient;
 use aws_sdk_dynamodb::client::Waiters;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, KeySchemaElement,
     KeyType, KeysAndAttributes, Projection, ProjectionType, ScalarAttributeType, TableDescription,
     TableStatus,
 };
+use aws_sdk_dynamodb::Client as DynamoClient;
 use datafusion::arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -25,10 +25,10 @@ use powdrr_lib::data_contract::{
 };
 use powdrr_lib::router::router;
 use powdrr_lib::serving_dataset::read_parquet_documents;
-use powdrr_lib::test_api::{IndexingMode, TestProcessingMode};
+use powdrr_lib::test_api::{CompactionMode, IndexingMode, StateMode, TestProcessingMode};
 use reqwest::Client as HttpClient;
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -557,20 +557,44 @@ async fn configure_powdrr_table(
         .error_for_status()
         .unwrap();
 
-    client
-        .put(format!("{}/{}/_dynamodb/config", base_url, table_name))
-        .json(config)
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
+    let url = format!("{}/{}/_dynamodb/config", base_url, table_name);
+    let mut last_status = None;
+    let mut last_body = String::new();
+
+    for _ in 0..25 {
+        let response = client.put(&url).json(config).send().await.unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        if status.is_success() {
+            return;
+        }
+        if body.contains("Checkpoint did not contain a usable schema")
+            || body.contains("No checkpoint was available")
+            || body.contains("Checkpoint metadata was not found")
+        {
+            last_status = Some(status);
+            last_body = body;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            continue;
+        }
+        panic!(
+            "PUT /{}/_dynamodb/config failed with status {} and body {}",
+            table_name, status, body
+        );
+    }
+
+    panic!(
+        "PUT /{}/_dynamodb/config never became ready; last status {:?}, last body {}",
+        table_name, last_status, last_body
+    );
 }
 
 async fn configure_powdrr_testing_mode(base_url: &str) {
     let client = HttpClient::new();
-    let mut mode = TestProcessingMode::dynamo_testing(Some("http://127.0.0.1:4566".to_string()));
+    let mut mode = TestProcessingMode::default();
+    mode.state_mode = StateMode::Testing;
     mode.indexing_mode = IndexingMode::Disabled;
+    mode.compaction_mode = CompactionMode::Disabled;
 
     client
         .put(format!(

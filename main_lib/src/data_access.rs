@@ -9,12 +9,13 @@ use datafusion::datasource::{
     listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
 };
 use datafusion::execution::options::{ArrowReadOptions, JsonReadOptions};
+use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use datafusion::prelude::SessionConfig;
 use datafusion::{
     arrow,
     arrow::array::RecordBatch,
     error::DataFusionError,
-    prelude::{DataFrame, ParquetReadOptions, SessionContext},
+    prelude::{DataFrame, SessionContext},
 };
 use futures::stream::{self, StreamExt};
 use futures_util::TryStreamExt;
@@ -1717,18 +1718,67 @@ async fn load_parquet_file_as_table(
             }
         }
     } else {
-        let result = data_fusion_context
-            .register_parquet(local_name, file_path, ParquetReadOptions::new())
-            .await;
-        match result {
-            Err(e) => {
-                if e.message().contains("already exists") {
-                    Ok(())
-                } else {
-                    log_err(e)
-                }
+        load_local_parquet_files_as_table(data_fusion_context, &vec![file_path.clone()], local_name)
+    }
+}
+
+fn normalize_local_file_path(file_path: &str) -> &str {
+    file_path.strip_prefix("file://").unwrap_or(file_path)
+}
+
+fn read_local_parquet_batches(
+    file_path: &str,
+) -> Result<(Arc<arrow::datatypes::Schema>, Vec<RecordBatch>), DataFusionError> {
+    let local_file_path = normalize_local_file_path(file_path);
+    let file = std::fs::File::open(local_file_path)
+        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|error| DataFusionError::ArrowError(Box::new(error.into()), None))?;
+    let schema = builder.schema().clone();
+    let reader = builder
+        .build()
+        .map_err(|error| DataFusionError::ArrowError(Box::new(error.into()), None))?;
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| DataFusionError::ArrowError(Box::new(error), None))?;
+    Ok((schema, batches))
+}
+
+fn load_local_parquet_files_as_table(
+    data_fusion_context: &SessionContext,
+    file_paths: &Vec<String>,
+    local_name: &String,
+) -> Result<(), DataFusionError> {
+    let mut table_schema: Option<Arc<arrow::datatypes::Schema>> = None;
+    let mut partitions = Vec::with_capacity(file_paths.len());
+
+    for file_path in file_paths {
+        let (schema, batches) = read_local_parquet_batches(file_path)?;
+        if let Some(existing_schema) = table_schema.as_ref() {
+            if existing_schema.as_ref() != schema.as_ref() {
+                return Err(DataFusionError::Execution(format!(
+                    "Local parquet files for {} did not share a schema",
+                    local_name
+                )));
             }
-            _ => Ok(()),
+        } else {
+            table_schema = Some(schema);
+        }
+        partitions.push(batches);
+    }
+
+    let table = Arc::new(datafusion::datasource::MemTable::try_new(
+        table_schema.expect("local parquet load requires at least one file"),
+        partitions,
+    )?);
+    match data_fusion_context.register_table(local_name, table) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if e.message().contains("already exists") {
+                Ok(())
+            } else {
+                log_err(e)
+            }
         }
     }
 }
@@ -1751,6 +1801,17 @@ async fn load_parquet_files_as_table(
         return log_err(DataFusionError::Execution(
             "No parquet files were provided".to_string(),
         ));
+    }
+
+    if file_paths.len() == 1 {
+        return load_parquet_file_as_table(data_fusion_context, &file_paths[0], local_name).await;
+    }
+
+    if file_paths
+        .iter()
+        .all(|file_path| !file_path.starts_with("s3:"))
+    {
+        return load_local_parquet_files_as_table(data_fusion_context, file_paths, local_name);
     }
 
     tracing::info!(
@@ -2581,14 +2642,20 @@ pub(crate) fn s3_ingest_base_path() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        IcebergLibMetadata, IcebergTableMetadataCache, IcebergTableRowGroupStatsTracker,
-        ParquetRowGroupStatsCache, serving_session_config,
+        drop, execute_sql_async, load_files_as_table, serving_session_config, IcebergLibMetadata,
+        IcebergTableMetadataCache, IcebergTableRowGroupStatsTracker, ParquetRowGroupStatsCache,
+        RecordBatch,
     };
     use crate::data_contract::{IcebergColumnStats, IcebergRowGroupStats};
+    use datafusion::arrow::array::{Int64Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::parquet::arrow::ArrowWriter;
     use iceberg::spec::Schema;
     use serde_json::Value;
     use std::collections::HashSet;
+    use std::fs::File;
     use std::sync::Arc;
+    use tempfile::TempDir;
 
     fn sample_row_group_stats(index: usize) -> Vec<IcebergRowGroupStats> {
         vec![IcebergRowGroupStats {
@@ -2755,5 +2822,52 @@ mod tests {
 
         assert!(cache.get("default/logs", 10).is_none());
         assert!(cache.get("default/metrics", 11).is_some());
+    }
+
+    #[tokio::test]
+    async fn load_files_as_table_reads_single_local_parquet_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let parquet_path = temp_dir.path().join("single-file.parquet");
+
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            Field::new("tenant", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["acme", "globex"])),
+                Arc::new(Int64Array::from(vec![10_i64, 20_i64])),
+            ],
+        )
+        .unwrap();
+
+        let file = File::create(&parquet_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let table_name = "single_local_parquet_test".to_string();
+        let file_url = format!("file://{}", parquet_path.display());
+        load_files_as_table(&table_name, &vec![file_url], schema.as_ref())
+            .await
+            .unwrap();
+
+        let sql = format!("SELECT COUNT(*) AS count FROM {}", table_name);
+        let batches = execute_sql_async(&sql).await.unwrap();
+        let count = batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0)
+            })
+            .sum::<i64>();
+
+        assert_eq!(count, 2);
+        drop(&table_name).await;
     }
 }
