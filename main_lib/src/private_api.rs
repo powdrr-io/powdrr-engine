@@ -25,11 +25,12 @@ use crate::lakehouse_serving::{
     default_serving_cache_manager_request, execute_serving_cache_manager_plan,
 };
 use crate::peers::{
-    CheckpointDescriptor, PrivateCompactionInvocation, PrivateExtensionInvocation,
-    PrivatePrefetchInvocation, PrivateSearchAggregationFilterSpec, PrivateSearchAggregationPartial,
-    PrivateSearchAggregationSpec, PrivateSearchHistogramBucketPartial, PrivateSearchInvocation,
-    PrivateSearchResult, PrivateSearchSortSpec, PrivateSearchTermsBucketPartial,
-    PrivateSearchTermsOrderSpec, PrivateSqlInvocation,
+    CheckpointDescriptor, PrivateCompactionInvocation, PrivateExactConstraintGroup,
+    PrivateExtensionInvocation, PrivatePrefetchInvocation, PrivateSearchAggregationFilterSpec,
+    PrivateSearchAggregationPartial, PrivateSearchAggregationSpec,
+    PrivateSearchHistogramBucketPartial, PrivateSearchInvocation, PrivateSearchResult,
+    PrivateSearchSortSpec, PrivateSearchTermsBucketPartial, PrivateSearchTermsOrderSpec,
+    PrivateSqlInvocation,
 };
 use crate::prefetch::warm_iceberg_checkpoints;
 use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema, SqlQuery};
@@ -37,6 +38,8 @@ use crate::search_executor::typed_sort_projection_name;
 use crate::search_runtime::batches_to_serde_value;
 use crate::state_provider::*;
 use crate::util::log_err;
+
+const EXACT_CANDIDATE_DOC_ID_FETCH_THRESHOLD: usize = 128;
 
 #[derive(Debug, PartialEq, Eq)]
 struct ExtensionFileSpec {
@@ -88,11 +91,6 @@ struct FilteredFiles {
     all_files_count: usize,
 }
 
-struct DeterminedRequiredFiles {
-    required_files: RequiredFiles,
-    table_metadata: TableMetadataCheckpoint,
-}
-
 fn filter_iceberg(
     iceberg_metadata: &Option<IcebergMetadata>,
     index: u64,
@@ -140,32 +138,50 @@ async fn determine_required_files(
     checkpoints: &Vec<CheckpointDescriptor>,
     index: u64,
     num: u64,
-) -> Result<DeterminedRequiredFiles, PrivateApiError> {
+) -> Result<RequiredFiles, PrivateApiError> {
     if required_extensions.len() > 1 || checkpoints.len() != 1 {
         return Err(PrivateApiError {
             message: "Only read for one table at a time please.".to_string(),
         });
     }
 
+    let table_metadata = load_checkpoint_table_metadata(checkpoints).await?;
+    required_files_from_table_metadata(required_extensions, &table_metadata, index, num)
+}
+
+async fn load_checkpoint_table_metadata(
+    checkpoints: &Vec<CheckpointDescriptor>,
+) -> Result<TableMetadataCheckpoint, PrivateApiError> {
+    if checkpoints.len() != 1 {
+        return Err(PrivateApiError {
+            message: "Only read for one table at a time please.".to_string(),
+        });
+    }
+
     let target_checkpoint = &checkpoints[0];
-    let table_metadata = match STATE_PROVIDER
+    match STATE_PROVIDER
         .get_checkpoint(target_checkpoint.clone())
         .await
     {
         Ok(tmc) => match tmc {
-            Some(tmc) => tmc,
+            Some(tmc) => Ok(tmc),
             None => panic!(
                 "The table metadata was not found for a known checkpoint: {}",
                 target_checkpoint
             ),
         },
-        Err(_e) => {
-            return log_err(PrivateApiError {
-                message: "Error calling get checkpoint".to_string(),
-            });
-        }
-    };
+        Err(_e) => log_err(PrivateApiError {
+            message: "Error calling get checkpoint".to_string(),
+        }),
+    }
+}
 
+fn required_files_from_table_metadata(
+    required_extensions: &Vec<String>,
+    table_metadata: &TableMetadataCheckpoint,
+    index: u64,
+    num: u64,
+) -> Result<RequiredFiles, PrivateApiError> {
     // TODO: add logic to select the iceberg and speedboat files for this host.
 
     let filtered_iceberg_files = filter_iceberg(&table_metadata.iceberg_metadata, index, num);
@@ -180,21 +196,18 @@ async fn determine_required_files(
         .iter()
         .map(|f| get_extension_files(required_extensions, &table_metadata, &f.file_path))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(DeterminedRequiredFiles {
-        required_files: RequiredFiles {
-            table_schema: table_metadata.schema.clone(),
-            iceberg_files: filtered_iceberg_files.files.clone(),
-            all_iceberg_files_count: filtered_iceberg_files.all_files_count,
-            iceberg_file_extensions,
-            speedboat_files: filtered_speedboat_files.files.clone(),
-            all_speedboat_files_count: filtered_speedboat_files.all_files_count,
-            speedboat_file_extensions,
-            delete_files: table_metadata
-                .deletes_metadata
-                .as_ref()
-                .map_or_else(Vec::new, |d| d.files.clone()),
-        },
-        table_metadata,
+    Ok(RequiredFiles {
+        table_schema: table_metadata.schema.clone(),
+        iceberg_files: filtered_iceberg_files.files.clone(),
+        all_iceberg_files_count: filtered_iceberg_files.all_files_count,
+        iceberg_file_extensions,
+        speedboat_files: filtered_speedboat_files.files.clone(),
+        all_speedboat_files_count: filtered_speedboat_files.all_files_count,
+        speedboat_file_extensions,
+        delete_files: table_metadata
+            .deletes_metadata
+            .as_ref()
+            .map_or_else(Vec::new, |d| d.files.clone()),
     })
 }
 
@@ -274,7 +287,6 @@ async fn narrow_prefetch_files_for_serving_warmup(
     );
     Some(warmup_plan)
 }
-
 fn generate_required_files(
     invocation: &PrivateCompactionInvocation,
     index: u64,
@@ -403,6 +415,27 @@ async fn ensure_loaded(
     Ok(new_local_name.clone())
 }
 
+async fn ensure_loaded_extension_only(
+    base_file_path: &String,
+    extension_file: &ExtensionFileSpec,
+    top_level_size: u64,
+) -> Result<String, DataFusionError> {
+    let local_name = format!(
+        "{}_{}",
+        data_access::path_to_table_name(base_file_path),
+        extension_file.suffix
+    );
+
+    data_access::reserve(&local_name, top_level_size, vec![]).await;
+    match load_file_as_table(&local_name, &extension_file.file_path, true, None).await {
+        Ok(_) => Ok(local_name),
+        Err(error) => {
+            data_access::release(&local_name).await;
+            log_err(error)
+        }
+    }
+}
+
 async fn execute_sql(
     sql_template: &String,
     local_name: &String,
@@ -426,6 +459,21 @@ async fn execute_sql(
         match results.collect().await {
             Ok(r) => Ok(r),
             Err(e) => log_err(e),
+        }
+    }
+}
+
+async fn execute_raw_sql(
+    sql: &str,
+    use_cpu_threadpool: bool,
+) -> Result<Vec<RecordBatch>, DataFusionError> {
+    if use_cpu_threadpool {
+        data_access::execute_sql_async(&sql.to_string()).await
+    } else {
+        let results = data_access::execute_sql(&sql.to_string()).await?;
+        match results.collect().await {
+            Ok(batches) => Ok(batches),
+            Err(error) => log_err(error),
         }
     }
 }
@@ -523,6 +571,198 @@ async fn process_speedboat_file(
     Ok(local_results)
 }
 
+fn exact_extension_file<'a>(
+    extension_files: &'a [ExtensionFileSpec],
+) -> Option<&'a ExtensionFileSpec> {
+    extension_files
+        .iter()
+        .find(|extension| extension.suffix == "exact_index")
+}
+
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn exact_candidate_doc_ids_sql(
+    table_name: &str,
+    constraints: &[PrivateExactConstraintGroup],
+) -> Option<String> {
+    if constraints.is_empty() {
+        return None;
+    }
+
+    let clause = constraints
+        .iter()
+        .map(|constraint| {
+            let mut values = constraint.values.clone();
+            values.sort();
+            values.dedup();
+            let values = values
+                .iter()
+                .map(|value| sql_string_literal(value))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "(field_name = {} AND field_value IN ({}))",
+                sql_string_literal(&constraint.field),
+                values
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+
+    if constraints.len() == 1 {
+        Some(format!(
+            "SELECT DISTINCT doc_id FROM {table_name} WHERE {clause}"
+        ))
+    } else {
+        Some(format!(
+            "SELECT doc_id FROM {table_name} WHERE {clause} GROUP BY doc_id HAVING COUNT(DISTINCT field_name) = {}",
+            constraints.len()
+        ))
+    }
+}
+
+async fn exact_candidate_doc_ids(
+    base_file_path: &String,
+    top_level_size: u64,
+    extension_files: &Vec<ExtensionFileSpec>,
+    constraints: &[PrivateExactConstraintGroup],
+    use_cpu_threadpool: bool,
+) -> Result<Vec<serde_json::Value>, PrivateApiError> {
+    let Some(extension_file) = exact_extension_file(extension_files) else {
+        return Ok(vec![]);
+    };
+    let exact_local_name =
+        ensure_loaded_extension_only(base_file_path, extension_file, top_level_size)
+            .await
+            .map_err(PrivateApiError::from)?;
+
+    let sql = match exact_candidate_doc_ids_sql(&exact_local_name, constraints) {
+        Some(sql) => sql,
+        None => {
+            data_access::release(&exact_local_name).await;
+            return Ok(vec![]);
+        }
+    };
+
+    let batches = match execute_raw_sql(&sql, use_cpu_threadpool).await {
+        Ok(batches) => batches,
+        Err(error) => {
+            data_access::release(&exact_local_name).await;
+            return log_err(PrivateApiError::from(error));
+        }
+    };
+
+    let serde_result = match batches_to_serde_value(&batches).await {
+        Ok(result) => result,
+        Err(error) => {
+            data_access::release(&exact_local_name).await;
+            return Err(PrivateApiError {
+                message: error.message,
+            });
+        }
+    };
+    data_access::release(&exact_local_name).await;
+
+    let mut doc_ids = serde_result
+        .values
+        .into_iter()
+        .filter_map(|row| row.get("doc_id").cloned())
+        .filter(|value| !value.is_null())
+        .collect::<Vec<_>>();
+    doc_ids.sort_by(|left, right| left.to_string().cmp(&right.to_string()));
+    doc_ids.dedup_by(|left, right| left == right);
+    Ok(doc_ids)
+}
+
+async fn process_file_with_exact_candidates(
+    sql: &SqlQuery,
+    exact_sql: &SqlQuery,
+    file: &FileDescriptor,
+    extension_files: &Vec<ExtensionFileSpec>,
+    table_schema: &PowdrrSchema,
+    deletes_table_name: &String,
+    use_cpu_threadpool: bool,
+    exact_constraints: &[PrivateExactConstraintGroup],
+    exact_doc_id_field_name: &str,
+    parquet: bool,
+) -> Result<Vec<RecordBatch>, PrivateApiError> {
+    let candidate_doc_ids = exact_candidate_doc_ids(
+        &file.file_path,
+        if parquet { 1 } else { file.size },
+        extension_files,
+        exact_constraints,
+        use_cpu_threadpool,
+    )
+    .await?;
+    if candidate_doc_ids.is_empty() {
+        return Ok(vec![]);
+    }
+    if candidate_doc_ids.len() > EXACT_CANDIDATE_DOC_ID_FETCH_THRESHOLD {
+        return if parquet {
+            process_iceberg_file(
+                exact_sql,
+                file,
+                extension_files,
+                table_schema,
+                deletes_table_name,
+                use_cpu_threadpool,
+            )
+            .await
+        } else {
+            process_speedboat_file(
+                exact_sql,
+                file,
+                extension_files,
+                table_schema,
+                deletes_table_name,
+                use_cpu_threadpool,
+            )
+            .await
+        };
+    }
+
+    let Some(filtered_sql) =
+        sql.with_doc_id_filter_values(exact_doc_id_field_name, &candidate_doc_ids)
+    else {
+        return Ok(vec![]);
+    };
+    let empty_extensions = vec![];
+    let load_schema = if parquet {
+        table_schema.clone()
+    } else {
+        file.schema.clone()
+    };
+    let local_name = ensure_loaded(
+        &file.file_path,
+        &empty_extensions,
+        if parquet { 1 } else { file.size },
+        parquet,
+        Some(load_schema),
+    )
+    .await
+    .map_err(PrivateApiError::from)?;
+
+    let built_sql = filtered_sql.build(table_schema, &file.schema);
+    let local_results = match execute_sql(
+        &built_sql,
+        &local_name,
+        deletes_table_name,
+        use_cpu_threadpool,
+    )
+    .await
+    {
+        Ok(results) => results,
+        Err(error) => {
+            data_access::release(&local_name).await;
+            return log_err(PrivateApiError::from(error));
+        }
+    };
+    data_access::release(&local_name).await;
+    Ok(local_results)
+}
+
 pub(crate) async fn data_query(
     invocation: &PrivateSqlInvocation,
     index: u64,
@@ -535,7 +775,7 @@ pub(crate) async fn data_query(
         });
     }
 
-    let determined_files = match determine_required_files(
+    let required_files = match determine_required_files(
         &invocation.required_extensions,
         &invocation.checkpoints,
         index,
@@ -546,7 +786,6 @@ pub(crate) async fn data_query(
         Ok(rf) => rf,
         Err(e) => return log_err(e),
     };
-    let required_files = determined_files.required_files;
 
     let parquet_size = required_files
         .iceberg_files
@@ -576,7 +815,7 @@ pub(crate) async fn search_query(
         });
     }
 
-    let determined_files = match determine_required_files(
+    let mut required_files = match determine_required_files(
         &invocation.required_extensions,
         &invocation.checkpoints,
         index,
@@ -585,9 +824,36 @@ pub(crate) async fn search_query(
     .await
     {
         Ok(rf) => rf,
-        Err(e) => return log_err(e),
+        Err(e) => {
+            if invocation.exact_sql.is_some() && !invocation.calculate_score {
+                match determine_required_files(&vec![], &invocation.checkpoints, index, num).await {
+                    Ok(rf) => rf,
+                    Err(_) => return log_err(e),
+                }
+            } else {
+                return log_err(e);
+            }
+        }
     };
-    let required_files = determined_files.required_files;
+
+    let use_exact_candidates = !invocation.exact_constraints.is_empty()
+        && invocation.exact_doc_id_field_name.is_some()
+        && invocation
+            .exact_sql
+            .as_ref()
+            .is_some_and(|_| required_files_have_extension_suffix(&required_files, "exact_index"));
+    let use_exact_sql = invocation
+        .exact_sql
+        .as_ref()
+        .is_some_and(|_| required_files_have_extension_suffix(&required_files, "exact_index"));
+
+    if use_exact_candidates || use_exact_sql {
+        retain_required_file_extension_suffixes(&mut required_files, &["exact_index"]);
+    } else if invocation.calculate_score {
+        retain_required_file_extension_suffixes(&mut required_files, &["search_index"]);
+    } else {
+        clear_required_file_extensions(&mut required_files);
+    }
 
     let parquet_size = required_files
         .iceberg_files
@@ -601,7 +867,25 @@ pub(crate) async fn search_query(
         .sum::<u64>();
     log_required_files("Search", &required_files, parquet_size, speedboat_size);
 
-    let batches = data_query_batches_worker(&invocation.sql, &required_files, true).await?;
+    let sql = if use_exact_sql {
+        invocation.exact_sql.as_ref().unwrap_or(&invocation.sql)
+    } else {
+        &invocation.sql
+    };
+
+    let batches = if use_exact_candidates {
+        data_query_batches_exact_worker(
+            &invocation.sql,
+            invocation.exact_sql.as_ref().unwrap_or(&invocation.sql),
+            &required_files,
+            &invocation.exact_constraints,
+            invocation.exact_doc_id_field_name.as_deref().unwrap(),
+            true,
+        )
+        .await?
+    } else {
+        data_query_batches_worker(sql, &required_files, true).await?
+    };
     let serde_result = match batches_to_serde_value(&batches).await {
         Ok(result) => result,
         Err(e) => return Err(PrivateApiError { message: e.message }),
@@ -648,6 +932,36 @@ pub(crate) async fn search_query(
         total_hits,
         aggregations,
     })
+}
+
+fn required_files_have_extension_suffix(required_files: &RequiredFiles, suffix: &str) -> bool {
+    required_files
+        .iceberg_file_extensions
+        .iter()
+        .chain(required_files.speedboat_file_extensions.iter())
+        .all(|extensions| {
+            extensions
+                .iter()
+                .any(|extension| extension.suffix.as_str() == suffix)
+        })
+}
+
+fn retain_required_file_extension_suffixes(required_files: &mut RequiredFiles, suffixes: &[&str]) {
+    for extensions in required_files.iceberg_file_extensions.iter_mut() {
+        extensions.retain(|extension| suffixes.iter().any(|suffix| extension.suffix == *suffix));
+    }
+    for extensions in required_files.speedboat_file_extensions.iter_mut() {
+        extensions.retain(|extension| suffixes.iter().any(|suffix| extension.suffix == *suffix));
+    }
+}
+
+fn clear_required_file_extensions(required_files: &mut RequiredFiles) {
+    for extensions in required_files.iceberg_file_extensions.iter_mut() {
+        extensions.clear();
+    }
+    for extensions in required_files.speedboat_file_extensions.iter_mut() {
+        extensions.clear();
+    }
 }
 
 fn search_sort_values_for_row(
@@ -846,6 +1160,64 @@ mod tests {
                 .contains("missing published metadata for required extension es")
         );
     }
+
+    #[test]
+    fn retain_required_file_extension_suffixes_keeps_only_selected_suffixes() {
+        let mut required_files = RequiredFiles {
+            table_schema: PowdrrSchema::minimal(),
+            iceberg_files: vec![],
+            all_iceberg_files_count: 0,
+            iceberg_file_extensions: vec![vec![
+                ExtensionFileSpec {
+                    suffix: "search_index".to_string(),
+                    file_path: "search.parquet".to_string(),
+                },
+                ExtensionFileSpec {
+                    suffix: "exact_index".to_string(),
+                    file_path: "exact.parquet".to_string(),
+                },
+            ]],
+            speedboat_files: vec![],
+            all_speedboat_files_count: 0,
+            speedboat_file_extensions: vec![],
+            delete_files: vec![],
+        };
+
+        retain_required_file_extension_suffixes(&mut required_files, &["exact_index"]);
+
+        assert_eq!(
+            required_files.iceberg_file_extensions,
+            vec![vec![ExtensionFileSpec {
+                suffix: "exact_index".to_string(),
+                file_path: "exact.parquet".to_string(),
+            }]]
+        );
+    }
+
+    #[test]
+    fn clear_required_file_extensions_removes_all_sidecars() {
+        let mut required_files = RequiredFiles {
+            table_schema: PowdrrSchema::minimal(),
+            iceberg_files: vec![],
+            all_iceberg_files_count: 0,
+            iceberg_file_extensions: vec![vec![ExtensionFileSpec {
+                suffix: "search_index".to_string(),
+                file_path: "search.parquet".to_string(),
+            }]],
+            speedboat_files: vec![],
+            all_speedboat_files_count: 0,
+            speedboat_file_extensions: vec![vec![ExtensionFileSpec {
+                suffix: "exact_index".to_string(),
+                file_path: "exact.parquet".to_string(),
+            }]],
+            delete_files: vec![],
+        };
+
+        clear_required_file_extensions(&mut required_files);
+
+        assert_eq!(required_files.iceberg_file_extensions, vec![vec![]]);
+        assert_eq!(required_files.speedboat_file_extensions, vec![vec![]]);
+    }
 }
 
 pub(crate) async fn compaction_query(
@@ -889,29 +1261,26 @@ pub(crate) async fn prefetch_query(
         }
     }
 
-    let mut determined_files = match determine_required_files(
+    let table_metadata = match load_checkpoint_table_metadata(&invocation.checkpoints).await {
+        Ok(metadata) => metadata,
+        Err(e) => return log_err(e),
+    };
+    let mut required_files = match required_files_from_table_metadata(
         &invocation.required_extensions,
-        &invocation.checkpoints,
+        &table_metadata,
         index,
         num,
     )
-    .await
     {
         Ok(rf) => rf,
         Err(e) => return log_err(e),
     };
-    let files_considered = determined_files.required_files.iceberg_files.len();
+    let files_considered = required_files.iceberg_files.len();
     let targeted_warmup_plan = if invocation.required_extensions.is_empty() {
-        narrow_prefetch_files_for_serving_warmup(
-            &mut determined_files.required_files,
-            &determined_files.table_metadata,
-        )
-        .await
+        narrow_prefetch_files_for_serving_warmup(&mut required_files, &table_metadata).await
     } else {
         None
     };
-    let required_files = determined_files.required_files;
-
     let result = if let Some(plan) = targeted_warmup_plan.as_ref() {
         execute_serving_cache_manager_plan(plan, &required_files.delete_files)
             .await
@@ -928,15 +1297,15 @@ pub(crate) async fn prefetch_query(
     data_access::flush_serving_bulk_cache()
         .await
         .map_err(|message| PrivateApiError { message })?;
+    let snapshot_id = table_metadata
+        .iceberg_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.snapshot_id.clone());
     if let Some(plan) = targeted_warmup_plan.as_ref() {
         data_access::record_serving_cache_manager_operation(
             data_access::ServingCacheManagerOperationStats {
-                table: determined_files.table_metadata.table_name.clone(),
-                snapshot_id: determined_files
-                    .table_metadata
-                    .iceberg_metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.snapshot_id.clone()),
+                table: table_metadata.table_name.clone(),
+                snapshot_id: snapshot_id.clone(),
                 warmed_files: plan.warm_files.len(),
                 evicted_files: plan.files_to_evict.len(),
                 targeted_ranges: plan.targeted_ranges,
@@ -949,12 +1318,8 @@ pub(crate) async fn prefetch_query(
         );
     }
     data_access::record_serving_bulk_cache_warmup(data_access::ServingBulkCacheWarmupStats {
-        table: determined_files.table_metadata.table_name,
-        snapshot_id: determined_files
-            .table_metadata
-            .iceberg_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.snapshot_id.clone()),
+        table: table_metadata.table_name,
+        snapshot_id,
         targeted: targeted_warmup_plan.is_some(),
         matched_patterns: targeted_warmup_plan
             .as_ref()
@@ -1330,6 +1695,92 @@ async fn data_query_batches_worker(
         .into_iter()
         .chain(speedboat_results.into_iter())
         .map(|result| result.unwrap())
+        .collect())
+}
+
+async fn data_query_batches_exact_worker(
+    sql: &SqlQuery,
+    exact_sql: &SqlQuery,
+    required_files: &RequiredFiles,
+    exact_constraints: &[PrivateExactConstraintGroup],
+    exact_doc_id_field_name: &str,
+    use_cpu_threadpool: bool,
+) -> Result<Vec<RecordBatch>, PrivateApiError> {
+    let mut delete_local_names = vec![];
+    let delete_schema = PowdrrSchema::from(&vec![PowdrrField {
+        name: "_id_seq_no".to_string(),
+        data_type: PowdrrDataType::String,
+    }]);
+    let extension_file_vecs = vec![];
+    for delete_file_path in required_files.delete_files.iter() {
+        let local_name = ensure_loaded(
+            &delete_file_path,
+            &extension_file_vecs,
+            1,
+            false,
+            Some(delete_schema.clone()),
+        )
+        .await
+        .map_err(PrivateApiError::from)?;
+        delete_local_names.push(local_name);
+    }
+    let all_deletes_local_name = create_all_deletes_table(&delete_local_names).await?;
+
+    let iceberg_calls = required_files
+        .iceberg_files
+        .iter()
+        .zip(required_files.iceberg_file_extensions.iter())
+        .map(|(iceberg_file, iceberg_file_extensions)| {
+            process_file_with_exact_candidates(
+                sql,
+                exact_sql,
+                iceberg_file,
+                iceberg_file_extensions,
+                &required_files.table_schema,
+                &all_deletes_local_name,
+                use_cpu_threadpool,
+                exact_constraints,
+                exact_doc_id_field_name,
+                true,
+            )
+        });
+    let speedboat_calls = required_files
+        .speedboat_files
+        .iter()
+        .zip(required_files.speedboat_file_extensions.iter())
+        .map(|(speedboat_file, speedboat_file_extensions)| {
+            process_file_with_exact_candidates(
+                sql,
+                exact_sql,
+                speedboat_file,
+                speedboat_file_extensions,
+                &required_files.table_schema,
+                &all_deletes_local_name,
+                use_cpu_threadpool,
+                exact_constraints,
+                exact_doc_id_field_name,
+                false,
+            )
+        });
+
+    let iceberg_results = try_join_all(iceberg_calls)
+        .await
+        .map_err(|error| PrivateApiError {
+            message: error.message,
+        })?;
+    let speedboat_results =
+        try_join_all(speedboat_calls)
+            .await
+            .map_err(|error| PrivateApiError {
+                message: error.message,
+            })?;
+
+    data_access::drop(&all_deletes_local_name).await;
+
+    Ok(iceberg_results
+        .into_iter()
+        .chain(speedboat_results.into_iter())
+        .flatten()
         .collect())
 }
 
