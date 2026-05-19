@@ -1,7 +1,7 @@
 use crate::data_access::load_file_as_table;
 use crate::data_contract::{ExtensionFileMetadata, ExtensionWorkItem, FileDescriptor};
 use crate::elastic_search_common::call_peers;
-use crate::elastic_table_validation::{ElasticTableValidationError, validate_elastic_table_files};
+use crate::elastic_table_validation::{validate_elastic_table_files, ElasticTableValidationError};
 use crate::peers::{PrivateExtensionInvocation, PrivateInvocation, PrivateInvocationResult};
 use crate::schema_massager::PowdrrSchema;
 use crate::state_provider::STATE_PROVIDER;
@@ -11,8 +11,11 @@ use crate::{
     data_contract::{ExtensionCommit, ExtensionFile},
     util::add_file_suffix,
 };
+use datafusion::common::config::{ParquetColumnOptions, TableParquetOptions};
 use datafusion::error::DataFusionError;
+use datafusion::prelude::col;
 use datafusion::{arrow::datatypes::DataType, dataframe::DataFrameWriteOptions};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Display;
 
@@ -56,6 +59,28 @@ fn is_string_type(data_type: &DataType) -> bool {
     data_type.equals_datatype(&DataType::Utf8View)
         || data_type.equals_datatype(&DataType::Utf8)
         || data_type.equals_datatype(&DataType::LargeUtf8)
+}
+
+fn sidecar_parquet_options() -> TableParquetOptions {
+    TableParquetOptions {
+        column_specific_options: HashMap::from([
+            (
+                "field_name".to_string(),
+                ParquetColumnOptions {
+                    bloom_filter_enabled: Some(true),
+                    ..ParquetColumnOptions::default()
+                },
+            ),
+            (
+                "field_term".to_string(),
+                ParquetColumnOptions {
+                    bloom_filter_enabled: Some(true),
+                    ..ParquetColumnOptions::default()
+                },
+            ),
+        ]),
+        ..TableParquetOptions::default()
+    }
 }
 
 fn is_exact_index_type(data_type: &DataType) -> bool {
@@ -199,8 +224,14 @@ async fn create_index_worker(
     match joined_table
         .write_parquet(
             target_file_path,
-            DataFrameWriteOptions::new().with_single_file_output(true),
-            None,
+            DataFrameWriteOptions::new()
+                .with_single_file_output(true)
+                .with_sort_by(vec![
+                    col("field_name").sort(true, true),
+                    col("field_term").sort(true, true),
+                    col("doc_id").sort(true, true),
+                ]),
+            Some(sidecar_parquet_options()),
         )
         .await
     {
@@ -603,26 +634,77 @@ pub(crate) async fn create_index_inner(
 #[cfg(test)]
 mod tests {
     use crate::elastic_search_index::create_index_parquet;
+    use crate::util::add_file_suffix;
+    use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::parquet::arrow::ArrowWriter;
     use gotham::test::Server;
-    use std::env;
+    use parquet_55::file::reader::FileReader;
+    use parquet_55::file::serialized_reader::SerializedFileReader;
+    use std::fs;
+    use std::path::Path;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn write_test_parquet(path: &Path) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc_id", DataType::Int64, false),
+            Field::new("message", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![2_i64, 1_i64, 3_i64])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["beta alpha", "alpha beta", "alpha"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let file = fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
 
     #[test]
-    fn test_simple_create_index_parquet() {
+    fn test_sidecar_parquet_enables_bloom_filters_and_sorting_metadata() {
         let test_server = &*crate::router::tests::TEST_SERVER;
 
         test_server.run_future(async {
-            match create_index_parquet(
-                &format!(
-                    "file://{}/tests/data/flights.parquet",
-                    env::current_dir().unwrap().to_str().unwrap()
-                ),
-                &"index_col".to_string(),
-            )
-            .await
-            {
-                Err(_) => panic!("failed"),
-                Ok(_) => (),
-            }
+            let temp_dir = TempDir::new().unwrap();
+            let parquet_path = temp_dir.path().join("events.parquet");
+            write_test_parquet(&parquet_path);
+
+            let source_path = format!("file://{}", parquet_path.display());
+            let sidecar_path = add_file_suffix(
+                &source_path,
+                &"search_index".to_string(),
+                Some(&".parquet".to_string()),
+            );
+
+            let result = create_index_parquet(&source_path, &"doc_id".to_string())
+                .await
+                .unwrap();
+            assert_eq!(result.as_deref(), Some(sidecar_path.as_str()));
+
+            let sidecar_local_path = sidecar_path.strip_prefix("file://").unwrap();
+            let file = fs::File::open(sidecar_local_path).unwrap();
+            let reader = SerializedFileReader::new(file).unwrap();
+            let metadata = reader.metadata();
+            let row_group = metadata.row_group(0);
+
+            let sorting_columns = row_group.sorting_columns().unwrap();
+            assert_eq!(sorting_columns.len(), 3);
+
+            let bloom_enabled_columns = row_group
+                .columns()
+                .iter()
+                .filter(|column| column.bloom_filter_offset().is_some())
+                .map(|column| column.column_path().string())
+                .collect::<Vec<String>>();
+            assert!(bloom_enabled_columns.contains(&"field_name".to_string()));
+            assert!(bloom_enabled_columns.contains(&"field_term".to_string()));
         });
     }
     /*
