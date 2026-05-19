@@ -17,8 +17,9 @@ use serde_json::Value;
 
 use crate::data_access::{self, execute_sql_async, load_files_as_table};
 use crate::data_contract::{
-    CreateTable, FileDescriptor, IcebergColumnStats, IcebergFileStats, IcebergRowGroupStats,
-    ServingPattern, ServingTableConfig, TableDescription,
+    CreateTable, FileDescriptor, IcebergAccessArtifact, IcebergColumnStats, IcebergFileStats,
+    IcebergPartitionField, IcebergRowGroupStats, IcebergSortField, ServingPattern,
+    ServingTableConfig, TableDescription,
 };
 use crate::elastic_search_endpoints::NamePathExtractor;
 use crate::peers::CheckpointDescriptor;
@@ -32,6 +33,12 @@ const MAX_LIMIT: usize = 1000;
 const MAX_IN_VALUES: usize = 32;
 const MAX_WARMUP_FILE_GROUPS_PER_PATTERN: usize = 2;
 const MAX_WARMUP_FILES: usize = 8;
+const ACCESS_ARTIFACT_KIND_BLOOM_FILTER: &str = "bloom-filter";
+const ACCESS_ARTIFACT_KIND_FILE_STATS: &str = "file-stats";
+const ACCESS_ARTIFACT_KIND_PAGE_INDEX: &str = "page-index";
+const ACCESS_ARTIFACT_KIND_PARTITION_SPEC: &str = "partition-spec";
+const ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS: &str = "row-group-stats";
+const ACCESS_ARTIFACT_KIND_SORT_ORDER: &str = "sort-order";
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ServingQueryResponse {
@@ -51,6 +58,12 @@ pub struct ServingQueryResponse {
     pub row_groups_selected: usize,
     pub estimated_bytes: u64,
     #[serde(default)]
+    pub partition_fields_available: usize,
+    #[serde(default)]
+    pub sort_fields_available: usize,
+    #[serde(default)]
+    pub declared_sort_order_match: bool,
+    #[serde(default)]
     pub metadata_snapshot_cached: bool,
     #[serde(default)]
     pub metadata_files_cached: usize,
@@ -60,6 +73,10 @@ pub struct ServingQueryResponse {
     pub page_index_row_groups_selected: usize,
     #[serde(default)]
     pub bloom_filter_row_groups_selected: usize,
+    #[serde(default)]
+    pub artifacts_considered: Vec<String>,
+    #[serde(default)]
+    pub artifacts_used: Vec<String>,
     #[serde(default)]
     pub bulk_cache: data_access::ServingBulkCacheStats,
     #[serde(default)]
@@ -81,6 +98,9 @@ struct ServingExecutionContext {
     files: Vec<FileDescriptor>,
     delete_files: Vec<String>,
     file_stats: HashMap<String, IcebergFileStats>,
+    partition_spec: Vec<IcebergPartitionField>,
+    sort_order: Vec<IcebergSortField>,
+    access_artifacts: Vec<IcebergAccessArtifact>,
     snapshot_id: Option<String>,
     metadata_snapshot_cached: bool,
 }
@@ -97,11 +117,16 @@ struct ServingPlan {
     row_groups_considered: usize,
     row_groups_selected: usize,
     estimated_bytes: u64,
+    partition_fields_available: usize,
+    sort_fields_available: usize,
+    declared_sort_order_match: bool,
     metadata_snapshot_cached: bool,
     metadata_files_cached: usize,
     metadata_row_groups_cached: usize,
     page_index_row_groups_selected: usize,
     bloom_filter_row_groups_selected: usize,
+    artifacts_considered: Vec<String>,
+    artifacts_used: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -120,6 +145,50 @@ pub(crate) struct ServingWarmupPlan {
     pub steps: Vec<ServingWarmupStep>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ServingCacheRangeTarget {
+    pub field: String,
+    pub gt: Option<Value>,
+    pub gte: Option<Value>,
+    pub lt: Option<Value>,
+    pub lte: Option<Value>,
+    pub order_descending: bool,
+    pub limit: Option<usize>,
+    pub projection: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ServingCacheWarmTarget {
+    Metadata,
+    Pattern(String),
+    Files(Vec<String>),
+    Range(ServingCacheRangeTarget),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ServingCacheEvictTarget {
+    Files(Vec<String>),
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ServingCacheManagerRequest {
+    pub warm_targets: Vec<ServingCacheWarmTarget>,
+    pub evict_targets: Vec<ServingCacheEvictTarget>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ServingCacheManagerPlan {
+    pub matched_patterns: Vec<String>,
+    pub matched_artifacts: Vec<String>,
+    pub warm_files: Vec<FileDescriptor>,
+    pub estimated_warm_bytes: u64,
+    pub warmup_steps: Vec<ServingWarmupStep>,
+    pub files_to_evict: Vec<String>,
+    pub targeted_ranges: usize,
+    pub metadata_refreshed: bool,
+    pub bulk_cache_reset: bool,
+}
+
 #[derive(Clone, Debug)]
 struct OrderedFileGroup {
     files: Vec<FileDescriptor>,
@@ -133,6 +202,7 @@ struct PrunedFileSelection {
     row_groups_considered: usize,
     row_groups_selected: usize,
     estimated_bytes: u64,
+    artifacts_used: Vec<String>,
     metadata_files_cached: usize,
     metadata_row_groups_cached: usize,
     page_index_row_groups_selected: usize,
@@ -297,11 +367,16 @@ pub async fn execute_serving_query(
             row_groups_considered: plan.row_groups_considered,
             row_groups_selected: plan.row_groups_selected,
             estimated_bytes: plan.estimated_bytes,
+            partition_fields_available: plan.partition_fields_available,
+            sort_fields_available: plan.sort_fields_available,
+            declared_sort_order_match: plan.declared_sort_order_match,
             metadata_snapshot_cached: plan.metadata_snapshot_cached,
             metadata_files_cached: plan.metadata_files_cached,
             metadata_row_groups_cached: plan.metadata_row_groups_cached,
             page_index_row_groups_selected: plan.page_index_row_groups_selected,
             bloom_filter_row_groups_selected: plan.bloom_filter_row_groups_selected,
+            artifacts_considered: plan.artifacts_considered,
+            artifacts_used: plan.artifacts_used,
             bulk_cache,
             sql: Some(plan.sql),
             rows: vec![],
@@ -320,11 +395,16 @@ pub async fn execute_serving_query(
             row_groups_considered: plan.row_groups_considered,
             row_groups_selected: plan.row_groups_selected,
             estimated_bytes: plan.estimated_bytes,
+            partition_fields_available: plan.partition_fields_available,
+            sort_fields_available: plan.sort_fields_available,
+            declared_sort_order_match: plan.declared_sort_order_match,
             metadata_snapshot_cached: plan.metadata_snapshot_cached,
             metadata_files_cached: plan.metadata_files_cached,
             metadata_row_groups_cached: plan.metadata_row_groups_cached,
             page_index_row_groups_selected: plan.page_index_row_groups_selected,
             bloom_filter_row_groups_selected: plan.bloom_filter_row_groups_selected,
+            artifacts_considered: plan.artifacts_considered,
+            artifacts_used: plan.artifacts_used,
             bulk_cache,
             sql: Some(plan.sql),
             rows: vec![],
@@ -345,11 +425,16 @@ pub async fn execute_serving_query(
             row_groups_considered: plan.row_groups_considered,
             row_groups_selected: plan.row_groups_selected,
             estimated_bytes: plan.estimated_bytes,
+            partition_fields_available: plan.partition_fields_available,
+            sort_fields_available: plan.sort_fields_available,
+            declared_sort_order_match: plan.declared_sort_order_match,
             metadata_snapshot_cached: plan.metadata_snapshot_cached,
             metadata_files_cached: plan.metadata_files_cached,
             metadata_row_groups_cached: plan.metadata_row_groups_cached,
             page_index_row_groups_selected: plan.page_index_row_groups_selected,
             bloom_filter_row_groups_selected: plan.bloom_filter_row_groups_selected,
+            artifacts_considered: plan.artifacts_considered,
+            artifacts_used: plan.artifacts_used,
             bulk_cache,
             sql: Some(plan.sql),
             rows: vec![],
@@ -360,6 +445,7 @@ pub async fn execute_serving_query(
         &plan.selected_files,
         &context.delete_files,
         &context.file_stats,
+        &context.sort_order,
         &request,
         &plan.sql,
         plan.limit,
@@ -381,11 +467,16 @@ pub async fn execute_serving_query(
         row_groups_considered: plan.row_groups_considered,
         row_groups_selected: plan.row_groups_selected,
         estimated_bytes: plan.estimated_bytes,
+        partition_fields_available: plan.partition_fields_available,
+        sort_fields_available: plan.sort_fields_available,
+        declared_sort_order_match: plan.declared_sort_order_match,
         metadata_snapshot_cached: plan.metadata_snapshot_cached,
         metadata_files_cached: plan.metadata_files_cached,
         metadata_row_groups_cached: plan.metadata_row_groups_cached,
         page_index_row_groups_selected: plan.page_index_row_groups_selected,
         bloom_filter_row_groups_selected: plan.bloom_filter_row_groups_selected,
+        artifacts_considered: plan.artifacts_considered,
+        artifacts_used: plan.artifacts_used,
         bulk_cache,
         sql: Some(plan.sql),
         rows,
@@ -489,6 +580,9 @@ async fn load_serving_context(
         files,
         delete_files,
         file_stats,
+        partition_spec: iceberg_metadata.partition_spec.clone(),
+        sort_order: iceberg_metadata.sort_order.clone(),
+        access_artifacts: iceberg_metadata.access_artifacts.clone(),
         metadata_snapshot_cached,
     })
 }
@@ -500,6 +594,12 @@ fn plan_request(
     let serving = context.description.serving.clone().unwrap_or_default();
     let limit = request.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     let sql = build_sql("{table}", request, limit, !context.delete_files.is_empty())?;
+    let declared_sort_order_match = sort_order_matches_request(&context.sort_order, request);
+    let artifacts_considered = applicable_artifacts_for_request(
+        request,
+        &context.access_artifacts,
+        declared_sort_order_match,
+    );
 
     if !request_supported(request) {
         return Ok(ServingPlan {
@@ -514,15 +614,29 @@ fn plan_request(
             row_groups_considered: 0,
             row_groups_selected: 0,
             estimated_bytes: 0,
+            partition_fields_available: context.partition_spec.len(),
+            sort_fields_available: context.sort_order.len(),
+            declared_sort_order_match,
             metadata_snapshot_cached: context.metadata_snapshot_cached,
             metadata_files_cached: 0,
             metadata_row_groups_cached: 0,
             page_index_row_groups_selected: 0,
             bloom_filter_row_groups_selected: 0,
+            artifacts_considered,
+            artifacts_used: vec![],
         });
     }
 
     let pruned = prune_candidate_files(&context.files, &context.file_stats, request);
+    let mut artifacts_used = pruned.artifacts_used.clone();
+    if declared_sort_order_match {
+        for artifact in artifacts_considered
+            .iter()
+            .filter(|artifact| artifact.starts_with(ACCESS_ARTIFACT_KIND_SORT_ORDER))
+        {
+            push_unique_string(&mut artifacts_used, artifact.clone());
+        }
+    }
 
     if let Some(pattern) = serving
         .patterns
@@ -541,11 +655,16 @@ fn plan_request(
             row_groups_considered: pruned.row_groups_considered,
             row_groups_selected: pruned.row_groups_selected,
             estimated_bytes: pruned.estimated_bytes,
+            partition_fields_available: context.partition_spec.len(),
+            sort_fields_available: context.sort_order.len(),
+            declared_sort_order_match,
             metadata_snapshot_cached: context.metadata_snapshot_cached,
             metadata_files_cached: pruned.metadata_files_cached,
             metadata_row_groups_cached: pruned.metadata_row_groups_cached,
             page_index_row_groups_selected: pruned.page_index_row_groups_selected,
             bloom_filter_row_groups_selected: pruned.bloom_filter_row_groups_selected,
+            artifacts_considered,
+            artifacts_used,
         });
     }
 
@@ -561,11 +680,16 @@ fn plan_request(
         row_groups_considered: pruned.row_groups_considered,
         row_groups_selected: pruned.row_groups_selected,
         estimated_bytes: pruned.estimated_bytes,
+        partition_fields_available: context.partition_spec.len(),
+        sort_fields_available: context.sort_order.len(),
+        declared_sort_order_match,
         metadata_snapshot_cached: context.metadata_snapshot_cached,
         metadata_files_cached: pruned.metadata_files_cached,
         metadata_row_groups_cached: pruned.metadata_row_groups_cached,
         page_index_row_groups_selected: pruned.page_index_row_groups_selected,
         bloom_filter_row_groups_selected: pruned.bloom_filter_row_groups_selected,
+        artifacts_considered,
+        artifacts_used,
     })
 }
 
@@ -573,6 +697,7 @@ async fn execute_plan(
     files: &[FileDescriptor],
     delete_files: &[String],
     file_stats: &HashMap<String, IcebergFileStats>,
+    sort_order: &[IcebergSortField],
     request: &ServingRequestPlan,
     sql: &str,
     limit: usize,
@@ -582,9 +707,14 @@ async fn execute_plan(
     }
 
     if let Some(sort) = request.order_by.first() {
-        if let Some(ordered_groups) =
-            ordered_file_groups_for_top_k(files, file_stats, request, &sort.field, sort.descending)
-        {
+        if let Some(ordered_groups) = ordered_file_groups_for_top_k(
+            files,
+            file_stats,
+            sort_order,
+            request,
+            &sort.field,
+            sort.descending,
+        ) {
             return execute_ordered_top_k_plan(ordered_groups, delete_files, request, sql, limit)
                 .await;
         }
@@ -694,6 +824,7 @@ fn serving_file_parallelism() -> usize {
 fn ordered_file_groups_for_top_k(
     files: &[FileDescriptor],
     file_stats: &HashMap<String, IcebergFileStats>,
+    sort_order: &[IcebergSortField],
     request: &ServingRequestPlan,
     sort_field: &str,
     descending: bool,
@@ -701,12 +832,13 @@ fn ordered_file_groups_for_top_k(
     let mut groups = group_files_by_schema(files)
         .into_iter()
         .map(|group| {
-            file_group_sort_bound(&group, file_stats, request, sort_field, descending).map(
-                |bound| OrderedFileGroup {
-                    files: group,
-                    best_case_sort_value: bound,
-                },
+            file_group_sort_bound(
+                &group, file_stats, sort_order, request, sort_field, descending,
             )
+            .map(|bound| OrderedFileGroup {
+                files: group,
+                best_case_sort_value: bound,
+            })
         })
         .collect::<Option<Vec<_>>>()?;
 
@@ -725,16 +857,34 @@ pub(crate) fn select_serving_warmup_files(
     serving: &ServingTableConfig,
     files: &[FileDescriptor],
     file_stats: &HashMap<String, IcebergFileStats>,
+    sort_order: &[IcebergSortField],
 ) -> Vec<FileDescriptor> {
-    build_serving_warmup_plan(serving, files, file_stats)
+    build_serving_warmup_plan(serving, files, file_stats, sort_order)
         .map(|plan| plan.selected_files)
         .unwrap_or_default()
+}
+
+pub(crate) fn default_serving_cache_manager_request(
+    serving: &ServingTableConfig,
+) -> ServingCacheManagerRequest {
+    let mut warm_targets = vec![ServingCacheWarmTarget::Metadata];
+    warm_targets.extend(
+        serving
+            .patterns
+            .iter()
+            .map(|pattern| ServingCacheWarmTarget::Pattern(pattern.name.clone())),
+    );
+    ServingCacheManagerRequest {
+        warm_targets,
+        evict_targets: vec![],
+    }
 }
 
 pub(crate) fn build_serving_warmup_plan(
     serving: &ServingTableConfig,
     files: &[FileDescriptor],
     file_stats: &HashMap<String, IcebergFileStats>,
+    sort_order: &[IcebergSortField],
 ) -> Option<ServingWarmupPlan> {
     let mut selected = vec![];
     let mut seen_paths = HashSet::new();
@@ -749,62 +899,36 @@ pub(crate) fn build_serving_warmup_plan(
         if !request_matches_pattern(&request, pattern, limit) {
             continue;
         }
-        let pruned = prune_candidate_files(files, file_stats, &request);
-        let Some(sort) = request.order_by.first() else {
+        let Some(step) =
+            build_warmup_step_for_request(&pattern.name, request, files, file_stats, sort_order)
+        else {
             continue;
         };
-        let Some(ordered_groups) = ordered_file_groups_for_top_k(
-            &pruned.selected_files,
-            file_stats,
-            &request,
-            &sort.field,
-            sort.descending,
-        ) else {
-            continue;
-        };
-        let mut step_selected_files = vec![];
-        let mut step_estimated_bytes = 0;
-
-        for group in ordered_groups
-            .into_iter()
-            .take(MAX_WARMUP_FILE_GROUPS_PER_PATTERN)
-        {
-            for file in group.files {
-                step_estimated_bytes += file.size;
-                step_selected_files.push(file.clone());
-                if seen_paths.insert(file.file_path.clone()) {
-                    estimated_bytes += file.size;
-                    selected.push(file);
-                    if selected.len() >= MAX_WARMUP_FILES {
-                        if !step_selected_files.is_empty() {
-                            matched_patterns.push(pattern.name.clone());
-                            steps.push(ServingWarmupStep {
-                                pattern_name: pattern.name.clone(),
-                                request: request.clone(),
-                                selected_files: step_selected_files,
-                                estimated_bytes: step_estimated_bytes,
-                            });
-                        }
-                        return Some(ServingWarmupPlan {
-                            matched_patterns,
-                            selected_files: selected,
-                            estimated_bytes,
-                            steps,
-                        });
-                    }
+        let mut capped_step_files = vec![];
+        for file in step.selected_files.iter().cloned() {
+            capped_step_files.push(file.clone());
+            if seen_paths.insert(file.file_path.clone()) {
+                estimated_bytes += file.size;
+                selected.push(file);
+                if selected.len() >= MAX_WARMUP_FILES {
+                    matched_patterns.push(pattern.name.clone());
+                    steps.push(ServingWarmupStep {
+                        pattern_name: step.pattern_name,
+                        request: step.request,
+                        selected_files: capped_step_files,
+                        estimated_bytes: step.estimated_bytes,
+                    });
+                    return Some(ServingWarmupPlan {
+                        matched_patterns,
+                        selected_files: selected,
+                        estimated_bytes,
+                        steps,
+                    });
                 }
             }
         }
-
-        if !step_selected_files.is_empty() {
-            matched_patterns.push(pattern.name.clone());
-            steps.push(ServingWarmupStep {
-                pattern_name: pattern.name.clone(),
-                request,
-                selected_files: step_selected_files,
-                estimated_bytes: step_estimated_bytes,
-            });
-        }
+        matched_patterns.push(pattern.name.clone());
+        steps.push(step);
     }
 
     if selected.is_empty() {
@@ -817,6 +941,117 @@ pub(crate) fn build_serving_warmup_plan(
             steps,
         })
     }
+}
+
+pub(crate) fn build_serving_cache_manager_plan(
+    request: &ServingCacheManagerRequest,
+    serving: &ServingTableConfig,
+    files: &[FileDescriptor],
+    file_stats: &HashMap<String, IcebergFileStats>,
+    sort_order: &[IcebergSortField],
+    access_artifacts: &[IcebergAccessArtifact],
+) -> ServingCacheManagerPlan {
+    let mut plan = ServingCacheManagerPlan::default();
+    let mut seen_warm_files = HashSet::new();
+    let mut seen_evict_files = HashSet::new();
+
+    for target in request.warm_targets.iter() {
+        match target {
+            ServingCacheWarmTarget::Metadata => {
+                plan.metadata_refreshed = true;
+            }
+            ServingCacheWarmTarget::Pattern(pattern_name) => {
+                let Some(pattern) = serving
+                    .patterns
+                    .iter()
+                    .find(|pattern| &pattern.name == pattern_name)
+                else {
+                    continue;
+                };
+                let Some((warm_request, limit)) = warmup_request_for_pattern(pattern) else {
+                    continue;
+                };
+                if !request_matches_pattern(&warm_request, pattern, limit) {
+                    continue;
+                }
+                let Some(step) = build_warmup_step_for_request(
+                    &pattern.name,
+                    warm_request,
+                    files,
+                    file_stats,
+                    sort_order,
+                ) else {
+                    continue;
+                };
+                push_unique_string(&mut plan.matched_patterns, pattern.name.clone());
+                for artifact in applicable_artifacts_for_request(
+                    &step.request,
+                    access_artifacts,
+                    sort_order_matches_request(sort_order, &step.request),
+                ) {
+                    push_unique_string(&mut plan.matched_artifacts, artifact);
+                }
+                for file in step.selected_files.iter().cloned() {
+                    if seen_warm_files.insert(file.file_path.clone()) {
+                        plan.estimated_warm_bytes += file.size;
+                        plan.warm_files.push(file);
+                    }
+                }
+                plan.warmup_steps.push(step);
+            }
+            ServingCacheWarmTarget::Files(file_paths) => {
+                for file in files
+                    .iter()
+                    .filter(|file| file_paths.contains(&file.file_path))
+                {
+                    if seen_warm_files.insert(file.file_path.clone()) {
+                        plan.estimated_warm_bytes += file.size;
+                        plan.warm_files.push(file.clone());
+                    }
+                }
+            }
+            ServingCacheWarmTarget::Range(range_target) => {
+                let warm_request = request_for_cache_range_target(range_target);
+                if let Some(step) = build_warmup_step_for_request(
+                    &format!("range:{}", range_target.field),
+                    warm_request,
+                    files,
+                    file_stats,
+                    sort_order,
+                ) {
+                    plan.targeted_ranges += 1;
+                    for artifact in applicable_artifacts_for_request(
+                        &step.request,
+                        access_artifacts,
+                        sort_order_matches_request(sort_order, &step.request),
+                    ) {
+                        push_unique_string(&mut plan.matched_artifacts, artifact);
+                    }
+                    for file in step.selected_files.iter().cloned() {
+                        if seen_warm_files.insert(file.file_path.clone()) {
+                            plan.estimated_warm_bytes += file.size;
+                            plan.warm_files.push(file);
+                        }
+                    }
+                    plan.warmup_steps.push(step);
+                }
+            }
+        }
+    }
+
+    for target in request.evict_targets.iter() {
+        match target {
+            ServingCacheEvictTarget::Files(file_paths) => {
+                for file_path in file_paths {
+                    if seen_evict_files.insert(file_path.clone()) {
+                        plan.files_to_evict.push(file_path.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    plan
 }
 
 pub(crate) async fn execute_serving_warmup_plan(
@@ -834,6 +1069,86 @@ pub(crate) async fn execute_serving_warmup_plan(
     }
 
     Ok(())
+}
+
+pub(crate) async fn execute_serving_cache_manager_plan(
+    plan: &ServingCacheManagerPlan,
+    delete_files: &[String],
+) -> Result<(), ServingQueryError> {
+    if !plan.files_to_evict.is_empty() {
+        data_access::evict_serving_metadata_for_files(&plan.files_to_evict);
+    }
+    if !plan.warmup_steps.is_empty() {
+        execute_serving_warmup_plan(
+            &ServingWarmupPlan {
+                matched_patterns: plan.matched_patterns.clone(),
+                selected_files: plan.warm_files.clone(),
+                estimated_bytes: plan.estimated_warm_bytes,
+                steps: plan.warmup_steps.clone(),
+            },
+            delete_files,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn build_warmup_step_for_request(
+    pattern_name: &str,
+    request: ServingRequestPlan,
+    files: &[FileDescriptor],
+    file_stats: &HashMap<String, IcebergFileStats>,
+    sort_order: &[IcebergSortField],
+) -> Option<ServingWarmupStep> {
+    let pruned = prune_candidate_files(files, file_stats, &request);
+    if pruned.selected_files.is_empty() {
+        return None;
+    }
+
+    let (selected_files, estimated_bytes) = if let Some(sort) = request.order_by.first() {
+        let ordered_groups = ordered_file_groups_for_top_k(
+            &pruned.selected_files,
+            file_stats,
+            sort_order,
+            &request,
+            &sort.field,
+            sort.descending,
+        )?;
+        let mut selected_files = vec![];
+        let mut estimated_bytes = 0;
+        for group in ordered_groups
+            .into_iter()
+            .take(MAX_WARMUP_FILE_GROUPS_PER_PATTERN)
+        {
+            for file in group.files {
+                estimated_bytes += file.size;
+                selected_files.push(file);
+            }
+        }
+        if selected_files.is_empty() {
+            return None;
+        }
+        (selected_files, estimated_bytes)
+    } else {
+        let selected_files = pruned
+            .selected_files
+            .iter()
+            .take(MAX_WARMUP_FILES)
+            .cloned()
+            .collect::<Vec<_>>();
+        let estimated_bytes = selected_files.iter().map(|file| file.size).sum();
+        if selected_files.is_empty() {
+            return None;
+        }
+        (selected_files, estimated_bytes)
+    };
+
+    Some(ServingWarmupStep {
+        pattern_name: pattern_name.to_string(),
+        request,
+        selected_files,
+        estimated_bytes,
+    })
 }
 
 async fn execute_serving_warmup_step(
@@ -862,6 +1177,7 @@ async fn execute_serving_warmup_step(
 fn file_group_sort_bound(
     files: &[FileDescriptor],
     file_stats: &HashMap<String, IcebergFileStats>,
+    sort_order: &[IcebergSortField],
     request: &ServingRequestPlan,
     sort_field: &str,
     descending: bool,
@@ -869,7 +1185,9 @@ fn file_group_sort_bound(
     let mut best_bound: Option<Value> = None;
 
     for file in files {
-        let candidate = file_sort_bound(file, file_stats, request, sort_field, descending)?;
+        let candidate = file_sort_bound(
+            file, file_stats, sort_order, request, sort_field, descending,
+        )?;
         if best_bound
             .as_ref()
             .map(|best| compare_sort_values(&candidate, best, descending) == Ordering::Less)
@@ -885,6 +1203,7 @@ fn file_group_sort_bound(
 fn file_sort_bound(
     file: &FileDescriptor,
     file_stats: &HashMap<String, IcebergFileStats>,
+    sort_order: &[IcebergSortField],
     request: &ServingRequestPlan,
     sort_field: &str,
     descending: bool,
@@ -903,7 +1222,7 @@ fn file_sort_bound(
         let mut best_row_group_bound: Option<Value> = None;
         for row_group in matching_row_groups.iter() {
             let Some(candidate) = row_group_sort_bound(row_group, sort_field, descending) else {
-                return file_level_sort_bound(stats, sort_field, descending);
+                return file_level_sort_bound(stats, sort_order, sort_field, descending);
             };
             if best_row_group_bound
                 .as_ref()
@@ -916,18 +1235,23 @@ fn file_sort_bound(
         return best_row_group_bound;
     }
 
-    file_level_sort_bound(stats, sort_field, descending)
+    file_level_sort_bound(stats, sort_order, sort_field, descending)
 }
 
 fn file_level_sort_bound(
     stats: &IcebergFileStats,
+    sort_order: &[IcebergSortField],
     sort_field: &str,
     descending: bool,
 ) -> Option<Value> {
     let column_stats = stats
         .columns
         .iter()
-        .find(|stats| stats.field_name == sort_field)?;
+        .find(|stats| stats.field_name == sort_field);
+    if column_stats.is_none() && sort_order_supports_field(sort_order, sort_field) {
+        return partition_value_sort_bound(stats, sort_field);
+    }
+    let column_stats = column_stats?;
 
     if column_is_all_null(column_stats, stats.record_count) {
         return Some(Value::Null);
@@ -938,6 +1262,24 @@ fn file_level_sort_bound(
     } else {
         column_stats.lower_bound.clone()
     }
+}
+
+fn partition_value_sort_bound(stats: &IcebergFileStats, sort_field: &str) -> Option<Value> {
+    stats
+        .partition_values
+        .iter()
+        .find(|partition_value| {
+            partition_value.source_field_name == sort_field
+                && partition_value.transform == "identity"
+        })
+        .and_then(|partition_value| partition_value.value.clone())
+}
+
+fn sort_order_supports_field(sort_order: &[IcebergSortField], sort_field: &str) -> bool {
+    sort_order
+        .first()
+        .map(|field| field.source_field_name == sort_field && field.transform == "identity")
+        .unwrap_or(false)
 }
 
 fn row_group_sort_bound(
@@ -1326,6 +1668,21 @@ fn request_supported(request: &ServingRequestPlan) -> bool {
     request.order_by.len() <= 1
 }
 
+fn sort_order_matches_request(
+    sort_order: &[IcebergSortField],
+    request: &ServingRequestPlan,
+) -> bool {
+    let Some(request_sort) = request.order_by.first() else {
+        return false;
+    };
+    let Some(sort_field) = sort_order.first() else {
+        return false;
+    };
+    sort_field.transform == "identity"
+        && sort_field.source_field_name == request_sort.field
+        && sort_field.descending == request_sort.descending
+}
+
 fn request_matches_pattern(
     request: &ServingRequestPlan,
     pattern: &ServingPattern,
@@ -1418,6 +1775,76 @@ fn warmup_request_for_pattern(pattern: &ServingPattern) -> Option<(ServingReques
     ))
 }
 
+fn request_for_cache_range_target(target: &ServingCacheRangeTarget) -> ServingRequestPlan {
+    ServingRequestPlan {
+        select: target.projection.clone(),
+        filters: vec![ServingPredicate {
+            field: target.field.clone(),
+            eq: None,
+            in_values: None,
+            gt: target.gt.clone(),
+            gte: target.gte.clone(),
+            lt: target.lt.clone(),
+            lte: target.lte.clone(),
+        }],
+        order_by: target
+            .limit
+            .map(|_| {
+                vec![crate::serving_plan::ServingSort {
+                    field: target.field.clone(),
+                    descending: target.order_descending,
+                }]
+            })
+            .unwrap_or_default(),
+        limit: target.limit,
+        allow_slow_path: false,
+        explain: false,
+    }
+}
+
+fn push_unique_string(values: &mut Vec<String>, value: String) {
+    if !values.contains(&value) {
+        values.push(value);
+        values.sort();
+    }
+}
+
+fn applicable_artifacts_for_request(
+    request: &ServingRequestPlan,
+    artifacts: &[IcebergAccessArtifact],
+    declared_sort_order_match: bool,
+) -> Vec<String> {
+    let mut matched = vec![];
+
+    for artifact in artifacts {
+        let matches_filter = request.filters.iter().any(|predicate| {
+            if !artifact.fields.contains(&predicate.field) {
+                return false;
+            }
+            let uses_eq = predicate.eq.is_some() || predicate.in_values.is_some();
+            let uses_range = predicate.gt.is_some()
+                || predicate.gte.is_some()
+                || predicate.lt.is_some()
+                || predicate.lte.is_some();
+            (uses_eq && artifact.supports_eq) || (uses_range && artifact.supports_range)
+        });
+        let matches_sort = request
+            .order_by
+            .first()
+            .map(|sort| {
+                artifact.supports_order
+                    && declared_sort_order_match
+                    && artifact.fields.contains(&sort.field)
+            })
+            .unwrap_or(false);
+        if matches_filter || matches_sort {
+            push_unique_string(&mut matched, artifact.name.clone());
+        }
+    }
+
+    matched
+}
+
 fn prune_candidate_files(
     files: &[FileDescriptor],
     file_stats: &HashMap<String, IcebergFileStats>,
@@ -1434,7 +1861,12 @@ fn prune_candidate_files(
             continue;
         };
 
+        if !partition_values_may_match_request(stats, request, &mut pruned) {
+            continue;
+        }
+
         if stats.row_groups.is_empty() {
+            record_file_stats_artifact_usage(&mut pruned, stats, request);
             if file_may_match_request(stats, request) {
                 pruned.estimated_bytes += file.size;
                 pruned.files_selected += 1;
@@ -1454,6 +1886,9 @@ fn prune_candidate_files(
             continue;
         }
 
+        if !request.filters.is_empty() {
+            record_artifact_usage(&mut pruned, ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS);
+        }
         pruned.files_selected += 1;
         pruned.row_groups_selected += matching_row_groups.len();
         pruned.estimated_bytes += matching_row_groups
@@ -1468,10 +1903,32 @@ fn prune_candidate_files(
     pruned
 }
 
+fn record_artifact_usage(pruned: &mut PrunedFileSelection, artifact_name: &str) {
+    push_unique_string(&mut pruned.artifacts_used, artifact_name.to_string());
+}
+
 fn record_metadata_cache_coverage(pruned: &mut PrunedFileSelection, file_path: &str) {
     let coverage = data_access::cached_parquet_row_group_stats_coverage(&[file_path.to_string()]);
     pruned.metadata_files_cached += coverage.files_cached;
     pruned.metadata_row_groups_cached += coverage.row_groups_cached;
+}
+
+fn record_file_stats_artifact_usage(
+    pruned: &mut PrunedFileSelection,
+    file_stats: &IcebergFileStats,
+    request: &ServingRequestPlan,
+) {
+    if request.filters.is_empty() {
+        return;
+    }
+    if request.filters.iter().any(|predicate| {
+        file_stats
+            .columns
+            .iter()
+            .any(|column| column.field_name == predicate.field)
+    }) {
+        record_artifact_usage(pruned, ACCESS_ARTIFACT_KIND_FILE_STATS);
+    }
 }
 
 fn record_page_pruning_coverage(
@@ -1487,10 +1944,99 @@ fn record_page_pruning_coverage(
         .iter()
         .filter(|row_group| row_group.page_index_present)
         .count();
+    if pruned.page_index_row_groups_selected > 0 {
+        record_artifact_usage(pruned, ACCESS_ARTIFACT_KIND_PAGE_INDEX);
+    }
     pruned.bloom_filter_row_groups_selected += matching_row_groups
         .iter()
         .filter(|row_group| row_group.bloom_filter_present)
         .count();
+    if pruned.bloom_filter_row_groups_selected > 0 {
+        record_artifact_usage(pruned, ACCESS_ARTIFACT_KIND_BLOOM_FILTER);
+    }
+}
+
+fn partition_values_may_match_request(
+    file_stats: &IcebergFileStats,
+    request: &ServingRequestPlan,
+    pruned: &mut PrunedFileSelection,
+) -> bool {
+    for predicate in request.filters.iter() {
+        let Some((may_match, artifact_name)) =
+            partition_predicate_may_match_file(file_stats, predicate)
+        else {
+            continue;
+        };
+        record_artifact_usage(pruned, &artifact_name);
+        if !may_match {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn partition_predicate_may_match_file(
+    file_stats: &IcebergFileStats,
+    predicate: &ServingPredicate,
+) -> Option<(bool, String)> {
+    let partition_value = file_stats.partition_values.iter().find(|partition_value| {
+        partition_value.source_field_name == predicate.field
+            && partition_value.transform == "identity"
+    })?;
+    let value = partition_value.value.as_ref()?;
+    let may_match = if let Some(eq) = predicate.eq.as_ref() {
+        compare_scalar_values(eq, value) == Some(Ordering::Equal)
+    } else if let Some(in_values) = predicate.in_values.as_ref() {
+        in_values
+            .iter()
+            .any(|candidate| compare_scalar_values(candidate, value) == Some(Ordering::Equal))
+    } else {
+        partition_range_may_match(value, predicate)
+    };
+    Some((
+        may_match,
+        format!(
+            "{}:{}",
+            ACCESS_ARTIFACT_KIND_PARTITION_SPEC, partition_value.field_name
+        ),
+    ))
+}
+
+fn partition_range_may_match(value: &Value, predicate: &ServingPredicate) -> bool {
+    if let Some(candidate) = predicate.gt.as_ref() {
+        if matches!(
+            compare_scalar_values(value, candidate),
+            Some(Ordering::Less | Ordering::Equal)
+        ) {
+            return false;
+        }
+    }
+    if let Some(candidate) = predicate.gte.as_ref() {
+        if matches!(
+            compare_scalar_values(value, candidate),
+            Some(Ordering::Less)
+        ) {
+            return false;
+        }
+    }
+    if let Some(candidate) = predicate.lt.as_ref() {
+        if matches!(
+            compare_scalar_values(value, candidate),
+            Some(Ordering::Greater | Ordering::Equal)
+        ) {
+            return false;
+        }
+    }
+    if let Some(candidate) = predicate.lte.as_ref() {
+        if matches!(
+            compare_scalar_values(value, candidate),
+            Some(Ordering::Greater)
+        ) {
+            return false;
+        }
+    }
+    true
 }
 
 fn file_may_match_request(file_stats: &IcebergFileStats, request: &ServingRequestPlan) -> bool {
@@ -1914,6 +2460,9 @@ mod tests {
                 .into_iter()
                 .map(|stats| (stats.file_path.clone(), stats))
                 .collect(),
+            partition_spec: vec![],
+            sort_order: vec![],
+            access_artifacts: vec![],
             snapshot_id: Some("snapshot_1".to_string()),
             metadata_snapshot_cached: false,
         }
@@ -1943,6 +2492,7 @@ mod tests {
             file_path: file_path.to_string(),
             record_count,
             columns,
+            partition_values: vec![],
             row_groups: vec![],
         }
     }
@@ -2552,7 +3102,7 @@ mod tests {
         };
 
         let ordered_groups =
-            ordered_file_groups_for_top_k(&files, &file_stats, &request, "score", true)
+            ordered_file_groups_for_top_k(&files, &file_stats, &[], &request, "score", true)
                 .expect("score bounds should enable ordered top-k");
 
         assert_eq!(
@@ -2611,7 +3161,8 @@ mod tests {
         };
 
         assert!(
-            ordered_file_groups_for_top_k(&files, &file_stats, &request, "score", true).is_none(),
+            ordered_file_groups_for_top_k(&files, &file_stats, &[], &request, "score", true)
+                .is_none(),
             "missing score bounds should fall back to the existing parallel path"
         );
     }
@@ -2673,6 +3224,7 @@ mod tests {
             },
             &files,
             &file_stats,
+            &[],
         );
 
         assert_eq!(
@@ -2730,6 +3282,7 @@ mod tests {
             },
             &files,
             &file_stats,
+            &[],
         );
 
         assert!(selected.is_empty());
@@ -2766,6 +3319,7 @@ mod tests {
             },
             &files,
             &file_stats,
+            &[],
         );
 
         assert!(selected.is_empty());
@@ -2829,6 +3383,7 @@ mod tests {
             },
             &files,
             &file_stats,
+            &[],
         )
         .expect("order-only pattern should produce a warmup plan");
 

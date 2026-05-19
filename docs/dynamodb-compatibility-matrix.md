@@ -33,11 +33,20 @@ The backing artifacts are:
 | Operation | Coverage | Notes |
 |---|---|---|
 | `ListTables` | Differential | Must only surface tables explicitly exposed through DynamoDB config |
-| `DescribeTable` | Differential | Includes primary key schema, billing mode, and declared GSIs |
-| `GetItem` | Differential | Projection behavior compared against LocalStack |
+| `DescribeTable` | Differential | Includes primary key schema, billing mode, and declared GSIs and LSIs |
+| `GetItem` | Differential | Projection behavior and `ReturnConsumedCapacity` response shape compared against LocalStack |
 | `BatchGetItem` | Differential | Response shape and item projection compared against LocalStack |
-| `Query` | Differential | Covers primary-key range queries, `begins_with`, filter subset, pagination, and GSI queries |
-| `Scan` | Differential | Covers ordered pagination, filtered counts, and continuation keys |
+| `Query` | Differential | Covers primary-key range queries, `begins_with`, richer filter behavior, pagination, GSI queries, LSI queries, and `ReturnConsumedCapacity` response shape |
+| `Scan` | Differential | Covers ordered pagination, filtered counts, continuation keys, and `ReturnConsumedCapacity` response shape |
+
+## Auth Contract
+
+- The DynamoDB wire endpoint now requires SigV4-style `Authorization` headers.
+- Requests without SigV4 must fail explicitly with
+  `UnrecognizedClientException`.
+- The matrix harness checks required-auth rejection directly on the raw wire
+  path, while the differential suites use real SDK clients with static test
+  credentials.
 
 ## Explicit Error Surface
 
@@ -62,8 +71,19 @@ Supported operations must also fail explicitly for unsupported request members
 or unsupported expression forms. The matrix harness currently checks:
 
 - unknown top-level request fields on supported operations
-- unsupported `FilterExpression` clauses
+- required SigV4 auth for raw wire requests
+- unsupported `Select` / `ProjectionExpression` combinations
+- unsupported `ReturnConsumedCapacity` values
 - unsupported `KeyConditionExpression` shapes
+
+Supported read operations are also expected to accept and exercise the current
+read-contract subset:
+
+- `ReturnConsumedCapacity` on `GetItem`, `BatchGetItem`, `Query`, and `Scan`
+- `ConsistentRead` on table and LSI reads, with explicit rejection on GSIs
+- `FilterExpression` support for `AND`, `OR`, `NOT`, `contains`,
+  `attribute_exists`, `attribute_not_exists`, `attribute_type`, `size`,
+  `IN`, `BETWEEN`, and `begins_with`
 
 ## Local Runner
 

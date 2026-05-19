@@ -1,7 +1,7 @@
 use crate::data_contract::{
     CleanupCommit, CleanupWorkItem, CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody,
-    CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, OrgSettings,
-    SpeedboatCommit, TableDescription, TableMetadataCheckpoint,
+    CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, OrgSettings, SpeedboatCommit,
+    TableDescription, TableMetadataCheckpoint,
 };
 use crate::distributed_cache::set_redis_address;
 use crate::dynamodb_state_provider::DynamoDbStateProvider;
@@ -560,10 +560,7 @@ impl StateProvider {
         state_provider_func_impl!(self, create_table(create_table))
     }
 
-    pub async fn create_org(
-        &mut self,
-        settings: &OrgSettings,
-    ) -> Result<(), ServiceApiError> {
+    pub async fn create_org(&mut self, settings: &OrgSettings) -> Result<(), ServiceApiError> {
         state_provider_func_impl!(self, create_org(settings))
     }
 
@@ -1152,8 +1149,11 @@ mod tests {
                 table_schema: schema.clone(),
                 snapshot_id: Some(snapshot_id.to_string()),
                 files: FileSetPayload::single(file_path.to_string(), 1, schema),
+                partition_spec: vec![],
+                sort_order: vec![],
                 column_names: vec![],
                 column_stats: vec![],
+                access_artifacts: vec![],
                 file_stats: vec![],
             },
             deletes_table_info: None,
