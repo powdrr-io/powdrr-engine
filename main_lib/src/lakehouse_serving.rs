@@ -105,10 +105,19 @@ struct ServingPlan {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct ServingWarmupStep {
+    pub pattern_name: String,
+    pub request: ServingRequestPlan,
+    pub selected_files: Vec<FileDescriptor>,
+    pub estimated_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct ServingWarmupPlan {
     pub matched_patterns: Vec<String>,
     pub selected_files: Vec<FileDescriptor>,
     pub estimated_bytes: u64,
+    pub steps: Vec<ServingWarmupStep>,
 }
 
 #[derive(Clone, Debug)]
@@ -711,6 +720,7 @@ fn ordered_file_groups_for_top_k(
     Some(groups)
 }
 
+#[cfg(test)]
 pub(crate) fn select_serving_warmup_files(
     serving: &ServingTableConfig,
     files: &[FileDescriptor],
@@ -730,6 +740,7 @@ pub(crate) fn build_serving_warmup_plan(
     let mut seen_paths = HashSet::new();
     let mut matched_patterns = vec![];
     let mut estimated_bytes = 0;
+    let mut steps = vec![];
 
     for pattern in serving.patterns.iter() {
         let Some((request, limit)) = warmup_request_for_pattern(pattern) else {
@@ -751,33 +762,48 @@ pub(crate) fn build_serving_warmup_plan(
         ) else {
             continue;
         };
-        let mut pattern_selected = false;
+        let mut step_selected_files = vec![];
+        let mut step_estimated_bytes = 0;
 
         for group in ordered_groups
             .into_iter()
             .take(MAX_WARMUP_FILE_GROUPS_PER_PATTERN)
         {
             for file in group.files {
+                step_estimated_bytes += file.size;
+                step_selected_files.push(file.clone());
                 if seen_paths.insert(file.file_path.clone()) {
                     estimated_bytes += file.size;
                     selected.push(file);
-                    pattern_selected = true;
                     if selected.len() >= MAX_WARMUP_FILES {
-                        if pattern_selected {
+                        if !step_selected_files.is_empty() {
                             matched_patterns.push(pattern.name.clone());
+                            steps.push(ServingWarmupStep {
+                                pattern_name: pattern.name.clone(),
+                                request: request.clone(),
+                                selected_files: step_selected_files,
+                                estimated_bytes: step_estimated_bytes,
+                            });
                         }
                         return Some(ServingWarmupPlan {
                             matched_patterns,
                             selected_files: selected,
                             estimated_bytes,
+                            steps,
                         });
                     }
                 }
             }
         }
 
-        if pattern_selected {
+        if !step_selected_files.is_empty() {
             matched_patterns.push(pattern.name.clone());
+            steps.push(ServingWarmupStep {
+                pattern_name: pattern.name.clone(),
+                request,
+                selected_files: step_selected_files,
+                estimated_bytes: step_estimated_bytes,
+            });
         }
     }
 
@@ -788,8 +814,49 @@ pub(crate) fn build_serving_warmup_plan(
             matched_patterns,
             selected_files: selected,
             estimated_bytes,
+            steps,
         })
     }
+}
+
+pub(crate) async fn execute_serving_warmup_plan(
+    plan: &ServingWarmupPlan,
+    delete_files: &[String],
+) -> Result<(), ServingQueryError> {
+    for step in plan.steps.iter() {
+        tracing::info!(
+            pattern_name = step.pattern_name,
+            estimated_bytes = step.estimated_bytes,
+            files_selected = step.selected_files.len(),
+            "Executing serving-shaped warmup query"
+        );
+        execute_serving_warmup_step(step, delete_files).await?;
+    }
+
+    Ok(())
+}
+
+async fn execute_serving_warmup_step(
+    step: &ServingWarmupStep,
+    delete_files: &[String],
+) -> Result<(), ServingQueryError> {
+    let limit = step.request.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+    let sql = build_sql("{table}", &step.request, limit, !delete_files.is_empty())?;
+    let file_groups = group_files_by_schema(&step.selected_files);
+    let concurrency = file_groups.len().clamp(1, serving_file_parallelism());
+    let delete_files = delete_files.to_vec();
+    let mut results = stream::iter(file_groups.into_iter().map(|files| {
+        let local_sql = sql.clone();
+        let local_delete_files = delete_files.clone();
+        async move { execute_file_group_warmup(files, &local_sql, &local_delete_files).await }
+    }))
+    .buffer_unordered(concurrency);
+
+    while let Some(result) = results.next().await {
+        result?;
+    }
+
+    Ok(())
 }
 
 fn file_group_sort_bound(
@@ -974,6 +1041,77 @@ async fn execute_file_group_plan(
             ServingQueryError::new(StatusCode::UNPROCESSABLE_ENTITY, &error.message)
         })?;
         Ok::<Vec<Value>, ServingQueryError>(serde_result.values)
+    }
+    .await;
+    for table_name in &created_delete_tables {
+        data_access::drop(table_name).await;
+    }
+    if deletes_union_created {
+        data_access::drop(&deletes_table_name).await;
+    }
+    data_access::release(&local_name).await;
+    result
+}
+
+async fn execute_file_group_warmup(
+    files: Vec<FileDescriptor>,
+    sql_template: &str,
+    delete_files: &[String],
+) -> Result<(), ServingQueryError> {
+    let local_name = file_group_table_name(&files);
+    let deletes_table_name = format!("serving_deletes_{}", IdInstance::next_id());
+    let delete_local_tables = delete_files
+        .iter()
+        .map(|_| format!("serving_delete_file_{}", IdInstance::next_id()))
+        .collect::<Vec<_>>();
+    let file_paths = files
+        .iter()
+        .map(|file| file.file_path.clone())
+        .collect::<Vec<_>>();
+    let total_size = files.iter().map(|file| file.size).sum::<u64>();
+    data_access::reserve(&local_name, total_size, vec![]).await;
+    let mut created_delete_tables = vec![];
+    let mut deletes_union_created = false;
+    let result = async {
+        load_files_as_table(&local_name, &file_paths, &files[0].schema.to_arrow_schema())
+            .await
+            .map_err(|error| {
+                ServingQueryError::new(StatusCode::SERVICE_UNAVAILABLE, &error.to_string())
+            })?;
+
+        if !delete_files.is_empty() {
+            let delete_schema = PowdrrSchema::deletes().to_arrow_schema();
+            for (local_delete_table, delete_file_path) in
+                delete_local_tables.iter().zip(delete_files.iter())
+            {
+                data_access::load_file_as_table(
+                    local_delete_table,
+                    delete_file_path,
+                    false,
+                    Some(delete_schema.clone()),
+                )
+                .await
+                .map_err(|error| {
+                    ServingQueryError::new(StatusCode::SERVICE_UNAVAILABLE, &error.to_string())
+                })?;
+                created_delete_tables.push(local_delete_table.clone());
+            }
+            let deletes_sql = create_serving_deletes_table_sql(&delete_local_tables);
+            data_access::create_table(&deletes_table_name, &deletes_sql)
+                .await
+                .map_err(|error| {
+                    ServingQueryError::new(StatusCode::SERVICE_UNAVAILABLE, &error.to_string())
+                })?;
+            deletes_union_created = true;
+        }
+
+        let local_sql = sql_template
+            .replace("{table}", &local_name)
+            .replace("{deletes_table}", &deletes_table_name);
+        let _ = execute_sql_async(&local_sql).await.map_err(|error| {
+            ServingQueryError::new(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string())
+        })?;
+        Ok::<(), ServingQueryError>(())
     }
     .await;
     for table_name in &created_delete_tables {
@@ -2542,7 +2680,7 @@ mod tests {
                 .iter()
                 .map(|file| file.file_path.as_str())
                 .collect::<Vec<_>>(),
-            vec!["file://second.parquet", "file://first.parquet"]
+            vec!["file://first.parquet", "file://second.parquet"]
         );
     }
 
@@ -2696,12 +2834,16 @@ mod tests {
 
         assert_eq!(plan.matched_patterns, vec!["top_scores"]);
         assert_eq!(plan.estimated_bytes, 300);
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].pattern_name, "top_scores");
+        assert_eq!(plan.steps[0].estimated_bytes, 300);
+        assert_eq!(plan.steps[0].request.order_by[0].field, "score".to_string());
         assert_eq!(
             plan.selected_files
                 .iter()
                 .map(|file| file.file_path.as_str())
                 .collect::<Vec<_>>(),
-            vec!["file://second.parquet", "file://first.parquet"]
+            vec!["file://first.parquet", "file://second.parquet"]
         );
     }
 
