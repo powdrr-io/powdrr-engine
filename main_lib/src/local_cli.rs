@@ -2,12 +2,12 @@ use crate::data_contract::{
     ExtensionFile, FileDescriptor, FileSetPayload, IcebergMetadata, TableMetadataCheckpoint,
 };
 use crate::elastic_search_common::CommandContext;
-use crate::elastic_search_index::{create_index_inner_with_doc_id, IndexError};
+use crate::elastic_search_index::{IndexError, create_index_inner_with_doc_id};
 use crate::elastic_search_parser;
 use crate::elastic_table_validation::{
-    validate_elastic_table_files, ElasticTableValidation, ElasticTableValidationError,
+    ElasticTableValidation, ElasticTableValidationError, validate_elastic_table_files,
 };
-use crate::schema_massager::{to_powdrr_schema, PowdrrDataType, PowdrrSchema};
+use crate::schema_massager::{PowdrrDataType, PowdrrSchema, to_powdrr_schema};
 use crate::search_executor;
 use crate::state_provider::STATE_PROVIDER;
 use crate::test_api::PeerModeType;
@@ -16,7 +16,7 @@ use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use futures_util::TryStreamExt;
 use idgenerator::IdInstance;
 use object_store::{
-    aws::AmazonS3Builder, path::Path as ObjectStorePath, ObjectStore, ObjectStoreExt,
+    ObjectStore, ObjectStoreExt, aws::AmazonS3Builder, path::Path as ObjectStorePath,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -868,9 +868,9 @@ fn read_manifest(cache_dir: &Path) -> Result<CacheManifest, LocalCliError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_local_parquet_cache, query_local_parquet_cache, validate_local_parquet_source,
         LocalParquetBuildRequest, LocalParquetQueryRequest, LocalParquetValidateRequest,
-        LocalQueryLanguage,
+        LocalQueryLanguage, build_local_parquet_cache, query_local_parquet_cache,
+        validate_local_parquet_source,
     };
     use crate::schema_massager::PowdrrDataType;
     use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
@@ -1001,8 +1001,10 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("no searchable top-level string columns"));
+        assert!(
+            error
+                .to_string()
+                .contains("no searchable top-level string columns")
+        );
     }
 }

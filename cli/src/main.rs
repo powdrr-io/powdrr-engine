@@ -1,8 +1,8 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use powdrr_lib::local_cli::{
-    analyze_local_query, build_local_parquet_cache, query_local_parquet_cache,
-    validate_local_parquet_source, LocalParquetBuildRequest, LocalParquetQueryRequest,
-    LocalParquetValidateRequest, LocalQueryAnalysisRequest, LocalQueryLanguage,
+    LocalParquetBuildRequest, LocalParquetQueryRequest, LocalParquetValidateRequest,
+    LocalQueryAnalysisRequest, LocalQueryLanguage, analyze_local_query, build_local_parquet_cache,
+    query_local_parquet_cache, validate_local_parquet_source,
 };
 use std::fs;
 use std::path::PathBuf;

@@ -754,8 +754,14 @@ impl DynamoDbConnector {
         table_name: &String,
         table_body: &TableBody,
     ) -> Result<bool, Error> {
-        if self.describe_powdrr_table(org_id, table_name).await?.is_none() {
-            return self.create_table_helper(org_id, table_name, table_body).await;
+        if self
+            .describe_powdrr_table(org_id, table_name)
+            .await?
+            .is_none()
+        {
+            return self
+                .create_table_helper(org_id, table_name, table_body)
+                .await;
         }
 
         let expression = expr::Update::new("SET entity = :entity").value(":entity", table_body);

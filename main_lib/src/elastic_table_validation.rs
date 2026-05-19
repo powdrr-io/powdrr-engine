@@ -67,10 +67,7 @@ pub(crate) fn validate_elastic_table_files(
             Some(existing) if existing != &doc_id.data_type => {
                 return Err(ElasticTableValidationError::new(format!(
                     "File {} has doc id field {} with type {:?}, but other files use {:?}. Elastic serving currently requires the doc id type to match across every file in the table.",
-                    file_descriptor.file_path,
-                    doc_id_field,
-                    doc_id.data_type,
-                    existing
+                    file_descriptor.file_path, doc_id_field, doc_id.data_type, existing
                 )));
             }
             Some(_) => {}
@@ -279,9 +276,11 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("type to match across every file"));
+        assert!(
+            error
+                .to_string()
+                .contains("type to match across every file")
+        );
     }
 
     #[test]
@@ -304,8 +303,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("no searchable top-level string columns"));
+        assert!(
+            error
+                .to_string()
+                .contains("no searchable top-level string columns")
+        );
     }
 }

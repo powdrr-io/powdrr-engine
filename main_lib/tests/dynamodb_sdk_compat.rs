@@ -6,13 +6,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
+use aws_sdk_dynamodb::Client as DynamoClient;
 use aws_sdk_dynamodb::client::Waiters;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, KeySchemaElement,
     KeyType, KeysAndAttributes, Projection, ProjectionType, ScalarAttributeType, Select,
     TableDescription, TableStatus,
 };
-use aws_sdk_dynamodb::Client as DynamoClient;
 use datafusion::arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -29,7 +29,7 @@ use powdrr_lib::state_provider::STATE_PROVIDER;
 use powdrr_lib::test_api::{CompactionMode, IndexingMode, StateMode, TestProcessingMode};
 use reqwest::Client as HttpClient;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -1088,7 +1088,8 @@ fn compare_table_descriptions(powdrr: &TableDescription, localstack: &TableDescr
 }
 
 fn flatten_scan_pages(pages: &[aws_sdk_dynamodb::operation::scan::ScanOutput]) -> Vec<Value> {
-    pages.iter()
+    pages
+        .iter()
         .flat_map(|page| items_to_json(page.items()))
         .collect()
 }

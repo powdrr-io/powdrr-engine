@@ -1,7 +1,7 @@
 use crate::data_access::load_file_as_table;
 use crate::data_contract::{ExtensionFileMetadata, ExtensionWorkItem, FileDescriptor};
 use crate::elastic_search_common::call_peers;
-use crate::elastic_table_validation::{validate_elastic_table_files, ElasticTableValidationError};
+use crate::elastic_table_validation::{ElasticTableValidationError, validate_elastic_table_files};
 use crate::peers::{PrivateExtensionInvocation, PrivateInvocation, PrivateInvocationResult};
 use crate::schema_massager::PowdrrSchema;
 use crate::state_provider::STATE_PROVIDER;
