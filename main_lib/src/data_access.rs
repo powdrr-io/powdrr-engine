@@ -9,12 +9,13 @@ use datafusion::datasource::{
     listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
 };
 use datafusion::execution::options::{ArrowReadOptions, JsonReadOptions};
+use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use datafusion::prelude::SessionConfig;
 use datafusion::{
     arrow,
     arrow::array::RecordBatch,
     error::DataFusionError,
-    prelude::{DataFrame, ParquetReadOptions, SessionContext},
+    prelude::{DataFrame, SessionContext},
 };
 use futures::stream::{self, StreamExt};
 use futures_util::TryStreamExt;
@@ -1717,23 +1718,67 @@ async fn load_parquet_file_as_table(
             }
         }
     } else {
-        let local_file_path = if file_path.starts_with("file://") {
-            file_path.trim_start_matches("file://")
-        } else {
-            file_path.as_str()
-        };
-        let result = data_fusion_context
-            .register_parquet(local_name, local_file_path, ParquetReadOptions::new())
-            .await;
-        match result {
-            Err(e) => {
-                if e.message().contains("already exists") {
-                    Ok(())
-                } else {
-                    log_err(e)
-                }
+        load_local_parquet_files_as_table(data_fusion_context, &vec![file_path.clone()], local_name)
+    }
+}
+
+fn normalize_local_file_path(file_path: &str) -> &str {
+    file_path.strip_prefix("file://").unwrap_or(file_path)
+}
+
+fn read_local_parquet_batches(
+    file_path: &str,
+) -> Result<(Arc<arrow::datatypes::Schema>, Vec<RecordBatch>), DataFusionError> {
+    let local_file_path = normalize_local_file_path(file_path);
+    let file = std::fs::File::open(local_file_path)
+        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|error| DataFusionError::ArrowError(Box::new(error.into()), None))?;
+    let schema = builder.schema().clone();
+    let reader = builder
+        .build()
+        .map_err(|error| DataFusionError::ArrowError(Box::new(error.into()), None))?;
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| DataFusionError::ArrowError(Box::new(error), None))?;
+    Ok((schema, batches))
+}
+
+fn load_local_parquet_files_as_table(
+    data_fusion_context: &SessionContext,
+    file_paths: &Vec<String>,
+    local_name: &String,
+) -> Result<(), DataFusionError> {
+    let mut table_schema: Option<Arc<arrow::datatypes::Schema>> = None;
+    let mut partitions = Vec::with_capacity(file_paths.len());
+
+    for file_path in file_paths {
+        let (schema, batches) = read_local_parquet_batches(file_path)?;
+        if let Some(existing_schema) = table_schema.as_ref() {
+            if existing_schema.as_ref() != schema.as_ref() {
+                return Err(DataFusionError::Execution(format!(
+                    "Local parquet files for {} did not share a schema",
+                    local_name
+                )));
             }
-            _ => Ok(()),
+        } else {
+            table_schema = Some(schema);
+        }
+        partitions.push(batches);
+    }
+
+    let table = Arc::new(datafusion::datasource::MemTable::try_new(
+        table_schema.expect("local parquet load requires at least one file"),
+        partitions,
+    )?);
+    match data_fusion_context.register_table(local_name, table) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if e.message().contains("already exists") {
+                Ok(())
+            } else {
+                log_err(e)
+            }
         }
     }
 }
@@ -1760,6 +1805,13 @@ async fn load_parquet_files_as_table(
 
     if file_paths.len() == 1 {
         return load_parquet_file_as_table(data_fusion_context, &file_paths[0], local_name).await;
+    }
+
+    if file_paths
+        .iter()
+        .all(|file_path| !file_path.starts_with("s3:"))
+    {
+        return load_local_parquet_files_as_table(data_fusion_context, file_paths, local_name);
     }
 
     tracing::info!(
@@ -2590,9 +2642,9 @@ pub(crate) fn s3_ingest_base_path() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        drop, execute_sql_async, load_files_as_table, IcebergLibMetadata,
+        drop, execute_sql_async, load_files_as_table, serving_session_config, IcebergLibMetadata,
         IcebergTableMetadataCache, IcebergTableRowGroupStatsTracker, ParquetRowGroupStatsCache,
-        RecordBatch, serving_session_config,
+        RecordBatch,
     };
     use crate::data_contract::{IcebergColumnStats, IcebergRowGroupStats};
     use datafusion::arrow::array::{Int64Array, StringArray};

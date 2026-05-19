@@ -4,6 +4,19 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="$ROOT_DIR/tests/es_compat/docker-compose.yml"
 REUSE_EXISTING_STACK="${REUSE_EXISTING_STACK:-0}"
+REDIS_URL="${POWDRR_TEST_REDIS_URL:-redis://127.0.0.1:6379/}"
+REDIS_HOST_PORT="${REDIS_URL#redis://}"
+REDIS_HOST_PORT="${REDIS_HOST_PORT%%/*}"
+REDIS_HOST="${REDIS_HOST_PORT%%:*}"
+REDIS_PORT="${REDIS_HOST_PORT##*:}"
+
+if [[ "$REDIS_HOST" == "$REDIS_HOST_PORT" ]]; then
+  REDIS_PORT="6379"
+fi
+
+if [[ "$REDIS_HOST_PORT" == "$REDIS_PORT" ]]; then
+  REDIS_HOST="127.0.0.1"
+fi
 
 cleanup() {
   if [[ "$REUSE_EXISTING_STACK" != "1" ]]; then
@@ -41,10 +54,14 @@ wait_for_tcp() {
 trap cleanup EXIT
 
 if [[ "$REUSE_EXISTING_STACK" != "1" ]]; then
-  docker compose -f "$COMPOSE_FILE" up -d
+  if [[ "$REDIS_URL" == "redis://127.0.0.1:6379/" ]]; then
+    docker compose -f "$COMPOSE_FILE" up -d redis localstack rest
+  else
+    docker compose -f "$COMPOSE_FILE" up -d localstack rest
+  fi
 fi
 
-wait_for_tcp "127.0.0.1" "6379" "Redis"
+wait_for_tcp "$REDIS_HOST" "$REDIS_PORT" "Redis"
 wait_for_http "http://localhost:9000/minio/health/live" "MinIO"
 wait_for_http "http://localhost:8181" "Iceberg REST catalog"
 wait_for_http "http://localhost:4566/_localstack/health" "LocalStack"

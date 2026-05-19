@@ -2277,6 +2277,20 @@ mod tests {
     }
 
     #[test]
+    fn test_list_tables_request_rejects_unknown_fields() {
+        let error = serde_json::from_value::<super::ListTablesRequest>(json!({
+            "UnknownField": true
+        }))
+        .err()
+        .expect("ListTablesRequest should reject unknown fields");
+        assert!(
+            error.to_string().contains("unknown field `UnknownField`"),
+            "{}",
+            error
+        );
+    }
+
+    #[test]
     fn test_dynamodb_root_operations() {
         let test_server = TestServer::with_timeout(crate::router::router(true), 1000).unwrap();
         let dataset_path =
@@ -2377,6 +2391,18 @@ mod tests {
             .unwrap()
             .iter()
             .any(|value| value == &json!(table_name)));
+
+        let list_tables_unknown_field_response = perform_dynamodb_request(
+            &test_server,
+            "ListTables",
+            json!({ "UnknownField": true }),
+        );
+        assert_eq!(
+            list_tables_unknown_field_response.status(),
+            400,
+            "{}",
+            list_tables_unknown_field_response.read_utf8_body().unwrap()
+        );
 
         let get_item_response = perform_dynamodb_request(
             &test_server,

@@ -3,7 +3,7 @@ use std::fs;
 use std::net::TcpStream;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
@@ -27,13 +27,16 @@ use powdrr_lib::data_contract::{
 };
 use powdrr_lib::router::router;
 use powdrr_lib::serving_dataset::read_parquet_documents;
-use powdrr_lib::test_api::{CompactionMode, IndexingMode, StateMode, TestProcessingMode};
+use powdrr_lib::test_api::{
+    CacheMode, CompactionMode, IndexingMode, StateMode, TestProcessingMode,
+};
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use url::Url;
 
 const CASES_JSON: &str = include_str!("data/dynamodb_compat_cases.json");
 
@@ -877,10 +880,28 @@ fn compare_query_page_outputs(
 
 fn ensure_local_engine_dependencies() -> Result<(), String> {
     require_local_service("LocalStack/DynamoDB", "127.0.0.1:4566")?;
-    require_local_service("Redis", "127.0.0.1:6379")?;
+    let (redis_host, redis_port) = test_redis_endpoint();
+    require_local_service("Redis", &format!("{}:{}", redis_host, redis_port))?;
     require_local_service("MinIO", "127.0.0.1:9000")?;
     require_local_service("Iceberg REST catalog", "127.0.0.1:8181")?;
     Ok(())
+}
+
+fn configured_test_redis_url() -> Option<String> {
+    std::env::var("POWDRR_TEST_REDIS_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+fn test_redis_endpoint() -> (String, u16) {
+    let Some(redis_url) = configured_test_redis_url() else {
+        return ("127.0.0.1".to_string(), 6379);
+    };
+    let parsed = Url::parse(&redis_url)
+        .unwrap_or_else(|error| panic!("invalid POWDRR_TEST_REDIS_URL {}: {}", redis_url, error));
+    let host = parsed.host_str().unwrap_or("127.0.0.1").to_string();
+    let port = parsed.port().unwrap_or(6379);
+    (host, port)
 }
 
 fn require_local_service(name: &str, address: &str) -> Result<(), String> {
@@ -972,6 +993,9 @@ async fn configure_powdrr_testing_mode(base_url: &str) {
     mode.state_mode = StateMode::Testing;
     mode.indexing_mode = IndexingMode::Disabled;
     mode.compaction_mode = CompactionMode::Disabled;
+    if let Some(redis_url) = configured_test_redis_url() {
+        mode.cache_mode = CacheMode::Redis(Some(redis_url));
+    }
     let client = powdrr_http_client();
     let url = format!("{}/_test/v1/_testing_and_processing_mode", base_url);
     let mut last_error = String::new();
@@ -1051,7 +1075,8 @@ async fn wait_for_powdrr_rows(
     sort_key_name: &str,
     rows: &[&EventRow],
 ) {
-    for _ in 0..60 {
+    let started = Instant::now();
+    for attempt in 0..240 {
         let mut all_present = true;
         for row in rows {
             let key = serde_dynamo::aws_sdk_dynamodb_1::to_item(json!({
@@ -1078,11 +1103,21 @@ async fn wait_for_powdrr_rows(
         if all_present {
             return;
         }
+        if attempt > 0 && attempt % 30 == 0 {
+            eprintln!(
+                "dynamo fixture: still waiting for {} rows on {} after {:?}",
+                table_name,
+                sort_key_name,
+                started.elapsed()
+            );
+        }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     panic!(
-        "Powdrr table {} did not become readable for sort key {} in time",
-        table_name, sort_key_name
+        "Powdrr table {} did not become readable for sort key {} after {:?}",
+        table_name,
+        sort_key_name,
+        started.elapsed()
     );
 }
 
