@@ -1,5 +1,5 @@
 use crate::data_contract::{
-    ACCESS_KEY_HEADER_KEY, CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody,
+    ACCESS_KEY_HEADER_KEY, CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody, OrgSettings,
     SECRET_KEY_HEADER_KEY,
 };
 use crate::data_contract::{
@@ -169,6 +169,31 @@ impl LeaderlessStateProvider {
         create_table: &CreateTable,
     ) -> Result<bool, ServiceApiError> {
         self.create_table(create_table).await
+    }
+
+    pub(crate) async fn create_org(
+        &mut self,
+        settings: &OrgSettings,
+    ) -> Result<(), ServiceApiError> {
+        Self::handle_response(
+            self.client
+                .post(format!("{}/api/v1/create_org", self.base_address))
+                .body(serde_json::to_string(settings).unwrap())
+                .send()
+                .await,
+        )
+        .await
+    }
+
+    pub(crate) async fn lookup_secret_access_key(
+        &mut self,
+        access_key: &String,
+    ) -> Result<Option<String>, ServiceApiError> {
+        if access_key == &self.access_key {
+            Ok(Some(self.secret_key.clone()))
+        } else {
+            Ok(None)
+        }
     }
 
     pub(crate) async fn describe_table(

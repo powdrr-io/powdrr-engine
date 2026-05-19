@@ -12,8 +12,8 @@ use aws_sdk_dynamodb::client::Waiters;
 use aws_sdk_dynamodb::operation::query::QueryOutput;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, KeySchemaElement,
-    KeyType, KeysAndAttributes, Projection, ProjectionType, ScalarAttributeType, TableDescription,
-    TableStatus,
+    KeyType, KeysAndAttributes, Projection, ProjectionType, ScalarAttributeType, Select,
+    TableDescription, TableStatus,
 };
 use datafusion::arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -23,10 +23,11 @@ use futures_util::future;
 use gotham::bind_server;
 use powdrr_lib::data_contract::{
     DynamoDbGlobalSecondaryIndexConfig, DynamoDbTableConfig, FileSetPayload, IcebergMetadata,
-    TableMetadataCheckpoint,
+    LicenseType, OrgCreds, OrgSettings, TableMetadataCheckpoint,
 };
 use powdrr_lib::router::router;
 use powdrr_lib::serving_dataset::read_parquet_documents;
+use powdrr_lib::state_provider::STATE_PROVIDER;
 use powdrr_lib::test_api::{
     CacheMode, CompactionMode, IndexingMode, StateMode, TestProcessingMode,
 };
@@ -108,6 +109,7 @@ const SUPPORTED_DYNAMODB_OPERATIONS: &[&str] = &[
     "GetItem",
     "ListTables",
     "Query",
+    "Scan",
 ];
 
 #[derive(Debug, Deserialize)]
@@ -267,6 +269,7 @@ fn compatibility_matrix_wire_contract_locally() {
                     "GetItem" => compare_get_item(&fixture).await,
                     "BatchGetItem" => compare_batch_get_item(&fixture).await,
                     "Query" => compare_query_operation(&fixture).await,
+                    "Scan" => compare_scan_operation(&fixture).await,
                     other => panic!(
                         "missing supported DynamoDB differential executor for {}",
                         other
@@ -296,6 +299,7 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
 
     eprintln!("dynamo fixture: configuring Powdrr testing mode");
     configure_powdrr_testing_mode(base_url).await;
+    register_powdrr_test_org().await;
     eprintln!("dynamo fixture: configuring Powdrr primary table");
     configure_powdrr_table(
         base_url,
@@ -436,9 +440,9 @@ async fn assert_parser_rejections_explicit(base_url: &str) {
                     "tenant": { "S": "acme" },
                     "ts": { "N": "10" }
                 },
-                "ConsistentRead": true
+                "ReturnConsumedCapacity": "TOTAL"
             }),
-            "unknown field `ConsistentRead`",
+            "unknown field `ReturnConsumedCapacity`",
         ),
         (
             "BatchGetItem",
@@ -466,9 +470,9 @@ async fn assert_parser_rejections_explicit(base_url: &str) {
                 "ExpressionAttributeValues": {
                     ":pk": { "S": "acme" }
                 },
-                "Select": "COUNT"
+                "ReturnConsumedCapacity": "TOTAL"
             }),
-            "unknown field `Select`",
+            "unknown field `ReturnConsumedCapacity`",
         ),
     ];
 
@@ -1262,6 +1266,101 @@ async fn compare_query_operation(fixture: &DifferentialFixture) {
             "ts": 25,
         })],
     );
+
+    let powdrr_count = query_count_page(&fixture.powdrr_client, &fixture.primary_table_name).await;
+    let localstack_count =
+        query_count_page(&fixture.localstack_client, &fixture.primary_table_name).await;
+    assert_eq!(powdrr_count.count(), 3);
+    assert_eq!(powdrr_count.scanned_count(), 3);
+    assert_eq!(powdrr_count.count(), localstack_count.count());
+    assert_eq!(powdrr_count.scanned_count(), localstack_count.scanned_count());
+    assert_eq!(powdrr_count.items().len(), 0);
+}
+
+async fn compare_scan_operation(fixture: &DifferentialFixture) {
+    let powdrr_full = scan_page(&fixture.powdrr_client, &fixture.primary_table_name, None, None).await;
+    let localstack_full =
+        scan_page(&fixture.localstack_client, &fixture.primary_table_name, None, None).await;
+    let expected_full = normalize_item_list(vec![
+        json!({
+            "tenant": "acme",
+            "ts": 10,
+            "event_id": "evt-1",
+            "region": "us-east-1",
+            "active": true,
+            "count": 1,
+        }),
+        json!({
+            "tenant": "acme",
+            "ts": 20,
+            "event_id": "evt-2",
+            "region": "us-west-2",
+            "active": false,
+            "count": 2,
+        }),
+        json!({
+            "tenant": "acme",
+            "ts": 30,
+            "event_id": "evt-3",
+            "region": "eu-central-1",
+            "active": true,
+            "count": 3,
+        }),
+        json!({
+            "tenant": "globex",
+            "ts": 15,
+            "event_id": "evt-4",
+            "region": "ap-southeast-2",
+            "active": true,
+            "count": 4,
+        }),
+        json!({
+            "tenant": "initech",
+            "ts": 25,
+            "event_id": "evt-5",
+            "region": "us-east-1",
+            "active": false,
+            "count": 5,
+        }),
+    ]);
+    let powdrr_full_items = normalize_item_list(items_to_json(powdrr_full.items()));
+    let localstack_full_items = normalize_item_list(items_to_json(localstack_full.items()));
+    assert_eq!(powdrr_full_items, expected_full);
+    assert_eq!(powdrr_full_items, localstack_full_items);
+    assert_eq!(powdrr_full.count(), localstack_full.count());
+    assert_eq!(powdrr_full.scanned_count(), localstack_full.scanned_count());
+
+    let powdrr_pages =
+        collect_scan_pages(&fixture.powdrr_client, &fixture.primary_table_name, Some(2)).await;
+    let localstack_pages =
+        collect_scan_pages(&fixture.localstack_client, &fixture.primary_table_name, Some(2)).await;
+    assert_eq!(
+        normalize_item_list(flatten_scan_pages(&powdrr_pages)),
+        expected_full,
+        "Powdrr paginated Scan should cover the full item set",
+    );
+    assert_eq!(
+        normalize_item_list(flatten_scan_pages(&powdrr_pages)),
+        normalize_item_list(flatten_scan_pages(&localstack_pages)),
+        "paginated Scan should cover the same full item set as LocalStack",
+    );
+    assert!(
+        powdrr_pages.first().and_then(|page| page.last_evaluated_key()).is_some(),
+        "first paginated Scan page should expose a continuation key"
+    );
+    assert!(
+        powdrr_pages.last().and_then(|page| page.last_evaluated_key()).is_none(),
+        "final paginated Scan page should not expose a continuation key"
+    );
+
+    let powdrr_count = scan_count_page(&fixture.powdrr_client, &fixture.primary_table_name).await;
+    let localstack_count =
+        scan_count_page(&fixture.localstack_client, &fixture.primary_table_name).await;
+    assert_eq!(powdrr_count.count(), 3);
+    assert_eq!(powdrr_count.scanned_count(), 5);
+    assert_eq!(powdrr_count.count(), localstack_count.count());
+    assert_eq!(powdrr_count.scanned_count(), localstack_count.scanned_count());
+    assert_eq!(powdrr_count.items().len(), 0);
 }
 
 fn compare_query_page_outputs(
@@ -1279,6 +1378,12 @@ fn compare_query_page_outputs(
         optional_item_to_json(powdrr.last_evaluated_key()),
         optional_item_to_json(localstack.last_evaluated_key())
     );
+}
+
+fn flatten_scan_pages(pages: &[aws_sdk_dynamodb::operation::scan::ScanOutput]) -> Vec<Value> {
+    pages.iter()
+        .flat_map(|page| items_to_json(page.items()))
+        .collect()
 }
 
 fn ensure_local_engine_dependencies() -> Result<(), String> {
@@ -1418,6 +1523,31 @@ async fn configure_powdrr_testing_mode(base_url: &str) {
         "PUT /_test/v1/_testing_and_processing_mode failed after retries: {}",
         last_error
     );
+}
+
+async fn register_powdrr_test_org() {
+    let access_key = "test".to_string();
+    if STATE_PROVIDER
+        .lookup_secret_access_key(&access_key)
+        .await
+        .unwrap()
+        .as_deref()
+        == Some("test")
+    {
+        return;
+    }
+    STATE_PROVIDER
+        .create_org(&OrgSettings {
+            org_id: "dynamodb_test_org".to_string(),
+            license_type: LicenseType::Free,
+            creds: vec![OrgCreds {
+                access_key_id: access_key,
+                secret_access_key: "test".to_string(),
+                nickname: Some("dynamodb-test".to_string()),
+            }],
+        })
+        .await
+        .unwrap();
 }
 
 async fn checkpoint_from_parquet(table_name: &str, parquet_path: &Path) -> TableMetadataCheckpoint {
@@ -1859,6 +1989,83 @@ async fn query_region_index_page(
         .send()
         .await
         .unwrap()
+}
+
+async fn query_count_page(client: &DynamoClient, table_name: &str) -> QueryOutput {
+    client
+        .query()
+        .table_name(table_name)
+        .key_condition_expression("#pk = :pk AND #sk BETWEEN :start AND :end")
+        .expression_attribute_names("#pk", "tenant")
+        .expression_attribute_names("#sk", "ts")
+        .expression_attribute_values(":pk", AttributeValue::S("acme".to_string()))
+        .expression_attribute_values(":start", AttributeValue::N("10".to_string()))
+        .expression_attribute_values(":end", AttributeValue::N("30".to_string()))
+        .select(Select::Count)
+        .limit(5)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn scan_page(
+    client: &DynamoClient,
+    table_name: &str,
+    limit: Option<i32>,
+    exclusive_start_key: Option<HashMap<String, AttributeValue>>,
+) -> aws_sdk_dynamodb::operation::scan::ScanOutput {
+    let mut request = client
+        .scan()
+        .table_name(table_name)
+        .expression_attribute_names("#tenant", "tenant")
+        .expression_attribute_names("#ts", "ts")
+        .expression_attribute_names("#event", "event_id")
+        .expression_attribute_names("#region", "region")
+        .expression_attribute_names("#active", "active")
+        .expression_attribute_names("#count", "count")
+        .projection_expression("#tenant, #ts, #event, #region, #active, #count");
+    if let Some(limit) = limit {
+        request = request.limit(limit);
+    }
+    request
+        .set_exclusive_start_key(exclusive_start_key)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn scan_count_page(
+    client: &DynamoClient,
+    table_name: &str,
+) -> aws_sdk_dynamodb::operation::scan::ScanOutput {
+    client
+        .scan()
+        .table_name(table_name)
+        .expression_attribute_names("#active", "active")
+        .expression_attribute_values(":active", AttributeValue::Bool(true))
+        .filter_expression("#active = :active")
+        .select(Select::Count)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn collect_scan_pages(
+    client: &DynamoClient,
+    table_name: &str,
+    limit: Option<i32>,
+) -> Vec<aws_sdk_dynamodb::operation::scan::ScanOutput> {
+    let mut pages = vec![];
+    let mut exclusive_start_key = None;
+    loop {
+        let page = scan_page(client, table_name, limit, exclusive_start_key).await;
+        exclusive_start_key = page.last_evaluated_key().cloned();
+        let done = exclusive_start_key.is_none();
+        pages.push(page);
+        if done {
+            return pages;
+        }
+    }
 }
 
 async fn list_tables_page(

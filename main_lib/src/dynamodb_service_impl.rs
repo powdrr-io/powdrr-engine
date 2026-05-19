@@ -1181,6 +1181,41 @@ impl DynamoDBServiceImpl {
             .await
             .map_err(from_modyne)
     }
+
+    pub async fn lookup_secret_access_key(
+        &mut self,
+        access_key_id: &String,
+    ) -> Result<Option<String>, ServiceApiError> {
+        let entities = self
+            .connector
+            .fetch_entities(&MANAGEMENT_ORG_ID.to_string(), &"org_settings".to_string(), None)
+            .await
+            .map_err(from_modyne)?;
+        let mut matched_secret = None;
+        for entity in entities.entities {
+            let Some(settings) = self
+                .connector
+                .describe_org_settings(&MANAGEMENT_ORG_ID.to_string(), &entity.entity_id)
+                .await
+                .map_err(from_modyne)?
+            else {
+                continue;
+            };
+            for creds in settings.creds.iter() {
+                if &creds.access_key_id != access_key_id {
+                    continue;
+                }
+                if matched_secret.is_some() {
+                    return Err(ServiceApiError::new(format!(
+                        "Multiple org credentials share access key {}",
+                        access_key_id
+                    )));
+                }
+                matched_secret = Some(creds.secret_access_key.clone());
+            }
+        }
+        Ok(matched_secret)
+    }
 }
 
 #[async_trait::async_trait]

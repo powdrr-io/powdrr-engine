@@ -37,6 +37,7 @@ The backing artifacts are:
 | `GetItem` | Differential | Projection behavior compared against LocalStack |
 | `BatchGetItem` | Differential | Response shape and item projection compared against LocalStack |
 | `Query` | Differential | Covers primary-key range queries, `begins_with`, filter subset, pagination, and GSI queries |
+| `Scan` | Differential | Covers ordered pagination, filtered counts, and continuation keys |
 
 ## Explicit Error Surface
 
@@ -49,7 +50,7 @@ That includes:
 
 - write operations such as `PutItem`, `UpdateItem`, `DeleteItem`, and
   `BatchWriteItem`
-- scan and transactional operations such as `Scan`, `TransactGetItems`, and
+- transactional operations such as `TransactGetItems` and
   `TransactWriteItems`
 - control-plane APIs such as `CreateTable`, `DeleteTable`, `UpdateTable`, and
   backup/import/export flows
