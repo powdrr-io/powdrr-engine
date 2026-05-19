@@ -5,7 +5,7 @@ use gotham::helpers::http::response::create_empty_response;
 use gotham::{
     handler::HandlerFuture,
     helpers::http::response::create_response,
-    hyper::{Body, body},
+    hyper::{body, Body},
     mime,
     prelude::StaticResponseExtender,
     state::{FromState, State, StateData},
@@ -13,7 +13,7 @@ use gotham::{
 use http::StatusCode;
 use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 use crate::elastic_search_common::MIME_ES_JSON;
 use crate::util::{log_service_err, log_service_err_response};
@@ -21,11 +21,12 @@ use crate::{
     data_access,
     data_contract::{AliasInfo, CreateIndexBody, PropertyInfo, TableDescription},
     elastic_search_cluster_info,
-    elastic_search_common::{CommandContext, execute_command},
+    elastic_search_common::{execute_command, CommandContext},
     elastic_search_ingest, elastic_search_parser, elastic_search_pipeline,
     elastic_search_responses::{
         ErrorDetails, QueryResultShards, QueryResults, SingleDocCreateFailedResult,
     },
+    schema_massager::{PowdrrField, PowdrrSchema},
     search_executor,
     search_runtime::df_to_serde_value,
     state_provider::STATE_PROVIDER,
@@ -558,8 +559,8 @@ fn matches_requested_value(value: &str, requested: &[String]) -> bool {
             .any(|requested_value| wildcard_matches(requested_value, value))
 }
 
-async fn all_table_descriptions()
--> Result<Vec<TableDescription>, crate::state_provider::ServiceApiError> {
+async fn all_table_descriptions(
+) -> Result<Vec<TableDescription>, crate::state_provider::ServiceApiError> {
     let mut table_descriptions = Vec::new();
     let mut table_names = STATE_PROVIDER.get_all_iceberg_tables().await?;
     table_names.sort();
@@ -816,7 +817,8 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
         }));
     };
 
-    let mut local_tables = Vec::new();
+    let checkpoint_schema = checkpoint.schema.clone();
+    let mut local_tables: Vec<(String, PowdrrSchema)> = Vec::new();
     let mut delete_local_tables = Vec::new();
 
     if let Some(iceberg_metadata) = checkpoint.iceberg_metadata {
@@ -830,7 +832,7 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
             )
             .await
             .map_err(|e| e.message().to_string())?;
-            local_tables.push(local_name);
+            local_tables.push((local_name, file_descriptor.schema));
         }
     }
 
@@ -845,7 +847,7 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
             )
             .await
             .map_err(|e| e.message().to_string())?;
-            local_tables.push(local_name);
+            local_tables.push((local_name, file_descriptor.schema));
         }
     }
 
@@ -882,14 +884,17 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
     let escaped_doc_id = doc_id.replace('\'', "''");
     let union_sql = local_tables
         .iter()
-        .map(|table_name| format!("SELECT * FROM {table_name}"))
+        .map(|(table_name, file_schema)| {
+            build_document_lookup_select(table_name, &checkpoint_schema, file_schema)
+        })
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
     let deletes_table_name = create_document_lookup_deletes_table(&delete_local_tables).await?;
     let lookup_sql = format!(
         "SELECT docs.* FROM ({union_sql}) AS docs \
          LEFT JOIN {deletes_table_name} dt ON dt._id_seq_no = docs._id_seq_no \
-         WHERE docs._id = '{escaped_doc_id}' AND dt._id_seq_no IS NULL LIMIT 1"
+         WHERE docs._id = '{escaped_doc_id}' AND dt._id_seq_no IS NULL \
+         ORDER BY docs._seq_no DESC, docs._version DESC LIMIT 1"
     );
     let lookup_df = data_access::execute_sql(&lookup_sql)
         .await
@@ -898,7 +903,7 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
         .await
         .map_err(|e| e.message.clone())?;
 
-    for table_name in &local_tables {
+    for (table_name, _) in &local_tables {
         data_access::drop(table_name).await;
     }
     for table_name in &delete_local_tables {
@@ -922,6 +927,44 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
         ),
     )
     .map_err(|e| e.to_string())
+}
+
+fn build_document_lookup_select(
+    table_name: &str,
+    checkpoint_schema: &PowdrrSchema,
+    file_schema: &PowdrrSchema,
+) -> String {
+    let file_fields = file_schema
+        .fields
+        .iter()
+        .map(|field| (field.name.as_str(), field))
+        .collect::<HashMap<_, _>>();
+    let select_fields = checkpoint_schema
+        .fields
+        .iter()
+        .map(|field| lookup_select_field_sql(field, &file_fields))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("SELECT {select_fields} FROM {table_name}")
+}
+
+fn lookup_select_field_sql(
+    field: &PowdrrField,
+    file_fields: &HashMap<&str, &PowdrrField>,
+) -> String {
+    let escaped_name = escape_lookup_identifier(&field.name);
+    if file_fields.contains_key(field.name.as_str()) {
+        format!("\"{escaped_name}\"")
+    } else {
+        format!(
+            "CAST(NULL AS {}) AS \"{escaped_name}\"",
+            field.data_type.to_sql_type()
+        )
+    }
+}
+
+fn escape_lookup_identifier(identifier: &str) -> String {
+    identifier.replace('"', "\"\"")
 }
 
 async fn create_document_lookup_deletes_table(local_names: &[String]) -> Result<String, String> {

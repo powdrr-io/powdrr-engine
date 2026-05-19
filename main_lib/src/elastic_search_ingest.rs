@@ -5,7 +5,7 @@ use crate::data_contract::{
 };
 use crate::elastic_search_commands::LookupById;
 use crate::elastic_search_common::{
-    CommandContext, ElasticSearchResponse, MIME_ES_JSON, load_command_raw_result,
+    load_command_raw_result, CommandContext, ElasticSearchResponse, MIME_ES_JSON,
 };
 use crate::elastic_search_parser::UpdateBody;
 use crate::elastic_search_responses::{
@@ -15,16 +15,16 @@ use crate::elastic_search_storage_schema::{
     FullRecord, RecordDelete, RecordInput, SpeedboatCommitBuilder,
 };
 use crate::schema_massager::PowdrrSchema;
-use crate::search_runtime::{SerdeValueResult, df_to_serde_value};
-use crate::state_provider::{STATE_PROVIDER, ServiceApiError};
+use crate::search_runtime::{df_to_serde_value, SerdeValueResult};
+use crate::state_provider::{ServiceApiError, STATE_PROVIDER};
 use crate::util::{describe_table_log_error_then_none, log_err, log_service_err};
 use arrow_ipc::writer::StreamWriter;
 use arrow_json::LineDelimitedWriter;
 use datafusion::arrow::ipc::writer::FileWriter;
 use futures::FutureExt;
 use gotham::mime;
-use http::StatusCode;
 use http::header::LOCATION;
+use http::StatusCode;
 use idgenerator::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -671,7 +671,10 @@ async fn get_existing_docs(
                     message: e.message.clone(),
                 })?;
                 data_access::drop(&raw_table).await;
-                serde_result
+                SerdeValueResult {
+                    values: dedupe_lookup_docs(doc_ids, serde_result.values),
+                    schema: serde_result.schema,
+                }
             }
             None => SerdeValueResult {
                 values: vec![],
@@ -681,6 +684,63 @@ async fn get_existing_docs(
         Err(_) => panic!("weird"),
     };
     Ok(docs)
+}
+
+fn lookup_record_is_newer(candidate: &Value, current: &Value) -> bool {
+    let candidate_seq_no = candidate
+        .get("_seq_no")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let current_seq_no = current
+        .get("_seq_no")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    if candidate_seq_no != current_seq_no {
+        return candidate_seq_no > current_seq_no;
+    }
+
+    let candidate_version = candidate
+        .get("_version")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let current_version = current
+        .get("_version")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    candidate_version > current_version
+}
+
+fn dedupe_lookup_docs(doc_ids: &[String], values: Vec<Value>) -> Vec<Value> {
+    let mut by_id: HashMap<String, Value> = HashMap::new();
+    let mut passthrough = vec![];
+
+    for value in values {
+        let Some(doc_id) = value.get("_id").and_then(Value::as_str) else {
+            passthrough.push(value);
+            continue;
+        };
+
+        match by_id.get_mut(doc_id) {
+            Some(existing) => {
+                if lookup_record_is_newer(&value, existing) {
+                    *existing = value;
+                }
+            }
+            None => {
+                by_id.insert(doc_id.to_string(), value);
+            }
+        }
+    }
+
+    let mut deduped = vec![];
+    for doc_id in doc_ids {
+        if let Some(value) = by_id.remove(doc_id) {
+            deduped.push(value);
+        }
+    }
+    deduped.extend(by_id.into_values());
+    deduped.extend(passthrough);
+    deduped
 }
 
 fn insert_record(
