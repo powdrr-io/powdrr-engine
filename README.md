@@ -220,6 +220,14 @@ scripts/cargo-worktree.sh run -p powdrr-cli -- elastic analyze \
   --body '{"query":{"match":{"message":"failed"}}}'
 ```
 
+Validate that a source table satisfies the current Elastic sidecar contract:
+
+```bash
+scripts/cargo-worktree.sh run -p powdrr-cli -- elastic validate \
+  --source /path/to/parquet-dir \
+  --doc-id-field _id_seq_no
+```
+
 Run the query locally:
 
 ```bash
@@ -230,10 +238,21 @@ scripts/cargo-worktree.sh run -p powdrr-cli -- elastic query \
 
 Current constraints:
 
-- the source data must expose a stable document id column
-- pass that column with `--doc-id-field` unless it is already `_id_seq_no`
+- the source data must expose a stable scalar document id column in every file
+- the clustered/server-side Elastic path still assumes that field is
+  `_id_seq_no`
+- if you override the field in the local CLI, `--doc-id-field` must be a simple
+  SQL identifier made from ASCII letters, numbers, and underscores
+- every file must expose at least one additional top-level string column for
+  text indexing
+- only top-level string columns are tokenized, using whitespace splitting
 - for `s3://...` sources, the build step mirrors the source objects into the
-  local cache before query execution
+  local cache before query execution, and `elastic validate` downloads them
+  into a temporary scratch directory before cleaning it up
+
+See [docs/elastic-table-assumptions.md](docs/elastic-table-assumptions.md) for
+the full current contract and optional performance recommendations, including
+when Parquet bloom filters and page indexes are likely to help.
 
 ## Experimental Mongo Wire Listener
 

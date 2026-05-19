@@ -20,7 +20,9 @@ use crate::data_contract::{
 };
 use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_responses::{QueryResultHit, compare_query_result_hits_desc};
-use crate::lakehouse_serving::{ServingWarmupPlan, build_serving_warmup_plan};
+use crate::lakehouse_serving::{
+    ServingWarmupPlan, build_serving_warmup_plan, execute_serving_warmup_plan,
+};
 use crate::peers::{
     CheckpointDescriptor, PrivateCompactionInvocation, PrivateExtensionInvocation,
     PrivatePrefetchInvocation, PrivateSearchAggregationFilterSpec, PrivateSearchAggregationPartial,
@@ -898,7 +900,19 @@ pub(crate) async fn prefetch_query(
     };
     let required_files = determined_files.required_files;
 
-    let result = data_query_worker(&SqlQuery::dummy(), &required_files, false).await?;
+    let result = if let Some(plan) = targeted_warmup_plan.as_ref() {
+        execute_serving_warmup_plan(plan, &required_files.delete_files)
+            .await
+            .map_err(|error| PrivateApiError {
+                message: error.message,
+            })?;
+        DataQueryResult {
+            num: 0,
+            result: vec![],
+        }
+    } else {
+        data_query_worker(&SqlQuery::dummy(), &required_files, false).await?
+    };
     data_access::flush_serving_bulk_cache()
         .await
         .map_err(|message| PrivateApiError { message })?;
@@ -911,15 +925,25 @@ pub(crate) async fn prefetch_query(
             .and_then(|metadata| metadata.snapshot_id.clone()),
         targeted: targeted_warmup_plan.is_some(),
         matched_patterns: targeted_warmup_plan
-            .map(|plan| plan.matched_patterns)
+            .as_ref()
+            .map(|plan| plan.matched_patterns.clone())
             .unwrap_or_default(),
+        shaped_queries: targeted_warmup_plan
+            .as_ref()
+            .map(|plan| plan.steps.len())
+            .unwrap_or(0),
         files_considered,
         files_selected: required_files.iceberg_files.len(),
-        estimated_bytes: required_files
-            .iceberg_files
-            .iter()
-            .map(|file| file.size)
-            .sum(),
+        estimated_bytes: targeted_warmup_plan
+            .as_ref()
+            .map(|plan| plan.estimated_bytes)
+            .unwrap_or_else(|| {
+                required_files
+                    .iceberg_files
+                    .iter()
+                    .map(|file| file.size)
+                    .sum()
+            }),
     });
     Ok(result)
 }
