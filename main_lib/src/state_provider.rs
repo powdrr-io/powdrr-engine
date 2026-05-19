@@ -1,7 +1,7 @@
 use crate::data_contract::{
     CleanupCommit, CleanupWorkItem, CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody,
-    CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit,
-    TableDescription, TableMetadataCheckpoint,
+    CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, OrgSettings,
+    SpeedboatCommit, TableDescription, TableMetadataCheckpoint,
 };
 use crate::distributed_cache::set_redis_address;
 use crate::dynamodb_state_provider::DynamoDbStateProvider;
@@ -63,6 +63,10 @@ enum StateProviderActorMessage {
         respond_to: oneshot::Sender<Result<bool, ServiceApiError>>,
         create_table: CreateTable,
     },
+    CreateOrg {
+        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
+        settings: OrgSettings,
+    },
     UpsertTableMetadata {
         respond_to: oneshot::Sender<Result<bool, ServiceApiError>>,
         create_table: CreateTable,
@@ -70,6 +74,10 @@ enum StateProviderActorMessage {
     DescribeTable {
         respond_to: oneshot::Sender<Result<Option<TableDescription>, ServiceApiError>>,
         name: String,
+    },
+    LookupSecretAccessKey {
+        respond_to: oneshot::Sender<Result<Option<String>, ServiceApiError>>,
+        access_key_id: String,
     },
     GetAllIcebergTables {
         respond_to: oneshot::Sender<Result<Vec<String>, ServiceApiError>>,
@@ -324,6 +332,12 @@ impl StateProviderActor {
                 };
                 handle_message_impl!(self, respond_to, create_table(&create_table));
             }
+            StateProviderActorMessage::CreateOrg {
+                respond_to,
+                settings,
+            } => {
+                handle_message_impl!(self, respond_to, create_org(&settings));
+            }
             StateProviderActorMessage::UpsertTableMetadata {
                 respond_to,
                 create_table,
@@ -336,6 +350,12 @@ impl StateProviderActor {
             }
             StateProviderActorMessage::DescribeTable { respond_to, name } => {
                 handle_message_impl!(self, respond_to, describe_table(&name));
+            }
+            StateProviderActorMessage::LookupSecretAccessKey {
+                respond_to,
+                access_key_id,
+            } => {
+                handle_message_impl!(self, respond_to, lookup_secret_access_key(&access_key_id));
             }
             StateProviderActorMessage::GetAllIcebergTables { respond_to } => {
                 handle_message_impl!(self, respond_to, get_all_iceberg_tables());
@@ -540,6 +560,13 @@ impl StateProvider {
         state_provider_func_impl!(self, create_table(create_table))
     }
 
+    pub async fn create_org(
+        &mut self,
+        settings: &OrgSettings,
+    ) -> Result<(), ServiceApiError> {
+        state_provider_func_impl!(self, create_org(settings))
+    }
+
     #[allow(dead_code)]
     pub async fn upsert_table_metadata(
         &mut self,
@@ -553,6 +580,13 @@ impl StateProvider {
         name: &String,
     ) -> Result<Option<TableDescription>, ServiceApiError> {
         state_provider_func_impl!(self, describe_table(name))
+    }
+
+    pub async fn lookup_secret_access_key(
+        &mut self,
+        access_key_id: &String,
+    ) -> Result<Option<String>, ServiceApiError> {
+        state_provider_func_impl!(self, lookup_secret_access_key(access_key_id))
     }
 
     pub async fn add_alias(
@@ -804,6 +838,10 @@ impl StateProviderHandle {
         send_message!(self, CreateTable, create_table = create_table.clone())
     }
 
+    pub async fn create_org(&self, settings: &OrgSettings) -> Result<(), ServiceApiError> {
+        send_message!(self, CreateOrg, settings = settings.clone())
+    }
+
     pub async fn upsert_table_metadata(
         &self,
         create_table: &CreateTable,
@@ -820,6 +858,17 @@ impl StateProviderHandle {
         table_name: &String,
     ) -> Result<Option<TableDescription>, ServiceApiError> {
         send_message!(self, DescribeTable, name = table_name.clone())
+    }
+
+    pub async fn lookup_secret_access_key(
+        &self,
+        access_key_id: &String,
+    ) -> Result<Option<String>, ServiceApiError> {
+        send_message!(
+            self,
+            LookupSecretAccessKey,
+            access_key_id = access_key_id.clone()
+        )
     }
 
     pub async fn get_all_iceberg_tables(&self) -> Result<Vec<String>, ServiceApiError> {

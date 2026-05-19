@@ -217,8 +217,8 @@
     },
     {
       "operation": "Scan",
-      "mode": "explicit_error",
-      "description": "Table scans are unsupported and must fail explicitly."
+      "mode": "differential_supported",
+      "description": "Read-only scans must match DynamoDB-compatible behavior."
     },
     {
       "operation": "TagResource",
