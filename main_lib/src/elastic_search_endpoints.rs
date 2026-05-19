@@ -1,5 +1,6 @@
 use std::{collections::HashMap, env, pin::Pin, sync::Arc};
 
+use datafusion::arrow::datatypes::{DataType, Field};
 use futures::FutureExt;
 use gotham::helpers::http::response::create_empty_response;
 use gotham::{
@@ -26,7 +27,7 @@ use crate::{
     elastic_search_responses::{
         ErrorDetails, QueryResultShards, QueryResults, SingleDocCreateFailedResult,
     },
-    schema_massager::{PowdrrField, PowdrrSchema},
+    schema_massager::PowdrrSchema,
     search_executor,
     search_runtime::df_to_serde_value,
     state_provider::STATE_PROVIDER,
@@ -934,37 +935,51 @@ fn build_document_lookup_select(
     checkpoint_schema: &PowdrrSchema,
     file_schema: &PowdrrSchema,
 ) -> String {
-    let file_fields = file_schema
+    let checkpoint_arrow_schema = checkpoint_schema.to_arrow_schema();
+    let file_arrow_schema = file_schema.to_arrow_schema();
+    let select_fields = checkpoint_arrow_schema
         .fields
         .iter()
-        .map(|field| (field.name.as_str(), field))
-        .collect::<HashMap<_, _>>();
-    let select_fields = checkpoint_schema
-        .fields
-        .iter()
-        .map(|field| lookup_select_field_sql(field, &file_fields))
+        .map(|field| lookup_select_field_sql(field.as_ref(), &file_arrow_schema))
         .collect::<Vec<_>>()
         .join(", ");
     format!("SELECT {select_fields} FROM {table_name}")
 }
 
 fn lookup_select_field_sql(
-    field: &PowdrrField,
-    file_fields: &HashMap<&str, &PowdrrField>,
+    field: &Field,
+    file_arrow_schema: &datafusion::arrow::datatypes::Schema,
 ) -> String {
-    let escaped_name = escape_lookup_identifier(&field.name);
-    if file_fields.contains_key(field.name.as_str()) {
+    let escaped_name = escape_lookup_identifier(field.name());
+    if file_arrow_schema.field_with_name(field.name()).is_ok() {
         format!("\"{escaped_name}\"")
     } else {
         format!(
             "CAST(NULL AS {}) AS \"{escaped_name}\"",
-            field.data_type.to_sql_type()
+            lookup_sql_type(field.data_type())
         )
     }
 }
 
 fn escape_lookup_identifier(identifier: &str) -> String {
     identifier.replace('"', "\"\"")
+}
+
+fn lookup_sql_type(data_type: &DataType) -> &'static str {
+    match data_type {
+        DataType::Boolean => "BOOLEAN",
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => "DOUBLE",
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => "BIGINT",
+        DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 => "STRING",
+        _ => "STRING",
+    }
 }
 
 async fn create_document_lookup_deletes_table(local_names: &[String]) -> Result<String, String> {
