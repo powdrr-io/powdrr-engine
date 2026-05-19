@@ -11,10 +11,10 @@ use crate::elastic_search_responses::{
     QueryResults, TermAggregationBucket, TermAggregationResult, compare_query_result_hits_desc,
 };
 use crate::peers::{
-    CheckpointDescriptor, PrivateInvocation, PrivateSearchAggregationFilterSpec,
-    PrivateSearchAggregationPartial, PrivateSearchAggregationSpec,
-    PrivateSearchDateHistogramExtendedBoundsSpec, PrivateSearchInvocation, PrivateSearchSortSpec,
-    PrivateSearchTermsOrderSpec,
+    CheckpointDescriptor, PrivateExactConstraintGroup, PrivateInvocation,
+    PrivateSearchAggregationFilterSpec, PrivateSearchAggregationPartial,
+    PrivateSearchAggregationSpec, PrivateSearchDateHistogramExtendedBoundsSpec,
+    PrivateSearchInvocation, PrivateSearchSortSpec, PrivateSearchTermsOrderSpec,
 };
 use crate::schema_massager::{FieldExpression, SqlBuilder, SqlExpression};
 use crate::search_plan;
@@ -28,6 +28,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures::future::try_join_all;
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -120,6 +121,9 @@ pub(crate) struct SearchCommand {
     execution_strategy: SearchExecutionStrategy,
     typed_aggregation_specs: Option<Vec<PrivateSearchAggregationSpec>>,
     typed_sort_specs: Vec<PrivateSearchSortSpec>,
+    exact_sql: Option<crate::schema_massager::SqlQuery>,
+    exact_constraints: Vec<PrivateExactConstraintGroup>,
+    exact_doc_id_field_name: Option<String>,
     backend: SearchBackend,
 }
 
@@ -162,6 +166,11 @@ impl SearchCommand {
         )
     }
 
+    #[allow(dead_code)]
+    fn supports_exact_sidecar(&self) -> bool {
+        self.exact_sql.is_some()
+    }
+
     pub(crate) fn performance_assessment(&self) -> SearchPerformanceAssessment {
         match self.execution_strategy {
             SearchExecutionStrategy::TypedNodeMerge(result_order) => SearchPerformanceAssessment {
@@ -183,9 +192,20 @@ impl SearchCommand {
         } else {
             self.execution_plan.merge.from as usize + self.execution_plan.merge.size
         };
+        let mut required_extensions = legacy_command.required_extensions();
+        if self.exact_sql.is_some()
+            && !required_extensions
+                .iter()
+                .any(|extension| extension == "es")
+        {
+            required_extensions.push("es".to_string());
+        }
         Some(PrivateSearchInvocation {
             sql: legacy_command.sql.clone(),
-            required_extensions: legacy_command.required_extensions(),
+            exact_sql: self.exact_sql.clone(),
+            exact_constraints: self.exact_constraints.clone(),
+            exact_doc_id_field_name: self.exact_doc_id_field_name.clone(),
+            required_extensions,
             checkpoints,
             table: legacy_command.table.clone(),
             size,
@@ -625,7 +645,9 @@ pub(crate) fn search_plan_to_command_with_options(
 ) -> Result<SearchCommand, ParseError> {
     let backend =
         compile_legacy_sql_command(&plan, query, doc_id_field_name, include_deletes_join)?;
-    let execution_plan = create_execution_plan(&plan, &backend);
+    let exact_constraints = compile_exact_constraint_groups(&plan)?;
+    let exact_sql = compile_exact_sql_query(&plan, query, doc_id_field_name, include_deletes_join)?;
+    let execution_plan = create_execution_plan(&plan, &backend, exact_sql.is_some());
     let typed_aggregation_specs = private_search_aggregation_specs(&plan.aggregations);
     let typed_sort_specs = private_search_sort_specs(&plan.sort, &backend);
     let execution_strategy = choose_execution_strategy(
@@ -644,6 +666,10 @@ pub(crate) fn search_plan_to_command_with_options(
         execution_strategy,
         typed_aggregation_specs,
         typed_sort_specs: typed_sort_specs.unwrap_or_default(),
+        exact_sql,
+        exact_doc_id_field_name: (!exact_constraints.is_empty())
+            .then(|| doc_id_field_name.unwrap_or("_id_seq_no").to_string()),
+        exact_constraints,
         backend: SearchBackend::LegacySql(backend),
     })
 }
@@ -1323,6 +1349,258 @@ fn compile_legacy_sql_command(
     })
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct ExactConstraintGroup {
+    field: String,
+    values: Vec<Value>,
+}
+
+fn compile_exact_constraint_groups(
+    plan: &search_plan::SearchPlan,
+) -> Result<Vec<PrivateExactConstraintGroup>, ParseError> {
+    let Some(query_plan) = &plan.query else {
+        return Ok(vec![]);
+    };
+    let Some(groups) = exact_constraint_groups_for_query(query_plan) else {
+        return Ok(vec![]);
+    };
+
+    groups
+        .into_iter()
+        .map(|group| {
+            let mut values = group
+                .values
+                .iter()
+                .map(exact_value_to_index_string)
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| ParseError {
+                    message:
+                        "Exact-match sidecar only supports string, numeric, and boolean values"
+                            .to_string(),
+                })?;
+            values.sort();
+            values.dedup();
+            Ok(PrivateExactConstraintGroup {
+                field: group.field,
+                values,
+            })
+        })
+        .collect()
+}
+
+fn compile_exact_sql_query(
+    plan: &search_plan::SearchPlan,
+    query: &QueryStringSearch,
+    doc_id_field_name: Option<&str>,
+    include_deletes_join: bool,
+) -> Result<Option<crate::schema_massager::SqlQuery>, ParseError> {
+    let Some(query_plan) = &plan.query else {
+        return Ok(None);
+    };
+    let Some(groups) = exact_constraint_groups_for_query(query_plan) else {
+        return Ok(None);
+    };
+    if groups.is_empty() {
+        return Ok(None);
+    }
+
+    let doc_id_field_name = doc_id_field_name.unwrap_or("_id_seq_no");
+    let normalized_doc_id_field_name = doc_id_field_name.replace(".", "_");
+    let mut builder =
+        SqlBuilder::for_query_with_options(true, doc_id_field_name, include_deletes_join);
+
+    for (index, group) in groups.iter().enumerate() {
+        let alias = format!("ei{index}");
+        builder.joins.push(format!(
+            "INNER JOIN {{target_table}}_exact_index {alias} ON {alias}.doc_id = t.\"{normalized_doc_id_field_name}\""
+        ));
+        builder.filter(SqlExpression::Comparison(
+            Box::new(SqlExpression::FieldRef(
+                alias.clone(),
+                "field_name".to_string(),
+            )),
+            "=".to_string(),
+            Box::new(SqlExpression::LiteralString(group.field.clone())),
+        ));
+
+        let mut values = group
+            .values
+            .iter()
+            .map(exact_value_to_index_string)
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| ParseError {
+                message: "Exact-match sidecar only supports string, numeric, and boolean values"
+                    .to_string(),
+            })?;
+        values.sort();
+        values.dedup();
+
+        if values.len() == 1 {
+            builder.filter(SqlExpression::Comparison(
+                Box::new(SqlExpression::FieldRef(
+                    alias.clone(),
+                    "field_value".to_string(),
+                )),
+                "=".to_string(),
+                Box::new(SqlExpression::LiteralString(values[0].clone())),
+            ));
+        } else {
+            builder.filter(SqlExpression::In(
+                Box::new(SqlExpression::FieldRef(
+                    alias.clone(),
+                    "field_value".to_string(),
+                )),
+                values
+                    .into_iter()
+                    .map(SqlExpression::LiteralString)
+                    .collect::<Vec<_>>(),
+            ));
+        }
+    }
+
+    append_sort_projection_fields(&mut builder, &plan.sort);
+
+    let table_name = match &plan.target {
+        search_plan::SearchTarget::Table(table_name) => table_name,
+        search_plan::SearchTarget::Pit(_) => return Ok(None),
+    };
+
+    Ok(Some(
+        SqlCommand {
+            sql: builder.build(),
+            table: table_name.clone(),
+            calculate_score: false,
+            aggs: aggregation_plans_to_runtime(None, &plan.aggregations),
+            query_params: query.clone(),
+        }
+        .sql,
+    ))
+}
+
+fn exact_constraint_groups_for_query(
+    query: &search_plan::QueryPlan,
+) -> Option<Vec<ExactConstraintGroup>> {
+    match query {
+        search_plan::QueryPlan::Term(term_plan) => exact_constraint_groups_for_term(term_plan),
+        search_plan::QueryPlan::Bool(bool_plan) => exact_constraint_groups_for_bool(bool_plan),
+        _ => None,
+    }
+}
+
+fn exact_constraint_groups_for_term(
+    term_plan: &search_plan::TermPlan,
+) -> Option<Vec<ExactConstraintGroup>> {
+    if term_plan.clauses.len() != 1 {
+        return None;
+    }
+    let clause = term_plan.clauses.first()?;
+    exact_value_to_index_string(&clause.value)?;
+    Some(vec![ExactConstraintGroup {
+        field: clause.field.clone(),
+        values: vec![clause.value.clone()],
+    }])
+}
+
+fn exact_constraint_groups_for_bool(
+    bool_plan: &search_plan::BoolPlan,
+) -> Option<Vec<ExactConstraintGroup>> {
+    if !bool_plan.must_not.is_empty() {
+        return None;
+    }
+
+    let mut groups = Vec::new();
+    for query in bool_plan.must.iter().chain(bool_plan.filter.iter()) {
+        let next_groups = exact_constraint_groups_for_query(query)?;
+        groups = merge_exact_constraint_groups(groups, next_groups)?;
+    }
+
+    if !bool_plan.should.is_empty() {
+        let effective_minimum_should_match = bool_plan.minimum_should_match.unwrap_or_else(|| {
+            if bool_plan.must.is_empty() && bool_plan.filter.is_empty() {
+                1
+            } else {
+                0
+            }
+        });
+        if effective_minimum_should_match != 1 {
+            return None;
+        }
+        let should_group = exact_should_group(&bool_plan.should)?;
+        groups = merge_exact_constraint_groups(groups, vec![should_group])?;
+    }
+
+    if groups.is_empty() {
+        None
+    } else {
+        Some(groups)
+    }
+}
+
+fn exact_should_group(queries: &[search_plan::QueryPlan]) -> Option<ExactConstraintGroup> {
+    let mut field_name = None::<String>;
+    let mut values = Vec::new();
+
+    for query in queries {
+        let mut groups = exact_constraint_groups_for_query(query)?;
+        if groups.len() != 1 {
+            return None;
+        }
+        let group = groups.pop().unwrap();
+        match &field_name {
+            Some(existing) if existing != &group.field => return None,
+            Some(_) => (),
+            None => field_name = Some(group.field.clone()),
+        }
+        for value in group.values {
+            if !values.iter().any(|existing| existing == &value) {
+                values.push(value);
+            }
+        }
+    }
+
+    let field = field_name?;
+    values.sort_by(|left, right| left.to_string().cmp(&right.to_string()));
+    Some(ExactConstraintGroup { field, values })
+}
+
+fn merge_exact_constraint_groups(
+    mut left: Vec<ExactConstraintGroup>,
+    right: Vec<ExactConstraintGroup>,
+) -> Option<Vec<ExactConstraintGroup>> {
+    for incoming in right {
+        if let Some(existing) = left.iter_mut().find(|group| group.field == incoming.field) {
+            let allowed = incoming
+                .values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<BTreeSet<_>>();
+            let intersection = existing
+                .values
+                .iter()
+                .filter(|value| allowed.contains(&value.to_string()))
+                .cloned()
+                .collect::<Vec<_>>();
+            if intersection.is_empty() {
+                return None;
+            }
+            existing.values = intersection;
+        } else {
+            left.push(incoming);
+        }
+    }
+    left.sort_by(|left_group, right_group| left_group.field.cmp(&right_group.field));
+    Some(left)
+}
+
+fn exact_value_to_index_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
 fn append_sort_projection_fields(builder: &mut SqlBuilder, sorts: &[search_plan::SortPlan]) {
     for sort in sorts {
         let field = match sort {
@@ -1358,13 +1636,18 @@ fn append_sort_projection_fields(builder: &mut SqlBuilder, sorts: &[search_plan:
 fn create_execution_plan(
     plan: &search_plan::SearchPlan,
     backend: &SqlCommand,
+    exact_sql: bool,
 ) -> SearchExecutionPlan {
     let segment = SearchSegmentExecutionPlan::LegacySql(LegacySqlSegmentPlan {
         segment_id: "segment-000".to_string(),
         table: backend.table.clone(),
         sql: backend.sql.clone(),
         calculate_score: backend.calculate_score,
-        required_extension: backend.calculate_score.then(|| "es".to_string()),
+        required_extension: if backend.calculate_score || exact_sql {
+            Some("es".to_string())
+        } else {
+            None
+        },
     });
 
     SearchExecutionPlan {
@@ -1456,6 +1739,7 @@ mod tests {
         );
 
         assert!(command.supports_typed_node_merge());
+        assert!(!command.supports_exact_sidecar());
     }
 
     #[test]
@@ -1497,7 +1781,7 @@ mod tests {
             r#"{
   "query": {
     "query_string": {
-      "query": "service:auth AND Login",
+      "query": "service:auth OR service:api",
       "fields": ["message"],
       "default_operator": "OR"
     }
@@ -1506,6 +1790,7 @@ mod tests {
         );
 
         assert!(command.supports_typed_node_merge());
+        assert!(command.supports_exact_sidecar());
     }
 
     #[test]
@@ -1531,13 +1816,14 @@ mod tests {
             r#"{
   "query": {
     "term": {
-      "index_col": 2
+      "service": "auth"
     }
   }
 }"#,
         );
 
         assert!(command.supports_typed_node_merge());
+        assert!(command.supports_exact_sidecar());
     }
 
     #[test]
@@ -1546,13 +1832,14 @@ mod tests {
             r#"{
   "query": {
     "terms": {
-      "index_col": [2, 5]
+      "service": ["auth", "api"]
     }
   }
 }"#,
         );
 
         assert!(command.supports_typed_node_merge());
+        assert!(command.supports_exact_sidecar());
     }
 
     #[test]
