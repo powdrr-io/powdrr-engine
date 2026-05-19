@@ -1,8 +1,8 @@
 use crate::distributed_cache;
 use crate::elastic_search_common::create_denormalized_value;
-use crate::elastic_search_ingest::{commit_speedboat, IngestError, WriteBuffer};
+use crate::elastic_search_ingest::{IngestError, WriteBuffer, commit_speedboat};
 use crate::elastic_search_responses::{OperationResult, QueryResultHit, Shards};
-use crate::schema_massager::{extract_powdrr_schema_option, PowdrrSchema};
+use crate::schema_massager::{PowdrrSchema, extract_powdrr_schema_option};
 use serde_json::Value;
 
 #[derive(Clone)]
@@ -66,7 +66,10 @@ impl RecordInput {
 
     pub fn ensure_normalized_value(&mut self, seq_no: Option<u64>) -> () {
         if self.existing_normalized.is_none() {
-            assert!(seq_no.is_some(), "Need to pass in a seq_no when calling ensure_normalized_value() on a record that doesn't have one already.");
+            assert!(
+                seq_no.is_some(),
+                "Need to pass in a seq_no when calling ensure_normalized_value() on a record that doesn't have one already."
+            );
             self.ensure_source();
             let mut values = serde_json::Map::new();
             let denormalized_value = create_denormalized_value(self.source.as_ref().unwrap());
@@ -142,7 +145,7 @@ impl RecordInput {
                 _index: table.clone(),
                 _id: self.id().clone(),
                 _version: self.version(),
-                result: "inserted".to_string(),
+                result: "created".to_string(),
                 _shards: Shards {
                     total: 1,
                     successful: 1,

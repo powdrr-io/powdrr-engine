@@ -3044,20 +3044,192 @@
       ]
     },
     {
-      "id": "post_doc_with_id_returns_clear_unsupported_message",
-      "description": "POST /:index/_doc/:id fails with a clear unsupported message",
-      "differential_enabled": false,
-      "setup_steps": [],
+      "id": "post_doc_auto_id_returns_created",
+      "description": "POST /:index/_doc creates a document with an auto-generated id",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        }
+      ],
       "request": {
         "method": "POST",
-        "path": "/{{index}}/_doc/my_id",
-        "body": "{\"message\":\"hello\"}",
+        "path": "/{{index}}/_doc",
+        "body": "{ \"@timestamp\": \"2099-11-15T13:12:00\", \"message\": \"auto id create\", \"user\": { \"id\": \"kimchy\" } }",
         "mime": "application/json"
       },
       "assertions": [
-        { "kind": "status", "value": 501 },
-        { "kind": "json_path_string", "path": "error.type", "value": "unsupported_operation_exception" },
-        { "kind": "body_contains", "value": "document update API is not supported" }
+        { "kind": "status", "value": 201 },
+        { "kind": "json_path_exists", "path": "_id" },
+        { "kind": "json_path_number", "path": "_version", "value": 1 }
+      ]
+    },
+    {
+      "id": "put_doc_with_id_replaces_existing_doc",
+      "description": "PUT /:index/_doc/:id replaces an existing document and increments the version",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}/_doc/my_id",
+            "body": "{ \"@timestamp\": \"2099-11-15T13:12:00\", \"message\": \"original message\", \"user\": { \"id\": \"kimchy\" } }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "PUT",
+        "path": "/{{index}}/_doc/my_id",
+        "body": "{ \"@timestamp\": \"2099-11-15T13:13:00\", \"message\": \"replacement message\", \"user\": { \"id\": \"kimchy\" } }",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_string", "path": "_id", "value": "my_id" },
+        { "kind": "json_path_number", "path": "_version", "value": 2 }
+      ]
+    },
+    {
+      "id": "bulk_index_replaces_existing_doc_after_refresh",
+      "description": "Bulk index replaces an existing document and the refreshed read returns the replacement source",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"index\":{\"_index\":\"{{index}}\",\"_id\":\"my_id\"}}\n{ \"@timestamp\": \"2099-11-15T13:12:00\", \"message\": \"bulk original message\", \"user\": { \"id\": \"kimchy\" } }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"index\":{\"_index\":\"{{index}}\",\"_id\":\"my_id\"}}\n{ \"@timestamp\": \"2099-11-15T13:13:00\", \"message\": \"bulk replacement message\", \"user\": { \"id\": \"kimchy\" } }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/{{index}}/_doc/my_id",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number", "path": "_version", "value": 2 },
+        { "kind": "json_path_string", "path": "_source.message", "value": "bulk replacement message" }
       ]
     },
     {

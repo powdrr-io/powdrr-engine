@@ -1712,6 +1712,69 @@ pub fn es_create_with_id(mut state: State) -> Pin<Box<HandlerFuture>> {
     .boxed()
 }
 
+pub fn es_index_auto_id(mut state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_index_auto_id");
+    async move {
+        let path_extractor = NamePathExtractor::borrow_from(&state);
+        let index_name = path_extractor.name.to_string();
+        let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
+            Ok(vb) => vb,
+            Err(_) => panic!("Oh no"),
+        };
+        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+        let index_result =
+            elastic_search_ingest::index_single(&index_name, None, &body_content).await;
+        match index_result {
+            Ok(success) => {
+                let res = success.generate_response(&state);
+                Ok((state, res))
+            }
+            Err(e) => {
+                let res = create_response(
+                    &state,
+                    StatusCode::ALREADY_REPORTED,
+                    mime::TEXT_PLAIN,
+                    e.message,
+                );
+                Ok((state, res))
+            }
+        }
+    }
+    .boxed()
+}
+
+pub fn es_index_with_id(mut state: State) -> Pin<Box<HandlerFuture>> {
+    tracing::info!("es_index_with_id");
+    async move {
+        let path_extractor = NameIdPathExtractor::borrow_from(&state);
+        let index_name = path_extractor.name.to_string();
+        let doc_id = path_extractor.id.to_string();
+        let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
+            Ok(vb) => vb,
+            Err(_) => panic!("Oh no"),
+        };
+        let body_content = String::from_utf8(valid_body.to_vec()).unwrap();
+        let index_result =
+            elastic_search_ingest::index_single(&index_name, Some(&doc_id), &body_content).await;
+        match index_result {
+            Ok(success) => {
+                let res = success.generate_response(&state);
+                Ok((state, res))
+            }
+            Err(e) => {
+                let res = create_response(
+                    &state,
+                    StatusCode::ALREADY_REPORTED,
+                    mime::TEXT_PLAIN,
+                    e.message,
+                );
+                Ok((state, res))
+            }
+        }
+    }
+    .boxed()
+}
+
 pub fn es_update_with_id(mut state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_update_with_id");
     async {
@@ -2868,8 +2931,9 @@ pub fn es_bulk_ingest(mut state: State) -> Pin<Box<HandlerFuture>> {
                 Ok((state, res))
             }
             Err(e) => {
-                let _error = format!("{}", e.message);
-                panic!("Oopsie");
+                let res =
+                    create_response(&state, StatusCode::BAD_REQUEST, mime::TEXT_PLAIN, e.message);
+                Ok((state, res))
             }
         }
     }

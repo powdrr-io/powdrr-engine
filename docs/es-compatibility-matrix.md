@@ -57,9 +57,12 @@ The manifest file turns this into an enforceable surface contract:
 | Search | wildcard multi-index sorted pagination with `search_after` returns the expected next page | `logs_wildcard_search_after_returns_expected_hits` | Yes | Yes | Freezes the current typed wildcard merge path |
 | Search | zero-hit query on an existing index returns zero total hits | `zero_hit_query_on_existing_index_returns_zero_total` | Yes | Yes | Guards empty-result behavior |
 | Document lifecycle | `POST /:index/_create/:id` conflicts after refresh | `create_with_id_conflict_after_refresh` | Yes | Yes | Captures current create-vs-existing semantics |
+| Document lifecycle | `POST /:index/_doc` creates a document with an auto-generated id | `post_doc_auto_id_returns_created` | Yes | Yes | Full-document index semantics only; the fixture checks creation status, id allocation, and version `1` |
+| Document lifecycle | `PUT /:index/_doc/:id` replaces an existing document and increments the version | `put_doc_with_id_replaces_existing_doc` | Yes | Yes | Covers full-document replacement, not partial update semantics |
 | Document lifecycle | `GET /:index/_doc/:id` returns stored source | `get_existing_doc_returns_source` | Yes | Yes | Freezes current `_doc` retrieval behavior |
 | Document lifecycle | `DELETE /:index/_doc/:id` succeeds for existing doc | `delete_existing_doc_returns_200` | Yes | Yes | Status-only for first cut |
 | Document lifecycle | `GET /:index/_doc/:id` returns `404` after delete and refresh | `get_deleted_doc_returns_404` | Yes | Yes | Captures delete visibility |
+| Document lifecycle | `_bulk` `index` replaces an existing document and refreshed reads return the replacement source | `bulk_index_replaces_existing_doc_after_refresh` | Yes | Yes | Pins replacement visibility for the current speedboat-backed write path |
 | Mutations | `_update_by_query` scripted field becomes searchable after refresh | `update_by_query_scripted_field_becomes_searchable_after_refresh` | Yes | Yes | Freezes the supported update-by-query subset |
 | Index metadata | `PUT /_aliases` allows subsequent search via alias name | `alias_update_allows_search_via_alias_name` | Yes | Yes | Covers alias routing even though `GET /_alias` is still stubbed |
 | Templates | `HEAD /_index_template/:name` returns `200` after create | `index_template_head_returns_200_after_create` | Yes | Yes | Captures template existence checks |
@@ -78,6 +81,17 @@ The manifest file turns this into an enforceable surface contract:
 | Aggregations | `cardinality` over `logs-*` returns the expected distinct value count | `logs_wildcard_cardinality_returns_expected_value` | Yes | Yes | Uses exact merge semantics in the typed path |
 | Aggregations | `terms` over `logs-*` respects `_key` ordering and the configured missing bucket | `logs_wildcard_terms_order_and_missing_return_expected_buckets` | Yes | Yes | Pins the new terms bucket ordering and missing-value behavior |
 | Aggregations | `terms` with per-bucket `avg` sub-aggregations over `logs-*` returns the expected merged buckets | `logs_wildcard_terms_subaggregation_returns_expected_buckets` | Yes | Yes | First differential contract for typed bucket sub-aggregation merge |
+
+## Current Write Limits
+
+The current ES-compatible write surface is still intentionally narrow:
+
+- `/_doc` is full-document index/replace only; partial `POST /:index/_update/:id`
+  remains unsupported.
+- `_bulk` is frozen for `create` and `index`; bulk `update` and bulk `delete`
+  are not yet part of the compatibility contract.
+- refresh flags, optimistic-concurrency request params such as `if_seq_no` and
+  `if_primary_term`, and persisted ingest pipelines are not covered yet.
 
 ## Surface Rules
 

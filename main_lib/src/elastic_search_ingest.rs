@@ -5,7 +5,7 @@ use crate::data_contract::{
 };
 use crate::elastic_search_commands::LookupById;
 use crate::elastic_search_common::{
-    load_command_raw_result, CommandContext, ElasticSearchResponse, MIME_ES_JSON,
+    CommandContext, ElasticSearchResponse, MIME_ES_JSON, load_command_raw_result,
 };
 use crate::elastic_search_parser::UpdateBody;
 use crate::elastic_search_responses::{
@@ -15,16 +15,16 @@ use crate::elastic_search_storage_schema::{
     FullRecord, RecordDelete, RecordInput, SpeedboatCommitBuilder,
 };
 use crate::schema_massager::PowdrrSchema;
-use crate::search_runtime::{df_to_serde_value, SerdeValueResult};
-use crate::state_provider::{ServiceApiError, STATE_PROVIDER};
+use crate::search_runtime::{SerdeValueResult, df_to_serde_value};
+use crate::state_provider::{STATE_PROVIDER, ServiceApiError};
 use crate::util::{describe_table_log_error_then_none, log_err, log_service_err};
 use arrow_ipc::writer::StreamWriter;
 use arrow_json::LineDelimitedWriter;
 use datafusion::arrow::ipc::writer::FileWriter;
 use futures::FutureExt;
 use gotham::mime;
-use http::header::LOCATION;
 use http::StatusCode;
+use http::header::LOCATION;
 use idgenerator::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -550,6 +550,14 @@ pub(crate) async fn create_single(
     create_single_worker(index, doc_id, payload).await
 }
 
+pub(crate) async fn index_single(
+    index: &String,
+    doc_id: Option<&String>,
+    payload: &String,
+) -> Result<ElasticSearchResponse, IngestError> {
+    index_single_worker(index, doc_id.cloned(), payload).await
+}
+
 pub(crate) async fn upsert_single(
     index: &String,
     doc_id: &String,
@@ -674,6 +682,37 @@ async fn get_existing_docs(
     Ok(docs)
 }
 
+fn insert_record(
+    buffer: &mut SpeedboatCommitBuilder,
+    doc_id: String,
+    version: u64,
+    doc: &Value,
+    status: Option<u32>,
+) {
+    buffer.insert(&RecordInput::new(doc_id, version, doc, status));
+}
+
+fn replace_record(
+    buffer: &mut SpeedboatCommitBuilder,
+    existing_doc: &FullRecord,
+    doc: &Value,
+    status: Option<u32>,
+) {
+    let mut updated_doc = RecordInput::new(
+        existing_doc.record_input.id().clone(),
+        existing_doc.record_input.version() + 1,
+        doc,
+        status,
+    );
+    updated_doc.ensure_source();
+    buffer.update(&updated_doc);
+    buffer.delete(&RecordDelete::new(
+        existing_doc.record_input.id(),
+        existing_doc.seq_no,
+        existing_doc.record_input.version(),
+    ));
+}
+
 async fn create_single_worker(
     index: &String,
     doc_id: &String,
@@ -718,21 +757,7 @@ async fn create_single_worker(
             };
 
             let mut buffer = SpeedboatCommitBuilder::new(index);
-            ingest_create(
-                &Create {
-                    create: IndexOrCreateBody {
-                        index: None,
-                        id: Some(doc_id.clone()),
-                        list_executed_pipelines: false,
-                        require_alias: false,
-                        dynamic_templates: None,
-                    },
-                },
-                &valid_doc,
-                1,
-                None,
-                &mut buffer,
-            );
+            insert_record(&mut buffer, doc_id.clone(), 1, &valid_doc, None);
 
             let commit_result = buffer.commit().await?;
             assert_eq!(commit_result.operations.len(), 1);
@@ -761,6 +786,72 @@ async fn create_single_worker(
                 headers: vec![],
             })
         }
+    }
+}
+
+async fn index_single_worker(
+    index: &String,
+    doc_id: Option<String>,
+    payload: &String,
+) -> Result<ElasticSearchResponse, IngestError> {
+    let table_description: TableDescription = match describe_table_log_error_then_none(&index).await
+    {
+        Some(t) => t,
+        None => {
+            return Err(IngestError {
+                message: "Index does not exist".to_string(),
+            });
+        }
+    };
+    let doc: Result<Value, serde_json::Error> = serde_json::from_str(payload);
+    match doc {
+        Ok(valid_doc) => {
+            let resolved_doc_id = doc_id.clone().unwrap_or_else(|| UuidB64::new().to_string());
+            let mut buffer = SpeedboatCommitBuilder::new(index);
+            let status = if doc_id.is_some() {
+                let docs =
+                    get_existing_docs(&table_description.name, &vec![resolved_doc_id.clone()])
+                        .await?;
+                if docs.values.is_empty() {
+                    insert_record(&mut buffer, resolved_doc_id.clone(), 1, &valid_doc, None);
+                    StatusCode::CREATED
+                } else {
+                    assert_eq!(docs.values.len(), 1);
+                    let existing_doc = FullRecord::from_record(&docs.values[0]);
+                    replace_record(&mut buffer, &existing_doc, &valid_doc, None);
+                    StatusCode::OK
+                }
+            } else {
+                insert_record(&mut buffer, resolved_doc_id.clone(), 1, &valid_doc, None);
+                StatusCode::CREATED
+            };
+
+            let result = buffer.commit().await?;
+            assert!(
+                !result.operations.is_empty(),
+                "single-document index commit must return at least one operation"
+            );
+            let headers = vec![(
+                LOCATION,
+                format!(
+                    "/{}/_doc/{}",
+                    table_description.name,
+                    url_escape::encode_userinfo(&resolved_doc_id)
+                ),
+            )];
+            Ok(ElasticSearchResponse {
+                status,
+                mime: MIME_ES_JSON.clone(),
+                body: serde_json::to_string(&result.operations[0]).unwrap(),
+                headers,
+            })
+        }
+        Err(_) => Ok(ElasticSearchResponse {
+            status: StatusCode::BAD_REQUEST,
+            mime: mime::APPLICATION_JSON,
+            body: "Bad request".to_string(),
+            headers: vec![],
+        }),
     }
 }
 
@@ -994,9 +1085,12 @@ pub(crate) async fn ingest(
                     };
                     let doc_str = match iterator.next() {
                         Some(ds) => ds.trim(),
-                        None => panic!(
-                            "How do I make my own error? This should return an error instead of panic"
-                        ),
+                        None => {
+                            return Err(IngestError {
+                                message: "Bulk create is missing a source document line"
+                                    .to_string(),
+                            });
+                        }
                     };
                     let doc: Result<Value, serde_json::Error> = serde_json::from_str(doc_str);
                     match doc {
@@ -1008,6 +1102,76 @@ pub(crate) async fn ingest(
                                 Some(201),
                                 ingest_result.get(&table_description.name),
                             );
+                        }
+                        Err(e) => {
+                            return Err(IngestError {
+                                message: format!("Serde error doc: {}", e),
+                            });
+                        }
+                    }
+                }
+                IngestCommand::Index(i) => {
+                    let index = match &i.index.index {
+                        Some(i) => {
+                            match provided_index {
+                                Some(pi) => {
+                                    if i != pi {
+                                        return Err(IngestError {
+                                            message: "Can not provide a index in create here"
+                                                .to_string(),
+                                        });
+                                    }
+                                }
+                                None => (),
+                            }
+                            i
+                        }
+                        None => match provided_index {
+                            Some(pi) => pi,
+                            None => {
+                                return Err(IngestError {
+                                    message: "Must provide index name".to_string(),
+                                });
+                            }
+                        },
+                    };
+                    let table_description = match describe_table_log_error_then_none(&index).await {
+                        Some(t) => t,
+                        None => {
+                            return Err(IngestError {
+                                message: "Index does not exist".to_string(),
+                            });
+                        }
+                    };
+                    let doc_str = match iterator.next() {
+                        Some(ds) => ds.trim(),
+                        None => {
+                            return Err(IngestError {
+                                message: "Bulk index is missing a source document line".to_string(),
+                            });
+                        }
+                    };
+                    let doc: Result<Value, serde_json::Error> = serde_json::from_str(doc_str);
+                    match doc {
+                        Ok(valid_doc) => {
+                            let resolved_doc_id = i
+                                .index
+                                .id
+                                .clone()
+                                .unwrap_or_else(|| UuidB64::new().to_string());
+                            let docs = get_existing_docs(
+                                &table_description.name,
+                                &vec![resolved_doc_id.clone()],
+                            )
+                            .await?;
+                            let buffer = ingest_result.get(&table_description.name);
+                            if docs.values.is_empty() {
+                                insert_record(buffer, resolved_doc_id, 1, &valid_doc, Some(201));
+                            } else {
+                                assert_eq!(docs.values.len(), 1);
+                                let existing_doc = FullRecord::from_record(&docs.values[0]);
+                                replace_record(buffer, &existing_doc, &valid_doc, Some(200));
+                            }
                         }
                         Err(e) => {
                             return Err(IngestError {
@@ -1053,19 +1217,27 @@ pub(crate) async fn ingest(
                         get_existing_docs(&table_description.name, &vec![u.update.id.unwrap()])
                             .await?;
                     if existing_docs.values.len() == 0 {
-                        todo!("Need to handle this case")
+                        return Err(IngestError {
+                            message: "Bulk update without an existing document is not implemented"
+                                .to_string(),
+                        });
                     }
                     let doc_str = match iterator.next() {
                         Some(ds) => ds.trim(),
-                        None => panic!(
-                            "How do I make my own error? This should return an error instead of panic"
-                        ),
+                        None => {
+                            return Err(IngestError {
+                                message: "Bulk update is missing an update body line".to_string(),
+                            });
+                        }
                     };
                     let doc: Result<UpdateBody, serde_json::Error> = serde_json::from_str(doc_str);
                     match doc {
                         Ok(update_request) => {
                             if update_request.doc.is_none() {
-                                todo!("What do we do here?")
+                                return Err(IngestError {
+                                    message: "Bulk update without a doc payload is not implemented"
+                                        .to_string(),
+                                });
                             }
                             let mut existing_doc =
                                 FullRecord::from_record(&existing_docs.values[0]);
@@ -1094,9 +1266,6 @@ pub(crate) async fn ingest(
                             });
                         }
                     }
-                }
-                _ => {
-                    panic!("Not implemented")
                 }
             },
             Err(e) => {
