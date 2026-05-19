@@ -14,7 +14,8 @@ use crate::peers::{
     CheckpointDescriptor, PrivateExactConstraintGroup, PrivateInvocation,
     PrivateSearchAggregationFilterSpec, PrivateSearchAggregationPartial,
     PrivateSearchAggregationSpec, PrivateSearchDateHistogramExtendedBoundsSpec,
-    PrivateSearchInvocation, PrivateSearchSortSpec, PrivateSearchTermsOrderSpec,
+    PrivateSearchInvocation, PrivateSearchRangeConstraint, PrivateSearchSortSpec,
+    PrivateSearchTermsOrderSpec,
 };
 use crate::schema_massager::{FieldExpression, SqlBuilder, SqlExpression};
 use crate::search_plan;
@@ -123,6 +124,7 @@ pub(crate) struct SearchCommand {
     typed_sort_specs: Vec<PrivateSearchSortSpec>,
     exact_sql: Option<crate::schema_massager::SqlQuery>,
     exact_constraints: Vec<PrivateExactConstraintGroup>,
+    range_constraints: Vec<PrivateSearchRangeConstraint>,
     exact_doc_id_field_name: Option<String>,
     backend: SearchBackend,
 }
@@ -204,6 +206,7 @@ impl SearchCommand {
             sql: legacy_command.sql.clone(),
             exact_sql: self.exact_sql.clone(),
             exact_constraints: self.exact_constraints.clone(),
+            range_constraints: self.range_constraints.clone(),
             exact_doc_id_field_name: self.exact_doc_id_field_name.clone(),
             required_extensions,
             checkpoints,
@@ -646,6 +649,7 @@ pub(crate) fn search_plan_to_command_with_options(
     let backend =
         compile_legacy_sql_command(&plan, query, doc_id_field_name, include_deletes_join)?;
     let exact_constraints = compile_exact_constraint_groups(&plan)?;
+    let range_constraints = compile_range_constraints(&plan);
     let exact_sql = compile_exact_sql_query(&plan, query, doc_id_field_name, include_deletes_join)?;
     let execution_plan = create_execution_plan(&plan, &backend, exact_sql.is_some());
     let typed_aggregation_specs = private_search_aggregation_specs(&plan.aggregations);
@@ -670,6 +674,7 @@ pub(crate) fn search_plan_to_command_with_options(
         exact_doc_id_field_name: (!exact_constraints.is_empty())
             .then(|| doc_id_field_name.unwrap_or("_id_seq_no").to_string()),
         exact_constraints,
+        range_constraints,
         backend: SearchBackend::LegacySql(backend),
     })
 }
@@ -1601,6 +1606,56 @@ fn exact_value_to_index_string(value: &Value) -> Option<String> {
     }
 }
 
+fn compile_range_constraints(plan: &search_plan::SearchPlan) -> Vec<PrivateSearchRangeConstraint> {
+    let Some(query_plan) = &plan.query else {
+        return vec![];
+    };
+
+    let mut constraints = vec![];
+    collect_mandatory_range_constraints(query_plan, &mut constraints);
+    constraints
+}
+
+fn collect_mandatory_range_constraints(
+    query: &search_plan::QueryPlan,
+    constraints: &mut Vec<PrivateSearchRangeConstraint>,
+) {
+    match query {
+        search_plan::QueryPlan::Range(range_plan) => {
+            for clause in &range_plan.clauses {
+                let mut constraint = PrivateSearchRangeConstraint {
+                    field: clause.field.clone(),
+                    gt: None,
+                    gte: None,
+                    lt: None,
+                    lte: None,
+                };
+                match &clause.operator {
+                    search_plan::RangeOperatorPlan::Gt(value) => {
+                        constraint.gt = Some(value.clone())
+                    }
+                    search_plan::RangeOperatorPlan::Gte(value) => {
+                        constraint.gte = Some(value.clone())
+                    }
+                    search_plan::RangeOperatorPlan::Lt(value) => {
+                        constraint.lt = Some(value.clone())
+                    }
+                    search_plan::RangeOperatorPlan::Lte(value) => {
+                        constraint.lte = Some(value.clone())
+                    }
+                }
+                constraints.push(constraint);
+            }
+        }
+        search_plan::QueryPlan::Bool(bool_plan) => {
+            for query in bool_plan.must.iter().chain(bool_plan.filter.iter()) {
+                collect_mandatory_range_constraints(query, constraints);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn append_sort_projection_fields(builder: &mut SqlBuilder, sorts: &[search_plan::SortPlan]) {
     for sort in sorts {
         let field = match sort {
@@ -1808,6 +1863,43 @@ mod tests {
         );
 
         assert!(command.supports_typed_node_merge());
+    }
+
+    #[test]
+    fn test_range_constraints_are_compiled_for_private_search_pruning() {
+        let command = parse_search_command(
+            r#"{
+  "query": {
+    "bool": {
+      "filter": [
+        {
+          "term": {
+            "service": "auth"
+          }
+        },
+        {
+          "range": {
+            "@timestamp": {
+              "gte": 100
+            }
+          }
+        }
+      ]
+    }
+  }
+}"#,
+        );
+
+        assert_eq!(
+            command.range_constraints,
+            vec![crate::peers::PrivateSearchRangeConstraint {
+                field: "@timestamp".to_string(),
+                gt: None,
+                gte: Some(serde_json::Value::from(100)),
+                lt: None,
+                lte: None,
+            }]
+        );
     }
 
     #[test]

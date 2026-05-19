@@ -1,9 +1,10 @@
 use crate::data_access::load_file_as_table;
 use crate::data_contract::{ExtensionFileMetadata, ExtensionWorkItem, FileDescriptor};
 use crate::elastic_search_common::call_peers;
-use crate::elastic_table_validation::{validate_elastic_table_files, ElasticTableValidationError};
+use crate::elastic_table_validation::{ElasticTableValidationError, validate_elastic_table_files};
 use crate::peers::{PrivateExtensionInvocation, PrivateInvocation, PrivateInvocationResult};
 use crate::schema_massager::PowdrrSchema;
+use crate::search_runtime::batches_to_serde_value;
 use crate::state_provider::STATE_PROVIDER;
 use crate::{
     data_access,
@@ -11,13 +12,12 @@ use crate::{
     data_contract::{ExtensionCommit, ExtensionFile},
     util::add_file_suffix,
 };
-use datafusion::common::config::{ParquetColumnOptions, TableParquetOptions};
 use datafusion::error::DataFusionError;
-use datafusion::prelude::col;
 use datafusion::{arrow::datatypes::DataType, dataframe::DataFrameWriteOptions};
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Display;
+
+const EXACT_PRUNING_VALUE_LIMIT: usize = 64;
 
 #[derive(Debug)]
 pub(crate) struct IndexError {
@@ -59,28 +59,6 @@ fn is_string_type(data_type: &DataType) -> bool {
     data_type.equals_datatype(&DataType::Utf8View)
         || data_type.equals_datatype(&DataType::Utf8)
         || data_type.equals_datatype(&DataType::LargeUtf8)
-}
-
-fn sidecar_parquet_options() -> TableParquetOptions {
-    TableParquetOptions {
-        column_specific_options: HashMap::from([
-            (
-                "field_name".to_string(),
-                ParquetColumnOptions {
-                    bloom_filter_enabled: Some(true),
-                    ..ParquetColumnOptions::default()
-                },
-            ),
-            (
-                "field_term".to_string(),
-                ParquetColumnOptions {
-                    bloom_filter_enabled: Some(true),
-                    ..ParquetColumnOptions::default()
-                },
-            ),
-        ]),
-        ..TableParquetOptions::default()
-    }
 }
 
 fn is_exact_index_type(data_type: &DataType) -> bool {
@@ -224,14 +202,8 @@ async fn create_index_worker(
     match joined_table
         .write_parquet(
             target_file_path,
-            DataFrameWriteOptions::new()
-                .with_single_file_output(true)
-                .with_sort_by(vec![
-                    col("field_name").sort(true, true),
-                    col("field_term").sort(true, true),
-                    col("doc_id").sort(true, true),
-                ]),
-            Some(sidecar_parquet_options()),
+            DataFrameWriteOptions::new().with_single_file_output(true),
+            None,
         )
         .await
     {
@@ -296,6 +268,103 @@ async fn create_exact_index_worker(
         Err(e) => Err(IndexError::from(e)),
         Ok(_) => Ok(()),
     }
+}
+
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+async fn exact_pruning_field_values(
+    table_name: &str,
+    field_name: &str,
+) -> Result<Vec<String>, IndexError> {
+    let sql = format!(
+        "SELECT CAST({table_name}.\"{field_name}\" as string) as field_value \
+         FROM {table_name} \
+         WHERE {table_name}.\"{field_name}\" IS NOT NULL \
+         GROUP BY {table_name}.\"{field_name}\" \
+         LIMIT {}",
+        EXACT_PRUNING_VALUE_LIMIT + 1
+    );
+    let dataframe = execute_sql(&sql).await.map_err(IndexError::from)?;
+    let batches = dataframe.collect().await.map_err(IndexError::from)?;
+    let values = batches_to_serde_value(&batches)
+        .await
+        .map_err(|error| IndexError::new(error.message))?
+        .values
+        .into_iter()
+        .filter_map(|row| {
+            row.get("field_value")
+                .and_then(|value| value.as_str().map(ToString::to_string))
+        })
+        .collect::<Vec<_>>();
+    Ok(values)
+}
+
+async fn create_exact_pruning_worker(
+    table_name: &String,
+    doc_id_field_name: &String,
+    target_file_path: &String,
+) -> Result<bool, IndexError> {
+    let raw_table = execute_sql(&format!("select * from {table_name}").to_string())
+        .await
+        .map_err(IndexError::from)?;
+
+    let exact_fields: Vec<&String> = raw_table
+        .schema()
+        .iter()
+        .filter(|c| is_exact_index_type(c.1.data_type()) && c.1.name() != doc_id_field_name)
+        .map(|c| c.1.name())
+        .collect();
+
+    if exact_fields.is_empty() {
+        return Ok(false);
+    }
+
+    let mut row_queries = vec![];
+    for field_name in exact_fields {
+        let values = exact_pruning_field_values(table_name, field_name).await?;
+        if values.len() > EXACT_PRUNING_VALUE_LIMIT {
+            row_queries.push(format!(
+                "SELECT {} as field_name, CAST(NULL as string) as field_value, false as complete",
+                sql_string_literal(field_name)
+            ));
+            continue;
+        }
+
+        if values.is_empty() {
+            row_queries.push(format!(
+                "SELECT {} as field_name, CAST(NULL as string) as field_value, true as complete",
+                sql_string_literal(field_name)
+            ));
+            continue;
+        }
+
+        row_queries.extend(values.into_iter().map(|value| {
+            format!(
+                "SELECT {} as field_name, {} as field_value, true as complete",
+                sql_string_literal(field_name),
+                sql_string_literal(&value)
+            )
+        }));
+    }
+
+    if row_queries.is_empty() {
+        return Ok(false);
+    }
+
+    let summary_table = execute_sql(&row_queries.join(" UNION ALL "))
+        .await
+        .map_err(IndexError::from)?;
+    summary_table
+        .write_parquet(
+            target_file_path,
+            DataFrameWriteOptions::new().with_single_file_output(true),
+            None,
+        )
+        .await
+        .map_err(IndexError::from)?;
+    Ok(true)
 }
 
 pub(crate) async fn create_index_jsonl(
@@ -460,6 +529,100 @@ pub(crate) async fn create_exact_index_parquet(
     Ok(Some(target_file_path))
 }
 
+pub(crate) async fn create_exact_pruning_index_jsonl(
+    file_path: &String,
+    doc_id_field_name: &String,
+    schema: &PowdrrSchema,
+) -> Result<Option<String>, IndexError> {
+    let target_file_path = add_file_suffix(
+        file_path,
+        &"exact_pruning".to_string(),
+        Some(&".parquet".to_string()),
+    );
+    if file_exists(&target_file_path).await {
+        return Ok(None);
+    }
+
+    let top_level_name = data_access::path_to_table_name(file_path);
+    data_access::reserve(&top_level_name, 1000, vec![]).await;
+
+    let result = data_access::load_file_as_table(
+        &top_level_name,
+        file_path,
+        false,
+        Some(schema.to_arrow_schema()),
+    )
+    .await;
+    match result {
+        Err(e) => {
+            data_access::release(&top_level_name).await;
+            return Err(IndexError::from(e));
+        }
+        Ok(_) => (),
+    };
+
+    let created =
+        match create_exact_pruning_worker(&top_level_name, doc_id_field_name, &target_file_path)
+            .await
+        {
+            Ok(created) => created,
+            Err(e) => {
+                data_access::release(&top_level_name).await;
+                return Err(e);
+            }
+        };
+
+    data_access::release(&top_level_name).await;
+    if created {
+        Ok(Some(target_file_path))
+    } else {
+        Ok(None)
+    }
+}
+
+pub(crate) async fn create_exact_pruning_index_parquet(
+    file_path: &String,
+    doc_id_field_name: &String,
+) -> Result<Option<String>, IndexError> {
+    let target_file_path = add_file_suffix(
+        file_path,
+        &"exact_pruning".to_string(),
+        Some(&".parquet".to_string()),
+    );
+    if file_exists(&target_file_path).await {
+        return Ok(None);
+    }
+
+    let top_level_name = data_access::path_to_table_name(file_path);
+    data_access::reserve(&top_level_name, 1000, vec![]).await;
+
+    let result = load_file_as_table(&top_level_name, file_path, true, None).await;
+    match result {
+        Err(e) => {
+            data_access::release(&top_level_name).await;
+            return Err(IndexError::from(e));
+        }
+        Ok(_) => (),
+    };
+
+    let created =
+        match create_exact_pruning_worker(&top_level_name, doc_id_field_name, &target_file_path)
+            .await
+        {
+            Ok(created) => created,
+            Err(e) => {
+                data_access::release(&top_level_name).await;
+                return Err(e);
+            }
+        };
+    data_access::release(&top_level_name).await;
+    if created {
+        Ok(Some(target_file_path))
+    } else {
+        Ok(None)
+    }
+}
+
 pub(crate) async fn create_index(work_item: &ExtensionWorkItem) -> Result<(), IndexError> {
     let invocation = PrivateInvocation::Extension(PrivateExtensionInvocation {
         extension_name: work_item.extension_type.clone(),
@@ -574,6 +737,27 @@ pub(crate) async fn create_index_inner_with_doc_id(
                 )));
             }
         }
+
+        match create_exact_pruning_index_parquet(&file_desc.file_path, doc_id_field_name).await {
+            Ok(output) => match output {
+                Some(extension_file_path) => {
+                    files
+                        .entry(file_desc.file_path.clone())
+                        .or_insert_with(Vec::new)
+                        .push(ExtensionFile {
+                            suffix: "exact_pruning".to_string(),
+                            location: extension_file_path.clone(),
+                        });
+                }
+                None => (),
+            },
+            Err(e) => {
+                return Err(IndexError::new(format!(
+                    "Failed to build exact pruning sidecar for {}: {}",
+                    file_desc.file_path, e
+                )));
+            }
+        }
     }
 
     for file_desc in speedboat_files {
@@ -620,6 +804,33 @@ pub(crate) async fn create_index_inner_with_doc_id(
                 )));
             }
         }
+
+        match create_exact_pruning_index_jsonl(
+            &file_desc.file_path,
+            doc_id_field_name,
+            &file_desc.schema,
+        )
+        .await
+        {
+            Ok(output) => match output {
+                Some(extension_file_path) => {
+                    files
+                        .entry(file_desc.file_path.clone())
+                        .or_insert_with(Vec::new)
+                        .push(ExtensionFile {
+                            suffix: "exact_pruning".to_string(),
+                            location: extension_file_path.clone(),
+                        });
+                }
+                None => (),
+            },
+            Err(e) => {
+                return Err(IndexError::new(format!(
+                    "Failed to build exact pruning sidecar for {}: {}",
+                    file_desc.file_path, e
+                )));
+            }
+        }
     }
     Ok(files)
 }
@@ -634,77 +845,26 @@ pub(crate) async fn create_index_inner(
 #[cfg(test)]
 mod tests {
     use crate::elastic_search_index::create_index_parquet;
-    use crate::util::add_file_suffix;
-    use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::arrow::record_batch::RecordBatch;
-    use datafusion::parquet::arrow::ArrowWriter;
     use gotham::test::Server;
-    use parquet_55::file::reader::FileReader;
-    use parquet_55::file::serialized_reader::SerializedFileReader;
-    use std::fs;
-    use std::path::Path;
-    use std::sync::Arc;
-    use tempfile::TempDir;
-
-    fn write_test_parquet(path: &Path) {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("doc_id", DataType::Int64, false),
-            Field::new("message", DataType::Utf8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(vec![2_i64, 1_i64, 3_i64])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["beta alpha", "alpha beta", "alpha"])) as ArrayRef,
-            ],
-        )
-        .unwrap();
-
-        let file = fs::File::create(path).unwrap();
-        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-    }
+    use std::env;
 
     #[test]
-    fn test_sidecar_parquet_enables_bloom_filters_and_sorting_metadata() {
+    fn test_simple_create_index_parquet() {
         let test_server = &*crate::router::tests::TEST_SERVER;
 
         test_server.run_future(async {
-            let temp_dir = TempDir::new().unwrap();
-            let parquet_path = temp_dir.path().join("events.parquet");
-            write_test_parquet(&parquet_path);
-
-            let source_path = format!("file://{}", parquet_path.display());
-            let sidecar_path = add_file_suffix(
-                &source_path,
-                &"search_index".to_string(),
-                Some(&".parquet".to_string()),
-            );
-
-            let result = create_index_parquet(&source_path, &"doc_id".to_string())
-                .await
-                .unwrap();
-            assert_eq!(result.as_deref(), Some(sidecar_path.as_str()));
-
-            let sidecar_local_path = sidecar_path.strip_prefix("file://").unwrap();
-            let file = fs::File::open(sidecar_local_path).unwrap();
-            let reader = SerializedFileReader::new(file).unwrap();
-            let metadata = reader.metadata();
-            let row_group = metadata.row_group(0);
-
-            let sorting_columns = row_group.sorting_columns().unwrap();
-            assert_eq!(sorting_columns.len(), 3);
-
-            let bloom_enabled_columns = row_group
-                .columns()
-                .iter()
-                .filter(|column| column.bloom_filter_offset().is_some())
-                .map(|column| column.column_path().string())
-                .collect::<Vec<String>>();
-            assert!(bloom_enabled_columns.contains(&"field_name".to_string()));
-            assert!(bloom_enabled_columns.contains(&"field_term".to_string()));
+            match create_index_parquet(
+                &format!(
+                    "file://{}/tests/data/flights.parquet",
+                    env::current_dir().unwrap().to_str().unwrap()
+                ),
+                &"index_col".to_string(),
+            )
+            .await
+            {
+                Err(_) => panic!("failed"),
+                Ok(_) => (),
+            }
         });
     }
     /*
