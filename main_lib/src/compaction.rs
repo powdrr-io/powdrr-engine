@@ -253,8 +253,11 @@ impl CompactionCommand {
                     .collect(),
                 sizes: compaction_response.lib_metadata.sizes.clone(),
             },
+            partition_spec: compaction_response.lib_metadata.partition_spec.clone(),
+            sort_order: compaction_response.lib_metadata.sort_order.clone(),
             column_names: compaction_response.lib_metadata.column_names.clone(),
             column_stats: compaction_response.lib_metadata.column_stats.clone(),
+            access_artifacts: compaction_response.lib_metadata.access_artifacts.clone(),
             file_stats: compaction_response.lib_metadata.file_stats.clone(),
         };
         metadata.files.validate();

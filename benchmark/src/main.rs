@@ -1011,12 +1011,15 @@ async fn setup_powdrr(
                 file_schemas: vec![0],
                 schemas: vec![schema.clone()],
             },
+            partition_spec: vec![],
+            sort_order: vec![],
             column_names: schema
                 .fields()
                 .iter()
                 .map(|field| field.name.clone())
                 .collect(),
             column_stats: vec![],
+            access_artifacts: vec![],
             file_stats: vec![],
         }),
         speedboat_metadata: None,

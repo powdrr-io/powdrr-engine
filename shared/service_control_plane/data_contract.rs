@@ -66,6 +66,51 @@ pub struct IcebergColumnStats {
     pub upper_bound: Option<Value>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct IcebergPartitionField {
+    pub source_field_id: i32,
+    pub source_field_name: String,
+    pub field_id: i32,
+    pub field_name: String,
+    pub transform: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct IcebergPartitionValue {
+    pub source_field_name: String,
+    pub field_name: String,
+    pub transform: String,
+    #[serde(default)]
+    pub value: Option<Value>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct IcebergSortField {
+    pub source_field_id: i32,
+    pub source_field_name: String,
+    pub transform: String,
+    #[serde(default)]
+    pub descending: bool,
+    #[serde(default)]
+    pub nulls_first: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct IcebergAccessArtifact {
+    pub name: String,
+    pub kind: String,
+    #[serde(default)]
+    pub fields: Vec<String>,
+    #[serde(default)]
+    pub exact: bool,
+    #[serde(default)]
+    pub supports_eq: bool,
+    #[serde(default)]
+    pub supports_range: bool,
+    #[serde(default)]
+    pub supports_order: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct IcebergRowGroupStats {
     pub row_group_index: usize,
@@ -89,6 +134,8 @@ pub struct IcebergFileStats {
     #[serde(default)]
     pub columns: Vec<IcebergColumnStats>,
     #[serde(default)]
+    pub partition_values: Vec<IcebergPartitionValue>,
+    #[serde(default)]
     pub row_groups: Vec<IcebergRowGroupStats>,
 }
 
@@ -97,10 +144,16 @@ pub struct IcebergMetadata {
     pub table_schema: PowdrrSchema,
     pub snapshot_id: Option<String>,
     pub files: FileSetPayload,
+    #[serde(default)]
+    pub partition_spec: Vec<IcebergPartitionField>,
+    #[serde(default)]
+    pub sort_order: Vec<IcebergSortField>,
     pub column_names: Vec<String>,
     // per file, per column lower and upper bounds
     // TODO: this needs to be generalized to support bloom filters
     pub column_stats: Vec<(String, String)>,
+    #[serde(default)]
+    pub access_artifacts: Vec<IcebergAccessArtifact>,
     #[serde(default)]
     pub file_stats: Vec<IcebergFileStats>,
 }
@@ -339,13 +392,25 @@ impl TableMetadataCheckpoint {
                 table_schema: iceberg_metadata.table_schema.clone(),
                 snapshot_id: None,
                 files: file_payload,
+                partition_spec: iceberg_metadata.partition_spec.clone(),
+                sort_order: iceberg_metadata.sort_order.clone(),
                 column_names: vec![],
                 column_stats: vec![],
+                access_artifacts: iceberg_metadata.access_artifacts.clone(),
                 file_stats,
             });
         } else {
             let metadata = self.iceberg_metadata.as_mut().unwrap();
             metadata.files.merge_inplace(&file_payload);
+            if metadata.partition_spec.is_empty() {
+                metadata.partition_spec = iceberg_metadata.partition_spec.clone();
+            }
+            if metadata.sort_order.is_empty() {
+                metadata.sort_order = iceberg_metadata.sort_order.clone();
+            }
+            if metadata.access_artifacts.is_empty() {
+                metadata.access_artifacts = iceberg_metadata.access_artifacts.clone();
+            }
             for stat in file_stats {
                 if !metadata
                     .file_stats

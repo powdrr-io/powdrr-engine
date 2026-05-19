@@ -1273,14 +1273,28 @@ async fn compare_query_operation(fixture: &DifferentialFixture) {
     assert_eq!(powdrr_count.count(), 3);
     assert_eq!(powdrr_count.scanned_count(), 3);
     assert_eq!(powdrr_count.count(), localstack_count.count());
-    assert_eq!(powdrr_count.scanned_count(), localstack_count.scanned_count());
+    assert_eq!(
+        powdrr_count.scanned_count(),
+        localstack_count.scanned_count()
+    );
     assert_eq!(powdrr_count.items().len(), 0);
 }
 
 async fn compare_scan_operation(fixture: &DifferentialFixture) {
-    let powdrr_full = scan_page(&fixture.powdrr_client, &fixture.primary_table_name, None, None).await;
-    let localstack_full =
-        scan_page(&fixture.localstack_client, &fixture.primary_table_name, None, None).await;
+    let powdrr_full = scan_page(
+        &fixture.powdrr_client,
+        &fixture.primary_table_name,
+        None,
+        None,
+    )
+    .await;
+    let localstack_full = scan_page(
+        &fixture.localstack_client,
+        &fixture.primary_table_name,
+        None,
+        None,
+    )
+    .await;
     let expected_full = normalize_item_list(vec![
         json!({
             "tenant": "acme",
@@ -1332,8 +1346,12 @@ async fn compare_scan_operation(fixture: &DifferentialFixture) {
 
     let powdrr_pages =
         collect_scan_pages(&fixture.powdrr_client, &fixture.primary_table_name, Some(2)).await;
-    let localstack_pages =
-        collect_scan_pages(&fixture.localstack_client, &fixture.primary_table_name, Some(2)).await;
+    let localstack_pages = collect_scan_pages(
+        &fixture.localstack_client,
+        &fixture.primary_table_name,
+        Some(2),
+    )
+    .await;
     assert_eq!(
         normalize_item_list(flatten_scan_pages(&powdrr_pages)),
         expected_full,
@@ -1345,11 +1363,17 @@ async fn compare_scan_operation(fixture: &DifferentialFixture) {
         "paginated Scan should cover the same full item set as LocalStack",
     );
     assert!(
-        powdrr_pages.first().and_then(|page| page.last_evaluated_key()).is_some(),
+        powdrr_pages
+            .first()
+            .and_then(|page| page.last_evaluated_key())
+            .is_some(),
         "first paginated Scan page should expose a continuation key"
     );
     assert!(
-        powdrr_pages.last().and_then(|page| page.last_evaluated_key()).is_none(),
+        powdrr_pages
+            .last()
+            .and_then(|page| page.last_evaluated_key())
+            .is_none(),
         "final paginated Scan page should not expose a continuation key"
     );
 
@@ -1359,7 +1383,10 @@ async fn compare_scan_operation(fixture: &DifferentialFixture) {
     assert_eq!(powdrr_count.count(), 3);
     assert_eq!(powdrr_count.scanned_count(), 5);
     assert_eq!(powdrr_count.count(), localstack_count.count());
-    assert_eq!(powdrr_count.scanned_count(), localstack_count.scanned_count());
+    assert_eq!(
+        powdrr_count.scanned_count(),
+        localstack_count.scanned_count()
+    );
     assert_eq!(powdrr_count.items().len(), 0);
 }
 
@@ -1381,7 +1408,8 @@ fn compare_query_page_outputs(
 }
 
 fn flatten_scan_pages(pages: &[aws_sdk_dynamodb::operation::scan::ScanOutput]) -> Vec<Value> {
-    pages.iter()
+    pages
+        .iter()
         .flat_map(|page| items_to_json(page.items()))
         .collect()
 }
@@ -1569,6 +1597,8 @@ async fn checkpoint_from_parquet(table_name: &str, parquet_path: &Path) -> Table
                 file_schemas: vec![0],
                 sizes: vec![file_size],
             },
+            partition_spec: vec![],
+            sort_order: vec![],
             column_names: dataset
                 .schema
                 .fields()
@@ -1576,6 +1606,7 @@ async fn checkpoint_from_parquet(table_name: &str, parquet_path: &Path) -> Table
                 .map(|field| field.name.clone())
                 .collect(),
             column_stats: vec![],
+            access_artifacts: vec![],
             file_stats: vec![],
         }),
         speedboat_metadata: None,

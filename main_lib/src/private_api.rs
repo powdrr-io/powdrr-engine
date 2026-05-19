@@ -21,7 +21,8 @@ use crate::data_contract::{
 use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_responses::{QueryResultHit, compare_query_result_hits_desc};
 use crate::lakehouse_serving::{
-    ServingWarmupPlan, build_serving_warmup_plan, execute_serving_warmup_plan,
+    ServingCacheManagerPlan, build_serving_cache_manager_plan,
+    default_serving_cache_manager_request, execute_serving_cache_manager_plan,
 };
 use crate::peers::{
     CheckpointDescriptor, PrivateCompactionInvocation, PrivateExtensionInvocation,
@@ -200,7 +201,7 @@ async fn determine_required_files(
 async fn narrow_prefetch_files_for_serving_warmup(
     required_files: &mut RequiredFiles,
     table_metadata: &TableMetadataCheckpoint,
-) -> Option<ServingWarmupPlan> {
+) -> Option<ServingCacheManagerPlan> {
     if required_files.iceberg_files.is_empty() {
         return None;
     }
@@ -231,11 +232,21 @@ async fn narrow_prefetch_files_for_serving_warmup(
         .iter()
         .map(|stats| (stats.file_path.clone(), stats.clone()))
         .collect::<HashMap<_, _>>();
-    let warmup_plan =
-        build_serving_warmup_plan(serving, &required_files.iceberg_files, &file_stats)?;
+    let manager_request = default_serving_cache_manager_request(serving);
+    let warmup_plan = build_serving_cache_manager_plan(
+        &manager_request,
+        serving,
+        &required_files.iceberg_files,
+        &file_stats,
+        &iceberg_metadata.sort_order,
+        &iceberg_metadata.access_artifacts,
+    );
+    if warmup_plan.warm_files.is_empty() {
+        return None;
+    }
 
     let selected_paths = warmup_plan
-        .selected_files
+        .warm_files
         .iter()
         .map(|file| file.file_path.clone())
         .collect::<BTreeSet<_>>();
@@ -254,7 +265,8 @@ async fn narrow_prefetch_files_for_serving_warmup(
 
     tracing::info!(
         matched_patterns = ?warmup_plan.matched_patterns,
-        estimated_bytes = warmup_plan.estimated_bytes,
+        matched_artifacts = ?warmup_plan.matched_artifacts,
+        estimated_bytes = warmup_plan.estimated_warm_bytes,
         "Prefetch narrowed serving warmup for {} to {}/{} parquet files",
         table_metadata.table_name,
         required_files.iceberg_files.len(),
@@ -901,7 +913,7 @@ pub(crate) async fn prefetch_query(
     let required_files = determined_files.required_files;
 
     let result = if let Some(plan) = targeted_warmup_plan.as_ref() {
-        execute_serving_warmup_plan(plan, &required_files.delete_files)
+        execute_serving_cache_manager_plan(plan, &required_files.delete_files)
             .await
             .map_err(|error| PrivateApiError {
                 message: error.message,
@@ -916,6 +928,26 @@ pub(crate) async fn prefetch_query(
     data_access::flush_serving_bulk_cache()
         .await
         .map_err(|message| PrivateApiError { message })?;
+    if let Some(plan) = targeted_warmup_plan.as_ref() {
+        data_access::record_serving_cache_manager_operation(
+            data_access::ServingCacheManagerOperationStats {
+                table: determined_files.table_metadata.table_name.clone(),
+                snapshot_id: determined_files
+                    .table_metadata
+                    .iceberg_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.snapshot_id.clone()),
+                warmed_files: plan.warm_files.len(),
+                evicted_files: plan.files_to_evict.len(),
+                targeted_ranges: plan.targeted_ranges,
+                matched_patterns: plan.matched_patterns.clone(),
+                matched_artifacts: plan.matched_artifacts.clone(),
+                metadata_refreshed: plan.metadata_refreshed,
+                bulk_cache_flushed: true,
+                bulk_cache_reset: plan.bulk_cache_reset,
+            },
+        );
+    }
     data_access::record_serving_bulk_cache_warmup(data_access::ServingBulkCacheWarmupStats {
         table: determined_files.table_metadata.table_name,
         snapshot_id: determined_files
@@ -930,13 +962,13 @@ pub(crate) async fn prefetch_query(
             .unwrap_or_default(),
         shaped_queries: targeted_warmup_plan
             .as_ref()
-            .map(|plan| plan.steps.len())
+            .map(|plan| plan.warmup_steps.len())
             .unwrap_or(0),
         files_considered,
         files_selected: required_files.iceberg_files.len(),
         estimated_bytes: targeted_warmup_plan
             .as_ref()
-            .map(|plan| plan.estimated_bytes)
+            .map(|plan| plan.estimated_warm_bytes)
             .unwrap_or_else(|| {
                 required_files
                     .iceberg_files
