@@ -188,6 +188,8 @@ pub(crate) struct QueryResultHits {
 pub(crate) struct TermAggregationBucket {
     pub key: String,
     pub doc_count: u64,
+    #[serde(flatten)]
+    pub aggs: HashMap<String, AggregationResult>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -464,7 +466,7 @@ impl UpdateByQuerySuccess {
 
 #[cfg(test)]
 mod tests {
-    use super::{QueryResultHit, compare_query_result_hits_desc};
+    use super::{compare_query_result_hits_desc, QueryResultHit};
     use serde_json::json;
 
     #[test]

@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::net::{SocketAddr, TcpStream};
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -90,6 +90,11 @@ enum Assertion {
     JsonPathFloat {
         path: String,
         value: f64,
+        tolerance: Option<f64>,
+    },
+    JsonPathFloatList {
+        path: String,
+        values: Vec<f64>,
         tolerance: Option<f64>,
     },
     JsonPathMissing {
@@ -596,6 +601,39 @@ fn evaluate_assertion(
                 allowed_delta
             );
         }
+        Assertion::JsonPathFloatList {
+            path,
+            values,
+            tolerance,
+        } => {
+            let rendered_path = render_template(path, vars);
+            let json = parse_json_body(response, case, target_label);
+            let actual = float_list(&json, &rendered_path, case);
+            let allowed_delta = tolerance.unwrap_or(1e-9);
+            assert_eq!(
+                actual.len(),
+                values.len(),
+                "case '{}' failed on target '{}' for path '{}': expected {} float values, got {}",
+                case.id,
+                target_label,
+                rendered_path,
+                values.len(),
+                actual.len()
+            );
+            for (index, (actual, expected)) in actual.iter().zip(values.iter()).enumerate() {
+                assert!(
+                    (*actual - *expected).abs() <= allowed_delta,
+                    "case '{}' failed on target '{}' for path '{}' at index {}: expected {}, got {}, tolerance {}",
+                    case.id,
+                    target_label,
+                    rendered_path,
+                    index,
+                    expected,
+                    actual,
+                    allowed_delta
+                );
+            }
+        }
         Assertion::JsonPathMissing { path } => {
             let rendered_path = render_template(path, vars);
             let json = parse_json_body(response, case, target_label);
@@ -798,6 +836,39 @@ fn compare_assertion_projection(
                 allowed_delta
             );
         }
+        Assertion::JsonPathFloatList {
+            path, tolerance, ..
+        } => {
+            let rendered_path = render_template(path, vars);
+            let local_json = parse_json_body(local_response, case, "local");
+            let external_json = parse_json_body(external_response, case, "external");
+            let local = float_list(&local_json, &rendered_path, case);
+            let external = float_list(&external_json, &rendered_path, case);
+            let allowed_delta = tolerance.unwrap_or(1e-9);
+            assert_eq!(
+                local.len(),
+                external.len(),
+                "case '{}' produced different float list lengths for path '{}': local={:?}, external={:?}",
+                case.id,
+                rendered_path,
+                local,
+                external
+            );
+            for (index, (local_value, external_value)) in
+                local.iter().zip(external.iter()).enumerate()
+            {
+                assert!(
+                    (*local_value - *external_value).abs() <= allowed_delta,
+                    "case '{}' produced different float values for path '{}' at index {}: local={}, external={}, tolerance={}",
+                    case.id,
+                    rendered_path,
+                    index,
+                    local_value,
+                    external_value,
+                    allowed_delta
+                );
+            }
+        }
         Assertion::JsonPathMissing { path } => {
             let rendered_path = render_template(path, vars);
             let local_json = parse_json_body(local_response, case, "local");
@@ -938,6 +1009,17 @@ fn bool_list(value: &Value, path: &str, case: &CompatibilityCase) -> Vec<bool> {
         .map(|v| {
             v.as_bool().unwrap_or_else(|| {
                 panic!("non-bool value for path '{}' in case '{}'", path, case.id)
+            })
+        })
+        .collect()
+}
+
+fn float_list(value: &Value, path: &str, case: &CompatibilityCase) -> Vec<f64> {
+    extract_values(value, path)
+        .into_iter()
+        .map(|v| {
+            v.as_f64().unwrap_or_else(|| {
+                panic!("non-float value for path '{}' in case '{}'", path, case.id)
             })
         })
         .collect()
