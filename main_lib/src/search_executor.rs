@@ -1483,6 +1483,31 @@ mod tests {
     }
 
     #[test]
+    fn test_date_histogram_terms_subaggregation_uses_typed_node_merge_path() {
+        let command = parse_search_command(
+            r#"{
+  "aggs": {
+    "per_day": {
+      "date_histogram": {
+        "field": "@timestamp",
+        "fixed_interval": "1d"
+      },
+      "aggs": {
+        "by_service": {
+          "terms": {
+            "field": "service"
+          }
+        }
+      }
+    }
+  }
+}"#,
+        );
+
+        assert!(command.supports_typed_node_merge());
+    }
+
+    #[test]
     fn test_terms_subaggregation_uses_typed_node_merge_path() {
         let command = parse_search_command(
             r#"{
@@ -1495,6 +1520,31 @@ mod tests {
         "avg_index_col": {
           "avg": {
             "field": "index_col"
+          }
+        }
+      }
+    }
+  }
+}"#,
+        );
+
+        assert!(command.supports_typed_node_merge());
+    }
+
+    #[test]
+    fn test_terms_date_histogram_subaggregation_uses_typed_node_merge_path() {
+        let command = parse_search_command(
+            r#"{
+  "aggs": {
+    "by_service": {
+      "terms": {
+        "field": "service"
+      },
+      "aggs": {
+        "per_day": {
+          "date_histogram": {
+            "field": "@timestamp",
+            "fixed_interval": "1d"
           }
         }
       }
@@ -1594,6 +1644,34 @@ mod tests {
     "by_service": {
       "terms": {
         "field": "service"
+      },
+      "aggs": {
+        "price_ranges": {
+          "range": {
+            "field": "price",
+            "ranges": [
+              { "from": "0", "to": "100" }
+            ]
+          }
+        }
+      }
+    }
+  }
+}"#,
+        );
+
+        assert!(!command.supports_typed_node_merge());
+    }
+
+    #[test]
+    fn test_date_histogram_subaggregation_with_unsupported_nested_range_stays_on_legacy_path() {
+        let command = parse_search_command(
+            r#"{
+  "aggs": {
+    "per_day": {
+      "date_histogram": {
+        "field": "@timestamp",
+        "fixed_interval": "1d"
       },
       "aggs": {
         "price_ranges": {

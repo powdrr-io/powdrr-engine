@@ -2920,6 +2920,48 @@ pub(crate) mod tests {
         );
         assert_eq!(histogram_buckets[2]["doc_count"], json!(2));
 
+        let multi_index_date_histogram_avg_subagg_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs,events_extra/_search",
+                r#"{
+                  "size": 0,
+                  "aggs": {
+                    "per_day": {
+                      "date_histogram": {
+                        "field": "@timestamp",
+                        "fixed_interval": "1d"
+                      },
+                      "aggs": {
+                        "avg_index_col": {
+                          "avg": {
+                            "field": "index_col"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(multi_index_date_histogram_avg_subagg_response.status(), 200);
+        let multi_index_date_histogram_avg_subagg_json: Value = serde_json::from_str(
+            &multi_index_date_histogram_avg_subagg_response
+                .read_utf8_body()
+                .unwrap(),
+        )
+        .unwrap();
+        let histogram_avg_buckets =
+            multi_index_date_histogram_avg_subagg_json["aggregations"]["per_day"]["buckets"]
+                .as_array()
+                .unwrap();
+        assert_eq!(histogram_avg_buckets.len(), 5);
+        assert_eq!(histogram_avg_buckets[0]["avg_index_col"]["value"], json!(0.0));
+        assert_eq!(histogram_avg_buckets[1]["avg_index_col"]["value"], json!(3.0));
+        assert_eq!(histogram_avg_buckets[2]["avg_index_col"]["value"], json!(4.5));
+
         let multi_index_terms_subagg_response = test_server
             .client()
             .post(

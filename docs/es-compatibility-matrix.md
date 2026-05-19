@@ -75,6 +75,9 @@ The manifest file turns this into an enforceable surface contract:
 | Aggregations | `date_histogram` over `logs-*` returns expected per-day buckets | `logs_wildcard_date_histogram_returns_expected_buckets` | Yes | Yes | First differential workload histogram contract |
 | Aggregations | `cardinality` over `logs-*` returns the expected distinct value count | `logs_wildcard_cardinality_returns_expected_value` | Yes | Yes | Uses exact merge semantics in the typed path |
 | Aggregations | `terms` with per-bucket `avg` sub-aggregations over `logs-*` returns the expected merged buckets | `logs_wildcard_terms_subaggregation_returns_expected_buckets` | Yes | Yes | First differential contract for typed bucket sub-aggregation merge |
+| Aggregations | `date_histogram` with nested per-bucket `avg` metrics over `logs-*` returns the expected bucket metrics | `logs_wildcard_date_histogram_metric_subaggregation_returns_expected_bucket_metrics` | Yes | Yes | Freezes typed histogram bucket metric merge |
+| Aggregations | `date_histogram` with nested `terms` buckets over `logs-*` returns the expected nested bucket tree | `logs_wildcard_date_histogram_terms_subaggregation_returns_expected_nested_buckets` | Yes | Yes | Covers histogram-to-terms dashboard drilldown |
+| Aggregations | `terms` with nested `date_histogram` buckets over `logs-*` returns the expected nested bucket tree | `logs_wildcard_terms_date_histogram_subaggregation_returns_expected_nested_buckets` | Yes | Yes | Covers terms-to-histogram dashboard drilldown |
 
 ## Surface Rules
 
