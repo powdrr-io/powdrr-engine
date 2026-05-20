@@ -1044,6 +1044,7 @@ fn bm25_fallback_score_from_values(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data_contract::IcebergColumnStats;
     use std::collections::HashMap;
 
     fn checkpoint_with_extension_metadata(
@@ -1124,40 +1125,46 @@ mod tests {
             row_groups: vec![],
         };
 
-        assert!(iceberg_file_may_match_search(
+        assert!(file_may_match_predicates(
             &file_stats,
-            &[PrivateExactConstraintGroup {
-                field: "service".to_string(),
-                values: vec!["billing".to_string(), "payments".to_string()],
-            }],
-            &[PrivateSearchRangeConstraint {
-                field: "@timestamp".to_string(),
-                gt: None,
-                gte: Some(serde_json::Value::from(150_i64)),
-                lt: None,
-                lte: Some(serde_json::Value::from(250_i64)),
-            }],
+            &search_query_predicates(
+                &[PrivateExactConstraintGroup {
+                    field: "service".to_string(),
+                    values: vec!["billing".to_string(), "payments".to_string()],
+                }],
+                &[PrivateSearchRangeConstraint {
+                    field: "@timestamp".to_string(),
+                    gt: None,
+                    gte: Some(serde_json::Value::from(150_i64)),
+                    lt: None,
+                    lte: Some(serde_json::Value::from(250_i64)),
+                }],
+            ),
         ));
 
-        assert!(!iceberg_file_may_match_search(
+        assert!(!file_may_match_predicates(
             &file_stats,
-            &[PrivateExactConstraintGroup {
-                field: "service".to_string(),
-                values: vec!["zzz".to_string()],
-            }],
-            &[],
+            &search_query_predicates(
+                &[PrivateExactConstraintGroup {
+                    field: "service".to_string(),
+                    values: vec!["zzz".to_string()],
+                }],
+                &[],
+            ),
         ));
 
-        assert!(!iceberg_file_may_match_search(
+        assert!(!file_may_match_predicates(
             &file_stats,
-            &[],
-            &[PrivateSearchRangeConstraint {
-                field: "@timestamp".to_string(),
-                gt: None,
-                gte: Some(serde_json::Value::from(250_i64)),
-                lt: None,
-                lte: None,
-            }],
+            &search_query_predicates(
+                &[],
+                &[PrivateSearchRangeConstraint {
+                    field: "@timestamp".to_string(),
+                    gt: None,
+                    gte: Some(serde_json::Value::from(250_i64)),
+                    lt: None,
+                    lte: None,
+                }],
+            ),
         ));
     }
 
