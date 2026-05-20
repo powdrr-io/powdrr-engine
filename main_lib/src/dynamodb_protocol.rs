@@ -11,14 +11,14 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::parquet::arrow::ArrowWriter;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{body, Body};
+use gotham::hyper::{Body, body};
 use gotham::mime;
 use gotham::state::{FromState, State};
 use hmac::{Hmac, Mac};
 use http::{HeaderMap, StatusCode};
 use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::data_access::{self, execute_sql_async, load_files_as_table};
@@ -28,7 +28,7 @@ use crate::data_contract::{
     ServingTableConfig, TableDescription, TableMetadataCheckpoint,
 };
 use crate::elastic_search_endpoints::NamePathExtractor;
-use crate::lakehouse_serving::{execute_serving_query, ServingQueryError, ServingQueryResponse};
+use crate::lakehouse_serving::{ServingQueryError, ServingQueryResponse, execute_serving_query};
 use crate::peers::CheckpointDescriptor;
 use crate::schema_massager::{PowdrrDataType, PowdrrSchema, extract_powdrr_schema};
 use crate::search_runtime::batches_to_serde_value;
@@ -259,6 +259,29 @@ struct PutItemResponse {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "PascalCase")]
+struct UpdateItemRequest {
+    table_name: String,
+    key: Map<String, Value>,
+    update_expression: String,
+    #[serde(default)]
+    condition_expression: Option<String>,
+    #[serde(default)]
+    expression_attribute_names: Option<HashMap<String, String>>,
+    #[serde(default)]
+    expression_attribute_values: Option<HashMap<String, Value>>,
+    #[serde(default)]
+    return_values: Option<String>,
+}
+
+#[derive(Serialize)]
+struct UpdateItemResponse {
+    #[serde(rename = "Attributes", skip_serializing_if = "Option::is_none")]
+    attributes: Option<Map<String, Value>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "PascalCase")]
 struct DeleteItemRequest {
     table_name: String,
     key: Map<String, Value>,
@@ -276,6 +299,43 @@ struct DeleteItemRequest {
 struct DeleteItemResponse {
     #[serde(rename = "Attributes", skip_serializing_if = "Option::is_none")]
     attributes: Option<Map<String, Value>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "PascalCase")]
+struct BatchWriteItemRequest {
+    request_items: HashMap<String, Vec<BatchWriteRequest>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "PascalCase")]
+struct BatchWriteRequest {
+    #[serde(default)]
+    put_request: Option<BatchPutRequest>,
+    #[serde(default)]
+    delete_request: Option<BatchDeleteRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "PascalCase")]
+struct BatchPutRequest {
+    item: Map<String, Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "PascalCase")]
+struct BatchDeleteRequest {
+    key: Map<String, Value>,
+}
+
+#[derive(Serialize)]
+struct BatchWriteItemResponse {
+    #[serde(rename = "UnprocessedItems")]
+    unprocessed_items: Map<String, Value>,
 }
 
 #[derive(Deserialize)]
@@ -469,6 +529,9 @@ enum ReturnConsumedCapacityMode {
 enum WriteReturnValues {
     None,
     AllOld,
+    UpdatedOld,
+    AllNew,
+    UpdatedNew,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -520,6 +583,31 @@ enum FilterPredicateKind {
     AttributeExists,
     AttributeNotExists,
     AttributeType(String),
+}
+
+#[derive(Clone, Debug)]
+struct ParsedUpdateExpression {
+    actions: Vec<UpdateAction>,
+    touched_fields: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+enum UpdateAction {
+    Set { field: String, value: Value },
+    Remove { field: String },
+    Add { field: String, value: Value },
+    Delete { field: String, value: Value },
+}
+
+#[derive(Clone, Debug)]
+enum BatchWriteOperation {
+    Put {
+        item: Value,
+        key: HashMap<String, Value>,
+    },
+    Delete {
+        key: HashMap<String, Value>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -674,8 +762,10 @@ pub fn dynamodb_api(mut state: State) -> Pin<Box<HandlerFuture>> {
                 "DescribeTable" => handle_describe_table(payload).await?,
                 "GetItem" => handle_get_item(payload).await?,
                 "PutItem" => handle_put_item(payload).await?,
+                "UpdateItem" => handle_update_item(payload).await?,
                 "DeleteItem" => handle_delete_item(payload).await?,
                 "BatchGetItem" => handle_batch_get_item(payload).await?,
+                "BatchWriteItem" => handle_batch_write_item(payload).await?,
                 "Query" => handle_query(payload).await?,
                 "Scan" => handle_scan(payload).await?,
                 _ => {
@@ -938,7 +1028,61 @@ async fn handle_put_item(payload: Value) -> Result<Value, DynamoDbError> {
                 .as_ref()
                 .map(json_row_to_dynamodb_item)
                 .transpose()?,
+            WriteReturnValues::UpdatedOld
+            | WriteReturnValues::AllNew
+            | WriteReturnValues::UpdatedNew => {
+                unreachable!("PutItem parser should reject update-only ReturnValues variants")
+            }
         },
+    })
+    .unwrap())
+}
+
+async fn handle_update_item(payload: Value) -> Result<Value, DynamoDbError> {
+    let request = serde_json::from_value::<UpdateItemRequest>(payload).map_err(|error| {
+        DynamoDbError::validation(format!("Invalid UpdateItem request: {}", error))
+    })?;
+    let context = load_dynamodb_table_context(&request.table_name).await?;
+    let key_schema = primary_key_schema(&context.config);
+    let key = parse_key_map(&request.key, &key_schema)?;
+    let return_values = parse_write_return_values(request.return_values.as_deref(), "UpdateItem")?;
+    let condition_expression = parse_condition_expression(
+        request.condition_expression.as_ref(),
+        request.expression_attribute_names.as_ref(),
+        request.expression_attribute_values.as_ref(),
+    )?;
+    let parsed_update_expression = parse_update_expression(
+        &request.update_expression,
+        request.expression_attribute_names.as_ref(),
+        request.expression_attribute_values.as_ref(),
+        &context.schema,
+        &key_schema,
+    )?;
+
+    let (checkpoint, rows) = load_mutable_table_rows(&request.table_name).await?;
+    let (existing_item, mut retained_rows) = split_rows_by_key(rows, &key_schema, &key)?;
+    if !condition_matches(existing_item.as_ref(), &condition_expression)? {
+        return Err(DynamoDbError::conditional_check_failed(
+            "The conditional request failed",
+        ));
+    }
+
+    let updated_item = apply_update_expression(
+        existing_item.as_ref(),
+        &key_schema,
+        &key,
+        &parsed_update_expression,
+    )?;
+    retained_rows.push(updated_item.clone());
+    publish_mutated_checkpoint(&checkpoint, retained_rows).await?;
+
+    Ok(serde_json::to_value(UpdateItemResponse {
+        attributes: update_return_attributes(
+            return_values,
+            existing_item.as_ref(),
+            &updated_item,
+            &parsed_update_expression.touched_fields,
+        )?,
     })
     .unwrap())
 }
@@ -975,7 +1119,94 @@ async fn handle_delete_item(payload: Value) -> Result<Value, DynamoDbError> {
                 .as_ref()
                 .map(json_row_to_dynamodb_item)
                 .transpose()?,
+            WriteReturnValues::UpdatedOld
+            | WriteReturnValues::AllNew
+            | WriteReturnValues::UpdatedNew => {
+                unreachable!("DeleteItem parser should reject update-only ReturnValues variants")
+            }
         },
+    })
+    .unwrap())
+}
+
+async fn handle_batch_write_item(payload: Value) -> Result<Value, DynamoDbError> {
+    let request = serde_json::from_value::<BatchWriteItemRequest>(payload).map_err(|error| {
+        DynamoDbError::validation(format!("Invalid BatchWriteItem request: {}", error))
+    })?;
+    if request.request_items.is_empty() {
+        return Err(DynamoDbError::validation(
+            "BatchWriteItem requires at least one table entry",
+        ));
+    }
+    let total_operations = request
+        .request_items
+        .values()
+        .map(|requests| requests.len())
+        .sum::<usize>();
+    if total_operations > 25 {
+        return Err(DynamoDbError::validation(
+            "BatchWriteItem supports at most 25 write requests",
+        ));
+    }
+
+    let mut duplicate_keys = HashSet::new();
+    let mut table_mutations = Vec::new();
+    for (table_name, requests) in request.request_items.iter() {
+        if requests.is_empty() {
+            return Err(DynamoDbError::validation(format!(
+                "BatchWriteItem requires at least one write request for table {}",
+                table_name
+            )));
+        }
+        let context = load_dynamodb_table_context(table_name).await?;
+        let key_schema = primary_key_schema(&context.config);
+        let mut operations = Vec::with_capacity(requests.len());
+        for request in requests.iter() {
+            let operation = parse_batch_write_request(request, &context.schema, &key_schema)?;
+            let key = match &operation {
+                BatchWriteOperation::Put { key, .. } | BatchWriteOperation::Delete { key } => key,
+            };
+            let duplicate_key = format!(
+                "{}:{}",
+                table_name,
+                serde_json::to_string(&canonical_key_value(&key_schema, key)).unwrap()
+            );
+            if !duplicate_keys.insert(duplicate_key) {
+                return Err(DynamoDbError::validation(
+                    "BatchWriteItem cannot perform multiple operations on the same item in one request",
+                ));
+            }
+            operations.push(operation);
+        }
+        table_mutations.push((table_name.clone(), key_schema, operations));
+    }
+
+    for (table_name, key_schema, operations) in table_mutations.into_iter() {
+        let (checkpoint, mut rows) = load_mutable_table_rows(&table_name).await?;
+        let mut changed = false;
+        for operation in operations.into_iter() {
+            match operation {
+                BatchWriteOperation::Put { item, key } => {
+                    let (_, retained_rows) = split_rows_by_key(rows, &key_schema, &key)?;
+                    rows = retained_rows;
+                    rows.push(item);
+                    changed = true;
+                }
+                BatchWriteOperation::Delete { key } => {
+                    let (existing_item, retained_rows) =
+                        split_rows_by_key(rows, &key_schema, &key)?;
+                    rows = retained_rows;
+                    changed |= existing_item.is_some();
+                }
+            }
+        }
+        if changed {
+            publish_mutated_checkpoint(&checkpoint, rows).await?;
+        }
+    }
+
+    Ok(serde_json::to_value(BatchWriteItemResponse {
+        unprocessed_items: Map::new(),
     })
     .unwrap())
 }
@@ -1789,6 +2020,543 @@ fn validate_put_item_fields(schema: &PowdrrSchema, item: &Value) -> Result<(), D
     )))
 }
 
+fn parse_update_expression(
+    expression: &str,
+    names: Option<&HashMap<String, String>>,
+    values: Option<&HashMap<String, Value>>,
+    schema: &PowdrrSchema,
+    key_schema: &DynamoDbKeySchemaConfig,
+) -> Result<ParsedUpdateExpression, DynamoDbError> {
+    let resolved = resolve_expression_names(expression, names)?;
+    let empty_values = HashMap::new();
+    let values = values.unwrap_or(&empty_values);
+    let mut remaining = resolved.trim();
+    if remaining.is_empty() {
+        return Err(DynamoDbError::validation(
+            "UpdateExpression must not be empty",
+        ));
+    }
+
+    let mut actions = Vec::new();
+    let mut touched_fields = Vec::new();
+    let mut seen_fields = HashSet::new();
+    while !remaining.is_empty() {
+        let (action_name, action_body, rest) = split_next_update_action(remaining)?;
+        for clause in split_update_action_clauses(action_body)? {
+            let action =
+                parse_update_action_clause(action_name, clause, values, schema, key_schema)?;
+            let field_name = match &action {
+                UpdateAction::Set { field, .. }
+                | UpdateAction::Remove { field }
+                | UpdateAction::Add { field, .. }
+                | UpdateAction::Delete { field, .. } => field.clone(),
+            };
+            if !seen_fields.insert(field_name.clone()) {
+                return Err(DynamoDbError::validation(format!(
+                    "UpdateExpression cannot update attribute {} multiple times",
+                    field_name
+                )));
+            }
+            touched_fields.push(field_name);
+            actions.push(action);
+        }
+        remaining = rest;
+    }
+
+    Ok(ParsedUpdateExpression {
+        actions,
+        touched_fields,
+    })
+}
+
+fn split_next_update_action<'a>(
+    expression: &'a str,
+) -> Result<(&'static str, &'a str, &'a str), DynamoDbError> {
+    let trimmed = expression.trim_start();
+    let Some((action_name, remainder)) = leading_update_action(trimmed) else {
+        return Err(DynamoDbError::validation(
+            "UpdateExpression must start with SET, REMOVE, ADD, or DELETE",
+        ));
+    };
+    let next_start = find_next_update_action_start(remainder);
+    let (body, rest) = match next_start {
+        Some(index) => (&remainder[..index], &remainder[index..]),
+        None => (remainder, ""),
+    };
+    if body.trim().is_empty() {
+        return Err(DynamoDbError::validation(format!(
+            "UpdateExpression {} action must include at least one clause",
+            action_name
+        )));
+    }
+    Ok((action_name, body.trim(), rest.trim_start()))
+}
+
+fn leading_update_action(input: &str) -> Option<(&'static str, &str)> {
+    for keyword in ["SET", "REMOVE", "ADD", "DELETE"] {
+        if input.len() < keyword.len() {
+            continue;
+        }
+        let (head, tail) = input.split_at(keyword.len());
+        if head.eq_ignore_ascii_case(keyword)
+            && tail.chars().next().map(char::is_whitespace).unwrap_or(true)
+        {
+            return Some((keyword, tail.trim_start()));
+        }
+    }
+    None
+}
+
+fn find_next_update_action_start(input: &str) -> Option<usize> {
+    let mut previous_was_whitespace = true;
+    for (index, character) in input.char_indices() {
+        if !previous_was_whitespace {
+            previous_was_whitespace = character.is_whitespace();
+            continue;
+        }
+        for keyword in ["SET", "REMOVE", "ADD", "DELETE"] {
+            if input[index..].len() < keyword.len() {
+                continue;
+            }
+            let candidate = &input[index..index + keyword.len()];
+            let tail = &input[index + keyword.len()..];
+            if candidate.eq_ignore_ascii_case(keyword)
+                && tail.chars().next().map(char::is_whitespace).unwrap_or(true)
+            {
+                return Some(index);
+            }
+        }
+        previous_was_whitespace = character.is_whitespace();
+    }
+    None
+}
+
+fn split_update_action_clauses(action_body: &str) -> Result<Vec<&str>, DynamoDbError> {
+    let clauses = action_body
+        .split(',')
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+        .collect::<Vec<_>>();
+    if clauses.is_empty() {
+        return Err(DynamoDbError::validation(
+            "UpdateExpression action must include at least one clause",
+        ));
+    }
+    Ok(clauses)
+}
+
+fn parse_update_action_clause(
+    action_name: &str,
+    clause: &str,
+    values: &HashMap<String, Value>,
+    schema: &PowdrrSchema,
+    key_schema: &DynamoDbKeySchemaConfig,
+) -> Result<UpdateAction, DynamoDbError> {
+    match action_name {
+        "SET" => {
+            let (field, token) = clause.split_once('=').ok_or_else(|| {
+                DynamoDbError::validation(
+                    "UpdateItem currently supports SET clauses of the form field = :value",
+                )
+            })?;
+            let field = validate_update_field_name(field.trim(), schema, key_schema)?;
+            let token = token.trim();
+            if !token.starts_with(':') {
+                return Err(DynamoDbError::validation(
+                    "UpdateItem currently supports SET clauses with ExpressionAttributeValues only",
+                ));
+            }
+            let value = lookup_expression_value(token, values)?;
+            validate_update_value_type(schema, &field, &value, "SET")?;
+            Ok(UpdateAction::Set { field, value })
+        }
+        "REMOVE" => {
+            let field = validate_update_field_name(clause.trim(), schema, key_schema)?;
+            Ok(UpdateAction::Remove { field })
+        }
+        "ADD" | "DELETE" => {
+            let mut parts = clause.split_whitespace();
+            let field_token = parts.next().ok_or_else(|| {
+                DynamoDbError::validation(format!(
+                    "UpdateItem {} clauses must include an attribute name",
+                    action_name
+                ))
+            })?;
+            let value_token = parts.next().ok_or_else(|| {
+                DynamoDbError::validation(format!(
+                    "UpdateItem {} clauses must include an ExpressionAttributeValues token",
+                    action_name
+                ))
+            })?;
+            if parts.next().is_some() {
+                return Err(DynamoDbError::validation(format!(
+                    "UpdateItem currently supports simple {} clauses only",
+                    action_name
+                )));
+            }
+            let field = validate_update_field_name(field_token, schema, key_schema)?;
+            if !value_token.starts_with(':') {
+                return Err(DynamoDbError::validation(format!(
+                    "UpdateItem {} clauses must use ExpressionAttributeValues tokens",
+                    action_name
+                )));
+            }
+            let value = lookup_expression_value(value_token, values)?;
+            match action_name {
+                "ADD" => {
+                    validate_add_value(&value)?;
+                    validate_update_value_type(schema, &field, &value, "ADD")?;
+                    Ok(UpdateAction::Add { field, value })
+                }
+                "DELETE" => {
+                    validate_delete_value(&value)?;
+                    validate_update_value_type(schema, &field, &value, "DELETE")?;
+                    Ok(UpdateAction::Delete { field, value })
+                }
+                _ => unreachable!(),
+            }
+        }
+        _ => Err(DynamoDbError::validation(format!(
+            "Unsupported UpdateExpression action {}",
+            action_name
+        ))),
+    }
+}
+
+fn validate_update_field_name(
+    field_name: &str,
+    schema: &PowdrrSchema,
+    key_schema: &DynamoDbKeySchemaConfig,
+) -> Result<String, DynamoDbError> {
+    if field_name.is_empty() {
+        return Err(DynamoDbError::validation(
+            "UpdateExpression field name must not be empty",
+        ));
+    }
+    if field_name.contains('.') || field_name.contains('[') || field_name.contains(']') {
+        return Err(DynamoDbError::validation(
+            "UpdateItem currently supports only top-level attribute updates",
+        ));
+    }
+    if field_name == key_schema.partition_key || key_schema.sort_key.as_deref() == Some(field_name)
+    {
+        return Err(DynamoDbError::validation(format!(
+            "UpdateItem cannot modify key attribute {}",
+            field_name
+        )));
+    }
+    let known_fields = schema
+        .fields()
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<HashSet<_>>();
+    if !known_fields.contains(field_name) {
+        return Err(DynamoDbError::validation(format!(
+            "UpdateItem currently supports only existing table schema attributes; unknown field {}",
+            field_name
+        )));
+    }
+    Ok(field_name.to_string())
+}
+
+fn validate_update_value_type(
+    schema: &PowdrrSchema,
+    field_name: &str,
+    value: &Value,
+    action_name: &str,
+) -> Result<(), DynamoDbError> {
+    let schema_map = schema.to_map();
+    let field = schema_map
+        .get(field_name)
+        .ok_or_else(|| DynamoDbError::validation(format!("Unknown schema field {}", field_name)))?;
+    let matches = match &field.data_type {
+        PowdrrDataType::String => value.is_string() || value.is_null(),
+        PowdrrDataType::Integer => {
+            value.as_i64().is_some() || value.as_u64().is_some() || value.is_null()
+        }
+        PowdrrDataType::Float => value.is_number() || value.is_null(),
+        PowdrrDataType::Boolean => value.is_boolean() || value.is_null(),
+        PowdrrDataType::Object(_) => value.is_object() || value.is_null(),
+        PowdrrDataType::Array(_) => value.is_array() || value.is_null(),
+        PowdrrDataType::Null => value.is_null(),
+    };
+    if matches {
+        return Ok(());
+    }
+    Err(DynamoDbError::validation(format!(
+        "{} value for field {} did not match the existing table schema type",
+        action_name, field_name
+    )))
+}
+
+fn validate_add_value(value: &Value) -> Result<(), DynamoDbError> {
+    if value.is_number() {
+        return Ok(());
+    }
+    if let Some((_, members)) = dynamodb_set_members(value) {
+        if members.is_empty() {
+            return Err(DynamoDbError::validation(
+                "ADD does not support empty set values",
+            ));
+        }
+        return Ok(());
+    }
+    Err(DynamoDbError::validation(
+        "ADD currently supports only number and set values",
+    ))
+}
+
+fn validate_delete_value(value: &Value) -> Result<(), DynamoDbError> {
+    let Some((_, members)) = dynamodb_set_members(value) else {
+        return Err(DynamoDbError::validation(
+            "DELETE currently supports only set values",
+        ));
+    };
+    if members.is_empty() {
+        return Err(DynamoDbError::validation(
+            "DELETE does not support empty set values",
+        ));
+    }
+    Ok(())
+}
+
+fn apply_update_expression(
+    existing_item: Option<&Value>,
+    key_schema: &DynamoDbKeySchemaConfig,
+    key: &HashMap<String, Value>,
+    parsed: &ParsedUpdateExpression,
+) -> Result<Value, DynamoDbError> {
+    let mut object = existing_item
+        .and_then(|item| item.as_object().cloned())
+        .unwrap_or_default();
+    object.insert(
+        key_schema.partition_key.clone(),
+        key.get(&key_schema.partition_key)
+            .cloned()
+            .ok_or_else(|| DynamoDbError::internal("Partition key was missing during update"))?,
+    );
+    if let Some(sort_key) = key_schema.sort_key.as_ref() {
+        object.insert(
+            sort_key.clone(),
+            key.get(sort_key)
+                .cloned()
+                .ok_or_else(|| DynamoDbError::internal("Sort key was missing during update"))?,
+        );
+    }
+    for action in parsed.actions.iter() {
+        apply_update_action(&mut object, action)?;
+    }
+    Ok(Value::Object(object))
+}
+
+fn apply_update_action(
+    object: &mut Map<String, Value>,
+    action: &UpdateAction,
+) -> Result<(), DynamoDbError> {
+    match action {
+        UpdateAction::Set { field, value } => {
+            object.insert(field.clone(), value.clone());
+            Ok(())
+        }
+        UpdateAction::Remove { field } => {
+            object.remove(field);
+            Ok(())
+        }
+        UpdateAction::Add { field, value } => apply_add_action(object, field, value),
+        UpdateAction::Delete { field, value } => apply_delete_action(object, field, value),
+    }
+}
+
+fn apply_add_action(
+    object: &mut Map<String, Value>,
+    field: &str,
+    operand: &Value,
+) -> Result<(), DynamoDbError> {
+    let next_value = match visible_object_value(object, field) {
+        None => operand.clone(),
+        Some(existing) if existing.is_number() && operand.is_number() => {
+            add_numeric_values(existing, operand)?
+        }
+        Some(existing) => union_set_values(existing, operand)?,
+    };
+    object.insert(field.to_string(), next_value);
+    Ok(())
+}
+
+fn apply_delete_action(
+    object: &mut Map<String, Value>,
+    field: &str,
+    operand: &Value,
+) -> Result<(), DynamoDbError> {
+    let Some(existing) = visible_object_value(object, field) else {
+        return Ok(());
+    };
+    let Some(next_value) = subtract_set_values(existing, operand)? else {
+        object.remove(field);
+        return Ok(());
+    };
+    object.insert(field.to_string(), next_value);
+    Ok(())
+}
+
+fn add_numeric_values(left: &Value, right: &Value) -> Result<Value, DynamoDbError> {
+    if left.is_i64() && right.is_i64() {
+        let left = left.as_i64().unwrap();
+        let right = right.as_i64().unwrap();
+        return Ok(json!(left + right));
+    }
+    let left = left.as_f64().ok_or_else(|| {
+        DynamoDbError::validation("ADD numeric operand must reference a numeric attribute")
+    })?;
+    let right = right
+        .as_f64()
+        .ok_or_else(|| DynamoDbError::validation("ADD numeric operand must be a number"))?;
+    Ok(json!(left + right))
+}
+
+fn union_set_values(existing: &Value, operand: &Value) -> Result<Value, DynamoDbError> {
+    let (existing_marker, existing_members) = dynamodb_set_members(existing).ok_or_else(|| {
+        DynamoDbError::validation("ADD currently supports only number and set values")
+    })?;
+    let (operand_marker, operand_members) = dynamodb_set_members(operand).ok_or_else(|| {
+        DynamoDbError::validation("ADD currently supports only number and set values")
+    })?;
+    if existing_marker != operand_marker {
+        return Err(DynamoDbError::validation(
+            "ADD set operands must use the same set type",
+        ));
+    }
+    let mut combined = existing_members.clone();
+    for member in operand_members.iter() {
+        if !combined.iter().any(|existing| existing == member) {
+            combined.push(member.clone());
+        }
+    }
+    Ok(set_value(existing_marker, combined))
+}
+
+fn subtract_set_values(existing: &Value, operand: &Value) -> Result<Option<Value>, DynamoDbError> {
+    let (existing_marker, existing_members) = dynamodb_set_members(existing).ok_or_else(|| {
+        DynamoDbError::validation("DELETE currently supports only set attributes")
+    })?;
+    let (operand_marker, operand_members) = dynamodb_set_members(operand)
+        .ok_or_else(|| DynamoDbError::validation("DELETE currently supports only set values"))?;
+    if existing_marker != operand_marker {
+        return Err(DynamoDbError::validation(
+            "DELETE set operands must use the same set type",
+        ));
+    }
+    let remaining = existing_members
+        .iter()
+        .filter(|member| !operand_members.iter().any(|candidate| candidate == *member))
+        .cloned()
+        .collect::<Vec<_>>();
+    if remaining.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(set_value(existing_marker, remaining)))
+}
+
+fn dynamodb_set_members(value: &Value) -> Option<(&'static str, Vec<Value>)> {
+    let object = value.as_object()?;
+    for marker in [
+        DYNAMODB_STRING_SET_MARKER,
+        DYNAMODB_NUMBER_SET_MARKER,
+        DYNAMODB_BINARY_SET_MARKER,
+    ] {
+        if let Some(values) = object.get(marker).and_then(|value| value.as_array()) {
+            return Some((marker, values.to_vec()));
+        }
+    }
+    None
+}
+
+fn set_value(marker: &str, values: Vec<Value>) -> Value {
+    Value::Object(Map::from_iter([(marker.to_string(), Value::Array(values))]))
+}
+
+fn parse_batch_write_request(
+    request: &BatchWriteRequest,
+    schema: &PowdrrSchema,
+    key_schema: &DynamoDbKeySchemaConfig,
+) -> Result<BatchWriteOperation, DynamoDbError> {
+    match (&request.put_request, &request.delete_request) {
+        (Some(_), Some(_)) => Err(DynamoDbError::validation(
+            "BatchWriteItem request entries cannot include both PutRequest and DeleteRequest",
+        )),
+        (None, None) => Err(DynamoDbError::validation(
+            "BatchWriteItem request entries must include PutRequest or DeleteRequest",
+        )),
+        (Some(put_request), None) => {
+            let item = dynamodb_item_to_json_row(&put_request.item)?;
+            validate_put_item_fields(schema, &item)?;
+            let key = parse_item_key_map(&put_request.item, key_schema)?;
+            Ok(BatchWriteOperation::Put { item, key })
+        }
+        (None, Some(delete_request)) => Ok(BatchWriteOperation::Delete {
+            key: parse_key_map(&delete_request.key, key_schema)?,
+        }),
+    }
+}
+
+fn canonical_key_value(
+    key_schema: &DynamoDbKeySchemaConfig,
+    key: &HashMap<String, Value>,
+) -> Value {
+    let mut object = Map::new();
+    if let Some(value) = key.get(&key_schema.partition_key) {
+        object.insert(key_schema.partition_key.clone(), value.clone());
+    }
+    if let Some(sort_key) = key_schema.sort_key.as_ref() {
+        if let Some(value) = key.get(sort_key) {
+            object.insert(sort_key.clone(), value.clone());
+        }
+    }
+    Value::Object(object)
+}
+
+fn update_return_attributes(
+    return_values: WriteReturnValues,
+    old_item: Option<&Value>,
+    new_item: &Value,
+    touched_fields: &[String],
+) -> Result<Option<Map<String, Value>>, DynamoDbError> {
+    match return_values {
+        WriteReturnValues::None => Ok(None),
+        WriteReturnValues::AllOld => old_item.map(json_row_to_dynamodb_item).transpose(),
+        WriteReturnValues::AllNew => Ok(Some(json_row_to_dynamodb_item(new_item)?)),
+        WriteReturnValues::UpdatedOld => updated_attribute_projection(old_item, touched_fields)
+            .map(|map| if map.is_empty() { None } else { Some(map) }),
+        WriteReturnValues::UpdatedNew => {
+            let map = updated_attribute_projection(Some(new_item), touched_fields)?;
+            if map.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(map))
+            }
+        }
+    }
+}
+
+fn updated_attribute_projection(
+    item: Option<&Value>,
+    touched_fields: &[String],
+) -> Result<Map<String, Value>, DynamoDbError> {
+    let Some(item) = item else {
+        return Ok(Map::new());
+    };
+    let object = item
+        .as_object()
+        .ok_or_else(|| DynamoDbError::internal("Updated DynamoDB item was not an object"))?;
+    let mut attributes = Map::new();
+    for field in touched_fields.iter() {
+        if let Some(value) = visible_object_value(object, field) {
+            attributes.insert(field.clone(), json_to_dynamodb_attr(value)?);
+        }
+    }
+    Ok(attributes)
+}
+
 fn validate_dynamodb_config(
     schema: &PowdrrSchema,
     config: &DynamoDbTableConfig,
@@ -2465,6 +3233,9 @@ fn parse_write_return_values(
     match value.unwrap_or("NONE") {
         "NONE" => Ok(WriteReturnValues::None),
         "ALL_OLD" => Ok(WriteReturnValues::AllOld),
+        "UPDATED_OLD" if operation == "UpdateItem" => Ok(WriteReturnValues::UpdatedOld),
+        "ALL_NEW" if operation == "UpdateItem" => Ok(WriteReturnValues::AllNew),
+        "UPDATED_NEW" if operation == "UpdateItem" => Ok(WriteReturnValues::UpdatedNew),
         other => Err(DynamoDbError::validation(format!(
             "Unsupported ReturnValues value {} for {}",
             other, operation
@@ -3363,6 +4134,9 @@ fn json_row_to_dynamodb_item(row: &Value) -> Result<Map<String, Value>, DynamoDb
         .ok_or_else(|| DynamoDbError::internal("Serving query returned a non-object row"))?;
     let mut item = Map::new();
     for (key, value) in object.iter() {
+        if value.is_null() {
+            continue;
+        }
         item.insert(key.clone(), json_to_dynamodb_attr(value)?);
     }
     Ok(item)
@@ -3639,6 +4413,10 @@ fn compare_scan_row_field(left: Option<&Value>, right: Option<&Value>) -> Orderi
     }
 }
 
+fn visible_object_value<'a>(object: &'a Map<String, Value>, field_name: &str) -> Option<&'a Value> {
+    object.get(field_name).filter(|value| !value.is_null())
+}
+
 fn group_files_by_schema(files: &[FileDescriptor]) -> Vec<Vec<FileDescriptor>> {
     let mut groups: Vec<Vec<FileDescriptor>> = vec![];
     for file in files.iter().cloned() {
@@ -3737,10 +4515,10 @@ fn evaluate_filter_predicate(
 ) -> Result<bool, DynamoDbError> {
     match &predicate.kind {
         FilterPredicateKind::AttributeExists => {
-            Ok(object.contains_key(predicate.operand.field_name()))
+            Ok(visible_object_value(object, predicate.operand.field_name()).is_some())
         }
         FilterPredicateKind::AttributeNotExists => {
-            Ok(!object.contains_key(predicate.operand.field_name()))
+            Ok(visible_object_value(object, predicate.operand.field_name()).is_none())
         }
         FilterPredicateKind::AttributeType(expected) => {
             let Some(value) = filter_operand_value(object, &predicate.operand) else {
@@ -3797,16 +4575,17 @@ fn filter_operand_value<'a>(
     operand: &FilterOperand,
 ) -> Option<&'a Value> {
     match operand {
-        FilterOperand::Field(field_name) => object.get(field_name),
+        FilterOperand::Field(field_name) => visible_object_value(object, field_name),
         FilterOperand::Size(_) => None,
     }
 }
 
 fn filter_operand_scalar(object: &Map<String, Value>, operand: &FilterOperand) -> Option<Value> {
     match operand {
-        FilterOperand::Field(field_name) => object.get(field_name).cloned(),
+        FilterOperand::Field(field_name) => visible_object_value(object, field_name).cloned(),
         FilterOperand::Size(field_name) => object
             .get(field_name)
+            .filter(|value| !value.is_null())
             .and_then(filter_value_size)
             .map(|size| json!(size)),
     }
@@ -3960,7 +4739,7 @@ fn project_row(row: &Value, projection: &[String]) -> Result<Value, DynamoDbErro
         .ok_or_else(|| DynamoDbError::internal("Serving query returned a non-object row"))?;
     let mut projected = Map::new();
     for field in projection.iter() {
-        if let Some(value) = object.get(field) {
+        if let Some(value) = visible_object_value(object, field) {
             projected.insert(field.clone(), value.clone());
         }
     }
@@ -4222,9 +5001,12 @@ mod tests {
     use crate::schema_massager::extract_powdrr_schema;
     use crate::serving_dataset::read_parquet_documents;
     use crate::state_provider::STATE_PROVIDER;
-    use crate::test_api::{CompactionMode, IndexingMode, StateMode, TestProcessingMode};
+    use crate::test_api::{
+        CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode, StorageMode,
+        TestProcessingMode,
+    };
     use chrono::Utc;
-    use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+    use datafusion::arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::parquet::arrow::ArrowWriter;
@@ -4425,9 +5207,6 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        runtime.block_on(async {
-            ensure_test_org_registered().await;
-        });
         let dataset = runtime
             .block_on(read_parquet_documents(&dataset_path_string, Some(10)))
             .unwrap();
@@ -4463,10 +5242,15 @@ mod tests {
             extension_metadata: HashMap::new(),
             schema: dataset.schema.clone(),
         };
-        let mut mode = TestProcessingMode::default();
-        mode.state_mode = StateMode::Testing;
-        mode.indexing_mode = IndexingMode::Disabled;
-        mode.compaction_mode = CompactionMode::Disabled;
+        let mode = TestProcessingMode {
+            state_mode: StateMode::Testing,
+            storage_mode: StorageMode::default(),
+            cache_mode: CacheMode::Redis(None),
+            peer_mode: PeerMode::SelfOnly,
+            indexing_mode: IndexingMode::Disabled,
+            compaction_mode: CompactionMode::Disabled,
+            prefetch_mode: PrefetchMode::Disabled,
+        };
         let mode_response = test_server
             .client()
             .put(
@@ -4501,6 +5285,9 @@ mod tests {
             .perform()
             .unwrap();
         assert_eq!(config_response.status(), 200);
+        runtime.block_on(async {
+            ensure_test_org_registered().await;
+        });
 
         let key = json!({
             "tenant": { "S": "acme" },
@@ -4516,6 +5303,7 @@ mod tests {
                     "ts": { "N": "10" },
                     "event_id": { "S": "evt-1b" },
                     "region": { "S": "eu" },
+                    "active": { "BOOL": true },
                     "count": { "N": "7" }
                 },
                 "ConditionExpression": "attribute_exists(#pk)",
@@ -4554,6 +5342,46 @@ mod tests {
             dynamodb_attr_to_json(&get_item_body["Item"]["count"]).unwrap(),
             json!(7)
         );
+        assert_eq!(
+            dynamodb_attr_to_json(&get_item_body["Item"]["active"]).unwrap(),
+            json!(true)
+        );
+
+        let update_response = perform_dynamodb_request(
+            &test_server,
+            "UpdateItem",
+            json!({
+                "TableName": table_name,
+                "Key": {
+                    "tenant": { "S": "acme" },
+                    "ts": { "N": "10" }
+                },
+                "UpdateExpression": "SET event_id = :event, active = :active ADD count :delta REMOVE region",
+                "ExpressionAttributeValues": {
+                    ":event": { "S": "evt-1c" },
+                    ":active": { "BOOL": false },
+                    ":delta": { "N": "5" }
+                },
+                "ReturnValues": "ALL_NEW"
+            }),
+        );
+        assert_eq!(update_response.status(), 200);
+        let update_body =
+            serde_json::from_str::<serde_json::Value>(&update_response.read_utf8_body().unwrap())
+                .unwrap();
+        assert_eq!(
+            dynamodb_attr_to_json(&update_body["Attributes"]["event_id"]).unwrap(),
+            json!("evt-1c")
+        );
+        assert_eq!(
+            dynamodb_attr_to_json(&update_body["Attributes"]["count"]).unwrap(),
+            json!(12)
+        );
+        assert_eq!(
+            dynamodb_attr_to_json(&update_body["Attributes"]["active"]).unwrap(),
+            json!(false)
+        );
+        assert!(update_body["Attributes"].get("region").is_none());
 
         let delete_response = perform_dynamodb_request(
             &test_server,
@@ -4574,7 +5402,69 @@ mod tests {
                 .unwrap();
         assert_eq!(
             dynamodb_attr_to_json(&delete_body["Attributes"]["event_id"]).unwrap(),
-            json!("evt-1b")
+            json!("evt-1c")
+        );
+        assert_eq!(
+            dynamodb_attr_to_json(&delete_body["Attributes"]["count"]).unwrap(),
+            json!(12)
+        );
+
+        let batch_write_response = perform_dynamodb_request(
+            &test_server,
+            "BatchWriteItem",
+            json!({
+                "RequestItems": {
+                    (table_name.clone()): [
+                        {
+                            "PutRequest": {
+                                "Item": {
+                                    "tenant": { "S": "acme" },
+                                    "ts": { "N": "11" },
+                                    "event_id": { "S": "evt-11" },
+                                    "region": { "S": "us-west-1" },
+                                    "active": { "BOOL": true },
+                                    "count": { "N": "11" }
+                                }
+                            }
+                        },
+                        {
+                            "DeleteRequest": {
+                                "Key": {
+                                    "tenant": { "S": "acme" },
+                                    "ts": { "N": "20" }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }),
+        );
+        assert_eq!(batch_write_response.status(), 200);
+        let batch_write_body = serde_json::from_str::<serde_json::Value>(
+            &batch_write_response.read_utf8_body().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(batch_write_body["UnprocessedItems"], json!({}));
+
+        let batch_item_response = perform_dynamodb_request(
+            &test_server,
+            "GetItem",
+            json!({
+                "TableName": table_name,
+                "Key": {
+                    "tenant": { "S": "acme" },
+                    "ts": { "N": "11" }
+                }
+            }),
+        );
+        assert_eq!(batch_item_response.status(), 200);
+        let batch_item_body = serde_json::from_str::<serde_json::Value>(
+            &batch_item_response.read_utf8_body().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            dynamodb_attr_to_json(&batch_item_body["Item"]["event_id"]).unwrap(),
+            json!("evt-11")
         );
 
         let missing_item_response = perform_dynamodb_request(
@@ -4718,11 +5608,13 @@ mod tests {
             &list_tables_response.read_utf8_body().unwrap(),
         )
         .unwrap();
-        assert!(list_tables_body["TableNames"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value == &json!(table_name)));
+        assert!(
+            list_tables_body["TableNames"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == &json!(table_name))
+        );
 
         let list_tables_unknown_field_response =
             perform_dynamodb_request(&test_server, "ListTables", json!({ "UnknownField": true }));
@@ -4809,6 +5701,7 @@ mod tests {
             Field::new("ts", DataType::Int64, false),
             Field::new("event_id", DataType::Utf8, false),
             Field::new("region", DataType::Utf8, false),
+            Field::new("active", DataType::Boolean, false),
             Field::new("count", DataType::Int64, false),
         ]));
         let batch = RecordBatch::try_new(
@@ -4818,6 +5711,7 @@ mod tests {
                 std::sync::Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
                 std::sync::Arc::new(StringArray::from(vec!["evt-1", "evt-2"])) as ArrayRef,
                 std::sync::Arc::new(StringArray::from(vec!["us", "us"])) as ArrayRef,
+                std::sync::Arc::new(BooleanArray::from(vec![true, false])) as ArrayRef,
                 std::sync::Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
             ],
         )

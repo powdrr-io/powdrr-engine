@@ -11,10 +11,10 @@ use aws_sdk_dynamodb::Client as DynamoClient;
 use aws_sdk_dynamodb::client::Waiters;
 use aws_sdk_dynamodb::operation::query::QueryOutput;
 use aws_sdk_dynamodb::types::{
-    AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, KeySchemaElement,
-    KeyType, KeysAndAttributes, LocalSecondaryIndex, Projection, ProjectionType,
-    ReturnConsumedCapacity, ReturnValue, ScalarAttributeType, Select, TableDescription,
-    TableStatus,
+    AttributeDefinition, AttributeValue, BillingMode, DeleteRequest, GlobalSecondaryIndex,
+    KeySchemaElement, KeyType, KeysAndAttributes, LocalSecondaryIndex, Projection, ProjectionType,
+    PutRequest, ReturnConsumedCapacity, ReturnValue, ScalarAttributeType, Select, TableDescription,
+    TableStatus, WriteRequest,
 };
 use chrono::Utc;
 use datafusion::arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
@@ -109,6 +109,7 @@ const ALL_DYNAMODB_OPERATIONS: &[&str] = &[
 
 const SUPPORTED_DYNAMODB_OPERATIONS: &[&str] = &[
     "BatchGetItem",
+    "BatchWriteItem",
     "DeleteItem",
     "DescribeTable",
     "GetItem",
@@ -116,6 +117,7 @@ const SUPPORTED_DYNAMODB_OPERATIONS: &[&str] = &[
     "PutItem",
     "Query",
     "Scan",
+    "UpdateItem",
 ];
 
 #[derive(Debug, Deserialize)]
@@ -286,7 +288,9 @@ fn compatibility_matrix_wire_contract_locally() {
                     "GetItem" => compare_get_item(&fixture).await,
                     "BatchGetItem" => compare_batch_get_item(&fixture).await,
                     "PutItem" => compare_put_item_operation(&fixture).await,
+                    "UpdateItem" => compare_update_item_operation(&fixture).await,
                     "DeleteItem" => compare_delete_item_operation(&fixture).await,
+                    "BatchWriteItem" => compare_batch_write_item_operation(&fixture).await,
                     "Query" => compare_query_operation(&fixture).await,
                     "Scan" => compare_scan_operation(&fixture).await,
                     other => panic!(
@@ -644,6 +648,61 @@ async fn assert_stateful_query_errors(base_url: &str, table_name: &str) {
                 "ReturnValues": "UPDATED_OLD"
             }),
             "Unsupported ReturnValues value UPDATED_OLD for DeleteItem",
+        ),
+        (
+            "UpdateItem",
+            json!({
+                "TableName": table_name,
+                "Key": {
+                    "tenant": { "S": "acme" },
+                    "ts": { "N": "10" }
+                },
+                "UpdateExpression": "SET event_id = :event",
+                "ExpressionAttributeValues": {
+                    ":event": { "S": "evt-updated" }
+                },
+                "ReturnValues": "SIZE"
+            }),
+            "Unsupported ReturnValues value SIZE for UpdateItem",
+        ),
+        (
+            "UpdateItem",
+            json!({
+                "TableName": table_name,
+                "Key": {
+                    "tenant": { "S": "acme" },
+                    "ts": { "N": "10" }
+                },
+                "UpdateExpression": "SET metadata.nested = :value",
+                "ExpressionAttributeValues": {
+                    ":value": { "S": "x" }
+                }
+            }),
+            "UpdateItem currently supports only top-level attribute updates",
+        ),
+        (
+            "BatchWriteItem",
+            json!({
+                "RequestItems": {
+                    (table_name): [
+                        {
+                            "PutRequest": {
+                                "Item": {
+                                    "tenant": { "S": "acme" },
+                                    "ts": { "N": "10" }
+                                }
+                            },
+                            "DeleteRequest": {
+                                "Key": {
+                                    "tenant": { "S": "acme" },
+                                    "ts": { "N": "10" }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }),
+            "cannot include both PutRequest and DeleteRequest",
         ),
     ];
 
@@ -1202,6 +1261,229 @@ async fn compare_put_item_operation(fixture: &DifferentialFixture) {
     );
 }
 
+async fn compare_update_item_operation(fixture: &DifferentialFixture) {
+    let powdrr_update = fixture
+        .powdrr_client
+        .update_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(20))))
+        .update_expression("SET event_id = :event, active = :active ADD count :delta")
+        .condition_expression("attribute_exists(#pk) AND #count = :count")
+        .expression_attribute_names("#pk", "tenant")
+        .expression_attribute_names("#count", "count")
+        .expression_attribute_values(":event", AttributeValue::S("evt-2-updated".to_string()))
+        .expression_attribute_values(":active", AttributeValue::Bool(true))
+        .expression_attribute_values(":delta", AttributeValue::N("5".to_string()))
+        .expression_attribute_values(":count", AttributeValue::N("22".to_string()))
+        .return_values(ReturnValue::UpdatedOld)
+        .send()
+        .await
+        .unwrap();
+    let localstack_update = fixture
+        .localstack_client
+        .update_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(20))))
+        .update_expression("SET event_id = :event, active = :active ADD count :delta")
+        .condition_expression("attribute_exists(#pk) AND #count = :count")
+        .expression_attribute_names("#pk", "tenant")
+        .expression_attribute_names("#count", "count")
+        .expression_attribute_values(":event", AttributeValue::S("evt-2-updated".to_string()))
+        .expression_attribute_values(":active", AttributeValue::Bool(true))
+        .expression_attribute_values(":delta", AttributeValue::N("5".to_string()))
+        .expression_attribute_values(":count", AttributeValue::N("22".to_string()))
+        .return_values(ReturnValue::UpdatedOld)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        optional_item_to_json(powdrr_update.attributes()),
+        Some(json!({
+            "event_id": "evt-2-replaced",
+            "active": true,
+            "count": 22,
+        }))
+    );
+    assert_eq!(
+        optional_item_to_json(powdrr_update.attributes()),
+        optional_item_to_json(localstack_update.attributes())
+    );
+
+    let powdrr_remove = fixture
+        .powdrr_client
+        .update_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(20))))
+        .update_expression("REMOVE region")
+        .return_values(ReturnValue::AllNew)
+        .send()
+        .await
+        .unwrap();
+    let localstack_remove = fixture
+        .localstack_client
+        .update_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(20))))
+        .update_expression("REMOVE region")
+        .return_values(ReturnValue::AllNew)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        optional_item_to_json(powdrr_remove.attributes()),
+        Some(json!({
+            "tenant": "acme",
+            "ts": 20,
+            "event_id": "evt-2-updated",
+            "active": true,
+            "count": 27,
+        }))
+    );
+    assert_eq!(
+        optional_item_to_json(powdrr_remove.attributes()),
+        optional_item_to_json(localstack_remove.attributes())
+    );
+
+    let powdrr_post_remove = fixture
+        .powdrr_client
+        .update_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(20))))
+        .update_expression("SET active = :active")
+        .condition_expression("attribute_not_exists(#region)")
+        .expression_attribute_names("#region", "region")
+        .expression_attribute_values(":active", AttributeValue::Bool(false))
+        .return_values(ReturnValue::UpdatedNew)
+        .send()
+        .await
+        .unwrap();
+    let localstack_post_remove = fixture
+        .localstack_client
+        .update_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(20))))
+        .update_expression("SET active = :active")
+        .condition_expression("attribute_not_exists(#region)")
+        .expression_attribute_names("#region", "region")
+        .expression_attribute_values(":active", AttributeValue::Bool(false))
+        .return_values(ReturnValue::UpdatedNew)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        optional_item_to_json(powdrr_post_remove.attributes()),
+        Some(json!({
+            "active": false,
+        }))
+    );
+    assert_eq!(
+        optional_item_to_json(powdrr_post_remove.attributes()),
+        optional_item_to_json(localstack_post_remove.attributes())
+    );
+
+    let powdrr_upsert = fixture
+        .powdrr_client
+        .update_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(50))))
+        .update_expression(
+            "SET event_id = :event, region = :region, active = :active, count = :count",
+        )
+        .expression_attribute_values(":event", AttributeValue::S("evt-50".to_string()))
+        .expression_attribute_values(":region", AttributeValue::S("eu-west-1".to_string()))
+        .expression_attribute_values(":active", AttributeValue::Bool(true))
+        .expression_attribute_values(":count", AttributeValue::N("50".to_string()))
+        .return_values(ReturnValue::AllOld)
+        .send()
+        .await
+        .unwrap();
+    let localstack_upsert = fixture
+        .localstack_client
+        .update_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(50))))
+        .update_expression(
+            "SET event_id = :event, region = :region, active = :active, count = :count",
+        )
+        .expression_attribute_values(":event", AttributeValue::S("evt-50".to_string()))
+        .expression_attribute_values(":region", AttributeValue::S("eu-west-1".to_string()))
+        .expression_attribute_values(":active", AttributeValue::Bool(true))
+        .expression_attribute_values(":count", AttributeValue::N("50".to_string()))
+        .return_values(ReturnValue::AllOld)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(powdrr_upsert.attributes(), None);
+    assert_eq!(powdrr_upsert.attributes(), localstack_upsert.attributes());
+
+    let powdrr_upsert_item = fixture
+        .powdrr_client
+        .get_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(50))))
+        .send()
+        .await
+        .unwrap();
+    let localstack_upsert_item = fixture
+        .localstack_client
+        .get_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(50))))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        optional_item_to_json(powdrr_upsert_item.item()),
+        Some(json!({
+            "tenant": "acme",
+            "ts": 50,
+            "event_id": "evt-50",
+            "region": "eu-west-1",
+            "active": true,
+            "count": 50,
+        }))
+    );
+    assert_eq!(
+        optional_item_to_json(powdrr_upsert_item.item()),
+        optional_item_to_json(localstack_upsert_item.item())
+    );
+
+    let powdrr_condition_failure = fixture
+        .powdrr_client
+        .update_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(50))))
+        .update_expression("SET count = :count")
+        .condition_expression("attribute_not_exists(#pk)")
+        .expression_attribute_names("#pk", "tenant")
+        .expression_attribute_values(":count", AttributeValue::N("99".to_string()))
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    let localstack_condition_failure = fixture
+        .localstack_client
+        .update_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(50))))
+        .update_expression("SET count = :count")
+        .condition_expression("attribute_not_exists(#pk)")
+        .expression_attribute_names("#pk", "tenant")
+        .expression_attribute_values(":count", AttributeValue::N("99".to_string()))
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    assert_eq!(
+        powdrr_condition_failure.meta().code(),
+        Some("ConditionalCheckFailedException")
+    );
+    assert_eq!(
+        powdrr_condition_failure.meta().code(),
+        localstack_condition_failure.meta().code()
+    );
+}
+
 async fn compare_delete_item_operation(fixture: &DifferentialFixture) {
     fixture
         .powdrr_client
@@ -1328,6 +1610,120 @@ async fn compare_delete_item_operation(fixture: &DifferentialFixture) {
         powdrr_condition_failure.meta().code(),
         localstack_condition_failure.meta().code()
     );
+}
+
+async fn compare_batch_write_item_operation(fixture: &DifferentialFixture) {
+    let powdrr_batch = fixture
+        .powdrr_client
+        .batch_write_item()
+        .request_items(&fixture.write_table_name, batch_write_requests())
+        .send()
+        .await
+        .unwrap();
+    let localstack_batch = fixture
+        .localstack_client
+        .batch_write_item()
+        .request_items(&fixture.write_table_name, batch_write_requests())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        powdrr_batch.unprocessed_items().map(|items| items.len()),
+        Some(0)
+    );
+    assert_eq!(
+        powdrr_batch.unprocessed_items().map(|items| items.len()),
+        localstack_batch
+            .unprocessed_items()
+            .map(|items| items.len())
+    );
+
+    let powdrr_inserted = fixture
+        .powdrr_client
+        .get_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(60))))
+        .send()
+        .await
+        .unwrap();
+    let localstack_inserted = fixture
+        .localstack_client
+        .get_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(60))))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        optional_item_to_json(powdrr_inserted.item()),
+        Some(json!({
+            "tenant": "acme",
+            "ts": 60,
+            "event_id": "evt-60",
+            "region": "us-central-1",
+            "active": true,
+            "count": 60,
+        }))
+    );
+    assert_eq!(
+        optional_item_to_json(powdrr_inserted.item()),
+        optional_item_to_json(localstack_inserted.item())
+    );
+
+    let powdrr_deleted = fixture
+        .powdrr_client
+        .get_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("globex", json!(15))))
+        .send()
+        .await
+        .unwrap();
+    let localstack_deleted = fixture
+        .localstack_client
+        .get_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("globex", json!(15))))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(powdrr_deleted.item(), None);
+    assert_eq!(powdrr_deleted.item(), localstack_deleted.item());
+}
+
+fn batch_write_requests() -> Vec<WriteRequest> {
+    vec![
+        WriteRequest::builder()
+            .put_request(
+                PutRequest::builder()
+                    .set_item(Some(item_from_json(json!({
+                        "tenant": "acme",
+                        "ts": 60,
+                        "event_id": "evt-60",
+                        "region": "us-central-1",
+                        "active": true,
+                        "count": 60,
+                    }))))
+                    .build()
+                    .unwrap(),
+            )
+            .build(),
+        WriteRequest::builder()
+            .delete_request(
+                DeleteRequest::builder()
+                    .set_key(Some(primary_key_item_from_parts("globex", json!(15))))
+                    .build()
+                    .unwrap(),
+            )
+            .build(),
+        WriteRequest::builder()
+            .delete_request(
+                DeleteRequest::builder()
+                    .set_key(Some(primary_key_item_from_parts("acme", json!(999))))
+                    .build()
+                    .unwrap(),
+            )
+            .build(),
+    ]
 }
 
 async fn compare_query_operation(fixture: &DifferentialFixture) {
