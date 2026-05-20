@@ -290,6 +290,14 @@ General test guidance:
 RUST_BACKTRACE=1 scripts/cargo-worktree.sh test -- --nocapture --test-threads=1
 ```
 
+Fast Elasticsearch mutation regression guardrail:
+
+```bash
+bash scripts/run_es_mutation_regression_local.sh
+```
+
+That runner expects Redis on `127.0.0.1:6379`, matching the router test harness.
+
 Heavy compatibility suites are explicit:
 
 ```bash
