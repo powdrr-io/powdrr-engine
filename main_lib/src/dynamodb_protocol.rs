@@ -350,9 +350,15 @@ struct ConsumedCapacity {
     read_capacity_units: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     table: Option<CapacityBreakdown>,
-    #[serde(rename = "LocalSecondaryIndexes", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "LocalSecondaryIndexes",
+        skip_serializing_if = "Option::is_none"
+    )]
     local_secondary_indexes: Option<HashMap<String, CapacityBreakdown>>,
-    #[serde(rename = "GlobalSecondaryIndexes", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "GlobalSecondaryIndexes",
+        skip_serializing_if = "Option::is_none"
+    )]
     global_secondary_indexes: Option<HashMap<String, CapacityBreakdown>>,
 }
 
@@ -1005,9 +1011,7 @@ async fn handle_query(payload: Value) -> Result<Value, DynamoDbError> {
         )?;
         evaluated_rows.truncate(page_limit);
         Some(key)
-    } else if evaluated_rows.len() == page_limit
-        && !sort_is_exact_eq
-        && !query_target.unique_lookup
+    } else if evaluated_rows.len() == page_limit && !sort_is_exact_eq && !query_target.unique_lookup
     {
         Some(row_to_key(
             evaluated_rows
@@ -1044,10 +1048,7 @@ async fn handle_query(payload: Value) -> Result<Value, DynamoDbError> {
             &request.table_name,
             query_target.index_kind,
             query_target.index_name.as_deref(),
-            estimate_read_capacity_units(
-                scanned_count,
-                request.consistent_read.unwrap_or(false),
-            ),
+            estimate_read_capacity_units(scanned_count, request.consistent_read.unwrap_or(false)),
         ),
     })
     .unwrap())
@@ -1135,10 +1136,7 @@ async fn handle_scan(payload: Value) -> Result<Value, DynamoDbError> {
             &request.table_name,
             query_target.index_kind,
             query_target.index_name.as_deref(),
-            estimate_read_capacity_units(
-                scanned_count,
-                request.consistent_read.unwrap_or(false),
-            ),
+            estimate_read_capacity_units(scanned_count, request.consistent_read.unwrap_or(false)),
         ),
     })
     .unwrap())
@@ -1599,7 +1597,6 @@ fn derived_dynamodb_serving_patterns(config: &DynamoDbTableConfig) -> Vec<Servin
     patterns
 }
 
-
 fn parse_target(headers: &HeaderMap) -> Result<String, DynamoDbError> {
     let target = headers
         .get("x-amz-target")
@@ -1816,10 +1813,7 @@ fn sigv4_signature(
     )?))
 }
 
-fn validate_sigv4_request_time(
-    amz_date: &str,
-    credential_date: &str,
-) -> Result<(), DynamoDbError> {
+fn validate_sigv4_request_time(amz_date: &str, credential_date: &str) -> Result<(), DynamoDbError> {
     let parsed = NaiveDateTime::parse_from_str(amz_date, "%Y%m%dT%H%M%SZ")
         .map_err(|_| DynamoDbError::auth("x-amz-date was not a valid SigV4 timestamp"))?;
     let timestamp = DateTime::<Utc>::from_naive_utc_and_offset(parsed, Utc);
@@ -1828,9 +1822,14 @@ fn validate_sigv4_request_time(
             "Credential scope date did not match x-amz-date",
         ));
     }
-    let skew = Utc::now().signed_duration_since(timestamp).num_minutes().abs();
+    let skew = Utc::now()
+        .signed_duration_since(timestamp)
+        .num_minutes()
+        .abs();
     if skew > SIGV4_ALLOWED_CLOCK_SKEW_MINUTES {
-        return Err(DynamoDbError::auth("x-amz-date was outside the allowed clock skew"));
+        return Err(DynamoDbError::auth(
+            "x-amz-date was outside the allowed clock skew",
+        ));
     }
     Ok(())
 }
@@ -2356,10 +2355,7 @@ impl<'a> FilterParser<'a> {
         Ok(FilterOperand::Field(self.parse_identifier()?))
     }
 
-    fn parse_field_value_function(
-        &mut self,
-        name: &str,
-    ) -> Result<(String, Value), DynamoDbError> {
+    fn parse_field_value_function(&mut self, name: &str) -> Result<(String, Value), DynamoDbError> {
         self.expect_identifier_ci(name)?;
         self.expect_token(&FilterToken::LParen)?;
         let field = self.parse_identifier()?;
@@ -2409,9 +2405,7 @@ impl<'a> FilterParser<'a> {
         if self.consume_token(expected) {
             Ok(())
         } else {
-            Err(DynamoDbError::validation(
-                "FilterExpression was malformed",
-            ))
+            Err(DynamoDbError::validation("FilterExpression was malformed"))
         }
     }
 
@@ -2498,8 +2492,7 @@ fn tokenize_filter_expression(expression: &str) -> Result<Vec<FilterToken>, Dyna
             ':' => {
                 let start = index;
                 index += 1;
-                while index < characters.len()
-                    && is_filter_identifier_character(characters[index])
+                while index < characters.len() && is_filter_identifier_character(characters[index])
                 {
                     index += 1;
                 }
@@ -2510,8 +2503,7 @@ fn tokenize_filter_expression(expression: &str) -> Result<Vec<FilterToken>, Dyna
             character if is_filter_identifier_start(character) => {
                 let start = index;
                 index += 1;
-                while index < characters.len()
-                    && is_filter_identifier_character(characters[index])
+                while index < characters.len() && is_filter_identifier_character(characters[index])
                 {
                     index += 1;
                 }
@@ -2547,7 +2539,9 @@ fn is_filter_identifier_character(character: char) -> bool {
 
 fn collect_filter_fields(node: &FilterNode, fields: &mut Vec<String>) {
     match node {
-        FilterNode::Predicate(predicate) => append_selected_field(fields, predicate.operand.field_name()),
+        FilterNode::Predicate(predicate) => {
+            append_selected_field(fields, predicate.operand.field_name())
+        }
         FilterNode::And(nodes) | FilterNode::Or(nodes) => {
             for node in nodes.iter() {
                 collect_filter_fields(node, fields);
@@ -3157,11 +3151,13 @@ fn apply_filter_expression(
         return Ok(rows);
     };
     rows.into_iter()
-        .filter_map(|row| match row_matches_filter_expression(&row, expression) {
-            Ok(true) => Some(Ok(row)),
-            Ok(false) => None,
-            Err(error) => Some(Err(error)),
-        })
+        .filter_map(
+            |row| match row_matches_filter_expression(&row, expression) {
+                Ok(true) => Some(Ok(row)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            },
+        )
         .collect()
 }
 
@@ -3206,7 +3202,9 @@ fn evaluate_filter_predicate(
     predicate: &FilterPredicate,
 ) -> Result<bool, DynamoDbError> {
     match &predicate.kind {
-        FilterPredicateKind::AttributeExists => Ok(object.contains_key(predicate.operand.field_name())),
+        FilterPredicateKind::AttributeExists => {
+            Ok(object.contains_key(predicate.operand.field_name()))
+        }
         FilterPredicateKind::AttributeNotExists => {
             Ok(!object.contains_key(predicate.operand.field_name()))
         }
@@ -3234,16 +3232,28 @@ fn evaluate_filter_predicate(
         FilterPredicateKind::Eq(expected) => Ok(filter_operand_value(object, &predicate.operand)
             .map(|value| value == expected)
             .unwrap_or(false)),
-        FilterPredicateKind::In(expected_values) => Ok(filter_operand_value(object, &predicate.operand)
-            .map(|value| expected_values.iter().any(|expected| expected == value))
-            .unwrap_or(false)),
-        FilterPredicateKind::Gt(expected) => compare_filter_operand(object, &predicate.operand, expected, Ordering::Greater),
-        FilterPredicateKind::Gte(expected) => compare_filter_operand_at_least(object, &predicate.operand, expected),
-        FilterPredicateKind::Lt(expected) => compare_filter_operand(object, &predicate.operand, expected, Ordering::Less),
-        FilterPredicateKind::Lte(expected) => compare_filter_operand_at_most(object, &predicate.operand, expected),
+        FilterPredicateKind::In(expected_values) => {
+            Ok(filter_operand_value(object, &predicate.operand)
+                .map(|value| expected_values.iter().any(|expected| expected == value))
+                .unwrap_or(false))
+        }
+        FilterPredicateKind::Gt(expected) => {
+            compare_filter_operand(object, &predicate.operand, expected, Ordering::Greater)
+        }
+        FilterPredicateKind::Gte(expected) => {
+            compare_filter_operand_at_least(object, &predicate.operand, expected)
+        }
+        FilterPredicateKind::Lt(expected) => {
+            compare_filter_operand(object, &predicate.operand, expected, Ordering::Less)
+        }
+        FilterPredicateKind::Lte(expected) => {
+            compare_filter_operand_at_most(object, &predicate.operand, expected)
+        }
         FilterPredicateKind::Between { start, end } => {
-            Ok(compare_filter_operand_at_least(object, &predicate.operand, start)?
-                && compare_filter_operand_at_most(object, &predicate.operand, end)?)
+            Ok(
+                compare_filter_operand_at_least(object, &predicate.operand, start)?
+                    && compare_filter_operand_at_most(object, &predicate.operand, end)?,
+            )
         }
     }
 }
@@ -3277,7 +3287,9 @@ fn compare_filter_operand(
     let Some(value) = filter_operand_scalar(object, operand) else {
         return Ok(false);
     };
-    Ok(compare_scalars(&value, expected).map(|ordering| ordering == desired).unwrap_or(false))
+    Ok(compare_scalars(&value, expected)
+        .map(|ordering| ordering == desired)
+        .unwrap_or(false))
 }
 
 fn compare_filter_operand_at_least(
@@ -3314,13 +3326,22 @@ fn filter_value_contains(value: &Value, expected: &Value) -> bool {
             .unwrap_or(false),
         Value::Array(values) => values.iter().any(|candidate| candidate == expected),
         Value::Object(map) => {
-            if let Some(values) = map.get(DYNAMODB_STRING_SET_MARKER).and_then(|value| value.as_array()) {
+            if let Some(values) = map
+                .get(DYNAMODB_STRING_SET_MARKER)
+                .and_then(|value| value.as_array())
+            {
                 return values.iter().any(|candidate| candidate == expected);
             }
-            if let Some(values) = map.get(DYNAMODB_NUMBER_SET_MARKER).and_then(|value| value.as_array()) {
+            if let Some(values) = map
+                .get(DYNAMODB_NUMBER_SET_MARKER)
+                .and_then(|value| value.as_array())
+            {
                 return values.iter().any(|candidate| candidate == expected);
             }
-            if let Some(values) = map.get(DYNAMODB_BINARY_SET_MARKER).and_then(|value| value.as_array()) {
+            if let Some(values) = map
+                .get(DYNAMODB_BINARY_SET_MARKER)
+                .and_then(|value| value.as_array())
+            {
                 return values.iter().any(|candidate| candidate == expected);
             }
             false
@@ -3357,16 +3378,28 @@ fn filter_value_size(value: &Value) -> Option<usize> {
         Value::String(text) => Some(text.len()),
         Value::Array(values) => Some(values.len()),
         Value::Object(map) => {
-            if let Some(values) = map.get(DYNAMODB_STRING_SET_MARKER).and_then(|value| value.as_array()) {
+            if let Some(values) = map
+                .get(DYNAMODB_STRING_SET_MARKER)
+                .and_then(|value| value.as_array())
+            {
                 return Some(values.len());
             }
-            if let Some(values) = map.get(DYNAMODB_NUMBER_SET_MARKER).and_then(|value| value.as_array()) {
+            if let Some(values) = map
+                .get(DYNAMODB_NUMBER_SET_MARKER)
+                .and_then(|value| value.as_array())
+            {
                 return Some(values.len());
             }
-            if let Some(values) = map.get(DYNAMODB_BINARY_SET_MARKER).and_then(|value| value.as_array()) {
+            if let Some(values) = map
+                .get(DYNAMODB_BINARY_SET_MARKER)
+                .and_then(|value| value.as_array())
+            {
                 return Some(values.len());
             }
-            if let Some(binary) = map.get(DYNAMODB_BINARY_MARKER).and_then(|value| value.as_str()) {
+            if let Some(binary) = map
+                .get(DYNAMODB_BINARY_MARKER)
+                .and_then(|value| value.as_str())
+            {
                 return Some(binary.len());
             }
             Some(map.len())
@@ -3791,9 +3824,7 @@ mod tests {
         }));
         let values = HashMap::new();
         let parsed = parse_filter_expression(
-            Some(
-                &"attribute_not_exists(deleted_at) AND attribute_exists(region)".to_string(),
-            ),
+            Some(&"attribute_not_exists(deleted_at) AND attribute_exists(region)".to_string()),
             None,
             Some(&values),
         )
@@ -3845,10 +3876,15 @@ mod tests {
     #[ignore = "requires the full local cache/state-provider harness"]
     fn test_dynamodb_root_operations() {
         let redis_address = "127.0.0.1:6379".parse().unwrap();
-        if std::net::TcpStream::connect_timeout(&redis_address, std::time::Duration::from_millis(200))
-            .is_err()
+        if std::net::TcpStream::connect_timeout(
+            &redis_address,
+            std::time::Duration::from_millis(200),
+        )
+        .is_err()
         {
-            eprintln!("Skipping DynamoDB root smoke test; Redis is not available on 127.0.0.1:6379");
+            eprintln!(
+                "Skipping DynamoDB root smoke test; Redis is not available on 127.0.0.1:6379"
+            );
             return;
         }
         let test_server = TestServer::with_timeout(crate::router::router(true), 1000).unwrap();

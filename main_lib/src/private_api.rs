@@ -1270,8 +1270,7 @@ pub(crate) async fn prefetch_query(
         &table_metadata,
         index,
         num,
-    )
-    {
+    ) {
         Ok(rf) => rf,
         Err(e) => return log_err(e),
     };

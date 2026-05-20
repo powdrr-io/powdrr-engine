@@ -744,4 +744,3 @@ pub(crate) const CLUSTER_SETTINGS_WITH_DEFAULTS: &str = r#"{
       "xpack.watcher.watch.scroll.size": "0"
     }
   }"#;
-  

@@ -1016,11 +1016,9 @@ impl EphemeralServiceImpl {
         secret_key: &String,
     ) -> Result<Option<OrgInfo>, ServiceApiError> {
         for settings in self.org_settings.values() {
-            if settings
-                .creds
-                .iter()
-                .any(|creds| &creds.access_key_id == access_key && &creds.secret_access_key == secret_key)
-            {
+            if settings.creds.iter().any(|creds| {
+                &creds.access_key_id == access_key && &creds.secret_access_key == secret_key
+            }) {
                 return Ok(Some(settings.to_org_info()));
             }
         }

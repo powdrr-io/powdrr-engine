@@ -25,8 +25,7 @@ use gotham::bind_server;
 use hmac::{Hmac, Mac};
 use powdrr_lib::data_contract::{
     DynamoDbGlobalSecondaryIndexConfig, DynamoDbLocalSecondaryIndexConfig, DynamoDbTableConfig,
-    FileSetPayload, IcebergMetadata, LicenseType, OrgCreds, OrgSettings,
-    TableMetadataCheckpoint,
+    FileSetPayload, IcebergMetadata, LicenseType, OrgCreds, OrgSettings, TableMetadataCheckpoint,
 };
 use powdrr_lib::router::router;
 use powdrr_lib::serving_dataset::read_parquet_documents;
@@ -1371,11 +1370,9 @@ async fn compare_query_operation(fixture: &DifferentialFixture) {
 
     let powdrr_or_filter =
         query_with_or_not_filter_page(&fixture.powdrr_client, &fixture.primary_table_name).await;
-    let localstack_or_filter = query_with_or_not_filter_page(
-        &fixture.localstack_client,
-        &fixture.primary_table_name,
-    )
-    .await;
+    let localstack_or_filter =
+        query_with_or_not_filter_page(&fixture.localstack_client, &fixture.primary_table_name)
+            .await;
     compare_query_page_outputs(
         &powdrr_or_filter,
         &localstack_or_filter,
@@ -1397,11 +1394,9 @@ async fn compare_query_operation(fixture: &DifferentialFixture) {
         ],
     );
 
-    let powdrr_attribute_filter = query_with_attribute_meta_filter_page(
-        &fixture.powdrr_client,
-        &fixture.primary_table_name,
-    )
-    .await;
+    let powdrr_attribute_filter =
+        query_with_attribute_meta_filter_page(&fixture.powdrr_client, &fixture.primary_table_name)
+            .await;
     let localstack_attribute_filter = query_with_attribute_meta_filter_page(
         &fixture.localstack_client,
         &fixture.primary_table_name,
@@ -1550,11 +1545,8 @@ async fn compare_scan_operation(fixture: &DifferentialFixture) {
     );
     assert_eq!(powdrr_count.items().len(), 0);
 
-    let powdrr_count_with_capacity = scan_count_page_with_capacity(
-        &fixture.powdrr_client,
-        &fixture.primary_table_name,
-    )
-    .await;
+    let powdrr_count_with_capacity =
+        scan_count_page_with_capacity(&fixture.powdrr_client, &fixture.primary_table_name).await;
     assert_eq!(
         powdrr_count_with_capacity
             .consumed_capacity()
@@ -2036,12 +2028,7 @@ async fn raw_dynamodb_request(base_url: &str, operation: &str, body: &Value) -> 
     let signed_headers = "content-type;host;x-amz-date;x-amz-target";
     let canonical_request = format!(
         "POST\n/\n\ncontent-type:{}\nhost:{}\nx-amz-date:{}\nx-amz-target:{}\n\n{}\n{}",
-        "application/json",
-        host,
-        amz_date,
-        target,
-        signed_headers,
-        payload_hash
+        "application/json", host, amz_date, target, signed_headers, payload_hash
     );
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{}\n{}/us-east-1/dynamodb/aws4_request\n{}",

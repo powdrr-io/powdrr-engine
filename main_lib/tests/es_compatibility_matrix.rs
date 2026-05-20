@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::net::{SocketAddr, TcpStream};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

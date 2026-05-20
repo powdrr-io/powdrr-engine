@@ -21,8 +21,7 @@ use futures_util::future;
 use gotham::bind_server;
 use powdrr_lib::data_contract::{
     DynamoDbGlobalSecondaryIndexConfig, DynamoDbLocalSecondaryIndexConfig, DynamoDbTableConfig,
-    FileSetPayload, IcebergMetadata, LicenseType, OrgCreds, OrgSettings,
-    TableMetadataCheckpoint,
+    FileSetPayload, IcebergMetadata, LicenseType, OrgCreds, OrgSettings, TableMetadataCheckpoint,
 };
 use powdrr_lib::router::router;
 use powdrr_lib::serving_dataset::read_parquet_documents;
@@ -591,8 +590,8 @@ async fn run_dynamodb_sdk_compat_test() {
             .is_some()
     );
 
-    let powdrr_lsi_query = query_local_index_page(&powdrr_client, &table_name, &tenant_count_index)
-        .await;
+    let powdrr_lsi_query =
+        query_local_index_page(&powdrr_client, &table_name, &tenant_count_index).await;
     let localstack_lsi_query =
         query_local_index_page(&localstack_client, &table_name, &tenant_count_index).await;
     let expected_lsi_items = vec![

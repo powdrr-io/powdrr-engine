@@ -466,7 +466,7 @@ impl UpdateByQuerySuccess {
 
 #[cfg(test)]
 mod tests {
-    use super::{compare_query_result_hits_desc, QueryResultHit};
+    use super::{QueryResultHit, compare_query_result_hits_desc};
     use serde_json::json;
 
     #[test]

@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use crate::schema_massager::PowdrrSchema;
 use crate::search_runtime::batches_to_serde_value;
+use datafusion::prelude::{ParquetReadOptions, SessionContext};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ParquetDocumentSet {
