@@ -22,6 +22,7 @@ use crate::test_api::test_v1_create_index;
 use crate::test_api::test_v1_process_work;
 use crate::test_api::test_v1_set_testing_mode;
 use crate::test_api::test_v1_set_testing_processing_mode;
+use crate::elastic_search_common::MIME_ARROW_STREAM;
 use crate::{elastic_search_endpoints, elastic_search_lifetime_policy, lakehouse_serving};
 use futures::future;
 use futures::TryFutureExt;
@@ -46,6 +47,18 @@ use serde::Deserialize;
 use std::pin::Pin;
 use std::sync::Arc;
 
+fn binary_response(
+    status: StatusCode,
+    mime: mime::Mime,
+    body: Vec<u8>,
+) -> gotham::hyper::Response<Body> {
+    gotham::hyper::Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, mime.to_string())
+        .body(Body::from(body))
+        .unwrap()
+}
+
 pub fn private_v1_sql(mut state: State) -> Pin<Box<HandlerFuture>> {
     async move {
         let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
@@ -66,12 +79,7 @@ pub fn private_v1_sql(mut state: State) -> Pin<Box<HandlerFuture>> {
         .await;
         match query_result {
             Ok(success) => {
-                let res = create_response(
-                    &state,
-                    StatusCode::OK,
-                    mime::APPLICATION_JSON,
-                    serde_json::to_string(&success.result).unwrap(),
-                );
+                let res = binary_response(StatusCode::OK, MIME_ARROW_STREAM.clone(), success);
                 Ok((state, res))
             }
             Err(error) => {
@@ -214,12 +222,7 @@ pub fn private_v1_compact(mut state: State) -> Pin<Box<HandlerFuture>> {
         };
         match compaction_query(&command.invocation, command.index, command.num).await {
             Ok(success) => {
-                let res = create_response(
-                    &state,
-                    StatusCode::OK,
-                    mime::APPLICATION_JSON,
-                    serde_json::to_string(&success.result).unwrap(),
-                );
+                let res = binary_response(StatusCode::OK, MIME_ARROW_STREAM.clone(), success);
                 Ok((state, res))
             }
             Err(error) => {
@@ -714,11 +717,14 @@ pub(crate) mod tests {
         CreateTable, DeletesMetadata, FileSetPayload, IcebergFileStats, IcebergMetadata,
         SpeedboatMetadata, TableMetadataCheckpoint,
     };
+    use crate::elastic_search_common::result_to_record_batch;
+    use crate::peers::{CheckpointDescriptor, PrivateSqlInvocation, PrivateSqlInvocationExternal};
     use crate::elastic_search_responses::{QueryResultTotal, QueryResults};
     use crate::lakehouse_serving::ServingConfigResponse;
     use crate::router::router;
     use crate::schema_massager::{
-        extract_powdrr_schema_str, PowdrrDataType, PowdrrField, PowdrrSchema,
+        SqlBuilder, SqlExpression, extract_powdrr_schema_str, PowdrrDataType, PowdrrField,
+        PowdrrSchema,
     };
     use crate::serving_plan::ServingQueryClassification;
     use crate::state_provider::STATE_PROVIDER;
@@ -3321,84 +3327,105 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(missing_index_response.status(), 404);
     }
-    /*
-        #[test]
-        fn test_private_api_data_query() {
-            let test_server = &*TEST_SERVER;
+    #[test]
+    fn test_private_api_data_query_returns_arrow_stream() {
+        let test_server = &*TEST_SERVER;
+        set_testing_and_processing_mode(test_server);
 
-            test_server.client().put(
-                "http://localhost/_test/v1/_testing_mode",
-                "",
-                mime::TEXT_PLAIN
-            ).perform().unwrap();
+        let schema = PowdrrSchema::from(&vec![
+            PowdrrField {
+                name: "_id_seq_no".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "snippet".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "searchTerms".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "title".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+        ]);
 
-            let file_path = format!("file://{}/tests/data/flights.parquet", env::current_dir().unwrap().to_str().unwrap());
+        let checkpoint = TableMetadataCheckpoint {
+            table_name: "flights".to_string(),
+            original_checkpoint_id: None,
+            checkpoint_id: "0".to_string(),
+            iceberg_metadata: Some(IcebergMetadata {
+                table_schema: schema.clone(),
+                snapshot_id: Some("fake_iceberg_snapshot".to_string()),
+                files: FileSetPayload::single(
+                    format!(
+                        "file://{}/tests/data/flights.parquet",
+                        env::current_dir().unwrap().to_str().unwrap()
+                    ),
+                    1,
+                    schema.clone(),
+                ),
+                partition_spec: vec![],
+                sort_order: vec![],
+                column_names: vec![],
+                column_stats: vec![],
+                access_artifacts: vec![],
+                file_stats: vec![],
+            }),
+            speedboat_metadata: None,
+            deletes_metadata: None,
+            extension_metadata: HashMap::new(),
+            schema: schema.clone(),
+        };
 
-            let schema = PowdrrSchema::from(&vec!(
-                PowdrrField{ name: "snippet".to_string(), data_type: PowdrrDataType::String },
-                PowdrrField{ name: "searchTerms".to_string(), data_type: PowdrrDataType::String },
-                PowdrrField{ name: "title".to_string(), data_type: PowdrrDataType::String },
-            ));
-
-            let checkpoint = TableMetadataCheckpoint {
-                table_name: "flights".to_string(),
-                checkpoint_id: "0".to_string(),
-                iceberg_metadata: Some(IcebergMetadata {
-                    snapshot_id: "fake_iceberg_snapshot".to_string(),
-                    files: vec!(file_path),
-                    column_names: vec!(),
-                    column_stats: vec!(),
-                    schemas: vec!(schema.clone()),
-                    file_schemas: vec!(0),
-                }),
-                speedboat_metadata: None,
-                deletes_metadata: None,
-                extension_metadata: None,
-                schema: schema.clone(),
-            };
-
-            let checkpoint_response = test_server.client().post(
+        test_server
+            .client()
+            .post(
                 "http://localhost/_test/v1/_add_checkpoint",
                 serde_json::to_string(&checkpoint).unwrap(),
                 mime::APPLICATION_JSON,
-            ).perform();
+            )
+            .perform()
+            .unwrap();
 
-            match checkpoint_response {
-                Err(_) => panic!("test setup failed"),
-                Ok(_) => ()
-            };
+        let mut builder = SqlBuilder::for_agg();
+        builder.set_all_fields_testing_only();
+        builder.filter(SqlExpression::Like(
+            Box::new(SqlExpression::FieldRef("t".to_string(), "snippet".to_string())),
+            Box::new(SqlExpression::LiteralString("%Looking%".to_string())),
+        ));
 
+        let body_obj = PrivateSqlInvocationExternal {
+            invocation: PrivateSqlInvocation {
+                sql: builder.build(),
+                required_extensions: vec![],
+                file_filter: vec![],
+                checkpoints: vec![CheckpointDescriptor::new(
+                    "flights".to_string(),
+                    "0".to_string(),
+                )],
+            },
+            index: 0,
+            num: 1,
+        };
 
-            let mut builder = SqlBuilder::for_agg();
-            builder.set_all_fields_testing_only();
-            builder.filter(SqlExpression::Like(
-                Box::new(SqlExpression::FieldRef("t".to_string(), "snippet".to_string())),
-                Box::new(SqlExpression::LiteralString("%Looking%".to_string())),
-            ));
-
-            let body_obj = PrivateSqlInvocation::new(
-                builder.build(),
-                vec!["es".to_string()],
-                vec![],
-                vec!(SnapshotDescriptor { table_name: "flights".to_string(), snapshot_id: "fake_id".to_string()}),
-                0,
-                1,
-            );
-
-            let response = test_server.client().post(
+        let response = test_server
+            .client()
+            .post(
                 "http://localhost/_private/v1/_sql",
                 serde_json::to_string(&body_obj).unwrap(),
                 mime::APPLICATION_JSON,
-            ).perform().unwrap();
+            )
+            .perform()
+            .unwrap();
 
-            assert_eq!(response.status(), 200);
-            let body = response.read_body().unwrap();
-            let str_body = str::from_utf8(&body).unwrap();
-            let json_body: serde_json::Value = serde_json::from_str(&str_body).unwrap();
-            let num = json_body["num"].as_u64().unwrap();
-            assert_eq!(num, 505);
-        }
-    */
+        assert_eq!(response.status(), 200);
+        let body = response.read_body().unwrap();
+        assert!(serde_json::from_slice::<Value>(&body).is_err());
+        let batches = result_to_record_batch(&body);
+        assert_eq!(batches.iter().map(|batch| batch.num_rows()).sum::<usize>(), 505);
+    }
     #[test]
     fn test_es_search_table_parquet() {
         let test_server = &*TEST_SERVER;

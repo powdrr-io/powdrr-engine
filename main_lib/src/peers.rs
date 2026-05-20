@@ -15,10 +15,12 @@ use crate::compaction::{CompactionCommand, CompactionResponse, compact_logs};
 use crate::data_contract::{ExtensionFileMetadata, FileSetPayload};
 use crate::elastic_search_common::result_to_record_batch;
 use crate::elastic_search_responses::QueryResultHit;
-use crate::private_api::{compaction_query, extension_query, prefetch_query};
+use crate::private_api::{
+    compaction_query_batches, data_query_batches, extension_query, prefetch_query,
+};
 use crate::schema_massager::{PowdrrSchema, SqlQuery};
 use crate::test_api::{CompactionMode, PeerModeType};
-use crate::{private_api::data_query, state_common::FileFilter};
+use crate::state_common::FileFilter;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct FieldFileFilterDescriptor {
@@ -373,7 +375,7 @@ impl PeerClient for RemotePeer {
             Ok(res) => {
                 assert!(res.status().is_success());
                 let body = res.bytes().await.unwrap();
-                Ok(result_to_record_batch(serde_json::from_slice(&body).unwrap()).await)
+                Ok(result_to_record_batch(body.as_ref()))
             }
             Err(e) => Err(PeerClientError {
                 message: format!("Error: {}", e),
@@ -435,7 +437,7 @@ impl PeerClient for RemotePeer {
             Ok(res) => {
                 assert!(res.status().is_success());
                 let body = res.bytes().await.unwrap();
-                Ok(result_to_record_batch(serde_json::from_slice(&body).unwrap()).await)
+                Ok(result_to_record_batch(body.as_ref()))
             }
             Err(e) => Err(PeerClientError {
                 message: format!("Error: {}", e),
@@ -613,7 +615,7 @@ impl PeerClient for TestingRemotePeer {
             Ok(res) => {
                 assert!(res.status().is_success());
                 let body = res.read_body().await.unwrap();
-                Ok(result_to_record_batch(serde_json::from_slice(&body).unwrap()).await)
+                Ok(result_to_record_batch(&body))
             }
             Err(e) => Err(PeerClientError {
                 message: format!("Error: {}", e),
@@ -691,7 +693,7 @@ impl PeerClient for TestingRemotePeer {
             Ok(res) => {
                 assert!(res.status().is_success());
                 let body = res.read_body().await.unwrap();
-                Ok(result_to_record_batch(serde_json::from_slice(&body).unwrap()).await)
+                Ok(result_to_record_batch(&body))
             }
             Err(e) => Err(PeerClientError {
                 message: format!("Error: {}", e),
@@ -974,9 +976,9 @@ impl PeerClient for SelfPeer {
         index: u64,
         num: u64,
     ) -> Result<Vec<RecordBatch>, PeerClientError> {
-        let query_result = data_query(invocation, index, num).await;
+        let query_result = data_query_batches(invocation, index, num).await;
         match query_result {
-            Ok(qr) => Ok(result_to_record_batch(qr.result).await),
+            Ok(qr) => Ok(qr),
             Err(e) => Err(PeerClientError { message: e.message }),
         }
     }
@@ -999,9 +1001,9 @@ impl PeerClient for SelfPeer {
         index: u64,
         num: u64,
     ) -> Result<Vec<RecordBatch>, PeerClientError> {
-        let query_result = compaction_query(invocation, index, num).await;
+        let query_result = compaction_query_batches(invocation, index, num).await;
         match query_result {
-            Ok(qr) => Ok(result_to_record_batch(qr.result).await),
+            Ok(qr) => Ok(qr),
             Err(e) => Err(PeerClientError { message: e.message }),
         }
     }
@@ -1074,5 +1076,121 @@ impl PeerClient for SelfPeer {
             }
             CompactionMode::Disabled => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_contract::{FileSetPayload, IcebergMetadata, TableMetadataCheckpoint};
+    use crate::router::router;
+    use crate::schema_massager::{PowdrrDataType, PowdrrField, SqlBuilder, SqlExpression};
+    use gotham::mime;
+    use std::collections::HashMap;
+    use std::env;
+
+    async fn setup_private_sql_invocation(test_server: &AsyncTestServer) -> PrivateSqlInvocation {
+        test_server
+            .client()
+            .put("http://localhost/_test/v1/_testing_mode")
+            .body("")
+            .mime(mime::TEXT_PLAIN)
+            .perform()
+            .await
+            .unwrap();
+
+        let schema = PowdrrSchema::from(&vec![
+            PowdrrField {
+                name: "_id_seq_no".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "snippet".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "searchTerms".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "title".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+        ]);
+        let file_path = format!(
+            "file://{}/tests/data/flights.parquet",
+            env::current_dir().unwrap().to_str().unwrap()
+        );
+        let checkpoint = TableMetadataCheckpoint {
+            table_name: "flights".to_string(),
+            original_checkpoint_id: None,
+            checkpoint_id: "0".to_string(),
+            iceberg_metadata: Some(IcebergMetadata {
+                table_schema: schema.clone(),
+                snapshot_id: Some("fake_iceberg_snapshot".to_string()),
+                files: FileSetPayload::single(file_path, 1, schema.clone()),
+                partition_spec: vec![],
+                sort_order: vec![],
+                column_names: vec![],
+                column_stats: vec![],
+                access_artifacts: vec![],
+                file_stats: vec![],
+            }),
+            speedboat_metadata: None,
+            deletes_metadata: None,
+            extension_metadata: HashMap::new(),
+            schema,
+        };
+
+        test_server
+            .client()
+            .post("http://localhost/_test/v1/_add_checkpoint")
+            .body(serde_json::to_string(&checkpoint).unwrap())
+            .mime(mime::APPLICATION_JSON)
+            .perform()
+            .await
+            .unwrap();
+
+        let mut builder = SqlBuilder::for_agg();
+        builder.set_all_fields_testing_only();
+        builder.filter(SqlExpression::Like(
+            Box::new(SqlExpression::FieldRef("t".to_string(), "snippet".to_string())),
+            Box::new(SqlExpression::LiteralString("%Looking%".to_string())),
+        ));
+
+        PrivateSqlInvocation {
+            sql: builder.build(),
+            required_extensions: vec![],
+            file_filter: vec![],
+            checkpoints: vec![CheckpointDescriptor::new(
+                "flights".to_string(),
+                "0".to_string(),
+            )],
+        }
+    }
+
+    #[tokio::test]
+    async fn testing_remote_peer_private_sql_decodes_arrow_stream() {
+        let test_server = AsyncTestServer::new(router(true)).await.unwrap();
+        let invocation = setup_private_sql_invocation(&test_server).await;
+        let peer = TestingRemotePeer::new(test_server.clone());
+        let batches = peer.private_sql(&invocation, 0, 1).await.unwrap();
+
+        assert_eq!(batches.iter().map(|batch| batch.num_rows()).sum::<usize>(), 505);
+    }
+
+    #[tokio::test]
+    async fn self_peer_private_sql_uses_direct_batch_path() {
+        let test_server = AsyncTestServer::new(router(true)).await.unwrap();
+        let invocation = setup_private_sql_invocation(&test_server).await;
+        let expected = data_query_batches(&invocation, 0, 1).await.unwrap();
+        let peer = SelfPeer::new(CompactionMode::Disabled);
+        let batches = peer.private_sql(&invocation, 0, 1).await.unwrap();
+
+        assert_eq!(batches.len(), expected.len());
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            expected.iter().map(|batch| batch.num_rows()).sum::<usize>()
+        );
     }
 }

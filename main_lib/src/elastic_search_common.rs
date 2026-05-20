@@ -3,22 +3,20 @@ use crate::data_access::load_memtable;
 use crate::elastic_search_responses::QueryFailure;
 use crate::peers::{PeerClient, PeerClientError, PrivateInvocation, PrivateInvocationResult};
 use crate::state_provider::STATE_PROVIDER;
-use arrow_flight::FlightData;
-use arrow_flight::decode::FlightRecordBatchStream;
-use arrow_flight::error::FlightError;
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::ipc::reader::StreamReader;
+use datafusion::arrow::ipc::writer::StreamWriter;
 use futures::future::try_join_all;
-use futures_util::{StreamExt, stream};
 use gotham::helpers::http::response::create_response;
 use gotham::mime::Mime;
 use gotham::state::State;
 use http::{HeaderName, StatusCode};
-use prost::Message;
 use serde_json::{Map, Value};
 use std::error::Error;
 use std::fmt::Display;
 use std::future::Future;
+use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 
@@ -26,6 +24,10 @@ pub(crate) const MIME_ES_JSON: LazyLock<Mime> = LazyLock::new(|| {
     "application/vnd.elasticsearch+json;compatible-with=8"
         .parse()
         .unwrap()
+});
+
+pub(crate) const MIME_ARROW_STREAM: LazyLock<Mime> = LazyLock::new(|| {
+    "application/vnd.apache.arrow.stream".parse().unwrap()
 });
 
 pub(crate) struct CommandContext {}
@@ -274,30 +276,52 @@ pub fn create_denormalized_value(value: &Value) -> Value {
     Value::from(new_map)
 }
 
-pub(crate) async fn result_to_record_batch(result: Vec<Vec<u8>>) -> Vec<RecordBatch> {
-    let mut retval = Vec::new();
-    let flight_data = result
-        .iter()
-        .map(|x| Ok(FlightData::decode(&x[..]).unwrap()))
-        .collect::<Vec<Result<FlightData, FlightError>>>();
-    let mut record_batch_stream =
-        FlightRecordBatchStream::new_from_flight_data(stream::iter(flight_data));
-    while let Some(batch) = record_batch_stream.next().await {
-        match batch {
-            Ok(batch) => retval.push(batch),
-            Err(e) => {
-                let error = format!("Error: {}", e);
-                panic!("{}", error);
-            }
-        };
+pub(crate) fn record_batches_to_ipc_stream_bytes(
+    batches: &[RecordBatch],
+) -> Result<Vec<u8>, ParseError> {
+    if batches.is_empty() {
+        return Ok(vec![]);
     }
-    retval
+
+    let mut bytes = Vec::new();
+    let schema = batches[0].schema();
+    let mut writer = StreamWriter::try_new(&mut bytes, &schema).map_err(|e| ParseError {
+        message: format!("Failed to create Arrow stream writer: {e}"),
+    })?;
+    for batch in batches {
+        writer.write(batch).map_err(|e| ParseError {
+            message: format!("Failed to write Arrow stream batch: {e}"),
+        })?;
+    }
+    writer.finish().map_err(|e| ParseError {
+        message: format!("Failed to finish Arrow stream: {e}"),
+    })?;
+    Ok(bytes)
+}
+
+pub(crate) fn result_to_record_batch(result: &[u8]) -> Vec<RecordBatch> {
+    if result.is_empty() {
+        return vec![];
+    }
+
+    let reader = StreamReader::try_new(Cursor::new(result), None).unwrap_or_else(|e| {
+        panic!("Error creating Arrow stream reader: {e}");
+    });
+    reader
+        .map(|batch| batch.unwrap_or_else(|e| panic!("Error decoding Arrow stream batch: {e}")))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::elastic_search_common::create_denormalized_value;
+    use crate::elastic_search_common::{
+        create_denormalized_value, record_batches_to_ipc_stream_bytes, result_to_record_batch,
+    };
+    use datafusion::arrow::array::{Array, Int32Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
     use serde_json::json;
+    use std::sync::Arc;
 
     #[test]
     fn test_denormalized() {
@@ -321,5 +345,42 @@ mod tests {
         let denormalized_val_str = serde_json::to_string(&denormalized_val).unwrap();
         assert!(denormalized_val_str.contains("A_B"));
         assert!(denormalized_val_str.contains("A_C"));
+    }
+
+    #[test]
+    fn test_record_batch_arrow_stream_roundtrip() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("message", DataType::Utf8, false),
+            Field::new("count", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["alpha", "beta"])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+            ],
+        )
+        .unwrap();
+
+        let bytes = record_batches_to_ipc_stream_bytes(std::slice::from_ref(&batch)).unwrap();
+        let decoded = result_to_record_batch(&bytes);
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].schema(), schema);
+        assert_eq!(decoded[0].num_rows(), 2);
+        let messages = decoded[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let counts = decoded[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(messages.value(0), "alpha");
+        assert_eq!(messages.value(1), "beta");
+        assert_eq!(counts.value(0), 1);
+        assert_eq!(counts.value(1), 2);
     }
 }

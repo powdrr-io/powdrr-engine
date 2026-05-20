@@ -1,12 +1,8 @@
-use arrow_flight::encode::FlightDataEncoderBuilder;
-use arrow_flight::error::FlightError;
 use chrono::{DateTime, SecondsFormat, Utc};
 use datafusion::arrow::array::RecordBatch;
 use datafusion::error::DataFusionError;
-use futures_util::StreamExt;
 use futures_util::future::try_join_all;
 use idgenerator::IdInstance;
-use prost::Message;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -20,6 +16,7 @@ use crate::data_contract::{
     ExtensionFile, ExtensionFileMetadata, FileDescriptor, IcebergColumnStats, IcebergFileStats,
     IcebergMetadata, SpeedboatMetadata, TableMetadataCheckpoint,
 };
+use crate::elastic_search_common::record_batches_to_ipc_stream_bytes;
 use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_responses::{QueryResultHit, compare_query_result_hits_desc};
 use crate::lakehouse_serving::{
@@ -83,12 +80,6 @@ impl PrivateApiError {
             message: format!("DataFusionError: {}", source),
         }
     }
-}
-
-pub(crate) struct DataQueryResult {
-    #[allow(dead_code)]
-    pub(crate) num: u32,
-    pub(crate) result: Vec<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -1143,12 +1134,20 @@ pub(crate) async fn data_query(
     invocation: &PrivateSqlInvocation,
     index: u64,
     num: u64,
-) -> Result<DataQueryResult, PrivateApiError> {
+) -> Result<Vec<u8>, PrivateApiError> {
+    let batches = data_query_batches(invocation, index, num).await?;
+    record_batches_to_ipc_stream_bytes(&batches).map_err(|error| PrivateApiError {
+        message: error.message,
+    })
+}
+
+pub(crate) async fn data_query_batches(
+    invocation: &PrivateSqlInvocation,
+    index: u64,
+    num: u64,
+) -> Result<Vec<RecordBatch>, PrivateApiError> {
     if invocation.checkpoints.len() == 0 {
-        return Ok(DataQueryResult {
-            num: 0,
-            result: vec![],
-        });
+        return Ok(vec![]);
     }
 
     let required_files = match determine_required_files(
@@ -1175,7 +1174,7 @@ pub(crate) async fn data_query(
         .sum::<u64>();
     log_required_files("Query", &required_files, parquet_size, speedboat_size);
 
-    data_query_worker(&invocation.sql, &required_files, true).await
+    data_query_batches_worker(&invocation.sql, &required_files, true).await
 }
 
 pub(crate) async fn search_query(
@@ -1714,10 +1713,20 @@ pub(crate) async fn compaction_query(
     invocation: &PrivateCompactionInvocation,
     index: u64,
     num: u64,
-) -> Result<DataQueryResult, PrivateApiError> {
-    let required_files = generate_required_files(invocation, index, num);
+) -> Result<Vec<u8>, PrivateApiError> {
+    let batches = compaction_query_batches(invocation, index, num).await?;
+    record_batches_to_ipc_stream_bytes(&batches).map_err(|error| PrivateApiError {
+        message: error.message,
+    })
+}
 
-    data_query_worker(&invocation.sql, &required_files, true).await
+pub(crate) async fn compaction_query_batches(
+    invocation: &PrivateCompactionInvocation,
+    index: u64,
+    num: u64,
+) -> Result<Vec<RecordBatch>, PrivateApiError> {
+    let required_files = generate_required_files(invocation, index, num);
+    data_query_batches_worker(&invocation.sql, &required_files, true).await
 }
 
 pub(crate) async fn extension_query(
@@ -1739,7 +1748,7 @@ pub(crate) async fn prefetch_query(
     invocation: &PrivatePrefetchInvocation,
     index: u64,
     num: u64,
-) -> Result<DataQueryResult, PrivateApiError> {
+) -> Result<(), PrivateApiError> {
     if invocation.required_extensions.is_empty() {
         match warm_iceberg_checkpoints(&invocation.checkpoints).await {
             Ok(_) => {}
@@ -1770,19 +1779,15 @@ pub(crate) async fn prefetch_query(
     } else {
         None
     };
-    let result = if let Some(plan) = targeted_warmup_plan.as_ref() {
+    if let Some(plan) = targeted_warmup_plan.as_ref() {
         execute_serving_cache_manager_plan(plan, &required_files.delete_files)
             .await
             .map_err(|error| PrivateApiError {
                 message: error.message,
             })?;
-        DataQueryResult {
-            num: 0,
-            result: vec![],
-        }
     } else {
-        data_query_worker(&SqlQuery::dummy(), &required_files, false).await?
-    };
+        data_query_batches_worker(&SqlQuery::dummy(), &required_files, false).await?;
+    }
     data_access::flush_serving_bulk_cache()
         .await
         .map_err(|message| PrivateApiError { message })?;
@@ -1831,7 +1836,7 @@ pub(crate) async fn prefetch_query(
                     .sum()
             }),
     });
-    Ok(result)
+    Ok(())
 }
 
 fn log_required_files(
@@ -2186,26 +2191,21 @@ async fn data_query_batches_worker(
 
     let iceberg_results = try_join_all(iceberg_calls).await?;
 
-    let speedboat_results: Vec<Result<RecordBatch, FlightError>> =
-        match try_join_all(speedboat_calls).await {
-            Ok(ar) => ar
-                .iter()
-                .flatten()
-                .map(|x| Ok(x.clone()))
-                .collect::<Vec<Result<RecordBatch, FlightError>>>(),
-            Err(e) => {
-                let error = format!("{}", e.message);
-                println!("{}", error);
-                panic!("dude")
-            }
-        };
+    let speedboat_results: Vec<RecordBatch> = match try_join_all(speedboat_calls).await {
+        Ok(ar) => ar.iter().flatten().cloned().collect::<Vec<RecordBatch>>(),
+        Err(e) => {
+            let error = format!("{}", e.message);
+            println!("{}", error);
+            panic!("dude")
+        }
+    };
 
     if let Some(all_deletes_local_name) = all_deletes_local_name.as_ref() {
         data_access::drop(all_deletes_local_name).await;
     }
 
     let mut combined = iceberg_results.into_iter().flatten().collect::<Vec<_>>();
-    combined.extend(speedboat_results.into_iter().map(|result| result.unwrap()));
+    combined.extend(speedboat_results);
     Ok(combined)
 }
 
@@ -2293,38 +2293,4 @@ async fn data_query_batches_exact_worker(
         .chain(speedboat_results.into_iter())
         .flatten()
         .collect())
-}
-
-async fn data_query_worker(
-    sql: &SqlQuery,
-    required_files: &RequiredFiles,
-    use_cpu_threadpool: bool,
-) -> Result<DataQueryResult, PrivateApiError> {
-    let batches = data_query_batches_worker(sql, required_files, use_cpu_threadpool).await?;
-
-    let mut retval = Vec::new();
-    let input_stream =
-        futures::stream::iter(batches.into_iter().map(Ok::<RecordBatch, FlightError>));
-    let mut flight_data_stream = FlightDataEncoderBuilder::new().build(input_stream);
-    while let Some(value) = flight_data_stream.next().await {
-        let mut buf = Vec::new();
-        match value {
-            Ok(v) => match v.encode(&mut buf) {
-                Ok(_) => (),
-                Err(e) => {
-                    let error = format!("Error encoding data: {:?}", e);
-                    panic!("{}", error);
-                }
-            },
-            Err(e) => {
-                let error = format!("Error streaming data: {:?}", e);
-                panic!("{}", error);
-            }
-        };
-        retval.push(buf);
-    }
-    Ok(DataQueryResult {
-        num: 0,
-        result: retval,
-    })
 }
