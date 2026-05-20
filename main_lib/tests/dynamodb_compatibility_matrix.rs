@@ -1314,7 +1314,8 @@ async fn compare_update_item_operation(fixture: &DifferentialFixture) {
         .update_item()
         .table_name(&fixture.write_table_name)
         .set_key(Some(primary_key_item_from_parts("acme", json!(20))))
-        .update_expression("REMOVE region")
+        .update_expression("REMOVE #region")
+        .expression_attribute_names("#region", "region")
         .return_values(ReturnValue::AllNew)
         .send()
         .await
@@ -1324,7 +1325,8 @@ async fn compare_update_item_operation(fixture: &DifferentialFixture) {
         .update_item()
         .table_name(&fixture.write_table_name)
         .set_key(Some(primary_key_item_from_parts("acme", json!(20))))
-        .update_expression("REMOVE region")
+        .update_expression("REMOVE #region")
+        .expression_attribute_names("#region", "region")
         .return_values(ReturnValue::AllNew)
         .send()
         .await
@@ -1387,8 +1389,9 @@ async fn compare_update_item_operation(fixture: &DifferentialFixture) {
         .table_name(&fixture.write_table_name)
         .set_key(Some(primary_key_item_from_parts("acme", json!(50))))
         .update_expression(
-            "SET event_id = :event, region = :region, active = :active, #count = :count",
+            "SET event_id = :event, #region = :region, active = :active, #count = :count",
         )
+        .expression_attribute_names("#region", "region")
         .expression_attribute_names("#count", "count")
         .expression_attribute_values(":event", AttributeValue::S("evt-50".to_string()))
         .expression_attribute_values(":region", AttributeValue::S("eu-west-1".to_string()))
@@ -1404,8 +1407,9 @@ async fn compare_update_item_operation(fixture: &DifferentialFixture) {
         .table_name(&fixture.write_table_name)
         .set_key(Some(primary_key_item_from_parts("acme", json!(50))))
         .update_expression(
-            "SET event_id = :event, region = :region, active = :active, #count = :count",
+            "SET event_id = :event, #region = :region, active = :active, #count = :count",
         )
+        .expression_attribute_names("#region", "region")
         .expression_attribute_names("#count", "count")
         .expression_attribute_values(":event", AttributeValue::S("evt-50".to_string()))
         .expression_attribute_values(":region", AttributeValue::S("eu-west-1".to_string()))
