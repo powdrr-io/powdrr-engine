@@ -4,11 +4,11 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
 use std::sync::{LazyLock, Mutex};
 
-use futures::FutureExt;
 use futures::stream::{self, StreamExt};
+use futures::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{Body, body};
+use gotham::hyper::{body, Body};
 use gotham::mime;
 use gotham::state::{FromState, State};
 use http::StatusCode;
@@ -948,7 +948,7 @@ async fn load_serving_context(
     };
 
     let checkpoint_id = match STATE_PROVIDER
-        .get_active_servable_checkpoint(&description.name)
+        .get_published_active_servable_checkpoint(&description.name)
         .await
     {
         Ok(Some(checkpoint_id)) => checkpoint_id,
@@ -1021,11 +1021,7 @@ async fn load_serving_context(
         &extension_files,
         &exact_artifact_fields,
     );
-    append_secondary_pattern_artifacts(
-        &mut access_artifacts,
-        &serving,
-        &sort_order,
-    );
+    append_secondary_pattern_artifacts(&mut access_artifacts, &serving, &sort_order);
     let metadata_snapshot_cached = iceberg_metadata
         .snapshot_id
         .as_ref()
@@ -1250,24 +1246,25 @@ async fn execute_aggregate_plan(
         return Ok(empty_aggregate_rows(aggregate, &measure_plans));
     }
 
-    let partial_sql = build_aggregate_sql("{table}", request, limit, !delete_files.is_empty(), true)?;
+    let partial_sql =
+        build_aggregate_sql("{table}", request, limit, !delete_files.is_empty(), true)?;
     let delete_files = delete_files.to_vec();
     let concurrency = file_groups.len().clamp(1, serving_file_parallelism());
-    let mut results = stream::iter(file_groups.into_iter().map(|files| {
-        let local_partial_sql = partial_sql.clone();
-        let local_delete_files = delete_files.clone();
-        async move { execute_file_group_plan(files, &local_partial_sql, &local_delete_files).await }
-    }))
-    .buffer_unordered(concurrency);
+    let mut results =
+        stream::iter(
+            file_groups.into_iter().map(|files| {
+                let local_partial_sql = partial_sql.clone();
+                let local_delete_files = delete_files.clone();
+                async move {
+                    execute_file_group_plan(files, &local_partial_sql, &local_delete_files).await
+                }
+            }),
+        )
+        .buffer_unordered(concurrency);
 
     let mut merged = HashMap::<String, serde_json::Map<String, Value>>::new();
     while let Some(result) = results.next().await {
-        merge_partial_aggregate_rows(
-            &mut merged,
-            result?,
-            aggregate,
-            &measure_plans,
-        )?;
+        merge_partial_aggregate_rows(&mut merged, result?, aggregate, &measure_plans)?;
     }
 
     finalize_aggregate_rows(merged, aggregate, &measure_plans, limit)
@@ -1336,24 +1333,17 @@ fn merge_partial_aggregate_rows(
                         .get(&plan.partial_value_alias)
                         .and_then(value_as_f64)
                         .unwrap_or(0.0);
-                    let existing = entry
-                        .get(&plan.alias)
-                        .and_then(value_as_f64)
-                        .unwrap_or(0.0);
+                    let existing = entry.get(&plan.alias).and_then(value_as_f64).unwrap_or(0.0);
                     entry.insert(
                         plan.alias.clone(),
                         json_number_value(existing + partial_value),
                     );
                 }
                 AggregateFunction::Sum => {
-                    if let Some(partial_value) = object
-                        .get(&plan.partial_value_alias)
-                        .and_then(value_as_f64)
+                    if let Some(partial_value) =
+                        object.get(&plan.partial_value_alias).and_then(value_as_f64)
                     {
-                        let existing = entry
-                            .get(&plan.alias)
-                            .and_then(value_as_f64)
-                            .unwrap_or(0.0);
+                        let existing = entry.get(&plan.alias).and_then(value_as_f64).unwrap_or(0.0);
                         entry.insert(
                             plan.alias.clone(),
                             json_number_value(existing + partial_value),
@@ -1373,22 +1363,27 @@ fn merge_partial_aggregate_rows(
                         .unwrap_or(0.0);
                     let sum_key = format!("__avg_sum_{}", plan.alias);
                     let count_key = format!("__avg_count_{}", plan.alias);
-                    let existing_sum = entry
-                        .get(&sum_key)
-                        .and_then(value_as_f64)
-                        .unwrap_or(0.0);
-                    let existing_count = entry
-                        .get(&count_key)
-                        .and_then(value_as_f64)
-                        .unwrap_or(0.0);
+                    let existing_sum = entry.get(&sum_key).and_then(value_as_f64).unwrap_or(0.0);
+                    let existing_count =
+                        entry.get(&count_key).and_then(value_as_f64).unwrap_or(0.0);
                     entry.insert(sum_key, json_number_value(existing_sum + partial_sum));
                     entry.insert(count_key, json_number_value(existing_count + partial_count));
                 }
                 AggregateFunction::Min => {
-                    merge_extreme_value(entry, &plan.alias, object.get(&plan.partial_value_alias), true);
+                    merge_extreme_value(
+                        entry,
+                        &plan.alias,
+                        object.get(&plan.partial_value_alias),
+                        true,
+                    );
                 }
                 AggregateFunction::Max => {
-                    merge_extreme_value(entry, &plan.alias, object.get(&plan.partial_value_alias), false);
+                    merge_extreme_value(
+                        entry,
+                        &plan.alias,
+                        object.get(&plan.partial_value_alias),
+                        false,
+                    );
                 }
             }
         }
@@ -1417,7 +1412,8 @@ fn merge_extreme_value(
                 return;
             }
             let ordering = compare_values(candidate, existing);
-            if (is_min && ordering == Ordering::Less) || (!is_min && ordering == Ordering::Greater) {
+            if (is_min && ordering == Ordering::Less) || (!is_min && ordering == Ordering::Greater)
+            {
                 entry.insert(alias.to_string(), candidate.clone());
             }
         }
@@ -1462,9 +1458,7 @@ fn finalize_aggregate_rows(
                         row.entry(plan.alias.clone())
                             .or_insert_with(|| json_number_value(0.0));
                     }
-                    AggregateFunction::Sum
-                    | AggregateFunction::Min
-                    | AggregateFunction::Max => {
+                    AggregateFunction::Sum | AggregateFunction::Min | AggregateFunction::Max => {
                         row.entry(plan.alias.clone()).or_insert(Value::Null);
                     }
                 }
@@ -2378,7 +2372,10 @@ fn validate_aggregate_request(
                 let field_name = measure.field.as_ref().ok_or_else(|| {
                     ServingQueryError::new(
                         StatusCode::BAD_REQUEST,
-                        &format!("{} serving measures require a field", function.to_uppercase()),
+                        &format!(
+                            "{} serving measures require a field",
+                            function.to_uppercase()
+                        ),
                     )
                 })?;
                 let field = schema_map.get(field_name).ok_or_else(|| {
@@ -2389,7 +2386,10 @@ fn validate_aggregate_request(
                 })?;
                 validate_scalar_serving_field_type(&field.data_type, field_name)?;
                 if matches!(function, "sum" | "avg")
-                    && !matches!(field.data_type, PowdrrDataType::Float | PowdrrDataType::Integer)
+                    && !matches!(
+                        field.data_type,
+                        PowdrrDataType::Float | PowdrrDataType::Integer
+                    )
                 {
                     return Err(ServingQueryError::new(
                         StatusCode::BAD_REQUEST,
@@ -2464,7 +2464,10 @@ fn aggregate_measure_alias_with_function(
             let field = measure.field.as_ref().ok_or_else(|| {
                 ServingQueryError::new(
                     StatusCode::BAD_REQUEST,
-                    &format!("{} serving measures require a field", function.to_uppercase()),
+                    &format!(
+                        "{} serving measures require a field",
+                        function.to_uppercase()
+                    ),
                 )
             })?;
             Ok(format!("{function}_{field}"))
@@ -2709,7 +2712,10 @@ fn applicable_artifacts_for_request(
             .aggregate
             .as_ref()
             .map(|aggregate| {
-                aggregate.group_by.iter().any(|field| artifact.fields.contains(field))
+                aggregate
+                    .group_by
+                    .iter()
+                    .any(|field| artifact.fields.contains(field))
                     || aggregate.measures.iter().any(|measure| {
                         measure
                             .field
@@ -2871,22 +2877,21 @@ fn suggested_actions_for_request(
                 .to_string(),
         );
     }
-    if let Some(pattern_name) = context
-        .description
-        .serving
-        .as_ref()
-        .and_then(|serving| {
-            serving
-                .patterns
-                .iter()
-                .find(|pattern| request_matches_pattern(request, pattern, request.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT)))
-                .map(|pattern| pattern.name.clone())
-        })
-    {
+    if let Some(pattern_name) = context.description.serving.as_ref().and_then(|serving| {
+        serving
+            .patterns
+            .iter()
+            .find(|pattern| {
+                request_matches_pattern(
+                    request,
+                    pattern,
+                    request.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT),
+                )
+            })
+            .map(|pattern| pattern.name.clone())
+    }) {
         let secondary_artifact = secondary_pattern_artifact_name(&pattern_name);
-        if !artifacts_considered.contains(&secondary_artifact)
-            && !request.aggregate.is_some()
-        {
+        if !artifacts_considered.contains(&secondary_artifact) && !request.aggregate.is_some() {
             suggestions.push(format!(
                 "build a declared secondary serving artifact for pattern {}",
                 pattern_name
@@ -3036,7 +3041,10 @@ fn append_secondary_pattern_artifacts(
             continue;
         }
         let name = secondary_pattern_artifact_name(&pattern.name);
-        if access_artifacts.iter().any(|artifact| artifact.name == name) {
+        if access_artifacts
+            .iter()
+            .any(|artifact| artifact.name == name)
+        {
             continue;
         }
         let mut fields = pattern.eq_fields.clone();
@@ -3086,10 +3094,7 @@ fn secondary_pattern_is_supported(
             .unwrap_or(true)
 }
 
-fn artifact_supports_field_for_eq(
-    access_artifacts: &[IcebergAccessArtifact],
-    field: &str,
-) -> bool {
+fn artifact_supports_field_for_eq(access_artifacts: &[IcebergAccessArtifact], field: &str) -> bool {
     access_artifacts.iter().any(|artifact| {
         artifact.supports_eq
             && artifact.fields.iter().any(|candidate| candidate == field)
@@ -3107,13 +3112,15 @@ fn artifact_supports_field_for_range(
     field: &str,
 ) -> bool {
     access_artifacts.iter().any(|artifact| {
-        artifact.supports_range
-            && artifact.fields.iter().any(|candidate| candidate == field)
+        artifact.supports_range && artifact.fields.iter().any(|candidate| candidate == field)
     })
 }
 
 fn secondary_pattern_artifact_name(pattern_name: &str) -> String {
-    format!("{}:{}", ACCESS_ARTIFACT_KIND_SECONDARY_PATTERN, pattern_name)
+    format!(
+        "{}:{}",
+        ACCESS_ARTIFACT_KIND_SECONDARY_PATTERN, pattern_name
+    )
 }
 
 fn request_uses_exact_filters(request: &ServingRequestPlan) -> bool {
@@ -3662,7 +3669,11 @@ fn build_aggregate_sql(
     }
     sql.push_str(&format!(
         " LIMIT {}",
-        if aggregate.group_by.is_empty() { 1 } else { limit }
+        if aggregate.group_by.is_empty() {
+            1
+        } else {
+            limit
+        }
     ));
     Ok(sql)
 }
@@ -3838,15 +3849,15 @@ impl ServingQueryError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCESS_ARTIFACT_KIND_EXACT_PRUNING, ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS,
-        DEFAULT_FAST_PATH_MAX_DELETE_FILES, DEFAULT_SLOW_PATH_MAX_BYTES, ExactPruningFieldSummary,
-        ServingExecutionContext, aggregate_measure_plans, append_secondary_pattern_artifacts,
-        build_serving_layout_advice, build_serving_warmup_plan, build_sql,
-        exact_artifact_fields, exact_pruning_summary_may_match_request, file_group_table_name,
-        finalize_aggregate_rows, group_files_by_schema, merge_partial_aggregate_rows,
-        ordered_file_groups_for_top_k, plan_request, prune_candidate_files,
-        remaining_groups_cannot_beat_kth_row, request_matches_pattern,
-        secondary_pattern_artifact_name, select_serving_warmup_files,
+        aggregate_measure_plans, append_secondary_pattern_artifacts, build_serving_layout_advice,
+        build_serving_warmup_plan, build_sql, exact_artifact_fields,
+        exact_pruning_summary_may_match_request, file_group_table_name, finalize_aggregate_rows,
+        group_files_by_schema, merge_partial_aggregate_rows, ordered_file_groups_for_top_k,
+        plan_request, prune_candidate_files, remaining_groups_cannot_beat_kth_row,
+        request_matches_pattern, secondary_pattern_artifact_name, select_serving_warmup_files,
+        ExactPruningFieldSummary, ServingExecutionContext, ACCESS_ARTIFACT_KIND_EXACT_PRUNING,
+        ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS, DEFAULT_FAST_PATH_MAX_DELETE_FILES,
+        DEFAULT_SLOW_PATH_MAX_BYTES,
     };
     use crate::data_access::{
         prime_parquet_row_group_stats_cache_for_test, reset_serving_metadata_caches_for_test,
@@ -4558,16 +4569,18 @@ mod tests {
         let plan = plan_request(&context, &request).unwrap();
 
         assert_eq!(plan.classification, ServingQueryClassification::Rejected);
-        assert!(
-            plan.reason
-                .as_ref()
-                .is_some_and(|reason| reason.contains("exceeds serving budget"))
-        );
+        assert!(plan
+            .reason
+            .as_ref()
+            .is_some_and(|reason| reason.contains("exceeds serving budget")));
     }
 
     #[test]
     fn test_plan_request_rejects_aggregate_without_declared_pattern() {
-        let context = test_context(ServingTableConfig::default(), test_file_stats_for_aggregate());
+        let context = test_context(
+            ServingTableConfig::default(),
+            test_file_stats_for_aggregate(),
+        );
         let request = ServingRequestPlan {
             select: None,
             filters: vec![ServingPredicate {
@@ -4715,9 +4728,9 @@ mod tests {
             }],
         );
 
-        assert!(access_artifacts.iter().any(|artifact| {
-            artifact.name == secondary_pattern_artifact_name("tenant_recent")
-        }));
+        assert!(access_artifacts
+            .iter()
+            .any(|artifact| { artifact.name == secondary_pattern_artifact_name("tenant_recent") }));
     }
 
     #[test]
@@ -4770,11 +4783,10 @@ mod tests {
         let plan = plan_request(&context, &request).unwrap();
 
         assert_eq!(plan.classification, ServingQueryClassification::SlowPath);
-        assert!(
-            plan.reason
-                .as_ref()
-                .is_some_and(|reason| reason.contains("delete files"))
-        );
+        assert!(plan
+            .reason
+            .as_ref()
+            .is_some_and(|reason| reason.contains("delete files")));
     }
 
     #[test]
@@ -4838,12 +4850,10 @@ mod tests {
 
         assert_eq!(advice.patterns.len(), 1);
         assert!(!advice.issues.is_empty());
-        assert!(
-            advice.patterns[0]
-                .recommendation
-                .as_ref()
-                .is_some_and(|recommendation| recommendation.contains("Cluster or partition"))
-        );
+        assert!(advice.patterns[0]
+            .recommendation
+            .as_ref()
+            .is_some_and(|recommendation| recommendation.contains("Cluster or partition")));
     }
 
     #[test]

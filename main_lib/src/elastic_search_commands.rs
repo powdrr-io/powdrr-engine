@@ -12,8 +12,8 @@ use crate::elastic_search_common::{CommandError, ElasticSearchResponse};
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::elastic_search_ingest::IngestError;
 use crate::elastic_search_responses::{
-    AggregationResult, QueryResultsNotFound, UpdateByQueryResults, UpdateByQueryResultsRetries,
-    UpdateByQuerySuccess, transient_error,
+    transient_error, AggregationResult, QueryResultsNotFound, UpdateByQueryResults,
+    UpdateByQueryResultsRetries, UpdateByQuerySuccess,
 };
 use crate::elastic_search_storage_schema::{
     FullRecord, RecordDelete, RecordInput, SpeedboatCommitBuilder,
@@ -21,7 +21,7 @@ use crate::elastic_search_storage_schema::{
 use crate::peers::{PrivateInvocation, PrivateSqlInvocation};
 use crate::schema_massager::{PowdrrSchema, SqlBuilder, SqlExpression, SqlQuery};
 use crate::search_runtime::{
-    Aggregation, ScriptBlock, batches_to_serde_value, df_to_serde_value, process_aggregations,
+    batches_to_serde_value, df_to_serde_value, process_aggregations, Aggregation, ScriptBlock,
 };
 use crate::{
     data_access::{self, execute_sql},
@@ -95,7 +95,7 @@ impl LookupById {
 
     async fn current_target_snapshots(&self) -> Vec<CheckpointDescriptor> {
         let checkpoint_id = STATE_PROVIDER
-            .get_active_servable_checkpoint(&self.table)
+            .get_published_active_servable_checkpoint(&self.table)
             .await
             .unwrap();
         match checkpoint_id {
@@ -273,7 +273,7 @@ impl SqlCommand {
 
     async fn current_target_snapshots(&self) -> Vec<CheckpointDescriptor> {
         let checkpoint_id = match STATE_PROVIDER
-            .get_active_servable_checkpoint(&self.table)
+            .get_published_active_servable_checkpoint(&self.table)
             .await
         {
             Ok(c) => match c {
@@ -282,7 +282,7 @@ impl SqlCommand {
             },
             Err(e) => {
                 let error = format!(
-                    "Error getting latest checkpoint for table {}: {}",
+                    "Error getting active published checkpoint for table {}: {}",
                     self.table, e
                 );
                 tracing::error!("{}", error);

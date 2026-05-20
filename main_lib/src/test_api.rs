@@ -3,7 +3,7 @@ use gotham::plain::test::AsyncTestServer;
 use gotham::{
     handler::HandlerFuture,
     helpers::http::response::create_response,
-    hyper::{Body, StatusCode, body},
+    hyper::{body, Body, StatusCode},
     mime,
     state::{FromState, State},
 };
@@ -274,10 +274,10 @@ fn do_update_checkpoint_work_for_forever(wait_time_ms: u64) -> impl Future<Outpu
     async move {
         let mut work_done;
         loop {
-            match STATE_PROVIDER.update_all_checkpoints().await {
+            match STATE_PROVIDER.advance_published_checkpoints().await {
                 Ok(checkpoint_work_done) => work_done = checkpoint_work_done,
                 Err(e) => {
-                    tracing::error!("Error updating checkpoints: {}", e);
+                    tracing::error!("Error advancing published checkpoints: {}", e);
                     work_done = false;
                 }
             };
@@ -395,10 +395,10 @@ pub fn test_v1_process_work(mut state: State) -> Pin<Box<HandlerFuture>> {
                 do_available_compaction_work(snapshot_id).await;
             snapshot_id = new_snapshot_id;
             work_done = work_done | compaction_work_done;
-            match STATE_PROVIDER.update_all_checkpoints().await {
+            match STATE_PROVIDER.advance_published_checkpoints().await {
                 Ok(checkpoint_work_done) => work_done = work_done | checkpoint_work_done,
                 Err(e) => {
-                    tracing::error!("Error updating checkpoints: {}", e);
+                    tracing::error!("Error advancing published checkpoints: {}", e);
                 }
             };
             let num_deletes = do_next_cleanup().await;
