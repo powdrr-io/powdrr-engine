@@ -705,6 +705,7 @@ async fn compare_list_tables(fixture: &DifferentialFixture) {
     let expected_names = fixture_table_names(&[
         fixture.primary_table_name.clone(),
         fixture.begins_with_table_name.clone(),
+        fixture.write_table_name.clone(),
     ]);
 
     assert!(
@@ -1043,8 +1044,7 @@ async fn compare_put_item_operation(fixture: &DifferentialFixture) {
         "event_id": "evt-2-replaced",
         "region": "us-west-1",
         "active": true,
-        "count": 22,
-        "note": "replaced"
+        "count": 22
     }));
 
     let powdrr_replace = fixture
@@ -1095,8 +1095,7 @@ async fn compare_put_item_operation(fixture: &DifferentialFixture) {
         "event_id": "evt-40",
         "region": "us-east-2",
         "active": false,
-        "count": 40,
-        "note": "new"
+        "count": 40
     }));
     let powdrr_insert = fixture
         .powdrr_client
@@ -1150,7 +1149,6 @@ async fn compare_put_item_operation(fixture: &DifferentialFixture) {
             "region": "us-east-2",
             "active": false,
             "count": 40,
-            "note": "new",
         }))
     );
     assert_eq!(
@@ -1215,8 +1213,7 @@ async fn compare_delete_item_operation(fixture: &DifferentialFixture) {
             "event_id": "evt-41",
             "region": "us-east-2",
             "active": true,
-            "count": 41,
-            "note": "delete-target",
+            "count": 41
         }))))
         .send()
         .await
@@ -1231,8 +1228,7 @@ async fn compare_delete_item_operation(fixture: &DifferentialFixture) {
             "event_id": "evt-41",
             "region": "us-east-2",
             "active": true,
-            "count": 41,
-            "note": "delete-target",
+            "count": 41
         }))))
         .send()
         .await
@@ -1243,7 +1239,9 @@ async fn compare_delete_item_operation(fixture: &DifferentialFixture) {
         .delete_item()
         .table_name(&fixture.write_table_name)
         .set_key(Some(primary_key_item_from_parts("acme", json!(41))))
-        .condition_expression("attribute_exists(note)")
+        .condition_expression("#count = :count")
+        .expression_attribute_names("#count", "count")
+        .expression_attribute_values(":count", AttributeValue::N("41".to_string()))
         .return_values(ReturnValue::AllOld)
         .send()
         .await
@@ -1253,7 +1251,9 @@ async fn compare_delete_item_operation(fixture: &DifferentialFixture) {
         .delete_item()
         .table_name(&fixture.write_table_name)
         .set_key(Some(primary_key_item_from_parts("acme", json!(41))))
-        .condition_expression("attribute_exists(note)")
+        .condition_expression("#count = :count")
+        .expression_attribute_names("#count", "count")
+        .expression_attribute_values(":count", AttributeValue::N("41".to_string()))
         .return_values(ReturnValue::AllOld)
         .send()
         .await
@@ -1267,7 +1267,6 @@ async fn compare_delete_item_operation(fixture: &DifferentialFixture) {
             "region": "us-east-2",
             "active": true,
             "count": 41,
-            "note": "delete-target",
         }))
     );
     assert_eq!(
@@ -1304,7 +1303,8 @@ async fn compare_delete_item_operation(fixture: &DifferentialFixture) {
         .delete_item()
         .table_name(&fixture.write_table_name)
         .set_key(Some(primary_key_item_from_parts("acme", json!(10))))
-        .condition_expression("attribute_not_exists(region)")
+        .condition_expression("attribute_not_exists(#event)")
+        .expression_attribute_names("#event", "event_id")
         .send()
         .await
         .unwrap_err()
@@ -1314,7 +1314,8 @@ async fn compare_delete_item_operation(fixture: &DifferentialFixture) {
         .delete_item()
         .table_name(&fixture.write_table_name)
         .set_key(Some(primary_key_item_from_parts("acme", json!(10))))
-        .condition_expression("attribute_not_exists(region)")
+        .condition_expression("attribute_not_exists(#event)")
+        .expression_attribute_names("#event", "event_id")
         .send()
         .await
         .unwrap_err()

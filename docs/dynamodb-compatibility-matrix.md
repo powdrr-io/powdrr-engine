@@ -94,6 +94,9 @@ The first supported write milestone currently adds:
   expression subset
 - `ReturnValues` support for `NONE` and `ALL_OLD` on `PutItem` and
   `DeleteItem`
+- `PutItem` only for attributes already present in the published table
+  schema; introducing new top-level attributes is an explicit
+  `ValidationException`
 
 ## Local Runner
 

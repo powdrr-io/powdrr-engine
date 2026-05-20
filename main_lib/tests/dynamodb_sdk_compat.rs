@@ -850,7 +850,6 @@ async fn run_dynamodb_sdk_compat_test() {
             "region": "us-east-2",
             "active": false,
             "count": 40,
-            "note": "new",
         }))
     );
     assert_eq!(
@@ -889,7 +888,6 @@ async fn run_dynamodb_sdk_compat_test() {
             "region": "us-east-2",
             "active": false,
             "count": 40,
-            "note": "new",
         }))
     );
     assert_eq!(
@@ -1535,7 +1533,6 @@ async fn put_item_replace_existing(
             "region": "us-west-1",
             "active": true,
             "count": 22,
-            "note": "replaced",
         }))))
         .condition_expression("attribute_exists(#pk) AND #count = :count")
         .expression_attribute_names("#pk", "tenant")
@@ -1561,7 +1558,6 @@ async fn put_item_insert_new(
             "region": "us-east-2",
             "active": false,
             "count": 40,
-            "note": "new",
         }))))
         .condition_expression("attribute_not_exists(#pk) AND attribute_not_exists(#sk)")
         .expression_attribute_names("#pk", "tenant")
@@ -1604,7 +1600,9 @@ async fn delete_item_existing(
         .delete_item()
         .table_name(table_name)
         .set_key(Some(primary_key_item_from_parts("acme", json!(40))))
-        .condition_expression("attribute_exists(note)")
+        .condition_expression("#count = :count")
+        .expression_attribute_names("#count", "count")
+        .expression_attribute_values(":count", AttributeValue::N("40".to_string()))
         .return_values(ReturnValue::AllOld)
         .send()
         .await
@@ -1636,7 +1634,8 @@ async fn delete_item_condition_failure(
         .delete_item()
         .table_name(table_name)
         .set_key(Some(primary_key_item_from_parts("acme", json!(10))))
-        .condition_expression("attribute_not_exists(region)")
+        .condition_expression("attribute_not_exists(#event)")
+        .expression_attribute_names("#event", "event_id")
         .send()
         .await
 }

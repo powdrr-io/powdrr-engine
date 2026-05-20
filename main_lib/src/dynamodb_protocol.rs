@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Cursor;
@@ -910,6 +910,7 @@ async fn handle_put_item(payload: Value) -> Result<Value, DynamoDbError> {
     let context = load_dynamodb_table_context(&request.table_name).await?;
     let key_schema = primary_key_schema(&context.config);
     let item = dynamodb_item_to_json_row(&request.item)?;
+    validate_put_item_fields(&context.schema, &item)?;
     let item_key = parse_item_key_map(&request.item, &key_schema)?;
     let return_values = parse_write_return_values(request.return_values.as_deref(), "PutItem")?;
     let condition_expression = parse_condition_expression(
@@ -1758,6 +1759,31 @@ fn dynamodb_item_to_json_row(item: &Map<String, Value>) -> Result<Value, DynamoD
         converted.insert(key.clone(), dynamodb_attr_to_json(value)?);
     }
     Ok(Value::Object(converted))
+}
+
+fn validate_put_item_fields(schema: &PowdrrSchema, item: &Value) -> Result<(), DynamoDbError> {
+    let Value::Object(object) = item else {
+        return Err(DynamoDbError::validation(
+            "PutItem payload must encode to a top-level object",
+        ));
+    };
+    let known_fields = schema
+        .fields()
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<HashSet<_>>();
+    let unknown_fields = object
+        .keys()
+        .filter(|field| !known_fields.contains(*field))
+        .cloned()
+        .collect::<Vec<_>>();
+    if unknown_fields.is_empty() {
+        return Ok(());
+    }
+    Err(DynamoDbError::validation(format!(
+        "PutItem currently supports only existing table schema attributes; unknown fields: {}",
+        unknown_fields.join(", ")
+    )))
 }
 
 fn validate_dynamodb_config(
