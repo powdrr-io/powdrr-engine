@@ -21,7 +21,10 @@ use crate::state_provider::ServiceApiError;
 use crate::test_api::TestProcessingMode;
 use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const LEASE_LENGTH_MS: i64 = 60 * 1000;
 
 type CommittedCheckpoints = HashMap<String, String>;
 type SerializedCommittedCheckpoints = HashMap<String, CommittedCheckpoints>;
@@ -190,6 +193,13 @@ impl EphemeralServiceImpl {
         format!("{org_id}|{table_name}")
     }
 
+    fn current_timestamp_ms() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or_default()
+    }
+
     fn current_cutover_epoch(
         &self,
         table_name: &String,
@@ -222,6 +232,17 @@ impl EphemeralServiceImpl {
     fn clear_serving_node_activations(&mut self, table_name: &String, extension: &Option<String>) {
         self.serving_node_activations
             .remove(&Self::selector_group_key(table_name, extension));
+    }
+
+    fn prune_expired_serving_node_leases(&mut self) {
+        let earliest_live_ms = Self::current_timestamp_ms() - LEASE_LENGTH_MS;
+        self.serving_node_leases
+            .retain(|_, lease| lease.observed_at_ms >= earliest_live_ms);
+    }
+
+    fn live_serving_node_ids(&mut self) -> HashSet<String> {
+        self.prune_expired_serving_node_leases();
+        self.serving_node_leases.keys().cloned().collect()
     }
 
     fn get_published_checkpoint_sync(
@@ -1295,19 +1316,29 @@ impl EphemeralServiceImpl {
     }
 
     fn activation_matches_target(
-        &self,
+        &mut self,
         table_name: &String,
         extension: &Option<String>,
         target_checkpoint_id: &String,
     ) -> bool {
+        let live_nodes = self.live_serving_node_ids();
+        if live_nodes.is_empty() {
+            return false;
+        }
+
         let epoch = self.current_cutover_epoch(table_name, extension);
-        self.serving_node_activations
+        let Some(acks) = self
+            .serving_node_activations
             .get(&Self::selector_group_key(table_name, extension))
-            .map(|acks| {
-                acks.values()
-                    .any(|ack| ack.checkpoint_id == *target_checkpoint_id && ack.epoch == epoch)
-            })
-            .unwrap_or(false)
+        else {
+            return false;
+        };
+
+        live_nodes.into_iter().all(|node_id| {
+            acks.get(&node_id)
+                .map(|ack| ack.checkpoint_id == *target_checkpoint_id && ack.epoch == epoch)
+                .unwrap_or(false)
+        })
     }
 
     fn promote_active_checkpoint_if_ready(
@@ -1485,6 +1516,7 @@ impl MetadataStore for EphemeralServiceImpl {
         _org_info: &OrgInfo,
         lease: &ServingNodeLease,
     ) -> Result<(), ServiceApiError> {
+        self.prune_expired_serving_node_leases();
         self.serving_node_leases
             .insert(lease.node_id.clone(), lease.clone());
         Ok(())
