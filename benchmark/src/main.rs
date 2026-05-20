@@ -772,6 +772,7 @@ fn benchmark_plan(
     ServingRequestPlan {
         select: Some(workload.projection.clone()),
         filters,
+        aggregate: None,
         order_by: vec![ServingSort {
             field: workload.sort_field.clone(),
             descending,
@@ -854,6 +855,7 @@ fn safe_ordered_limit_for_field(
     let asc_plan = ServingRequestPlan {
         select: None,
         filters: vec![],
+        aggregate: None,
         order_by: vec![ServingSort {
             field: field_name.to_string(),
             descending: false,
@@ -865,6 +867,7 @@ fn safe_ordered_limit_for_field(
     let desc_plan = ServingRequestPlan {
         select: None,
         filters: vec![],
+        aggregate: None,
         order_by: vec![ServingSort {
             field: field_name.to_string(),
             descending: true,
@@ -1083,6 +1086,7 @@ fn pattern_from_case(name: &str, plan: &ServingRequestPlan) -> ServingPattern {
             .unwrap_or(false),
         max_limit: plan.limit.map(|limit| limit as u64),
         projection: plan.select.clone(),
+        aggregate: plan.aggregate.clone(),
     }
 }
 
@@ -1518,6 +1522,7 @@ mod tests {
         ServingRequestPlan {
             select: None,
             filters: vec![],
+            aggregate: None,
             order_by: vec![ServingSort {
                 field: field.to_string(),
                 descending,
@@ -1625,6 +1630,7 @@ mod tests {
                 lt: None,
                 lte: None,
             }],
+            aggregate: None,
             order_by: vec![ServingSort {
                 field: "title".to_string(),
                 descending: false,

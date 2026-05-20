@@ -808,6 +808,7 @@ async fn handle_get_item(payload: Value) -> Result<Value, DynamoDbError> {
         ServingRequestPlan {
             select: projection,
             filters: key_to_predicates(&key_schema, &key),
+            aggregate: None,
             order_by: vec![],
             limit: Some(1),
             allow_slow_path: false,
@@ -863,6 +864,7 @@ async fn handle_batch_get_item(payload: Value) -> Result<Value, DynamoDbError> {
                 ServingRequestPlan {
                     select: projection.clone(),
                     filters: key_to_predicates(&key_schema, &parsed_key),
+                    aggregate: None,
                     order_by: vec![],
                     limit: Some(1),
                     allow_slow_path: false,
@@ -994,6 +996,7 @@ async fn handle_query(payload: Value) -> Result<Value, DynamoDbError> {
         ServingRequestPlan {
             select: query_projection,
             filters: key_filters,
+            aggregate: None,
             order_by,
             limit: Some(effective_limit),
             allow_slow_path: false,
@@ -1499,6 +1502,7 @@ fn derived_serving_patterns_for_key_schema(
             descending: false,
             max_limit: Some(1),
             projection: None,
+            aggregate: None,
         });
     }
     if include_exact_query_pattern {
@@ -1511,6 +1515,7 @@ fn derived_serving_patterns_for_key_schema(
                 descending: false,
                 max_limit: None,
                 projection: None,
+                aggregate: None,
             });
         }
     }
@@ -1528,6 +1533,7 @@ fn derived_serving_patterns_for_key_schema(
                 descending,
                 max_limit: None,
                 projection: None,
+                aggregate: None,
             });
             patterns.push(ServingPattern {
                 name: format!(
@@ -1541,6 +1547,7 @@ fn derived_serving_patterns_for_key_schema(
                 descending,
                 max_limit: None,
                 projection: None,
+                aggregate: None,
             });
         }
     }
