@@ -12,8 +12,8 @@
     },
     {
       "operation": "BatchWriteItem",
-      "mode": "explicit_error",
-      "description": "Write APIs are intentionally unsupported and must fail explicitly."
+      "mode": "differential_supported",
+      "description": "Batched put and delete writes must match DynamoDB-compatible request validation and mutation behavior."
     },
     {
       "operation": "CreateBackup",
@@ -262,8 +262,8 @@
     },
     {
       "operation": "UpdateItem",
-      "mode": "explicit_error",
-      "description": "Item mutation is unsupported and must fail explicitly."
+      "mode": "differential_supported",
+      "description": "Partial item updates must match DynamoDB-compatible condition, return-value, and mutation behavior."
     },
     {
       "operation": "UpdateKinesisStreamingDestination",
