@@ -780,13 +780,11 @@ pub(crate) mod tests {
     }
 
     fn search_json(test_server: &TestServer, index: &str, body: &str) -> Value {
+        let url = format!("http://localhost/{index}/_search");
+        let body = body.to_string();
         let response = test_server
             .client()
-            .post(
-                &format!("http://localhost/{index}/_search"),
-                body,
-                mime::APPLICATION_JSON,
-            )
+            .post(&url, body, mime::APPLICATION_JSON)
             .perform()
             .unwrap();
 
