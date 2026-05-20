@@ -11,7 +11,7 @@ use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::{error::Error, fmt::Display};
 
-use crate::compaction::{CompactionCommand, CompactionResponse, compact_logs};
+use crate::compaction::{compact_logs, CompactionCommand, CompactionResponse};
 use crate::data_contract::{ExtensionFileMetadata, FileSetPayload};
 use crate::elastic_search_common::result_to_record_batch;
 use crate::elastic_search_responses::QueryResultHit;
@@ -66,7 +66,6 @@ pub struct PrivateSearchInvocation {
     pub exact_sql: Option<SqlQuery>,
     pub exact_constraints: Vec<PrivateExactConstraintGroup>,
     pub range_constraints: Vec<PrivateSearchRangeConstraint>,
-    pub exact_doc_id_field_name: Option<String>,
     pub required_extensions: Vec<String>,
     pub checkpoints: Vec<CheckpointDescriptor>,
     pub table: String,

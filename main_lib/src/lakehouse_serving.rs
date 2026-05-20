@@ -19,17 +19,20 @@ use serde_json::Value;
 use crate::data_access::{self, execute_sql_async};
 use crate::data_contract::{
     CreateTable, ExtensionFile, FileDescriptor, IcebergAccessArtifact, IcebergFileStats,
-    IcebergPartitionField, IcebergRowGroupStats, IcebergSortField, ServingPattern,
-    ServingTableConfig, TableDescription, TableMetadataCheckpoint,
-    ServingAggregateMeasure, ServingAggregateSpec,
+    IcebergPartitionField, IcebergRowGroupStats, IcebergSortField, ServingAggregateMeasure,
+    ServingAggregateSpec, ServingPattern, ServingTableConfig, TableDescription,
+    TableMetadataCheckpoint,
 };
 use crate::elastic_search_endpoints::NamePathExtractor;
 use crate::peers::CheckpointDescriptor;
 use crate::prefetch::warm_iceberg_checkpoints;
-use crate::query_execution::{QueryInputFile, execute_query_file_group_batches};
+use crate::query_execution::{
+    execute_query_plan_batches, group_query_input_files_by_schema, QueryExecutionPlan,
+    QueryInputFile, QuerySqlTemplate, QueryStorageKind,
+};
 use crate::query_path::{
-    QueryPredicate, column_is_all_null, compare_scalar_values, file_may_match_predicates,
-    group_files_by_schema, row_group_may_match_predicates,
+    column_is_all_null, compare_scalar_values, file_may_match_predicates, group_files_by_schema,
+    row_group_may_match_predicates, QueryPredicate,
 };
 use crate::schema_massager::{PowdrrDataType, PowdrrSchema};
 use crate::search_runtime::batches_to_serde_value;
@@ -221,6 +224,7 @@ struct ServingExecutionContext {
     checkpoint: CheckpointDescriptor,
     schema: PowdrrSchema,
     files: Vec<FileDescriptor>,
+    speedboat_files: Vec<FileDescriptor>,
     delete_files: Vec<String>,
     file_stats: HashMap<String, IcebergFileStats>,
     partition_spec: Vec<IcebergPartitionField>,
@@ -882,6 +886,7 @@ pub async fn execute_serving_query(
 
     let mut execution = execute_plan(
         &plan.selected_files,
+        &context.speedboat_files,
         &context.delete_files,
         &context.file_stats,
         &context.extension_files,
@@ -999,6 +1004,11 @@ async fn load_serving_context(
     };
 
     let files = iceberg_metadata.files.as_file_tuples();
+    let speedboat_files = checkpoint
+        .speedboat_metadata
+        .as_ref()
+        .map(|metadata| metadata.files.as_file_tuples())
+        .unwrap_or_default();
     let delete_files = checkpoint
         .deletes_metadata
         .as_ref()
@@ -1015,9 +1025,11 @@ async fn load_serving_context(
     let mut access_artifacts = iceberg_metadata.access_artifacts.clone();
     let sort_order = iceberg_metadata.sort_order.clone();
     let serving = description.serving.clone().unwrap_or_default();
+    let mut files_for_artifacts = files.clone();
+    files_for_artifacts.extend(speedboat_files.clone());
     append_exact_sidecar_artifacts(
         &mut access_artifacts,
-        &files,
+        &files_for_artifacts,
         &extension_files,
         &exact_artifact_fields,
     );
@@ -1036,6 +1048,7 @@ async fn load_serving_context(
         schema: iceberg_metadata.table_schema.clone(),
         snapshot_id: iceberg_metadata.snapshot_id.clone(),
         files,
+        speedboat_files,
         delete_files,
         file_stats,
         partition_spec: iceberg_metadata.partition_spec.clone(),
@@ -1075,7 +1088,7 @@ fn plan_request(
             limit,
             sql,
             selected_files: vec![],
-            files_considered: context.files.len(),
+            files_considered: context.files.len() + context.speedboat_files.len(),
             files_selected: 0,
             row_groups_considered: 0,
             row_groups_selected: 0,
@@ -1121,12 +1134,17 @@ fn plan_request(
         limit,
         sql,
         selected_files: pruned.selected_files.clone(),
-        files_considered: context.files.len(),
-        files_selected: pruned.files_selected,
+        files_considered: context.files.len() + context.speedboat_files.len(),
+        files_selected: pruned.files_selected + context.speedboat_files.len(),
         row_groups_considered: pruned.row_groups_considered,
         row_groups_selected: pruned.row_groups_selected,
         delete_files_considered: context.delete_files.len(),
-        estimated_bytes: pruned.estimated_bytes,
+        estimated_bytes: pruned.estimated_bytes
+            + context
+                .speedboat_files
+                .iter()
+                .map(|file| file.size)
+                .sum::<u64>(),
         partition_fields_available: context.partition_spec.len(),
         sort_fields_available: context.sort_order.len(),
         declared_sort_order_match,
@@ -1142,6 +1160,7 @@ fn plan_request(
 
 async fn execute_plan(
     files: &[FileDescriptor],
+    speedboat_files: &[FileDescriptor],
     delete_files: &[String],
     file_stats: &HashMap<String, IcebergFileStats>,
     extension_files: &HashMap<String, Vec<ExtensionFile>>,
@@ -1153,45 +1172,59 @@ async fn execute_plan(
     if limit == 0 {
         return Ok(ServingExecutionResult::default());
     }
-    let (files, execution_artifacts_used) =
+    let (files, mut execution_artifacts_used) =
         prune_execution_files_with_exact_artifact(files, extension_files, request).await?;
-    let execution_estimated_bytes = files.iter().map(|file| file.size).sum();
+    let (speedboat_files, speedboat_artifacts_used) =
+        prune_execution_files_with_exact_artifact(speedboat_files, extension_files, request)
+            .await?;
+    for artifact in speedboat_artifacts_used {
+        push_unique_string(&mut execution_artifacts_used, artifact);
+    }
+    let execution_estimated_bytes = files
+        .iter()
+        .chain(speedboat_files.iter())
+        .map(|file| file.size)
+        .sum();
 
     if request.aggregate.is_some() {
-        let rows = execute_aggregate_plan(&files, delete_files, request, limit).await?;
+        let rows =
+            execute_aggregate_plan(&files, &speedboat_files, delete_files, request, limit).await?;
         return Ok(ServingExecutionResult {
             rows,
-            files_selected: files.len(),
+            files_selected: files.len() + speedboat_files.len(),
             estimated_bytes: execution_estimated_bytes,
             artifacts_used: execution_artifacts_used,
         });
     }
 
-    if let Some(sort) = request.order_by.first() {
-        if let Some(ordered_groups) = ordered_file_groups_for_top_k(
-            &files,
-            file_stats,
-            sort_order,
-            request,
-            &sort.field,
-            sort.descending,
-        ) {
-            let rows =
-                execute_ordered_top_k_plan(ordered_groups, delete_files, request, sql, limit)
-                    .await?;
-            return Ok(ServingExecutionResult {
-                rows,
-                files_selected: files.len(),
-                estimated_bytes: execution_estimated_bytes,
-                artifacts_used: execution_artifacts_used,
-            });
+    if speedboat_files.is_empty() {
+        if let Some(sort) = request.order_by.first() {
+            if let Some(ordered_groups) = ordered_file_groups_for_top_k(
+                &files,
+                file_stats,
+                sort_order,
+                request,
+                &sort.field,
+                sort.descending,
+            ) {
+                let rows =
+                    execute_ordered_top_k_plan(ordered_groups, delete_files, request, sql, limit)
+                        .await?;
+                return Ok(ServingExecutionResult {
+                    rows,
+                    files_selected: files.len(),
+                    estimated_bytes: execution_estimated_bytes,
+                    artifacts_used: execution_artifacts_used,
+                });
+            }
         }
     }
 
-    let rows = execute_parallel_plan(&files, delete_files, request, sql, limit).await?;
+    let rows =
+        execute_parallel_plan(&files, &speedboat_files, delete_files, request, sql, limit).await?;
     Ok(ServingExecutionResult {
         rows,
-        files_selected: files.len(),
+        files_selected: files.len() + speedboat_files.len(),
         estimated_bytes: execution_estimated_bytes,
         artifacts_used: execution_artifacts_used,
     })
@@ -1199,6 +1232,7 @@ async fn execute_plan(
 
 async fn execute_parallel_plan(
     files: &[FileDescriptor],
+    speedboat_files: &[FileDescriptor],
     delete_files: &[String],
     request: &ServingRequestPlan,
     sql: &str,
@@ -1206,20 +1240,20 @@ async fn execute_parallel_plan(
 ) -> Result<Vec<Value>, ServingQueryError> {
     let mut rows = vec![];
     let sql_template = sql.to_string();
-    let file_groups = group_files_by_schema(files);
-    let concurrency = file_groups.len().clamp(1, serving_file_parallelism());
+    let query_input_groups = serving_query_input_groups(files, speedboat_files);
+    let concurrency = query_input_groups
+        .len()
+        .clamp(1, serving_file_parallelism());
     let delete_files = delete_files.to_vec();
-    let mut results =
-        stream::iter(
-            file_groups.into_iter().map(|files| {
-                let local_sql_template = sql_template.clone();
-                let local_delete_files = delete_files.clone();
-                async move {
-                    execute_file_group_plan(files, &local_sql_template, &local_delete_files).await
-                }
-            }),
-        )
-        .buffer_unordered(concurrency);
+    let mut results = stream::iter(query_input_groups.into_iter().map(|query_files| {
+        let local_sql_template = sql_template.clone();
+        let local_delete_files = delete_files.clone();
+        async move {
+            execute_query_input_group_plan(query_files, &local_sql_template, &local_delete_files)
+                .await
+        }
+    }))
+    .buffer_unordered(concurrency);
 
     while let Some(result) = results.next().await {
         merge_rows(&mut rows, result?, request, limit);
@@ -1230,6 +1264,7 @@ async fn execute_parallel_plan(
 
 async fn execute_aggregate_plan(
     files: &[FileDescriptor],
+    speedboat_files: &[FileDescriptor],
     delete_files: &[String],
     request: &ServingRequestPlan,
     limit: usize,
@@ -1241,26 +1276,26 @@ async fn execute_aggregate_plan(
         )
     })?;
     let measure_plans = aggregate_measure_plans(aggregate)?;
-    let file_groups = group_files_by_schema(files);
-    if file_groups.is_empty() {
+    let query_input_groups = serving_query_input_groups(files, speedboat_files);
+    if query_input_groups.is_empty() {
         return Ok(empty_aggregate_rows(aggregate, &measure_plans));
     }
 
     let partial_sql =
         build_aggregate_sql("{table}", request, limit, !delete_files.is_empty(), true)?;
     let delete_files = delete_files.to_vec();
-    let concurrency = file_groups.len().clamp(1, serving_file_parallelism());
-    let mut results =
-        stream::iter(
-            file_groups.into_iter().map(|files| {
-                let local_partial_sql = partial_sql.clone();
-                let local_delete_files = delete_files.clone();
-                async move {
-                    execute_file_group_plan(files, &local_partial_sql, &local_delete_files).await
-                }
-            }),
-        )
-        .buffer_unordered(concurrency);
+    let concurrency = query_input_groups
+        .len()
+        .clamp(1, serving_file_parallelism());
+    let mut results = stream::iter(query_input_groups.into_iter().map(|query_files| {
+        let local_partial_sql = partial_sql.clone();
+        let local_delete_files = delete_files.clone();
+        async move {
+            execute_query_input_group_plan(query_files, &local_partial_sql, &local_delete_files)
+                .await
+        }
+    }))
+    .buffer_unordered(concurrency);
 
     let mut merged = HashMap::<String, serde_json::Map<String, Value>>::new();
     while let Some(result) = results.next().await {
@@ -1285,7 +1320,12 @@ async fn execute_ordered_top_k_plan(
     let delete_files = delete_files.to_vec();
 
     while let Some(file_group) = file_groups.next() {
-        let new_rows = execute_file_group_plan(file_group.files, sql, &delete_files).await?;
+        let new_rows = execute_query_input_group_plan(
+            iceberg_query_inputs(file_group.files),
+            sql,
+            &delete_files,
+        )
+        .await?;
         merge_rows(&mut rows, new_rows, request, limit);
 
         if let Some(next_group) = file_groups.peek() {
@@ -2069,57 +2109,78 @@ fn remaining_groups_cannot_beat_kth_row(
     compare_sort_values(next_best_sort_value, kth_row_value, descending) == Ordering::Greater
 }
 
-async fn execute_file_group_plan(
-    files: Vec<FileDescriptor>,
-    sql_template: &str,
-    delete_files: &[String],
-) -> Result<Vec<Value>, ServingQueryError> {
-    let query_files = files
-        .into_iter()
-        .map(|file| QueryInputFile {
-            file,
-            extensions: vec![],
-        })
-        .collect::<Vec<_>>();
-    let batches = execute_query_file_group_batches(
-        query_files,
-        sql_template,
-        delete_files,
-        "{table}",
-        "{deletes_table}",
-        true,
-    )
-    .await
-    .map_err(|error| ServingQueryError::new(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string()))?;
-    let serde_result = batches_to_serde_value(&batches).await.map_err(|error| {
-        ServingQueryError::new(StatusCode::UNPROCESSABLE_ENTITY, &error.message)
-    })?;
-    Ok(serde_result.values)
-}
-
 async fn execute_file_group_warmup(
     files: Vec<FileDescriptor>,
     sql_template: &str,
     delete_files: &[String],
 ) -> Result<(), ServingQueryError> {
-    let query_files = files
+    let query_files = iceberg_query_inputs(files);
+    let _ = execute_query_plan_batches(QueryExecutionPlan {
+        sql: QuerySqlTemplate::Built(sql_template.replace("{table}", "{target_table}")),
+        files: query_files,
+        delete_files: delete_files.to_vec(),
+        extension_suffixes: None,
+        use_cpu_threadpool: true,
+    })
+    .await
+    .map_err(|error| {
+        ServingQueryError::new(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string())
+    })?;
+    Ok(())
+}
+
+fn iceberg_query_inputs(files: Vec<FileDescriptor>) -> Vec<QueryInputFile> {
+    files
         .into_iter()
         .map(|file| QueryInputFile {
             file,
+            storage: QueryStorageKind::Iceberg,
             extensions: vec![],
         })
-        .collect::<Vec<_>>();
-    let _ = execute_query_file_group_batches(
-        query_files,
-        sql_template,
-        delete_files,
-        "{table}",
-        "{deletes_table}",
-        true,
-    )
+        .collect()
+}
+
+fn speedboat_query_inputs(files: &[FileDescriptor]) -> Vec<QueryInputFile> {
+    files
+        .iter()
+        .cloned()
+        .map(|file| QueryInputFile {
+            file,
+            storage: QueryStorageKind::Speedboat,
+            extensions: vec![],
+        })
+        .collect()
+}
+
+fn serving_query_input_groups(
+    files: &[FileDescriptor],
+    speedboat_files: &[FileDescriptor],
+) -> Vec<Vec<QueryInputFile>> {
+    let mut query_files = iceberg_query_inputs(files.to_vec());
+    query_files.extend(speedboat_query_inputs(speedboat_files));
+    group_query_input_files_by_schema(query_files)
+}
+
+async fn execute_query_input_group_plan(
+    query_files: Vec<QueryInputFile>,
+    sql_template: &str,
+    delete_files: &[String],
+) -> Result<Vec<Value>, ServingQueryError> {
+    let batches = execute_query_plan_batches(QueryExecutionPlan {
+        sql: QuerySqlTemplate::Built(sql_template.replace("{table}", "{target_table}")),
+        files: query_files,
+        delete_files: delete_files.to_vec(),
+        extension_suffixes: None,
+        use_cpu_threadpool: true,
+    })
     .await
-    .map_err(|error| ServingQueryError::new(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string()))?;
-    Ok(())
+    .map_err(|error| {
+        ServingQueryError::new(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string())
+    })?;
+    let serde_result = batches_to_serde_value(&batches).await.map_err(|error| {
+        ServingQueryError::new(StatusCode::UNPROCESSABLE_ENTITY, &error.message)
+    })?;
+    Ok(serde_result.values)
 }
 
 fn file_group_table_name(files: &[FileDescriptor]) -> String {
@@ -2741,12 +2802,20 @@ fn classify_request_with_admission(
     artifacts_used: &[String],
     pruned: &PrunedFileSelection,
 ) -> (ServingQueryClassification, Option<String>) {
-    let exceeds_fast_budget = pruned.estimated_bytes > DEFAULT_FAST_PATH_MAX_BYTES
-        || pruned.files_selected > DEFAULT_FAST_PATH_MAX_FILES
+    let speedboat_files_selected = context.speedboat_files.len();
+    let speedboat_estimated_bytes = context
+        .speedboat_files
+        .iter()
+        .map(|file| file.size)
+        .sum::<u64>();
+    let exceeds_fast_budget = pruned.estimated_bytes + speedboat_estimated_bytes
+        > DEFAULT_FAST_PATH_MAX_BYTES
+        || pruned.files_selected + speedboat_files_selected > DEFAULT_FAST_PATH_MAX_FILES
         || pruned.row_groups_selected > DEFAULT_FAST_PATH_MAX_ROW_GROUPS
         || context.delete_files.len() > DEFAULT_FAST_PATH_MAX_DELETE_FILES;
-    let exceeds_slow_budget = pruned.estimated_bytes > DEFAULT_SLOW_PATH_MAX_BYTES
-        || pruned.files_selected > DEFAULT_SLOW_PATH_MAX_FILES
+    let exceeds_slow_budget = pruned.estimated_bytes + speedboat_estimated_bytes
+        > DEFAULT_SLOW_PATH_MAX_BYTES
+        || pruned.files_selected + speedboat_files_selected > DEFAULT_SLOW_PATH_MAX_FILES
         || pruned.row_groups_selected > DEFAULT_SLOW_PATH_MAX_ROW_GROUPS
         || context.delete_files.len() > DEFAULT_SLOW_PATH_MAX_DELETE_FILES;
 
@@ -3936,6 +4005,7 @@ mod tests {
             checkpoint: CheckpointDescriptor::new("events".to_string(), "checkpoint_1".to_string()),
             schema: schema.clone(),
             files: test_files(&schema),
+            speedboat_files: vec![],
             delete_files: vec![],
             file_stats: file_stats
                 .into_iter()
@@ -4526,6 +4596,7 @@ mod tests {
                 schema: schema.clone(),
                 size: DEFAULT_SLOW_PATH_MAX_BYTES + 1,
             }],
+            speedboat_files: vec![],
             delete_files: vec![],
             file_stats: HashMap::from([(
                 "file://huge.parquet".to_string(),
