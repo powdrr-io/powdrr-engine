@@ -418,3 +418,22 @@ pub fn test_v1_process_work(mut state: State) -> Pin<Box<HandlerFuture>> {
     }
     .boxed()
 }
+
+pub fn test_v1_advance_checkpoints(state: State) -> Pin<Box<HandlerFuture>> {
+    async move {
+        loop {
+            match STATE_PROVIDER.advance_published_checkpoints().await {
+                Ok(true) => continue,
+                Ok(false) => break,
+                Err(e) => {
+                    tracing::error!("Error advancing published checkpoints: {}", e);
+                    break;
+                }
+            };
+        }
+
+        let res = create_response(&state, StatusCode::OK, mime::TEXT_PLAIN, "Ok");
+        Ok((state, res))
+    }
+    .boxed()
+}
