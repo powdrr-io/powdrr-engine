@@ -534,6 +534,114 @@ impl DynamoDBServiceImpl {
         .await
     }
 
+    async fn maybe_reconfigure_cutover_membership_for_target(
+        &mut self,
+        org_id: &String,
+        table_name: &String,
+        extension: &Option<String>,
+        target_checkpoint_id: &String,
+    ) -> Result<(), ServiceApiError> {
+        let Some(existing_view) = self
+            .get_cutover_membership_view(org_id, table_name, extension)
+            .await?
+        else {
+            return Ok(());
+        };
+        if existing_view.target_checkpoint_id != *target_checkpoint_id {
+            return Ok(());
+        }
+
+        let live_node_ids: HashSet<String> = self
+            .live_serving_node_leases(org_id)
+            .await?
+            .into_iter()
+            .map(|lease| lease.node_id)
+            .collect();
+        if live_node_ids.is_empty() {
+            return Ok(());
+        }
+        if existing_view
+            .required_node_ids
+            .iter()
+            .all(|node_id| live_node_ids.contains(node_id))
+        {
+            return Ok(());
+        }
+
+        let mut required_node_ids: Vec<String> = live_node_ids.into_iter().collect();
+        required_node_ids.sort();
+        let epoch = self
+            .bump_cutover_epoch(org_id, table_name, extension)
+            .await?;
+        self.store_cutover_membership_view(
+            org_id,
+            table_name,
+            extension,
+            epoch,
+            target_checkpoint_id,
+            required_node_ids,
+        )
+        .await
+    }
+
+    fn checkpoint_references_any_cleanup_file(
+        checkpoint: &TableMetadataCheckpoint,
+        files_to_delete: &HashSet<String>,
+    ) -> bool {
+        checkpoint
+            .speedboat_metadata
+            .as_ref()
+            .map(|metadata| {
+                metadata
+                    .files
+                    .file_paths
+                    .iter()
+                    .any(|file_path| files_to_delete.contains(file_path))
+            })
+            .unwrap_or(false)
+            || checkpoint
+                .deletes_metadata
+                .as_ref()
+                .map(|metadata| {
+                    metadata
+                        .files
+                        .iter()
+                        .any(|file_path| files_to_delete.contains(file_path))
+                })
+                .unwrap_or(false)
+    }
+
+    async fn cleanup_work_item_is_ready(
+        &mut self,
+        org_info: &OrgInfo,
+        work_item: &CleanupWorkItem,
+    ) -> Result<bool, ServiceApiError> {
+        let files_to_delete: HashSet<String> = work_item.files_to_delete.iter().cloned().collect();
+
+        for extension in [None, Some("es".to_string())] {
+            let Some(checkpoint_id) = self
+                .get_active_checkpoint_id(&org_info.org_id, &work_item.table_name, &extension)
+                .await?
+            else {
+                continue;
+            };
+            let Some(checkpoint) = self
+                .get_checkpoint(
+                    org_info,
+                    &CheckpointDescriptor::new(work_item.table_name.clone(), checkpoint_id),
+                )
+                .await?
+            else {
+                continue;
+            };
+            if Self::checkpoint_references_any_cleanup_file(&checkpoint, &files_to_delete) {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
     async fn activation_matches_target(
         &mut self,
         org_id: &String,
@@ -542,6 +650,13 @@ impl DynamoDBServiceImpl {
         target_checkpoint_id: &String,
     ) -> Result<bool, ServiceApiError> {
         self.backfill_cutover_membership_for_target(
+            org_id,
+            table_name,
+            extension,
+            target_checkpoint_id,
+        )
+        .await?;
+        self.maybe_reconfigure_cutover_membership_for_target(
             org_id,
             table_name,
             extension,
@@ -1298,7 +1413,14 @@ impl DynamoDBServiceImpl {
                     .await
                     .map_err(from_modyne)?;
                 assert!(work_item.is_some());
-                work_items.push(work_item.unwrap());
+                let work_item = work_item.unwrap();
+                if !self
+                    .cleanup_work_item_is_ready(org_info, &work_item)
+                    .await?
+                {
+                    continue;
+                }
+                work_items.push(work_item);
                 transaction = self
                     .connector
                     .claim_cleanup_work_item_lease(transaction, available_info);
