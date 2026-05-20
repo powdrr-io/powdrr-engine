@@ -5,7 +5,7 @@ use crate::data_contract::{
 };
 use crate::elastic_search_commands::LookupById;
 use crate::elastic_search_common::{
-    load_command_raw_result, CommandContext, ElasticSearchResponse, MIME_ES_JSON,
+    CommandContext, ElasticSearchResponse, MIME_ES_JSON, load_command_raw_result,
 };
 use crate::elastic_search_parser::UpdateBody;
 use crate::elastic_search_responses::{
@@ -15,14 +15,14 @@ use crate::elastic_search_storage_schema::{
     FullRecord, RecordDelete, RecordInput, SpeedboatCommitBuilder,
 };
 use crate::schema_massager::PowdrrSchema;
-use crate::search_runtime::{df_to_serde_value, SerdeValueResult};
-use crate::state_provider::{ServiceApiError, STATE_PROVIDER};
+use crate::search_runtime::{SerdeValueResult, df_to_serde_value};
+use crate::state_provider::{STATE_PROVIDER, ServiceApiError};
 use crate::util::{describe_table_log_error_then_none, log_err, log_service_err};
 use datafusion::arrow::ipc::writer::FileWriter;
 use futures::FutureExt;
 use gotham::mime;
-use http::header::LOCATION;
 use http::StatusCode;
+use http::header::LOCATION;
 use idgenerator::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1699,7 +1699,7 @@ pub(crate) static INGEST_HANDLE: std::sync::LazyLock<IngestHandle> =
 mod tests {
     use crate::data_contract::{CreateIndexTemplateBody, PropertyInfo};
     use crate::elastic_search_ingest::{
-        next_speedboat_segment, speedboat_orphan_marker_path, IngestCommand, WriteBuffer,
+        IngestCommand, WriteBuffer, next_speedboat_segment, speedboat_orphan_marker_path,
     };
     use serde_json::json;
     use std::{collections::HashMap, fs};

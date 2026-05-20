@@ -290,6 +290,18 @@ General test guidance:
 RUST_BACKTRACE=1 scripts/cargo-worktree.sh test -- --nocapture --test-threads=1
 ```
 
+Fast Elasticsearch mutation regression guardrail:
+
+```bash
+docker compose -f tests/es_compat/docker-compose.yml up -d redis minio createbuckets rest localstack
+bash scripts/run_es_mutation_regression_local.sh
+```
+
+That runner expects the same local support stack those router tests use:
+Redis on `127.0.0.1:6379`, MinIO on `http://localhost:9000`, the Iceberg REST
+catalog on `http://localhost:8181`, and LocalStack on `http://localhost:4566`.
+The dedicated CI workflow boots that subset automatically.
+
 Heavy compatibility suites are explicit:
 
 ```bash

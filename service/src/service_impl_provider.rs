@@ -178,7 +178,7 @@ enum ServiceImplProviderActorMessage {
         org_info: OrgInfo,
         cleanup_commit: CleanupCommit,
     },
-    GetLatestCommittedCheckpoint {
+    GetPublishedActiveCheckpoint {
         respond_to: oneshot::Sender<Result<Option<String>, ServiceImplError>>,
         org_info: OrgInfo,
         table_name: String,
@@ -481,7 +481,7 @@ impl ServiceImplProviderActor {
             } => {
                 handle_message_impl!(self, respond_to, cleanup_commit(&org_info, &cleanup_commit));
             }
-            ServiceImplProviderActorMessage::GetLatestCommittedCheckpoint {
+            ServiceImplProviderActorMessage::GetPublishedActiveCheckpoint {
                 org_info,
                 table_name,
                 extensions,
@@ -490,7 +490,7 @@ impl ServiceImplProviderActor {
                 handle_message_impl!(
                     self,
                     respond_to,
-                    get_latest_committed_checkpoint(&org_info, &table_name, extensions)
+                    get_published_active_checkpoint(&org_info, &table_name, extensions)
                 );
             }
             ServiceImplProviderActorMessage::GetLatestTargetCheckpoint {
@@ -753,7 +753,7 @@ impl ServiceImpl {
         state_provider_func_impl!(self, cleanup_commit(org_info, commit))
     }
 
-    pub async fn get_latest_committed_checkpoint(
+    pub async fn get_published_active_checkpoint(
         &mut self,
         org_info: &OrgInfo,
         table_name: &String,
@@ -761,7 +761,7 @@ impl ServiceImpl {
     ) -> Result<Option<String>, ServiceImplError> {
         metadata_store_func_impl!(
             self,
-            get_latest_committed_checkpoint(org_info, table_name, extensions)
+            get_published_active_checkpoint(org_info, table_name, extensions)
         )
     }
 
@@ -1234,7 +1234,7 @@ impl ServiceImplHandle {
     ) -> Result<Option<String>, ServiceImplError> {
         send_message!(
             self,
-            GetLatestCommittedCheckpoint,
+            GetPublishedActiveCheckpoint,
             org_info = org_info.clone(),
             table_name = table_name.clone(),
             extensions = extension.clone()

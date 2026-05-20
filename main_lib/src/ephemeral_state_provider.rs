@@ -339,8 +339,8 @@ impl EphemeralStateProvider {
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
-        self.fetch_tracker
-            .get_latest_target_checkpoint(table_name, extension)
+        self.service_impl
+            .get_latest_committed_checkpoint(&self.fake_org_info, table_name, extension)
             .await
     }
 

@@ -85,6 +85,14 @@ pub struct ServingNodeActivationAck {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CutoverMembershipView {
+    pub selector: PublishedCheckpointSelector,
+    pub epoch: CutoverEpoch,
+    pub target_checkpoint_id: String,
+    pub required_node_ids: Vec<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointCutoverRequest {
     pub org_id: String,
     pub selector: PublishedCheckpointSelector,
@@ -205,9 +213,12 @@ pub trait MetadataStore {
             .await?
             .map(|record| record.checkpoint_id);
         let target_checkpoint_id = self
-            .get_published_checkpoint_record(org_info, &target_selector)
+            .get_latest_target_checkpoint(
+                org_info,
+                &target_selector.table_name,
+                target_selector.extension.clone(),
+            )
             .await?
-            .map(|record| record.checkpoint_id)
             .or_else(|| active_checkpoint_id.clone());
         Ok(CheckpointCutoverState {
             selector: target_selector,
@@ -242,13 +253,26 @@ pub trait MetadataStore {
         Ok(vec![])
     }
 
-    async fn get_latest_committed_checkpoint(
+    async fn get_published_active_checkpoint(
         &mut self,
         org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
         let selector = PublishedCheckpointSelector::active(table_name.clone(), extension);
+        Ok(self
+            .get_published_checkpoint_record(org_info, &selector)
+            .await?
+            .map(|record| record.checkpoint_id))
+    }
+
+    async fn get_latest_committed_checkpoint(
+        &mut self,
+        org_info: &OrgInfo,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> Result<Option<String>, ServiceApiError> {
+        let selector = PublishedCheckpointSelector::target(table_name.clone(), extension);
         Ok(self
             .get_published_checkpoint_record(org_info, &selector)
             .await?
@@ -262,10 +286,15 @@ pub trait MetadataStore {
         extension: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
         let selector = PublishedCheckpointSelector::target(table_name.clone(), extension);
-        Ok(self
+        if let Some(record) = self
             .get_published_checkpoint_record(org_info, &selector)
             .await?
-            .map(|record| record.checkpoint_id))
+        {
+            return Ok(Some(record.checkpoint_id));
+        }
+
+        self.get_latest_committed_checkpoint(org_info, table_name, selector.extension.clone())
+            .await
     }
 
     async fn get_checkpoint(

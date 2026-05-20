@@ -12,8 +12,8 @@ use crate::elastic_search_common::{CommandError, ElasticSearchResponse};
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::elastic_search_ingest::IngestError;
 use crate::elastic_search_responses::{
-    transient_error, AggregationResult, QueryResultsNotFound, UpdateByQueryResults,
-    UpdateByQueryResultsRetries, UpdateByQuerySuccess,
+    AggregationResult, QueryResultsNotFound, UpdateByQueryResults, UpdateByQueryResultsRetries,
+    UpdateByQuerySuccess, transient_error,
 };
 use crate::elastic_search_storage_schema::{
     FullRecord, RecordDelete, RecordInput, SpeedboatCommitBuilder,
@@ -21,7 +21,7 @@ use crate::elastic_search_storage_schema::{
 use crate::peers::{PrivateInvocation, PrivateSqlInvocation};
 use crate::schema_massager::{PowdrrSchema, SqlBuilder, SqlExpression, SqlQuery};
 use crate::search_runtime::{
-    batches_to_serde_value, df_to_serde_value, process_aggregations, Aggregation, ScriptBlock,
+    Aggregation, ScriptBlock, batches_to_serde_value, df_to_serde_value, process_aggregations,
 };
 use crate::{
     data_access::{self, execute_sql},

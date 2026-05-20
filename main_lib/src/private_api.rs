@@ -4,11 +4,8 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use datafusion::arrow::array::RecordBatch;
 use datafusion::error::DataFusionError;
 use futures_util::StreamExt;
-use futures_util::future::try_join_all;
-use idgenerator::IdInstance;
 use prost::Message;
 use std::{
-    cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap},
     error::Error,
     fmt,
@@ -17,8 +14,8 @@ use std::{
 
 use crate::data_access::{self, load_file_as_table};
 use crate::data_contract::{
-    ExtensionFile, ExtensionFileMetadata, FileDescriptor, IcebergColumnStats, IcebergFileStats,
-    IcebergMetadata, SpeedboatMetadata, TableMetadataCheckpoint,
+    ExtensionFile, ExtensionFileMetadata, FileDescriptor, IcebergFileStats, IcebergMetadata,
+    SpeedboatMetadata, TableMetadataCheckpoint,
 };
 use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_responses::{QueryResultHit, compare_query_result_hits_desc};
@@ -36,16 +33,15 @@ use crate::peers::{
 };
 use crate::prefetch::warm_iceberg_checkpoints;
 use crate::query_execution::{
-    QueryExtensionFileSpec, QueryInputFile, execute_query_file_group_batches,
-    group_query_input_files_by_schema,
+    QueryExecutionPlan, QueryExtensionFileSpec, QueryInputFile, QuerySqlTemplate, QueryStorageKind,
+    execute_query_plan_batches,
 };
-use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema, SqlQuery};
+use crate::query_path::{QueryPredicate, file_may_match_predicates};
+use crate::schema_massager::{PowdrrSchema, SqlQuery};
 use crate::search_executor::typed_sort_projection_name;
 use crate::search_runtime::batches_to_serde_value;
 use crate::state_provider::*;
 use crate::util::log_err;
-
-const EXACT_CANDIDATE_DOC_ID_FETCH_THRESHOLD: usize = 128;
 
 static EXACT_PRUNING_SUMMARY_CACHE: LazyLock<Mutex<HashMap<String, ExactPruningSummary>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -453,33 +449,6 @@ async fn ensure_loaded_extension_only(
     }
 }
 
-async fn execute_sql(
-    sql_template: &String,
-    local_name: &String,
-    deletes_local_name: &String,
-    use_cpu_threadpool: bool,
-) -> Result<Vec<RecordBatch>, DataFusionError> {
-    // create a plan to run a SQL query
-    let final_sql = sql_template
-        .replace("{target_table}", local_name)
-        .replace("{deletes_table}", deletes_local_name);
-    if use_cpu_threadpool {
-        match data_access::execute_sql_async(&final_sql).await {
-            Ok(val) => Ok(val),
-            Err(e) => log_err(e),
-        }
-    } else {
-        let results = match data_access::execute_sql(&final_sql).await {
-            Ok(val) => val,
-            Err(e) => return log_err(e),
-        };
-        match results.collect().await {
-            Ok(r) => Ok(r),
-            Err(e) => log_err(e),
-        }
-    }
-}
-
 async fn execute_raw_sql(
     sql: &str,
     use_cpu_threadpool: bool,
@@ -495,362 +464,12 @@ async fn execute_raw_sql(
     }
 }
 
-async fn create_all_deletes_table(local_names: &Vec<String>) -> Result<String, PrivateApiError> {
-    let table_name = format!("table_{}", IdInstance::next_id());
-    let ddl_stmt;
-    if local_names.len() == 0 {
-        ddl_stmt = "select null as _id_seq_no".to_string();
-    } else {
-        let union_selects = local_names
-            .iter()
-            .map(|x| format!("select * from {x}"))
-            .collect::<Vec<String>>()
-            .join(" union all ");
-        ddl_stmt = format!("select * from ({union_selects})");
-    }
-    match data_access::create_table(&table_name, &ddl_stmt).await {
-        Ok(_) => Ok(table_name.clone()),
-        Err(e) => return log_err(PrivateApiError::from(e)),
-    }
-}
-
-async fn process_iceberg_file(
-    sql: &SqlQuery,
-    iceberg_file: &FileDescriptor,
-    iceberg_file_extensions: &Vec<ExtensionFileSpec>,
-    table_schema: &PowdrrSchema,
-    deletes_table_name: &String,
-    use_cpu_threadpool: bool,
-) -> Result<Vec<RecordBatch>, PrivateApiError> {
-    let local_name = match ensure_loaded(
-        &iceberg_file.file_path,
-        iceberg_file_extensions,
-        1,
-        true,
-        Some(table_schema.clone()),
-    )
-    .await
-    {
-        Ok(ln) => ln,
-        Err(e) => return Err(PrivateApiError::from(e)),
-    };
-
-    let local_results = match execute_sql(
-        &sql.build(table_schema, &iceberg_file.schema),
-        &local_name,
-        deletes_table_name,
-        use_cpu_threadpool,
-    )
-    .await
-    {
-        Ok(vrb) => vrb,
-        Err(e) => {
-            data_access::release(&local_name).await;
-            return log_err(PrivateApiError::from(e));
-        }
-    };
-    data_access::release(&local_name).await;
-    Ok(local_results)
-}
-
-async fn process_speedboat_file(
-    sql: &SqlQuery,
-    speedboat_file: &FileDescriptor,
-    speedboat_file_extensions: &Vec<ExtensionFileSpec>,
-    table_schema: &PowdrrSchema,
-    deletes_table_name: &String,
-    use_cpu_threadpool: bool,
-) -> Result<Vec<RecordBatch>, PrivateApiError> {
-    let local_name = match ensure_loaded(
-        &speedboat_file.file_path,
-        speedboat_file_extensions,
-        speedboat_file.size,
-        false,
-        Some(speedboat_file.schema.clone()),
-    )
-    .await
-    {
-        Ok(ln) => ln,
-        Err(e) => return log_err(PrivateApiError::from(e)),
-    };
-    let sql = sql.build(table_schema, &speedboat_file.schema);
-    let local_results =
-        match execute_sql(&sql, &local_name, &deletes_table_name, use_cpu_threadpool).await {
-            Ok(vrb) => vrb,
-            Err(e) => {
-                return {
-                    data_access::release(&local_name).await;
-                    log_err(PrivateApiError::from(e))
-                };
-            }
-        };
-    data_access::release(&local_name).await;
-    Ok(local_results)
-}
-
-fn exact_extension_file<'a>(
-    extension_files: &'a [ExtensionFileSpec],
-) -> Option<&'a ExtensionFileSpec> {
-    extension_files
-        .iter()
-        .find(|extension| extension.suffix == "exact_index")
-}
-
 fn exact_pruning_extension_file<'a>(
     extension_files: &'a [ExtensionFileSpec],
 ) -> Option<&'a ExtensionFileSpec> {
     extension_files
         .iter()
         .find(|extension| extension.suffix == "exact_pruning")
-}
-
-fn sql_string_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-fn compare_scalar_values(left: &serde_json::Value, right: &serde_json::Value) -> Option<Ordering> {
-    match (left, right) {
-        (serde_json::Value::Number(left), serde_json::Value::Number(right)) => {
-            left.as_f64()?.partial_cmp(&right.as_f64()?)
-        }
-        (serde_json::Value::String(left), serde_json::Value::String(right)) => {
-            Some(left.cmp(right))
-        }
-        (serde_json::Value::Bool(left), serde_json::Value::Bool(right)) => Some(left.cmp(right)),
-        _ => None,
-    }
-}
-
-fn column_is_all_null(column_stats: &IcebergColumnStats, record_count: Option<u64>) -> bool {
-    match (column_stats.null_count, record_count) {
-        (Some(null_count), Some(record_count)) => null_count >= record_count,
-        _ => false,
-    }
-}
-
-fn equality_may_match(
-    column_stats: &IcebergColumnStats,
-    record_count: Option<u64>,
-    value: &serde_json::Value,
-) -> bool {
-    if column_is_all_null(column_stats, record_count) {
-        return false;
-    }
-
-    if let Some(lower_bound) = column_stats.lower_bound.as_ref() {
-        if matches!(
-            compare_scalar_values(value, lower_bound),
-            Some(Ordering::Less)
-        ) {
-            return false;
-        }
-    }
-    if let Some(upper_bound) = column_stats.upper_bound.as_ref() {
-        if matches!(
-            compare_scalar_values(value, upper_bound),
-            Some(Ordering::Greater)
-        ) {
-            return false;
-        }
-    }
-
-    true
-}
-
-fn exact_constraint_group_may_match_stats(
-    column_stats: &IcebergColumnStats,
-    record_count: Option<u64>,
-    constraint: &PrivateExactConstraintGroup,
-) -> bool {
-    constraint
-        .values
-        .iter()
-        .map(|value| serde_json::Value::String(value.clone()))
-        .any(|value| equality_may_match(column_stats, record_count, &value))
-}
-
-fn range_constraint_may_match_stats(
-    column_stats: &IcebergColumnStats,
-    record_count: Option<u64>,
-    constraint: &PrivateSearchRangeConstraint,
-) -> bool {
-    if column_is_all_null(column_stats, record_count) {
-        return false;
-    }
-
-    if let Some(value) = constraint.gt.as_ref() {
-        if let Some(upper_bound) = column_stats.upper_bound.as_ref() {
-            if matches!(
-                compare_scalar_values(upper_bound, value),
-                Some(Ordering::Less | Ordering::Equal)
-            ) {
-                return false;
-            }
-        }
-    }
-    if let Some(value) = constraint.gte.as_ref() {
-        if let Some(upper_bound) = column_stats.upper_bound.as_ref() {
-            if matches!(
-                compare_scalar_values(upper_bound, value),
-                Some(Ordering::Less)
-            ) {
-                return false;
-            }
-        }
-    }
-    if let Some(value) = constraint.lt.as_ref() {
-        if let Some(lower_bound) = column_stats.lower_bound.as_ref() {
-            if matches!(
-                compare_scalar_values(lower_bound, value),
-                Some(Ordering::Greater | Ordering::Equal)
-            ) {
-                return false;
-            }
-        }
-    }
-    if let Some(value) = constraint.lte.as_ref() {
-        if let Some(lower_bound) = column_stats.lower_bound.as_ref() {
-            if matches!(
-                compare_scalar_values(lower_bound, value),
-                Some(Ordering::Greater)
-            ) {
-                return false;
-            }
-        }
-    }
-
-    true
-}
-
-fn iceberg_file_may_match_search(
-    file_stats: &IcebergFileStats,
-    exact_constraints: &[PrivateExactConstraintGroup],
-    range_constraints: &[PrivateSearchRangeConstraint],
-) -> bool {
-    for constraint in exact_constraints {
-        let Some(column_stats) = file_stats
-            .columns
-            .iter()
-            .find(|stats| stats.field_name == constraint.field)
-        else {
-            continue;
-        };
-        if !exact_constraint_group_may_match_stats(
-            column_stats,
-            file_stats.record_count,
-            constraint,
-        ) {
-            return false;
-        }
-    }
-
-    for constraint in range_constraints {
-        let Some(column_stats) = file_stats
-            .columns
-            .iter()
-            .find(|stats| stats.field_name == constraint.field)
-        else {
-            continue;
-        };
-        if !range_constraint_may_match_stats(column_stats, file_stats.record_count, constraint) {
-            return false;
-        }
-    }
-
-    true
-}
-
-fn exact_candidate_doc_ids_sql(
-    table_name: &str,
-    constraints: &[PrivateExactConstraintGroup],
-) -> Option<String> {
-    if constraints.is_empty() {
-        return None;
-    }
-
-    let clause = constraints
-        .iter()
-        .map(|constraint| {
-            let mut values = constraint.values.clone();
-            values.sort();
-            values.dedup();
-            let values = values
-                .iter()
-                .map(|value| sql_string_literal(value))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "(field_name = {} AND field_value IN ({}))",
-                sql_string_literal(&constraint.field),
-                values
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" OR ");
-
-    if constraints.len() == 1 {
-        Some(format!(
-            "SELECT DISTINCT doc_id FROM {table_name} WHERE {clause}"
-        ))
-    } else {
-        Some(format!(
-            "SELECT doc_id FROM {table_name} WHERE {clause} GROUP BY doc_id HAVING COUNT(DISTINCT field_name) = {}",
-            constraints.len()
-        ))
-    }
-}
-
-async fn exact_candidate_doc_ids(
-    base_file_path: &String,
-    top_level_size: u64,
-    extension_files: &Vec<ExtensionFileSpec>,
-    constraints: &[PrivateExactConstraintGroup],
-    use_cpu_threadpool: bool,
-) -> Result<Vec<serde_json::Value>, PrivateApiError> {
-    let Some(extension_file) = exact_extension_file(extension_files) else {
-        return Ok(vec![]);
-    };
-    let exact_local_name =
-        ensure_loaded_extension_only(base_file_path, extension_file, top_level_size)
-            .await
-            .map_err(PrivateApiError::from)?;
-
-    let sql = match exact_candidate_doc_ids_sql(&exact_local_name, constraints) {
-        Some(sql) => sql,
-        None => {
-            data_access::release(&exact_local_name).await;
-            return Ok(vec![]);
-        }
-    };
-
-    let batches = match execute_raw_sql(&sql, use_cpu_threadpool).await {
-        Ok(batches) => batches,
-        Err(error) => {
-            data_access::release(&exact_local_name).await;
-            return log_err(PrivateApiError::from(error));
-        }
-    };
-
-    let serde_result = match batches_to_serde_value(&batches).await {
-        Ok(result) => result,
-        Err(error) => {
-            data_access::release(&exact_local_name).await;
-            return Err(PrivateApiError {
-                message: error.message,
-            });
-        }
-    };
-    data_access::release(&exact_local_name).await;
-
-    let mut doc_ids = serde_result
-        .values
-        .into_iter()
-        .filter_map(|row| row.get("doc_id").cloned())
-        .filter(|value| !value.is_null())
-        .collect::<Vec<_>>();
-    doc_ids.sort_by(|left, right| left.to_string().cmp(&right.to_string()));
-    doc_ids.dedup_by(|left, right| left == right);
-    Ok(doc_ids)
 }
 
 fn exact_pruning_summary_from_rows(rows: Vec<serde_json::Value>) -> ExactPruningSummary {
@@ -950,6 +569,43 @@ fn exact_pruning_summary_may_match(
     true
 }
 
+fn search_query_predicates(
+    exact_constraints: &[PrivateExactConstraintGroup],
+    range_constraints: &[PrivateSearchRangeConstraint],
+) -> Vec<QueryPredicate> {
+    let mut predicates = exact_constraints
+        .iter()
+        .map(|constraint| QueryPredicate {
+            field: constraint.field.clone(),
+            eq: None,
+            in_values: Some(
+                constraint
+                    .values
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
+        })
+        .collect::<Vec<_>>();
+
+    predicates.extend(range_constraints.iter().map(|constraint| QueryPredicate {
+        field: constraint.field.clone(),
+        eq: None,
+        in_values: None,
+        gt: constraint.gt.clone(),
+        gte: constraint.gte.clone(),
+        lt: constraint.lt.clone(),
+        lte: constraint.lte.clone(),
+    }));
+
+    predicates
+}
+
 async fn file_may_match_search(
     file: &FileDescriptor,
     extension_files: &Vec<ExtensionFileSpec>,
@@ -959,7 +615,10 @@ async fn file_may_match_search(
     parquet: bool,
 ) -> Result<bool, PrivateApiError> {
     if let Some(file_stats) = iceberg_file_stats {
-        if !iceberg_file_may_match_search(file_stats, exact_constraints, range_constraints) {
+        if !file_may_match_predicates(
+            file_stats,
+            &search_query_predicates(exact_constraints, range_constraints),
+        ) {
             return Ok(false);
         }
     }
@@ -1050,93 +709,6 @@ async fn prune_required_files_for_search(
     required_files.speedboat_file_extensions = retained_speedboat_extensions;
 
     Ok(())
-}
-
-async fn process_file_with_exact_candidates(
-    sql: &SqlQuery,
-    exact_sql: &SqlQuery,
-    file: &FileDescriptor,
-    extension_files: &Vec<ExtensionFileSpec>,
-    table_schema: &PowdrrSchema,
-    deletes_table_name: &String,
-    use_cpu_threadpool: bool,
-    exact_constraints: &[PrivateExactConstraintGroup],
-    exact_doc_id_field_name: &str,
-    parquet: bool,
-) -> Result<Vec<RecordBatch>, PrivateApiError> {
-    let candidate_doc_ids = exact_candidate_doc_ids(
-        &file.file_path,
-        if parquet { 1 } else { file.size },
-        extension_files,
-        exact_constraints,
-        use_cpu_threadpool,
-    )
-    .await?;
-    if candidate_doc_ids.is_empty() {
-        return Ok(vec![]);
-    }
-    if candidate_doc_ids.len() > EXACT_CANDIDATE_DOC_ID_FETCH_THRESHOLD {
-        return if parquet {
-            process_iceberg_file(
-                exact_sql,
-                file,
-                extension_files,
-                table_schema,
-                deletes_table_name,
-                use_cpu_threadpool,
-            )
-            .await
-        } else {
-            process_speedboat_file(
-                exact_sql,
-                file,
-                extension_files,
-                table_schema,
-                deletes_table_name,
-                use_cpu_threadpool,
-            )
-            .await
-        };
-    }
-
-    let Some(filtered_sql) =
-        sql.with_doc_id_filter_values(exact_doc_id_field_name, &candidate_doc_ids)
-    else {
-        return Ok(vec![]);
-    };
-    let empty_extensions = vec![];
-    let load_schema = if parquet {
-        table_schema.clone()
-    } else {
-        file.schema.clone()
-    };
-    let local_name = ensure_loaded(
-        &file.file_path,
-        &empty_extensions,
-        if parquet { 1 } else { file.size },
-        parquet,
-        Some(load_schema),
-    )
-    .await
-    .map_err(PrivateApiError::from)?;
-
-    let built_sql = filtered_sql.build(table_schema, &file.schema);
-    let local_results = match execute_sql(
-        &built_sql,
-        &local_name,
-        deletes_table_name,
-        use_cpu_threadpool,
-    )
-    .await
-    {
-        Ok(results) => results,
-        Err(error) => {
-            data_access::release(&local_name).await;
-            return log_err(PrivateApiError::from(error));
-        }
-    };
-    data_access::release(&local_name).await;
-    Ok(local_results)
 }
 
 pub(crate) async fn data_query(
@@ -1244,13 +816,13 @@ pub(crate) async fn search_query(
         .as_ref()
         .is_some_and(|_| required_files_have_extension_suffix(&required_files, "exact_index"));
 
-    if use_exact_sql {
-        retain_required_file_extension_suffixes(&mut required_files, &["exact_index"]);
+    let extension_suffixes = if use_exact_sql {
+        Some(vec!["exact_index".to_string()])
     } else if invocation.calculate_score {
-        retain_required_file_extension_suffixes(&mut required_files, &["search_index"]);
+        Some(vec!["search_index".to_string()])
     } else {
-        clear_required_file_extensions(&mut required_files);
-    }
+        Some(vec![])
+    };
 
     let parquet_size = required_files
         .iceberg_files
@@ -1270,7 +842,8 @@ pub(crate) async fn search_query(
         &invocation.sql
     };
 
-    let batches = data_query_batches_worker(sql, &required_files, true).await?;
+    let batches =
+        data_query_batches_worker(sql, &required_files, true, extension_suffixes.as_ref()).await?;
     let serde_result = match batches_to_serde_value(&batches).await {
         Ok(result) => result,
         Err(e) => return Err(PrivateApiError { message: e.message }),
@@ -1329,24 +902,6 @@ fn required_files_have_extension_suffix(required_files: &RequiredFiles, suffix: 
                 .iter()
                 .any(|extension| extension.suffix.as_str() == suffix)
         })
-}
-
-fn retain_required_file_extension_suffixes(required_files: &mut RequiredFiles, suffixes: &[&str]) {
-    for extensions in required_files.iceberg_file_extensions.iter_mut() {
-        extensions.retain(|extension| suffixes.iter().any(|suffix| extension.suffix == *suffix));
-    }
-    for extensions in required_files.speedboat_file_extensions.iter_mut() {
-        extensions.retain(|extension| suffixes.iter().any(|suffix| extension.suffix == *suffix));
-    }
-}
-
-fn clear_required_file_extensions(required_files: &mut RequiredFiles) {
-    for extensions in required_files.iceberg_file_extensions.iter_mut() {
-        extensions.clear();
-    }
-    for extensions in required_files.speedboat_file_extensions.iter_mut() {
-        extensions.clear();
-    }
 }
 
 fn search_sort_values_for_row(
@@ -1489,6 +1044,7 @@ fn bm25_fallback_score_from_values(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data_contract::IcebergColumnStats;
     use std::collections::HashMap;
 
     fn checkpoint_with_extension_metadata(
@@ -1547,64 +1103,6 @@ mod tests {
     }
 
     #[test]
-    fn retain_required_file_extension_suffixes_keeps_only_selected_suffixes() {
-        let mut required_files = RequiredFiles {
-            table_schema: PowdrrSchema::minimal(),
-            iceberg_files: vec![],
-            all_iceberg_files_count: 0,
-            iceberg_file_extensions: vec![vec![
-                ExtensionFileSpec {
-                    suffix: "search_index".to_string(),
-                    file_path: "search.parquet".to_string(),
-                },
-                ExtensionFileSpec {
-                    suffix: "exact_index".to_string(),
-                    file_path: "exact.parquet".to_string(),
-                },
-            ]],
-            speedboat_files: vec![],
-            all_speedboat_files_count: 0,
-            speedboat_file_extensions: vec![],
-            delete_files: vec![],
-        };
-
-        retain_required_file_extension_suffixes(&mut required_files, &["exact_index"]);
-
-        assert_eq!(
-            required_files.iceberg_file_extensions,
-            vec![vec![ExtensionFileSpec {
-                suffix: "exact_index".to_string(),
-                file_path: "exact.parquet".to_string(),
-            }]]
-        );
-    }
-
-    #[test]
-    fn clear_required_file_extensions_removes_all_sidecars() {
-        let mut required_files = RequiredFiles {
-            table_schema: PowdrrSchema::minimal(),
-            iceberg_files: vec![],
-            all_iceberg_files_count: 0,
-            iceberg_file_extensions: vec![vec![ExtensionFileSpec {
-                suffix: "search_index".to_string(),
-                file_path: "search.parquet".to_string(),
-            }]],
-            speedboat_files: vec![],
-            all_speedboat_files_count: 0,
-            speedboat_file_extensions: vec![vec![ExtensionFileSpec {
-                suffix: "exact_index".to_string(),
-                file_path: "exact.parquet".to_string(),
-            }]],
-            delete_files: vec![],
-        };
-
-        clear_required_file_extensions(&mut required_files);
-
-        assert_eq!(required_files.iceberg_file_extensions, vec![vec![]]);
-        assert_eq!(required_files.speedboat_file_extensions, vec![vec![]]);
-    }
-
-    #[test]
     fn iceberg_file_may_match_search_prunes_exact_and_range_filters() {
         let file_stats = IcebergFileStats {
             file_path: "s3://warehouse/table/data.parquet".to_string(),
@@ -1629,40 +1127,46 @@ mod tests {
             row_groups: vec![],
         };
 
-        assert!(iceberg_file_may_match_search(
+        assert!(file_may_match_predicates(
             &file_stats,
-            &[PrivateExactConstraintGroup {
-                field: "service".to_string(),
-                values: vec!["billing".to_string(), "payments".to_string()],
-            }],
-            &[PrivateSearchRangeConstraint {
-                field: "@timestamp".to_string(),
-                gt: None,
-                gte: Some(serde_json::Value::from(150_i64)),
-                lt: None,
-                lte: Some(serde_json::Value::from(250_i64)),
-            }],
+            &search_query_predicates(
+                &[PrivateExactConstraintGroup {
+                    field: "service".to_string(),
+                    values: vec!["billing".to_string(), "payments".to_string()],
+                }],
+                &[PrivateSearchRangeConstraint {
+                    field: "@timestamp".to_string(),
+                    gt: None,
+                    gte: Some(serde_json::Value::from(150_i64)),
+                    lt: None,
+                    lte: Some(serde_json::Value::from(250_i64)),
+                }],
+            ),
         ));
 
-        assert!(!iceberg_file_may_match_search(
+        assert!(!file_may_match_predicates(
             &file_stats,
-            &[PrivateExactConstraintGroup {
-                field: "service".to_string(),
-                values: vec!["zzz".to_string()],
-            }],
-            &[],
+            &search_query_predicates(
+                &[PrivateExactConstraintGroup {
+                    field: "service".to_string(),
+                    values: vec!["zzz".to_string()],
+                }],
+                &[],
+            ),
         ));
 
-        assert!(!iceberg_file_may_match_search(
+        assert!(!file_may_match_predicates(
             &file_stats,
-            &[],
-            &[PrivateSearchRangeConstraint {
-                field: "@timestamp".to_string(),
-                gt: None,
-                gte: Some(serde_json::Value::from(250_i64)),
-                lt: None,
-                lte: None,
-            }],
+            &search_query_predicates(
+                &[],
+                &[PrivateSearchRangeConstraint {
+                    field: "@timestamp".to_string(),
+                    gt: None,
+                    gte: Some(serde_json::Value::from(250_i64)),
+                    lt: None,
+                    lte: None,
+                }],
+            ),
         ));
     }
 
@@ -2096,6 +1600,7 @@ async fn data_query_batches_worker(
     sql: &SqlQuery,
     required_files: &RequiredFiles,
     use_cpu_threadpool: bool,
+    extension_suffixes: Option<&Vec<String>>,
 ) -> Result<Vec<RecordBatch>, PrivateApiError> {
     let iceberg_query_files = required_files
         .iceberg_files
@@ -2104,6 +1609,7 @@ async fn data_query_batches_worker(
         .zip(required_files.iceberg_file_extensions.iter().cloned())
         .map(|(file, extensions)| QueryInputFile {
             file,
+            storage: QueryStorageKind::Iceberg,
             extensions: extensions
                 .into_iter()
                 .map(|extension| QueryExtensionFileSpec {
@@ -2111,188 +1617,38 @@ async fn data_query_batches_worker(
                     file_path: extension.file_path,
                 })
                 .collect(),
-        })
-        .collect::<Vec<_>>();
-    let iceberg_groups = group_query_input_files_by_schema(iceberg_query_files);
-    let delete_files = required_files.delete_files.clone();
-    let table_schema = required_files.table_schema.clone();
-    let iceberg_calls = iceberg_groups.into_iter().map(move |group| {
-        let built_sql = sql.build(&table_schema, &group[0].file.schema);
-        let delete_files = delete_files.clone();
-        async move {
-            execute_query_file_group_batches(
-                group,
-                &built_sql,
-                &delete_files,
-                "{target_table}",
-                "{deletes_table}",
-                use_cpu_threadpool,
-            )
-            .await
-            .map_err(PrivateApiError::from)
-        }
-    });
-
-    let mut delete_local_names = vec![];
-    let mut all_deletes_local_name: Option<String> = None;
-    if !required_files.speedboat_files.is_empty() {
-        let delete_schema = PowdrrSchema::from(&vec![PowdrrField {
-            name: "_id_seq_no".to_string(),
-            data_type: PowdrrDataType::String,
-        }]);
-        let extension_file_vecs = vec![];
-        for delete_file_path in required_files.delete_files.iter() {
-            let local_name = match ensure_loaded(
-                &delete_file_path,
-                &extension_file_vecs,
-                1,
-                false,
-                Some(delete_schema.clone()),
-            )
-            .await
-            {
-                Ok(ln) => ln,
-                Err(e) => return log_err(PrivateApiError::from(e)),
-            };
-            delete_local_names.push(local_name);
-        }
-        all_deletes_local_name = Some(create_all_deletes_table(&delete_local_names).await?);
-    }
-
-    let speedboat_deletes_table_name = all_deletes_local_name.clone();
-    let speedboat_table_schema = required_files.table_schema.clone();
-    let speedboat_calls = required_files
+        });
+    let speedboat_query_files = required_files
         .speedboat_files
         .iter()
         .cloned()
         .zip(required_files.speedboat_file_extensions.iter().cloned())
-        .map(move |(speedboat_file, speedboat_file_extensions)| {
-            let deletes_table_name = speedboat_deletes_table_name
-                .clone()
-                .expect("speedboat delete table must exist");
-            let table_schema = speedboat_table_schema.clone();
-            async move {
-                process_speedboat_file(
-                    sql,
-                    &speedboat_file,
-                    &speedboat_file_extensions,
-                    &table_schema,
-                    &deletes_table_name,
-                    use_cpu_threadpool,
-                )
-                .await
-            }
+        .map(|(file, extensions)| QueryInputFile {
+            file,
+            storage: QueryStorageKind::Speedboat,
+            extensions: extensions
+                .into_iter()
+                .map(|extension| QueryExtensionFileSpec {
+                    suffix: extension.suffix,
+                    file_path: extension.file_path,
+                })
+                .collect(),
         });
 
-    let iceberg_results = try_join_all(iceberg_calls).await?;
+    let plan = QueryExecutionPlan {
+        sql: QuerySqlTemplate::Structured {
+            sql: sql.clone(),
+            table_schema: required_files.table_schema.clone(),
+        },
+        files: iceberg_query_files.chain(speedboat_query_files).collect(),
+        delete_files: required_files.delete_files.clone(),
+        extension_suffixes: extension_suffixes.cloned(),
+        use_cpu_threadpool,
+    };
 
-    let speedboat_results: Vec<Result<RecordBatch, FlightError>> =
-        match try_join_all(speedboat_calls).await {
-            Ok(ar) => ar
-                .iter()
-                .flatten()
-                .map(|x| Ok(x.clone()))
-                .collect::<Vec<Result<RecordBatch, FlightError>>>(),
-            Err(e) => {
-                let error = format!("{}", e.message);
-                println!("{}", error);
-                panic!("dude")
-            }
-        };
-
-    if let Some(all_deletes_local_name) = all_deletes_local_name.as_ref() {
-        data_access::drop(all_deletes_local_name).await;
-    }
-
-    let mut combined = iceberg_results.into_iter().flatten().collect::<Vec<_>>();
-    combined.extend(speedboat_results.into_iter().map(|result| result.unwrap()));
-    Ok(combined)
-}
-
-async fn data_query_batches_exact_worker(
-    sql: &SqlQuery,
-    exact_sql: &SqlQuery,
-    required_files: &RequiredFiles,
-    exact_constraints: &[PrivateExactConstraintGroup],
-    exact_doc_id_field_name: &str,
-    use_cpu_threadpool: bool,
-) -> Result<Vec<RecordBatch>, PrivateApiError> {
-    let mut delete_local_names = vec![];
-    let delete_schema = PowdrrSchema::from(&vec![PowdrrField {
-        name: "_id_seq_no".to_string(),
-        data_type: PowdrrDataType::String,
-    }]);
-    let extension_file_vecs = vec![];
-    for delete_file_path in required_files.delete_files.iter() {
-        let local_name = ensure_loaded(
-            &delete_file_path,
-            &extension_file_vecs,
-            1,
-            false,
-            Some(delete_schema.clone()),
-        )
+    execute_query_plan_batches(plan)
         .await
-        .map_err(PrivateApiError::from)?;
-        delete_local_names.push(local_name);
-    }
-    let all_deletes_local_name = create_all_deletes_table(&delete_local_names).await?;
-
-    let iceberg_calls = required_files
-        .iceberg_files
-        .iter()
-        .zip(required_files.iceberg_file_extensions.iter())
-        .map(|(iceberg_file, iceberg_file_extensions)| {
-            process_file_with_exact_candidates(
-                sql,
-                exact_sql,
-                iceberg_file,
-                iceberg_file_extensions,
-                &required_files.table_schema,
-                &all_deletes_local_name,
-                use_cpu_threadpool,
-                exact_constraints,
-                exact_doc_id_field_name,
-                true,
-            )
-        });
-    let speedboat_calls = required_files
-        .speedboat_files
-        .iter()
-        .zip(required_files.speedboat_file_extensions.iter())
-        .map(|(speedboat_file, speedboat_file_extensions)| {
-            process_file_with_exact_candidates(
-                sql,
-                exact_sql,
-                speedboat_file,
-                speedboat_file_extensions,
-                &required_files.table_schema,
-                &all_deletes_local_name,
-                use_cpu_threadpool,
-                exact_constraints,
-                exact_doc_id_field_name,
-                false,
-            )
-        });
-
-    let iceberg_results = try_join_all(iceberg_calls)
-        .await
-        .map_err(|error| PrivateApiError {
-            message: error.message,
-        })?;
-    let speedboat_results =
-        try_join_all(speedboat_calls)
-            .await
-            .map_err(|error| PrivateApiError {
-                message: error.message,
-            })?;
-
-    data_access::drop(&all_deletes_local_name).await;
-
-    Ok(iceberg_results
-        .into_iter()
-        .chain(speedboat_results.into_iter())
-        .flatten()
-        .collect())
+        .map_err(PrivateApiError::from)
 }
 
 async fn data_query_worker(
@@ -2300,7 +1656,7 @@ async fn data_query_worker(
     required_files: &RequiredFiles,
     use_cpu_threadpool: bool,
 ) -> Result<DataQueryResult, PrivateApiError> {
-    let batches = data_query_batches_worker(sql, required_files, use_cpu_threadpool).await?;
+    let batches = data_query_batches_worker(sql, required_files, use_cpu_threadpool, None).await?;
 
     let mut retval = Vec::new();
     let input_stream =

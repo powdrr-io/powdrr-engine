@@ -1047,48 +1047,6 @@ impl SqlQuery {
         self.build(schema, schema)
     }
 
-    pub(crate) fn with_doc_id_filter_values(
-        &self,
-        doc_id_field_name: &str,
-        values: &[Value],
-    ) -> Option<Self> {
-        let mut literal_values = values
-            .iter()
-            .filter_map(sql_expression_from_json_literal)
-            .collect::<Vec<_>>();
-        if literal_values.is_empty() {
-            return None;
-        }
-
-        let normalized_doc_id_field_name = doc_id_field_name.replace(".", "_");
-        let doc_id_ref = SqlExpression::FieldRef("t".to_string(), normalized_doc_id_field_name);
-        let id_filter = if literal_values.len() == 1 {
-            SqlExpression::Comparison(
-                Box::new(doc_id_ref),
-                "=".to_string(),
-                Box::new(literal_values.pop().unwrap()),
-            )
-        } else {
-            SqlExpression::In(Box::new(doc_id_ref), literal_values)
-        };
-
-        let filters = match &self.filters {
-            Some(existing) => Some(SqlExpression::And(vec![existing.clone(), id_filter])),
-            None => Some(id_filter),
-        };
-
-        Some(Self {
-            dummy: self.dummy,
-            all_fields: self.all_fields,
-            fields: self.fields.clone(),
-            joins: self.joins.clone(),
-            filters,
-            limit: self.limit,
-            order_by: self.order_by.clone(),
-            group_by: self.group_by.clone(),
-        })
-    }
-
     pub(crate) fn build(
         &self,
         original_schema: &PowdrrSchema,
@@ -1137,15 +1095,6 @@ impl SqlQuery {
         format!(
             "SELECT {fields} FROM {{target_table}} t {joins} WHERE {filters} GROUP BY {group_by} ORDER BY {order_by} {limit}"
         )
-    }
-}
-
-fn sql_expression_from_json_literal(value: &Value) -> Option<SqlExpression> {
-    match value {
-        Value::String(value) => Some(SqlExpression::LiteralString(value.clone())),
-        Value::Bool(value) => Some(SqlExpression::LiteralNonString(value.to_string())),
-        Value::Number(value) => Some(SqlExpression::LiteralNonString(value.to_string())),
-        _ => None,
     }
 }
 
