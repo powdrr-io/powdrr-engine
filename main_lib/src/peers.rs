@@ -11,7 +11,7 @@ use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::{error::Error, fmt::Display};
 
-use crate::compaction::{compact_logs, CompactionCommand, CompactionResponse};
+use crate::compaction::{CompactionCommand, CompactionResponse, compact_logs};
 use crate::data_contract::{ExtensionFileMetadata, FileSetPayload};
 use crate::elastic_search_common::result_to_record_batch;
 use crate::elastic_search_responses::QueryResultHit;

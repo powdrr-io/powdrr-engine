@@ -1186,7 +1186,7 @@ pub(crate) fn extract_powdrr_schema_option(value: &Option<Value>) -> PowdrrSchem
 #[cfg(test)]
 mod tests {
     use crate::schema_massager::{
-        extract_powdrr_schema, to_powdrr_schema, PowdrrSchema, SqlBuilder,
+        PowdrrSchema, SqlBuilder, extract_powdrr_schema, to_powdrr_schema,
     };
     use arrow_json::reader::infer_json_schema;
 

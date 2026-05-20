@@ -2,8 +2,8 @@ use std::{
     collections::{BTreeSet, HashMap},
     pin::Pin,
     sync::{
-        atomic::{AtomicI64, Ordering},
         LazyLock, Mutex,
+        atomic::{AtomicI64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -11,24 +11,24 @@ use std::{
 use futures_util::future::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{body, Body};
+use gotham::hyper::{Body, body};
 use gotham::mime;
 use gotham::prelude::StaticResponseExtender;
 use gotham::state::{FromState, State, StateData};
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::data_contract::{
     CreateTable, MongoDbTableConfig, TableDescription, TableMetadataCheckpoint,
 };
 use crate::elastic_search_endpoints::NamePathExtractor;
-use crate::lakehouse_serving::{execute_serving_query, ServingQueryError, ServingQueryResponse};
+use crate::lakehouse_serving::{ServingQueryError, ServingQueryResponse, execute_serving_query};
 use crate::peers::CheckpointDescriptor;
 use crate::schema_massager::{PowdrrDataType, PowdrrSchema};
 use crate::serving_plan::ServingQueryClassification;
-use crate::serving_protocol::{from_mongodb_find, MongoFindCommand, MongoProtocolError};
-use crate::state_provider::{ServiceApiError, STATE_PROVIDER};
+use crate::serving_protocol::{MongoFindCommand, MongoProtocolError, from_mongodb_find};
+use crate::state_provider::{STATE_PROVIDER, ServiceApiError};
 
 const MONGO_BAD_VALUE_CODE: i32 = 2;
 const MONGO_CURSOR_NOT_FOUND_CODE: i32 = 43;
