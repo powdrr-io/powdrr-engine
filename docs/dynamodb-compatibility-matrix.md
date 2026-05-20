@@ -36,6 +36,8 @@ The backing artifacts are:
 | `DescribeTable` | Differential | Includes primary key schema, billing mode, and declared GSIs and LSIs |
 | `GetItem` | Differential | Projection behavior and `ReturnConsumedCapacity` response shape compared against LocalStack |
 | `BatchGetItem` | Differential | Response shape and item projection compared against LocalStack |
+| `PutItem` | Differential | Covers key replacement, `ConditionExpression`, and `ReturnValues=ALL_OLD` / `NONE` |
+| `DeleteItem` | Differential | Covers key deletes, conditional failures, and `ReturnValues=ALL_OLD` / `NONE` |
 | `Query` | Differential | Covers primary-key range queries, `begins_with`, richer filter behavior, pagination, GSI queries, LSI queries, and `ReturnConsumedCapacity` response shape |
 | `Scan` | Differential | Covers ordered pagination, filtered counts, continuation keys, and `ReturnConsumedCapacity` response shape |
 
@@ -57,8 +59,7 @@ explicit unsupported-operation error.
 
 That includes:
 
-- write operations such as `PutItem`, `UpdateItem`, `DeleteItem`, and
-  `BatchWriteItem`
+- unsupported write operations such as `UpdateItem` and `BatchWriteItem`
 - transactional operations such as `TransactGetItems` and
   `TransactWriteItems`
 - control-plane APIs such as `CreateTable`, `DeleteTable`, `UpdateTable`, and
@@ -84,6 +85,15 @@ read-contract subset:
 - `FilterExpression` support for `AND`, `OR`, `NOT`, `contains`,
   `attribute_exists`, `attribute_not_exists`, `attribute_type`, `size`,
   `IN`, `BETWEEN`, and `begins_with`
+
+The first supported write milestone currently adds:
+
+- `PutItem` with full-item replacement semantics on the primary key
+- `DeleteItem` with idempotent key deletes
+- `ConditionExpression` on `PutItem` and `DeleteItem` using the current
+  expression subset
+- `ReturnValues` support for `NONE` and `ALL_OLD` on `PutItem` and
+  `DeleteItem`
 
 ## Local Runner
 

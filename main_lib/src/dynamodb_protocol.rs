@@ -1,9 +1,14 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::fs::{self, File};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::Cursor;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::parquet::arrow::ArrowWriter;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
 use gotham::hyper::{Body, body};
@@ -11,6 +16,7 @@ use gotham::mime;
 use gotham::state::{FromState, State};
 use hmac::{Hmac, Mac};
 use http::{HeaderMap, StatusCode};
+use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -18,13 +24,13 @@ use sha2::{Digest, Sha256};
 use crate::data_access::{self, execute_sql_async, load_files_as_table};
 use crate::data_contract::{
     CreateTable, DynamoDbGlobalSecondaryIndexConfig, DynamoDbLocalSecondaryIndexConfig,
-    DynamoDbTableConfig, FileDescriptor, ServingPattern, ServingTableConfig, TableDescription,
-    TableMetadataCheckpoint,
+    DynamoDbTableConfig, FileDescriptor, FileSetPayload, IcebergMetadata, ServingPattern,
+    ServingTableConfig, TableDescription, TableMetadataCheckpoint,
 };
 use crate::elastic_search_endpoints::NamePathExtractor;
 use crate::lakehouse_serving::{ServingQueryError, ServingQueryResponse, execute_serving_query};
 use crate::peers::CheckpointDescriptor;
-use crate::schema_massager::{PowdrrDataType, PowdrrSchema};
+use crate::schema_massager::{PowdrrDataType, PowdrrSchema, extract_powdrr_schema};
 use crate::search_runtime::batches_to_serde_value;
 use crate::serving_plan::{
     ServingPredicate, ServingQueryClassification, ServingRequestPlan, ServingSort,
@@ -41,6 +47,7 @@ const DYNAMODB_STRING_SET_MARKER: &str = "$string_set";
 const DYNAMODB_NUMBER_SET_MARKER: &str = "$number_set";
 const DYNAMODB_BINARY_SET_MARKER: &str = "$binary_set";
 const SIGV4_ALLOWED_CLOCK_SKEW_MINUTES: i64 = 15;
+const DYNAMODB_WRITE_LOCAL_DIR: &str = "powdrr-dynamodb-writes";
 
 #[derive(Clone, Debug)]
 pub(crate) struct DynamoDbRequestMeta {
@@ -79,6 +86,14 @@ impl DynamoDbError {
         Self::new(
             StatusCode::FORBIDDEN,
             "UnrecognizedClientException",
+            message,
+        )
+    }
+
+    fn conditional_check_failed(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "ConditionalCheckFailedException",
             message,
         )
     }
@@ -217,6 +232,50 @@ struct GetItemResponse {
     item: Option<Map<String, Value>>,
     #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
     consumed_capacity: Option<ConsumedCapacity>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "PascalCase")]
+struct PutItemRequest {
+    table_name: String,
+    item: Map<String, Value>,
+    #[serde(default)]
+    condition_expression: Option<String>,
+    #[serde(default)]
+    expression_attribute_names: Option<HashMap<String, String>>,
+    #[serde(default)]
+    expression_attribute_values: Option<HashMap<String, Value>>,
+    #[serde(default)]
+    return_values: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PutItemResponse {
+    #[serde(rename = "Attributes", skip_serializing_if = "Option::is_none")]
+    attributes: Option<Map<String, Value>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "PascalCase")]
+struct DeleteItemRequest {
+    table_name: String,
+    key: Map<String, Value>,
+    #[serde(default)]
+    condition_expression: Option<String>,
+    #[serde(default)]
+    expression_attribute_names: Option<HashMap<String, String>>,
+    #[serde(default)]
+    expression_attribute_values: Option<HashMap<String, Value>>,
+    #[serde(default)]
+    return_values: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DeleteItemResponse {
+    #[serde(rename = "Attributes", skip_serializing_if = "Option::is_none")]
+    attributes: Option<Map<String, Value>>,
 }
 
 #[derive(Deserialize)]
@@ -404,6 +463,12 @@ enum ReturnConsumedCapacityMode {
     None,
     Total,
     Indexes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteReturnValues {
+    None,
+    AllOld,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -608,6 +673,8 @@ pub fn dynamodb_api(mut state: State) -> Pin<Box<HandlerFuture>> {
                 "ListTables" => handle_list_tables(payload).await?,
                 "DescribeTable" => handle_describe_table(payload).await?,
                 "GetItem" => handle_get_item(payload).await?,
+                "PutItem" => handle_put_item(payload).await?,
+                "DeleteItem" => handle_delete_item(payload).await?,
                 "BatchGetItem" => handle_batch_get_item(payload).await?,
                 "Query" => handle_query(payload).await?,
                 "Scan" => handle_scan(payload).await?,
@@ -832,6 +899,81 @@ async fn handle_get_item(payload: Value) -> Result<Value, DynamoDbError> {
             None,
             estimate_read_capacity_units(1, request.consistent_read.unwrap_or(false)),
         ),
+    })
+    .unwrap())
+}
+
+async fn handle_put_item(payload: Value) -> Result<Value, DynamoDbError> {
+    let request = serde_json::from_value::<PutItemRequest>(payload).map_err(|error| {
+        DynamoDbError::validation(format!("Invalid PutItem request: {}", error))
+    })?;
+    let context = load_dynamodb_table_context(&request.table_name).await?;
+    let key_schema = primary_key_schema(&context.config);
+    let item = dynamodb_item_to_json_row(&request.item)?;
+    let item_key = parse_item_key_map(&request.item, &key_schema)?;
+    let return_values = parse_write_return_values(request.return_values.as_deref(), "PutItem")?;
+    let condition_expression = parse_condition_expression(
+        request.condition_expression.as_ref(),
+        request.expression_attribute_names.as_ref(),
+        request.expression_attribute_values.as_ref(),
+    )?;
+
+    let (checkpoint, rows) = load_mutable_table_rows(&request.table_name).await?;
+    let (existing_item, mut retained_rows) = split_rows_by_key(rows, &key_schema, &item_key)?;
+    if !condition_matches(existing_item.as_ref(), &condition_expression)? {
+        return Err(DynamoDbError::conditional_check_failed(
+            "The conditional request failed",
+        ));
+    }
+
+    retained_rows.push(item);
+    publish_mutated_checkpoint(&checkpoint, retained_rows).await?;
+
+    Ok(serde_json::to_value(PutItemResponse {
+        attributes: match return_values {
+            WriteReturnValues::None => None,
+            WriteReturnValues::AllOld => existing_item
+                .as_ref()
+                .map(json_row_to_dynamodb_item)
+                .transpose()?,
+        },
+    })
+    .unwrap())
+}
+
+async fn handle_delete_item(payload: Value) -> Result<Value, DynamoDbError> {
+    let request = serde_json::from_value::<DeleteItemRequest>(payload).map_err(|error| {
+        DynamoDbError::validation(format!("Invalid DeleteItem request: {}", error))
+    })?;
+    let context = load_dynamodb_table_context(&request.table_name).await?;
+    let key_schema = primary_key_schema(&context.config);
+    let key = parse_key_map(&request.key, &key_schema)?;
+    let return_values = parse_write_return_values(request.return_values.as_deref(), "DeleteItem")?;
+    let condition_expression = parse_condition_expression(
+        request.condition_expression.as_ref(),
+        request.expression_attribute_names.as_ref(),
+        request.expression_attribute_values.as_ref(),
+    )?;
+
+    let (checkpoint, rows) = load_mutable_table_rows(&request.table_name).await?;
+    let (existing_item, retained_rows) = split_rows_by_key(rows, &key_schema, &key)?;
+    if !condition_matches(existing_item.as_ref(), &condition_expression)? {
+        return Err(DynamoDbError::conditional_check_failed(
+            "The conditional request failed",
+        ));
+    }
+    if existing_item.is_some() {
+        publish_mutated_checkpoint(&checkpoint, retained_rows).await?;
+    }
+
+    Ok(serde_json::to_value(DeleteItemResponse {
+        attributes: match return_values {
+            WriteReturnValues::None => None,
+            WriteReturnValues::AllOld => existing_item
+                .as_ref()
+                .map(json_row_to_dynamodb_item)
+                .transpose()?,
+        },
     })
     .unwrap())
 }
@@ -1213,6 +1355,34 @@ async fn load_table_schema(table_name: &str) -> Result<PowdrrSchema, DynamoDbErr
     schema_from_checkpoint(&checkpoint)
 }
 
+async fn load_latest_base_checkpoint(
+    table_name: &str,
+) -> Result<TableMetadataCheckpoint, DynamoDbError> {
+    let checkpoint_id = STATE_PROVIDER
+        .get_latest_checkpoint(&table_name.to_string(), None)
+        .await
+        .map_err(service_error)?
+        .ok_or_else(|| {
+            DynamoDbError::resource_not_found(format!(
+                "No checkpoint was available for table {}",
+                table_name
+            ))
+        })?;
+    STATE_PROVIDER
+        .get_checkpoint(CheckpointDescriptor::new(
+            table_name.to_string(),
+            checkpoint_id,
+        ))
+        .await
+        .map_err(service_error)?
+        .ok_or_else(|| {
+            DynamoDbError::resource_not_found(format!(
+                "Checkpoint metadata was not found for table {}",
+                table_name
+            ))
+        })
+}
+
 async fn load_active_checkpoint(
     table_name: &str,
 ) -> Result<TableMetadataCheckpoint, DynamoDbError> {
@@ -1241,10 +1411,15 @@ async fn load_active_checkpoint(
         })
 }
 
-async fn load_table_files(table_name: &str) -> Result<Vec<FileDescriptor>, DynamoDbError> {
-    let checkpoint = load_active_checkpoint(table_name).await?;
-    let iceberg_metadata = checkpoint.iceberg_metadata.ok_or_else(|| {
-        DynamoDbError::validation("DynamoDB reads currently require Iceberg-backed storage")
+fn checkpoint_file_descriptors(
+    checkpoint: &TableMetadataCheckpoint,
+    operation: &str,
+) -> Result<Vec<FileDescriptor>, DynamoDbError> {
+    let iceberg_metadata = checkpoint.iceberg_metadata.as_ref().ok_or_else(|| {
+        DynamoDbError::validation(format!(
+            "DynamoDB {} currently requires Iceberg-backed storage",
+            operation
+        ))
     })?;
     if checkpoint
         .deletes_metadata
@@ -1252,11 +1427,17 @@ async fn load_table_files(table_name: &str) -> Result<Vec<FileDescriptor>, Dynam
         .map(|metadata| !metadata.files.is_empty())
         .unwrap_or(false)
     {
-        return Err(DynamoDbError::validation(
-            "Delete-aware DynamoDB reads are not implemented yet",
-        ));
+        return Err(DynamoDbError::validation(format!(
+            "Delete-aware DynamoDB {} is not implemented yet",
+            operation
+        )));
     }
     Ok(iceberg_metadata.files.as_file_tuples())
+}
+
+async fn load_table_files(table_name: &str) -> Result<Vec<FileDescriptor>, DynamoDbError> {
+    let checkpoint = load_active_checkpoint(table_name).await?;
+    checkpoint_file_descriptors(&checkpoint, "reads")
 }
 
 fn schema_from_checkpoint(
@@ -1271,6 +1452,312 @@ fn schema_from_checkpoint(
     Err(DynamoDbError::internal(
         "Checkpoint did not contain a usable schema",
     ))
+}
+
+async fn load_mutable_table_rows(
+    table_name: &str,
+) -> Result<(TableMetadataCheckpoint, Vec<Value>), DynamoDbError> {
+    let checkpoint = load_latest_base_checkpoint(table_name).await?;
+    let files = checkpoint_file_descriptors(&checkpoint, "writes")?;
+    let mut rows = vec![];
+    for file_group in group_files_by_schema(&files).into_iter() {
+        let mut group_rows = execute_scan_file_group(file_group, "SELECT * FROM {table}").await?;
+        rows.append(&mut group_rows);
+    }
+    Ok((checkpoint, rows))
+}
+
+async fn publish_mutated_checkpoint(
+    previous_checkpoint: &TableMetadataCheckpoint,
+    mut rows: Vec<Value>,
+) -> Result<(), DynamoDbError> {
+    let fallback_schema = schema_from_checkpoint(previous_checkpoint)?;
+    let previous_iceberg_metadata =
+        previous_checkpoint
+            .iceberg_metadata
+            .as_ref()
+            .ok_or_else(|| {
+                DynamoDbError::validation(
+                    "DynamoDB writes currently require Iceberg-backed storage",
+                )
+            })?;
+    let schema = merged_row_schema(&rows, &fallback_schema);
+    coerce_rows_to_schema(&mut rows, &schema)?;
+    let checkpoint_id = IdInstance::next_id().to_string();
+    let output_path = mutation_output_file_path(previous_checkpoint, &checkpoint_id)?;
+    let file_size = write_rows_to_parquet(&output_path, &rows, &schema).await?;
+    let checkpoint = TableMetadataCheckpoint {
+        table_name: previous_checkpoint.table_name.clone(),
+        original_checkpoint_id: Some(previous_checkpoint.checkpoint_id.clone()),
+        checkpoint_id: checkpoint_id.clone(),
+        iceberg_metadata: Some(IcebergMetadata {
+            table_schema: schema.clone(),
+            snapshot_id: Some(checkpoint_id),
+            files: FileSetPayload {
+                file_paths: vec![output_path],
+                schemas: vec![schema.clone()],
+                file_schemas: vec![0],
+                sizes: vec![file_size],
+            },
+            partition_spec: previous_iceberg_metadata.partition_spec.clone(),
+            sort_order: previous_iceberg_metadata.sort_order.clone(),
+            column_names: schema
+                .fields()
+                .iter()
+                .map(|field| field.name.clone())
+                .collect(),
+            column_stats: vec![],
+            access_artifacts: previous_iceberg_metadata.access_artifacts.clone(),
+            file_stats: vec![],
+        }),
+        speedboat_metadata: None,
+        deletes_metadata: None,
+        extension_metadata: HashMap::new(),
+        schema,
+    };
+    STATE_PROVIDER.add_checkpoint(&checkpoint).await;
+    Ok(())
+}
+
+fn merged_row_schema(rows: &[Value], fallback_schema: &PowdrrSchema) -> PowdrrSchema {
+    if rows.is_empty() {
+        return fallback_schema.clone();
+    }
+    PowdrrSchema::merge_all(
+        rows.iter()
+            .map(extract_powdrr_schema)
+            .collect::<Vec<PowdrrSchema>>(),
+    )
+}
+
+fn coerce_rows_to_schema(rows: &mut [Value], schema: &PowdrrSchema) -> Result<(), DynamoDbError> {
+    for row in rows.iter_mut() {
+        if !row.is_object() {
+            return Err(DynamoDbError::internal(
+                "DynamoDB mutation rows must be JSON objects",
+            ));
+        }
+        schema.coerce_value(row);
+    }
+    Ok(())
+}
+
+fn mutation_output_file_path(
+    checkpoint: &TableMetadataCheckpoint,
+    checkpoint_id: &str,
+) -> Result<String, DynamoDbError> {
+    let sanitized_table = sanitize_path_component(&checkpoint.table_name);
+    let file_name = format!("{}.parquet", checkpoint_id);
+    match checkpoint
+        .iceberg_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.files.file_paths.first())
+    {
+        Some(path) if path.starts_with("s3://") => Ok(format!(
+            "{}/dynamodb-write/{}/{}",
+            data_access::s3_ingest_base_path(),
+            sanitized_table,
+            file_name
+        )),
+        Some(path) if path.contains("://") && !path.starts_with("file://") => {
+            Err(DynamoDbError::validation(format!(
+                "DynamoDB writes do not support storage path {}",
+                path
+            )))
+        }
+        _ => {
+            let directory = std::env::temp_dir()
+                .join(DYNAMODB_WRITE_LOCAL_DIR)
+                .join(sanitized_table);
+            fs::create_dir_all(&directory).map_err(|error| {
+                DynamoDbError::internal(format!(
+                    "Failed to create local DynamoDB write directory: {}",
+                    error
+                ))
+            })?;
+            Ok(format!("file://{}", directory.join(file_name).display()))
+        }
+    }
+}
+
+fn sanitize_path_component(name: &str) -> String {
+    name.chars()
+        .map(|character| match character {
+            '/' | '\\' | ':' | ' ' => '_',
+            _ => character,
+        })
+        .collect()
+}
+
+async fn write_rows_to_parquet(
+    file_path: &str,
+    rows: &[Value],
+    schema: &PowdrrSchema,
+) -> Result<u64, DynamoDbError> {
+    let record_batch = record_batch_from_rows(rows, schema)?;
+    if file_path.starts_with("s3://") {
+        let mut buffer = Cursor::new(Vec::new());
+        {
+            let mut writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)
+                .map_err(|error| DynamoDbError::internal(error.to_string()))?;
+            writer
+                .write(&record_batch)
+                .map_err(|error| DynamoDbError::internal(error.to_string()))?;
+            writer
+                .close()
+                .map_err(|error| DynamoDbError::internal(error.to_string()))?;
+        }
+        let bytes = buffer.into_inner();
+        data_access::put_s3_file(&file_path.to_string(), &bytes)
+            .await
+            .map_err(|error| DynamoDbError::internal(error.to_string()))?;
+        return Ok(bytes.len() as u64);
+    }
+
+    let local_path = file_path.strip_prefix("file://").unwrap_or(file_path);
+    if let Some(parent) = std::path::Path::new(local_path).parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            DynamoDbError::internal(format!(
+                "Failed to create local DynamoDB write directory: {}",
+                error
+            ))
+        })?;
+    }
+    let file = File::create(local_path).map_err(|error| {
+        DynamoDbError::internal(format!("Failed to create local parquet file: {}", error))
+    })?;
+    let mut writer = ArrowWriter::try_new(file, record_batch.schema(), None)
+        .map_err(|error| DynamoDbError::internal(error.to_string()))?;
+    writer
+        .write(&record_batch)
+        .map_err(|error| DynamoDbError::internal(error.to_string()))?;
+    writer
+        .close()
+        .map_err(|error| DynamoDbError::internal(error.to_string()))?;
+    fs::metadata(local_path)
+        .map(|metadata| metadata.len())
+        .map_err(|error| {
+            DynamoDbError::internal(format!(
+                "Failed to stat local parquet file {}: {}",
+                local_path, error
+            ))
+        })
+}
+
+fn record_batch_from_rows(
+    rows: &[Value],
+    schema: &PowdrrSchema,
+) -> Result<RecordBatch, DynamoDbError> {
+    if rows.is_empty() {
+        return Ok(RecordBatch::new_empty(Arc::new(schema.to_arrow_schema())));
+    }
+    let arrow_schema = schema.to_arrow_schema();
+    let fields = arrow_schema.fields.as_ref();
+    let row_values = rows.to_vec();
+    serde_arrow::to_record_batch(fields, &row_values).map_err(|error| {
+        DynamoDbError::internal(format!(
+            "Failed to convert mutated DynamoDB rows to Arrow: {}",
+            error
+        ))
+    })
+}
+
+fn parse_condition_expression(
+    expression: Option<&String>,
+    names: Option<&HashMap<String, String>>,
+    values: Option<&HashMap<String, Value>>,
+) -> Result<ParsedFilterExpression, DynamoDbError> {
+    let empty_values = HashMap::new();
+    parse_filter_expression(expression, names, Some(values.unwrap_or(&empty_values)))
+}
+
+fn condition_matches(
+    item: Option<&Value>,
+    condition_expression: &ParsedFilterExpression,
+) -> Result<bool, DynamoDbError> {
+    let Some(expression) = condition_expression.expression.as_ref() else {
+        return Ok(true);
+    };
+    let empty = Map::new();
+    let object = match item {
+        Some(item) => item.as_object().ok_or_else(|| {
+            DynamoDbError::internal("DynamoDB condition target was not an object")
+        })?,
+        None => &empty,
+    };
+    evaluate_filter_node(object, expression)
+}
+
+fn parse_item_key_map(
+    item: &Map<String, Value>,
+    key_schema: &DynamoDbKeySchemaConfig,
+) -> Result<HashMap<String, Value>, DynamoDbError> {
+    let mut key = Map::new();
+    copy_key_attr(item, &mut key, &key_schema.partition_key)?;
+    if let Some(sort_key) = key_schema.sort_key.as_ref() {
+        copy_key_attr(item, &mut key, sort_key)?;
+    }
+    parse_key_map(&key, key_schema)
+}
+
+fn copy_key_attr(
+    item: &Map<String, Value>,
+    target: &mut Map<String, Value>,
+    field_name: &str,
+) -> Result<(), DynamoDbError> {
+    target.insert(
+        field_name.to_string(),
+        item.get(field_name).cloned().ok_or_else(|| {
+            DynamoDbError::validation(format!("Item was missing key field {}", field_name))
+        })?,
+    );
+    Ok(())
+}
+
+fn split_rows_by_key(
+    rows: Vec<Value>,
+    key_schema: &DynamoDbKeySchemaConfig,
+    key: &HashMap<String, Value>,
+) -> Result<(Option<Value>, Vec<Value>), DynamoDbError> {
+    let mut existing = None;
+    let mut retained = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row_matches_key(&row, key_schema, key)? {
+            if existing.is_none() {
+                existing = Some(row.clone());
+            }
+        } else {
+            retained.push(row);
+        }
+    }
+    Ok((existing, retained))
+}
+
+fn row_matches_key(
+    row: &Value,
+    key_schema: &DynamoDbKeySchemaConfig,
+    key: &HashMap<String, Value>,
+) -> Result<bool, DynamoDbError> {
+    let object = row
+        .as_object()
+        .ok_or_else(|| DynamoDbError::internal("DynamoDB mutation row was not an object"))?;
+    if object.get(&key_schema.partition_key) != key.get(&key_schema.partition_key) {
+        return Ok(false);
+    }
+    if let Some(sort_key) = key_schema.sort_key.as_ref() {
+        if object.get(sort_key) != key.get(sort_key) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn dynamodb_item_to_json_row(item: &Map<String, Value>) -> Result<Value, DynamoDbError> {
+    let mut converted = Map::new();
+    for (key, value) in item.iter() {
+        converted.insert(key.clone(), dynamodb_attr_to_json(value)?);
+    }
+    Ok(Value::Object(converted))
 }
 
 fn validate_dynamodb_config(
@@ -1934,6 +2421,20 @@ fn parse_return_consumed_capacity(
         other => Err(DynamoDbError::validation(format!(
             "Unsupported ReturnConsumedCapacity value {}",
             other
+        ))),
+    }
+}
+
+fn parse_write_return_values(
+    value: Option<&str>,
+    operation: &str,
+) -> Result<WriteReturnValues, DynamoDbError> {
+    match value.unwrap_or("NONE") {
+        "NONE" => Ok(WriteReturnValues::None),
+        "ALL_OLD" => Ok(WriteReturnValues::AllOld),
+        other => Err(DynamoDbError::validation(format!(
+            "Unsupported ReturnValues value {} for {}",
+            other, operation
         ))),
     }
 }
@@ -3682,12 +4183,18 @@ mod tests {
         query_select_fields, sha256_hex, sigv4_signature,
     };
     use crate::data_contract::{
-        DynamoDbTableConfig, FileSetPayload, IcebergMetadata, TableMetadataCheckpoint,
+        DynamoDbTableConfig, FileSetPayload, IcebergMetadata, LicenseType, OrgCreds, OrgSettings,
+        TableMetadataCheckpoint,
     };
     use crate::schema_massager::extract_powdrr_schema;
     use crate::serving_dataset::read_parquet_documents;
+    use crate::state_provider::STATE_PROVIDER;
     use crate::test_api::{CompactionMode, IndexingMode, StateMode, TestProcessingMode};
     use chrono::Utc;
+    use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::parquet::arrow::ArrowWriter;
     use gotham::mime;
     use gotham::test::TestServer;
     use serde_json::json;
@@ -3870,6 +4377,187 @@ mod tests {
             "{}",
             error
         );
+    }
+
+    #[test]
+    fn test_dynamodb_put_and_delete_item_smoke() {
+        let test_server = TestServer::with_timeout(crate::router::router(true), 1000).unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let parquet_path = temp_dir.path().join("events.parquet");
+        write_smoke_parquet(&parquet_path);
+        let dataset_path_string = parquet_path.display().to_string();
+        let file_path = format!("file://{}", parquet_path.display());
+        let file_size = fs::metadata(&parquet_path).unwrap().len();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            ensure_test_org_registered().await;
+        });
+        let dataset = runtime
+            .block_on(read_parquet_documents(&dataset_path_string, Some(10)))
+            .unwrap();
+        let table_name = format!(
+            "dynamo_write_smoke_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
+        let checkpoint = TableMetadataCheckpoint {
+            table_name: table_name.clone(),
+            original_checkpoint_id: None,
+            checkpoint_id: "checkpoint_0".to_string(),
+            iceberg_metadata: Some(IcebergMetadata {
+                table_schema: dataset.schema.clone(),
+                snapshot_id: Some("snapshot_1".to_string()),
+                files: FileSetPayload::single(file_path, file_size, dataset.schema.clone()),
+                partition_spec: vec![],
+                sort_order: vec![],
+                column_names: dataset
+                    .schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.name.clone())
+                    .collect(),
+                column_stats: vec![],
+                access_artifacts: vec![],
+                file_stats: vec![],
+            }),
+            speedboat_metadata: None,
+            deletes_metadata: None,
+            extension_metadata: HashMap::new(),
+            schema: dataset.schema.clone(),
+        };
+        let mut mode = TestProcessingMode::default();
+        mode.state_mode = StateMode::Testing;
+        mode.indexing_mode = IndexingMode::Disabled;
+        mode.compaction_mode = CompactionMode::Disabled;
+        let mode_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_testing_and_processing_mode",
+                serde_json::to_string(&mode).unwrap(),
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(mode_response.status(), 200);
+        let checkpoint_response = test_server
+            .client()
+            .post(
+                "http://localhost/_test/v1/_add_checkpoint",
+                serde_json::to_string(&checkpoint).unwrap(),
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(checkpoint_response.status(), 200);
+        let config_response = test_server
+            .client()
+            .put(
+                format!("http://localhost/{}/_dynamodb/config", table_name),
+                serde_json::to_string(&json!({
+                    "partition_key": "tenant",
+                    "sort_key": "ts"
+                }))
+                .unwrap(),
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(config_response.status(), 200);
+
+        let key = json!({
+            "tenant": { "S": "acme" },
+            "ts": { "N": "10" }
+        });
+        let put_response = perform_dynamodb_request(
+            &test_server,
+            "PutItem",
+            json!({
+                "TableName": table_name,
+                "Item": {
+                    "tenant": { "S": "acme" },
+                    "ts": { "N": "10" },
+                    "event_id": { "S": "evt-1b" },
+                    "region": { "S": "eu" },
+                    "count": { "N": "7" }
+                },
+                "ConditionExpression": "attribute_exists(#pk)",
+                "ExpressionAttributeNames": {
+                    "#pk": "tenant"
+                },
+                "ReturnValues": "ALL_OLD"
+            }),
+        );
+        assert_eq!(put_response.status(), 200);
+        let put_body =
+            serde_json::from_str::<serde_json::Value>(&put_response.read_utf8_body().unwrap())
+                .unwrap();
+        assert_eq!(
+            dynamodb_attr_to_json(&put_body["Attributes"]["event_id"]).unwrap(),
+            json!("evt-1")
+        );
+
+        let get_item_response = perform_dynamodb_request(
+            &test_server,
+            "GetItem",
+            json!({
+                "TableName": table_name,
+                "Key": key.clone()
+            }),
+        );
+        assert_eq!(get_item_response.status(), 200);
+        let get_item_body =
+            serde_json::from_str::<serde_json::Value>(&get_item_response.read_utf8_body().unwrap())
+                .unwrap();
+        assert_eq!(
+            dynamodb_attr_to_json(&get_item_body["Item"]["event_id"]).unwrap(),
+            json!("evt-1b")
+        );
+        assert_eq!(
+            dynamodb_attr_to_json(&get_item_body["Item"]["count"]).unwrap(),
+            json!(7)
+        );
+
+        let delete_response = perform_dynamodb_request(
+            &test_server,
+            "DeleteItem",
+            json!({
+                "TableName": table_name,
+                "Key": key.clone(),
+                "ConditionExpression": "attribute_exists(#pk)",
+                "ExpressionAttributeNames": {
+                    "#pk": "tenant"
+                },
+                "ReturnValues": "ALL_OLD"
+            }),
+        );
+        assert_eq!(delete_response.status(), 200);
+        let delete_body =
+            serde_json::from_str::<serde_json::Value>(&delete_response.read_utf8_body().unwrap())
+                .unwrap();
+        assert_eq!(
+            dynamodb_attr_to_json(&delete_body["Attributes"]["event_id"]).unwrap(),
+            json!("evt-1b")
+        );
+
+        let missing_item_response = perform_dynamodb_request(
+            &test_server,
+            "GetItem",
+            json!({
+                "TableName": table_name,
+                "Key": key
+            }),
+        );
+        assert_eq!(missing_item_response.status(), 200);
+        let missing_item_body = serde_json::from_str::<serde_json::Value>(
+            &missing_item_response.read_utf8_body().unwrap(),
+        )
+        .unwrap();
+        assert!(missing_item_body.get("Item").is_none());
     }
 
     #[test]
@@ -4058,6 +4746,55 @@ mod tests {
             dynamodb_attr_to_json(&query_body["Items"][0][partition_key.as_str()]).unwrap(),
             partition_value
         );
+    }
+
+    async fn ensure_test_org_registered() {
+        if STATE_PROVIDER
+            .lookup_secret_access_key(&"test".to_string())
+            .await
+            .unwrap()
+            .as_deref()
+            == Some("test")
+        {
+            return;
+        }
+        STATE_PROVIDER
+            .create_org(&OrgSettings {
+                org_id: "dynamodb_test_org".to_string(),
+                license_type: LicenseType::Free,
+                creds: vec![OrgCreds {
+                    access_key_id: "test".to_string(),
+                    secret_access_key: "test".to_string(),
+                    nickname: Some("dynamodb-test".to_string()),
+                }],
+            })
+            .await
+            .unwrap();
+    }
+
+    fn write_smoke_parquet(path: &std::path::Path) {
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("tenant", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("event_id", DataType::Utf8, false),
+            Field::new("region", DataType::Utf8, false),
+            Field::new("count", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                std::sync::Arc::new(StringArray::from(vec!["acme", "acme"])) as ArrayRef,
+                std::sync::Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
+                std::sync::Arc::new(StringArray::from(vec!["evt-1", "evt-2"])) as ArrayRef,
+                std::sync::Arc::new(StringArray::from(vec!["us", "us"])) as ArrayRef,
+                std::sync::Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let file = fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
     }
 
     fn perform_dynamodb_request(

@@ -37,8 +37,8 @@
     },
     {
       "operation": "DeleteItem",
-      "mode": "explicit_error",
-      "description": "Mutating item deletes are unsupported and must fail explicitly."
+      "mode": "differential_supported",
+      "description": "Mutating item deletes must match DynamoDB-compatible key, condition, and return-value behavior."
     },
     {
       "operation": "DeleteResourcePolicy",
@@ -192,8 +192,8 @@
     },
     {
       "operation": "PutItem",
-      "mode": "explicit_error",
-      "description": "Mutating writes are unsupported and must fail explicitly."
+      "mode": "differential_supported",
+      "description": "Mutating item puts must match DynamoDB-compatible key replacement, condition, and return-value behavior."
     },
     {
       "operation": "PutResourcePolicy",
