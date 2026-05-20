@@ -23,28 +23,28 @@ use datafusion::{
 };
 use futures::stream::{self, StreamExt};
 use futures_util::TryStreamExt;
-use iceberg::Catalog;
 use iceberg::arrow::ArrowFileReader;
 use iceberg::io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY};
 use iceberg::spec::{DataContentType, DataFile, Literal, ManifestContentType, PrimitiveType, Type};
 use iceberg::table::Table;
 use iceberg::transaction::ApplyTransactionAction;
+use iceberg::Catalog;
 use iceberg::{NamespaceIdent, TableCreation, TableIdent};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use idgenerator::IdInstance;
 #[cfg(target_os = "linux")]
 use liquid_cache_datafusion::cache::LiquidCacheParquetRef;
 #[cfg(target_os = "linux")]
-use liquid_cache_parquet::LiquidCacheLocalBuilder;
-#[cfg(target_os = "linux")]
 use liquid_cache_parquet::storage::cache::squeeze_policies::Evict;
 #[cfg(target_os = "linux")]
 use liquid_cache_parquet::storage::cache_policies::LiquidPolicy;
+#[cfg(target_os = "linux")]
+use liquid_cache_parquet::LiquidCacheLocalBuilder;
 use lru_mem::{HeapSize, LruCache, TryInsertError};
 use object_store::client::SpawnedReqwestConnector;
 use object_store::{
-    ObjectStoreExt, PutPayload,
     aws::{AmazonS3, AmazonS3Builder},
+    ObjectStoreExt, PutPayload,
 };
 use parquet_55::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet_55::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
@@ -61,7 +61,7 @@ use std::{
     sync::Arc,
 };
 use tokio::runtime::Handle;
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinSet;
 use url::Url;
 
@@ -1265,10 +1265,6 @@ enum CacheTrackerActorMessage {
         file_path: String,
         payload: Vec<u8>,
     },
-    FileGet {
-        respond_to: oneshot::Sender<Result<Vec<u8>, DataFusionError>>,
-        file_path: String,
-    },
     DropIcebergTable {
         respond_to: oneshot::Sender<Result<(), iceberg::Error>>,
         namespace: String,
@@ -1691,42 +1687,6 @@ impl CacheTrackerActor {
                 };
                 respond_to.send(retval).expect("Failed to send response");
             }
-            CacheTrackerActorMessage::FileGet {
-                respond_to,
-                file_path,
-            } => {
-                let retval = if file_path.starts_with("s3://") {
-                    let path_str = file_path.replace(S3_BASE_PATH, "");
-                    let path = match object_store::path::Path::from_url_path(path_str) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            respond_to
-                                .send(log_err(DataFusionError::ObjectStore(Box::new(e.into()))))
-                                .expect("Failed to send response");
-                            return;
-                        }
-                    };
-
-                    match self.s3_file_store.get(&path).await {
-                        Ok(result) => match result.bytes().await {
-                            Ok(bytes) => Ok(bytes.to_vec()),
-                            Err(e) => log_err(DataFusionError::ObjectStore(Box::new(e.into()))),
-                        },
-                        Err(e) => log_err(DataFusionError::ObjectStore(Box::new(e.into()))),
-                    }
-                } else {
-                    let final_file_path = if file_path.starts_with("file://") {
-                        file_path.replace("file://", "")
-                    } else {
-                        file_path
-                    };
-                    match std::fs::read(&final_file_path) {
-                        Ok(bytes) => Ok(bytes),
-                        Err(e) => log_err(DataFusionError::IoError(e)),
-                    }
-                };
-                respond_to.send(retval).expect("Failed to send response");
-            }
             CacheTrackerActorMessage::DropIcebergTable {
                 respond_to,
                 namespace,
@@ -1875,6 +1835,7 @@ impl CacheTrackerActor {
             );
             match load_json_file_as_table(
                 &self.data_fusion_context,
+                &self.s3_file_store,
                 file_path,
                 &table_name,
                 &schema.unwrap(),
@@ -2103,17 +2064,6 @@ impl LRUCacheHandle {
 
         let _ = self.sender.send(msg).await;
         // TODO: deal with errors
-        recv.await.expect("Actor task has been killed")
-    }
-
-    async fn file_get(&self, file_path: &String) -> Result<Vec<u8>, DataFusionError> {
-        let (send, recv) = oneshot::channel();
-        let msg = CacheTrackerActorMessage::FileGet {
-            respond_to: send,
-            file_path: file_path.clone(),
-        };
-
-        let _ = self.sender.send(msg).await;
         recv.await.expect("Actor task has been killed")
     }
 
@@ -2430,6 +2380,7 @@ async fn load_parquet_files_as_table(
 
 async fn load_json_file_as_table(
     data_fusion_context: &SessionContext,
+    s3_file_store: &Arc<AmazonS3>,
     file_path_without_suffix: &String,
     local_name: &String,
     schema: &Schema,
@@ -2471,15 +2422,40 @@ async fn load_json_file_as_table(
             format!("{}.arrow", file_path_without_suffix)
         };
         tracing::info!("Loading Arrow file {}", file_path);
-        load_arrow_as_memtable(&file_path, local_name).await
+        load_arrow_as_memtable(data_fusion_context, s3_file_store, &file_path, local_name).await
+    }
+}
+
+async fn read_file_bytes_direct(
+    s3_file_store: &Arc<AmazonS3>,
+    file_path: &String,
+) -> Result<Vec<u8>, DataFusionError> {
+    if file_path.starts_with("s3://") {
+        let path_str = file_path.replace(S3_BASE_PATH, "");
+        let path = object_store::path::Path::from_url_path(path_str)
+            .map_err(|error| DataFusionError::ObjectStore(Box::new(error.into())))?;
+
+        let result = s3_file_store
+            .get(&path)
+            .await
+            .map_err(|error| DataFusionError::ObjectStore(Box::new(error.into())))?;
+        result
+            .bytes()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(|error| DataFusionError::ObjectStore(Box::new(error.into())))
+    } else {
+        std::fs::read(normalize_local_file_path(file_path)).map_err(DataFusionError::IoError)
     }
 }
 
 async fn load_arrow_as_memtable(
+    data_fusion_context: &SessionContext,
+    s3_file_store: &Arc<AmazonS3>,
     file_path: &String,
     local_name: &String,
 ) -> Result<(), DataFusionError> {
-    let file_contents = LRU_CACHE_HANDLE.file_get(file_path).await?;
+    let file_contents = read_file_bytes_direct(s3_file_store, file_path).await?;
     let arrow_reader = ArrowIpcFileReader::try_new(Cursor::new(file_contents), None)
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
     let record_batches = arrow_reader
@@ -2493,7 +2469,36 @@ async fn load_arrow_as_memtable(
         )));
     }
 
-    load_memtable_with_name(local_name, &record_batches).await
+    register_memtable_with_name(data_fusion_context, local_name, &record_batches)
+}
+
+fn register_memtable_with_name(
+    data_fusion_context: &SessionContext,
+    result_table_name: &String,
+    records: &Vec<RecordBatch>,
+) -> Result<(), DataFusionError> {
+    if records.is_empty() {
+        panic!("Do not call this if you have no records");
+    }
+
+    let schema = records[0].schema();
+    let concated = arrow::compute::concat_batches(&records[0].schema(), records)
+        .map_err(|error| DataFusionError::ArrowError(Box::new(error), None))?;
+    let table = Arc::new(datafusion::datasource::MemTable::try_new(
+        schema,
+        vec![vec![concated]],
+    )?);
+
+    match data_fusion_context.register_table(result_table_name, table) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if e.message().contains("already exists") {
+                Ok(())
+            } else {
+                log_err(e)
+            }
+        }
+    }
 }
 
 pub(crate) fn path_to_table_name(file_path: &String) -> String {
@@ -3158,7 +3163,11 @@ fn select_stat_bound<'a, T>(
     max: Option<&'a T>,
     lower_bound: bool,
 ) -> Option<&'a T> {
-    if lower_bound { min } else { max }
+    if lower_bound {
+        min
+    } else {
+        max
+    }
 }
 
 fn scalar_bool_to_json(value: bool) -> Option<serde_json::Value> {
@@ -3252,11 +3261,11 @@ pub(crate) fn s3_ingest_base_path() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        IcebergLibMetadata, IcebergTableMetadataCache, IcebergTableRowGroupStatsTracker,
-        ParquetRowGroupStatsCache, RecordBatch, ServingBulkCacheWarmupStats, drop,
-        execute_sql_async, load_file_as_table, load_files_as_table,
+        drop, execute_sql_async, load_file_as_table, load_files_as_table,
         record_serving_bulk_cache_warmup, resolve_serving_liquid_cache_location,
-        serving_bulk_cache_stats, serving_session_config,
+        serving_bulk_cache_stats, serving_session_config, IcebergLibMetadata,
+        IcebergTableMetadataCache, IcebergTableRowGroupStatsTracker, ParquetRowGroupStatsCache,
+        RecordBatch, ServingBulkCacheWarmupStats,
     };
     use crate::data_contract::{IcebergColumnStats, IcebergRowGroupStats};
     use crate::elastic_search_ingest::WriteBuffer;
@@ -3265,8 +3274,8 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field};
     use datafusion::parquet::arrow::ArrowWriter;
     use iceberg::spec::Schema;
-    use serde_json::Value;
     use serde_json::json;
+    use serde_json::Value;
     use std::collections::HashSet;
     use std::fs::File;
     use std::path::PathBuf;
@@ -3578,11 +3587,9 @@ mod tests {
             location.root_dir,
             PathBuf::from("/var/cache/powdrr-serving")
         );
-        assert!(
-            location
-                .cache_dir
-                .starts_with(PathBuf::from("/var/cache/powdrr-serving"))
-        );
+        assert!(location
+            .cache_dir
+            .starts_with(PathBuf::from("/var/cache/powdrr-serving")));
     }
 
     #[test]
