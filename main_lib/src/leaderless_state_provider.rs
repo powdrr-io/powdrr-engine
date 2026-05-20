@@ -9,12 +9,14 @@ use crate::data_contract::{
 };
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::ephemeral_fetch_tracker::EphemeralFetchTracker;
+use crate::metadata_store::{CheckpointCutoverState, ServingNodeActivationAck};
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
 use crate::state_provider::ServiceApiError;
 use crate::test_api::TestProcessingMode;
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct LeaderlessStateProvider {
     base_address: String,
@@ -22,9 +24,26 @@ pub struct LeaderlessStateProvider {
     access_key: String,
     secret_key: String,
     fetch_tracker: EphemeralFetchTracker,
+    serving_node_id: String,
 }
 
 impl LeaderlessStateProvider {
+    fn default_serving_node_id() -> String {
+        if let Ok(node_id) = std::env::var("POWDRR_SERVING_NODE_ID") {
+            return node_id;
+        }
+
+        let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_string());
+        format!("leaderless-{}-{}", hostname, std::process::id())
+    }
+
+    fn current_timestamp_ms() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or_default()
+    }
+
     #[allow(dead_code)]
     pub(crate) fn new(
         mode: TestProcessingMode,
@@ -38,6 +57,7 @@ impl LeaderlessStateProvider {
             access_key,
             secret_key,
             fetch_tracker: EphemeralFetchTracker::new(mode),
+            serving_node_id: Self::default_serving_node_id(),
         }
     }
 
@@ -354,15 +374,17 @@ impl LeaderlessStateProvider {
                 if val {
                     for table_name in table_names {
                         let checkpoint_id = self
-                            .get_latest_committed_checkpoint(table_name, extensions.clone())
+                            .get_remote_latest_target_checkpoint(table_name, extensions.clone())
                             .await?;
-                        self.fetch_tracker
-                            .set_next_prefetch_checkpoints(
-                                table_name,
-                                extensions.clone(),
-                                &checkpoint_id.unwrap(),
-                            )
-                            .await?;
+                        if let Some(checkpoint_id) = checkpoint_id {
+                            self.fetch_tracker
+                                .set_next_prefetch_checkpoints(
+                                    table_name,
+                                    extensions.clone(),
+                                    &checkpoint_id,
+                                )
+                                .await?;
+                        }
                     }
                 }
                 Ok(val)
@@ -493,6 +515,64 @@ impl LeaderlessStateProvider {
         .await
     }
 
+    async fn get_remote_latest_target_checkpoint(
+        &mut self,
+        table_name: &String,
+        extensions: Option<String>,
+    ) -> Result<Option<String>, ServiceApiError> {
+        let payload = GetLatestCheckpoint {
+            table_name: table_name.to_owned(),
+            extension: extensions,
+        };
+        Self::handle_response_body_option(
+            self.get(format!(
+                "{}/api/v1/get_latest_target_checkpoint",
+                self.base_address
+            ))
+            .body(serde_json::to_string(&payload).unwrap())
+            .send()
+            .await,
+        )
+        .await
+    }
+
+    async fn get_checkpoint_cutover_state(
+        &mut self,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> Result<CheckpointCutoverState, ServiceApiError> {
+        let payload = GetLatestCheckpoint {
+            table_name: table_name.to_owned(),
+            extension,
+        };
+        Self::handle_response_body(
+            self.get(format!(
+                "{}/api/v1/get_checkpoint_cutover_state",
+                self.base_address
+            ))
+            .body(serde_json::to_string(&payload).unwrap())
+            .send()
+            .await,
+        )
+        .await
+    }
+
+    async fn record_serving_node_activation(
+        &mut self,
+        ack: &ServingNodeActivationAck,
+    ) -> Result<(), ServiceApiError> {
+        Self::handle_response(
+            self.post(format!(
+                "{}/api/v1/record_serving_node_activation",
+                self.base_address
+            ))
+            .body(serde_json::to_string(ack).unwrap())
+            .send()
+            .await,
+        )
+        .await
+    }
+
     pub(crate) async fn get_checkpoint(
         &mut self,
         checkpoint: &CheckpointDescriptor,
@@ -579,7 +659,27 @@ impl LeaderlessStateProvider {
         extension: Option<String>,
     ) -> Result<(), ServiceApiError> {
         self.fetch_tracker
-            .set_target_checkpoints(descriptors, extension)
-            .await
+            .set_target_checkpoints(descriptors, extension.clone())
+            .await?;
+
+        for descriptor in descriptors.iter() {
+            let cutover_state = self
+                .get_checkpoint_cutover_state(&descriptor.table_name, extension.clone())
+                .await?;
+            if cutover_state.target_checkpoint_id != Some(descriptor.checkpoint_id.clone()) {
+                continue;
+            }
+
+            self.record_serving_node_activation(&ServingNodeActivationAck {
+                selector: cutover_state.selector,
+                node_id: self.serving_node_id.clone(),
+                epoch: cutover_state.epoch,
+                checkpoint_id: descriptor.checkpoint_id.clone(),
+                activated_at_ms: Self::current_timestamp_ms(),
+            })
+            .await?;
+        }
+
+        Ok(())
     }
 }

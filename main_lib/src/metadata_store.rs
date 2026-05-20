@@ -5,13 +5,13 @@ use crate::peers::CheckpointDescriptor;
 use crate::state_provider::ServiceApiError;
 use async_trait::async_trait;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishedCheckpointRole {
     Active,
     Target,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PublishedCheckpointSelector {
     pub table_name: String,
     pub extension: Option<String>,
@@ -40,16 +40,27 @@ impl PublishedCheckpointSelector {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PublishedCheckpointRecord {
     pub selector: PublishedCheckpointSelector,
     pub checkpoint_id: String,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    serde::Serialize,
+    serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+)]
 pub struct CutoverEpoch(pub u64);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointCutoverState {
     pub selector: PublishedCheckpointSelector,
     pub epoch: CutoverEpoch,
@@ -57,14 +68,14 @@ pub struct CheckpointCutoverState {
     pub target_checkpoint_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ServingNodeLease {
     pub node_id: String,
     pub membership_epoch: CutoverEpoch,
     pub observed_at_ms: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ServingNodeActivationAck {
     pub selector: PublishedCheckpointSelector,
     pub node_id: String,
@@ -73,7 +84,7 @@ pub struct ServingNodeActivationAck {
     pub activated_at_ms: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointCutoverRequest {
     pub org_id: String,
     pub selector: PublishedCheckpointSelector,
@@ -95,7 +106,7 @@ impl CheckpointCutoverRequest {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct CheckpointUpdateRequest {
     pub org_id: String,
     pub table_name: String,

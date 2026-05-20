@@ -88,6 +88,15 @@ pub fn router(include_test_apis: bool) -> Router {
                 route
                     .get("/get_latest_checkpoint")
                     .to(v1_handlers::get_latest_checkpoint);
+                route
+                    .get("/get_latest_target_checkpoint")
+                    .to(v1_handlers::get_latest_target_checkpoint);
+                route
+                    .get("/get_checkpoint_cutover_state")
+                    .to(v1_handlers::get_checkpoint_cutover_state);
+                route
+                    .post("/record_serving_node_activation")
+                    .to(v1_handlers::record_serving_node_activation);
                 route.get("/get_checkpoint").to(v1_handlers::get_checkpoint);
                 route
                     .get("/get_extension_work_items/:name")
