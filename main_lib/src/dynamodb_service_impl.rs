@@ -14,7 +14,7 @@ use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::metadata_store::{
     CheckpointUpdateRequest, ClaimedCleanupWorkItem, ClaimedCompactionWorkItem,
     ClaimedExtensionWorkItem, MetadataClaimKind, MetadataStore, PublishedCheckpointRecord,
-    PublishedCheckpointSelector,
+    PublishedCheckpointRole, PublishedCheckpointSelector,
 };
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
@@ -1266,22 +1266,43 @@ impl MetadataStore for DynamoDBServiceImpl {
         Ok(())
     }
 
+    async fn get_latest_committed_checkpoint(
+        &mut self,
+        org_info: &OrgInfo,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> Result<Option<String>, ServiceApiError> {
+        // TODO: persist a distinct committed frontier for the DynamoDB metadata backend.
+        // Today this still resolves through the latest checkpoint pointer, which remains
+        // coupled to the published active frontier until that backend is tightened.
+        DynamoDBServiceImpl::get_latest_committed_checkpoint(self, org_info, table_name, extension)
+            .await
+    }
+
     async fn get_published_checkpoint_record(
         &mut self,
         org_info: &OrgInfo,
         selector: &PublishedCheckpointSelector,
     ) -> Result<Option<PublishedCheckpointRecord>, ServiceApiError> {
-        Ok(DynamoDBServiceImpl::get_latest_committed_checkpoint(
-            self,
-            org_info,
-            &selector.table_name,
-            selector.extension.clone(),
+        let checkpoint_id = match selector.role {
+            PublishedCheckpointRole::Active => {
+                DynamoDBServiceImpl::get_latest_committed_checkpoint(
+                    self,
+                    org_info,
+                    &selector.table_name,
+                    selector.extension.clone(),
+                )
+                .await?
+            }
+            PublishedCheckpointRole::Target => None,
+        };
+
+        Ok(
+            checkpoint_id.map(|checkpoint_id| PublishedCheckpointRecord {
+                selector: selector.clone(),
+                checkpoint_id,
+            }),
         )
-        .await?
-        .map(|checkpoint_id| PublishedCheckpointRecord {
-            selector: selector.clone(),
-            checkpoint_id,
-        }))
     }
 
     async fn get_checkpoint_metadata(
