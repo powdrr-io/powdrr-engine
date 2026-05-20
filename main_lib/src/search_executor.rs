@@ -18,6 +18,7 @@ use crate::peers::{
     PrivateSearchInvocation, PrivateSearchRangeConstraint, PrivateSearchSortSpec,
     PrivateSearchTermsOrderSpec,
 };
+use crate::read_plan::{ReadPlan, ReadPredicate, ReadSort};
 use crate::schema_massager::{FieldExpression, SqlBuilder, SqlExpression};
 use crate::search_plan;
 use crate::search_runtime::{
@@ -117,7 +118,9 @@ pub(crate) struct SearchPerformanceAssessment {
 
 pub(crate) struct SearchCommand {
     #[allow(dead_code)]
-    pub logical_plan: search_plan::SearchPlan,
+    pub search_plan: search_plan::SearchPlan,
+    #[allow(dead_code)]
+    pub read_plan: ReadPlan,
     #[allow(dead_code)]
     pub execution_plan: SearchExecutionPlan,
     execution_strategy: SearchExecutionStrategy,
@@ -189,7 +192,7 @@ impl SearchCommand {
     async fn private_search_invocation(&self) -> Option<PrivateSearchInvocation> {
         let legacy_command = self.legacy_sql_command()?;
         let checkpoints = self.current_target_snapshots(legacy_command).await;
-        let size = if self.logical_plan.search_after.is_some() {
+        let size = if self.read_plan.search_after.is_some() {
             usize::MAX
         } else {
             self.execution_plan.merge.from as usize + self.execution_plan.merge.size
@@ -259,12 +262,12 @@ fn typed_node_merge_reason(result_order: SearchResultOrder) -> String {
 }
 
 fn legacy_sql_fanout_reason(command: &SearchCommand) -> String {
-    if command.logical_plan.search_after.is_some() {
+    if command.read_plan.search_after.is_some() {
         return "Queries using `search_after` currently require the typed sorted path.".to_string();
     }
 
     if let Some(reason) = command
-        .logical_plan
+        .search_plan
         .aggregations
         .iter()
         .find_map(aggregation_legacy_path_reason)
@@ -276,7 +279,7 @@ fn legacy_sql_fanout_reason(command: &SearchCommand) -> String {
         SearchBackend::LegacySql(backend) => backend,
     };
     if let Some(reason) = command
-        .logical_plan
+        .search_plan
         .sort
         .iter()
         .find_map(|plan| sort_legacy_path_reason(plan, backend))
@@ -289,7 +292,7 @@ fn legacy_sql_fanout_reason(command: &SearchCommand) -> String {
     }
 
     if matches!(
-        command.logical_plan.target,
+        &command.search_plan.target,
         search_plan::SearchTarget::Pit(_)
     ) {
         return "Point-in-time queries currently use the legacy SQL fanout path.".to_string();
@@ -529,7 +532,7 @@ fn build_typed_search_response(
 
     let hits = match apply_search_after(
         hits,
-        command.logical_plan.search_after.as_deref(),
+        command.read_plan.search_after.as_deref(),
         result_order,
         &command.typed_sort_specs,
     ) {
@@ -647,24 +650,33 @@ pub(crate) fn search_plan_to_command_with_options(
 ) -> Result<SearchCommand, ParseError> {
     let backend =
         compile_legacy_sql_command(&plan, query, doc_id_field_name, include_deletes_join)?;
-    let exact_constraints = compile_exact_constraint_groups(&plan)?;
-    let range_constraints = compile_range_constraints(&plan);
+    let read_plan = read_plan_from_search_plan(&plan);
+    let exact_constraints = compile_exact_constraint_groups(&read_plan)?;
+    let range_constraints = compile_range_constraints(&read_plan);
     let exact_sql = compile_exact_sql_query(&plan, query, doc_id_field_name, include_deletes_join)?;
-    let execution_plan = create_execution_plan(&plan, &backend, exact_sql.is_some());
+    let execution_plan =
+        create_execution_plan(&read_plan, &plan.target, &backend, exact_sql.is_some());
     let typed_aggregation_specs = private_search_aggregation_specs(&plan.aggregations);
     let typed_sort_specs = private_search_sort_specs(&plan.sort, &backend);
     let execution_strategy = choose_execution_strategy(
-        &plan,
+        &read_plan,
+        &plan.target,
         query,
         &backend,
         typed_aggregation_specs.as_ref(),
         typed_sort_specs.as_ref(),
     );
 
-    validate_search_after(&plan, query, typed_sort_specs.as_ref(), execution_strategy)?;
+    validate_search_after(
+        &read_plan,
+        query,
+        typed_sort_specs.as_ref(),
+        execution_strategy,
+    )?;
 
     Ok(SearchCommand {
-        logical_plan: plan,
+        search_plan: plan,
+        read_plan,
         execution_plan,
         execution_strategy,
         typed_aggregation_specs,
@@ -677,7 +689,7 @@ pub(crate) fn search_plan_to_command_with_options(
 }
 
 fn validate_search_after(
-    plan: &search_plan::SearchPlan,
+    plan: &ReadPlan,
     query: &QueryStringSearch,
     typed_sort_specs: Option<&Vec<PrivateSearchSortSpec>>,
     execution_strategy: SearchExecutionStrategy,
@@ -686,7 +698,7 @@ fn validate_search_after(
         return Ok(());
     };
 
-    if plan.from != 0 {
+    if plan.offset != 0 {
         return Err(ParseError {
             message: "`search_after` does not support `from`".to_string(),
         });
@@ -704,7 +716,7 @@ fn validate_search_after(
         });
     };
 
-    if typed_sort_specs.is_empty() || plan.sort.is_empty() {
+    if typed_sort_specs.is_empty() || plan.order_by.is_empty() {
         return Err(ParseError {
             message: "`search_after` requires an explicit sort".to_string(),
         });
@@ -729,23 +741,24 @@ fn validate_search_after(
 }
 
 fn choose_execution_strategy(
-    plan: &search_plan::SearchPlan,
+    plan: &ReadPlan,
+    target: &search_plan::SearchTarget,
     query: &QueryStringSearch,
     backend: &SqlCommand,
     typed_aggregation_specs: Option<&Vec<PrivateSearchAggregationSpec>>,
     typed_sort_specs: Option<&Vec<PrivateSearchSortSpec>>,
 ) -> SearchExecutionStrategy {
-    if (!plan.aggregations.is_empty() && typed_aggregation_specs.is_none())
-        || (!plan.sort.is_empty() && typed_sort_specs.is_none())
+    if (typed_aggregation_specs.is_none() && backend.aggs.is_some())
+        || (!plan.order_by.is_empty() && typed_sort_specs.is_none())
         || query.sort.is_some()
     {
         return SearchExecutionStrategy::LegacySqlFanout;
     }
 
-    match &plan.target {
+    match target {
         search_plan::SearchTarget::Pit(_) => SearchExecutionStrategy::LegacySqlFanout,
         search_plan::SearchTarget::Table(_) => {
-            if !plan.sort.is_empty() {
+            if !plan.order_by.is_empty() {
                 SearchExecutionStrategy::TypedNodeMerge(SearchResultOrder::ExplicitSort)
             } else if backend.calculate_score {
                 SearchExecutionStrategy::TypedNodeMerge(SearchResultOrder::ScoreDesc)
@@ -753,6 +766,116 @@ fn choose_execution_strategy(
                 SearchExecutionStrategy::TypedNodeMerge(SearchResultOrder::PeerConcat)
             }
         }
+    }
+}
+
+fn read_plan_from_search_plan(plan: &search_plan::SearchPlan) -> ReadPlan {
+    let mut filters = vec![];
+
+    if let Some(query_plan) = &plan.query {
+        if let Some(groups) = exact_constraint_groups_for_query(query_plan) {
+            for group in groups {
+                let exact_filter = if group.values.len() == 1 {
+                    ReadPredicate {
+                        field: group.field,
+                        eq: Some(group.values[0].clone()),
+                        in_values: None,
+                        gt: None,
+                        gte: None,
+                        lt: None,
+                        lte: None,
+                    }
+                } else {
+                    ReadPredicate {
+                        field: group.field,
+                        eq: None,
+                        in_values: Some(group.values),
+                        gt: None,
+                        gte: None,
+                        lt: None,
+                        lte: None,
+                    }
+                };
+                merge_read_predicate(&mut filters, exact_filter);
+            }
+        }
+
+        let mut range_constraints = vec![];
+        collect_mandatory_range_constraints(query_plan, &mut range_constraints);
+        for constraint in range_constraints {
+            merge_read_predicate(
+                &mut filters,
+                ReadPredicate {
+                    field: constraint.field,
+                    eq: None,
+                    in_values: None,
+                    gt: constraint.gt,
+                    gte: constraint.gte,
+                    lt: constraint.lt,
+                    lte: constraint.lte,
+                },
+            );
+        }
+    }
+
+    ReadPlan {
+        select: None,
+        filters,
+        aggregate: None,
+        order_by: plan
+            .sort
+            .iter()
+            .filter_map(read_sort_from_search_sort)
+            .collect(),
+        limit: plan.size.map(|size| size as usize),
+        offset: plan.from as usize,
+        search_after: plan.search_after.clone(),
+        allow_slow_path: false,
+        explain: false,
+    }
+}
+
+fn read_sort_from_search_sort(sort: &search_plan::SortPlan) -> Option<ReadSort> {
+    match sort {
+        search_plan::SortPlan::Bare(field) => Some(ReadSort {
+            field: field.clone(),
+            descending: field == "_score",
+        }),
+        search_plan::SortPlan::Field { field, order, .. } => Some(ReadSort {
+            field: field.clone(),
+            descending: order
+                .as_deref()
+                .map(|order| order.eq_ignore_ascii_case("desc"))
+                .unwrap_or(field == "_score"),
+        }),
+    }
+}
+
+fn merge_read_predicate(filters: &mut Vec<ReadPredicate>, incoming: ReadPredicate) {
+    if let Some(existing) = filters
+        .iter_mut()
+        .find(|predicate| predicate.field == incoming.field)
+    {
+        if incoming.eq.is_some() {
+            existing.eq = incoming.eq;
+        }
+        if incoming.in_values.is_some() {
+            existing.in_values = incoming.in_values;
+        }
+        if incoming.gt.is_some() {
+            existing.gt = incoming.gt;
+        }
+        if incoming.gte.is_some() {
+            existing.gte = incoming.gte;
+        }
+        if incoming.lt.is_some() {
+            existing.lt = incoming.lt;
+        }
+        if incoming.lte.is_some() {
+            existing.lte = incoming.lte;
+        }
+    } else {
+        filters.push(incoming);
     }
 }
 
@@ -1358,36 +1481,38 @@ struct ExactConstraintGroup {
 }
 
 fn compile_exact_constraint_groups(
-    plan: &search_plan::SearchPlan,
+    plan: &ReadPlan,
 ) -> Result<Vec<PrivateExactConstraintGroup>, ParseError> {
-    let Some(query_plan) = &plan.query else {
-        return Ok(vec![]);
-    };
-    let Some(groups) = exact_constraint_groups_for_query(query_plan) else {
-        return Ok(vec![]);
-    };
+    let mut groups = vec![];
 
-    groups
-        .into_iter()
-        .map(|group| {
-            let mut values = group
-                .values
-                .iter()
-                .map(exact_value_to_index_string)
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| ParseError {
-                    message:
-                        "Exact-match sidecar only supports string, numeric, and boolean values"
-                            .to_string(),
-                })?;
-            values.sort();
-            values.dedup();
-            Ok(PrivateExactConstraintGroup {
-                field: group.field,
-                values,
-            })
-        })
-        .collect()
+    for predicate in plan.filters.iter() {
+        let Some(raw_values) = predicate
+            .eq
+            .as_ref()
+            .map(|value| vec![value.clone()])
+            .or_else(|| predicate.in_values.clone())
+        else {
+            continue;
+        };
+
+        let mut values = raw_values
+            .iter()
+            .map(exact_value_to_index_string)
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| ParseError {
+                message: "Exact-match sidecar only supports string, numeric, and boolean values"
+                    .to_string(),
+            })?;
+        values.sort();
+        values.dedup();
+        groups.push(PrivateExactConstraintGroup {
+            field: predicate.field.clone(),
+            values,
+        });
+    }
+
+    groups.sort_by(|left, right| left.field.cmp(&right.field));
+    Ok(groups)
 }
 
 fn compile_exact_sql_query(
@@ -1603,14 +1728,26 @@ fn exact_value_to_index_string(value: &Value) -> Option<String> {
     }
 }
 
-fn compile_range_constraints(plan: &search_plan::SearchPlan) -> Vec<PrivateSearchRangeConstraint> {
-    let Some(query_plan) = &plan.query else {
-        return vec![];
-    };
-
-    let mut constraints = vec![];
-    collect_mandatory_range_constraints(query_plan, &mut constraints);
-    constraints
+fn compile_range_constraints(plan: &ReadPlan) -> Vec<PrivateSearchRangeConstraint> {
+    plan.filters
+        .iter()
+        .filter_map(|predicate| {
+            if predicate.gt.is_none()
+                && predicate.gte.is_none()
+                && predicate.lt.is_none()
+                && predicate.lte.is_none()
+            {
+                return None;
+            }
+            Some(PrivateSearchRangeConstraint {
+                field: predicate.field.clone(),
+                gt: predicate.gt.clone(),
+                gte: predicate.gte.clone(),
+                lt: predicate.lt.clone(),
+                lte: predicate.lte.clone(),
+            })
+        })
+        .collect()
 }
 
 fn collect_mandatory_range_constraints(
@@ -1686,7 +1823,8 @@ fn append_sort_projection_fields(builder: &mut SqlBuilder, sorts: &[search_plan:
 }
 
 fn create_execution_plan(
-    plan: &search_plan::SearchPlan,
+    plan: &ReadPlan,
+    target: &search_plan::SearchTarget,
     backend: &SqlCommand,
     exact_sql: bool,
 ) -> SearchExecutionPlan {
@@ -1705,12 +1843,15 @@ fn create_execution_plan(
     SearchExecutionPlan {
         shards: vec![SearchShardExecutionPlan {
             shard_id: "shard-000".to_string(),
-            route: SearchShardRoute::BroadcastCurrentSnapshot,
+            route: match target {
+                search_plan::SearchTarget::Table(_) => SearchShardRoute::BroadcastCurrentSnapshot,
+                search_plan::SearchTarget::Pit(_) => SearchShardRoute::BroadcastCurrentSnapshot,
+            },
             segments: vec![segment],
         }],
         merge: SearchMergePlan {
-            from: plan.from,
-            size: plan.size.unwrap_or(10) as usize,
+            from: plan.offset as u32,
+            size: plan.limit.unwrap_or(10),
             stages: vec![
                 SearchMergeStage::SegmentToShardTopK,
                 SearchMergeStage::ShardToCoordinatorTopK,

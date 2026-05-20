@@ -34,6 +34,7 @@ use crate::query_path::{
     column_is_all_null, compare_scalar_values, file_may_match_predicates, group_files_by_schema,
     row_group_may_match_predicates, QueryPredicate,
 };
+use crate::read_plan::ReadPlan;
 use crate::schema_massager::{PowdrrDataType, PowdrrSchema};
 use crate::search_runtime::batches_to_serde_value;
 use crate::serving_plan::{ServingPredicate, ServingQueryClassification, ServingRequestPlan};
@@ -792,10 +793,11 @@ pub async fn execute_serving_query(
 ) -> Result<ServingQueryResponse, ServingQueryError> {
     let context = load_serving_context(table_name).await?;
     validate_request(&request, &context.schema)?;
+    let read_plan = ReadPlan::from(&request);
     let bulk_cache = data_access::serving_bulk_cache_stats();
 
-    let plan = plan_request(&context, &request)?;
-    if request.explain {
+    let plan = plan_request(&context, &read_plan)?;
+    if read_plan.explain {
         return Ok(ServingQueryResponse {
             table: context.description.name,
             classification: plan.classification,
@@ -853,7 +855,7 @@ pub async fn execute_serving_query(
         });
     }
 
-    if plan.classification == ServingQueryClassification::SlowPath && !request.allow_slow_path {
+    if plan.classification == ServingQueryClassification::SlowPath && !read_plan.allow_slow_path {
         return Ok(ServingQueryResponse {
             table: context.description.name,
             classification: plan.classification,
@@ -891,12 +893,12 @@ pub async fn execute_serving_query(
         &context.file_stats,
         &context.extension_files,
         &context.sort_order,
-        &request,
+        &read_plan,
         &plan.sql,
         plan.limit,
     )
     .await?;
-    if request.order_by.is_empty() {
+    if read_plan.order_by.is_empty() {
         execution.rows.truncate(plan.limit);
     }
     let bulk_cache = data_access::serving_bulk_cache_stats();
@@ -1062,10 +1064,10 @@ async fn load_serving_context(
 
 fn plan_request(
     context: &ServingExecutionContext,
-    request: &ServingRequestPlan,
+    request: &ReadPlan,
 ) -> Result<ServingPlan, ServingQueryError> {
     let serving = context.description.serving.clone().unwrap_or_default();
-    let limit = request.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+    let limit = request.normalized_limit(DEFAULT_LIMIT, MAX_LIMIT);
     let sql = build_sql("{table}", request, limit, !context.delete_files.is_empty())?;
     let declared_sort_order_match = sort_order_matches_request(&context.sort_order, request);
     let matched_pattern = serving
@@ -1165,7 +1167,7 @@ async fn execute_plan(
     file_stats: &HashMap<String, IcebergFileStats>,
     extension_files: &HashMap<String, Vec<ExtensionFile>>,
     sort_order: &[IcebergSortField],
-    request: &ServingRequestPlan,
+    request: &ReadPlan,
     sql: &str,
     limit: usize,
 ) -> Result<ServingExecutionResult, ServingQueryError> {
@@ -1234,7 +1236,7 @@ async fn execute_parallel_plan(
     files: &[FileDescriptor],
     speedboat_files: &[FileDescriptor],
     delete_files: &[String],
-    request: &ServingRequestPlan,
+    request: &ReadPlan,
     sql: &str,
     limit: usize,
 ) -> Result<Vec<Value>, ServingQueryError> {
@@ -1266,7 +1268,7 @@ async fn execute_aggregate_plan(
     files: &[FileDescriptor],
     speedboat_files: &[FileDescriptor],
     delete_files: &[String],
-    request: &ServingRequestPlan,
+    request: &ReadPlan,
     limit: usize,
 ) -> Result<Vec<Value>, ServingQueryError> {
     let aggregate = request.aggregate.as_ref().ok_or_else(|| {
@@ -1308,7 +1310,7 @@ async fn execute_aggregate_plan(
 async fn execute_ordered_top_k_plan(
     file_groups: Vec<OrderedFileGroup>,
     delete_files: &[String],
-    request: &ServingRequestPlan,
+    request: &ReadPlan,
     sql: &str,
     limit: usize,
 ) -> Result<Vec<Value>, ServingQueryError> {
@@ -1574,12 +1576,7 @@ fn json_number_value(value: f64) -> Value {
     }
 }
 
-fn merge_rows(
-    rows: &mut Vec<Value>,
-    new_rows: Vec<Value>,
-    request: &ServingRequestPlan,
-    limit: usize,
-) {
+fn merge_rows(rows: &mut Vec<Value>, new_rows: Vec<Value>, request: &ReadPlan, limit: usize) {
     rows.extend(new_rows);
 
     if let Some(sort) = request.order_by.first() {
@@ -1611,7 +1608,7 @@ fn ordered_file_groups_for_top_k(
     files: &[FileDescriptor],
     file_stats: &HashMap<String, IcebergFileStats>,
     sort_order: &[IcebergSortField],
-    request: &ServingRequestPlan,
+    request: &ReadPlan,
     sort_field: &str,
     descending: bool,
 ) -> Option<Vec<OrderedFileGroup>> {
@@ -1682,7 +1679,8 @@ pub(crate) fn build_serving_warmup_plan(
         let Some((request, limit)) = warmup_request_for_pattern(pattern) else {
             continue;
         };
-        if !request_matches_pattern(&request, pattern, limit) {
+        let read_request = ReadPlan::from(&request);
+        if !request_matches_pattern(&read_request, pattern, limit) {
             continue;
         }
         let Some(step) =
@@ -1757,7 +1755,8 @@ pub(crate) fn build_serving_cache_manager_plan(
                 let Some((warm_request, limit)) = warmup_request_for_pattern(pattern) else {
                     continue;
                 };
-                if !request_matches_pattern(&warm_request, pattern, limit) {
+                let read_request = ReadPlan::from(&warm_request);
+                if !request_matches_pattern(&read_request, pattern, limit) {
                     continue;
                 }
                 let Some(step) = build_warmup_step_for_request(
@@ -1769,12 +1768,13 @@ pub(crate) fn build_serving_cache_manager_plan(
                 ) else {
                     continue;
                 };
+                let step_request = ReadPlan::from(&step.request);
                 push_unique_string(&mut plan.matched_patterns, pattern.name.clone());
                 for artifact in applicable_artifacts_for_request(
-                    &step.request,
+                    &step_request,
                     &serving.patterns,
                     access_artifacts,
-                    sort_order_matches_request(sort_order, &step.request),
+                    sort_order_matches_request(sort_order, &step_request),
                 ) {
                     push_unique_string(&mut plan.matched_artifacts, artifact);
                 }
@@ -1807,11 +1807,12 @@ pub(crate) fn build_serving_cache_manager_plan(
                     sort_order,
                 ) {
                     plan.targeted_ranges += 1;
+                    let step_request = ReadPlan::from(&step.request);
                     for artifact in applicable_artifacts_for_request(
-                        &step.request,
+                        &step_request,
                         &serving.patterns,
                         access_artifacts,
-                        sort_order_matches_request(sort_order, &step.request),
+                        sort_order_matches_request(sort_order, &step_request),
                     ) {
                         push_unique_string(&mut plan.matched_artifacts, artifact);
                     }
@@ -1888,17 +1889,18 @@ fn build_warmup_step_for_request(
     file_stats: &HashMap<String, IcebergFileStats>,
     sort_order: &[IcebergSortField],
 ) -> Option<ServingWarmupStep> {
-    let pruned = prune_candidate_files(files, file_stats, &request);
+    let read_request = ReadPlan::from(&request);
+    let pruned = prune_candidate_files(files, file_stats, &read_request);
     if pruned.selected_files.is_empty() {
         return None;
     }
 
-    let (selected_files, estimated_bytes) = if let Some(sort) = request.order_by.first() {
+    let (selected_files, estimated_bytes) = if let Some(sort) = read_request.order_by.first() {
         let ordered_groups = ordered_file_groups_for_top_k(
             &pruned.selected_files,
             file_stats,
             sort_order,
-            &request,
+            &read_request,
             &sort.field,
             sort.descending,
         )?;
@@ -1943,8 +1945,9 @@ async fn execute_serving_warmup_step(
     step: &ServingWarmupStep,
     delete_files: &[String],
 ) -> Result<(), ServingQueryError> {
-    let limit = step.request.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-    let sql = build_sql("{table}", &step.request, limit, !delete_files.is_empty())?;
+    let request = ReadPlan::from(&step.request);
+    let limit = request.normalized_limit(DEFAULT_LIMIT, MAX_LIMIT);
+    let sql = build_sql("{table}", &request, limit, !delete_files.is_empty())?;
     let file_groups = group_files_by_schema(&step.selected_files);
     let concurrency = file_groups.len().clamp(1, serving_file_parallelism());
     let delete_files = delete_files.to_vec();
@@ -1966,7 +1969,7 @@ fn file_group_sort_bound(
     files: &[FileDescriptor],
     file_stats: &HashMap<String, IcebergFileStats>,
     sort_order: &[IcebergSortField],
-    request: &ServingRequestPlan,
+    request: &ReadPlan,
     sort_field: &str,
     descending: bool,
 ) -> Option<Value> {
@@ -1992,7 +1995,7 @@ fn file_sort_bound(
     file: &FileDescriptor,
     file_stats: &HashMap<String, IcebergFileStats>,
     sort_order: &[IcebergSortField],
-    request: &ServingRequestPlan,
+    request: &ReadPlan,
     sort_field: &str,
     descending: bool,
 ) -> Option<Value> {
@@ -2569,7 +2572,7 @@ fn aggregate_specs_match(
     }
 }
 
-fn request_supported(request: &ServingRequestPlan) -> bool {
+fn request_supported(request: &ReadPlan) -> bool {
     if request.aggregate.is_some() {
         request.order_by.is_empty()
     } else {
@@ -2577,10 +2580,7 @@ fn request_supported(request: &ServingRequestPlan) -> bool {
     }
 }
 
-fn sort_order_matches_request(
-    sort_order: &[IcebergSortField],
-    request: &ServingRequestPlan,
-) -> bool {
+fn sort_order_matches_request(sort_order: &[IcebergSortField], request: &ReadPlan) -> bool {
     let Some(request_sort) = request.order_by.first() else {
         return false;
     };
@@ -2592,11 +2592,7 @@ fn sort_order_matches_request(
         && sort_field.descending == request_sort.descending
 }
 
-fn request_matches_pattern(
-    request: &ServingRequestPlan,
-    pattern: &ServingPattern,
-    limit: usize,
-) -> bool {
+fn request_matches_pattern(request: &ReadPlan, pattern: &ServingPattern, limit: usize) -> bool {
     if pattern
         .max_limit
         .map(|max_limit| limit > max_limit as usize)
@@ -2726,7 +2722,7 @@ fn push_unique_string(values: &mut Vec<String>, value: String) {
 }
 
 fn applicable_artifacts_for_request(
-    request: &ServingRequestPlan,
+    request: &ReadPlan,
     patterns: &[ServingPattern],
     artifacts: &[IcebergAccessArtifact],
     declared_sort_order_match: bool,
@@ -2795,7 +2791,7 @@ fn applicable_artifacts_for_request(
 
 fn classify_request_with_admission(
     context: &ServingExecutionContext,
-    request: &ServingRequestPlan,
+    request: &ReadPlan,
     matched_pattern: Option<&str>,
     declared_sort_order_match: bool,
     artifacts_considered: &[String],
@@ -2885,7 +2881,7 @@ fn classify_request_with_admission(
 fn format_admission_reason(
     prefix: &str,
     context: &ServingExecutionContext,
-    request: &ServingRequestPlan,
+    request: &ReadPlan,
     declared_sort_order_match: bool,
     artifacts_considered: &[String],
     artifacts_used: &[String],
@@ -2915,7 +2911,7 @@ fn format_admission_reason(
 
 fn suggested_actions_for_request(
     context: &ServingExecutionContext,
-    request: &ServingRequestPlan,
+    request: &ReadPlan,
     declared_sort_order_match: bool,
     artifacts_considered: &[String],
     _artifacts_used: &[String],
@@ -3192,7 +3188,7 @@ fn secondary_pattern_artifact_name(pattern_name: &str) -> String {
     )
 }
 
-fn request_uses_exact_filters(request: &ServingRequestPlan) -> bool {
+fn request_uses_exact_filters(request: &ReadPlan) -> bool {
     request
         .filters
         .iter()
@@ -3208,7 +3204,7 @@ fn exact_pruning_extension_file(extension_files: &[ExtensionFile]) -> Option<&Ex
 async fn prune_execution_files_with_exact_artifact(
     files: &[FileDescriptor],
     extension_files: &HashMap<String, Vec<ExtensionFile>>,
-    request: &ServingRequestPlan,
+    request: &ReadPlan,
 ) -> Result<(Vec<FileDescriptor>, Vec<String>), ServingQueryError> {
     if files.is_empty() || !request_uses_exact_filters(request) {
         return Ok((files.to_vec(), vec![]));
@@ -3323,7 +3319,7 @@ fn exact_pruning_summary_from_rows(rows: Vec<Value>) -> ExactPruningSummary {
 
 fn exact_pruning_summary_may_match_request(
     summary: &ExactPruningSummary,
-    request: &ServingRequestPlan,
+    request: &ReadPlan,
 ) -> bool {
     for predicate in request.filters.iter() {
         let Some(field_summary) = summary.get(&predicate.field) else {
@@ -3366,7 +3362,7 @@ fn render_exact_pruning_value(value: &Value) -> Option<String> {
 fn prune_candidate_files(
     files: &[FileDescriptor],
     file_stats: &HashMap<String, IcebergFileStats>,
-    request: &ServingRequestPlan,
+    request: &ReadPlan,
 ) -> PrunedFileSelection {
     let mut pruned = PrunedFileSelection::default();
 
@@ -3434,7 +3430,7 @@ fn record_metadata_cache_coverage(pruned: &mut PrunedFileSelection, file_path: &
 fn record_file_stats_artifact_usage(
     pruned: &mut PrunedFileSelection,
     file_stats: &IcebergFileStats,
-    request: &ServingRequestPlan,
+    request: &ReadPlan,
 ) {
     if request.filters.is_empty() {
         return;
@@ -3452,7 +3448,7 @@ fn record_file_stats_artifact_usage(
 fn record_page_pruning_coverage(
     pruned: &mut PrunedFileSelection,
     matching_row_groups: &[&IcebergRowGroupStats],
-    request: &ServingRequestPlan,
+    request: &ReadPlan,
 ) {
     if request.filters.is_empty() {
         return;
@@ -3476,7 +3472,7 @@ fn record_page_pruning_coverage(
 
 fn partition_values_may_match_request(
     file_stats: &IcebergFileStats,
-    request: &ServingRequestPlan,
+    request: &ReadPlan,
     pruned: &mut PrunedFileSelection,
 ) -> bool {
     for predicate in request.filters.iter() {
@@ -3496,7 +3492,7 @@ fn partition_values_may_match_request(
 
 fn partition_predicate_may_match_file(
     file_stats: &IcebergFileStats,
-    predicate: &ServingPredicate,
+    predicate: &crate::read_plan::ReadPredicate,
 ) -> Option<(bool, String)> {
     let partition_value = file_stats.partition_values.iter().find(|partition_value| {
         partition_value.source_field_name == predicate.field
@@ -3521,7 +3517,7 @@ fn partition_predicate_may_match_file(
     ))
 }
 
-fn partition_range_may_match(value: &Value, predicate: &ServingPredicate) -> bool {
+fn partition_range_may_match(value: &Value, predicate: &crate::read_plan::ReadPredicate) -> bool {
     if let Some(candidate) = predicate.gt.as_ref() {
         if matches!(
             compare_scalar_values(value, candidate),
@@ -3557,36 +3553,21 @@ fn partition_range_may_match(value: &Value, predicate: &ServingPredicate) -> boo
     true
 }
 
-fn file_may_match_request(file_stats: &IcebergFileStats, request: &ServingRequestPlan) -> bool {
+fn file_may_match_request(file_stats: &IcebergFileStats, request: &ReadPlan) -> bool {
     file_may_match_predicates(file_stats, &serving_request_predicates(request))
 }
 
-fn row_group_may_match_request(
-    row_group_stats: &IcebergRowGroupStats,
-    request: &ServingRequestPlan,
-) -> bool {
+fn row_group_may_match_request(row_group_stats: &IcebergRowGroupStats, request: &ReadPlan) -> bool {
     row_group_may_match_predicates(row_group_stats, &serving_request_predicates(request))
 }
 
-fn serving_request_predicates(request: &ServingRequestPlan) -> Vec<QueryPredicate> {
-    request
-        .filters
-        .iter()
-        .map(|predicate| QueryPredicate {
-            field: predicate.field.clone(),
-            eq: predicate.eq.clone(),
-            in_values: predicate.in_values.clone(),
-            gt: predicate.gt.clone(),
-            gte: predicate.gte.clone(),
-            lt: predicate.lt.clone(),
-            lte: predicate.lte.clone(),
-        })
-        .collect()
+fn serving_request_predicates(request: &ReadPlan) -> Vec<QueryPredicate> {
+    request.filters.iter().map(QueryPredicate::from).collect()
 }
 
 fn build_sql(
     table_name: &str,
-    request: &ServingRequestPlan,
+    request: &ReadPlan,
     limit: usize,
     include_delete_filter: bool,
 ) -> Result<String, ServingQueryError> {
@@ -3635,7 +3616,7 @@ fn build_sql(
 
 fn build_aggregate_sql(
     table_name: &str,
-    request: &ServingRequestPlan,
+    request: &ReadPlan,
     limit: usize,
     include_delete_filter: bool,
     partial: bool,
@@ -3784,7 +3765,7 @@ fn aggregate_measure_plans(
         .collect()
 }
 
-fn sql_for_filter(filter: &ServingPredicate) -> Result<String, ServingQueryError> {
+fn sql_for_filter(filter: &crate::read_plan::ReadPredicate) -> Result<String, ServingQueryError> {
     let field = format!("\"{}\"", escape_identifier(&filter.field));
     if let Some(value) = filter.eq.as_ref() {
         return Ok(format!("{} = {}", field, sql_literal(value)?));
@@ -3937,6 +3918,7 @@ mod tests {
         ServingPattern, ServingTableConfig, TableDescription,
     };
     use crate::peers::CheckpointDescriptor;
+    use crate::read_plan::ReadPlan;
     use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
     use crate::serving_plan::{
         ServingPredicate, ServingQueryClassification, ServingRequestPlan, ServingSort,
@@ -4112,32 +4094,27 @@ mod tests {
 
     #[test]
     fn test_build_sql_for_range_top_n() {
-        let sql = build_sql(
-            "{table}",
-            &ServingRequestPlan {
-                select: Some(vec!["title".to_string()]),
-                filters: vec![ServingPredicate {
-                    field: "snippet".to_string(),
-                    eq: Some(json!("hello")),
-                    in_values: None,
-                    gt: None,
-                    gte: None,
-                    lt: None,
-                    lte: None,
-                }],
-                aggregate: None,
-                order_by: vec![ServingSort {
-                    field: "title".to_string(),
-                    descending: false,
-                }],
-                limit: Some(5),
-                allow_slow_path: false,
-                explain: false,
-            },
-            5,
-            false,
-        )
-        .unwrap();
+        let request = ServingRequestPlan {
+            select: Some(vec!["title".to_string()]),
+            filters: vec![ServingPredicate {
+                field: "snippet".to_string(),
+                eq: Some(json!("hello")),
+                in_values: None,
+                gt: None,
+                gte: None,
+                lt: None,
+                lte: None,
+            }],
+            aggregate: None,
+            order_by: vec![ServingSort {
+                field: "title".to_string(),
+                descending: false,
+            }],
+            limit: Some(5),
+            allow_slow_path: false,
+            explain: false,
+        };
+        let sql = build_sql("{table}", &ReadPlan::from(&request), 5, false).unwrap();
 
         assert_eq!(
             sql,
@@ -4170,7 +4147,11 @@ mod tests {
             aggregate: None,
         };
 
-        assert!(request_matches_pattern(&request, &pattern, 3));
+        assert!(request_matches_pattern(
+            &ReadPlan::from(&request),
+            &pattern,
+            3
+        ));
     }
 
     #[test]
@@ -4203,34 +4184,33 @@ mod tests {
             aggregate: Some(aggregate_spec()),
         };
 
-        assert!(request_matches_pattern(&request, &pattern, 10));
+        assert!(request_matches_pattern(
+            &ReadPlan::from(&request),
+            &pattern,
+            10
+        ));
     }
 
     #[test]
     fn test_build_sql_for_grouped_aggregate() {
-        let sql = build_sql(
-            "{table}",
-            &ServingRequestPlan {
-                select: None,
-                filters: vec![ServingPredicate {
-                    field: "tenant".to_string(),
-                    eq: Some(json!("acme")),
-                    in_values: None,
-                    gt: None,
-                    gte: None,
-                    lt: None,
-                    lte: None,
-                }],
-                aggregate: Some(aggregate_spec()),
-                order_by: vec![],
-                limit: Some(10),
-                allow_slow_path: false,
-                explain: false,
-            },
-            10,
-            false,
-        )
-        .unwrap();
+        let request = ServingRequestPlan {
+            select: None,
+            filters: vec![ServingPredicate {
+                field: "tenant".to_string(),
+                eq: Some(json!("acme")),
+                in_values: None,
+                gt: None,
+                gte: None,
+                lt: None,
+                lte: None,
+            }],
+            aggregate: Some(aggregate_spec()),
+            order_by: vec![],
+            limit: Some(10),
+            allow_slow_path: false,
+            explain: false,
+        };
+        let sql = build_sql("{table}", &ReadPlan::from(&request), 10, false).unwrap();
 
         assert_eq!(
             sql,
@@ -4294,7 +4274,8 @@ mod tests {
             explain: false,
         };
 
-        let plan = plan_request(&context, &request).unwrap();
+        let read_request = ReadPlan::from(&request);
+        let plan = plan_request(&context, &read_request).unwrap();
 
         assert_eq!(plan.classification, ServingQueryClassification::FastPath);
         assert_eq!(plan.files_considered, 2);
@@ -4401,7 +4382,8 @@ mod tests {
             explain: false,
         };
 
-        let plan = plan_request(&context, &request).unwrap();
+        let read_request = ReadPlan::from(&request);
+        let plan = plan_request(&context, &read_request).unwrap();
 
         assert_eq!(plan.classification, ServingQueryClassification::FastPath);
         assert_eq!(plan.files_selected, 1);
@@ -4490,7 +4472,8 @@ mod tests {
             explain: false,
         };
 
-        let plan = plan_request(&context, &request).unwrap();
+        let read_request = ReadPlan::from(&request);
+        let plan = plan_request(&context, &read_request).unwrap();
 
         assert_eq!(plan.metadata_files_cached, 1);
         assert_eq!(plan.metadata_row_groups_cached, 1);
@@ -4571,7 +4554,8 @@ mod tests {
             explain: false,
         };
 
-        let plan = plan_request(&context, &request).unwrap();
+        let read_request = ReadPlan::from(&request);
+        let plan = plan_request(&context, &read_request).unwrap();
 
         assert_eq!(plan.row_groups_selected, 1);
         assert_eq!(plan.page_index_row_groups_selected, 1);
@@ -4637,7 +4621,8 @@ mod tests {
             explain: false,
         };
 
-        let plan = plan_request(&context, &request).unwrap();
+        let read_request = ReadPlan::from(&request);
+        let plan = plan_request(&context, &read_request).unwrap();
 
         assert_eq!(plan.classification, ServingQueryClassification::Rejected);
         assert!(plan
@@ -4670,7 +4655,8 @@ mod tests {
             explain: false,
         };
 
-        let plan = plan_request(&context, &request).unwrap();
+        let read_request = ReadPlan::from(&request);
+        let plan = plan_request(&context, &read_request).unwrap();
 
         assert_eq!(plan.classification, ServingQueryClassification::Rejected);
         assert!(plan
@@ -4851,7 +4837,8 @@ mod tests {
             explain: false,
         };
 
-        let plan = plan_request(&context, &request).unwrap();
+        let read_request = ReadPlan::from(&request);
+        let plan = plan_request(&context, &read_request).unwrap();
 
         assert_eq!(plan.classification, ServingQueryClassification::SlowPath);
         assert!(plan
@@ -4887,7 +4874,10 @@ mod tests {
             explain: false,
         };
 
-        assert!(!exact_pruning_summary_may_match_request(&summary, &request));
+        assert!(!exact_pruning_summary_may_match_request(
+            &summary,
+            &ReadPlan::from(&request)
+        ));
     }
 
     #[test]
@@ -4957,7 +4947,7 @@ mod tests {
             explain: false,
         };
 
-        let selected_files = prune_candidate_files(&files, &file_stats, &request);
+        let selected_files = prune_candidate_files(&files, &file_stats, &ReadPlan::from(&request));
 
         assert_eq!(
             selected_files
@@ -5125,9 +5115,15 @@ mod tests {
             explain: false,
         };
 
-        let ordered_groups =
-            ordered_file_groups_for_top_k(&files, &file_stats, &[], &request, "score", true)
-                .expect("score bounds should enable ordered top-k");
+        let ordered_groups = ordered_file_groups_for_top_k(
+            &files,
+            &file_stats,
+            &[],
+            &ReadPlan::from(&request),
+            "score",
+            true,
+        )
+        .expect("score bounds should enable ordered top-k");
 
         assert_eq!(
             ordered_groups[0]
@@ -5186,8 +5182,15 @@ mod tests {
         };
 
         assert!(
-            ordered_file_groups_for_top_k(&files, &file_stats, &[], &request, "score", true)
-                .is_none(),
+            ordered_file_groups_for_top_k(
+                &files,
+                &file_stats,
+                &[],
+                &ReadPlan::from(&request),
+                "score",
+                true,
+            )
+            .is_none(),
             "missing score bounds should fall back to the existing parallel path"
         );
     }
