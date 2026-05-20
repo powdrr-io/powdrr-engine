@@ -1,6 +1,5 @@
 use crate::data_contract::{
-    CleanupCommit, CleanupWorkItem, CompactionWorkItemTracker, CreateIndexTemplateBody,
-    IcebergMetadata, OrgInfo, OrgSettings,
+    CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody, IcebergMetadata, OrgInfo, OrgSettings,
 };
 use crate::data_contract::{
     CompactionCommit, CompactionWorkItem, CreateTable, DeletesMetadata, ExtensionCommit,
@@ -11,8 +10,9 @@ use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::metadata_store::{
     CheckpointCutoverRequest, CheckpointCutoverState, CheckpointUpdateRequest,
     ClaimedCleanupWorkItem, ClaimedCompactionWorkItem, ClaimedExtensionWorkItem, CutoverEpoch,
-    MetadataClaimKind, MetadataStore, PublishedCheckpointRecord, PublishedCheckpointRole,
-    PublishedCheckpointSelector, ServingNodeActivationAck, ServingNodeLease,
+    CutoverMembershipView, MetadataClaimKind, MetadataStore, PublishedCheckpointRecord,
+    PublishedCheckpointRole, PublishedCheckpointSelector, ServingNodeActivationAck,
+    ServingNodeLease,
 };
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
@@ -25,14 +25,41 @@ use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const LEASE_LENGTH_MS: i64 = 60 * 1000;
+#[cfg(not(test))]
+const WORK_CLAIM_LEASE_LENGTH_MS: i64 = 60 * 1000;
+#[cfg(test)]
+const WORK_CLAIM_LEASE_LENGTH_MS: i64 = 50;
 
 type CommittedCheckpoints = HashMap<String, String>;
 type SerializedCommittedCheckpoints = HashMap<String, CommittedCheckpoints>;
 type PublishedCheckpoints = HashMap<String, String>;
 type CheckpointPublicationRequests = HashMap<String, CheckpointUpdateRequest>;
 type CheckpointCutoverEpochs = HashMap<String, CutoverEpoch>;
+type CutoverMembershipViews = HashMap<String, CutoverMembershipView>;
 type ServingNodeLeases = HashMap<String, ServingNodeLease>;
 type ServingNodeActivations = HashMap<String, HashMap<String, ServingNodeActivationAck>>;
+type ExtensionWorkItems = HashMap<String, HashMap<String, ExtensionWorkItemTracker>>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExtensionWorkItemTracker {
+    work_item: ExtensionWorkItem,
+    #[serde(default)]
+    lease_expires_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactionWorkItemTracker {
+    work_item: CompactionWorkItem,
+    #[serde(default)]
+    lease_expires_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CleanupWorkItemTracker {
+    work_item: CleanupWorkItem,
+    #[serde(default)]
+    lease_expires_at_ms: Option<i64>,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EphemeralServiceSnapshot {
@@ -45,12 +72,13 @@ pub struct EphemeralServiceSnapshot {
     published_checkpoint_id: PublishedCheckpoints,
     checkpoint_publication_requests: CheckpointPublicationRequests,
     checkpoint_cutover_epochs: CheckpointCutoverEpochs,
+    cutover_membership_views: CutoverMembershipViews,
     serving_node_leases: ServingNodeLeases,
     serving_node_activations: ServingNodeActivations,
     compaction_work_items: HashMap<String, CompactionWorkItemTracker>,
     not_compacted_checkpoint_ids: HashMap<String, Vec<String>>,
-    extension_work_items: HashMap<String, HashMap<String, ExtensionWorkItem>>,
-    cleanup_work_items: Vec<CleanupWorkItem>,
+    extension_work_items: ExtensionWorkItems,
+    cleanup_work_items: Vec<CleanupWorkItemTracker>,
     compactions: HashMap<String, (String, CompactionCommit)>,
     checkpoints: HashMap<String, TableMetadataCheckpoint>,
     checkpoints_needing_extension_work: HashMap<String, Vec<String>>,
@@ -71,12 +99,13 @@ pub struct EphemeralServiceImpl {
     published_checkpoint_id: PublishedCheckpoints,
     checkpoint_publication_requests: CheckpointPublicationRequests,
     checkpoint_cutover_epochs: CheckpointCutoverEpochs,
+    cutover_membership_views: CutoverMembershipViews,
     serving_node_leases: ServingNodeLeases,
     serving_node_activations: ServingNodeActivations,
     compaction_work_items: HashMap<String, CompactionWorkItemTracker>,
     not_compacted_checkpoint_ids: HashMap<String, Vec<String>>,
-    extension_work_items: HashMap<String, HashMap<String, ExtensionWorkItem>>,
-    cleanup_work_items: Vec<CleanupWorkItem>,
+    extension_work_items: ExtensionWorkItems,
+    cleanup_work_items: Vec<CleanupWorkItemTracker>,
     compactions: HashMap<String, (String, CompactionCommit)>,
     checkpoints: HashMap<String, TableMetadataCheckpoint>,
     checkpoints_needing_extension_work: HashMap<String, Vec<String>>,
@@ -104,6 +133,7 @@ impl EphemeralServiceImpl {
             published_checkpoint_id: snapshot.published_checkpoint_id,
             checkpoint_publication_requests: snapshot.checkpoint_publication_requests,
             checkpoint_cutover_epochs: snapshot.checkpoint_cutover_epochs,
+            cutover_membership_views: snapshot.cutover_membership_views,
             serving_node_leases: snapshot.serving_node_leases,
             serving_node_activations: snapshot.serving_node_activations,
             compaction_work_items: snapshot.compaction_work_items,
@@ -134,6 +164,7 @@ impl EphemeralServiceImpl {
             published_checkpoint_id: self.published_checkpoint_id.clone(),
             checkpoint_publication_requests: self.checkpoint_publication_requests.clone(),
             checkpoint_cutover_epochs: self.checkpoint_cutover_epochs.clone(),
+            cutover_membership_views: self.cutover_membership_views.clone(),
             serving_node_leases: self.serving_node_leases.clone(),
             serving_node_activations: self.serving_node_activations.clone(),
             compaction_work_items: self.compaction_work_items.clone(),
@@ -200,15 +231,14 @@ impl EphemeralServiceImpl {
             .unwrap_or_default()
     }
 
-    fn current_cutover_epoch(
-        &self,
-        table_name: &String,
-        extension: &Option<String>,
-    ) -> CutoverEpoch {
-        self.checkpoint_cutover_epochs
-            .get(&Self::selector_group_key(table_name, extension))
-            .copied()
-            .unwrap_or_default()
+    fn claim_lease_expires_at_ms() -> i64 {
+        Self::current_timestamp_ms() + WORK_CLAIM_LEASE_LENGTH_MS
+    }
+
+    fn lease_is_available(lease_expires_at_ms: Option<i64>) -> bool {
+        lease_expires_at_ms
+            .map(|expires_at_ms| expires_at_ms <= Self::current_timestamp_ms())
+            .unwrap_or(true)
     }
 
     fn bump_cutover_epoch(
@@ -234,6 +264,37 @@ impl EphemeralServiceImpl {
             .remove(&Self::selector_group_key(table_name, extension));
     }
 
+    fn get_cutover_membership_view(
+        &self,
+        table_name: &String,
+        extension: &Option<String>,
+    ) -> Option<&CutoverMembershipView> {
+        self.cutover_membership_views
+            .get(&Self::selector_group_key(table_name, extension))
+    }
+
+    fn store_cutover_membership_view(
+        &mut self,
+        table_name: &String,
+        extension: &Option<String>,
+        epoch: CutoverEpoch,
+        target_checkpoint_id: &String,
+        required_node_ids: Vec<String>,
+    ) {
+        self.cutover_membership_views.insert(
+            Self::selector_group_key(table_name, extension),
+            CutoverMembershipView {
+                selector: PublishedCheckpointSelector::target(
+                    table_name.clone(),
+                    extension.clone(),
+                ),
+                epoch,
+                target_checkpoint_id: target_checkpoint_id.clone(),
+                required_node_ids,
+            },
+        );
+    }
+
     fn prune_expired_serving_node_leases(&mut self) {
         let earliest_live_ms = Self::current_timestamp_ms() - LEASE_LENGTH_MS;
         self.serving_node_leases
@@ -243,6 +304,108 @@ impl EphemeralServiceImpl {
     fn live_serving_node_ids(&mut self) -> HashSet<String> {
         self.prune_expired_serving_node_leases();
         self.serving_node_leases.keys().cloned().collect()
+    }
+
+    fn maybe_reconfigure_cutover_membership_for_target(
+        &mut self,
+        table_name: &String,
+        extension: &Option<String>,
+        target_checkpoint_id: &String,
+    ) {
+        let Some(existing_view) = self
+            .get_cutover_membership_view(table_name, extension)
+            .cloned()
+        else {
+            return;
+        };
+        if existing_view.target_checkpoint_id != *target_checkpoint_id {
+            return;
+        }
+
+        let live_node_ids = self.live_serving_node_ids();
+        if live_node_ids.is_empty() {
+            return;
+        }
+        if existing_view
+            .required_node_ids
+            .iter()
+            .all(|node_id| live_node_ids.contains(node_id))
+        {
+            return;
+        }
+
+        let mut required_node_ids: Vec<String> = live_node_ids.into_iter().collect();
+        required_node_ids.sort();
+        let epoch = self.bump_cutover_epoch(table_name, extension);
+        self.store_cutover_membership_view(
+            table_name,
+            extension,
+            epoch,
+            target_checkpoint_id,
+            required_node_ids,
+        );
+        self.clear_serving_node_activations(table_name, extension);
+    }
+
+    fn capture_cutover_membership_for_target(
+        &mut self,
+        table_name: &String,
+        extension: &Option<String>,
+        target_checkpoint_id: &String,
+    ) {
+        if self
+            .get_cutover_membership_view(table_name, extension)
+            .map(|view| view.target_checkpoint_id == *target_checkpoint_id)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        let mut required_node_ids: Vec<String> = self.live_serving_node_ids().into_iter().collect();
+        required_node_ids.sort();
+        let epoch = self.bump_cutover_epoch(table_name, extension);
+        self.store_cutover_membership_view(
+            table_name,
+            extension,
+            epoch,
+            target_checkpoint_id,
+            required_node_ids,
+        );
+        self.clear_serving_node_activations(table_name, extension);
+    }
+
+    fn backfill_cutover_membership_for_target(
+        &mut self,
+        table_name: &String,
+        extension: &Option<String>,
+        target_checkpoint_id: &String,
+    ) {
+        let Some(existing_view) = self
+            .get_cutover_membership_view(table_name, extension)
+            .cloned()
+        else {
+            return;
+        };
+
+        if existing_view.target_checkpoint_id != *target_checkpoint_id
+            || !existing_view.required_node_ids.is_empty()
+        {
+            return;
+        }
+
+        let mut required_node_ids: Vec<String> = self.live_serving_node_ids().into_iter().collect();
+        required_node_ids.sort();
+        if required_node_ids.is_empty() {
+            return;
+        }
+
+        self.store_cutover_membership_view(
+            table_name,
+            extension,
+            existing_view.epoch,
+            target_checkpoint_id,
+            required_node_ids,
+        );
     }
 
     fn get_published_checkpoint_sync(
@@ -294,13 +457,62 @@ impl EphemeralServiceImpl {
         self.extension_work_items
             .get("es")
             .and_then(|items| items.get(table_name))
-            .map(|item| item.has_work())
+            .map(|item| item.work_item.has_work())
             .unwrap_or(false)
             || self
                 .checkpoints_needing_extension_work
                 .contains_key(&format!("{}_{}", table_name, "es"))
             || self.published_checkpoint_needs_activation(table_name, &None)
             || self.published_checkpoint_needs_activation(table_name, &Some("es".to_string()))
+    }
+
+    fn checkpoint_references_any_cleanup_file(
+        checkpoint: &TableMetadataCheckpoint,
+        files_to_delete: &HashSet<String>,
+    ) -> bool {
+        checkpoint
+            .speedboat_metadata
+            .as_ref()
+            .map(|metadata| {
+                metadata
+                    .files
+                    .file_paths
+                    .iter()
+                    .any(|file_path| files_to_delete.contains(file_path))
+            })
+            .unwrap_or(false)
+            || checkpoint
+                .deletes_metadata
+                .as_ref()
+                .map(|metadata| {
+                    metadata
+                        .files
+                        .iter()
+                        .any(|file_path| files_to_delete.contains(file_path))
+                })
+                .unwrap_or(false)
+    }
+
+    fn cleanup_work_item_is_ready(&self, work_item: &CleanupWorkItem) -> bool {
+        let files_to_delete: HashSet<String> = work_item.files_to_delete.iter().cloned().collect();
+        for extension in [None, Some("es".to_string())] {
+            let Some(checkpoint_id) = self.get_published_checkpoint_sync(
+                PublishedCheckpointRole::Active,
+                &work_item.table_name,
+                &extension,
+            ) else {
+                continue;
+            };
+            let Some(checkpoint) = self.get_checkpoint_sync(&work_item.table_name, &checkpoint_id)
+            else {
+                continue;
+            };
+            if Self::checkpoint_references_any_cleanup_file(&checkpoint, &files_to_delete) {
+                return false;
+            }
+        }
+
+        true
     }
 
     fn get_latest_materialized_checkpoint_sync(
@@ -514,21 +726,29 @@ impl EphemeralServiceImpl {
         if !es_work_items.contains_key(table_name) {
             es_work_items.insert(
                 table_name.clone(),
-                ExtensionWorkItem {
-                    id: IdInstance::next_id().to_string(),
-                    extension_type: extension.clone(),
-                    table_name: table_name.clone(),
-                    table_schema: schema.clone(),
-                    speedboat_files: speedboat_files.clone(),
-                    iceberg_files: iceberg_files.clone(),
+                ExtensionWorkItemTracker {
+                    work_item: ExtensionWorkItem {
+                        id: IdInstance::next_id().to_string(),
+                        extension_type: extension.clone(),
+                        table_name: table_name.clone(),
+                        table_schema: schema.clone(),
+                        speedboat_files: speedboat_files.clone(),
+                        iceberg_files: iceberg_files.clone(),
+                    },
+                    lease_expires_at_ms: None,
                 },
             );
         } else {
             let table_work_item = es_work_items.get_mut(table_name).unwrap();
-            table_work_item.table_schema = schema.clone();
-            table_work_item.speedboat_files =
-                table_work_item.speedboat_files.merge(speedboat_files);
-            table_work_item.iceberg_files = table_work_item.iceberg_files.merge(&iceberg_files);
+            table_work_item.work_item.table_schema = schema.clone();
+            table_work_item.work_item.speedboat_files = table_work_item
+                .work_item
+                .speedboat_files
+                .merge(speedboat_files);
+            table_work_item.work_item.iceberg_files = table_work_item
+                .work_item
+                .iceberg_files
+                .merge(&iceberg_files);
         }
         let key = format!("{}_{}", table_name, extension);
         if !self.checkpoints_needing_extension_work.contains_key(&key) {
@@ -696,29 +916,17 @@ impl EphemeralServiceImpl {
     fn replace_and_delete_checkpoints(
         &mut self,
         compaction: &String,
-        iceberg_metadata: &IcebergMetadata,
+        _iceberg_metadata: &IcebergMetadata,
     ) -> CleanupWorkItem {
         let (table_name, compaction_obj) = self.compactions.get(compaction).unwrap();
 
-        let checkpoint_key = format!("{}_{}", table_name, compaction_obj.checkpoint_id_to_replace);
-        assert!(self.checkpoints.contains_key(&checkpoint_key));
-        let checkpoint_to_replace = self.checkpoints.get_mut(&checkpoint_key).unwrap();
-        assert!(checkpoint_to_replace.speedboat_metadata.is_some());
-        checkpoint_to_replace.apply_compaction_for_replacement(compaction_obj, iceberg_metadata);
-
-        for checkpoint_id in &compaction_obj.checkpoints_to_delete {
-            let checkpoint_key = format!("{}_{}", table_name, checkpoint_id);
-            assert!(self.checkpoints.contains_key(&checkpoint_key));
-            self.checkpoints.remove(&checkpoint_key);
-        }
-
         match self.compaction_work_items.get(table_name) {
             Some(tracker) => {
-                assert!(tracker.in_progress);
                 assert_eq!(
                     tracker.work_item.checkpoint_id_to_replace,
                     compaction_obj.checkpoint_id_to_replace
                 );
+                assert_eq!(tracker.work_item.id, *compaction);
                 self.compaction_work_items.remove(table_name);
             }
             None => {
@@ -776,7 +984,7 @@ impl EphemeralServiceImpl {
                             .as_ref()
                             .unwrap(),
                     ),
-                    in_progress: false,
+                    lease_expires_at_ms: None,
                 },
             );
             self.not_compacted_checkpoint_ids
@@ -889,6 +1097,31 @@ impl EphemeralServiceImpl {
         } else {
             None
         }
+    }
+
+    fn apply_extension_commit_to_work_item(
+        &mut self,
+        table_name: &String,
+        extension_commit: &ExtensionCommit,
+    ) {
+        let Some(table_work_item) = self
+            .extension_work_items
+            .get_mut(&extension_commit.extension)
+            .and_then(|items| items.get_mut(table_name))
+        else {
+            return;
+        };
+
+        let committed_files: Vec<String> = extension_commit.files.keys().cloned().collect();
+        table_work_item
+            .work_item
+            .speedboat_files
+            .remove(&committed_files);
+        table_work_item
+            .work_item
+            .iceberg_files
+            .remove(&committed_files);
+        table_work_item.lease_expires_at_ms = None;
     }
 
     pub async fn get_all_iceberg_tables(&mut self) -> Result<Vec<String>, ServiceApiError> {
@@ -1132,7 +1365,10 @@ impl EphemeralServiceImpl {
         for compaction in iceberg_commit.compactions.iter() {
             let cleanup_work_item =
                 self.replace_and_delete_checkpoints(compaction, &iceberg_commit.metadata);
-            self.cleanup_work_items.push(cleanup_work_item);
+            self.cleanup_work_items.push(CleanupWorkItemTracker {
+                work_item: cleanup_work_item,
+                lease_expires_at_ms: None,
+            });
         }
 
         self.queue_publication_request(&org_info.org_id, table_name);
@@ -1160,6 +1396,7 @@ impl EphemeralServiceImpl {
         let max_id = removed_checkpoint_ids.iter().max().unwrap();
 
         self.add_recent_extension_files(table_name, commit);
+        self.apply_extension_commit_to_work_item(table_name, commit);
 
         match self.get_latest_materialized_checkpoint_sync(table_name, Some("es".to_string())) {
             Some(latest) => {
@@ -1197,8 +1434,10 @@ impl EphemeralServiceImpl {
     pub async fn cleanup_commit(
         &mut self,
         _org_info: &OrgInfo,
-        _commit: &CleanupCommit,
+        commit: &CleanupCommit,
     ) -> Result<bool, ServiceApiError> {
+        self.cleanup_work_items
+            .retain(|work_item| work_item.work_item.id != commit.id);
         Ok(true)
     }
 
@@ -1237,9 +1476,12 @@ impl EphemeralServiceImpl {
             match self.extension_work_items.get_mut(extension_type) {
                 Some(items) => {
                     for (_, work_items) in items.iter_mut() {
-                        if work_items.has_work() {
-                            collected_work_items.push(work_items.clone());
-                            work_items.clear();
+                        if work_items.work_item.has_work()
+                            && Self::lease_is_available(work_items.lease_expires_at_ms)
+                        {
+                            collected_work_items.push(work_items.work_item.clone());
+                            work_items.lease_expires_at_ms =
+                                Some(Self::claim_lease_expires_at_ms());
                         }
                     }
                 }
@@ -1257,10 +1499,10 @@ impl EphemeralServiceImpl {
     ) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
         let mut work_items = vec![];
         for (table_name, compaction_tracker) in self.compaction_work_items.iter_mut() {
-            if !compaction_tracker.in_progress {
+            if Self::lease_is_available(compaction_tracker.lease_expires_at_ms) {
                 tracing::info!("Returning compaction work item for {}", table_name);
                 work_items.push((table_name.clone(), compaction_tracker.work_item.clone()));
-                compaction_tracker.in_progress = true;
+                compaction_tracker.lease_expires_at_ms = Some(Self::claim_lease_expires_at_ms());
             }
         }
         Ok(work_items)
@@ -1270,9 +1512,24 @@ impl EphemeralServiceImpl {
         &mut self,
         _org_info: &OrgInfo,
     ) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
-        let work_items = self.cleanup_work_items.clone();
+        let mut work_items = vec![];
+        let ready_indexes: Vec<usize> = self
+            .cleanup_work_items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cleanup_work_item)| {
+                (self.cleanup_work_item_is_ready(&cleanup_work_item.work_item)
+                    && Self::lease_is_available(cleanup_work_item.lease_expires_at_ms))
+                .then_some(index)
+            })
+            .collect();
+
+        for index in ready_indexes {
+            let cleanup_work_item = &mut self.cleanup_work_items[index];
+            work_items.push(cleanup_work_item.work_item.clone());
+            cleanup_work_item.lease_expires_at_ms = Some(Self::claim_lease_expires_at_ms());
+        }
         tracing::info!("Returning {} cleanup work items", work_items.len());
-        self.cleanup_work_items.clear();
         Ok(work_items)
     }
 
@@ -1310,8 +1567,7 @@ impl EphemeralServiceImpl {
             &extension,
             &checkpoint_id,
         );
-        self.bump_cutover_epoch(table_name, &extension);
-        self.clear_serving_node_activations(table_name, &extension);
+        self.capture_cutover_membership_for_target(table_name, &extension, &checkpoint_id);
         true
     }
 
@@ -1321,12 +1577,22 @@ impl EphemeralServiceImpl {
         extension: &Option<String>,
         target_checkpoint_id: &String,
     ) -> bool {
-        let live_nodes = self.live_serving_node_ids();
-        if live_nodes.is_empty() {
+        self.backfill_cutover_membership_for_target(table_name, extension, target_checkpoint_id);
+        self.maybe_reconfigure_cutover_membership_for_target(
+            table_name,
+            extension,
+            target_checkpoint_id,
+        );
+
+        let Some(view) = self
+            .get_cutover_membership_view(table_name, extension)
+            .cloned()
+        else {
+            return false;
+        };
+        if view.target_checkpoint_id != *target_checkpoint_id || view.required_node_ids.is_empty() {
             return false;
         }
-
-        let epoch = self.current_cutover_epoch(table_name, extension);
         let Some(acks) = self
             .serving_node_activations
             .get(&Self::selector_group_key(table_name, extension))
@@ -1334,9 +1600,9 @@ impl EphemeralServiceImpl {
             return false;
         };
 
-        live_nodes.into_iter().all(|node_id| {
+        view.required_node_ids.into_iter().all(|node_id| {
             acks.get(&node_id)
-                .map(|ack| ack.checkpoint_id == *target_checkpoint_id && ack.epoch == epoch)
+                .map(|ack| ack.checkpoint_id == *target_checkpoint_id && ack.epoch == view.epoch)
                 .unwrap_or(false)
         })
     }
@@ -1467,10 +1733,10 @@ impl MetadataStore for EphemeralServiceImpl {
                 &request.selector.extension,
                 &request.target_checkpoint_id,
             );
-            self.bump_cutover_epoch(&request.selector.table_name, &request.selector.extension);
-            self.clear_serving_node_activations(
+            self.capture_cutover_membership_for_target(
                 &request.selector.table_name,
                 &request.selector.extension,
+                &request.target_checkpoint_id,
             );
         }
         Ok(())
@@ -1566,7 +1832,7 @@ impl MetadataStore for EphemeralServiceImpl {
                 .await?
                 .into_iter()
                 .map(|work_item| ClaimedExtensionWorkItem {
-                    claim: MetadataClaimKind::ProcessLocal,
+                    claim: MetadataClaimKind::Leased,
                     work_item,
                 })
                 .collect(),
@@ -1582,7 +1848,7 @@ impl MetadataStore for EphemeralServiceImpl {
                 .await?
                 .into_iter()
                 .map(|(table_name, work_item)| ClaimedCompactionWorkItem {
-                    claim: MetadataClaimKind::ProcessLocal,
+                    claim: MetadataClaimKind::Leased,
                     table_name,
                     work_item,
                 })
@@ -1598,7 +1864,7 @@ impl MetadataStore for EphemeralServiceImpl {
             .await?
             .into_iter()
             .map(|work_item| ClaimedCleanupWorkItem {
-                claim: MetadataClaimKind::ProcessLocal,
+                claim: MetadataClaimKind::Leased,
                 work_item,
             })
             .collect())
