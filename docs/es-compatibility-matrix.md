@@ -73,7 +73,7 @@ The manifest file turns this into an enforceable surface contract:
 | Batch reads | `_mget` and `_msearch` are covered on both global and index-scoped routes | `table_mget_returns_found_and_missing_docs` and related ids | Yes | Yes | Keeps batched client read flows stable |
 | Document lifecycle | `HEAD /:index/_doc/:id` returns `200` for existing docs | `head_existing_doc_returns_200` | Yes | Yes | Complements existing GET and DELETE coverage |
 | Local-only admin | nodes, license, xpack, PIT, pipeline simulation, ILM, monitoring bulk | manifest-backed local-only fixtures | Yes | No | Useful for clients, but not yet frozen against real Elasticsearch |
-| Unsupported | scroll, search template, async search, cat APIs, GET pipeline, `_update/:id` | manifest-backed unsupported fixtures | Yes | No | Every such route must now fail with a clear checked error payload |
+| Unsupported | scroll, search template, async search, cat APIs, GET pipeline | manifest-backed unsupported fixtures | Yes | No | Every such route must now fail with a clear checked error payload |
 | Aggregations | `terms` aggregation over string fields returns expected bucket keys and doc counts | `terms_aggregation_returns_expected_bucket_keys_and_counts` | Yes | No | Current local behavior depends on aggregating over analyzed text fields, which Elasticsearch rejects without exact-field mapping or fielddata |
 | Aggregations | `avg` plus filtered sub-aggregation returns expected metric values | `avg_and_filter_subaggregation_return_expected_values` | Yes | Yes | Uses exact alphanumeric string terms to avoid analyzed-text drift between Powdrr and Elasticsearch |
 | Aggregations | `date_histogram` with `min_doc_count` and `extended_bounds` over `logs-*` returns empty boundary and gap buckets | `logs_wildcard_date_histogram_with_bounds_returns_expected_buckets` | Yes | Yes | Freezes empty-bucket generation on the typed histogram merge path |
@@ -86,12 +86,15 @@ The manifest file turns this into an enforceable surface contract:
 
 The current ES-compatible write surface is still intentionally narrow:
 
-- `/_doc` is full-document index/replace only; partial `POST /:index/_update/:id`
-  remains unsupported.
-- `_bulk` is frozen for `create` and `index`; bulk `update` and bulk `delete`
-  are not yet part of the compatibility contract.
-- refresh flags, optimistic-concurrency request params such as `if_seq_no` and
-  `if_primary_term`, and persisted ingest pipelines are not covered yet.
+- `/_doc` supports full-document index/replace, and `POST /:index/_update/:id`
+  supports `doc`, `upsert`, and `doc_as_upsert` flows.
+- `_bulk` is now frozen for `create`, `index`, `update`, and `delete`, but only
+  for the document-based flows covered by the fixture corpus.
+- scripted updates, `scripted_upsert`, refresh flags, optimistic-concurrency
+  request params such as `if_seq_no` and `if_primary_term`, and persisted
+  ingest pipelines are not covered yet.
+- bulk per-item response parity is still not frozen; the compatibility fixtures
+  assert refreshed document state rather than exact item payload details.
 
 ## Surface Rules
 

@@ -1,11 +1,12 @@
 use std::{collections::HashMap, env, pin::Pin, sync::Arc};
 
+use datafusion::arrow::datatypes::{DataType, Field};
 use futures::FutureExt;
 use gotham::helpers::http::response::create_empty_response;
 use gotham::{
     handler::HandlerFuture,
     helpers::http::response::create_response,
-    hyper::{Body, body},
+    hyper::{body, Body},
     mime,
     prelude::StaticResponseExtender,
     state::{FromState, State, StateData},
@@ -13,7 +14,7 @@ use gotham::{
 use http::StatusCode;
 use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 use crate::elastic_search_common::MIME_ES_JSON;
 use crate::util::{log_service_err, log_service_err_response};
@@ -21,11 +22,12 @@ use crate::{
     data_access,
     data_contract::{AliasInfo, CreateIndexBody, PropertyInfo, TableDescription},
     elastic_search_cluster_info,
-    elastic_search_common::{CommandContext, execute_command},
+    elastic_search_common::{execute_command, CommandContext},
     elastic_search_ingest, elastic_search_parser, elastic_search_pipeline,
     elastic_search_responses::{
         ErrorDetails, QueryResultShards, QueryResults, SingleDocCreateFailedResult,
     },
+    schema_massager::PowdrrSchema,
     search_executor,
     search_runtime::df_to_serde_value,
     state_provider::STATE_PROVIDER,
@@ -427,18 +429,6 @@ pub fn es_unsupported_named_pipeline_simulate(state: State) -> Pin<Box<HandlerFu
     .boxed()
 }
 
-pub fn es_unsupported_update_api(state: State) -> Pin<Box<HandlerFuture>> {
-    tracing::info!("es_unsupported_update_api");
-    async {
-        let res = unsupported_api_response(
-            &state,
-            "The document update API is not supported. Use document indexing with POST /{index}/_doc/{id} or update_by_query.",
-        );
-        Ok((state, res))
-    }
-    .boxed()
-}
-
 pub fn es_cluster_health(mut state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_cluster_health");
     async {
@@ -570,8 +560,8 @@ fn matches_requested_value(value: &str, requested: &[String]) -> bool {
             .any(|requested_value| wildcard_matches(requested_value, value))
 }
 
-async fn all_table_descriptions()
--> Result<Vec<TableDescription>, crate::state_provider::ServiceApiError> {
+async fn all_table_descriptions(
+) -> Result<Vec<TableDescription>, crate::state_provider::ServiceApiError> {
     let mut table_descriptions = Vec::new();
     let mut table_names = STATE_PROVIDER.get_all_iceberg_tables().await?;
     table_names.sort();
@@ -828,7 +818,8 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
         }));
     };
 
-    let mut local_tables = Vec::new();
+    let checkpoint_schema = checkpoint.schema.clone();
+    let mut local_tables: Vec<(String, PowdrrSchema)> = Vec::new();
     let mut delete_local_tables = Vec::new();
 
     if let Some(iceberg_metadata) = checkpoint.iceberg_metadata {
@@ -842,7 +833,7 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
             )
             .await
             .map_err(|e| e.message().to_string())?;
-            local_tables.push(local_name);
+            local_tables.push((local_name, file_descriptor.schema));
         }
     }
 
@@ -857,7 +848,7 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
             )
             .await
             .map_err(|e| e.message().to_string())?;
-            local_tables.push(local_name);
+            local_tables.push((local_name, file_descriptor.schema));
         }
     }
 
@@ -894,14 +885,17 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
     let escaped_doc_id = doc_id.replace('\'', "''");
     let union_sql = local_tables
         .iter()
-        .map(|table_name| format!("SELECT * FROM {table_name}"))
+        .map(|(table_name, file_schema)| {
+            build_document_lookup_select(table_name, &checkpoint_schema, file_schema)
+        })
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
     let deletes_table_name = create_document_lookup_deletes_table(&delete_local_tables).await?;
     let lookup_sql = format!(
         "SELECT docs.* FROM ({union_sql}) AS docs \
          LEFT JOIN {deletes_table_name} dt ON dt._id_seq_no = docs._id_seq_no \
-         WHERE docs._id = '{escaped_doc_id}' AND dt._id_seq_no IS NULL LIMIT 1"
+         WHERE docs._id = '{escaped_doc_id}' AND dt._id_seq_no IS NULL \
+         ORDER BY docs._seq_no DESC, docs._version DESC LIMIT 1"
     );
     let lookup_df = data_access::execute_sql(&lookup_sql)
         .await
@@ -910,7 +904,7 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
         .await
         .map_err(|e| e.message.clone())?;
 
-    for table_name in &local_tables {
+    for (table_name, _) in &local_tables {
         data_access::drop(table_name).await;
     }
     for table_name in &delete_local_tables {
@@ -934,6 +928,58 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
         ),
     )
     .map_err(|e| e.to_string())
+}
+
+fn build_document_lookup_select(
+    table_name: &str,
+    checkpoint_schema: &PowdrrSchema,
+    file_schema: &PowdrrSchema,
+) -> String {
+    let checkpoint_arrow_schema = checkpoint_schema.to_arrow_schema();
+    let file_arrow_schema = file_schema.to_arrow_schema();
+    let select_fields = checkpoint_arrow_schema
+        .fields
+        .iter()
+        .map(|field| lookup_select_field_sql(field.as_ref(), &file_arrow_schema))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("SELECT {select_fields} FROM {table_name}")
+}
+
+fn lookup_select_field_sql(
+    field: &Field,
+    file_arrow_schema: &datafusion::arrow::datatypes::Schema,
+) -> String {
+    let escaped_name = escape_lookup_identifier(field.name());
+    if file_arrow_schema.field_with_name(field.name()).is_ok() {
+        format!("\"{escaped_name}\"")
+    } else {
+        format!(
+            "CAST(NULL AS {}) AS \"{escaped_name}\"",
+            lookup_sql_type(field.data_type())
+        )
+    }
+}
+
+fn escape_lookup_identifier(identifier: &str) -> String {
+    identifier.replace('"', "\"\"")
+}
+
+fn lookup_sql_type(data_type: &DataType) -> &'static str {
+    match data_type {
+        DataType::Boolean => "BOOLEAN",
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => "DOUBLE",
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => "BIGINT",
+        DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 => "STRING",
+        _ => "STRING",
+    }
 }
 
 async fn create_document_lookup_deletes_table(local_names: &[String]) -> Result<String, String> {

@@ -310,6 +310,7 @@ struct Update {
 enum IngestCommand {
     Create(Create),
     Index(Index),
+    Delete(Delete),
     Update(Update),
 }
 
@@ -790,7 +791,10 @@ async fn get_existing_docs(
                     message: e.message.clone(),
                 })?;
                 data_access::drop(&raw_table).await;
-                serde_result
+                SerdeValueResult {
+                    values: dedupe_lookup_docs(doc_ids, serde_result.values),
+                    schema: serde_result.schema,
+                }
             }
             None => SerdeValueResult {
                 values: vec![],
@@ -802,6 +806,63 @@ async fn get_existing_docs(
     Ok(docs)
 }
 
+fn lookup_record_is_newer(candidate: &Value, current: &Value) -> bool {
+    let candidate_seq_no = candidate
+        .get("_seq_no")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let current_seq_no = current
+        .get("_seq_no")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    if candidate_seq_no != current_seq_no {
+        return candidate_seq_no > current_seq_no;
+    }
+
+    let candidate_version = candidate
+        .get("_version")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let current_version = current
+        .get("_version")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    candidate_version > current_version
+}
+
+fn dedupe_lookup_docs(doc_ids: &[String], values: Vec<Value>) -> Vec<Value> {
+    let mut by_id: HashMap<String, Value> = HashMap::new();
+    let mut passthrough = vec![];
+
+    for value in values {
+        let Some(doc_id) = value.get("_id").and_then(Value::as_str) else {
+            passthrough.push(value);
+            continue;
+        };
+
+        match by_id.get_mut(doc_id) {
+            Some(existing) => {
+                if lookup_record_is_newer(&value, existing) {
+                    *existing = value;
+                }
+            }
+            None => {
+                by_id.insert(doc_id.to_string(), value);
+            }
+        }
+    }
+
+    let mut deduped = vec![];
+    for doc_id in doc_ids {
+        if let Some(value) = by_id.remove(doc_id) {
+            deduped.push(value);
+        }
+    }
+    deduped.extend(by_id.into_values());
+    deduped.extend(passthrough);
+    deduped
+}
+
 fn insert_record(
     buffer: &mut SpeedboatCommitBuilder,
     doc_id: String,
@@ -810,6 +871,18 @@ fn insert_record(
     status: Option<u32>,
 ) {
     buffer.insert(&RecordInput::new(doc_id, version, doc, status));
+}
+
+fn primary_operation<'a>(
+    operations: &'a [OperationResult],
+) -> Result<&'a OperationResult, IngestError> {
+    operations
+        .iter()
+        .find(|operation| operation.result != "delete")
+        .or_else(|| operations.first())
+        .ok_or_else(|| IngestError {
+            message: "Mutation commit returned no operations".to_string(),
+        })
 }
 
 fn replace_record(
@@ -831,6 +904,57 @@ fn replace_record(
         existing_doc.seq_no,
         existing_doc.record_input.version(),
     ));
+}
+
+enum UpdateOutcome {
+    Created,
+    Updated,
+}
+
+fn apply_update_request(
+    buffer: &mut SpeedboatCommitBuilder,
+    doc_id: &String,
+    existing_doc: Option<FullRecord>,
+    update_request: &UpdateBody,
+    created_status: Option<u32>,
+    updated_status: Option<u32>,
+) -> Result<UpdateOutcome, IngestError> {
+    if update_request.script.is_some() || update_request.scripted_upsert == Some(true) {
+        return Err(IngestError {
+            message: "Scripted document updates are not implemented".to_string(),
+        });
+    }
+
+    if let Some(mut existing_doc) = existing_doc {
+        let Some(doc_patch) = update_request.doc.as_ref() else {
+            return Err(IngestError {
+                message: "Document update without a doc payload is not implemented".to_string(),
+            });
+        };
+        existing_doc.record_input.ensure_source();
+        let merged_doc = merge_source(existing_doc.record_input.source().unwrap(), doc_patch);
+        replace_record(buffer, &existing_doc, &merged_doc, updated_status);
+        return Ok(UpdateOutcome::Updated);
+    }
+
+    if update_request.doc_as_upsert.unwrap_or(false) {
+        let Some(doc) = update_request.doc.as_ref() else {
+            return Err(IngestError {
+                message: "doc_as_upsert requires a doc payload".to_string(),
+            });
+        };
+        insert_record(buffer, doc_id.clone(), 1, doc, created_status);
+        return Ok(UpdateOutcome::Created);
+    }
+
+    if let Some(upsert_doc) = update_request.upsert.as_ref() {
+        insert_record(buffer, doc_id.clone(), 1, upsert_doc, created_status);
+        return Ok(UpdateOutcome::Created);
+    }
+
+    Err(IngestError {
+        message: "Document update requires an existing document or an upsert payload".to_string(),
+    })
 }
 
 async fn create_single_worker(
@@ -947,10 +1071,7 @@ async fn index_single_worker(
             };
 
             let result = buffer.commit().await?;
-            assert!(
-                !result.operations.is_empty(),
-                "single-document index commit must return at least one operation"
-            );
+            let primary_operation = primary_operation(&result.operations)?;
             let headers = vec![(
                 LOCATION,
                 format!(
@@ -962,7 +1083,7 @@ async fn index_single_worker(
             Ok(ElasticSearchResponse {
                 status,
                 mime: MIME_ES_JSON.clone(),
-                body: serde_json::to_string(&result.operations[0]).unwrap(),
+                body: serde_json::to_string(primary_operation).unwrap(),
                 headers,
             })
         }
@@ -1035,55 +1156,23 @@ async fn update_single_worker(
     let docs = get_existing_docs(&table_description.name, &vec![doc_id.to_string()]).await?;
 
     let mut buffer = SpeedboatCommitBuilder::new(&table_description.name);
-    if docs.values.len() != 0 {
-        assert_eq!(docs.values.len(), 1);
-        if update_request.doc.is_none() {
-            todo!("What do we do here?")
-        }
-        let mut existing_doc = FullRecord::from_record(&docs.values[0]);
-        existing_doc.record_input.ensure_source();
-        let mut updated_doc = RecordInput::new(
-            existing_doc.record_input.id().clone(),
-            existing_doc.record_input.version() + 1,
-            &merge_source(
-                existing_doc.record_input.source().unwrap(),
-                update_request.doc.as_ref().unwrap(),
-            ),
-            None,
-        );
-        updated_doc.ensure_source();
-        buffer.update(&updated_doc);
-        buffer.delete(&RecordDelete::new(
-            &existing_doc.record_input.id(),
-            existing_doc.seq_no,
-            existing_doc.record_input.version(),
-        ));
+    let existing_doc = if docs.values.is_empty() {
+        None
     } else {
-        if update_request.upsert.is_none() {
-            // TODO: this is the doc_as_upsert path to figure out
-            todo!("Need to implement upsert")
-        }
-
-        let upsert_doc = update_request.upsert.unwrap();
-        ingest_create(
-            &Create {
-                create: IndexOrCreateBody {
-                    index: None,
-                    id: Some(doc_id.clone()),
-                    list_executed_pipelines: false,
-                    require_alias: false,
-                    dynamic_templates: None,
-                },
-            },
-            &upsert_doc,
-            1,
-            None,
-            &mut buffer,
-        );
+        assert_eq!(docs.values.len(), 1);
+        Some(FullRecord::from_record(&docs.values[0]))
     };
+    let update_outcome = apply_update_request(
+        &mut buffer,
+        doc_id,
+        existing_doc,
+        &update_request,
+        None,
+        None,
+    )?;
 
     let result = buffer.commit().await?;
-    assert_eq!(result.operations.len(), 1);
+    let primary_operation = primary_operation(&result.operations)?;
     let headers = vec![(
         LOCATION,
         format!(
@@ -1093,9 +1182,12 @@ async fn update_single_worker(
         ),
     )];
     Ok(ElasticSearchResponse {
-        status: StatusCode::CREATED,
+        status: match update_outcome {
+            UpdateOutcome::Created => StatusCode::CREATED,
+            UpdateOutcome::Updated => StatusCode::OK,
+        },
         mime: MIME_ES_JSON.clone(),
-        body: serde_json::to_string(&result.operations[0]).unwrap(),
+        body: serde_json::to_string(primary_operation).unwrap(),
         headers: headers,
     })
 }
@@ -1333,15 +1425,16 @@ pub(crate) async fn ingest(
                             });
                         }
                     };
+                    let doc_id = match u.update.id.as_ref() {
+                        Some(id) => id.clone(),
+                        None => {
+                            return Err(IngestError {
+                                message: "Bulk update requires an _id".to_string(),
+                            });
+                        }
+                    };
                     let existing_docs =
-                        get_existing_docs(&table_description.name, &vec![u.update.id.unwrap()])
-                            .await?;
-                    if existing_docs.values.len() == 0 {
-                        return Err(IngestError {
-                            message: "Bulk update without an existing document is not implemented"
-                                .to_string(),
-                        });
-                    }
+                        get_existing_docs(&table_description.name, &vec![doc_id.clone()]).await?;
                     let doc_str = match iterator.next() {
                         Some(ds) => ds.trim(),
                         None => {
@@ -1353,38 +1446,78 @@ pub(crate) async fn ingest(
                     let doc: Result<UpdateBody, serde_json::Error> = serde_json::from_str(doc_str);
                     match doc {
                         Ok(update_request) => {
-                            if update_request.doc.is_none() {
-                                return Err(IngestError {
-                                    message: "Bulk update without a doc payload is not implemented"
-                                        .to_string(),
-                                });
-                            }
-                            let mut existing_doc =
-                                FullRecord::from_record(&existing_docs.values[0]);
-                            existing_doc.record_input.ensure_source();
-
-                            let mut updated_doc = RecordInput::new(
-                                existing_doc.record_input.id().clone(),
-                                existing_doc.record_input.version() + 1,
-                                &merge_source(
-                                    existing_doc.record_input.source().unwrap(),
-                                    update_request.doc.as_ref().unwrap(),
-                                ),
+                            let existing_doc = if existing_docs.values.is_empty() {
+                                None
+                            } else {
+                                assert_eq!(existing_docs.values.len(), 1);
+                                Some(FullRecord::from_record(&existing_docs.values[0]))
+                            };
+                            let _ = apply_update_request(
+                                ingest_result.get(index),
+                                &doc_id,
+                                existing_doc,
+                                &update_request,
                                 Some(201),
-                            );
-                            updated_doc.ensure_source();
-                            ingest_result.get(index).update(&updated_doc);
-                            ingest_result.get(index).delete(&RecordDelete::new(
-                                existing_doc.record_input.id(),
-                                existing_doc.seq_no,
-                                existing_doc.record_input.version(),
-                            ));
+                                Some(200),
+                            )?;
                         }
                         Err(e) => {
                             return Err(IngestError {
                                 message: format!("Serde error doc: {}", e),
                             });
                         }
+                    }
+                }
+                IngestCommand::Delete(d) => {
+                    let index = match &d.delete.index {
+                        Some(i) => {
+                            match provided_index {
+                                Some(pi) => {
+                                    if i != pi {
+                                        return Err(IngestError {
+                                            message: "Can not provide a index in create here"
+                                                .to_string(),
+                                        });
+                                    }
+                                }
+                                None => (),
+                            }
+                            i
+                        }
+                        None => match provided_index {
+                            Some(pi) => pi,
+                            None => {
+                                return Err(IngestError {
+                                    message: "Must provide index name".to_string(),
+                                });
+                            }
+                        },
+                    };
+                    let table_description = match describe_table_log_error_then_none(&index).await {
+                        Some(t) => t,
+                        None => {
+                            return Err(IngestError {
+                                message: "Index does not exist".to_string(),
+                            });
+                        }
+                    };
+                    let doc_id = match d.delete.id.as_ref() {
+                        Some(id) => id.clone(),
+                        None => {
+                            return Err(IngestError {
+                                message: "Bulk delete requires an _id".to_string(),
+                            });
+                        }
+                    };
+                    let existing_docs =
+                        get_existing_docs(&table_description.name, &vec![doc_id]).await?;
+                    if let Some(existing_doc) = existing_docs.values.first() {
+                        let existing_doc = FullRecord::from_record(existing_doc);
+                        ingest_result.get(index).delete(&RecordDelete::new(
+                            existing_doc.record_input.id(),
+                            existing_doc.seq_no,
+                            existing_doc.record_input.version(),
+                        ));
                     }
                 }
             },

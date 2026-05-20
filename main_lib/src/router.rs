@@ -596,7 +596,8 @@ pub fn router(include_test_apis: bool) -> Router {
             .to(elastic_search_endpoints::es_index_with_id);
         route
             .post("/:name/_update/:id")
-            .to(elastic_search_endpoints::es_unsupported_update_api);
+            .with_path_extractor::<NameIdPathExtractor>()
+            .to(elastic_search_endpoints::es_update_with_id);
         route
             .get("/:name/_doc/:id")
             .with_path_extractor::<NameIdPathExtractor>()
@@ -4690,6 +4691,386 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_es_update_single_merges_existing_doc() {
+        let test_server = &*TEST_SERVER;
+
+        set_testing_and_processing_mode(test_server);
+
+        let body_create_index = r#"{
+            "settings" : {
+                "index": {
+                "number_of_shards" : 2,
+                "number_of_replicas" : 1
+            } } }"#;
+
+        let response_create_index = test_server
+            .client()
+            .put(
+                "http://localhost/logs",
+                body_create_index,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(response_create_index.status(), 200);
+
+        let original_doc = r#"{
+            "@timestamp": "2099-11-15T13:12:00",
+            "message": "original message",
+            "user": {
+                "id": "kimchy"
+            }
+            }"#;
+        let update_doc = r#"{
+            "doc": {
+                "message": "patched message",
+                "user": {
+                    "name": "greg"
+                }
+            }
+            }"#;
+
+        let create_response = test_server
+            .client()
+            .put(
+                "http://localhost/logs/_doc/my_id",
+                original_doc,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(create_response.status(), 201);
+
+        let process_work_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_process_work",
+                "",
+                mime::TEXT_PLAIN,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(process_work_response.status(), 200);
+
+        let update_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs/_update/my_id",
+                update_doc,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(update_response.status(), 200);
+        let update_json: Value =
+            serde_json::from_str(&update_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(update_json["_version"], json!(2));
+
+        let second_process_work_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_process_work",
+                "",
+                mime::TEXT_PLAIN,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(second_process_work_response.status(), 200);
+
+        let get_response = test_server
+            .client()
+            .get("http://localhost/logs/_doc/my_id")
+            .perform()
+            .unwrap();
+
+        assert_eq!(get_response.status(), 200);
+        let get_json: Value =
+            serde_json::from_str(&get_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(get_json["_version"], json!(2));
+        assert_eq!(get_json["_source"]["message"], json!("patched message"));
+        assert_eq!(get_json["_source"]["user"]["id"], json!("kimchy"));
+        assert_eq!(get_json["_source"]["user"]["name"], json!("greg"));
+    }
+
+    #[test]
+    fn test_es_update_single_doc_as_upsert_creates_missing_doc() {
+        let test_server = &*TEST_SERVER;
+
+        set_testing_and_processing_mode(test_server);
+
+        let body_create_index = r#"{
+            "settings" : {
+                "index": {
+                "number_of_shards" : 2,
+                "number_of_replicas" : 1
+            } } }"#;
+
+        let response_create_index = test_server
+            .client()
+            .put(
+                "http://localhost/logs",
+                body_create_index,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(response_create_index.status(), 200);
+
+        let update_doc = r#"{
+            "doc": {
+                "@timestamp": "2099-11-15T13:12:00",
+                "message": "created via update",
+                "user": {
+                    "id": "kimchy"
+                }
+            },
+            "doc_as_upsert": true
+            }"#;
+
+        let update_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs/_update/upsert_id",
+                update_doc,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(update_response.status(), 201);
+        let update_json: Value =
+            serde_json::from_str(&update_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(update_json["_version"], json!(1));
+
+        let process_work_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_process_work",
+                "",
+                mime::TEXT_PLAIN,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(process_work_response.status(), 200);
+
+        let get_response = test_server
+            .client()
+            .get("http://localhost/logs/_doc/upsert_id")
+            .perform()
+            .unwrap();
+
+        assert_eq!(get_response.status(), 200);
+        let get_json: Value =
+            serde_json::from_str(&get_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(get_json["_version"], json!(1));
+        assert_eq!(get_json["_source"]["message"], json!("created via update"));
+    }
+
+    #[test]
+    fn test_es_bulk_update_merges_existing_doc_after_refresh() {
+        let test_server = &*TEST_SERVER;
+
+        set_testing_and_processing_mode(test_server);
+
+        let body_create_index = r#"{
+            "settings" : {
+                "index": {
+                "number_of_shards" : 2,
+                "number_of_replicas" : 1
+            } } }"#;
+
+        let response_create_index = test_server
+            .client()
+            .put(
+                "http://localhost/logs",
+                body_create_index,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(response_create_index.status(), 200);
+
+        let original_doc = r#"{
+            "@timestamp": "2099-11-15T13:12:00",
+            "message": "bulk original message",
+            "user": {
+                "id": "kimchy"
+            }
+            }"#;
+
+        let create_response = test_server
+            .client()
+            .put(
+                "http://localhost/logs/_doc/my_id",
+                original_doc,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(create_response.status(), 201);
+
+        let first_process_work_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_process_work",
+                "",
+                mime::TEXT_PLAIN,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(first_process_work_response.status(), 200);
+
+        let bulk_body = make_update_bulk_body(
+            "logs".to_string(),
+            vec![(
+                "my_id".to_string(),
+                r#"{
+                    "doc": {
+                        "message": "bulk patched message",
+                        "user": {
+                            "name": "greg"
+                        }
+                    }
+                }"#
+                .to_string(),
+            )],
+        );
+        let bulk_response = test_server
+            .client()
+            .post("http://localhost/_bulk", bulk_body, mime::APPLICATION_JSON)
+            .perform()
+            .unwrap();
+
+        assert_eq!(bulk_response.status(), 200);
+
+        let second_process_work_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_process_work",
+                "",
+                mime::TEXT_PLAIN,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(second_process_work_response.status(), 200);
+
+        let get_response = test_server
+            .client()
+            .get("http://localhost/logs/_doc/my_id")
+            .perform()
+            .unwrap();
+
+        assert_eq!(get_response.status(), 200);
+        let get_json: Value =
+            serde_json::from_str(&get_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(get_json["_version"], json!(2));
+        assert_eq!(
+            get_json["_source"]["message"],
+            json!("bulk patched message")
+        );
+        assert_eq!(get_json["_source"]["user"]["id"], json!("kimchy"));
+        assert_eq!(get_json["_source"]["user"]["name"], json!("greg"));
+    }
+
+    #[test]
+    fn test_es_bulk_delete_removes_existing_doc_after_refresh() {
+        let test_server = &*TEST_SERVER;
+
+        set_testing_and_processing_mode(test_server);
+
+        let body_create_index = r#"{
+            "settings" : {
+                "index": {
+                "number_of_shards" : 2,
+                "number_of_replicas" : 1
+            } } }"#;
+
+        let response_create_index = test_server
+            .client()
+            .put(
+                "http://localhost/logs",
+                body_create_index,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(response_create_index.status(), 200);
+
+        let original_doc = r#"{
+            "@timestamp": "2099-11-15T13:12:00",
+            "message": "bulk delete message",
+            "user": {
+                "id": "kimchy"
+            }
+            }"#;
+
+        let create_response = test_server
+            .client()
+            .put(
+                "http://localhost/logs/_doc/my_id",
+                original_doc,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(create_response.status(), 201);
+
+        let first_process_work_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_process_work",
+                "",
+                mime::TEXT_PLAIN,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(first_process_work_response.status(), 200);
+
+        let bulk_body = make_delete_bulk_body("logs".to_string(), vec!["my_id".to_string()]);
+        let bulk_response = test_server
+            .client()
+            .post("http://localhost/_bulk", bulk_body, mime::APPLICATION_JSON)
+            .perform()
+            .unwrap();
+
+        assert_eq!(bulk_response.status(), 200);
+
+        let second_process_work_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_process_work",
+                "",
+                mime::TEXT_PLAIN,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(second_process_work_response.status(), 200);
+
+        let get_response = test_server
+            .client()
+            .get("http://localhost/logs/_doc/my_id")
+            .perform()
+            .unwrap();
+
+        assert_eq!(get_response.status(), 404);
+    }
+
+    #[test]
     fn test_es_create_then_delete_single() {
         let test_server = &*TEST_SERVER;
 
@@ -5820,6 +6201,40 @@ pub(crate) mod tests {
             .iter()
             .zip(source_lines.iter())
             .map(|(index_line, source_line)| format!("{index_line}{source_line}"))
+            .collect::<Vec<String>>()
+            .join("")
+    }
+
+    fn make_update_bulk_body(index: String, values: Vec<(String, String)>) -> String {
+        let update_lines = values
+            .iter()
+            .map(|(id, _)| {
+                format!(
+                    "{{\"update\":{{\"_index\":\"{}\",\"_id\":\"{}\"}}}}\n",
+                    index, id
+                )
+            })
+            .collect::<Vec<String>>();
+        let body_lines = values
+            .iter()
+            .map(|(_, value)| format!("{}\n", value.replace("\n", "")))
+            .collect::<Vec<String>>();
+        update_lines
+            .iter()
+            .zip(body_lines.iter())
+            .map(|(update_line, body_line)| format!("{update_line}{body_line}"))
+            .collect::<Vec<String>>()
+            .join("")
+    }
+
+    fn make_delete_bulk_body(index: String, ids: Vec<String>) -> String {
+        ids.iter()
+            .map(|id| {
+                format!(
+                    "{{\"delete\":{{\"_index\":\"{}\",\"_id\":\"{}\"}}}}\n",
+                    index, id
+                )
+            })
             .collect::<Vec<String>>()
             .join("")
     }
