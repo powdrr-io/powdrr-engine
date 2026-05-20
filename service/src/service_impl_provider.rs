@@ -16,7 +16,9 @@ use powdrr_service_lib::dynamodb_service_impl::DynamoDBServiceImpl;
 use powdrr_service_lib::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use powdrr_service_lib::ephemeral_service_impl::EphemeralServiceImpl;
 use powdrr_service_lib::metadata_store::MetadataStore;
-use powdrr_service_lib::metadata_store::{CheckpointCutoverState, ServingNodeActivationAck};
+use powdrr_service_lib::metadata_store::{
+    CheckpointCutoverState, ServingNodeActivationAck, ServingNodeLease,
+};
 use powdrr_service_lib::peers::CheckpointDescriptor;
 use powdrr_service_lib::pipeline::PipelineDefinition;
 use powdrr_service_lib::raft_service_impl::{RaftServiceConfig, RaftServiceImpl};
@@ -193,6 +195,11 @@ enum ServiceImplProviderActorMessage {
         org_info: OrgInfo,
         table_name: String,
         extensions: Option<String>,
+    },
+    HeartbeatServingNode {
+        respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
+        org_info: OrgInfo,
+        lease: ServingNodeLease,
     },
     RecordServingNodeActivation {
         respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
@@ -510,6 +517,13 @@ impl ServiceImplProviderActor {
                     get_checkpoint_cutover_state(&org_info, &table_name, extensions)
                 );
             }
+            ServiceImplProviderActorMessage::HeartbeatServingNode {
+                org_info,
+                lease,
+                respond_to,
+            } => {
+                handle_message_impl!(self, respond_to, heartbeat_serving_node(&org_info, &lease));
+            }
             ServiceImplProviderActorMessage::RecordServingNodeActivation {
                 org_info,
                 ack,
@@ -773,6 +787,14 @@ impl ServiceImpl {
             self,
             get_checkpoint_cutover_state(org_info, table_name, extensions)
         )
+    }
+
+    pub async fn heartbeat_serving_node(
+        &mut self,
+        org_info: &OrgInfo,
+        lease: &ServingNodeLease,
+    ) -> Result<(), ServiceImplError> {
+        metadata_store_func_impl!(self, heartbeat_serving_node(org_info, lease))
     }
 
     pub async fn record_serving_node_activation(
@@ -1246,6 +1268,19 @@ impl ServiceImplHandle {
             org_info = org_info.clone(),
             table_name = table_name.clone(),
             extensions = extension.clone()
+        )
+    }
+
+    pub async fn heartbeat_serving_node(
+        &self,
+        org_info: &OrgInfo,
+        lease: &ServingNodeLease,
+    ) -> Result<(), ServiceImplError> {
+        send_message!(
+            self,
+            HeartbeatServingNode,
+            org_info = org_info.clone(),
+            lease = lease.clone()
         )
     }
 

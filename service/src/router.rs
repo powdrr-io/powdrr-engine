@@ -95,6 +95,9 @@ pub fn router(include_test_apis: bool) -> Router {
                     .get("/get_checkpoint_cutover_state")
                     .to(v1_handlers::get_checkpoint_cutover_state);
                 route
+                    .post("/heartbeat_serving_node")
+                    .to(v1_handlers::heartbeat_serving_node);
+                route
                     .post("/record_serving_node_activation")
                     .to(v1_handlers::record_serving_node_activation);
                 route.get("/get_checkpoint").to(v1_handlers::get_checkpoint);

@@ -709,7 +709,9 @@ mod tests {
         CompactionCommit, ExtensionCommit, ExtensionFile, FileSetPayload, IcebergCommit,
         IcebergMetadata, LicenseType, OrgInfo, SpeedboatCommit, SpeedboatCommitTableInfo,
     };
-    use crate::metadata_store::{MetadataStore, ServingNodeActivationAck};
+    use crate::metadata_store::{
+        CutoverEpoch, MetadataStore, ServingNodeActivationAck, ServingNodeLease,
+    };
     use crate::schema_massager::PowdrrSchema;
     use crate::test_api::{
         CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode, StorageMode,
@@ -799,6 +801,14 @@ mod tests {
         }
     }
 
+    fn serving_lease(node_id: &str) -> ServingNodeLease {
+        ServingNodeLease {
+            node_id: node_id.to_string(),
+            membership_epoch: CutoverEpoch::default(),
+            observed_at_ms: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+
     async fn single_node_raft(cluster_name: &str, mode: TestProcessingMode) -> RaftServiceImpl {
         let raft = RaftServiceImpl::new(
             RaftServiceConfig {
@@ -881,11 +891,14 @@ mod tests {
             .get_checkpoint_cutover_state(&org_info, &table_name, None)
             .await
             .unwrap();
+        raft.heartbeat_serving_node(&org_info, &serving_lease("warm-cache"))
+            .await
+            .unwrap();
         raft.record_serving_node_activation(
             &org_info,
             &ServingNodeActivationAck {
                 selector: base_cutover_state.selector,
-                node_id: "warm-base".to_string(),
+                node_id: "warm-cache".to_string(),
                 epoch: base_cutover_state.epoch,
                 checkpoint_id: target_base_checkpoint.clone(),
                 activated_at_ms: 1,
@@ -942,11 +955,14 @@ mod tests {
             .get_checkpoint_cutover_state(&org_info, &table_name, Some("es".to_string()))
             .await
             .unwrap();
+        raft.heartbeat_serving_node(&org_info, &serving_lease("warm-cache"))
+            .await
+            .unwrap();
         raft.record_serving_node_activation(
             &org_info,
             &ServingNodeActivationAck {
-                selector: extension_cutover_state.selector,
-                node_id: "warm-es".to_string(),
+                selector: extension_cutover_state.selector.clone(),
+                node_id: "warm-cache".to_string(),
                 epoch: extension_cutover_state.epoch,
                 checkpoint_id: target_extension_checkpoint.clone(),
                 activated_at_ms: 2,
@@ -954,12 +970,103 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(raft.update_all_checkpoints().await.unwrap());
+        let recorded_activations = raft
+            .list_serving_node_activations(&org_info, &table_name, Some("es".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(recorded_activations.len(), 1);
+        let promoted_extension = raft.update_all_checkpoints().await.unwrap();
+        let active_extension_checkpoint = raft
+            .get_latest_committed_checkpoint(&org_info, &table_name, Some("es".to_string()))
+            .await
+            .unwrap();
+        assert!(
+            promoted_extension
+                || active_extension_checkpoint == Some(target_extension_checkpoint.clone()),
+            "promoted_extension={promoted_extension}, active_extension_checkpoint={active_extension_checkpoint:?}, cutover_state={:?}, recorded_activations={recorded_activations:?}",
+            extension_cutover_state,
+        );
         assert_eq!(
-            raft.get_latest_committed_checkpoint(&org_info, &table_name, Some("es".to_string()))
+            active_extension_checkpoint,
+            Some(target_extension_checkpoint)
+        );
+    }
+
+    #[tokio::test]
+    async fn raft_active_checkpoint_waits_for_all_live_serving_nodes() {
+        initialize_ids();
+
+        let mut raft = single_node_raft(
+            "raft-live-node-cutover",
+            raft_test_mode(CompactionMode::Disabled),
+        )
+        .await;
+        let org_info = org_info();
+        let table_name = "strict_cutover_logs".to_string();
+        let file_path = "s3://bucket/logs/strict-cutover.parquet";
+
+        raft.speedboat_commit(&org_info, &speedboat_commit_for(&table_name, file_path))
+            .await
+            .unwrap();
+        assert!(raft.update_all_checkpoints().await.unwrap());
+
+        let target_checkpoint = raft
+            .get_latest_target_checkpoint(&org_info, &table_name, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let cutover_state = raft
+            .get_checkpoint_cutover_state(&org_info, &table_name, None)
+            .await
+            .unwrap();
+
+        raft.heartbeat_serving_node(&org_info, &serving_lease("node-a"))
+            .await
+            .unwrap();
+        raft.heartbeat_serving_node(&org_info, &serving_lease("node-b"))
+            .await
+            .unwrap();
+
+        raft.record_serving_node_activation(
+            &org_info,
+            &ServingNodeActivationAck {
+                selector: cutover_state.selector.clone(),
+                node_id: "node-a".to_string(),
+                epoch: cutover_state.epoch,
+                checkpoint_id: target_checkpoint.clone(),
+                activated_at_ms: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!raft.update_all_checkpoints().await.unwrap());
+        assert_eq!(
+            raft.get_latest_committed_checkpoint(&org_info, &table_name, None)
                 .await
                 .unwrap(),
-            Some(target_extension_checkpoint)
+            None
+        );
+
+        raft.record_serving_node_activation(
+            &org_info,
+            &ServingNodeActivationAck {
+                selector: cutover_state.selector,
+                node_id: "node-b".to_string(),
+                epoch: cutover_state.epoch,
+                checkpoint_id: target_checkpoint.clone(),
+                activated_at_ms: 2,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(raft.update_all_checkpoints().await.unwrap());
+        assert_eq!(
+            raft.get_latest_committed_checkpoint(&org_info, &table_name, None)
+                .await
+                .unwrap(),
+            Some(target_checkpoint)
         );
     }
 

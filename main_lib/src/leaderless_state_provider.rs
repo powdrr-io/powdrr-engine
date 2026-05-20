@@ -9,7 +9,9 @@ use crate::data_contract::{
 };
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::ephemeral_fetch_tracker::EphemeralFetchTracker;
-use crate::metadata_store::{CheckpointCutoverState, ServingNodeActivationAck};
+use crate::metadata_store::{
+    CheckpointCutoverState, CutoverEpoch, ServingNodeActivationAck, ServingNodeLease,
+};
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
 use crate::state_provider::ServiceApiError;
@@ -573,6 +575,26 @@ impl LeaderlessStateProvider {
         .await
     }
 
+    async fn heartbeat_serving_node(&mut self) -> Result<(), ServiceApiError> {
+        Self::handle_response(
+            self.post(format!(
+                "{}/api/v1/heartbeat_serving_node",
+                self.base_address
+            ))
+            .body(
+                serde_json::to_string(&ServingNodeLease {
+                    node_id: self.serving_node_id.clone(),
+                    membership_epoch: CutoverEpoch::default(),
+                    observed_at_ms: Self::current_timestamp_ms(),
+                })
+                .unwrap(),
+            )
+            .send()
+            .await,
+        )
+        .await
+    }
+
     pub(crate) async fn get_checkpoint(
         &mut self,
         checkpoint: &CheckpointDescriptor,
@@ -638,6 +660,7 @@ impl LeaderlessStateProvider {
         &mut self,
         extensions: Option<String>,
     ) -> Result<Vec<CheckpointDescriptor>, ServiceApiError> {
+        self.heartbeat_serving_node().await?;
         self.fetch_tracker
             .get_next_prefetch_checkpoints(extensions)
             .await
@@ -658,6 +681,7 @@ impl LeaderlessStateProvider {
         descriptors: &Vec<CheckpointDescriptor>,
         extension: Option<String>,
     ) -> Result<(), ServiceApiError> {
+        self.heartbeat_serving_node().await?;
         self.fetch_tracker
             .set_target_checkpoints(descriptors, extension.clone())
             .await?;
