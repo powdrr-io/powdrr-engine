@@ -1,0 +1,40 @@
+name: ES Mutation Regressions
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: es-mutation-regressions-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      # Keep the job on a stable target dir so rust-cache can reuse the build.
+      CARGO_TARGET_DIR: target
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start ES mutation test stack
+        run: docker compose -f tests/es_compat/docker-compose.yml up -d redis minio createbuckets rest localstack
+
+      - name: Run ES mutation regression tests
+        env:
+          POWDRR_WAIT_FOR_STACK: "1"
+        run: bash scripts/run_es_mutation_regression_local.sh
+
+      - name: Stop ES mutation test stack
+        if: always()
+        run: docker compose -f tests/es_compat/docker-compose.yml down -v

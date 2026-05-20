@@ -13,9 +13,9 @@ use crate::dynamodb::{
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::metadata_store::{
     CheckpointCutoverState, CheckpointUpdateRequest, ClaimedCleanupWorkItem,
-    ClaimedCompactionWorkItem, ClaimedExtensionWorkItem, CutoverEpoch, MetadataClaimKind,
-    MetadataStore, PublishedCheckpointRecord, PublishedCheckpointRole, PublishedCheckpointSelector,
-    ServingNodeActivationAck, ServingNodeLease,
+    ClaimedCompactionWorkItem, ClaimedExtensionWorkItem, CutoverEpoch, CutoverMembershipView,
+    MetadataClaimKind, MetadataStore, PublishedCheckpointRecord, PublishedCheckpointRole,
+    PublishedCheckpointSelector, ServingNodeActivationAck, ServingNodeLease,
 };
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
@@ -126,6 +126,13 @@ impl DynamoDBServiceImpl {
         match extension {
             Some(x) => format!("published_checkpoint#epoch#{}#{}", table_name, x),
             None => format!("published_checkpoint#epoch#{}", table_name),
+        }
+    }
+
+    fn membership_view_key(table_name: &String, extension: &Option<String>) -> String {
+        match extension {
+            Some(x) => format!("published_checkpoint#members#{}#{}", table_name, x),
+            None => format!("published_checkpoint#members#{}", table_name),
         }
     }
 
@@ -330,6 +337,54 @@ impl DynamoDBServiceImpl {
             .unwrap_or(false))
     }
 
+    async fn get_cutover_membership_view(
+        &mut self,
+        org_id: &String,
+        table_name: &String,
+        extension: &Option<String>,
+    ) -> Result<Option<CutoverMembershipView>, ServiceApiError> {
+        let key = Self::membership_view_key(table_name, extension);
+        self.connector
+            .describe_cutover_membership_view(org_id, &key)
+            .await
+            .map_err(from_modyne)
+    }
+
+    async fn store_cutover_membership_view(
+        &mut self,
+        org_id: &String,
+        table_name: &String,
+        extension: &Option<String>,
+        epoch: CutoverEpoch,
+        target_checkpoint_id: &String,
+        required_node_ids: Vec<String>,
+    ) -> Result<(), ServiceApiError> {
+        let key = Self::membership_view_key(table_name, extension);
+        let _ = self
+            .connector
+            .delete_cutover_membership_view(org_id, &key)
+            .await
+            .map_err(from_modyne)?;
+        let _ = self
+            .connector
+            .create_cutover_membership_view(
+                org_id,
+                &key,
+                &CutoverMembershipView {
+                    selector: PublishedCheckpointSelector::target(
+                        table_name.clone(),
+                        extension.clone(),
+                    ),
+                    epoch,
+                    target_checkpoint_id: target_checkpoint_id.clone(),
+                    required_node_ids,
+                },
+            )
+            .await
+            .map_err(from_modyne)?;
+        Ok(())
+    }
+
     async fn set_active_checkpoint_id(
         &mut self,
         org_id: &String,
@@ -400,6 +455,193 @@ impl DynamoDBServiceImpl {
         Ok(live_leases)
     }
 
+    async fn capture_cutover_membership_for_target(
+        &mut self,
+        org_id: &String,
+        table_name: &String,
+        extension: &Option<String>,
+        target_checkpoint_id: &String,
+    ) -> Result<(), ServiceApiError> {
+        if self
+            .get_cutover_membership_view(org_id, table_name, extension)
+            .await?
+            .map(|view| view.target_checkpoint_id == *target_checkpoint_id)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        let mut required_node_ids: Vec<String> = self
+            .live_serving_node_leases(org_id)
+            .await?
+            .into_iter()
+            .map(|lease| lease.node_id)
+            .collect();
+        required_node_ids.sort();
+        let epoch = self
+            .bump_cutover_epoch(org_id, table_name, extension)
+            .await?;
+        self.store_cutover_membership_view(
+            org_id,
+            table_name,
+            extension,
+            epoch,
+            target_checkpoint_id,
+            required_node_ids,
+        )
+        .await
+    }
+
+    async fn backfill_cutover_membership_for_target(
+        &mut self,
+        org_id: &String,
+        table_name: &String,
+        extension: &Option<String>,
+        target_checkpoint_id: &String,
+    ) -> Result<(), ServiceApiError> {
+        let Some(existing_view) = self
+            .get_cutover_membership_view(org_id, table_name, extension)
+            .await?
+        else {
+            return Ok(());
+        };
+
+        if existing_view.target_checkpoint_id != *target_checkpoint_id
+            || !existing_view.required_node_ids.is_empty()
+        {
+            return Ok(());
+        }
+
+        let mut required_node_ids: Vec<String> = self
+            .live_serving_node_leases(org_id)
+            .await?
+            .into_iter()
+            .map(|lease| lease.node_id)
+            .collect();
+        required_node_ids.sort();
+        if required_node_ids.is_empty() {
+            return Ok(());
+        }
+
+        self.store_cutover_membership_view(
+            org_id,
+            table_name,
+            extension,
+            existing_view.epoch,
+            target_checkpoint_id,
+            required_node_ids,
+        )
+        .await
+    }
+
+    async fn maybe_reconfigure_cutover_membership_for_target(
+        &mut self,
+        org_id: &String,
+        table_name: &String,
+        extension: &Option<String>,
+        target_checkpoint_id: &String,
+    ) -> Result<(), ServiceApiError> {
+        let Some(existing_view) = self
+            .get_cutover_membership_view(org_id, table_name, extension)
+            .await?
+        else {
+            return Ok(());
+        };
+        if existing_view.target_checkpoint_id != *target_checkpoint_id {
+            return Ok(());
+        }
+
+        let live_node_ids: HashSet<String> = self
+            .live_serving_node_leases(org_id)
+            .await?
+            .into_iter()
+            .map(|lease| lease.node_id)
+            .collect();
+        if live_node_ids.is_empty() {
+            return Ok(());
+        }
+        if existing_view
+            .required_node_ids
+            .iter()
+            .all(|node_id| live_node_ids.contains(node_id))
+        {
+            return Ok(());
+        }
+
+        let mut required_node_ids: Vec<String> = live_node_ids.into_iter().collect();
+        required_node_ids.sort();
+        let epoch = self
+            .bump_cutover_epoch(org_id, table_name, extension)
+            .await?;
+        self.store_cutover_membership_view(
+            org_id,
+            table_name,
+            extension,
+            epoch,
+            target_checkpoint_id,
+            required_node_ids,
+        )
+        .await
+    }
+
+    fn checkpoint_references_any_cleanup_file(
+        checkpoint: &TableMetadataCheckpoint,
+        files_to_delete: &HashSet<String>,
+    ) -> bool {
+        checkpoint
+            .speedboat_metadata
+            .as_ref()
+            .map(|metadata| {
+                metadata
+                    .files
+                    .file_paths
+                    .iter()
+                    .any(|file_path| files_to_delete.contains(file_path))
+            })
+            .unwrap_or(false)
+            || checkpoint
+                .deletes_metadata
+                .as_ref()
+                .map(|metadata| {
+                    metadata
+                        .files
+                        .iter()
+                        .any(|file_path| files_to_delete.contains(file_path))
+                })
+                .unwrap_or(false)
+    }
+
+    async fn cleanup_work_item_is_ready(
+        &mut self,
+        org_info: &OrgInfo,
+        work_item: &CleanupWorkItem,
+    ) -> Result<bool, ServiceApiError> {
+        let files_to_delete: HashSet<String> = work_item.files_to_delete.iter().cloned().collect();
+
+        for extension in [None, Some("es".to_string())] {
+            let Some(checkpoint_id) = self
+                .get_active_checkpoint_id(&org_info.org_id, &work_item.table_name, &extension)
+                .await?
+            else {
+                continue;
+            };
+            let Some(checkpoint) = self
+                .get_checkpoint(
+                    org_info,
+                    &CheckpointDescriptor::new(work_item.table_name.clone(), checkpoint_id),
+                )
+                .await?
+            else {
+                continue;
+            };
+            if Self::checkpoint_references_any_cleanup_file(&checkpoint, &files_to_delete) {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
     async fn activation_matches_target(
         &mut self,
         org_id: &String,
@@ -407,14 +649,33 @@ impl DynamoDBServiceImpl {
         extension: &Option<String>,
         target_checkpoint_id: &String,
     ) -> Result<bool, ServiceApiError> {
-        let live_leases = self.live_serving_node_leases(org_id).await?;
-        if live_leases.is_empty() {
+        self.backfill_cutover_membership_for_target(
+            org_id,
+            table_name,
+            extension,
+            target_checkpoint_id,
+        )
+        .await?;
+        self.maybe_reconfigure_cutover_membership_for_target(
+            org_id,
+            table_name,
+            extension,
+            target_checkpoint_id,
+        )
+        .await?;
+
+        let Some(membership_view) = self
+            .get_cutover_membership_view(org_id, table_name, extension)
+            .await?
+        else {
+            return Ok(false);
+        };
+        if membership_view.target_checkpoint_id != *target_checkpoint_id
+            || membership_view.required_node_ids.is_empty()
+        {
             return Ok(false);
         }
 
-        let epoch = self
-            .get_cutover_epoch(org_id, table_name, extension)
-            .await?;
         let activation_prefix = Self::activation_key_prefix(table_name, extension);
         let activations = self
             .connector
@@ -436,12 +697,18 @@ impl DynamoDBServiceImpl {
             }
         }
 
-        Ok(live_leases.into_iter().all(|lease| {
-            matching_acks
-                .get(&lease.node_id)
-                .map(|ack| ack.checkpoint_id == *target_checkpoint_id && ack.epoch == epoch)
-                .unwrap_or(false)
-        }))
+        Ok(membership_view
+            .required_node_ids
+            .into_iter()
+            .all(|node_id| {
+                matching_acks
+                    .get(&node_id)
+                    .map(|ack| {
+                        ack.checkpoint_id == *target_checkpoint_id
+                            && ack.epoch == membership_view.epoch
+                    })
+                    .unwrap_or(false)
+            }))
     }
 
     async fn promote_active_checkpoint_if_ready(
@@ -1146,7 +1413,14 @@ impl DynamoDBServiceImpl {
                     .await
                     .map_err(from_modyne)?;
                 assert!(work_item.is_some());
-                work_items.push(work_item.unwrap());
+                let work_item = work_item.unwrap();
+                if !self
+                    .cleanup_work_item_is_ready(org_info, &work_item)
+                    .await?
+                {
+                    continue;
+                }
+                work_items.push(work_item);
                 transaction = self
                     .connector
                     .claim_cleanup_work_item_lease(transaction, available_info);
@@ -1345,7 +1619,13 @@ impl DynamoDBServiceImpl {
         if new_target_checkpoint_id != previous_target_checkpoint_id
             && new_target_checkpoint_id.is_some()
         {
-            let _ = self.bump_cutover_epoch(org_id, table_name, &None).await?;
+            self.capture_cutover_membership_for_target(
+                org_id,
+                table_name,
+                &None,
+                &new_target_checkpoint_id.unwrap(),
+            )
+            .await?;
         }
 
         Ok(true)
@@ -1460,9 +1740,13 @@ impl DynamoDBServiceImpl {
         if new_target_checkpoint_id != previous_target_checkpoint_id
             && new_target_checkpoint_id.is_some()
         {
-            let _ = self
-                .bump_cutover_epoch(org_id, table_name, &extension)
-                .await?;
+            self.capture_cutover_membership_for_target(
+                org_id,
+                table_name,
+                &extension,
+                &new_target_checkpoint_id.unwrap(),
+            )
+            .await?;
         }
 
         Ok(work_done)

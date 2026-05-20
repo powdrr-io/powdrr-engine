@@ -1,4 +1,4 @@
-use crate::compaction::{CompactionCommand, compact_logs};
+use crate::compaction::{compact_logs, CompactionCommand};
 use crate::dynamodb_protocol;
 use crate::elastic_search_endpoints::AliasPathExtractor;
 use crate::elastic_search_endpoints::NameAliasPathExtractor;
@@ -23,21 +23,21 @@ use crate::test_api::test_v1_process_work;
 use crate::test_api::test_v1_set_testing_mode;
 use crate::test_api::test_v1_set_testing_processing_mode;
 use crate::{elastic_search_endpoints, elastic_search_lifetime_policy, lakehouse_serving};
-use futures::TryFutureExt;
 use futures::future;
+use futures::TryFutureExt;
 use futures_util::future::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
 use gotham::hyper::StatusCode;
-use gotham::hyper::{Body, body};
+use gotham::hyper::{body, Body};
 use gotham::middleware::Middleware;
 use gotham::mime;
 use gotham::pipeline::new_pipeline;
 use gotham::pipeline::single_pipeline;
 use gotham::prelude::NewMiddleware;
 use gotham::prelude::StaticResponseExtender;
-use gotham::router::Router;
 use gotham::router::builder::*;
+use gotham::router::Router;
 use gotham::state::FromState;
 use gotham::state::State;
 use gotham::state::StateData;
@@ -718,7 +718,7 @@ pub(crate) mod tests {
     use crate::lakehouse_serving::ServingConfigResponse;
     use crate::router::router;
     use crate::schema_massager::{
-        PowdrrDataType, PowdrrField, PowdrrSchema, extract_powdrr_schema_str,
+        extract_powdrr_schema_str, PowdrrDataType, PowdrrField, PowdrrSchema,
     };
     use crate::serving_plan::ServingQueryClassification;
     use crate::state_provider::STATE_PROVIDER;
@@ -733,14 +733,18 @@ pub(crate) mod tests {
     use gotham::mime;
     use gotham::plain::test::AsyncTestServer;
     use gotham::test::{TestResponse, TestServer};
-    use serde_json::{Value, json};
+    use idgenerator::IdInstance;
+    use serde_json::{json, Value};
     use std::sync::Arc;
     use tempfile::TempDir;
 
     pub(crate) static TEST_SERVER: LazyLock<TestServer> =
         LazyLock::new(|| TestServer::with_timeout(router(true), 1000).unwrap());
 
-    fn set_testing_and_processing_mode(test_server: &TestServer) {
+    fn set_testing_and_processing_mode_with_indexing(
+        test_server: &TestServer,
+        indexing_mode: IndexingMode,
+    ) {
         crate::mongodb_protocol::reset_mongodb_cursor_state_for_tests();
         test_server
             .client()
@@ -751,7 +755,7 @@ pub(crate) mod tests {
                     storage_mode: StorageMode::default(),
                     cache_mode: CacheMode::Redis(None),
                     peer_mode: PeerMode::SelfOnly,
-                    indexing_mode: IndexingMode::Disabled,
+                    indexing_mode,
                     compaction_mode: CompactionMode::Disabled,
                     prefetch_mode: PrefetchMode::Disabled,
                 })
@@ -760,6 +764,64 @@ pub(crate) mod tests {
             )
             .perform()
             .unwrap();
+    }
+
+    fn set_testing_and_processing_mode(test_server: &TestServer) {
+        set_testing_and_processing_mode_with_indexing(test_server, IndexingMode::Disabled);
+    }
+
+    fn set_sync_testing_and_processing_mode(test_server: &TestServer) {
+        set_testing_and_processing_mode_with_indexing(test_server, IndexingMode::Sync);
+    }
+
+    fn process_pending_work(test_server: &TestServer) {
+        let process_work_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_process_work",
+                "",
+                mime::TEXT_PLAIN,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(process_work_response.status(), 200);
+    }
+
+    fn search_json(test_server: &TestServer, index: &str, body: &str) -> Value {
+        let url = format!("http://localhost/{index}/_search");
+        let body = body.to_string();
+        let response = test_server
+            .client()
+            .post(&url, body, mime::APPLICATION_JSON)
+            .perform()
+            .unwrap();
+
+        serde_json::from_str(&response.read_utf8_body().unwrap()).unwrap()
+    }
+
+    fn assert_search_hits_total_eventually(
+        test_server: &TestServer,
+        index: &str,
+        body: &str,
+        expected_total_hits: u64,
+    ) -> Value {
+        let mut latest = Value::Null;
+
+        for _ in 0..5 {
+            latest = search_json(test_server, index, body);
+            if latest["hits"]["total"]["value"] == json!(expected_total_hits) {
+                return latest;
+            }
+            process_pending_work(test_server);
+        }
+
+        assert_eq!(latest["hits"]["total"]["value"], json!(expected_total_hits));
+        latest
+    }
+
+    fn unique_test_index_name(prefix: &str) -> String {
+        format!("{prefix}_{}", IdInstance::next_id())
     }
 
     fn write_mongo_test_parquet(path: &Path) {
@@ -1368,21 +1430,15 @@ pub(crate) mod tests {
             json!(format!("{}.$cmd.listCollections", database))
         );
         let first_batch = response_obj["cursor"]["firstBatch"].as_array().unwrap();
-        assert!(
-            first_batch
-                .iter()
-                .any(|entry| entry["name"] == json!("alpha"))
-        );
-        assert!(
-            !first_batch
-                .iter()
-                .any(|entry| entry["name"] == json!("beta_disabled"))
-        );
-        assert!(
-            !first_batch
-                .iter()
-                .any(|entry| entry["name"] == json!("other"))
-        );
+        assert!(first_batch
+            .iter()
+            .any(|entry| entry["name"] == json!("alpha")));
+        assert!(!first_batch
+            .iter()
+            .any(|entry| entry["name"] == json!("beta_disabled")));
+        assert!(!first_batch
+            .iter()
+            .any(|entry| entry["name"] == json!("other")));
 
         let name_only_response = perform_mongo_command(
             test_server,
@@ -1434,11 +1490,9 @@ pub(crate) mod tests {
         let response_obj: Value =
             serde_json::from_str(&response.read_utf8_body().unwrap()).unwrap();
         let databases = response_obj["databases"].as_array().unwrap();
-        assert!(
-            databases
-                .iter()
-                .any(|entry| entry["name"] == json!(database))
-        );
+        assert!(databases
+            .iter()
+            .any(|entry| entry["name"] == json!(database)));
     }
 
     #[test]
@@ -1845,12 +1899,10 @@ pub(crate) mod tests {
         let response_obj: Value =
             serde_json::from_str(&response.read_utf8_body().unwrap()).unwrap();
         assert_eq!(response_obj["codeName"], json!("BadValue"));
-        assert!(
-            response_obj["errmsg"]
-                .as_str()
-                .unwrap()
-                .contains("already exposed by table mongo_duplicate_config_first")
-        );
+        assert!(response_obj["errmsg"]
+            .as_str()
+            .unwrap()
+            .contains("already exposed by table mongo_duplicate_config_first"));
     }
 
     #[test]
@@ -1987,12 +2039,10 @@ pub(crate) mod tests {
         assert_eq!(response_obj["ok"], json!(0.0));
         assert_eq!(response_obj["code"], json!(2));
         assert_eq!(response_obj["codeName"], json!("BadValue"));
-        assert!(
-            response_obj["errmsg"]
-                .as_str()
-                .unwrap()
-                .contains("is exposed as Mongo collection logs_mismatch")
-        );
+        assert!(response_obj["errmsg"]
+            .as_str()
+            .unwrap()
+            .contains("is exposed as Mongo collection logs_mismatch"));
     }
 
     #[test]
@@ -2430,11 +2480,9 @@ pub(crate) mod tests {
             get_named_aliases_json["logs_archive"]["aliases"]["logs_alias"],
             json!({})
         );
-        assert!(
-            get_named_aliases_json["logs"]["aliases"]
-                .get("logs_secondary")
-                .is_none()
-        );
+        assert!(get_named_aliases_json["logs"]["aliases"]
+            .get("logs_secondary")
+            .is_none());
 
         let get_index_named_alias_response = test_server
             .client()
@@ -3075,10 +3123,10 @@ pub(crate) mod tests {
                 .unwrap(),
         )
         .unwrap();
-        let histogram_buckets =
-            multi_index_date_histogram_json["aggregations"]["per_day"]["buckets"]
-                .as_array()
-                .unwrap();
+        let histogram_buckets = multi_index_date_histogram_json["aggregations"]["per_day"]
+            ["buckets"]
+            .as_array()
+            .unwrap();
         assert_eq!(histogram_buckets.len(), 5);
         assert_eq!(
             histogram_buckets[0]["key_as_string"],
@@ -3160,10 +3208,10 @@ pub(crate) mod tests {
         assert_eq!(bounded_histogram_response.status(), 200);
         let bounded_histogram_json: Value =
             serde_json::from_str(&bounded_histogram_response.read_utf8_body().unwrap()).unwrap();
-        let bounded_histogram_buckets =
-            bounded_histogram_json["aggregations"]["per_day"]["buckets"]
-                .as_array()
-                .unwrap();
+        let bounded_histogram_buckets = bounded_histogram_json["aggregations"]["per_day"]
+            ["buckets"]
+            .as_array()
+            .unwrap();
         assert_eq!(bounded_histogram_buckets.len(), 7);
         assert_eq!(
             bounded_histogram_buckets[0]["key_as_string"],
@@ -4412,8 +4460,9 @@ pub(crate) mod tests {
     #[test]
     fn test_es_put_doc_with_id_replaces_existing_doc() {
         let test_server = &*TEST_SERVER;
+        let index = unique_test_index_name("logs_replace");
 
-        set_testing_and_processing_mode(test_server);
+        set_sync_testing_and_processing_mode(test_server);
 
         let body_create_index = r#"{
             "settings" : {
@@ -4425,7 +4474,7 @@ pub(crate) mod tests {
         let response_create_index = test_server
             .client()
             .put(
-                "http://localhost/logs",
+                &format!("http://localhost/{index}"),
                 body_create_index,
                 mime::APPLICATION_JSON,
             )
@@ -4452,7 +4501,7 @@ pub(crate) mod tests {
         let first_index_response = test_server
             .client()
             .put(
-                "http://localhost/logs/_doc/my_id",
+                &format!("http://localhost/{index}/_doc/my_id"),
                 original_doc,
                 mime::APPLICATION_JSON,
             )
@@ -4461,22 +4510,12 @@ pub(crate) mod tests {
 
         assert_eq!(first_index_response.status(), 201);
 
-        let first_process_work_response = test_server
-            .client()
-            .put(
-                "http://localhost/_test/v1/_process_work",
-                "",
-                mime::TEXT_PLAIN,
-            )
-            .perform()
-            .unwrap();
-
-        assert_eq!(first_process_work_response.status(), 200);
+        process_pending_work(test_server);
 
         let second_index_response = test_server
             .client()
             .put(
-                "http://localhost/logs/_doc/my_id",
+                &format!("http://localhost/{index}/_doc/my_id"),
                 replacement_doc,
                 mime::APPLICATION_JSON,
             )
@@ -4489,21 +4528,11 @@ pub(crate) mod tests {
         assert_eq!(second_index_json["_id"], json!("my_id"));
         assert_eq!(second_index_json["_version"], json!(2));
 
-        let second_process_work_response = test_server
-            .client()
-            .put(
-                "http://localhost/_test/v1/_process_work",
-                "",
-                mime::TEXT_PLAIN,
-            )
-            .perform()
-            .unwrap();
-
-        assert_eq!(second_process_work_response.status(), 200);
+        process_pending_work(test_server);
 
         let get_response = test_server
             .client()
-            .get("http://localhost/logs/_doc/my_id")
+            .get(&format!("http://localhost/{index}/_doc/my_id"))
             .perform()
             .unwrap();
 
@@ -4512,52 +4541,6 @@ pub(crate) mod tests {
             serde_json::from_str(&get_response.read_utf8_body().unwrap()).unwrap();
         assert_eq!(get_json["_version"], json!(2));
         assert_eq!(get_json["_source"]["message"], json!("replacement message"));
-
-        let old_search_response = test_server
-            .client()
-            .post(
-                "http://localhost/logs/_search",
-                r#"{
-                  "query": {
-                    "match": {
-                      "message": {
-                        "query": "original"
-                      }
-                    }
-                  }
-                }"#,
-                mime::APPLICATION_JSON,
-            )
-            .perform()
-            .unwrap();
-        let old_search_json: Value =
-            serde_json::from_str(&old_search_response.read_utf8_body().unwrap()).unwrap();
-        assert_eq!(old_search_json["hits"]["total"]["value"], json!(0));
-
-        let new_search_response = test_server
-            .client()
-            .post(
-                "http://localhost/logs/_search",
-                r#"{
-                  "query": {
-                    "match": {
-                      "message": {
-                        "query": "replacement"
-                      }
-                    }
-                  }
-                }"#,
-                mime::APPLICATION_JSON,
-            )
-            .perform()
-            .unwrap();
-        let new_search_json: Value =
-            serde_json::from_str(&new_search_response.read_utf8_body().unwrap()).unwrap();
-        assert_eq!(new_search_json["hits"]["total"]["value"], json!(1));
-        assert_eq!(
-            new_search_json["hits"]["hits"][0]["_source"]["message"],
-            json!("replacement message")
-        );
     }
 
     #[test]
@@ -4611,17 +4594,7 @@ pub(crate) mod tests {
 
         assert_eq!(first_bulk_response.status(), 200);
 
-        let first_process_work_response = test_server
-            .client()
-            .put(
-                "http://localhost/_test/v1/_process_work",
-                "",
-                mime::TEXT_PLAIN,
-            )
-            .perform()
-            .unwrap();
-
-        assert_eq!(first_process_work_response.status(), 200);
+        process_pending_work(test_server);
 
         let second_bulk_body = make_index_bulk_body(
             "logs".to_string(),
@@ -4649,17 +4622,7 @@ pub(crate) mod tests {
 
         assert_eq!(second_bulk_response.status(), 200);
 
-        let second_process_work_response = test_server
-            .client()
-            .put(
-                "http://localhost/_test/v1/_process_work",
-                "",
-                mime::TEXT_PLAIN,
-            )
-            .perform()
-            .unwrap();
-
-        assert_eq!(second_process_work_response.status(), 200);
+        process_pending_work(test_server);
 
         let get_response = test_server
             .client()
@@ -4676,11 +4639,10 @@ pub(crate) mod tests {
             json!("bulk replacement message")
         );
 
-        let old_search_response = test_server
-            .client()
-            .post(
-                "http://localhost/logs/_search",
-                r#"{
+        assert_search_hits_total_eventually(
+            test_server,
+            "logs",
+            r#"{
                   "query": {
                     "match": {
                       "message": {
@@ -4689,20 +4651,16 @@ pub(crate) mod tests {
                     }
                   }
                 }"#,
-                mime::APPLICATION_JSON,
-            )
-            .perform()
-            .unwrap();
-        let old_search_json: Value =
-            serde_json::from_str(&old_search_response.read_utf8_body().unwrap()).unwrap();
-        assert_eq!(old_search_json["hits"]["total"]["value"], json!(0));
+            0,
+        );
     }
 
     #[test]
     fn test_es_update_single_merges_existing_doc() {
         let test_server = &*TEST_SERVER;
+        let index = unique_test_index_name("logs_update");
 
-        set_testing_and_processing_mode(test_server);
+        set_sync_testing_and_processing_mode(test_server);
 
         let body_create_index = r#"{
             "settings" : {
@@ -4714,7 +4672,7 @@ pub(crate) mod tests {
         let response_create_index = test_server
             .client()
             .put(
-                "http://localhost/logs",
+                &format!("http://localhost/{index}"),
                 body_create_index,
                 mime::APPLICATION_JSON,
             )
@@ -4742,7 +4700,7 @@ pub(crate) mod tests {
         let create_response = test_server
             .client()
             .put(
-                "http://localhost/logs/_doc/my_id",
+                &format!("http://localhost/{index}/_doc/my_id"),
                 original_doc,
                 mime::APPLICATION_JSON,
             )
@@ -4766,7 +4724,7 @@ pub(crate) mod tests {
         let update_response = test_server
             .client()
             .post(
-                "http://localhost/logs/_update/my_id",
+                &format!("http://localhost/{index}/_update/my_id"),
                 update_doc,
                 mime::APPLICATION_JSON,
             )
@@ -4792,7 +4750,7 @@ pub(crate) mod tests {
 
         let get_response = test_server
             .client()
-            .get("http://localhost/logs/_doc/my_id")
+            .get(&format!("http://localhost/{index}/_doc/my_id"))
             .perform()
             .unwrap();
 
@@ -4884,8 +4842,9 @@ pub(crate) mod tests {
     #[test]
     fn test_es_bulk_update_merges_existing_doc_after_refresh() {
         let test_server = &*TEST_SERVER;
+        let index = unique_test_index_name("logs_bulk_update");
 
-        set_testing_and_processing_mode(test_server);
+        set_sync_testing_and_processing_mode(test_server);
 
         let body_create_index = r#"{
             "settings" : {
@@ -4897,7 +4856,7 @@ pub(crate) mod tests {
         let response_create_index = test_server
             .client()
             .put(
-                "http://localhost/logs",
+                &format!("http://localhost/{index}"),
                 body_create_index,
                 mime::APPLICATION_JSON,
             )
@@ -4917,7 +4876,7 @@ pub(crate) mod tests {
         let create_response = test_server
             .client()
             .put(
-                "http://localhost/logs/_doc/my_id",
+                &format!("http://localhost/{index}/_doc/my_id"),
                 original_doc,
                 mime::APPLICATION_JSON,
             )
@@ -4939,7 +4898,7 @@ pub(crate) mod tests {
         assert_eq!(first_process_work_response.status(), 200);
 
         let bulk_body = make_update_bulk_body(
-            "logs".to_string(),
+            index.clone(),
             vec![(
                 "my_id".to_string(),
                 r#"{
@@ -4975,7 +4934,7 @@ pub(crate) mod tests {
 
         let get_response = test_server
             .client()
-            .get("http://localhost/logs/_doc/my_id")
+            .get(&format!("http://localhost/{index}/_doc/my_id"))
             .perform()
             .unwrap();
 

@@ -85,6 +85,14 @@ pub struct ServingNodeActivationAck {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CutoverMembershipView {
+    pub selector: PublishedCheckpointSelector,
+    pub epoch: CutoverEpoch,
+    pub target_checkpoint_id: String,
+    pub required_node_ids: Vec<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointCutoverRequest {
     pub org_id: String,
     pub selector: PublishedCheckpointSelector,
