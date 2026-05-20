@@ -13,7 +13,8 @@ use aws_sdk_dynamodb::operation::query::QueryOutput;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, KeySchemaElement,
     KeyType, KeysAndAttributes, LocalSecondaryIndex, Projection, ProjectionType,
-    ReturnConsumedCapacity, ScalarAttributeType, Select, TableDescription, TableStatus,
+    ReturnConsumedCapacity, ReturnValue, ScalarAttributeType, Select, TableDescription,
+    TableStatus,
 };
 use chrono::Utc;
 use datafusion::arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
@@ -108,9 +109,11 @@ const ALL_DYNAMODB_OPERATIONS: &[&str] = &[
 
 const SUPPORTED_DYNAMODB_OPERATIONS: &[&str] = &[
     "BatchGetItem",
+    "DeleteItem",
     "DescribeTable",
     "GetItem",
     "ListTables",
+    "PutItem",
     "Query",
     "Scan",
 ];
@@ -193,6 +196,7 @@ struct DifferentialFixture {
     rows: Vec<EventRow>,
     primary_table_name: String,
     begins_with_table_name: String,
+    write_table_name: String,
     hidden_table_name: String,
     region_event_id_index: String,
     tenant_count_index: String,
@@ -281,6 +285,8 @@ fn compatibility_matrix_wire_contract_locally() {
                     "DescribeTable" => compare_describe_table(&fixture).await,
                     "GetItem" => compare_get_item(&fixture).await,
                     "BatchGetItem" => compare_batch_get_item(&fixture).await,
+                    "PutItem" => compare_put_item_operation(&fixture).await,
+                    "DeleteItem" => compare_delete_item_operation(&fixture).await,
                     "Query" => compare_query_operation(&fixture).await,
                     "Scan" => compare_scan_operation(&fixture).await,
                     other => panic!(
@@ -307,6 +313,7 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
 
     let primary_table_name = unique_table_name("dynamo_matrix_primary");
     let begins_with_table_name = unique_table_name("dynamo_matrix_begins_with");
+    let write_table_name = unique_table_name("dynamo_matrix_write");
     let hidden_table_name = unique_table_name("dynamo_matrix_hidden");
     let region_event_id_index = "region-event-id-index".to_string();
     let tenant_count_index = "tenant-count-index".to_string();
@@ -342,6 +349,19 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
         &DynamoDbTableConfig {
             partition_key: "tenant".to_string(),
             sort_key: Some("event_id".to_string()),
+            local_secondary_indexes: vec![],
+            global_secondary_indexes: vec![],
+        },
+    )
+    .await;
+    eprintln!("dynamo fixture: configuring Powdrr write table");
+    configure_powdrr_table(
+        base_url,
+        &write_table_name,
+        &parquet_path,
+        &DynamoDbTableConfig {
+            partition_key: "tenant".to_string(),
+            sort_key: Some("ts".to_string()),
             local_secondary_indexes: vec![],
             global_secondary_indexes: vec![],
         },
@@ -383,6 +403,17 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
         vec![],
     )
     .await;
+    eprintln!("dynamo fixture: creating LocalStack write table");
+    create_localstack_table(
+        &localstack_client,
+        &write_table_name,
+        &rows,
+        "ts",
+        ScalarAttributeType::N,
+        vec![],
+        vec![],
+    )
+    .await;
     eprintln!("dynamo fixture: waiting for Powdrr primary rows");
     wait_for_powdrr_rows(
         &powdrr_client,
@@ -399,6 +430,14 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
         &[&rows[0], &rows[2]],
     )
     .await;
+    eprintln!("dynamo fixture: waiting for Powdrr write rows");
+    wait_for_powdrr_rows(
+        &powdrr_client,
+        &write_table_name,
+        "ts",
+        &[&rows[1], &rows[3]],
+    )
+    .await;
     eprintln!("dynamo fixture: ready");
 
     DifferentialFixture {
@@ -408,6 +447,7 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
         rows,
         primary_table_name,
         begins_with_table_name,
+        write_table_name,
         hidden_table_name,
         region_event_id_index,
         tenant_count_index,
@@ -581,6 +621,30 @@ async fn assert_stateful_query_errors(base_url: &str, table_name: &str) {
             }),
             "Consistent reads are not supported on global secondary indexes",
         ),
+        (
+            "PutItem",
+            json!({
+                "TableName": table_name,
+                "Item": {
+                    "tenant": { "S": "acme" },
+                    "ts": { "N": "55" }
+                },
+                "ReturnValues": "ALL_NEW"
+            }),
+            "Unsupported ReturnValues value ALL_NEW for PutItem",
+        ),
+        (
+            "DeleteItem",
+            json!({
+                "TableName": table_name,
+                "Key": {
+                    "tenant": { "S": "acme" },
+                    "ts": { "N": "10" }
+                },
+                "ReturnValues": "UPDATED_OLD"
+            }),
+            "Unsupported ReturnValues value UPDATED_OLD for DeleteItem",
+        ),
     ];
 
     for (operation, body, expected_message_fragment) in explicit_error_cases {
@@ -641,6 +705,7 @@ async fn compare_list_tables(fixture: &DifferentialFixture) {
     let expected_names = fixture_table_names(&[
         fixture.primary_table_name.clone(),
         fixture.begins_with_table_name.clone(),
+        fixture.write_table_name.clone(),
     ]);
 
     assert!(
@@ -969,6 +1034,299 @@ async fn compare_batch_get_item(fixture: &DifferentialFixture) {
             &localstack_multi_table_output,
             &fixture.begins_with_table_name
         ))
+    );
+}
+
+async fn compare_put_item_operation(fixture: &DifferentialFixture) {
+    let replacement_item = item_from_json(json!({
+        "tenant": "acme",
+        "ts": 20,
+        "event_id": "evt-2-replaced",
+        "region": "us-west-1",
+        "active": true,
+        "count": 22
+    }));
+
+    let powdrr_replace = fixture
+        .powdrr_client
+        .put_item()
+        .table_name(&fixture.write_table_name)
+        .set_item(Some(replacement_item.clone()))
+        .condition_expression("attribute_exists(#pk) AND #count = :count")
+        .expression_attribute_names("#pk", "tenant")
+        .expression_attribute_names("#count", "count")
+        .expression_attribute_values(":count", AttributeValue::N("2".to_string()))
+        .return_values(ReturnValue::AllOld)
+        .send()
+        .await
+        .unwrap();
+    let localstack_replace = fixture
+        .localstack_client
+        .put_item()
+        .table_name(&fixture.write_table_name)
+        .set_item(Some(replacement_item))
+        .condition_expression("attribute_exists(#pk) AND #count = :count")
+        .expression_attribute_names("#pk", "tenant")
+        .expression_attribute_names("#count", "count")
+        .expression_attribute_values(":count", AttributeValue::N("2".to_string()))
+        .return_values(ReturnValue::AllOld)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        optional_item_to_json(powdrr_replace.attributes()),
+        Some(json!({
+            "tenant": "acme",
+            "ts": 20,
+            "event_id": "evt-2",
+            "region": "us-west-2",
+            "active": false,
+            "count": 2,
+        }))
+    );
+    assert_eq!(
+        optional_item_to_json(powdrr_replace.attributes()),
+        optional_item_to_json(localstack_replace.attributes())
+    );
+
+    let inserted_item = item_from_json(json!({
+        "tenant": "acme",
+        "ts": 40,
+        "event_id": "evt-40",
+        "region": "us-east-2",
+        "active": false,
+        "count": 40
+    }));
+    let powdrr_insert = fixture
+        .powdrr_client
+        .put_item()
+        .table_name(&fixture.write_table_name)
+        .set_item(Some(inserted_item.clone()))
+        .condition_expression("attribute_not_exists(#pk) AND attribute_not_exists(#sk)")
+        .expression_attribute_names("#pk", "tenant")
+        .expression_attribute_names("#sk", "ts")
+        .return_values(ReturnValue::None)
+        .send()
+        .await
+        .unwrap();
+    let localstack_insert = fixture
+        .localstack_client
+        .put_item()
+        .table_name(&fixture.write_table_name)
+        .set_item(Some(inserted_item))
+        .condition_expression("attribute_not_exists(#pk) AND attribute_not_exists(#sk)")
+        .expression_attribute_names("#pk", "tenant")
+        .expression_attribute_names("#sk", "ts")
+        .return_values(ReturnValue::None)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(powdrr_insert.attributes(), None);
+    assert_eq!(powdrr_insert.attributes(), localstack_insert.attributes());
+
+    let powdrr_after_insert = fixture
+        .powdrr_client
+        .get_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(40))))
+        .send()
+        .await
+        .unwrap();
+    let localstack_after_insert = fixture
+        .localstack_client
+        .get_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(40))))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        optional_item_to_json(powdrr_after_insert.item()),
+        Some(json!({
+            "tenant": "acme",
+            "ts": 40,
+            "event_id": "evt-40",
+            "region": "us-east-2",
+            "active": false,
+            "count": 40,
+        }))
+    );
+    assert_eq!(
+        optional_item_to_json(powdrr_after_insert.item()),
+        optional_item_to_json(localstack_after_insert.item())
+    );
+
+    let powdrr_condition_failure = fixture
+        .powdrr_client
+        .put_item()
+        .table_name(&fixture.write_table_name)
+        .set_item(Some(item_from_json(json!({
+            "tenant": "acme",
+            "ts": 40,
+            "event_id": "evt-40-fail",
+            "region": "us-east-2",
+            "active": true,
+            "count": 41,
+        }))))
+        .condition_expression("attribute_not_exists(#pk)")
+        .expression_attribute_names("#pk", "tenant")
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    let localstack_condition_failure = fixture
+        .localstack_client
+        .put_item()
+        .table_name(&fixture.write_table_name)
+        .set_item(Some(item_from_json(json!({
+            "tenant": "acme",
+            "ts": 40,
+            "event_id": "evt-40-fail",
+            "region": "us-east-2",
+            "active": true,
+            "count": 41,
+        }))))
+        .condition_expression("attribute_not_exists(#pk)")
+        .expression_attribute_names("#pk", "tenant")
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    assert_eq!(
+        powdrr_condition_failure.meta().code(),
+        Some("ConditionalCheckFailedException")
+    );
+    assert_eq!(
+        powdrr_condition_failure.meta().code(),
+        localstack_condition_failure.meta().code()
+    );
+}
+
+async fn compare_delete_item_operation(fixture: &DifferentialFixture) {
+    fixture
+        .powdrr_client
+        .put_item()
+        .table_name(&fixture.write_table_name)
+        .set_item(Some(item_from_json(json!({
+            "tenant": "acme",
+            "ts": 41,
+            "event_id": "evt-41",
+            "region": "us-east-2",
+            "active": true,
+            "count": 41
+        }))))
+        .send()
+        .await
+        .unwrap();
+    fixture
+        .localstack_client
+        .put_item()
+        .table_name(&fixture.write_table_name)
+        .set_item(Some(item_from_json(json!({
+            "tenant": "acme",
+            "ts": 41,
+            "event_id": "evt-41",
+            "region": "us-east-2",
+            "active": true,
+            "count": 41
+        }))))
+        .send()
+        .await
+        .unwrap();
+
+    let powdrr_delete = fixture
+        .powdrr_client
+        .delete_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(41))))
+        .condition_expression("#count = :count")
+        .expression_attribute_names("#count", "count")
+        .expression_attribute_values(":count", AttributeValue::N("41".to_string()))
+        .return_values(ReturnValue::AllOld)
+        .send()
+        .await
+        .unwrap();
+    let localstack_delete = fixture
+        .localstack_client
+        .delete_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(41))))
+        .condition_expression("#count = :count")
+        .expression_attribute_names("#count", "count")
+        .expression_attribute_values(":count", AttributeValue::N("41".to_string()))
+        .return_values(ReturnValue::AllOld)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        optional_item_to_json(powdrr_delete.attributes()),
+        Some(json!({
+            "tenant": "acme",
+            "ts": 41,
+            "event_id": "evt-41",
+            "region": "us-east-2",
+            "active": true,
+            "count": 41,
+        }))
+    );
+    assert_eq!(
+        optional_item_to_json(powdrr_delete.attributes()),
+        optional_item_to_json(localstack_delete.attributes())
+    );
+
+    let powdrr_missing_delete = fixture
+        .powdrr_client
+        .delete_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(999))))
+        .return_values(ReturnValue::AllOld)
+        .send()
+        .await
+        .unwrap();
+    let localstack_missing_delete = fixture
+        .localstack_client
+        .delete_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(999))))
+        .return_values(ReturnValue::AllOld)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(powdrr_missing_delete.attributes(), None);
+    assert_eq!(
+        powdrr_missing_delete.attributes(),
+        localstack_missing_delete.attributes()
+    );
+
+    let powdrr_condition_failure = fixture
+        .powdrr_client
+        .delete_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(10))))
+        .condition_expression("attribute_not_exists(#event)")
+        .expression_attribute_names("#event", "event_id")
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    let localstack_condition_failure = fixture
+        .localstack_client
+        .delete_item()
+        .table_name(&fixture.write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(10))))
+        .condition_expression("attribute_not_exists(#event)")
+        .expression_attribute_names("#event", "event_id")
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    assert_eq!(
+        powdrr_condition_failure.meta().code(),
+        Some("ConditionalCheckFailedException")
+    );
+    assert_eq!(
+        powdrr_condition_failure.meta().code(),
+        localstack_condition_failure.meta().code()
     );
 }
 
@@ -2654,6 +3012,10 @@ fn optional_item_to_json(item: Option<&HashMap<String, AttributeValue>>) -> Opti
 
 fn item_map_to_json(item: HashMap<String, AttributeValue>) -> Value {
     serde_dynamo::aws_sdk_dynamodb_1::from_item(item).unwrap()
+}
+
+fn item_from_json(item: Value) -> HashMap<String, AttributeValue> {
+    serde_dynamo::aws_sdk_dynamodb_1::to_item(item).unwrap()
 }
 
 fn normalize_item_list(items: Vec<Value>) -> Vec<Value> {

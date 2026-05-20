@@ -11,7 +11,8 @@ use aws_sdk_dynamodb::client::Waiters;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, KeySchemaElement,
     KeyType, KeysAndAttributes, LocalSecondaryIndex, Projection, ProjectionType,
-    ReturnConsumedCapacity, ScalarAttributeType, Select, TableDescription, TableStatus,
+    ReturnConsumedCapacity, ReturnValue, ScalarAttributeType, Select, TableDescription,
+    TableStatus,
 };
 use datafusion::arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -115,6 +116,7 @@ async fn run_dynamodb_sdk_compat_test() {
 
     let table_name = unique_table_name("dynamo_sdk_compat");
     let begins_with_table_name = unique_table_name("dynamo_sdk_begins_with");
+    let write_table_name = unique_table_name("dynamo_sdk_write");
     let region_event_id_index = "region-event-id-index".to_string();
     let tenant_count_index = "tenant-count-index".to_string();
     let powdrr_server = PowdrrServer::spawn().await;
@@ -151,6 +153,18 @@ async fn run_dynamodb_sdk_compat_test() {
         },
     )
     .await;
+    configure_powdrr_table(
+        &powdrr_server.base_url,
+        &write_table_name,
+        &parquet_path,
+        &DynamoDbTableConfig {
+            partition_key: "tenant".to_string(),
+            sort_key: Some("ts".to_string()),
+            local_secondary_indexes: vec![],
+            global_secondary_indexes: vec![],
+        },
+    )
+    .await;
 
     let powdrr_client = dynamodb_client(&powdrr_server.base_url).await;
     let localstack_client = dynamodb_client("http://127.0.0.1:4566").await;
@@ -179,6 +193,16 @@ async fn run_dynamodb_sdk_compat_test() {
         &rows,
         "event_id",
         ScalarAttributeType::S,
+        vec![],
+        vec![],
+    )
+    .await;
+    create_localstack_table(
+        &localstack_client,
+        &write_table_name,
+        &rows,
+        "ts",
+        ScalarAttributeType::N,
         vec![],
         vec![],
     )
@@ -774,6 +798,129 @@ async fn run_dynamodb_sdk_compat_test() {
             .consumed_capacity()
             .and_then(|capacity| capacity.capacity_units())
             .is_some()
+    );
+
+    let powdrr_put_replace = put_item_replace_existing(&powdrr_client, &write_table_name).await;
+    let localstack_put_replace =
+        put_item_replace_existing(&localstack_client, &write_table_name).await;
+    assert_eq!(
+        optional_item_to_json(powdrr_put_replace.attributes()),
+        Some(json!({
+            "tenant": "acme",
+            "ts": 20,
+            "event_id": "evt-2",
+            "region": "us-west-2",
+            "active": false,
+            "count": 2,
+        }))
+    );
+    assert_eq!(
+        optional_item_to_json(powdrr_put_replace.attributes()),
+        optional_item_to_json(localstack_put_replace.attributes())
+    );
+
+    let powdrr_put_insert = put_item_insert_new(&powdrr_client, &write_table_name).await;
+    let localstack_put_insert = put_item_insert_new(&localstack_client, &write_table_name).await;
+    assert_eq!(powdrr_put_insert.attributes(), None);
+    assert_eq!(
+        powdrr_put_insert.attributes(),
+        localstack_put_insert.attributes()
+    );
+
+    let powdrr_after_insert = powdrr_client
+        .get_item()
+        .table_name(&write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(40))))
+        .send()
+        .await
+        .unwrap();
+    let localstack_after_insert = localstack_client
+        .get_item()
+        .table_name(&write_table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(40))))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        optional_item_to_json(powdrr_after_insert.item()),
+        Some(json!({
+            "tenant": "acme",
+            "ts": 40,
+            "event_id": "evt-40",
+            "region": "us-east-2",
+            "active": false,
+            "count": 40,
+        }))
+    );
+    assert_eq!(
+        optional_item_to_json(powdrr_after_insert.item()),
+        optional_item_to_json(localstack_after_insert.item())
+    );
+
+    let powdrr_put_condition_failure =
+        put_item_condition_failure(&powdrr_client, &write_table_name)
+            .await
+            .unwrap_err()
+            .into_service_error();
+    let localstack_put_condition_failure =
+        put_item_condition_failure(&localstack_client, &write_table_name)
+            .await
+            .unwrap_err()
+            .into_service_error();
+    assert_eq!(
+        powdrr_put_condition_failure.meta().code(),
+        Some("ConditionalCheckFailedException")
+    );
+    assert_eq!(
+        powdrr_put_condition_failure.meta().code(),
+        localstack_put_condition_failure.meta().code()
+    );
+
+    let powdrr_delete_existing = delete_item_existing(&powdrr_client, &write_table_name).await;
+    let localstack_delete_existing =
+        delete_item_existing(&localstack_client, &write_table_name).await;
+    assert_eq!(
+        optional_item_to_json(powdrr_delete_existing.attributes()),
+        Some(json!({
+            "tenant": "acme",
+            "ts": 40,
+            "event_id": "evt-40",
+            "region": "us-east-2",
+            "active": false,
+            "count": 40,
+        }))
+    );
+    assert_eq!(
+        optional_item_to_json(powdrr_delete_existing.attributes()),
+        optional_item_to_json(localstack_delete_existing.attributes())
+    );
+
+    let powdrr_delete_missing = delete_item_missing(&powdrr_client, &write_table_name).await;
+    let localstack_delete_missing =
+        delete_item_missing(&localstack_client, &write_table_name).await;
+    assert_eq!(powdrr_delete_missing.attributes(), None);
+    assert_eq!(
+        powdrr_delete_missing.attributes(),
+        localstack_delete_missing.attributes()
+    );
+
+    let powdrr_delete_condition_failure =
+        delete_item_condition_failure(&powdrr_client, &write_table_name)
+            .await
+            .unwrap_err()
+            .into_service_error();
+    let localstack_delete_condition_failure =
+        delete_item_condition_failure(&localstack_client, &write_table_name)
+            .await
+            .unwrap_err()
+            .into_service_error();
+    assert_eq!(
+        powdrr_delete_condition_failure.meta().code(),
+        Some("ConditionalCheckFailedException")
+    );
+    assert_eq!(
+        powdrr_delete_condition_failure.meta().code(),
+        localstack_delete_condition_failure.meta().code()
     );
 }
 
@@ -1372,6 +1519,127 @@ async fn collect_scan_pages(
     }
 }
 
+async fn put_item_replace_existing(
+    client: &DynamoClient,
+    table_name: &str,
+) -> aws_sdk_dynamodb::operation::put_item::PutItemOutput {
+    client
+        .put_item()
+        .table_name(table_name)
+        .set_item(Some(item_from_json(json!({
+            "tenant": "acme",
+            "ts": 20,
+            "event_id": "evt-2-replaced",
+            "region": "us-west-1",
+            "active": true,
+            "count": 22,
+        }))))
+        .condition_expression("attribute_exists(#pk) AND #count = :count")
+        .expression_attribute_names("#pk", "tenant")
+        .expression_attribute_names("#count", "count")
+        .expression_attribute_values(":count", AttributeValue::N("2".to_string()))
+        .return_values(ReturnValue::AllOld)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn put_item_insert_new(
+    client: &DynamoClient,
+    table_name: &str,
+) -> aws_sdk_dynamodb::operation::put_item::PutItemOutput {
+    client
+        .put_item()
+        .table_name(table_name)
+        .set_item(Some(item_from_json(json!({
+            "tenant": "acme",
+            "ts": 40,
+            "event_id": "evt-40",
+            "region": "us-east-2",
+            "active": false,
+            "count": 40,
+        }))))
+        .condition_expression("attribute_not_exists(#pk) AND attribute_not_exists(#sk)")
+        .expression_attribute_names("#pk", "tenant")
+        .expression_attribute_names("#sk", "ts")
+        .return_values(ReturnValue::None)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn put_item_condition_failure(
+    client: &DynamoClient,
+    table_name: &str,
+) -> Result<
+    aws_sdk_dynamodb::operation::put_item::PutItemOutput,
+    aws_sdk_dynamodb::error::SdkError<aws_sdk_dynamodb::operation::put_item::PutItemError>,
+> {
+    client
+        .put_item()
+        .table_name(table_name)
+        .set_item(Some(item_from_json(json!({
+            "tenant": "acme",
+            "ts": 40,
+            "event_id": "evt-40-fail",
+            "region": "us-east-2",
+            "active": true,
+            "count": 41,
+        }))))
+        .condition_expression("attribute_not_exists(#pk)")
+        .expression_attribute_names("#pk", "tenant")
+        .send()
+        .await
+}
+
+async fn delete_item_existing(
+    client: &DynamoClient,
+    table_name: &str,
+) -> aws_sdk_dynamodb::operation::delete_item::DeleteItemOutput {
+    client
+        .delete_item()
+        .table_name(table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(40))))
+        .condition_expression("#count = :count")
+        .expression_attribute_names("#count", "count")
+        .expression_attribute_values(":count", AttributeValue::N("40".to_string()))
+        .return_values(ReturnValue::AllOld)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn delete_item_missing(
+    client: &DynamoClient,
+    table_name: &str,
+) -> aws_sdk_dynamodb::operation::delete_item::DeleteItemOutput {
+    client
+        .delete_item()
+        .table_name(table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(999))))
+        .return_values(ReturnValue::AllOld)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn delete_item_condition_failure(
+    client: &DynamoClient,
+    table_name: &str,
+) -> Result<
+    aws_sdk_dynamodb::operation::delete_item::DeleteItemOutput,
+    aws_sdk_dynamodb::error::SdkError<aws_sdk_dynamodb::operation::delete_item::DeleteItemError>,
+> {
+    client
+        .delete_item()
+        .table_name(table_name)
+        .set_key(Some(primary_key_item_from_parts("acme", json!(10))))
+        .condition_expression("attribute_not_exists(#event)")
+        .expression_attribute_names("#event", "event_id")
+        .send()
+        .await
+}
+
 fn compare_table_descriptions(powdrr: &TableDescription, localstack: &TableDescription) {
     assert_eq!(powdrr.table_name(), localstack.table_name());
     assert_eq!(
@@ -1528,6 +1796,10 @@ fn item_map_to_json(item: HashMap<String, AttributeValue>) -> Value {
     serde_dynamo::aws_sdk_dynamodb_1::from_item(item).unwrap()
 }
 
+fn item_from_json(item: Value) -> HashMap<String, AttributeValue> {
+    serde_dynamo::aws_sdk_dynamodb_1::to_item(item).unwrap()
+}
+
 fn normalize_item_list(items: Vec<Value>) -> Vec<Value> {
     let mut keyed = items
         .into_iter()
@@ -1555,6 +1827,14 @@ fn primary_key_item(row: &EventRow) -> HashMap<String, AttributeValue> {
     serde_dynamo::aws_sdk_dynamodb_1::to_item(json!({
         "tenant": row.tenant.clone(),
         "ts": row.ts,
+    }))
+    .unwrap()
+}
+
+fn primary_key_item_from_parts(tenant: &str, ts: Value) -> HashMap<String, AttributeValue> {
+    serde_dynamo::aws_sdk_dynamodb_1::to_item(json!({
+        "tenant": tenant,
+        "ts": ts,
     }))
     .unwrap()
 }
