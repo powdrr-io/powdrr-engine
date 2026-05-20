@@ -1,15 +1,14 @@
 use crate::elastic_search_commands::{SqlCommand, UpdateByQueryCommand};
 use crate::elastic_search_common::{
-    execute_command, Command, CommandContext, ElasticSearchResponse, ParseError,
-    ResultGeneratorFuture,
+    Command, CommandContext, ElasticSearchResponse, ParseError, ResultGeneratorFuture,
+    execute_command,
 };
 use crate::elastic_search_datetime_parser;
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::elastic_search_responses::{
-    compare_query_result_hits_desc, AggregationResult, AverageAggregationResult,
-    CardinalityAggregationResult, FilterAggregationResult, HistogramAggregationBucket,
-    HistogramAggregationResult, QueryFailure, QueryResults, TermAggregationBucket,
-    TermAggregationResult,
+    AggregationResult, AverageAggregationResult, CardinalityAggregationResult,
+    FilterAggregationResult, HistogramAggregationBucket, HistogramAggregationResult, QueryFailure,
+    QueryResults, TermAggregationBucket, TermAggregationResult, compare_query_result_hits_desc,
 };
 use crate::peers::{
     CheckpointDescriptor, PrivateExactConstraintGroup, PrivateInvocation,

@@ -4,11 +4,11 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
 use std::sync::{LazyLock, Mutex};
 
-use futures::stream::{self, StreamExt};
 use futures::FutureExt;
+use futures::stream::{self, StreamExt};
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{body, Body};
+use gotham::hyper::{Body, body};
 use gotham::mime;
 use gotham::state::{FromState, State};
 use http::StatusCode;
@@ -27,12 +27,12 @@ use crate::elastic_search_endpoints::NamePathExtractor;
 use crate::peers::CheckpointDescriptor;
 use crate::prefetch::warm_iceberg_checkpoints;
 use crate::query_execution::{
-    execute_query_plan_batches, group_query_input_files_by_schema, QueryExecutionPlan,
-    QueryInputFile, QuerySqlTemplate, QueryStorageKind,
+    QueryExecutionPlan, QueryInputFile, QuerySqlTemplate, QueryStorageKind,
+    execute_query_plan_batches, group_query_input_files_by_schema,
 };
 use crate::query_path::{
-    column_is_all_null, compare_scalar_values, file_may_match_predicates, group_files_by_schema,
-    row_group_may_match_predicates, QueryPredicate,
+    QueryPredicate, column_is_all_null, compare_scalar_values, file_may_match_predicates,
+    group_files_by_schema, row_group_may_match_predicates,
 };
 use crate::read_plan::ReadPlan;
 use crate::schema_massager::{PowdrrDataType, PowdrrSchema};
@@ -3899,15 +3899,14 @@ impl ServingQueryError {
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_measure_plans, append_secondary_pattern_artifacts, build_serving_layout_advice,
-        build_serving_warmup_plan, build_sql, exact_artifact_fields,
+        ACCESS_ARTIFACT_KIND_EXACT_PRUNING, ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS,
+        DEFAULT_FAST_PATH_MAX_DELETE_FILES, DEFAULT_SLOW_PATH_MAX_BYTES, ExactPruningFieldSummary,
+        ServingExecutionContext, aggregate_measure_plans, append_secondary_pattern_artifacts,
+        build_serving_layout_advice, build_serving_warmup_plan, build_sql, exact_artifact_fields,
         exact_pruning_summary_may_match_request, file_group_table_name, finalize_aggregate_rows,
         group_files_by_schema, merge_partial_aggregate_rows, ordered_file_groups_for_top_k,
         plan_request, prune_candidate_files, remaining_groups_cannot_beat_kth_row,
         request_matches_pattern, secondary_pattern_artifact_name, select_serving_warmup_files,
-        ExactPruningFieldSummary, ServingExecutionContext, ACCESS_ARTIFACT_KIND_EXACT_PRUNING,
-        ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS, DEFAULT_FAST_PATH_MAX_DELETE_FILES,
-        DEFAULT_SLOW_PATH_MAX_BYTES,
     };
     use crate::data_access::{
         prime_parquet_row_group_stats_cache_for_test, reset_serving_metadata_caches_for_test,
@@ -4625,10 +4624,11 @@ mod tests {
         let plan = plan_request(&context, &read_request).unwrap();
 
         assert_eq!(plan.classification, ServingQueryClassification::Rejected);
-        assert!(plan
-            .reason
-            .as_ref()
-            .is_some_and(|reason| reason.contains("exceeds serving budget")));
+        assert!(
+            plan.reason
+                .as_ref()
+                .is_some_and(|reason| reason.contains("exceeds serving budget"))
+        );
     }
 
     #[test]
@@ -4659,10 +4659,11 @@ mod tests {
         let plan = plan_request(&context, &read_request).unwrap();
 
         assert_eq!(plan.classification, ServingQueryClassification::Rejected);
-        assert!(plan
-            .reason
-            .as_ref()
-            .is_some_and(|reason| reason.contains("aggregate serving pattern")));
+        assert!(
+            plan.reason
+                .as_ref()
+                .is_some_and(|reason| reason.contains("aggregate serving pattern"))
+        );
     }
 
     #[test]
@@ -4785,9 +4786,11 @@ mod tests {
             }],
         );
 
-        assert!(access_artifacts
-            .iter()
-            .any(|artifact| { artifact.name == secondary_pattern_artifact_name("tenant_recent") }));
+        assert!(
+            access_artifacts.iter().any(|artifact| {
+                artifact.name == secondary_pattern_artifact_name("tenant_recent")
+            })
+        );
     }
 
     #[test]
@@ -4841,10 +4844,11 @@ mod tests {
         let plan = plan_request(&context, &read_request).unwrap();
 
         assert_eq!(plan.classification, ServingQueryClassification::SlowPath);
-        assert!(plan
-            .reason
-            .as_ref()
-            .is_some_and(|reason| reason.contains("delete files")));
+        assert!(
+            plan.reason
+                .as_ref()
+                .is_some_and(|reason| reason.contains("delete files"))
+        );
     }
 
     #[test]
@@ -4911,10 +4915,12 @@ mod tests {
 
         assert_eq!(advice.patterns.len(), 1);
         assert!(!advice.issues.is_empty());
-        assert!(advice.patterns[0]
-            .recommendation
-            .as_ref()
-            .is_some_and(|recommendation| recommendation.contains("Cluster or partition")));
+        assert!(
+            advice.patterns[0]
+                .recommendation
+                .as_ref()
+                .is_some_and(|recommendation| recommendation.contains("Cluster or partition"))
+        );
     }
 
     #[test]

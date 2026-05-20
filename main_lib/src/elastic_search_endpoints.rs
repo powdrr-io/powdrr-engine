@@ -6,7 +6,7 @@ use gotham::helpers::http::response::create_empty_response;
 use gotham::{
     handler::HandlerFuture,
     helpers::http::response::create_response,
-    hyper::{body, Body},
+    hyper::{Body, body},
     mime,
     prelude::StaticResponseExtender,
     state::{FromState, State, StateData},
@@ -14,7 +14,7 @@ use gotham::{
 use http::StatusCode;
 use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::elastic_search_common::MIME_ES_JSON;
 use crate::util::{log_service_err, log_service_err_response};
@@ -22,7 +22,7 @@ use crate::{
     data_access,
     data_contract::{AliasInfo, CreateIndexBody, PropertyInfo, TableDescription},
     elastic_search_cluster_info,
-    elastic_search_common::{execute_command, CommandContext},
+    elastic_search_common::{CommandContext, execute_command},
     elastic_search_ingest, elastic_search_parser, elastic_search_pipeline,
     elastic_search_responses::{
         ErrorDetails, QueryResultShards, QueryResults, SingleDocCreateFailedResult,
@@ -560,8 +560,8 @@ fn matches_requested_value(value: &str, requested: &[String]) -> bool {
             .any(|requested_value| wildcard_matches(requested_value, value))
 }
 
-async fn all_table_descriptions(
-) -> Result<Vec<TableDescription>, crate::state_provider::ServiceApiError> {
+async fn all_table_descriptions()
+-> Result<Vec<TableDescription>, crate::state_provider::ServiceApiError> {
     let mut table_descriptions = Vec::new();
     let mut table_names = STATE_PROVIDER.get_all_iceberg_tables().await?;
     table_names.sort();

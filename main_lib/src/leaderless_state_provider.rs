@@ -1,11 +1,11 @@
 use crate::data_contract::{
+    ACCESS_KEY_HEADER_KEY, CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody, OrgSettings,
+    SECRET_KEY_HEADER_KEY,
+};
+use crate::data_contract::{
     AddAlias, CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit,
     ExtensionWorkItem, GetLatestCheckpoint, IcebergCommit, SpeedboatCommit, TableDescription,
     TableMetadataCheckpoint,
-};
-use crate::data_contract::{
-    CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody, OrgSettings, ACCESS_KEY_HEADER_KEY,
-    SECRET_KEY_HEADER_KEY,
 };
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::ephemeral_fetch_tracker::EphemeralFetchTracker;
