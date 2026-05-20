@@ -1,9 +1,10 @@
 use crate::data_access::{self, load_file_as_table, load_files_as_table};
 use crate::data_contract::FileDescriptor;
-use crate::schema_massager::PowdrrSchema;
+use crate::schema_massager::{PowdrrSchema, SqlQuery};
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::error::DataFusionError;
+use futures_util::future::try_join_all;
 use idgenerator::IdInstance;
 use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -14,10 +15,37 @@ pub(crate) struct QueryExtensionFileSpec {
     pub file_path: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QueryStorageKind {
+    Iceberg,
+    Speedboat,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct QueryInputFile {
     pub file: FileDescriptor,
+    pub storage: QueryStorageKind,
     pub extensions: Vec<QueryExtensionFileSpec>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum QuerySqlTemplate {
+    Built(String),
+    Structured {
+        sql: SqlQuery,
+        table_schema: PowdrrSchema,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct QueryExecutionPlan {
+    // This is the protocol-neutral mixed-source read plan consumed by both
+    // lakehouse serving and Elasticsearch/private reads.
+    pub sql: QuerySqlTemplate,
+    pub files: Vec<QueryInputFile>,
+    pub delete_files: Vec<String>,
+    pub extension_suffixes: Option<Vec<String>>,
+    pub use_cpu_threadpool: bool,
 }
 
 pub(crate) fn group_query_input_files_by_schema(
@@ -42,7 +70,9 @@ pub(crate) fn group_query_input_files_by_schema(
                 .map(|extension| extension.suffix.clone())
                 .collect::<Vec<_>>();
             existing_suffixes.sort();
-            existing.file.schema == file.file.schema && existing_suffixes == suffixes
+            existing.storage == file.storage
+                && existing.file.schema == file.file.schema
+                && existing_suffixes == suffixes
         }) {
             existing_group.push(file);
         } else {
@@ -53,24 +83,134 @@ pub(crate) fn group_query_input_files_by_schema(
     groups
 }
 
+impl QuerySqlTemplate {
+    fn build_for_schema(&self, target_schema: &PowdrrSchema) -> String {
+        match self {
+            QuerySqlTemplate::Built(sql) => sql.clone(),
+            QuerySqlTemplate::Structured { sql, table_schema } => {
+                sql.build(table_schema, target_schema)
+            }
+        }
+    }
+}
+
+pub(crate) async fn execute_query_plan_batches(
+    plan: QueryExecutionPlan,
+) -> Result<Vec<RecordBatch>, DataFusionError> {
+    let QueryExecutionPlan {
+        sql,
+        files,
+        delete_files,
+        extension_suffixes,
+        use_cpu_threadpool,
+    } = plan;
+
+    if files.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let files = filter_query_input_extensions(files, extension_suffixes.as_ref());
+    let delete_local_tables = load_delete_local_tables(&delete_files).await?;
+    let deletes_table_name = create_deletes_union_table(&delete_local_tables).await?;
+    let grouped_files = group_query_input_files_by_schema(files);
+
+    // Iceberg and speedboat share one execution entry point here; the only
+    // per-storage difference is how a grouped file set is loaded into local
+    // DataFusion tables before the shared SQL runs.
+    let grouped_calls = grouped_files.into_iter().map(|group| {
+        let sql_template = sql.build_for_schema(&group[0].file.schema);
+        let deletes_table_name = deletes_table_name.clone();
+        async move {
+            match group[0].storage {
+                QueryStorageKind::Iceberg => {
+                    execute_query_file_group_batches_with_deletes_table(
+                        group,
+                        &sql_template,
+                        &deletes_table_name,
+                        "{target_table}",
+                        use_cpu_threadpool,
+                    )
+                    .await
+                }
+                QueryStorageKind::Speedboat => {
+                    execute_speedboat_group_batches(
+                        group,
+                        &sql_template,
+                        &deletes_table_name,
+                        use_cpu_threadpool,
+                    )
+                    .await
+                }
+            }
+        }
+    });
+
+    let grouped_results = try_join_all(grouped_calls).await;
+
+    for local_table in delete_local_tables.iter() {
+        data_access::drop(local_table).await;
+    }
+    data_access::drop(&deletes_table_name).await;
+
+    grouped_results.map(|results| results.into_iter().flatten().collect())
+}
+
+fn filter_query_input_extensions(
+    files: Vec<QueryInputFile>,
+    suffixes: Option<&Vec<String>>,
+) -> Vec<QueryInputFile> {
+    let Some(suffixes) = suffixes else {
+        return files;
+    };
+
+    files
+        .into_iter()
+        .map(|mut file| {
+            file.extensions
+                .retain(|extension| suffixes.iter().any(|suffix| suffix == &extension.suffix));
+            file
+        })
+        .collect()
+}
+
 pub(crate) async fn execute_query_file_group_batches(
     files: Vec<QueryInputFile>,
     sql_template: &str,
     delete_files: &[String],
     table_placeholder: &str,
-    deletes_placeholder: &str,
+    _deletes_placeholder: &str,
     use_cpu_threadpool: bool,
 ) -> Result<Vec<RecordBatch>, DataFusionError> {
     if files.is_empty() {
         return Ok(vec![]);
     }
 
+    let delete_local_tables = load_delete_local_tables(delete_files).await?;
+    let deletes_table_name = create_deletes_union_table(&delete_local_tables).await?;
+    let result = execute_query_file_group_batches_with_deletes_table(
+        files,
+        sql_template,
+        &deletes_table_name,
+        table_placeholder,
+        use_cpu_threadpool,
+    )
+    .await;
+
+    for local_table in delete_local_tables.iter() {
+        data_access::drop(local_table).await;
+    }
+    data_access::drop(&deletes_table_name).await;
+    result
+}
+
+async fn execute_query_file_group_batches_with_deletes_table(
+    files: Vec<QueryInputFile>,
+    sql_template: &str,
+    deletes_table_name: &str,
+    table_placeholder: &str,
+    use_cpu_threadpool: bool,
+) -> Result<Vec<RecordBatch>, DataFusionError> {
     let local_name = file_group_table_name(&files);
-    let deletes_table_name = format!("query_deletes_{}", IdInstance::next_id());
-    let delete_local_tables = delete_files
-        .iter()
-        .map(|_| format!("query_delete_file_{}", IdInstance::next_id()))
-        .collect::<Vec<_>>();
     let extension_groups = extension_groups_by_suffix(&files);
     let related_names = extension_groups
         .keys()
@@ -83,8 +223,6 @@ pub(crate) async fn execute_query_file_group_batches(
     let total_size = files.iter().map(|file| file.file.size).sum::<u64>();
     data_access::reserve(&local_name, total_size, related_names).await;
 
-    let mut created_delete_tables = vec![];
-    let mut deletes_union_created = false;
     let result = async {
         load_files_as_table(
             &local_name,
@@ -102,41 +240,75 @@ pub(crate) async fn execute_query_file_group_batches(
             .await?;
         }
 
-        if !delete_files.is_empty() {
-            let delete_schema = PowdrrSchema::deletes().to_arrow_schema();
-            for (local_delete_table, delete_file_path) in
-                delete_local_tables.iter().zip(delete_files.iter())
-            {
-                load_file_as_table(
-                    local_delete_table,
-                    delete_file_path,
-                    false,
-                    Some(delete_schema.clone()),
-                )
-                .await?;
-                created_delete_tables.push(local_delete_table.clone());
-            }
-        }
-        data_access::create_table(
-            &deletes_table_name,
-            &create_deletes_table_sql(&delete_local_tables),
-        )
-        .await?;
-        deletes_union_created = true;
-
         let local_sql = sql_template
             .replace(table_placeholder, &local_name)
-            .replace(deletes_placeholder, &deletes_table_name);
+            .replace("{deletes_table}", deletes_table_name);
         execute_group_sql(&local_sql, use_cpu_threadpool).await
     }
     .await;
 
-    for table_name in &created_delete_tables {
-        data_access::drop(table_name).await;
+    data_access::release(&local_name).await;
+    result
+}
+
+async fn execute_speedboat_group_batches(
+    files: Vec<QueryInputFile>,
+    sql_template: &str,
+    deletes_table_name: &str,
+    use_cpu_threadpool: bool,
+) -> Result<Vec<RecordBatch>, DataFusionError> {
+    let per_file_calls = files.into_iter().map(|file| {
+        let sql_template = sql_template.to_string();
+        let deletes_table_name = deletes_table_name.to_string();
+        async move {
+            execute_single_file_batches(
+                file,
+                &sql_template,
+                &deletes_table_name,
+                use_cpu_threadpool,
+            )
+            .await
+        }
+    });
+    let results = try_join_all(per_file_calls).await?;
+    Ok(results.into_iter().flatten().collect())
+}
+
+async fn execute_single_file_batches(
+    file: QueryInputFile,
+    sql_template: &str,
+    deletes_table_name: &str,
+    use_cpu_threadpool: bool,
+) -> Result<Vec<RecordBatch>, DataFusionError> {
+    let local_name = query_input_local_name(&file);
+    let extension_table_names = file
+        .extensions
+        .iter()
+        .map(|extension| format!("{}_{}", local_name, extension.suffix))
+        .collect::<Vec<_>>();
+    data_access::reserve(&local_name, file.file.size, extension_table_names).await;
+
+    let result = async {
+        load_file_as_table(
+            &local_name,
+            &file.file.file_path,
+            matches!(file.storage, QueryStorageKind::Iceberg),
+            Some(file.file.schema.to_arrow_schema()),
+        )
+        .await?;
+
+        for extension in file.extensions.iter() {
+            let extension_table_name = format!("{}_{}", local_name, extension.suffix);
+            load_file_as_table(&extension_table_name, &extension.file_path, true, None).await?;
+        }
+
+        let local_sql = sql_template
+            .replace("{target_table}", &local_name)
+            .replace("{deletes_table}", deletes_table_name);
+        execute_group_sql(&local_sql, use_cpu_threadpool).await
     }
-    if deletes_union_created {
-        data_access::drop(&deletes_table_name).await;
-    }
+    .await;
+
     data_access::release(&local_name).await;
     result
 }
@@ -167,6 +339,39 @@ fn extension_groups_by_suffix(files: &[QueryInputFile]) -> BTreeMap<String, Vec<
         }
     }
     grouped
+}
+
+fn query_input_local_name(file: &QueryInputFile) -> String {
+    data_access::path_to_table_name(&file.file.file_path)
+}
+
+async fn load_delete_local_tables(delete_files: &[String]) -> Result<Vec<String>, DataFusionError> {
+    let delete_schema = PowdrrSchema::deletes().to_arrow_schema();
+    let mut local_tables = vec![];
+    for delete_file in delete_files.iter() {
+        let local_table = format!("query_delete_file_{}", IdInstance::next_id());
+        load_file_as_table(
+            &local_table,
+            delete_file,
+            false,
+            Some(delete_schema.clone()),
+        )
+        .await?;
+        local_tables.push(local_table);
+    }
+    Ok(local_tables)
+}
+
+async fn create_deletes_union_table(
+    delete_local_tables: &[String],
+) -> Result<String, DataFusionError> {
+    let deletes_table_name = format!("query_deletes_{}", IdInstance::next_id());
+    data_access::create_table(
+        &deletes_table_name,
+        &create_deletes_table_sql(delete_local_tables),
+    )
+    .await?;
+    Ok(deletes_table_name)
 }
 
 fn extension_schema_for_suffix(suffix: &str) -> Result<Schema, DataFusionError> {
