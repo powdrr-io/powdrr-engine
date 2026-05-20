@@ -5641,8 +5641,14 @@ dependencies = [
 name = "powdrr_lib"
 version = "0.0.1"
 dependencies = [
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-dynamodb",
+ "chrono",
  "datafusion",
  "futures-util",
+ "gotham",
+ "hmac",
  "idgenerator",
  "mongodb",
  "object_store",
@@ -5650,7 +5656,12 @@ dependencies = [
  "powdrr-query-server",
  "reqwest",
  "serde",
+ "serde_dynamo",
  "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "url",
 ]
 
 [[package]]

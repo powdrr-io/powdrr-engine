@@ -17,7 +17,7 @@ The backing artifacts are:
   `main_lib/tests/data/dynamodb_compat_cases.json`
 - compatibility harness:
   `main_lib/tests/dynamodb_compatibility_matrix.rs`
-- complementary read-path SDK smoke test:
+- complementary SDK compatibility suite:
   `main_lib/tests/dynamodb_sdk_compat.rs`
 
 ## Contract
@@ -37,7 +37,9 @@ The backing artifacts are:
 | `GetItem` | Differential | Projection behavior and `ReturnConsumedCapacity` response shape compared against LocalStack |
 | `BatchGetItem` | Differential | Response shape and item projection compared against LocalStack |
 | `PutItem` | Differential | Covers key replacement, `ConditionExpression`, and `ReturnValues=ALL_OLD` / `NONE` |
+| `UpdateItem` | Differential | Covers `SET`, `REMOVE`, `ADD`, `DELETE`, conditional failures, upserts, and `ReturnValues=ALL_OLD` / `UPDATED_OLD` / `ALL_NEW` / `UPDATED_NEW` / `NONE` |
 | `DeleteItem` | Differential | Covers key deletes, conditional failures, and `ReturnValues=ALL_OLD` / `NONE` |
+| `BatchWriteItem` | Differential | Covers mixed `PutRequest` and `DeleteRequest` batches with explicit duplicate/invalid request rejection |
 | `Query` | Differential | Covers primary-key range queries, `begins_with`, richer filter behavior, pagination, GSI queries, LSI queries, and `ReturnConsumedCapacity` response shape |
 | `Scan` | Differential | Covers ordered pagination, filtered counts, continuation keys, and `ReturnConsumedCapacity` response shape |
 
@@ -59,7 +61,6 @@ explicit unsupported-operation error.
 
 That includes:
 
-- unsupported write operations such as `UpdateItem` and `BatchWriteItem`
 - transactional operations such as `TransactGetItems` and
   `TransactWriteItems`
 - control-plane APIs such as `CreateTable`, `DeleteTable`, `UpdateTable`, and
@@ -76,6 +77,8 @@ or unsupported expression forms. The matrix harness currently checks:
 - unsupported `Select` / `ProjectionExpression` combinations
 - unsupported `ReturnConsumedCapacity` values
 - unsupported `KeyConditionExpression` shapes
+- unsupported `UpdateExpression` shapes such as nested paths or unsupported
+  return-value modes on write APIs
 
 Supported read operations are also expected to accept and exercise the current
 read-contract subset:
@@ -89,14 +92,21 @@ read-contract subset:
 The first supported write milestone currently adds:
 
 - `PutItem` with full-item replacement semantics on the primary key
+- `UpdateItem` with top-level `SET`, `REMOVE`, `ADD`, and `DELETE` actions
+  plus upsert behavior on missing keys
 - `DeleteItem` with idempotent key deletes
-- `ConditionExpression` on `PutItem` and `DeleteItem` using the current
-  expression subset
+- `BatchWriteItem` with `PutRequest` and `DeleteRequest` support
+- `ConditionExpression` on `PutItem`, `UpdateItem`, and `DeleteItem` using
+  the current expression subset
 - `ReturnValues` support for `NONE` and `ALL_OLD` on `PutItem` and
-  `DeleteItem`
+  `DeleteItem`, plus `UPDATED_OLD`, `ALL_NEW`, and `UPDATED_NEW` on
+  `UpdateItem`
 - `PutItem` only for attributes already present in the published table
   schema; introducing new top-level attributes is an explicit
   `ValidationException`
+- `UpdateItem` only for existing top-level schema attributes; nested paths,
+  key mutation, and non-schema top-level attributes are explicit
+  `ValidationException`s
 
 ## Local Runner
 

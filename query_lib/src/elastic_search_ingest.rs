@@ -18,8 +18,6 @@ use crate::schema_massager::PowdrrSchema;
 use crate::search_runtime::{SerdeValueResult, df_to_serde_value};
 use crate::state_provider::{STATE_PROVIDER, ServiceApiError};
 use crate::util::{describe_table_log_error_then_none, log_err, log_service_err};
-use arrow_ipc::writer::StreamWriter;
-use arrow_json::LineDelimitedWriter;
 use datafusion::arrow::ipc::writer::FileWriter;
 use futures::FutureExt;
 use http::StatusCode;
@@ -32,13 +30,12 @@ use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt::Display;
 use std::future::Future;
-use std::io::{Cursor, SeekFrom, Write};
+use std::io::Write;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashMap, fs, fs::File};
-use tokio::io::AsyncSeekExt;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::{mpsc, oneshot};
 use uuid_b64::UuidB64;
@@ -76,7 +73,7 @@ pub(crate) struct WriteBuffer {
     schema: Option<PowdrrSchema>,
 }
 
-pub(crate) const JSON_MODE: bool = true;
+pub(crate) const JSON_MODE: bool = false;
 
 impl WriteBuffer {
     pub fn empty() -> Self {
@@ -133,20 +130,10 @@ impl WriteBuffer {
         assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
         assert!(self.schema.is_some(), "Cannot write buffer without schema");
         ensure_local_parent_dir(file_name)?;
-        let arrow_schema = self.schema.as_ref().unwrap().to_arrow_schema();
-        let fields = arrow_schema.fields.as_ref();
-        let record_batch = serde_arrow::to_record_batch(fields, &self.lines).unwrap();
-        let file = File::create(file_name).unwrap();
-        let mut writer = FileWriter::try_new_buffered(file, &record_batch.schema()).unwrap();
-        writer.write(&record_batch).unwrap();
-        writer.finish().unwrap();
-        let len = File::open(file_name)
-            .unwrap()
-            .metadata()
-            .as_ref()
-            .map(|m| m.len())
-            .unwrap();
-        Ok(len)
+        let bytes = self.arrow_file_bytes()?;
+        let mut file = File::create(file_name).unwrap();
+        file.write_all(&bytes).unwrap();
+        Ok(bytes.len() as u64)
     }
 
     #[allow(dead_code)]
@@ -154,50 +141,13 @@ impl WriteBuffer {
         assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
         assert!(self.schema.is_some(), "Cannot write buffer without schema");
         let full_s3_path = format!("{}.arrow", s3_path);
-        let arrow_schema = self.schema.as_ref().unwrap().to_arrow_schema();
-        let fields = arrow_schema.fields.as_ref();
-        let record_batch = serde_arrow::to_record_batch(fields, &self.lines).unwrap();
-        let mut buffer = Cursor::new(Vec::new());
-        let mut writer = StreamWriter::try_new(&mut buffer, &record_batch.schema()).unwrap();
-        writer.write(&record_batch).map_err(|e| IngestError {
-            message: format!("{}", e).to_string(),
-        })?;
-        writer.finish().map_err(|e| IngestError {
-            message: format!("{}", e).to_string(),
-        })?;
-        let _ = buffer
-            .seek(SeekFrom::Start(0))
+        let bytes = self.arrow_file_bytes()?;
+        data_access::put_s3_file(&full_s3_path, &bytes)
             .await
             .map_err(|e| IngestError {
                 message: format!("{}", e).to_string(),
             })?;
-        data_access::put_s3_file(&full_s3_path, buffer.get_ref())
-            .await
-            .map_err(|e| IngestError {
-                message: format!("{}", e).to_string(),
-            })?;
-        let len = buffer.get_ref().len() as u64;
-        Ok(len)
-    }
-
-    async fn write_to_json_s3(&self, s3_path: &String) -> Result<u64, IngestError> {
-        assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
-        assert!(self.schema.is_some(), "Cannot write buffer without schema");
-        let full_s3_path = format!("{}.json", s3_path);
-        let arrow_schema = self.schema.as_ref().unwrap().to_arrow_schema();
-        let fields = arrow_schema.fields.as_ref();
-        let record_batch = serde_arrow::to_record_batch(fields, &self.lines).unwrap();
-        let mut buf = Vec::new();
-        let mut writer = LineDelimitedWriter::new(&mut buf);
-        writer.write_batches(&[&record_batch]).unwrap();
-        writer.finish().unwrap();
-        data_access::put_s3_file(&full_s3_path, &buf)
-            .await
-            .map_err(|e| IngestError {
-                message: format!("{}", e).to_string(),
-            })?;
-        let len = buf.len() as u64;
-        Ok(len)
+        Ok(bytes.len() as u64)
     }
 
     #[cfg(test)]
@@ -208,6 +158,26 @@ impl WriteBuffer {
             buffer.push(b'\n');
         }
         buffer
+    }
+
+    fn arrow_file_bytes(&self) -> Result<Vec<u8>, IngestError> {
+        assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
+        assert!(self.schema.is_some(), "Cannot write buffer without schema");
+        let arrow_schema = self.schema.as_ref().unwrap().to_arrow_schema();
+        let fields = arrow_schema.fields.as_ref();
+        let record_batch = serde_arrow::to_record_batch(fields, &self.lines).unwrap();
+        let mut bytes = Vec::new();
+        let mut writer =
+            FileWriter::try_new(&mut bytes, &record_batch.schema()).map_err(|e| IngestError {
+                message: format!("{}", e),
+            })?;
+        writer.write(&record_batch).map_err(|e| IngestError {
+            message: format!("{}", e),
+        })?;
+        writer.finish().map_err(|e| IngestError {
+            message: format!("{}", e),
+        })?;
+        Ok(bytes)
     }
 
     fn stable_segment_id(&self, index: &String, label: &String) -> Result<String, IngestError> {
@@ -693,7 +663,7 @@ pub(crate) async fn write_to_file(
 ) -> Result<SpeedboatSegmentFile, IngestError> {
     let mut segment = next_speedboat_segment(buffer, index, label)?;
     if USE_SPEEDBOAT_S3 {
-        let size = buffer.write_to_json_s3(&segment.file_path).await?;
+        let size = buffer.write_to_arrow_s3(&segment.file_path).await?;
         segment.size = size;
         Ok(segment)
     } else {
@@ -1815,9 +1785,24 @@ mod tests {
         let size = buffer.write_to_file(&nested_path_str).unwrap();
 
         assert!(size > 0);
-        assert!(nested_path.with_extension("json").exists());
+        assert!(nested_path.with_extension("arrow").exists());
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_arrow_file_bytes_use_arrow_file_framing() {
+        let buffer = WriteBuffer::delete(vec![json!({
+            "_id": "doc-1",
+            "_id_seq_no": "doc-1:1",
+            "_version": 1
+        })]);
+
+        let bytes = buffer.arrow_file_bytes().unwrap();
+
+        assert!(bytes.len() > 12);
+        assert_eq!(&bytes[..6], b"ARROW1");
+        assert_eq!(&bytes[bytes.len() - 6..], b"ARROW1");
     }
 
     #[test]

@@ -10,6 +10,7 @@ use crate::elastic_search_http_types::QueryStringFieldCaps;
 use crate::elastic_search_http_types::QueryStringSearchExtractor;
 use crate::mongodb_protocol;
 use crate::test_api_endpoints::test_v1_add_checkpoint;
+use crate::test_api_endpoints::test_v1_advance_checkpoints;
 use crate::test_api_endpoints::test_v1_create_index;
 use crate::test_api_endpoints::test_v1_process_work;
 use crate::test_api_endpoints::test_v1_set_testing_mode;
@@ -37,6 +38,7 @@ use gotham::state::State;
 use gotham::state::StateData;
 use http::HeaderMap;
 use powdrr_query_lib::compaction::{CompactionCommand, compact_logs};
+use powdrr_query_lib::elastic_search_common::MIME_ARROW_STREAM;
 use powdrr_query_lib::peers::{
     PrivateCompactionInvocationExternal, PrivateExtensionInvocationExternal,
     PrivatePrefetchInvocationExternal, PrivateSearchInvocationExternal,
@@ -49,6 +51,18 @@ use powdrr_query_lib::private_api::{
 use serde::Deserialize;
 use std::pin::Pin;
 use std::sync::Arc;
+
+fn binary_response(
+    status: StatusCode,
+    mime: mime::Mime,
+    body: Vec<u8>,
+) -> gotham::hyper::Response<Body> {
+    gotham::hyper::Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, mime.to_string())
+        .body(Body::from(body))
+        .unwrap()
+}
 
 pub fn private_v1_sql(mut state: State) -> Pin<Box<HandlerFuture>> {
     async move {
@@ -70,12 +84,7 @@ pub fn private_v1_sql(mut state: State) -> Pin<Box<HandlerFuture>> {
         .await;
         match query_result {
             Ok(success) => {
-                let res = create_response(
-                    &state,
-                    StatusCode::OK,
-                    mime::APPLICATION_JSON,
-                    serde_json::to_string(&success.result).unwrap(),
-                );
+                let res = binary_response(StatusCode::OK, MIME_ARROW_STREAM.clone(), success);
                 Ok((state, res))
             }
             Err(error) => {
@@ -218,12 +227,7 @@ pub fn private_v1_compact(mut state: State) -> Pin<Box<HandlerFuture>> {
         };
         match compaction_query(&command.invocation, command.index, command.num).await {
             Ok(success) => {
-                let res = create_response(
-                    &state,
-                    StatusCode::OK,
-                    mime::APPLICATION_JSON,
-                    serde_json::to_string(&success.result).unwrap(),
-                );
+                let res = binary_response(StatusCode::OK, MIME_ARROW_STREAM.clone(), success);
                 Ok((state, res))
             }
             Err(error) => {
@@ -353,6 +357,9 @@ pub fn router(include_test_apis: bool) -> Router {
                 route.scope("/v1", |route| {
                     route.post("/_create_index").to(test_v1_create_index);
                     route.post("/_add_checkpoint").to(test_v1_add_checkpoint);
+                    route
+                        .put("/_advance_checkpoints")
+                        .to(test_v1_advance_checkpoints);
                     route.put("/_testing_mode").to(test_v1_set_testing_mode);
                     route
                         .put("/_testing_and_processing_mode")
@@ -728,10 +735,15 @@ pub(crate) mod tests {
         CreateTable, DeletesMetadata, FileSetPayload, IcebergFileStats, IcebergMetadata,
         SpeedboatMetadata, TableMetadataCheckpoint,
     };
+    use powdrr_query_lib::elastic_search_common::result_to_record_batch;
     use powdrr_query_lib::elastic_search_responses::{QueryResultTotal, QueryResults};
     use powdrr_query_lib::lakehouse_serving::ServingConfigResponse;
+    use powdrr_query_lib::peers::{
+        CheckpointDescriptor, PrivateSqlInvocation, PrivateSqlInvocationExternal,
+    };
     use powdrr_query_lib::schema_massager::{
-        PowdrrDataType, PowdrrField, PowdrrSchema, extract_powdrr_schema_str,
+        PowdrrDataType, PowdrrField, PowdrrSchema, SqlBuilder, SqlExpression,
+        extract_powdrr_schema_str,
     };
     use powdrr_query_lib::serving_plan::ServingQueryClassification;
     use powdrr_query_lib::state_provider::STATE_PROVIDER;
@@ -775,10 +787,6 @@ pub(crate) mod tests {
         set_testing_and_processing_mode_with_indexing(test_server, IndexingMode::Disabled);
     }
 
-    fn set_sync_testing_and_processing_mode(test_server: &TestServer) {
-        set_testing_and_processing_mode_with_indexing(test_server, IndexingMode::Sync);
-    }
-
     fn process_pending_work(test_server: &TestServer) {
         let process_work_response = test_server
             .client()
@@ -791,6 +799,20 @@ pub(crate) mod tests {
             .unwrap();
 
         assert_eq!(process_work_response.status(), 200);
+    }
+
+    fn advance_pending_checkpoints(test_server: &TestServer) {
+        let checkpoint_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_advance_checkpoints",
+                "",
+                mime::TEXT_PLAIN,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(checkpoint_response.status(), 200);
     }
 
     fn search_json(test_server: &TestServer, index: &str, body: &str) -> Value {
@@ -3342,84 +3364,111 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(missing_index_response.status(), 404);
     }
-    /*
-        #[test]
-        fn test_private_api_data_query() {
-            let test_server = &*TEST_SERVER;
+    #[test]
+    fn test_private_api_data_query_returns_arrow_stream() {
+        let test_server = &*TEST_SERVER;
+        set_testing_and_processing_mode(test_server);
 
-            test_server.client().put(
-                "http://localhost/_test/v1/_testing_mode",
-                "",
-                mime::TEXT_PLAIN
-            ).perform().unwrap();
+        let schema = PowdrrSchema::from(&vec![
+            PowdrrField {
+                name: "_id_seq_no".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "snippet".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "searchTerms".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "title".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+        ]);
 
-            let file_path = format!("file://{}/tests/data/flights.parquet", env::current_dir().unwrap().to_str().unwrap());
+        let checkpoint = TableMetadataCheckpoint {
+            table_name: "flights".to_string(),
+            original_checkpoint_id: None,
+            checkpoint_id: "0".to_string(),
+            iceberg_metadata: Some(IcebergMetadata {
+                table_schema: schema.clone(),
+                snapshot_id: Some("fake_iceberg_snapshot".to_string()),
+                files: FileSetPayload::single(
+                    format!(
+                        "file://{}/tests/data/flights.parquet",
+                        env::current_dir().unwrap().to_str().unwrap()
+                    ),
+                    1,
+                    schema.clone(),
+                ),
+                partition_spec: vec![],
+                sort_order: vec![],
+                column_names: vec![],
+                column_stats: vec![],
+                access_artifacts: vec![],
+                file_stats: vec![],
+            }),
+            speedboat_metadata: None,
+            deletes_metadata: None,
+            extension_metadata: HashMap::new(),
+            schema: schema.clone(),
+        };
 
-            let schema = PowdrrSchema::from(&vec!(
-                PowdrrField{ name: "snippet".to_string(), data_type: PowdrrDataType::String },
-                PowdrrField{ name: "searchTerms".to_string(), data_type: PowdrrDataType::String },
-                PowdrrField{ name: "title".to_string(), data_type: PowdrrDataType::String },
-            ));
-
-            let checkpoint = TableMetadataCheckpoint {
-                table_name: "flights".to_string(),
-                checkpoint_id: "0".to_string(),
-                iceberg_metadata: Some(IcebergMetadata {
-                    snapshot_id: "fake_iceberg_snapshot".to_string(),
-                    files: vec!(file_path),
-                    column_names: vec!(),
-                    column_stats: vec!(),
-                    schemas: vec!(schema.clone()),
-                    file_schemas: vec!(0),
-                }),
-                speedboat_metadata: None,
-                deletes_metadata: None,
-                extension_metadata: None,
-                schema: schema.clone(),
-            };
-
-            let checkpoint_response = test_server.client().post(
+        test_server
+            .client()
+            .post(
                 "http://localhost/_test/v1/_add_checkpoint",
                 serde_json::to_string(&checkpoint).unwrap(),
                 mime::APPLICATION_JSON,
-            ).perform();
+            )
+            .perform()
+            .unwrap();
 
-            match checkpoint_response {
-                Err(_) => panic!("test setup failed"),
-                Ok(_) => ()
-            };
+        let mut builder = SqlBuilder::for_agg();
+        builder.set_all_fields_testing_only();
+        builder.filter(SqlExpression::Like(
+            Box::new(SqlExpression::FieldRef(
+                "t".to_string(),
+                "snippet".to_string(),
+            )),
+            Box::new(SqlExpression::LiteralString("%Looking%".to_string())),
+        ));
 
+        let body_obj = PrivateSqlInvocationExternal {
+            invocation: PrivateSqlInvocation {
+                sql: builder.build(),
+                required_extensions: vec![],
+                file_filter: vec![],
+                checkpoints: vec![CheckpointDescriptor::new(
+                    "flights".to_string(),
+                    "0".to_string(),
+                )],
+            },
+            index: 0,
+            num: 1,
+        };
 
-            let mut builder = SqlBuilder::for_agg();
-            builder.set_all_fields_testing_only();
-            builder.filter(SqlExpression::Like(
-                Box::new(SqlExpression::FieldRef("t".to_string(), "snippet".to_string())),
-                Box::new(SqlExpression::LiteralString("%Looking%".to_string())),
-            ));
-
-            let body_obj = PrivateSqlInvocation::new(
-                builder.build(),
-                vec!["es".to_string()],
-                vec![],
-                vec!(SnapshotDescriptor { table_name: "flights".to_string(), snapshot_id: "fake_id".to_string()}),
-                0,
-                1,
-            );
-
-            let response = test_server.client().post(
+        let response = test_server
+            .client()
+            .post(
                 "http://localhost/_private/v1/_sql",
                 serde_json::to_string(&body_obj).unwrap(),
                 mime::APPLICATION_JSON,
-            ).perform().unwrap();
+            )
+            .perform()
+            .unwrap();
 
-            assert_eq!(response.status(), 200);
-            let body = response.read_body().unwrap();
-            let str_body = str::from_utf8(&body).unwrap();
-            let json_body: serde_json::Value = serde_json::from_str(&str_body).unwrap();
-            let num = json_body["num"].as_u64().unwrap();
-            assert_eq!(num, 505);
-        }
-    */
+        assert_eq!(response.status(), 200);
+        let body = response.read_body().unwrap();
+        assert!(serde_json::from_slice::<Value>(&body).is_err());
+        let batches = result_to_record_batch(&body);
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            505
+        );
+    }
     #[test]
     fn test_es_search_table_parquet() {
         let test_server = &*TEST_SERVER;
@@ -4483,7 +4532,7 @@ pub(crate) mod tests {
         let test_server = &*TEST_SERVER;
         let index = unique_test_index_name("logs_replace");
 
-        set_sync_testing_and_processing_mode(test_server);
+        set_testing_and_processing_mode(test_server);
 
         let body_create_index = r#"{
             "settings" : {
@@ -4531,7 +4580,7 @@ pub(crate) mod tests {
 
         assert_eq!(first_index_response.status(), 201);
 
-        process_pending_work(test_server);
+        advance_pending_checkpoints(test_server);
 
         let second_index_response = test_server
             .client()
@@ -4549,7 +4598,7 @@ pub(crate) mod tests {
         assert_eq!(second_index_json["_id"], json!("my_id"));
         assert_eq!(second_index_json["_version"], json!(2));
 
-        process_pending_work(test_server);
+        advance_pending_checkpoints(test_server);
 
         let get_response = test_server
             .client()
@@ -4681,7 +4730,7 @@ pub(crate) mod tests {
         let test_server = &*TEST_SERVER;
         let index = unique_test_index_name("logs_update");
 
-        set_sync_testing_and_processing_mode(test_server);
+        set_testing_and_processing_mode(test_server);
 
         let body_create_index = r#"{
             "settings" : {
@@ -4730,17 +4779,7 @@ pub(crate) mod tests {
 
         assert_eq!(create_response.status(), 201);
 
-        let process_work_response = test_server
-            .client()
-            .put(
-                "http://localhost/_test/v1/_process_work",
-                "",
-                mime::TEXT_PLAIN,
-            )
-            .perform()
-            .unwrap();
-
-        assert_eq!(process_work_response.status(), 200);
+        advance_pending_checkpoints(test_server);
 
         let update_response = test_server
             .client()
@@ -4757,17 +4796,7 @@ pub(crate) mod tests {
             serde_json::from_str(&update_response.read_utf8_body().unwrap()).unwrap();
         assert_eq!(update_json["_version"], json!(2));
 
-        let second_process_work_response = test_server
-            .client()
-            .put(
-                "http://localhost/_test/v1/_process_work",
-                "",
-                mime::TEXT_PLAIN,
-            )
-            .perform()
-            .unwrap();
-
-        assert_eq!(second_process_work_response.status(), 200);
+        advance_pending_checkpoints(test_server);
 
         let get_response = test_server
             .client()
@@ -4865,7 +4894,7 @@ pub(crate) mod tests {
         let test_server = &*TEST_SERVER;
         let index = unique_test_index_name("logs_bulk_update");
 
-        set_sync_testing_and_processing_mode(test_server);
+        set_testing_and_processing_mode(test_server);
 
         let body_create_index = r#"{
             "settings" : {
@@ -4906,17 +4935,7 @@ pub(crate) mod tests {
 
         assert_eq!(create_response.status(), 201);
 
-        let first_process_work_response = test_server
-            .client()
-            .put(
-                "http://localhost/_test/v1/_process_work",
-                "",
-                mime::TEXT_PLAIN,
-            )
-            .perform()
-            .unwrap();
-
-        assert_eq!(first_process_work_response.status(), 200);
+        advance_pending_checkpoints(test_server);
 
         let bulk_body = make_update_bulk_body(
             index.clone(),
@@ -4941,17 +4960,7 @@ pub(crate) mod tests {
 
         assert_eq!(bulk_response.status(), 200);
 
-        let second_process_work_response = test_server
-            .client()
-            .put(
-                "http://localhost/_test/v1/_process_work",
-                "",
-                mime::TEXT_PLAIN,
-            )
-            .perform()
-            .unwrap();
-
-        assert_eq!(second_process_work_response.status(), 200);
+        advance_pending_checkpoints(test_server);
 
         let get_response = test_server
             .client()

@@ -5,13 +5,14 @@ use crate::data_contract::{
 use crate::elastic_search_ingest::JSON_MODE;
 use crate::util::log_err;
 use datafusion::arrow::datatypes::Schema;
+use datafusion::arrow::ipc::reader::FileReader as ArrowIpcFileReader;
 use datafusion::common::HashMap;
 use datafusion::config::ConfigOptions;
 use datafusion::datasource::{
     file_format::parquet::ParquetFormat,
     listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
 };
-use datafusion::execution::options::{ArrowReadOptions, JsonReadOptions};
+use datafusion::execution::options::JsonReadOptions;
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use datafusion::prelude::SessionConfig;
 use datafusion::{
@@ -51,6 +52,7 @@ use parquet_55::file::statistics::Statistics;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::Cursor;
 use std::string::ToString;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
@@ -1833,6 +1835,7 @@ impl CacheTrackerActor {
             );
             match load_json_file_as_table(
                 &self.data_fusion_context,
+                &self.s3_file_store,
                 file_path,
                 &table_name,
                 &schema.unwrap(),
@@ -2373,6 +2376,7 @@ async fn load_parquet_files_as_table(
 
 async fn load_json_file_as_table(
     data_fusion_context: &SessionContext,
+    s3_file_store: &Arc<AmazonS3>,
     file_path_without_suffix: &String,
     local_name: &String,
     schema: &Schema,
@@ -2408,11 +2412,88 @@ async fn load_json_file_as_table(
             }
         }
     } else {
-        let file_path = format!("{}.arrow", file_path_without_suffix);
+        let file_path = if file_path_without_suffix.ends_with(".arrow") {
+            file_path_without_suffix.clone()
+        } else {
+            format!("{}.arrow", file_path_without_suffix)
+        };
         tracing::info!("Loading Arrow file {}", file_path);
-        data_fusion_context
-            .register_arrow(local_name, &file_path, ArrowReadOptions::default())
+        load_arrow_as_memtable(data_fusion_context, s3_file_store, &file_path, local_name).await
+    }
+}
+
+async fn read_file_bytes_direct(
+    s3_file_store: &Arc<AmazonS3>,
+    file_path: &String,
+) -> Result<Vec<u8>, DataFusionError> {
+    if file_path.starts_with("s3://") {
+        let path_str = file_path.replace(S3_BASE_PATH, "");
+        let path = object_store::path::Path::from_url_path(path_str)
+            .map_err(|error| DataFusionError::ObjectStore(Box::new(error.into())))?;
+
+        let result = s3_file_store
+            .get(&path)
             .await
+            .map_err(|error| DataFusionError::ObjectStore(Box::new(error.into())))?;
+        result
+            .bytes()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(|error| DataFusionError::ObjectStore(Box::new(error.into())))
+    } else {
+        std::fs::read(normalize_local_file_path(file_path)).map_err(DataFusionError::IoError)
+    }
+}
+
+async fn load_arrow_as_memtable(
+    data_fusion_context: &SessionContext,
+    s3_file_store: &Arc<AmazonS3>,
+    file_path: &String,
+    local_name: &String,
+) -> Result<(), DataFusionError> {
+    let file_contents = read_file_bytes_direct(s3_file_store, file_path).await?;
+    let arrow_reader = ArrowIpcFileReader::try_new(Cursor::new(file_contents), None)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    let record_batches = arrow_reader
+        .collect::<arrow::error::Result<Vec<RecordBatch>>>()
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+    if record_batches.is_empty() {
+        return log_err(DataFusionError::Execution(format!(
+            "Arrow file {} contained no record batches",
+            file_path
+        )));
+    }
+
+    register_memtable_with_name(data_fusion_context, local_name, &record_batches)
+}
+
+fn register_memtable_with_name(
+    data_fusion_context: &SessionContext,
+    result_table_name: &String,
+    records: &Vec<RecordBatch>,
+) -> Result<(), DataFusionError> {
+    if records.is_empty() {
+        panic!("Do not call this if you have no records");
+    }
+
+    let schema = records[0].schema();
+    let concated = arrow::compute::concat_batches(&records[0].schema(), records)
+        .map_err(|error| DataFusionError::ArrowError(Box::new(error), None))?;
+    let table = Arc::new(datafusion::datasource::MemTable::try_new(
+        schema,
+        vec![vec![concated]],
+    )?);
+
+    match data_fusion_context.register_table(result_table_name, table) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if e.message().contains("already exists") {
+                Ok(())
+            } else {
+                log_err(e)
+            }
+        }
     }
 }
 
@@ -3174,15 +3255,19 @@ mod tests {
     use super::{
         IcebergLibMetadata, IcebergTableMetadataCache, IcebergTableRowGroupStatsTracker,
         ParquetRowGroupStatsCache, RecordBatch, ServingBulkCacheWarmupStats, drop,
-        execute_sql_async, load_files_as_table, record_serving_bulk_cache_warmup,
-        resolve_serving_liquid_cache_location, serving_bulk_cache_stats, serving_session_config,
+        execute_sql_async, load_file_as_table, load_files_as_table,
+        record_serving_bulk_cache_warmup, resolve_serving_liquid_cache_location,
+        serving_bulk_cache_stats, serving_session_config,
     };
     use crate::data_contract::{IcebergColumnStats, IcebergRowGroupStats};
+    use crate::elastic_search_ingest::WriteBuffer;
+    use crate::schema_massager::PowdrrSchema;
     use datafusion::arrow::array::{Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field};
     use datafusion::parquet::arrow::ArrowWriter;
     use iceberg::spec::Schema;
     use serde_json::Value;
+    use serde_json::json;
     use std::collections::HashSet;
     use std::fs::File;
     use std::path::PathBuf;
@@ -3436,6 +3521,46 @@ mod tests {
             .sum::<i64>();
 
         assert_eq!(count, 2);
+        drop(&table_name).await;
+    }
+
+    #[tokio::test]
+    async fn load_file_as_table_reads_local_arrow_speedboat_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let segment_path = temp_dir.path().join("segment");
+        let segment_path = segment_path.to_string_lossy().to_string();
+        let buffer = WriteBuffer::delete(vec![json!({
+            "_id": "doc-1",
+            "_id_seq_no": "doc-1:1",
+            "_version": 1
+        })]);
+        buffer.write_to_file(&segment_path).unwrap();
+
+        let table_name = "local_arrow_speedboat_test".to_string();
+        load_file_as_table(
+            &table_name,
+            &segment_path,
+            false,
+            Some(PowdrrSchema::deletes().to_arrow_schema()),
+        )
+        .await
+        .unwrap();
+
+        let sql = format!("SELECT COUNT(*) AS count FROM {}", table_name);
+        let batches = execute_sql_async(&sql).await.unwrap();
+        let count = batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0)
+            })
+            .sum::<i64>();
+
+        assert_eq!(count, 1);
         drop(&table_name).await;
     }
 
