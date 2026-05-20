@@ -17,6 +17,7 @@ use powdrr_service_lib::data_contract::{
     SpeedboatCommit,
 };
 use powdrr_service_lib::elastic_search_lifetime_policy::ILMPolicyDefinition;
+use powdrr_service_lib::metadata_store::ServingNodeActivationAck;
 use powdrr_service_lib::peers::CheckpointDescriptor;
 use powdrr_service_lib::pipeline::PipelineDefinition;
 use reqwest::Client;
@@ -466,6 +467,18 @@ body_handler_org_info! { cleanup_commit(org_info: OrgInfo, input: CleanupCommit)
 
 body_handler_org_info! { get_latest_checkpoint(org_info: OrgInfo, input: GetLatestCheckpoint) -> GenericResponse {
     handle_result_option(SERVICE_IMPL.get_latest_checkpoint(&org_info, &input.table_name, input.extension).await)
+}}
+
+body_handler_org_info! { get_latest_target_checkpoint(org_info: OrgInfo, input: GetLatestCheckpoint) -> GenericResponse {
+    handle_result_option(SERVICE_IMPL.get_latest_target_checkpoint(&org_info, &input.table_name, input.extension).await)
+}}
+
+body_handler_org_info! { get_checkpoint_cutover_state(org_info: OrgInfo, input: GetLatestCheckpoint) -> GenericResponse {
+    handle_result(SERVICE_IMPL.get_checkpoint_cutover_state(&org_info, &input.table_name, input.extension).await)
+}}
+
+body_handler_org_info! { record_serving_node_activation(org_info: OrgInfo, input: ServingNodeActivationAck) -> GenericResponse {
+    handle_result(SERVICE_IMPL.record_serving_node_activation(&org_info, &input).await)
 }}
 
 body_handler_org_info! { get_checkpoint(org_info: OrgInfo, input: CheckpointDescriptor) -> GenericResponse {

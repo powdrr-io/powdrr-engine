@@ -4,6 +4,7 @@ use crate::data_contract::{
     SpeedboatCommit, TableMetadataCheckpoint,
 };
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
+use crate::metadata_store::ServingNodeActivationAck;
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
 use crate::schema_massager::PowdrrSchema;
@@ -621,6 +622,7 @@ powdrr_named_entity!(powdrr_table, TableBody);
 powdrr_named_entity!(table_template, CreateIndexTemplateBody);
 powdrr_named_entity!(pipeline, PipelineDefinition);
 powdrr_named_entity!(lifetime_policy, ILMPolicyDefinition);
+powdrr_named_entity!(serving_node_activation, ServingNodeActivationAck);
 powdrr_named_entity!(latest, EntityVersionInfo);
 powdrr_named_entity!(org_settings, OrgSettings);
 
