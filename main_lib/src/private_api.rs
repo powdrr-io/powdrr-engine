@@ -35,6 +35,10 @@ use crate::peers::{
     PrivateSearchTermsOrderSpec, PrivateSqlInvocation,
 };
 use crate::prefetch::warm_iceberg_checkpoints;
+use crate::query_execution::{
+    QueryExtensionFileSpec, QueryInputFile, execute_query_file_group_batches,
+    group_query_input_files_by_schema,
+};
 use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema, SqlQuery};
 use crate::search_executor::typed_sort_projection_name;
 use crate::search_runtime::batches_to_serde_value;
@@ -1235,18 +1239,12 @@ pub(crate) async fn search_query(
         .await?;
     }
 
-    let use_exact_candidates = !invocation.exact_constraints.is_empty()
-        && invocation.exact_doc_id_field_name.is_some()
-        && invocation
-            .exact_sql
-            .as_ref()
-            .is_some_and(|_| required_files_have_extension_suffix(&required_files, "exact_index"));
     let use_exact_sql = invocation
         .exact_sql
         .as_ref()
         .is_some_and(|_| required_files_have_extension_suffix(&required_files, "exact_index"));
 
-    if use_exact_candidates || use_exact_sql {
+    if use_exact_sql {
         retain_required_file_extension_suffixes(&mut required_files, &["exact_index"]);
     } else if invocation.calculate_score {
         retain_required_file_extension_suffixes(&mut required_files, &["search_index"]);
@@ -1272,19 +1270,7 @@ pub(crate) async fn search_query(
         &invocation.sql
     };
 
-    let batches = if use_exact_candidates {
-        data_query_batches_exact_worker(
-            &invocation.sql,
-            invocation.exact_sql.as_ref().unwrap_or(&invocation.sql),
-            &required_files,
-            &invocation.exact_constraints,
-            invocation.exact_doc_id_field_name.as_deref().unwrap(),
-            true,
-        )
-        .await?
-    } else {
-        data_query_batches_worker(sql, &required_files, true).await?
-    };
+    let batches = data_query_batches_worker(sql, &required_files, true).await?;
     let serde_result = match batches_to_serde_value(&batches).await {
         Ok(result) => result,
         Err(e) => return Err(PrivateApiError { message: e.message }),
@@ -2111,72 +2097,94 @@ async fn data_query_batches_worker(
     required_files: &RequiredFiles,
     use_cpu_threadpool: bool,
 ) -> Result<Vec<RecordBatch>, PrivateApiError> {
-    let mut delete_local_names = vec![];
-    let delete_schema = PowdrrSchema::from(&vec![PowdrrField {
-        name: "_id_seq_no".to_string(),
-        data_type: PowdrrDataType::String,
-    }]);
-    let extension_file_vecs = vec![];
-    for delete_file_path in required_files.delete_files.iter() {
-        let local_name = match ensure_loaded(
-            &delete_file_path,
-            &extension_file_vecs,
-            1,
-            false,
-            Some(delete_schema.clone()),
-        )
-        .await
-        {
-            Ok(ln) => ln,
-            Err(e) => return log_err(PrivateApiError::from(e)),
-        };
-        delete_local_names.push(local_name);
-    }
-    // TODO: need to make a stable name here and skip this if it is already loaded
-    let all_deletes_local_name = create_all_deletes_table(&delete_local_names).await?;
-
-    let iceberg_calls = required_files
+    let iceberg_query_files = required_files
         .iceberg_files
         .iter()
-        .zip(required_files.iceberg_file_extensions.iter())
-        .map(|(iceberg_file, iceberg_file_extensions)| {
-            process_iceberg_file(
-                sql,
-                iceberg_file,
-                iceberg_file_extensions,
-                &required_files.table_schema,
-                &all_deletes_local_name,
+        .cloned()
+        .zip(required_files.iceberg_file_extensions.iter().cloned())
+        .map(|(file, extensions)| QueryInputFile {
+            file,
+            extensions: extensions
+                .into_iter()
+                .map(|extension| QueryExtensionFileSpec {
+                    suffix: extension.suffix,
+                    file_path: extension.file_path,
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let iceberg_groups = group_query_input_files_by_schema(iceberg_query_files);
+    let delete_files = required_files.delete_files.clone();
+    let table_schema = required_files.table_schema.clone();
+    let iceberg_calls = iceberg_groups.into_iter().map(move |group| {
+        let built_sql = sql.build(&table_schema, &group[0].file.schema);
+        let delete_files = delete_files.clone();
+        async move {
+            execute_query_file_group_batches(
+                group,
+                &built_sql,
+                &delete_files,
+                "{target_table}",
+                "{deletes_table}",
                 use_cpu_threadpool,
             )
-        });
+            .await
+            .map_err(PrivateApiError::from)
+        }
+    });
+
+    let mut delete_local_names = vec![];
+    let mut all_deletes_local_name: Option<String> = None;
+    if !required_files.speedboat_files.is_empty() {
+        let delete_schema = PowdrrSchema::from(&vec![PowdrrField {
+            name: "_id_seq_no".to_string(),
+            data_type: PowdrrDataType::String,
+        }]);
+        let extension_file_vecs = vec![];
+        for delete_file_path in required_files.delete_files.iter() {
+            let local_name = match ensure_loaded(
+                &delete_file_path,
+                &extension_file_vecs,
+                1,
+                false,
+                Some(delete_schema.clone()),
+            )
+            .await
+            {
+                Ok(ln) => ln,
+                Err(e) => return log_err(PrivateApiError::from(e)),
+            };
+            delete_local_names.push(local_name);
+        }
+        all_deletes_local_name = Some(create_all_deletes_table(&delete_local_names).await?);
+    }
+
+    let speedboat_deletes_table_name = all_deletes_local_name.clone();
+    let speedboat_table_schema = required_files.table_schema.clone();
     let speedboat_calls = required_files
         .speedboat_files
         .iter()
-        .zip(required_files.speedboat_file_extensions.iter())
-        .map(|(speedboat_file, speedboat_file_extensions)| {
-            process_speedboat_file(
-                sql,
-                speedboat_file,
-                speedboat_file_extensions,
-                &required_files.table_schema,
-                &all_deletes_local_name,
-                use_cpu_threadpool,
-            )
+        .cloned()
+        .zip(required_files.speedboat_file_extensions.iter().cloned())
+        .map(move |(speedboat_file, speedboat_file_extensions)| {
+            let deletes_table_name = speedboat_deletes_table_name
+                .clone()
+                .expect("speedboat delete table must exist");
+            let table_schema = speedboat_table_schema.clone();
+            async move {
+                process_speedboat_file(
+                    sql,
+                    &speedboat_file,
+                    &speedboat_file_extensions,
+                    &table_schema,
+                    &deletes_table_name,
+                    use_cpu_threadpool,
+                )
+                .await
+            }
         });
 
-    let iceberg_results: Vec<Result<RecordBatch, FlightError>> =
-        match try_join_all(iceberg_calls).await {
-            Ok(ar) => ar
-                .iter()
-                .flatten()
-                .map(|x| Ok(x.clone()))
-                .collect::<Vec<Result<RecordBatch, FlightError>>>(),
-            Err(e) => {
-                let error = format!("{}", e.message);
-                println!("{}", error);
-                panic!("dude")
-            }
-        };
+    let iceberg_results = try_join_all(iceberg_calls).await?;
 
     let speedboat_results: Vec<Result<RecordBatch, FlightError>> =
         match try_join_all(speedboat_calls).await {
@@ -2192,13 +2200,13 @@ async fn data_query_batches_worker(
             }
         };
 
-    data_access::drop(&all_deletes_local_name).await;
+    if let Some(all_deletes_local_name) = all_deletes_local_name.as_ref() {
+        data_access::drop(all_deletes_local_name).await;
+    }
 
-    Ok(iceberg_results
-        .into_iter()
-        .chain(speedboat_results.into_iter())
-        .map(|result| result.unwrap())
-        .collect())
+    let mut combined = iceberg_results.into_iter().flatten().collect::<Vec<_>>();
+    combined.extend(speedboat_results.into_iter().map(|result| result.unwrap()));
+    Ok(combined)
 }
 
 async fn data_query_batches_exact_worker(

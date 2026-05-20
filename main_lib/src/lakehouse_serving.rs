@@ -16,15 +16,20 @@ use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::data_access::{self, execute_sql_async, load_files_as_table};
+use crate::data_access::{self, execute_sql_async};
 use crate::data_contract::{
-    CreateTable, ExtensionFile, FileDescriptor, IcebergAccessArtifact, IcebergColumnStats,
-    IcebergFileStats, IcebergPartitionField, IcebergRowGroupStats, IcebergSortField,
-    ServingPattern, ServingTableConfig, TableDescription, TableMetadataCheckpoint,
+    CreateTable, ExtensionFile, FileDescriptor, IcebergAccessArtifact, IcebergFileStats,
+    IcebergPartitionField, IcebergRowGroupStats, IcebergSortField, ServingPattern,
+    ServingTableConfig, TableDescription, TableMetadataCheckpoint,
 };
 use crate::elastic_search_endpoints::NamePathExtractor;
 use crate::peers::CheckpointDescriptor;
 use crate::prefetch::warm_iceberg_checkpoints;
+use crate::query_execution::{QueryInputFile, execute_query_file_group_batches};
+use crate::query_path::{
+    QueryPredicate, column_is_all_null, compare_scalar_values, file_may_match_predicates,
+    group_files_by_schema, row_group_may_match_predicates,
+};
 use crate::schema_massager::{PowdrrDataType, PowdrrSchema};
 use crate::search_runtime::batches_to_serde_value;
 use crate::serving_plan::{ServingPredicate, ServingQueryClassification, ServingRequestPlan};
@@ -1747,73 +1752,27 @@ async fn execute_file_group_plan(
     sql_template: &str,
     delete_files: &[String],
 ) -> Result<Vec<Value>, ServingQueryError> {
-    let local_name = file_group_table_name(&files);
-    let deletes_table_name = format!("serving_deletes_{}", IdInstance::next_id());
-    let delete_local_tables = delete_files
-        .iter()
-        .map(|_| format!("serving_delete_file_{}", IdInstance::next_id()))
+    let query_files = files
+        .into_iter()
+        .map(|file| QueryInputFile {
+            file,
+            extensions: vec![],
+        })
         .collect::<Vec<_>>();
-    let file_paths = files
-        .iter()
-        .map(|file| file.file_path.clone())
-        .collect::<Vec<_>>();
-    let total_size = files.iter().map(|file| file.size).sum::<u64>();
-    data_access::reserve(&local_name, total_size, vec![]).await;
-    let mut created_delete_tables = vec![];
-    let mut deletes_union_created = false;
-    let result = async {
-        load_files_as_table(&local_name, &file_paths, &files[0].schema.to_arrow_schema())
-            .await
-            .map_err(|error| {
-                ServingQueryError::new(StatusCode::SERVICE_UNAVAILABLE, &error.to_string())
-            })?;
-
-        if !delete_files.is_empty() {
-            let delete_schema = PowdrrSchema::deletes().to_arrow_schema();
-            for (local_delete_table, delete_file_path) in
-                delete_local_tables.iter().zip(delete_files.iter())
-            {
-                data_access::load_file_as_table(
-                    local_delete_table,
-                    delete_file_path,
-                    false,
-                    Some(delete_schema.clone()),
-                )
-                .await
-                .map_err(|error| {
-                    ServingQueryError::new(StatusCode::SERVICE_UNAVAILABLE, &error.to_string())
-                })?;
-                created_delete_tables.push(local_delete_table.clone());
-            }
-            let deletes_sql = create_serving_deletes_table_sql(&delete_local_tables);
-            data_access::create_table(&deletes_table_name, &deletes_sql)
-                .await
-                .map_err(|error| {
-                    ServingQueryError::new(StatusCode::SERVICE_UNAVAILABLE, &error.to_string())
-                })?;
-            deletes_union_created = true;
-        }
-
-        let local_sql = sql_template
-            .replace("{table}", &local_name)
-            .replace("{deletes_table}", &deletes_table_name);
-        let batches = execute_sql_async(&local_sql).await.map_err(|error| {
-            ServingQueryError::new(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string())
-        })?;
-        let serde_result = batches_to_serde_value(&batches).await.map_err(|error| {
-            ServingQueryError::new(StatusCode::UNPROCESSABLE_ENTITY, &error.message)
-        })?;
-        Ok::<Vec<Value>, ServingQueryError>(serde_result.values)
-    }
-    .await;
-    for table_name in &created_delete_tables {
-        data_access::drop(table_name).await;
-    }
-    if deletes_union_created {
-        data_access::drop(&deletes_table_name).await;
-    }
-    data_access::release(&local_name).await;
-    result
+    let batches = execute_query_file_group_batches(
+        query_files,
+        sql_template,
+        delete_files,
+        "{table}",
+        "{deletes_table}",
+        true,
+    )
+    .await
+    .map_err(|error| ServingQueryError::new(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string()))?;
+    let serde_result = batches_to_serde_value(&batches).await.map_err(|error| {
+        ServingQueryError::new(StatusCode::UNPROCESSABLE_ENTITY, &error.message)
+    })?;
+    Ok(serde_result.values)
 }
 
 async fn execute_file_group_warmup(
@@ -1821,102 +1780,24 @@ async fn execute_file_group_warmup(
     sql_template: &str,
     delete_files: &[String],
 ) -> Result<(), ServingQueryError> {
-    let local_name = file_group_table_name(&files);
-    let deletes_table_name = format!("serving_deletes_{}", IdInstance::next_id());
-    let delete_local_tables = delete_files
-        .iter()
-        .map(|_| format!("serving_delete_file_{}", IdInstance::next_id()))
+    let query_files = files
+        .into_iter()
+        .map(|file| QueryInputFile {
+            file,
+            extensions: vec![],
+        })
         .collect::<Vec<_>>();
-    let file_paths = files
-        .iter()
-        .map(|file| file.file_path.clone())
-        .collect::<Vec<_>>();
-    let total_size = files.iter().map(|file| file.size).sum::<u64>();
-    data_access::reserve(&local_name, total_size, vec![]).await;
-    let mut created_delete_tables = vec![];
-    let mut deletes_union_created = false;
-    let result = async {
-        load_files_as_table(&local_name, &file_paths, &files[0].schema.to_arrow_schema())
-            .await
-            .map_err(|error| {
-                ServingQueryError::new(StatusCode::SERVICE_UNAVAILABLE, &error.to_string())
-            })?;
-
-        if !delete_files.is_empty() {
-            let delete_schema = PowdrrSchema::deletes().to_arrow_schema();
-            for (local_delete_table, delete_file_path) in
-                delete_local_tables.iter().zip(delete_files.iter())
-            {
-                data_access::load_file_as_table(
-                    local_delete_table,
-                    delete_file_path,
-                    false,
-                    Some(delete_schema.clone()),
-                )
-                .await
-                .map_err(|error| {
-                    ServingQueryError::new(StatusCode::SERVICE_UNAVAILABLE, &error.to_string())
-                })?;
-                created_delete_tables.push(local_delete_table.clone());
-            }
-            let deletes_sql = create_serving_deletes_table_sql(&delete_local_tables);
-            data_access::create_table(&deletes_table_name, &deletes_sql)
-                .await
-                .map_err(|error| {
-                    ServingQueryError::new(StatusCode::SERVICE_UNAVAILABLE, &error.to_string())
-                })?;
-            deletes_union_created = true;
-        }
-
-        let local_sql = sql_template
-            .replace("{table}", &local_name)
-            .replace("{deletes_table}", &deletes_table_name);
-        let _ = execute_sql_async(&local_sql).await.map_err(|error| {
-            ServingQueryError::new(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string())
-        })?;
-        Ok::<(), ServingQueryError>(())
-    }
-    .await;
-    for table_name in &created_delete_tables {
-        data_access::drop(table_name).await;
-    }
-    if deletes_union_created {
-        data_access::drop(&deletes_table_name).await;
-    }
-    data_access::release(&local_name).await;
-    result
-}
-
-fn create_serving_deletes_table_sql(local_names: &[String]) -> String {
-    if local_names.is_empty() {
-        "select null as _id_seq_no".to_string()
-    } else {
-        let union_selects = local_names
-            .iter()
-            .map(|table_name| format!("select * from {table_name}"))
-            .collect::<Vec<_>>()
-            .join(" union all ");
-        format!("select * from ({union_selects})")
-    }
-}
-
-fn group_files_by_schema(files: &[FileDescriptor]) -> Vec<Vec<FileDescriptor>> {
-    let mut groups: Vec<Vec<FileDescriptor>> = vec![];
-
-    for file in files.iter().cloned() {
-        if let Some(existing_group) = groups.iter_mut().find(|group| {
-            group
-                .first()
-                .map(|existing| existing.schema == file.schema)
-                .unwrap_or(false)
-        }) {
-            existing_group.push(file);
-        } else {
-            groups.push(vec![file]);
-        }
-    }
-
-    groups
+    let _ = execute_query_file_group_batches(
+        query_files,
+        sql_template,
+        delete_files,
+        "{table}",
+        "{deletes_table}",
+        true,
+    )
+    .await
+    .map_err(|error| ServingQueryError::new(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string()))?;
+    Ok(())
 }
 
 fn file_group_table_name(files: &[FileDescriptor]) -> String {
@@ -2886,162 +2767,30 @@ fn partition_range_may_match(value: &Value, predicate: &ServingPredicate) -> boo
 }
 
 fn file_may_match_request(file_stats: &IcebergFileStats, request: &ServingRequestPlan) -> bool {
-    request
-        .filters
-        .iter()
-        .all(|predicate| predicate_may_match_file(file_stats, predicate))
+    file_may_match_predicates(file_stats, &serving_request_predicates(request))
 }
 
 fn row_group_may_match_request(
     row_group_stats: &IcebergRowGroupStats,
     request: &ServingRequestPlan,
 ) -> bool {
+    row_group_may_match_predicates(row_group_stats, &serving_request_predicates(request))
+}
+
+fn serving_request_predicates(request: &ServingRequestPlan) -> Vec<QueryPredicate> {
     request
         .filters
         .iter()
-        .all(|predicate| predicate_may_match_row_group(row_group_stats, predicate))
-}
-
-fn predicate_may_match_file(file_stats: &IcebergFileStats, predicate: &ServingPredicate) -> bool {
-    let Some(column_stats) = file_stats
-        .columns
-        .iter()
-        .find(|stats| stats.field_name == predicate.field)
-    else {
-        return true;
-    };
-
-    predicate_may_match_stats(column_stats, file_stats.record_count, predicate)
-}
-
-fn predicate_may_match_row_group(
-    row_group_stats: &IcebergRowGroupStats,
-    predicate: &ServingPredicate,
-) -> bool {
-    let Some(column_stats) = row_group_stats
-        .columns
-        .iter()
-        .find(|stats| stats.field_name == predicate.field)
-    else {
-        return true;
-    };
-
-    predicate_may_match_stats(column_stats, row_group_stats.record_count, predicate)
-}
-
-fn predicate_may_match_stats(
-    column_stats: &IcebergColumnStats,
-    record_count: Option<u64>,
-    predicate: &ServingPredicate,
-) -> bool {
-    if let Some(eq) = predicate.eq.as_ref() {
-        return equality_may_match(column_stats, record_count, eq);
-    }
-    if let Some(values) = predicate.in_values.as_ref() {
-        return values
-            .iter()
-            .any(|value| equality_may_match(column_stats, record_count, value));
-    }
-
-    range_may_match(column_stats, record_count, predicate)
-}
-
-fn equality_may_match(
-    column_stats: &IcebergColumnStats,
-    record_count: Option<u64>,
-    value: &Value,
-) -> bool {
-    if column_is_all_null(column_stats, record_count) {
-        return false;
-    }
-
-    if let Some(lower_bound) = column_stats.lower_bound.as_ref() {
-        if matches!(
-            compare_scalar_values(value, lower_bound),
-            Some(Ordering::Less)
-        ) {
-            return false;
-        }
-    }
-    if let Some(upper_bound) = column_stats.upper_bound.as_ref() {
-        if matches!(
-            compare_scalar_values(value, upper_bound),
-            Some(Ordering::Greater)
-        ) {
-            return false;
-        }
-    }
-
-    true
-}
-
-fn range_may_match(
-    column_stats: &IcebergColumnStats,
-    record_count: Option<u64>,
-    predicate: &ServingPredicate,
-) -> bool {
-    if column_is_all_null(column_stats, record_count) {
-        return false;
-    }
-
-    if let Some(value) = predicate.gt.as_ref() {
-        if let Some(upper_bound) = column_stats.upper_bound.as_ref() {
-            if matches!(
-                compare_scalar_values(upper_bound, value),
-                Some(Ordering::Less | Ordering::Equal)
-            ) {
-                return false;
-            }
-        }
-    }
-    if let Some(value) = predicate.gte.as_ref() {
-        if let Some(upper_bound) = column_stats.upper_bound.as_ref() {
-            if matches!(
-                compare_scalar_values(upper_bound, value),
-                Some(Ordering::Less)
-            ) {
-                return false;
-            }
-        }
-    }
-    if let Some(value) = predicate.lt.as_ref() {
-        if let Some(lower_bound) = column_stats.lower_bound.as_ref() {
-            if matches!(
-                compare_scalar_values(lower_bound, value),
-                Some(Ordering::Greater | Ordering::Equal)
-            ) {
-                return false;
-            }
-        }
-    }
-    if let Some(value) = predicate.lte.as_ref() {
-        if let Some(lower_bound) = column_stats.lower_bound.as_ref() {
-            if matches!(
-                compare_scalar_values(lower_bound, value),
-                Some(Ordering::Greater)
-            ) {
-                return false;
-            }
-        }
-    }
-
-    true
-}
-
-fn column_is_all_null(column_stats: &IcebergColumnStats, record_count: Option<u64>) -> bool {
-    match (column_stats.null_count, record_count) {
-        (Some(null_count), Some(record_count)) => null_count >= record_count,
-        _ => false,
-    }
-}
-
-fn compare_scalar_values(left: &Value, right: &Value) -> Option<Ordering> {
-    match (left, right) {
-        (Value::Number(left), Value::Number(right)) => left.as_f64()?.partial_cmp(&right.as_f64()?),
-        (Value::String(left), Value::String(right)) => Some(left.cmp(right)),
-        (Value::Bool(left), Value::Bool(right)) => Some(left.cmp(right)),
-        _ => None,
-    }
+        .map(|predicate| QueryPredicate {
+            field: predicate.field.clone(),
+            eq: predicate.eq.clone(),
+            in_values: predicate.in_values.clone(),
+            gt: predicate.gt.clone(),
+            gte: predicate.gte.clone(),
+            lt: predicate.lt.clone(),
+            lte: predicate.lte.clone(),
+        })
+        .collect()
 }
 
 fn build_sql(

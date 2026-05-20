@@ -37,6 +37,8 @@ pub mod peers;
 pub mod pipeline;
 mod prefetch;
 mod private_api;
+mod query_path;
+mod query_execution;
 pub mod router;
 pub mod schema_massager;
 mod search_executor;
