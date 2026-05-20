@@ -3,7 +3,7 @@ use gotham::plain::test::AsyncTestServer;
 use gotham::{
     handler::HandlerFuture,
     helpers::http::response::create_response,
-    hyper::{body, Body, StatusCode},
+    hyper::{Body, StatusCode, body},
     mime,
     state::{FromState, State},
 };

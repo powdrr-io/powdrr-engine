@@ -18,10 +18,10 @@ use crate::data_contract::{
     SpeedboatMetadata, TableMetadataCheckpoint,
 };
 use crate::elastic_search_index::create_index_inner;
-use crate::elastic_search_responses::{compare_query_result_hits_desc, QueryResultHit};
+use crate::elastic_search_responses::{QueryResultHit, compare_query_result_hits_desc};
 use crate::lakehouse_serving::{
-    build_serving_cache_manager_plan, default_serving_cache_manager_request,
-    execute_serving_cache_manager_plan, ServingCacheManagerPlan,
+    ServingCacheManagerPlan, build_serving_cache_manager_plan,
+    default_serving_cache_manager_request, execute_serving_cache_manager_plan,
 };
 use crate::peers::{
     CheckpointDescriptor, PrivateCompactionInvocation, PrivateExactConstraintGroup,
@@ -33,10 +33,10 @@ use crate::peers::{
 };
 use crate::prefetch::warm_iceberg_checkpoints;
 use crate::query_execution::{
-    execute_query_plan_batches, QueryExecutionPlan, QueryExtensionFileSpec, QueryInputFile,
-    QuerySqlTemplate, QueryStorageKind,
+    QueryExecutionPlan, QueryExtensionFileSpec, QueryInputFile, QuerySqlTemplate, QueryStorageKind,
+    execute_query_plan_batches,
 };
-use crate::query_path::{file_may_match_predicates, QueryPredicate};
+use crate::query_path::{QueryPredicate, file_may_match_predicates};
 use crate::schema_massager::{PowdrrSchema, SqlQuery};
 use crate::search_executor::typed_sort_projection_name;
 use crate::search_runtime::batches_to_serde_value;
@@ -1095,9 +1095,11 @@ mod tests {
         let error =
             get_extension_files(&vec!["es".to_string()], &checkpoint, &file_path).unwrap_err();
 
-        assert!(error
-            .message
-            .contains("missing published metadata for required extension es"));
+        assert!(
+            error
+                .message
+                .contains("missing published metadata for required extension es")
+        );
     }
 
     #[test]
