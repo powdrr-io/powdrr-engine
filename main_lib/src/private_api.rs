@@ -8,15 +8,17 @@ use futures_util::future::try_join_all;
 use idgenerator::IdInstance;
 use prost::Message;
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap},
     error::Error,
     fmt,
+    sync::{LazyLock, Mutex},
 };
 
 use crate::data_access::{self, load_file_as_table};
 use crate::data_contract::{
-    ExtensionFile, ExtensionFileMetadata, FileDescriptor, IcebergMetadata, SpeedboatMetadata,
-    TableMetadataCheckpoint,
+    ExtensionFile, ExtensionFileMetadata, FileDescriptor, IcebergColumnStats, IcebergFileStats,
+    IcebergMetadata, SpeedboatMetadata, TableMetadataCheckpoint,
 };
 use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_responses::{QueryResultHit, compare_query_result_hits_desc};
@@ -28,9 +30,9 @@ use crate::peers::{
     CheckpointDescriptor, PrivateCompactionInvocation, PrivateExactConstraintGroup,
     PrivateExtensionInvocation, PrivatePrefetchInvocation, PrivateSearchAggregationFilterSpec,
     PrivateSearchAggregationPartial, PrivateSearchAggregationSpec,
-    PrivateSearchHistogramBucketPartial, PrivateSearchInvocation, PrivateSearchResult,
-    PrivateSearchSortSpec, PrivateSearchTermsBucketPartial, PrivateSearchTermsOrderSpec,
-    PrivateSqlInvocation,
+    PrivateSearchHistogramBucketPartial, PrivateSearchInvocation, PrivateSearchRangeConstraint,
+    PrivateSearchResult, PrivateSearchSortSpec, PrivateSearchTermsBucketPartial,
+    PrivateSearchTermsOrderSpec, PrivateSqlInvocation,
 };
 use crate::prefetch::warm_iceberg_checkpoints;
 use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema, SqlQuery};
@@ -41,11 +43,22 @@ use crate::util::log_err;
 
 const EXACT_CANDIDATE_DOC_ID_FETCH_THRESHOLD: usize = 128;
 
-#[derive(Debug, PartialEq, Eq)]
+static EXACT_PRUNING_SUMMARY_CACHE: LazyLock<Mutex<HashMap<String, ExactPruningSummary>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ExtensionFileSpec {
     suffix: String,
     file_path: String,
 }
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ExactPruningFieldSummary {
+    complete: bool,
+    values: BTreeSet<String>,
+}
+
+type ExactPruningSummary = HashMap<String, ExactPruningFieldSummary>;
 
 #[derive(Debug)]
 pub(crate) struct PrivateApiError {
@@ -579,8 +592,168 @@ fn exact_extension_file<'a>(
         .find(|extension| extension.suffix == "exact_index")
 }
 
+fn exact_pruning_extension_file<'a>(
+    extension_files: &'a [ExtensionFileSpec],
+) -> Option<&'a ExtensionFileSpec> {
+    extension_files
+        .iter()
+        .find(|extension| extension.suffix == "exact_pruning")
+}
+
 fn sql_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+fn compare_scalar_values(left: &serde_json::Value, right: &serde_json::Value) -> Option<Ordering> {
+    match (left, right) {
+        (serde_json::Value::Number(left), serde_json::Value::Number(right)) => {
+            left.as_f64()?.partial_cmp(&right.as_f64()?)
+        }
+        (serde_json::Value::String(left), serde_json::Value::String(right)) => {
+            Some(left.cmp(right))
+        }
+        (serde_json::Value::Bool(left), serde_json::Value::Bool(right)) => Some(left.cmp(right)),
+        _ => None,
+    }
+}
+
+fn column_is_all_null(column_stats: &IcebergColumnStats, record_count: Option<u64>) -> bool {
+    match (column_stats.null_count, record_count) {
+        (Some(null_count), Some(record_count)) => null_count >= record_count,
+        _ => false,
+    }
+}
+
+fn equality_may_match(
+    column_stats: &IcebergColumnStats,
+    record_count: Option<u64>,
+    value: &serde_json::Value,
+) -> bool {
+    if column_is_all_null(column_stats, record_count) {
+        return false;
+    }
+
+    if let Some(lower_bound) = column_stats.lower_bound.as_ref() {
+        if matches!(
+            compare_scalar_values(value, lower_bound),
+            Some(Ordering::Less)
+        ) {
+            return false;
+        }
+    }
+    if let Some(upper_bound) = column_stats.upper_bound.as_ref() {
+        if matches!(
+            compare_scalar_values(value, upper_bound),
+            Some(Ordering::Greater)
+        ) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn exact_constraint_group_may_match_stats(
+    column_stats: &IcebergColumnStats,
+    record_count: Option<u64>,
+    constraint: &PrivateExactConstraintGroup,
+) -> bool {
+    constraint
+        .values
+        .iter()
+        .map(|value| serde_json::Value::String(value.clone()))
+        .any(|value| equality_may_match(column_stats, record_count, &value))
+}
+
+fn range_constraint_may_match_stats(
+    column_stats: &IcebergColumnStats,
+    record_count: Option<u64>,
+    constraint: &PrivateSearchRangeConstraint,
+) -> bool {
+    if column_is_all_null(column_stats, record_count) {
+        return false;
+    }
+
+    if let Some(value) = constraint.gt.as_ref() {
+        if let Some(upper_bound) = column_stats.upper_bound.as_ref() {
+            if matches!(
+                compare_scalar_values(upper_bound, value),
+                Some(Ordering::Less | Ordering::Equal)
+            ) {
+                return false;
+            }
+        }
+    }
+    if let Some(value) = constraint.gte.as_ref() {
+        if let Some(upper_bound) = column_stats.upper_bound.as_ref() {
+            if matches!(
+                compare_scalar_values(upper_bound, value),
+                Some(Ordering::Less)
+            ) {
+                return false;
+            }
+        }
+    }
+    if let Some(value) = constraint.lt.as_ref() {
+        if let Some(lower_bound) = column_stats.lower_bound.as_ref() {
+            if matches!(
+                compare_scalar_values(lower_bound, value),
+                Some(Ordering::Greater | Ordering::Equal)
+            ) {
+                return false;
+            }
+        }
+    }
+    if let Some(value) = constraint.lte.as_ref() {
+        if let Some(lower_bound) = column_stats.lower_bound.as_ref() {
+            if matches!(
+                compare_scalar_values(lower_bound, value),
+                Some(Ordering::Greater)
+            ) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+fn iceberg_file_may_match_search(
+    file_stats: &IcebergFileStats,
+    exact_constraints: &[PrivateExactConstraintGroup],
+    range_constraints: &[PrivateSearchRangeConstraint],
+) -> bool {
+    for constraint in exact_constraints {
+        let Some(column_stats) = file_stats
+            .columns
+            .iter()
+            .find(|stats| stats.field_name == constraint.field)
+        else {
+            continue;
+        };
+        if !exact_constraint_group_may_match_stats(
+            column_stats,
+            file_stats.record_count,
+            constraint,
+        ) {
+            return false;
+        }
+    }
+
+    for constraint in range_constraints {
+        let Some(column_stats) = file_stats
+            .columns
+            .iter()
+            .find(|stats| stats.field_name == constraint.field)
+        else {
+            continue;
+        };
+        if !range_constraint_may_match_stats(column_stats, file_stats.record_count, constraint) {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn exact_candidate_doc_ids_sql(
@@ -674,6 +847,205 @@ async fn exact_candidate_doc_ids(
     doc_ids.sort_by(|left, right| left.to_string().cmp(&right.to_string()));
     doc_ids.dedup_by(|left, right| left == right);
     Ok(doc_ids)
+}
+
+fn exact_pruning_summary_from_rows(rows: Vec<serde_json::Value>) -> ExactPruningSummary {
+    let mut summary = ExactPruningSummary::new();
+    for row in rows {
+        let Some(field_name) = row.get("field_name").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let complete = row
+            .get("complete")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let entry = summary
+            .entry(field_name.to_string())
+            .or_insert_with(ExactPruningFieldSummary::default);
+        if entry.values.is_empty() && !entry.complete {
+            entry.complete = complete;
+        } else {
+            entry.complete &= complete;
+        }
+        if let Some(field_value) = row.get("field_value").and_then(|value| value.as_str()) {
+            entry.values.insert(field_value.to_string());
+        }
+    }
+    summary
+}
+
+async fn load_exact_pruning_summary(
+    base_file_path: &String,
+    top_level_size: u64,
+    extension_files: &Vec<ExtensionFileSpec>,
+) -> Result<Option<ExactPruningSummary>, PrivateApiError> {
+    let Some(extension_file) = exact_pruning_extension_file(extension_files) else {
+        return Ok(None);
+    };
+
+    if let Some(cached) = EXACT_PRUNING_SUMMARY_CACHE
+        .lock()
+        .unwrap()
+        .get(&extension_file.file_path)
+        .cloned()
+    {
+        return Ok(Some(cached));
+    }
+
+    let pruning_local_name =
+        ensure_loaded_extension_only(base_file_path, extension_file, top_level_size)
+            .await
+            .map_err(PrivateApiError::from)?;
+    let sql = format!(
+        "SELECT field_name, field_value, complete FROM {}",
+        pruning_local_name
+    );
+    let batches = match execute_raw_sql(&sql, true).await {
+        Ok(batches) => batches,
+        Err(error) => {
+            data_access::release(&pruning_local_name).await;
+            return log_err(PrivateApiError::from(error));
+        }
+    };
+    let serde_result = match batches_to_serde_value(&batches).await {
+        Ok(result) => result,
+        Err(error) => {
+            data_access::release(&pruning_local_name).await;
+            return Err(PrivateApiError {
+                message: error.message,
+            });
+        }
+    };
+    data_access::release(&pruning_local_name).await;
+
+    let summary = exact_pruning_summary_from_rows(serde_result.values);
+    EXACT_PRUNING_SUMMARY_CACHE
+        .lock()
+        .unwrap()
+        .insert(extension_file.file_path.clone(), summary.clone());
+    Ok(Some(summary))
+}
+
+fn exact_pruning_summary_may_match(
+    summary: &ExactPruningSummary,
+    exact_constraints: &[PrivateExactConstraintGroup],
+) -> bool {
+    for constraint in exact_constraints {
+        let Some(field_summary) = summary.get(&constraint.field) else {
+            continue;
+        };
+        if field_summary.complete
+            && !constraint
+                .values
+                .iter()
+                .any(|value| field_summary.values.contains(value))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+async fn file_may_match_search(
+    file: &FileDescriptor,
+    extension_files: &Vec<ExtensionFileSpec>,
+    iceberg_file_stats: Option<&IcebergFileStats>,
+    exact_constraints: &[PrivateExactConstraintGroup],
+    range_constraints: &[PrivateSearchRangeConstraint],
+    parquet: bool,
+) -> Result<bool, PrivateApiError> {
+    if let Some(file_stats) = iceberg_file_stats {
+        if !iceberg_file_may_match_search(file_stats, exact_constraints, range_constraints) {
+            return Ok(false);
+        }
+    }
+
+    if exact_constraints.is_empty() {
+        return Ok(true);
+    }
+
+    let Some(summary) = load_exact_pruning_summary(
+        &file.file_path,
+        if parquet { 1 } else { file.size },
+        extension_files,
+    )
+    .await?
+    else {
+        return Ok(true);
+    };
+
+    Ok(exact_pruning_summary_may_match(&summary, exact_constraints))
+}
+
+async fn prune_required_files_for_search(
+    required_files: &mut RequiredFiles,
+    table_metadata: &TableMetadataCheckpoint,
+    exact_constraints: &[PrivateExactConstraintGroup],
+    range_constraints: &[PrivateSearchRangeConstraint],
+) -> Result<(), PrivateApiError> {
+    let iceberg_file_stats = table_metadata
+        .iceberg_metadata
+        .as_ref()
+        .map(|metadata| {
+            metadata
+                .file_stats
+                .iter()
+                .map(|stats| (stats.file_path.clone(), stats.clone()))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+    let mut retained_iceberg_files = vec![];
+    let mut retained_iceberg_extensions = vec![];
+    for (file, extensions) in required_files
+        .iceberg_files
+        .iter()
+        .cloned()
+        .zip(required_files.iceberg_file_extensions.iter().cloned())
+    {
+        if file_may_match_search(
+            &file,
+            &extensions,
+            iceberg_file_stats.get(&file.file_path),
+            exact_constraints,
+            range_constraints,
+            true,
+        )
+        .await?
+        {
+            retained_iceberg_files.push(file);
+            retained_iceberg_extensions.push(extensions);
+        }
+    }
+    required_files.iceberg_files = retained_iceberg_files;
+    required_files.iceberg_file_extensions = retained_iceberg_extensions;
+
+    let mut retained_speedboat_files = vec![];
+    let mut retained_speedboat_extensions = vec![];
+    for (file, extensions) in required_files
+        .speedboat_files
+        .iter()
+        .cloned()
+        .zip(required_files.speedboat_file_extensions.iter().cloned())
+    {
+        if file_may_match_search(
+            &file,
+            &extensions,
+            None,
+            exact_constraints,
+            range_constraints,
+            false,
+        )
+        .await?
+        {
+            retained_speedboat_files.push(file);
+            retained_speedboat_extensions.push(extensions);
+        }
+    }
+    required_files.speedboat_files = retained_speedboat_files;
+    required_files.speedboat_file_extensions = retained_speedboat_extensions;
+
+    Ok(())
 }
 
 async fn process_file_with_exact_candidates(
@@ -835,6 +1207,33 @@ pub(crate) async fn search_query(
             }
         }
     };
+
+    if !invocation.exact_constraints.is_empty() || !invocation.range_constraints.is_empty() {
+        let target_checkpoint = &invocation.checkpoints[0];
+        let table_metadata = match STATE_PROVIDER
+            .get_checkpoint(target_checkpoint.clone())
+            .await
+        {
+            Ok(Some(table_metadata)) => table_metadata,
+            Ok(None) => {
+                return Err(PrivateApiError {
+                    message: format!("Checkpoint {} was not found", target_checkpoint),
+                });
+            }
+            Err(error) => {
+                return Err(PrivateApiError {
+                    message: format!("Error loading checkpoint metadata: {}", error),
+                });
+            }
+        };
+        prune_required_files_for_search(
+            &mut required_files,
+            &table_metadata,
+            &invocation.exact_constraints,
+            &invocation.range_constraints,
+        )
+        .await?;
+    }
 
     let use_exact_candidates = !invocation.exact_constraints.is_empty()
         && invocation.exact_doc_id_field_name.is_some()
@@ -1217,6 +1616,111 @@ mod tests {
 
         assert_eq!(required_files.iceberg_file_extensions, vec![vec![]]);
         assert_eq!(required_files.speedboat_file_extensions, vec![vec![]]);
+    }
+
+    #[test]
+    fn iceberg_file_may_match_search_prunes_exact_and_range_filters() {
+        let file_stats = IcebergFileStats {
+            file_path: "s3://warehouse/table/data.parquet".to_string(),
+            record_count: Some(10),
+            columns: vec![
+                IcebergColumnStats {
+                    field_id: 1,
+                    field_name: "service".to_string(),
+                    null_count: Some(0),
+                    lower_bound: Some(serde_json::Value::String("auth".to_string())),
+                    upper_bound: Some(serde_json::Value::String("payments".to_string())),
+                },
+                IcebergColumnStats {
+                    field_id: 2,
+                    field_name: "@timestamp".to_string(),
+                    null_count: Some(0),
+                    lower_bound: Some(serde_json::Value::from(100_i64)),
+                    upper_bound: Some(serde_json::Value::from(200_i64)),
+                },
+            ],
+            partition_values: vec![],
+            row_groups: vec![],
+        };
+
+        assert!(iceberg_file_may_match_search(
+            &file_stats,
+            &[PrivateExactConstraintGroup {
+                field: "service".to_string(),
+                values: vec!["billing".to_string(), "payments".to_string()],
+            }],
+            &[PrivateSearchRangeConstraint {
+                field: "@timestamp".to_string(),
+                gt: None,
+                gte: Some(serde_json::Value::from(150_i64)),
+                lt: None,
+                lte: Some(serde_json::Value::from(250_i64)),
+            }],
+        ));
+
+        assert!(!iceberg_file_may_match_search(
+            &file_stats,
+            &[PrivateExactConstraintGroup {
+                field: "service".to_string(),
+                values: vec!["zzz".to_string()],
+            }],
+            &[],
+        ));
+
+        assert!(!iceberg_file_may_match_search(
+            &file_stats,
+            &[],
+            &[PrivateSearchRangeConstraint {
+                field: "@timestamp".to_string(),
+                gt: None,
+                gte: Some(serde_json::Value::from(250_i64)),
+                lt: None,
+                lte: None,
+            }],
+        ));
+    }
+
+    #[test]
+    fn exact_pruning_summary_may_match_only_prunes_complete_misses() {
+        let summary = exact_pruning_summary_from_rows(vec![
+            serde_json::json!({
+                "field_name": "service",
+                "field_value": "auth",
+                "complete": true
+            }),
+            serde_json::json!({
+                "field_name": "service",
+                "field_value": "api",
+                "complete": true
+            }),
+            serde_json::json!({
+                "field_name": "env",
+                "field_value": null,
+                "complete": false
+            }),
+        ]);
+
+        assert!(exact_pruning_summary_may_match(
+            &summary,
+            &[PrivateExactConstraintGroup {
+                field: "service".to_string(),
+                values: vec!["api".to_string()],
+            }]
+        ));
+        assert!(!exact_pruning_summary_may_match(
+            &summary,
+            &[PrivateExactConstraintGroup {
+                field: "service".to_string(),
+                values: vec!["payments".to_string()],
+            }]
+        ));
+        assert!(exact_pruning_summary_may_match(
+            &summary,
+            &[PrivateExactConstraintGroup {
+                field: "env".to_string(),
+                values: vec!["prod".to_string()],
+            }]
+        ));
     }
 }
 

@@ -65,6 +65,7 @@ pub struct PrivateSearchInvocation {
     pub sql: SqlQuery,
     pub exact_sql: Option<SqlQuery>,
     pub exact_constraints: Vec<PrivateExactConstraintGroup>,
+    pub range_constraints: Vec<PrivateSearchRangeConstraint>,
     pub exact_doc_id_field_name: Option<String>,
     pub required_extensions: Vec<String>,
     pub checkpoints: Vec<CheckpointDescriptor>,
@@ -99,6 +100,15 @@ pub struct PrivateSearchSortSpec {
 pub struct PrivateExactConstraintGroup {
     pub field: String,
     pub values: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PrivateSearchRangeConstraint {
+    pub field: String,
+    pub gt: Option<Value>,
+    pub gte: Option<Value>,
+    pub lt: Option<Value>,
+    pub lte: Option<Value>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
