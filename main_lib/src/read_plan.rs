@@ -37,6 +37,37 @@ impl ReadPlan {
     pub fn normalized_limit(&self, default_limit: usize, max_limit: usize) -> usize {
         self.limit.unwrap_or(default_limit).min(max_limit)
     }
+
+    pub fn uses_exact_filters(&self) -> bool {
+        self.filters
+            .iter()
+            .any(|predicate| predicate.eq.is_some() || predicate.in_values.is_some())
+    }
+
+    pub fn uses_range_filters(&self) -> bool {
+        self.filters.iter().any(|predicate| {
+            predicate.gt.is_some()
+                || predicate.gte.is_some()
+                || predicate.lt.is_some()
+                || predicate.lte.is_some()
+        })
+    }
+
+    pub fn base_extension_suffixes(&self, calculate_score: bool) -> Vec<String> {
+        if calculate_score {
+            vec!["search_index".to_string()]
+        } else {
+            vec![]
+        }
+    }
+
+    pub fn exact_extension_suffixes(&self) -> Vec<String> {
+        if self.uses_exact_filters() {
+            vec!["exact_index".to_string()]
+        } else {
+            vec![]
+        }
+    }
 }
 
 impl From<&ServingPredicate> for ReadPredicate {

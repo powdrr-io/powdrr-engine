@@ -11,7 +11,7 @@ use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::{error::Error, fmt::Display};
 
-use crate::compaction::{CompactionCommand, CompactionResponse, compact_logs};
+use crate::compaction::{compact_logs, CompactionCommand, CompactionResponse};
 use crate::data_contract::{ExtensionFileMetadata, FileSetPayload};
 use crate::elastic_search_common::result_to_record_batch;
 use crate::elastic_search_responses::QueryResultHit;
@@ -19,8 +19,8 @@ use crate::private_api::{
     compaction_query_batches, data_query_batches, extension_query, prefetch_query,
 };
 use crate::schema_massager::{PowdrrSchema, SqlQuery};
-use crate::test_api::{CompactionMode, PeerModeType};
 use crate::state_common::FileFilter;
+use crate::test_api::{CompactionMode, PeerModeType};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct FieldFileFilterDescriptor {
@@ -69,6 +69,8 @@ pub struct PrivateSearchInvocation {
     pub exact_constraints: Vec<PrivateExactConstraintGroup>,
     pub range_constraints: Vec<PrivateSearchRangeConstraint>,
     pub required_extensions: Vec<String>,
+    pub base_extension_suffixes: Vec<String>,
+    pub exact_extension_suffixes: Vec<String>,
     pub checkpoints: Vec<CheckpointDescriptor>,
     pub table: String,
     pub size: usize,
@@ -1153,7 +1155,10 @@ mod tests {
         let mut builder = SqlBuilder::for_agg();
         builder.set_all_fields_testing_only();
         builder.filter(SqlExpression::Like(
-            Box::new(SqlExpression::FieldRef("t".to_string(), "snippet".to_string())),
+            Box::new(SqlExpression::FieldRef(
+                "t".to_string(),
+                "snippet".to_string(),
+            )),
             Box::new(SqlExpression::LiteralString("%Looking%".to_string())),
         ));
 
@@ -1175,7 +1180,10 @@ mod tests {
         let peer = TestingRemotePeer::new(test_server.clone());
         let batches = peer.private_sql(&invocation, 0, 1).await.unwrap();
 
-        assert_eq!(batches.iter().map(|batch| batch.num_rows()).sum::<usize>(), 505);
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            505
+        );
     }
 
     #[tokio::test]

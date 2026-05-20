@@ -13,13 +13,12 @@ use datafusion::datasource::{
     listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
 };
 use datafusion::execution::options::JsonReadOptions;
-use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use datafusion::prelude::SessionConfig;
 use datafusion::{
     arrow,
     arrow::array::RecordBatch,
     error::DataFusionError,
-    prelude::{DataFrame, SessionContext},
+    prelude::{DataFrame, ParquetReadOptions, SessionContext},
 };
 use futures::stream::{self, StreamExt};
 use futures_util::TryStreamExt;
@@ -2245,7 +2244,20 @@ async fn load_parquet_file_as_table(
             }
         }
     } else {
-        load_local_parquet_files_as_table(data_fusion_context, &vec![file_path.clone()], local_name)
+        let normalized_path = normalize_local_file_path(file_path);
+        match data_fusion_context
+            .register_parquet(local_name, normalized_path, ParquetReadOptions::default())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if e.message().contains("already exists") {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 }
 
@@ -2253,51 +2265,36 @@ fn normalize_local_file_path(file_path: &str) -> &str {
     file_path.strip_prefix("file://").unwrap_or(file_path)
 }
 
-fn read_local_parquet_batches(
-    file_path: &str,
-) -> Result<(Arc<arrow::datatypes::Schema>, Vec<RecordBatch>), DataFusionError> {
-    let local_file_path = normalize_local_file_path(file_path);
-    let file = std::fs::File::open(local_file_path)
-        .map_err(|error| DataFusionError::External(Box::new(error)))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|error| DataFusionError::ArrowError(Box::new(error.into()), None))?;
-    let schema = builder.schema().clone();
-    let reader = builder
-        .build()
-        .map_err(|error| DataFusionError::ArrowError(Box::new(error.into()), None))?;
-    let batches = reader
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| DataFusionError::ArrowError(Box::new(error), None))?;
-    Ok((schema, batches))
+fn local_parquet_listing_url(file_path: &str) -> Result<ListingTableUrl, DataFusionError> {
+    let canonical_path = Path::new(normalize_local_file_path(file_path))
+        .canonicalize()
+        .map_err(DataFusionError::IoError)?;
+    let url = Url::from_file_path(&canonical_path).map_err(|_| {
+        DataFusionError::Execution(format!(
+            "Could not convert local parquet path {} into a listing URL",
+            canonical_path.display()
+        ))
+    })?;
+    ListingTableUrl::parse(url.as_str())
 }
 
 fn load_local_parquet_files_as_table(
     data_fusion_context: &SessionContext,
     file_paths: &Vec<String>,
     local_name: &String,
+    schema: &Schema,
 ) -> Result<(), DataFusionError> {
-    let mut table_schema: Option<Arc<arrow::datatypes::Schema>> = None;
-    let mut partitions = Vec::with_capacity(file_paths.len());
-
-    for file_path in file_paths {
-        let (schema, batches) = read_local_parquet_batches(file_path)?;
-        if let Some(existing_schema) = table_schema.as_ref() {
-            if existing_schema.as_ref() != schema.as_ref() {
-                return Err(DataFusionError::Execution(format!(
-                    "Local parquet files for {} did not share a schema",
-                    local_name
-                )));
-            }
-        } else {
-            table_schema = Some(schema);
-        }
-        partitions.push(batches);
-    }
-
-    let table = Arc::new(datafusion::datasource::MemTable::try_new(
-        table_schema.expect("local parquet load requires at least one file"),
-        partitions,
-    )?);
+    let table_paths = file_paths
+        .iter()
+        .map(|file_path| local_parquet_listing_url(file_path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let listing_options =
+        ListingOptions::new(Arc::new(ParquetFormat::default().with_enable_pruning(true)))
+            .with_file_extension(".parquet");
+    let config = ListingTableConfig::new_with_multi_paths(table_paths)
+        .with_listing_options(listing_options)
+        .with_schema(Arc::new(schema.clone()));
+    let table = Arc::new(ListingTable::try_new(config)?);
     match data_fusion_context.register_table(local_name, table) {
         Ok(_) => Ok(()),
         Err(e) => {
@@ -2338,7 +2335,12 @@ async fn load_parquet_files_as_table(
         .iter()
         .all(|file_path| !file_path.starts_with("s3:"))
     {
-        return load_local_parquet_files_as_table(data_fusion_context, file_paths, local_name);
+        return load_local_parquet_files_as_table(
+            data_fusion_context,
+            file_paths,
+            local_name,
+            schema,
+        );
     }
 
     tracing::info!(
