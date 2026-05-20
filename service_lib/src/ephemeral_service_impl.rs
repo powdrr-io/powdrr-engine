@@ -9,9 +9,10 @@ use crate::data_contract::{
 };
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::metadata_store::{
-    CheckpointUpdateRequest, ClaimedCleanupWorkItem, ClaimedCompactionWorkItem,
-    ClaimedExtensionWorkItem, MetadataClaimKind, MetadataStore, PublishedCheckpointRecord,
-    PublishedCheckpointSelector,
+    CheckpointCutoverRequest, CheckpointCutoverState, CheckpointUpdateRequest,
+    ClaimedCleanupWorkItem, ClaimedCompactionWorkItem, ClaimedExtensionWorkItem, CutoverEpoch,
+    MetadataClaimKind, MetadataStore, PublishedCheckpointRecord, PublishedCheckpointRole,
+    PublishedCheckpointSelector, ServingNodeActivationAck, ServingNodeLease,
 };
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
@@ -20,9 +21,18 @@ use crate::state_provider::ServiceApiError;
 use crate::test_api::TestProcessingMode;
 use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const LEASE_LENGTH_MS: i64 = 60 * 1000;
 
 type CommittedCheckpoints = HashMap<String, String>;
+type SerializedCommittedCheckpoints = HashMap<String, CommittedCheckpoints>;
+type PublishedCheckpoints = HashMap<String, String>;
+type CheckpointPublicationRequests = HashMap<String, CheckpointUpdateRequest>;
+type CheckpointCutoverEpochs = HashMap<String, CutoverEpoch>;
+type ServingNodeLeases = HashMap<String, ServingNodeLease>;
+type ServingNodeActivations = HashMap<String, HashMap<String, ServingNodeActivationAck>>;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EphemeralServiceSnapshot {
@@ -31,7 +41,12 @@ pub struct EphemeralServiceSnapshot {
     table_templates: HashMap<String, CreateIndexTemplateBody>,
     pipelines: HashMap<String, PipelineDefinition>,
     lifetime_policies: HashMap<String, ILMPolicyDefinition>,
-    latest_committed_checkpoint_id: HashMap<Option<String>, CommittedCheckpoints>,
+    latest_committed_checkpoint_id: SerializedCommittedCheckpoints,
+    published_checkpoint_id: PublishedCheckpoints,
+    checkpoint_publication_requests: CheckpointPublicationRequests,
+    checkpoint_cutover_epochs: CheckpointCutoverEpochs,
+    serving_node_leases: ServingNodeLeases,
+    serving_node_activations: ServingNodeActivations,
     compaction_work_items: HashMap<String, CompactionWorkItemTracker>,
     not_compacted_checkpoint_ids: HashMap<String, Vec<String>>,
     extension_work_items: HashMap<String, HashMap<String, ExtensionWorkItem>>,
@@ -53,6 +68,11 @@ pub struct EphemeralServiceImpl {
     pipelines: HashMap<String, PipelineDefinition>,
     lifetime_policies: HashMap<String, ILMPolicyDefinition>,
     latest_committed_checkpoint_id: HashMap<Option<String>, CommittedCheckpoints>,
+    published_checkpoint_id: PublishedCheckpoints,
+    checkpoint_publication_requests: CheckpointPublicationRequests,
+    checkpoint_cutover_epochs: CheckpointCutoverEpochs,
+    serving_node_leases: ServingNodeLeases,
+    serving_node_activations: ServingNodeActivations,
     compaction_work_items: HashMap<String, CompactionWorkItemTracker>,
     not_compacted_checkpoint_ids: HashMap<String, Vec<String>>,
     extension_work_items: HashMap<String, HashMap<String, ExtensionWorkItem>>,
@@ -78,7 +98,14 @@ impl EphemeralServiceImpl {
             table_templates: snapshot.table_templates,
             pipelines: snapshot.pipelines,
             lifetime_policies: snapshot.lifetime_policies,
-            latest_committed_checkpoint_id: snapshot.latest_committed_checkpoint_id,
+            latest_committed_checkpoint_id: Self::deserialize_latest_committed_checkpoint_id(
+                snapshot.latest_committed_checkpoint_id,
+            ),
+            published_checkpoint_id: snapshot.published_checkpoint_id,
+            checkpoint_publication_requests: snapshot.checkpoint_publication_requests,
+            checkpoint_cutover_epochs: snapshot.checkpoint_cutover_epochs,
+            serving_node_leases: snapshot.serving_node_leases,
+            serving_node_activations: snapshot.serving_node_activations,
             compaction_work_items: snapshot.compaction_work_items,
             not_compacted_checkpoint_ids: snapshot.not_compacted_checkpoint_ids,
             extension_work_items: if snapshot.extension_work_items.is_empty() {
@@ -103,7 +130,12 @@ impl EphemeralServiceImpl {
             table_templates: self.table_templates.clone(),
             pipelines: self.pipelines.clone(),
             lifetime_policies: self.lifetime_policies.clone(),
-            latest_committed_checkpoint_id: self.latest_committed_checkpoint_id.clone(),
+            latest_committed_checkpoint_id: self.serialize_latest_committed_checkpoint_id(),
+            published_checkpoint_id: self.published_checkpoint_id.clone(),
+            checkpoint_publication_requests: self.checkpoint_publication_requests.clone(),
+            checkpoint_cutover_epochs: self.checkpoint_cutover_epochs.clone(),
+            serving_node_leases: self.serving_node_leases.clone(),
+            serving_node_activations: self.serving_node_activations.clone(),
             compaction_work_items: self.compaction_work_items.clone(),
             not_compacted_checkpoint_ids: self.not_compacted_checkpoint_ids.clone(),
             extension_work_items: self.extension_work_items.clone(),
@@ -121,6 +153,186 @@ impl EphemeralServiceImpl {
         format!("{}:{}", access_key_id, secret_access_key)
     }
 
+    fn role_key(role: PublishedCheckpointRole) -> &'static str {
+        match role {
+            PublishedCheckpointRole::Active => "active",
+            PublishedCheckpointRole::Target => "target",
+        }
+    }
+
+    fn extension_storage_key(extension: &Option<String>) -> String {
+        extension.clone().unwrap_or_default()
+    }
+
+    fn extension_from_storage_key(key: &String) -> Option<String> {
+        if key.is_empty() {
+            None
+        } else {
+            Some(key.clone())
+        }
+    }
+
+    fn selector_storage_key(
+        role: PublishedCheckpointRole,
+        table_name: &String,
+        extension: &Option<String>,
+    ) -> String {
+        format!(
+            "{}|{}|{}",
+            Self::role_key(role),
+            Self::extension_storage_key(extension),
+            table_name
+        )
+    }
+
+    fn selector_group_key(table_name: &String, extension: &Option<String>) -> String {
+        format!("{}|{}", Self::extension_storage_key(extension), table_name)
+    }
+
+    fn checkpoint_publication_request_key(org_id: &String, table_name: &String) -> String {
+        format!("{org_id}|{table_name}")
+    }
+
+    fn current_timestamp_ms() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or_default()
+    }
+
+    fn current_cutover_epoch(
+        &self,
+        table_name: &String,
+        extension: &Option<String>,
+    ) -> CutoverEpoch {
+        self.checkpoint_cutover_epochs
+            .get(&Self::selector_group_key(table_name, extension))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn bump_cutover_epoch(
+        &mut self,
+        table_name: &String,
+        extension: &Option<String>,
+    ) -> CutoverEpoch {
+        let key = Self::selector_group_key(table_name, extension);
+        let next_epoch = self
+            .checkpoint_cutover_epochs
+            .get(&key)
+            .copied()
+            .unwrap_or_default()
+            .0
+            + 1;
+        let epoch = CutoverEpoch(next_epoch);
+        self.checkpoint_cutover_epochs.insert(key, epoch);
+        epoch
+    }
+
+    fn clear_serving_node_activations(&mut self, table_name: &String, extension: &Option<String>) {
+        self.serving_node_activations
+            .remove(&Self::selector_group_key(table_name, extension));
+    }
+
+    fn prune_expired_serving_node_leases(&mut self) {
+        let earliest_live_ms = Self::current_timestamp_ms() - LEASE_LENGTH_MS;
+        self.serving_node_leases
+            .retain(|_, lease| lease.observed_at_ms >= earliest_live_ms);
+    }
+
+    fn live_serving_node_ids(&mut self) -> HashSet<String> {
+        self.prune_expired_serving_node_leases();
+        self.serving_node_leases.keys().cloned().collect()
+    }
+
+    fn get_published_checkpoint_sync(
+        &self,
+        role: PublishedCheckpointRole,
+        table_name: &String,
+        extension: &Option<String>,
+    ) -> Option<String> {
+        self.published_checkpoint_id
+            .get(&Self::selector_storage_key(role, table_name, extension))
+            .cloned()
+    }
+
+    fn set_published_checkpoint(
+        &mut self,
+        role: PublishedCheckpointRole,
+        table_name: &String,
+        extension: &Option<String>,
+        checkpoint_id: &String,
+    ) {
+        self.published_checkpoint_id.insert(
+            Self::selector_storage_key(role, table_name, extension),
+            checkpoint_id.clone(),
+        );
+    }
+
+    fn published_checkpoint_needs_activation(
+        &self,
+        table_name: &String,
+        extension: &Option<String>,
+    ) -> bool {
+        match self.get_published_checkpoint_sync(
+            PublishedCheckpointRole::Target,
+            table_name,
+            extension,
+        ) {
+            Some(target_checkpoint_id) => {
+                self.get_published_checkpoint_sync(
+                    PublishedCheckpointRole::Active,
+                    table_name,
+                    extension,
+                ) != Some(target_checkpoint_id)
+            }
+            None => false,
+        }
+    }
+
+    fn checkpoint_publication_still_pending(&self, table_name: &String) -> bool {
+        self.extension_work_items
+            .get("es")
+            .and_then(|items| items.get(table_name))
+            .map(|item| item.has_work())
+            .unwrap_or(false)
+            || self
+                .checkpoints_needing_extension_work
+                .contains_key(&format!("{}_{}", table_name, "es"))
+            || self.published_checkpoint_needs_activation(table_name, &None)
+            || self.published_checkpoint_needs_activation(table_name, &Some("es".to_string()))
+    }
+
+    fn get_latest_materialized_checkpoint_sync(
+        &self,
+        table_name: &String,
+        extensions: Option<String>,
+    ) -> Option<String> {
+        let real_table_name = self.table_aliases.get(table_name).unwrap_or(table_name);
+        self.latest_committed_checkpoint_id
+            .get(&extensions)
+            .and_then(|c| c.get(real_table_name).cloned())
+    }
+
+    fn deserialize_latest_committed_checkpoint_id(
+        serialized: SerializedCommittedCheckpoints,
+    ) -> HashMap<Option<String>, CommittedCheckpoints> {
+        serialized
+            .into_iter()
+            .map(|(extension, checkpoints)| {
+                (Self::extension_from_storage_key(&extension), checkpoints)
+            })
+            .collect()
+    }
+
+    fn serialize_latest_committed_checkpoint_id(&self) -> SerializedCommittedCheckpoints {
+        self.latest_committed_checkpoint_id
+            .iter()
+            .map(|(extension, checkpoints)| {
+                (Self::extension_storage_key(extension), checkpoints.clone())
+            })
+            .collect()
+    }
     fn checkpoints_needing_extension_work(
         &self,
         table_name: &String,
@@ -229,7 +441,7 @@ impl EphemeralServiceImpl {
 
     pub async fn add_checkpoint(
         &mut self,
-        _org_info: &OrgInfo,
+        org_info: &OrgInfo,
         metadata: &TableMetadataCheckpoint,
     ) -> Result<(), ServiceApiError> {
         // To make testing a little easier, we'll just magic up a table as necessary
@@ -278,6 +490,7 @@ impl EphemeralServiceImpl {
                     .map_or(&FileSetPayload::new(), |m| &m.files),
             )
         }
+        self.queue_publication_request(&org_info.org_id, &metadata.table_name);
         Ok(())
     }
 
@@ -376,17 +589,6 @@ impl EphemeralServiceImpl {
         }
     }
 
-    fn get_latest_committed_checkpoint_sync(
-        &mut self,
-        table_name: &String,
-        extensions: Option<String>,
-    ) -> Option<String> {
-        let real_table_name = self.table_aliases.get(table_name).unwrap_or(table_name);
-        self.latest_committed_checkpoint_id
-            .get(&extensions)
-            .map_or(None, |c| c.get(real_table_name).cloned())
-    }
-
     fn set_latest_committed_checkpoint(
         &mut self,
         table_name: &String,
@@ -413,7 +615,7 @@ impl EphemeralServiceImpl {
         compaction: &Option<String>,
     ) -> Result<(), ServiceApiError> {
         let latest_checkpoint =
-            match self.get_latest_committed_checkpoint_sync(&table_info.table_name, None) {
+            match self.get_latest_materialized_checkpoint_sync(&table_info.table_name, None) {
                 Some(checkpoint_id) => {
                     let key = format!("{}_{}", &table_info.table_name, checkpoint_id);
                     match self.checkpoints.get(&key) {
@@ -537,6 +739,10 @@ impl EphemeralServiceImpl {
     }
 
     fn maybe_create_compaction_work_item(&mut self, checkpoint: &TableMetadataCheckpoint) -> () {
+        self.not_compacted_checkpoint_ids
+            .entry(checkpoint.table_name.clone())
+            .or_default();
+
         // If we have a work item waiting, then we just wait for that to happen before creating a new one.
         if self
             .compaction_work_items
@@ -586,7 +792,7 @@ impl EphemeralServiceImpl {
         compaction: &Option<String>,
     ) -> Result<(), ServiceApiError> {
         let latest_checkpoint =
-            match self.get_latest_committed_checkpoint_sync(&table_info.table_name, None) {
+            match self.get_latest_materialized_checkpoint_sync(&table_info.table_name, None) {
                 Some(checkpoint_id) => {
                     let key = format!("{}_{}", &table_info.table_name, checkpoint_id);
                     match self.checkpoints.get(&key) {
@@ -831,14 +1037,18 @@ impl EphemeralServiceImpl {
 
     pub async fn speedboat_commit(
         &mut self,
-        _org_info: &OrgInfo,
+        org_info: &OrgInfo,
         commit: &SpeedboatCommit,
     ) -> Result<bool, ServiceApiError> {
+        let mut touched_tables = vec![];
         assert!(
             commit.compaction.is_none(),
             "Speedboat commits do not yet support compactions"
         );
         for table_info in commit.type_files.iter() {
+            if !touched_tables.contains(&table_info.table_name) {
+                touched_tables.push(table_info.table_name.clone());
+            }
             if table_info.commit_type == "commit" || table_info.commit_type == "compact" {
                 self.speedboat_commit_type_commit(table_info, &commit.compaction)
                     .await?;
@@ -849,16 +1059,20 @@ impl EphemeralServiceImpl {
                 panic!("Unknown Speedboat commit type")
             }
         }
+        for table_name in touched_tables.iter() {
+            self.queue_publication_request(&org_info.org_id, table_name);
+        }
         Ok(true)
     }
 
     pub async fn iceberg_commit(
         &mut self,
-        _org_info: &OrgInfo,
+        org_info: &OrgInfo,
         table_name: &String,
         iceberg_commit: &IcebergCommit,
     ) -> Result<bool, ServiceApiError> {
-        let latest_checkpoint = match self.get_latest_committed_checkpoint_sync(table_name, None) {
+        let latest_checkpoint = match self.get_latest_materialized_checkpoint_sync(table_name, None)
+        {
             Some(checkpoint_id) => {
                 let key = format!("{}_{}", table_name, checkpoint_id);
                 match self.checkpoints.get(&key) {
@@ -921,12 +1135,13 @@ impl EphemeralServiceImpl {
             self.cleanup_work_items.push(cleanup_work_item);
         }
 
+        self.queue_publication_request(&org_info.org_id, table_name);
         Ok(true)
     }
 
     pub async fn extension_commit(
         &mut self,
-        _org_info: &OrgInfo,
+        org_info: &OrgInfo,
         table_name: &String,
         commit: &ExtensionCommit,
     ) -> Result<bool, ServiceApiError> {
@@ -946,7 +1161,7 @@ impl EphemeralServiceImpl {
 
         self.add_recent_extension_files(table_name, commit);
 
-        match self.get_latest_committed_checkpoint_sync(table_name, Some("es".to_string())) {
+        match self.get_latest_materialized_checkpoint_sync(table_name, Some("es".to_string())) {
             Some(latest) => {
                 if max_id > &latest {
                     self.set_latest_committed_checkpoint(
@@ -960,6 +1175,7 @@ impl EphemeralServiceImpl {
                 self.set_latest_committed_checkpoint(table_name, Some("es".to_string()), max_id);
             }
         };
+        self.queue_publication_request(&org_info.org_id, table_name);
         Ok(true)
     }
 
@@ -992,7 +1208,11 @@ impl EphemeralServiceImpl {
         table_name: &String,
         extensions: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
-        Ok(self.get_latest_committed_checkpoint_sync(table_name, extensions))
+        Ok(self.get_published_checkpoint_sync(
+            PublishedCheckpointRole::Active,
+            table_name,
+            &extensions,
+        ))
     }
 
     pub async fn get_checkpoint(
@@ -1056,8 +1276,130 @@ impl EphemeralServiceImpl {
         Ok(work_items)
     }
 
+    fn queue_publication_request(&mut self, org_id: &String, table_name: &String) {
+        let request = CheckpointUpdateRequest::new(org_id.clone(), table_name.clone());
+        self.checkpoint_publication_requests.insert(
+            Self::checkpoint_publication_request_key(org_id, table_name),
+            request,
+        );
+    }
+
+    fn advance_target_checkpoint(
+        &mut self,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> bool {
+        let Some(checkpoint_id) =
+            self.get_latest_materialized_checkpoint_sync(table_name, extension.clone())
+        else {
+            return false;
+        };
+
+        if self.get_published_checkpoint_sync(
+            PublishedCheckpointRole::Target,
+            table_name,
+            &extension,
+        ) == Some(checkpoint_id.clone())
+        {
+            return false;
+        }
+
+        self.set_published_checkpoint(
+            PublishedCheckpointRole::Target,
+            table_name,
+            &extension,
+            &checkpoint_id,
+        );
+        self.bump_cutover_epoch(table_name, &extension);
+        self.clear_serving_node_activations(table_name, &extension);
+        true
+    }
+
+    fn activation_matches_target(
+        &mut self,
+        table_name: &String,
+        extension: &Option<String>,
+        target_checkpoint_id: &String,
+    ) -> bool {
+        let live_nodes = self.live_serving_node_ids();
+        if live_nodes.is_empty() {
+            return false;
+        }
+
+        let epoch = self.current_cutover_epoch(table_name, extension);
+        let Some(acks) = self
+            .serving_node_activations
+            .get(&Self::selector_group_key(table_name, extension))
+        else {
+            return false;
+        };
+
+        live_nodes.into_iter().all(|node_id| {
+            acks.get(&node_id)
+                .map(|ack| ack.checkpoint_id == *target_checkpoint_id && ack.epoch == epoch)
+                .unwrap_or(false)
+        })
+    }
+
+    fn promote_active_checkpoint_if_ready(
+        &mut self,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> bool {
+        let Some(target_checkpoint_id) = self.get_published_checkpoint_sync(
+            PublishedCheckpointRole::Target,
+            table_name,
+            &extension,
+        ) else {
+            return false;
+        };
+
+        if self.get_published_checkpoint_sync(
+            PublishedCheckpointRole::Active,
+            table_name,
+            &extension,
+        ) == Some(target_checkpoint_id.clone())
+        {
+            return false;
+        }
+
+        if !self.activation_matches_target(table_name, &extension, &target_checkpoint_id) {
+            return false;
+        }
+
+        self.set_published_checkpoint(
+            PublishedCheckpointRole::Active,
+            table_name,
+            &extension,
+            &target_checkpoint_id,
+        );
+        true
+    }
+
     pub async fn update_all_checkpoints(&mut self) -> Result<bool, ServiceApiError> {
-        Ok(false)
+        let mut work_done = false;
+        let pending_requests: Vec<CheckpointUpdateRequest> = self
+            .checkpoint_publication_requests
+            .values()
+            .cloned()
+            .collect();
+
+        for request in pending_requests.iter() {
+            work_done |= self.advance_target_checkpoint(&request.table_name, None);
+            work_done |= self.promote_active_checkpoint_if_ready(&request.table_name, None);
+            work_done |=
+                self.advance_target_checkpoint(&request.table_name, Some("es".to_string()));
+            work_done |= self
+                .promote_active_checkpoint_if_ready(&request.table_name, Some("es".to_string()));
+
+            if !self.checkpoint_publication_still_pending(&request.table_name) {
+                self.checkpoint_publication_requests.remove(
+                    &Self::checkpoint_publication_request_key(&request.org_id, &request.table_name),
+                );
+            }
+        }
+
+        Ok(work_done)
     }
 
     pub async fn create_org(&mut self, _settings: &OrgSettings) -> Result<(), ServiceApiError> {
@@ -1090,27 +1432,120 @@ impl EphemeralServiceImpl {
 impl MetadataStore for EphemeralServiceImpl {
     async fn queue_checkpoint_publication(
         &mut self,
-        _request: &CheckpointUpdateRequest,
+        request: &CheckpointUpdateRequest,
     ) -> Result<(), ServiceApiError> {
+        self.queue_publication_request(&request.org_id, &request.table_name);
         Ok(())
     }
 
     async fn get_published_checkpoint_record(
         &mut self,
-        org_info: &OrgInfo,
+        _org_info: &OrgInfo,
         selector: &PublishedCheckpointSelector,
     ) -> Result<Option<PublishedCheckpointRecord>, ServiceApiError> {
-        Ok(EphemeralServiceImpl::get_latest_committed_checkpoint(
-            self,
-            org_info,
-            &selector.table_name,
-            selector.extension.clone(),
-        )
-        .await?
-        .map(|checkpoint_id| PublishedCheckpointRecord {
-            selector: selector.clone(),
-            checkpoint_id,
-        }))
+        Ok(self
+            .get_published_checkpoint_sync(selector.role, &selector.table_name, &selector.extension)
+            .map(|checkpoint_id| PublishedCheckpointRecord {
+                selector: selector.clone(),
+                checkpoint_id,
+            }))
+    }
+
+    async fn plan_checkpoint_cutover(
+        &mut self,
+        request: &CheckpointCutoverRequest,
+    ) -> Result<(), ServiceApiError> {
+        if self.get_published_checkpoint_sync(
+            PublishedCheckpointRole::Target,
+            &request.selector.table_name,
+            &request.selector.extension,
+        ) != Some(request.target_checkpoint_id.clone())
+        {
+            self.set_published_checkpoint(
+                PublishedCheckpointRole::Target,
+                &request.selector.table_name,
+                &request.selector.extension,
+                &request.target_checkpoint_id,
+            );
+            self.bump_cutover_epoch(&request.selector.table_name, &request.selector.extension);
+            self.clear_serving_node_activations(
+                &request.selector.table_name,
+                &request.selector.extension,
+            );
+        }
+        Ok(())
+    }
+
+    async fn get_checkpoint_cutover_state(
+        &mut self,
+        _org_info: &OrgInfo,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> Result<CheckpointCutoverState, ServiceApiError> {
+        let key = Self::selector_group_key(table_name, &extension);
+        Ok(CheckpointCutoverState {
+            selector: PublishedCheckpointSelector::target(table_name.clone(), extension.clone()),
+            epoch: self
+                .checkpoint_cutover_epochs
+                .get(&key)
+                .copied()
+                .unwrap_or_default(),
+            active_checkpoint_id: self.get_published_checkpoint_sync(
+                PublishedCheckpointRole::Active,
+                table_name,
+                &extension,
+            ),
+            target_checkpoint_id: self
+                .get_published_checkpoint_sync(
+                    PublishedCheckpointRole::Target,
+                    table_name,
+                    &extension,
+                )
+                .or_else(|| {
+                    self.get_published_checkpoint_sync(
+                        PublishedCheckpointRole::Active,
+                        table_name,
+                        &extension,
+                    )
+                }),
+        })
+    }
+
+    async fn heartbeat_serving_node(
+        &mut self,
+        _org_info: &OrgInfo,
+        lease: &ServingNodeLease,
+    ) -> Result<(), ServiceApiError> {
+        self.prune_expired_serving_node_leases();
+        self.serving_node_leases
+            .insert(lease.node_id.clone(), lease.clone());
+        Ok(())
+    }
+
+    async fn record_serving_node_activation(
+        &mut self,
+        _org_info: &OrgInfo,
+        ack: &ServingNodeActivationAck,
+    ) -> Result<(), ServiceApiError> {
+        let key = Self::selector_group_key(&ack.selector.table_name, &ack.selector.extension);
+        self.serving_node_activations
+            .entry(key)
+            .or_default()
+            .insert(ack.node_id.clone(), ack.clone());
+        Ok(())
+    }
+
+    async fn list_serving_node_activations(
+        &mut self,
+        _org_info: &OrgInfo,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> Result<Vec<ServingNodeActivationAck>, ServiceApiError> {
+        Ok(self
+            .serving_node_activations
+            .get(&Self::selector_group_key(table_name, &extension))
+            .map(|acks| acks.values().cloned().collect())
+            .unwrap_or_default())
     }
 
     async fn get_checkpoint_metadata(

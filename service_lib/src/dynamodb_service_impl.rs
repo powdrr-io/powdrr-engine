@@ -12,9 +12,10 @@ use crate::dynamodb::{
 };
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::metadata_store::{
-    CheckpointUpdateRequest, ClaimedCleanupWorkItem, ClaimedCompactionWorkItem,
-    ClaimedExtensionWorkItem, MetadataClaimKind, MetadataStore, PublishedCheckpointRecord,
-    PublishedCheckpointSelector,
+    CheckpointCutoverState, CheckpointUpdateRequest, ClaimedCleanupWorkItem,
+    ClaimedCompactionWorkItem, ClaimedExtensionWorkItem, CutoverEpoch, MetadataClaimKind,
+    MetadataStore, PublishedCheckpointRecord, PublishedCheckpointRole, PublishedCheckpointSelector,
+    ServingNodeActivationAck, ServingNodeLease,
 };
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
@@ -22,8 +23,8 @@ use crate::state_provider::ServiceApiError;
 use crate::test_api::{StateMode, TestProcessingMode};
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_dynamodb::Client;
-use modyne::model::TransactWrite;
 use modyne::TestTableExt;
+use modyne::model::TransactWrite;
 use std::collections::{HashMap, HashSet};
 
 const LEASE_LENGTH_MS: i64 = 60 * 1000; // 1 minute
@@ -114,6 +115,20 @@ impl DynamoDBServiceImpl {
         }
     }
 
+    fn latest_active_checkpoint_key(table_name: &String, extension: &Option<String>) -> String {
+        match extension {
+            Some(x) => format!("published_checkpoint#active#{}#{}", table_name, x),
+            None => format!("published_checkpoint#active#{}", table_name),
+        }
+    }
+
+    fn cutover_epoch_key(table_name: &String, extension: &Option<String>) -> String {
+        match extension {
+            Some(x) => format!("published_checkpoint#epoch#{}#{}", table_name, x),
+            None => format!("published_checkpoint#epoch#{}", table_name),
+        }
+    }
+
     fn latest_extension_work_item_key(table_name: &String, extension: &String) -> String {
         format!("extension_work_item#{}#{}", table_name, extension)
     }
@@ -130,6 +145,25 @@ impl DynamoDBServiceImpl {
         let raw = key.strip_prefix("checkpoint_publication_request#")?;
         let (org_id, table_name) = raw.split_once('#')?;
         Some((org_id.to_string(), table_name.to_string()))
+    }
+
+    fn activation_key_prefix(table_name: &String, extension: &Option<String>) -> String {
+        match extension {
+            Some(extension) => format!("checkpoint_activation#{}#{}#", table_name, extension),
+            None => format!("checkpoint_activation#{}#", table_name),
+        }
+    }
+
+    fn activation_key(table_name: &String, extension: &Option<String>, node_id: &String) -> String {
+        format!(
+            "{}{}",
+            Self::activation_key_prefix(table_name, extension),
+            node_id
+        )
+    }
+
+    fn lease_key(node_id: &String) -> String {
+        format!("serving-node#{}", node_id)
     }
 
     const NO_WORK_ITEM: &'static str = "-1";
@@ -167,6 +201,281 @@ impl DynamoDBServiceImpl {
         Ok(requests)
     }
 
+    async fn get_checkpoint_id_from_latest_key(
+        &mut self,
+        org_id: &String,
+        key: &String,
+    ) -> Result<Option<String>, ServiceApiError> {
+        Ok(self
+            .connector
+            .describe_latest(org_id, key)
+            .await
+            .map_err(from_modyne)?
+            .map(|val| CheckpointDescriptor::from_full_name(&val.entity_id).full_checkpoint_id()))
+    }
+
+    async fn get_active_checkpoint_id(
+        &mut self,
+        org_id: &String,
+        table_name: &String,
+        extension: &Option<String>,
+    ) -> Result<Option<String>, ServiceApiError> {
+        let active_key = Self::latest_active_checkpoint_key(table_name, extension);
+        match self
+            .get_checkpoint_id_from_latest_key(org_id, &active_key)
+            .await?
+        {
+            Some(checkpoint_id) => Ok(Some(checkpoint_id)),
+            None => {
+                if self
+                    .checkpoint_publication_request_exists(org_id, table_name)
+                    .await?
+                {
+                    Ok(None)
+                } else {
+                    self.get_target_checkpoint_id(org_id, table_name, extension)
+                        .await
+                }
+            }
+        }
+    }
+
+    async fn get_target_checkpoint_id(
+        &mut self,
+        org_id: &String,
+        table_name: &String,
+        extension: &Option<String>,
+    ) -> Result<Option<String>, ServiceApiError> {
+        let target_key = Self::latest_checkpoint_key(table_name, extension);
+        self.get_checkpoint_id_from_latest_key(org_id, &target_key)
+            .await
+    }
+
+    async fn get_cutover_epoch(
+        &mut self,
+        org_id: &String,
+        table_name: &String,
+        extension: &Option<String>,
+    ) -> Result<CutoverEpoch, ServiceApiError> {
+        let key = Self::cutover_epoch_key(table_name, extension);
+        Ok(self
+            .connector
+            .describe_latest(org_id, &key)
+            .await
+            .map_err(from_modyne)?
+            .and_then(|entity| entity.entity_id.parse::<u64>().ok())
+            .map(CutoverEpoch)
+            .unwrap_or_default())
+    }
+
+    async fn bump_cutover_epoch(
+        &mut self,
+        org_id: &String,
+        table_name: &String,
+        extension: &Option<String>,
+    ) -> Result<CutoverEpoch, ServiceApiError> {
+        let key = Self::cutover_epoch_key(table_name, extension);
+        match self
+            .connector
+            .describe_latest(org_id, &key)
+            .await
+            .map_err(from_modyne)?
+        {
+            Some(existing) => {
+                let next_epoch = existing.entity_id.parse::<u64>().unwrap_or_default() + 1;
+                let committed = self
+                    .connector
+                    .commit_conditional_transaction(DynamoDbConnector::bump_version(
+                        TransactWrite::new(),
+                        &existing,
+                        &next_epoch.to_string(),
+                    ))
+                    .await
+                    .map_err(from_modyne)?;
+                if committed {
+                    Ok(CutoverEpoch(next_epoch))
+                } else {
+                    self.get_cutover_epoch(org_id, table_name, extension).await
+                }
+            }
+            None => {
+                let _ = self
+                    .connector
+                    .create_latest(
+                        org_id,
+                        &key,
+                        &EntityVersionInfo::new(org_id, &key, &"1".to_string()),
+                    )
+                    .await
+                    .map_err(from_modyne)?;
+                self.get_cutover_epoch(org_id, table_name, extension).await
+            }
+        }
+    }
+
+    async fn checkpoint_publication_request_exists(
+        &mut self,
+        org_id: &String,
+        table_name: &String,
+    ) -> Result<bool, ServiceApiError> {
+        Ok(self
+            .connector
+            .describe_latest(
+                &MANAGEMENT_ORG_ID.to_string(),
+                &Self::checkpoint_publication_request_key(org_id, table_name),
+            )
+            .await
+            .map_err(from_modyne)?
+            .map(|entity| entity.entity_id != Self::NO_WORK_ITEM)
+            .unwrap_or(false))
+    }
+
+    async fn set_active_checkpoint_id(
+        &mut self,
+        org_id: &String,
+        table_name: &String,
+        extension: &Option<String>,
+        checkpoint_id: &String,
+    ) -> Result<bool, ServiceApiError> {
+        let checkpoint_full_name =
+            CheckpointDescriptor::new(table_name.clone(), checkpoint_id.clone()).full_name();
+        let key = Self::latest_active_checkpoint_key(table_name, extension);
+        match self
+            .connector
+            .describe_latest(org_id, &key)
+            .await
+            .map_err(from_modyne)?
+        {
+            Some(existing) => {
+                if existing.entity_id == checkpoint_full_name {
+                    return Ok(false);
+                }
+                let transaction = DynamoDbConnector::bump_version(
+                    TransactWrite::new(),
+                    &existing,
+                    &checkpoint_full_name,
+                );
+                let committed = self
+                    .connector
+                    .commit_conditional_transaction(transaction)
+                    .await
+                    .map_err(from_modyne)?;
+                Ok(committed)
+            }
+            None => self
+                .connector
+                .create_latest(
+                    org_id,
+                    &key,
+                    &EntityVersionInfo::new(org_id, &key, &checkpoint_full_name),
+                )
+                .await
+                .map_err(from_modyne),
+        }
+    }
+
+    async fn live_serving_node_leases(
+        &mut self,
+        org_id: &String,
+    ) -> Result<Vec<ServingNodeLease>, ServiceApiError> {
+        let leases = self
+            .connector
+            .fetch_entities(org_id, &"serving_node_lease".to_string(), None)
+            .await
+            .map_err(from_modyne)?;
+        let earliest_live_ms = chrono::Utc::now().timestamp_millis() - LEASE_LENGTH_MS;
+        let mut live_leases = vec![];
+        for entity in leases.entities.iter() {
+            if let Some(lease) = self
+                .connector
+                .describe_serving_node_lease(org_id, &entity.entity_id)
+                .await
+                .map_err(from_modyne)?
+            {
+                if lease.observed_at_ms >= earliest_live_ms {
+                    live_leases.push(lease);
+                }
+            }
+        }
+        Ok(live_leases)
+    }
+
+    async fn activation_matches_target(
+        &mut self,
+        org_id: &String,
+        table_name: &String,
+        extension: &Option<String>,
+        target_checkpoint_id: &String,
+    ) -> Result<bool, ServiceApiError> {
+        let live_leases = self.live_serving_node_leases(org_id).await?;
+        if live_leases.is_empty() {
+            return Ok(false);
+        }
+
+        let epoch = self
+            .get_cutover_epoch(org_id, table_name, extension)
+            .await?;
+        let activation_prefix = Self::activation_key_prefix(table_name, extension);
+        let activations = self
+            .connector
+            .fetch_entities(org_id, &"serving_node_activation".to_string(), None)
+            .await
+            .map_err(from_modyne)?;
+        let mut matching_acks = HashMap::new();
+        for activation in activations.entities.iter() {
+            if !activation.entity_id.starts_with(&activation_prefix) {
+                continue;
+            }
+            if let Some(ack) = self
+                .connector
+                .describe_serving_node_activation(org_id, &activation.entity_id)
+                .await
+                .map_err(from_modyne)?
+            {
+                matching_acks.insert(ack.node_id.clone(), ack);
+            }
+        }
+
+        Ok(live_leases.into_iter().all(|lease| {
+            matching_acks
+                .get(&lease.node_id)
+                .map(|ack| ack.checkpoint_id == *target_checkpoint_id && ack.epoch == epoch)
+                .unwrap_or(false)
+        }))
+    }
+
+    async fn promote_active_checkpoint_if_ready(
+        &mut self,
+        org_id: &String,
+        table_name: &String,
+        extension: &Option<String>,
+    ) -> Result<bool, ServiceApiError> {
+        let Some(target_checkpoint_id) = self
+            .get_target_checkpoint_id(org_id, table_name, extension)
+            .await?
+        else {
+            return Ok(false);
+        };
+
+        if self
+            .get_active_checkpoint_id(org_id, table_name, extension)
+            .await?
+            == Some(target_checkpoint_id.clone())
+        {
+            return Ok(false);
+        }
+
+        if !self
+            .activation_matches_target(org_id, table_name, extension, &target_checkpoint_id)
+            .await?
+        {
+            return Ok(false);
+        }
+
+        self.set_active_checkpoint_id(org_id, table_name, extension, &target_checkpoint_id)
+            .await
+    }
+
     async fn checkpoint_publication_still_pending(
         &mut self,
         org_id: &String,
@@ -182,12 +491,29 @@ impl DynamoDBServiceImpl {
             return Ok(true);
         }
 
-        Ok(!self
+        if !self
             .connector
             .oldest_available_checkpoint_waiting_for_extension(org_id, table_name, Some(1), None)
             .await
             .map_err(from_modyne)?
-            .is_empty())
+            .is_empty()
+        {
+            return Ok(true);
+        }
+
+        for extension in [None, Some("es".to_string())] {
+            if self
+                .get_active_checkpoint_id(org_id, table_name, &extension)
+                .await?
+                != self
+                    .get_target_checkpoint_id(org_id, table_name, &extension)
+                    .await?
+            {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     pub async fn add_checkpoint(
@@ -597,23 +923,17 @@ impl DynamoDBServiceImpl {
         table_name: &String,
         extensions: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
-        let value = self
-            .connector
-            .describe_latest(
-                &org_info.org_id,
-                &Self::latest_checkpoint_key(table_name, &extensions),
-            )
-            .await
-            .map_err(from_modyne)?;
-        match value {
-            Some(val) => {
-                tracing::info!("Latest checkpoint for {}: {}", table_name, val.entity_id);
-                Ok(Some(
-                    CheckpointDescriptor::from_full_name(&val.entity_id).full_checkpoint_id(),
-                ))
-            }
-            None => Ok(None),
+        let checkpoint_id = self
+            .get_active_checkpoint_id(&org_info.org_id, table_name, &extensions)
+            .await?;
+        if let Some(checkpoint_id) = checkpoint_id.as_ref() {
+            tracing::info!(
+                "Latest active checkpoint for {}: {}",
+                table_name,
+                checkpoint_id
+            );
         }
+        Ok(checkpoint_id)
     }
 
     pub async fn get_checkpoint(
@@ -870,7 +1190,19 @@ impl DynamoDBServiceImpl {
                     .await?;
             work_done = work_done
                 | self
+                    .promote_active_checkpoint_if_ready(&org_id, &table_name, &None)
+                    .await?;
+            work_done = work_done
+                | self
                     .update_extension_checkpoint(&org_id, &table_name)
+                    .await?;
+            work_done = work_done
+                | self
+                    .promote_active_checkpoint_if_ready(
+                        &org_id,
+                        &table_name,
+                        &Some("es".to_string()),
+                    )
                     .await?;
 
             if !self
@@ -898,6 +1230,9 @@ impl DynamoDBServiceImpl {
         table_name: &String,
     ) -> Result<bool, ServiceApiError> {
         // TODO: need a bulk fetcher
+        let previous_target_checkpoint_id = self
+            .get_target_checkpoint_id(org_id, table_name, &None)
+            .await?;
 
         let latest_speedboat_trackers = self
             .connector
@@ -1004,6 +1339,15 @@ impl DynamoDBServiceImpl {
             }
         }
 
+        let new_target_checkpoint_id = self
+            .get_target_checkpoint_id(org_id, table_name, &None)
+            .await?;
+        if new_target_checkpoint_id != previous_target_checkpoint_id
+            && new_target_checkpoint_id.is_some()
+        {
+            let _ = self.bump_cutover_epoch(org_id, table_name, &None).await?;
+        }
+
         Ok(true)
     }
 
@@ -1012,6 +1356,10 @@ impl DynamoDBServiceImpl {
         org_id: &String,
         table_name: &String,
     ) -> Result<bool, ServiceApiError> {
+        let extension = Some("es".to_string());
+        let previous_target_checkpoint_id = self
+            .get_target_checkpoint_id(org_id, table_name, &extension)
+            .await?;
         let latest_extension_trackers = self
             .connector
             .oldest_available_extension_commit_checkpointed(org_id, table_name, None, None)
@@ -1105,6 +1453,17 @@ impl DynamoDBServiceImpl {
         }
 
         // TODO: need to figure out protocol on when to mark an extension commit as done
+
+        let new_target_checkpoint_id = self
+            .get_target_checkpoint_id(org_id, table_name, &extension)
+            .await?;
+        if new_target_checkpoint_id != previous_target_checkpoint_id
+            && new_target_checkpoint_id.is_some()
+        {
+            let _ = self
+                .bump_cutover_epoch(org_id, table_name, &extension)
+                .await?;
+        }
 
         Ok(work_done)
     }
@@ -1201,17 +1560,128 @@ impl MetadataStore for DynamoDBServiceImpl {
         org_info: &OrgInfo,
         selector: &PublishedCheckpointSelector,
     ) -> Result<Option<PublishedCheckpointRecord>, ServiceApiError> {
-        Ok(DynamoDBServiceImpl::get_latest_committed_checkpoint(
-            self,
-            org_info,
-            &selector.table_name,
-            selector.extension.clone(),
+        let checkpoint_id = match selector.role {
+            PublishedCheckpointRole::Active => {
+                self.get_active_checkpoint_id(
+                    &org_info.org_id,
+                    &selector.table_name,
+                    &selector.extension,
+                )
+                .await?
+            }
+            PublishedCheckpointRole::Target => {
+                self.get_target_checkpoint_id(
+                    &org_info.org_id,
+                    &selector.table_name,
+                    &selector.extension,
+                )
+                .await?
+            }
+        };
+        Ok(
+            checkpoint_id.map(|checkpoint_id| PublishedCheckpointRecord {
+                selector: selector.clone(),
+                checkpoint_id,
+            }),
         )
-        .await?
-        .map(|checkpoint_id| PublishedCheckpointRecord {
-            selector: selector.clone(),
-            checkpoint_id,
-        }))
+    }
+
+    async fn get_checkpoint_cutover_state(
+        &mut self,
+        org_info: &OrgInfo,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> Result<CheckpointCutoverState, ServiceApiError> {
+        let active_checkpoint_id = self
+            .get_active_checkpoint_id(&org_info.org_id, table_name, &extension)
+            .await?;
+        let target_checkpoint_id = self
+            .get_target_checkpoint_id(&org_info.org_id, table_name, &extension)
+            .await?
+            .or_else(|| active_checkpoint_id.clone());
+        Ok(CheckpointCutoverState {
+            selector: PublishedCheckpointSelector::target(table_name.clone(), extension.clone()),
+            epoch: self
+                .get_cutover_epoch(&org_info.org_id, table_name, &extension)
+                .await?,
+            active_checkpoint_id,
+            target_checkpoint_id,
+        })
+    }
+
+    async fn heartbeat_serving_node(
+        &mut self,
+        org_info: &OrgInfo,
+        lease: &ServingNodeLease,
+    ) -> Result<(), ServiceApiError> {
+        let lease_name = Self::lease_key(&lease.node_id);
+        let _ = self
+            .connector
+            .delete_serving_node_lease(&org_info.org_id, &lease_name)
+            .await
+            .map_err(from_modyne)?;
+        let _ = self
+            .connector
+            .create_serving_node_lease(&org_info.org_id, &lease_name, lease)
+            .await
+            .map_err(from_modyne)?;
+        Ok(())
+    }
+
+    async fn record_serving_node_activation(
+        &mut self,
+        org_info: &OrgInfo,
+        ack: &ServingNodeActivationAck,
+    ) -> Result<(), ServiceApiError> {
+        let activation_name = Self::activation_key(
+            &ack.selector.table_name,
+            &ack.selector.extension,
+            &ack.node_id,
+        );
+        let _ = self
+            .connector
+            .delete_serving_node_activation(&org_info.org_id, &activation_name)
+            .await
+            .map_err(from_modyne)?;
+        let _ = self
+            .connector
+            .create_serving_node_activation(&org_info.org_id, &activation_name, ack)
+            .await
+            .map_err(from_modyne)?;
+        Ok(())
+    }
+
+    async fn list_serving_node_activations(
+        &mut self,
+        org_info: &OrgInfo,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> Result<Vec<ServingNodeActivationAck>, ServiceApiError> {
+        let activation_prefix = Self::activation_key_prefix(table_name, &extension);
+        let activations = self
+            .connector
+            .fetch_entities(
+                &org_info.org_id,
+                &"serving_node_activation".to_string(),
+                None,
+            )
+            .await
+            .map_err(from_modyne)?;
+        let mut matching_activations = vec![];
+        for activation in activations.entities.iter() {
+            if !activation.entity_id.starts_with(&activation_prefix) {
+                continue;
+            }
+            if let Some(ack) = self
+                .connector
+                .describe_serving_node_activation(&org_info.org_id, &activation.entity_id)
+                .await
+                .map_err(from_modyne)?
+            {
+                matching_activations.push(ack);
+            }
+        }
+        Ok(matching_activations)
     }
 
     async fn get_checkpoint_metadata(

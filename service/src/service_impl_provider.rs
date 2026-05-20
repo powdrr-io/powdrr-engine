@@ -16,6 +16,9 @@ use powdrr_service_lib::dynamodb_service_impl::DynamoDBServiceImpl;
 use powdrr_service_lib::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use powdrr_service_lib::ephemeral_service_impl::EphemeralServiceImpl;
 use powdrr_service_lib::metadata_store::MetadataStore;
+use powdrr_service_lib::metadata_store::{
+    CheckpointCutoverState, ServingNodeActivationAck, ServingNodeLease,
+};
 use powdrr_service_lib::peers::CheckpointDescriptor;
 use powdrr_service_lib::pipeline::PipelineDefinition;
 use powdrr_service_lib::raft_service_impl::{RaftServiceConfig, RaftServiceImpl};
@@ -180,6 +183,28 @@ enum ServiceImplProviderActorMessage {
         org_info: OrgInfo,
         table_name: String,
         extensions: Option<String>,
+    },
+    GetLatestTargetCheckpoint {
+        respond_to: oneshot::Sender<Result<Option<String>, ServiceImplError>>,
+        org_info: OrgInfo,
+        table_name: String,
+        extensions: Option<String>,
+    },
+    GetCheckpointCutoverState {
+        respond_to: oneshot::Sender<Result<CheckpointCutoverState, ServiceImplError>>,
+        org_info: OrgInfo,
+        table_name: String,
+        extensions: Option<String>,
+    },
+    HeartbeatServingNode {
+        respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
+        org_info: OrgInfo,
+        lease: ServingNodeLease,
+    },
+    RecordServingNodeActivation {
+        respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
+        org_info: OrgInfo,
+        ack: ServingNodeActivationAck,
     },
     GetCheckpoint {
         respond_to: oneshot::Sender<Result<Option<TableMetadataCheckpoint>, ServiceImplError>>,
@@ -468,6 +493,48 @@ impl ServiceImplProviderActor {
                     get_latest_committed_checkpoint(&org_info, &table_name, extensions)
                 );
             }
+            ServiceImplProviderActorMessage::GetLatestTargetCheckpoint {
+                org_info,
+                table_name,
+                extensions,
+                respond_to,
+            } => {
+                handle_message_impl!(
+                    self,
+                    respond_to,
+                    get_latest_target_checkpoint(&org_info, &table_name, extensions)
+                );
+            }
+            ServiceImplProviderActorMessage::GetCheckpointCutoverState {
+                org_info,
+                table_name,
+                extensions,
+                respond_to,
+            } => {
+                handle_message_impl!(
+                    self,
+                    respond_to,
+                    get_checkpoint_cutover_state(&org_info, &table_name, extensions)
+                );
+            }
+            ServiceImplProviderActorMessage::HeartbeatServingNode {
+                org_info,
+                lease,
+                respond_to,
+            } => {
+                handle_message_impl!(self, respond_to, heartbeat_serving_node(&org_info, &lease));
+            }
+            ServiceImplProviderActorMessage::RecordServingNodeActivation {
+                org_info,
+                ack,
+                respond_to,
+            } => {
+                handle_message_impl!(
+                    self,
+                    respond_to,
+                    record_serving_node_activation(&org_info, &ack)
+                );
+            }
             ServiceImplProviderActorMessage::GetCheckpoint {
                 checkpoint,
                 respond_to,
@@ -698,6 +765,45 @@ impl ServiceImpl {
         )
     }
 
+    pub async fn get_latest_target_checkpoint(
+        &mut self,
+        org_info: &OrgInfo,
+        table_name: &String,
+        extensions: Option<String>,
+    ) -> Result<Option<String>, ServiceImplError> {
+        metadata_store_func_impl!(
+            self,
+            get_latest_target_checkpoint(org_info, table_name, extensions)
+        )
+    }
+
+    pub async fn get_checkpoint_cutover_state(
+        &mut self,
+        org_info: &OrgInfo,
+        table_name: &String,
+        extensions: Option<String>,
+    ) -> Result<CheckpointCutoverState, ServiceImplError> {
+        metadata_store_func_impl!(
+            self,
+            get_checkpoint_cutover_state(org_info, table_name, extensions)
+        )
+    }
+
+    pub async fn heartbeat_serving_node(
+        &mut self,
+        org_info: &OrgInfo,
+        lease: &ServingNodeLease,
+    ) -> Result<(), ServiceImplError> {
+        metadata_store_func_impl!(self, heartbeat_serving_node(org_info, lease))
+    }
+
+    pub async fn record_serving_node_activation(
+        &mut self,
+        org_info: &OrgInfo,
+        ack: &ServingNodeActivationAck,
+    ) -> Result<(), ServiceImplError> {
+        metadata_store_func_impl!(self, record_serving_node_activation(org_info, ack))
+    }
     pub async fn get_checkpoint(
         &mut self,
         org_info: &OrgInfo,
@@ -1135,6 +1241,61 @@ impl ServiceImplHandle {
         )
     }
 
+    pub async fn get_latest_target_checkpoint(
+        &self,
+        org_info: &OrgInfo,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> Result<Option<String>, ServiceImplError> {
+        send_message!(
+            self,
+            GetLatestTargetCheckpoint,
+            org_info = org_info.clone(),
+            table_name = table_name.clone(),
+            extensions = extension.clone()
+        )
+    }
+
+    pub async fn get_checkpoint_cutover_state(
+        &self,
+        org_info: &OrgInfo,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> Result<CheckpointCutoverState, ServiceImplError> {
+        send_message!(
+            self,
+            GetCheckpointCutoverState,
+            org_info = org_info.clone(),
+            table_name = table_name.clone(),
+            extensions = extension.clone()
+        )
+    }
+
+    pub async fn heartbeat_serving_node(
+        &self,
+        org_info: &OrgInfo,
+        lease: &ServingNodeLease,
+    ) -> Result<(), ServiceImplError> {
+        send_message!(
+            self,
+            HeartbeatServingNode,
+            org_info = org_info.clone(),
+            lease = lease.clone()
+        )
+    }
+
+    pub async fn record_serving_node_activation(
+        &self,
+        org_info: &OrgInfo,
+        ack: &ServingNodeActivationAck,
+    ) -> Result<(), ServiceImplError> {
+        send_message!(
+            self,
+            RecordServingNodeActivation,
+            org_info = org_info.clone(),
+            ack = ack.clone()
+        )
+    }
     pub async fn get_checkpoint(
         &self,
         org_info: &OrgInfo,
@@ -1160,7 +1321,6 @@ impl ServiceImplHandle {
             extension_type = extension_type.clone()
         )
     }
-
     pub async fn get_compaction_work_items(
         &self,
         org_info: &OrgInfo,

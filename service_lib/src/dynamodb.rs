@@ -4,6 +4,7 @@ use crate::data_contract::{
     SpeedboatCommit, TableMetadataCheckpoint,
 };
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
+use crate::metadata_store::{ServingNodeActivationAck, ServingNodeLease};
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
 use crate::schema_massager::PowdrrSchema;
@@ -11,8 +12,8 @@ use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use idgenerator::IdInstance;
 use modyne::expr::Filter;
 use modyne::{
-    expr, keys, model::TransactWrite, projections, read_projection, Aggregate, Entity, EntityExt,
-    Error, Item, ProjectionExt, QueryInput, QueryInputExt, Table,
+    Aggregate, Entity, EntityExt, Error, Item, ProjectionExt, QueryInput, QueryInputExt, Table,
+    expr, keys, model::TransactWrite, projections, read_projection,
 };
 use std::collections::HashMap;
 
@@ -621,6 +622,8 @@ powdrr_named_entity!(powdrr_table, TableBody);
 powdrr_named_entity!(table_template, CreateIndexTemplateBody);
 powdrr_named_entity!(pipeline, PipelineDefinition);
 powdrr_named_entity!(lifetime_policy, ILMPolicyDefinition);
+powdrr_named_entity!(serving_node_lease, ServingNodeLease);
+powdrr_named_entity!(serving_node_activation, ServingNodeActivationAck);
 powdrr_named_entity!(latest, EntityVersionInfo);
 powdrr_named_entity!(org_settings, OrgSettings);
 
@@ -1110,9 +1113,11 @@ impl DynamoDbConnector {
             cloned_checkpoint_to_replace.checkpoint_id = IdInstance::next_id().to_string();
             cloned_checkpoint_to_replace
                 .apply_compaction_for_replacement(compaction_commit, &commit.metadata);
-            assert!(cloned_checkpoint_to_replace
-                .original_checkpoint_id
-                .is_none());
+            assert!(
+                cloned_checkpoint_to_replace
+                    .original_checkpoint_id
+                    .is_none()
+            );
             cloned_checkpoint_to_replace.original_checkpoint_id =
                 Some(compaction_commit.checkpoint_id_to_replace.clone());
 
