@@ -467,6 +467,10 @@ pub fn router(include_test_apis: bool) -> Router {
             .with_path_extractor::<NamePathExtractor>()
             .to(lakehouse_serving::get_serving_config);
         route
+            .get("/:name/_serve/layout")
+            .with_path_extractor::<NamePathExtractor>()
+            .to(lakehouse_serving::get_serving_layout_advice);
+        route
             .get("/:name/_dynamodb/config")
             .with_path_extractor::<NamePathExtractor>()
             .to(dynamodb_protocol::get_dynamodb_config);
@@ -494,6 +498,10 @@ pub fn router(include_test_apis: bool) -> Router {
             .post("/:name/_serve")
             .with_path_extractor::<NamePathExtractor>()
             .to(lakehouse_serving::serve_query);
+        route
+            .post("/:name/_serve/cache_manager")
+            .with_path_extractor::<NamePathExtractor>()
+            .to(lakehouse_serving::manage_serving_cache);
         route
             .post("/:name/_mongo/find")
             .with_path_extractor::<NamePathExtractor>()
