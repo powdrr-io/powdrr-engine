@@ -1447,6 +1447,15 @@ impl EphemeralServiceImpl {
         table_name: &String,
         extensions: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
+        Ok(self.get_latest_materialized_checkpoint_sync(table_name, extensions))
+    }
+
+    pub async fn get_published_active_checkpoint(
+        &mut self,
+        _org_info: &OrgInfo,
+        table_name: &String,
+        extensions: Option<String>,
+    ) -> Result<Option<String>, ServiceApiError> {
         Ok(self.get_published_checkpoint_sync(
             PublishedCheckpointRole::Active,
             table_name,
@@ -1704,6 +1713,16 @@ impl MetadataStore for EphemeralServiceImpl {
         Ok(())
     }
 
+    async fn get_latest_committed_checkpoint(
+        &mut self,
+        org_info: &OrgInfo,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> Result<Option<String>, ServiceApiError> {
+        EphemeralServiceImpl::get_latest_committed_checkpoint(self, org_info, table_name, extension)
+            .await
+    }
+
     async fn get_published_checkpoint_record(
         &mut self,
         _org_info: &OrgInfo,
@@ -1878,8 +1897,36 @@ impl MetadataStore for EphemeralServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::EphemeralServiceImpl;
-    use crate::data_contract::{LicenseType, OrgCreds, OrgSettings};
+    use crate::data_contract::{
+        CreateTable, FileSetPayload, IcebergCommit, IcebergMetadata, LicenseType, OrgCreds,
+        OrgInfo, OrgSettings,
+    };
+    use crate::metadata_store::{MetadataStore, ServingNodeActivationAck, ServingNodeLease};
+    use crate::schema_massager::PowdrrSchema;
     use crate::test_api::TestProcessingMode;
+    use std::collections::HashMap;
+
+    fn org_info() -> OrgInfo {
+        OrgInfo {
+            org_id: "org-1".to_string(),
+            license_type: LicenseType::Pro,
+        }
+    }
+
+    fn iceberg_metadata(file_path: &str, snapshot_id: &str) -> IcebergMetadata {
+        let schema = PowdrrSchema::minimal();
+        IcebergMetadata {
+            table_schema: schema.clone(),
+            snapshot_id: Some(snapshot_id.to_string()),
+            files: FileSetPayload::single(file_path.to_string(), 128, schema),
+            partition_spec: vec![],
+            sort_order: vec![],
+            column_names: vec![],
+            column_stats: vec![],
+            access_artifacts: vec![],
+            file_stats: vec![],
+        }
+    }
 
     #[tokio::test]
     async fn org_lookup_survives_snapshot_round_trip() {
@@ -1905,5 +1952,137 @@ mod tests {
             .unwrap();
 
         assert_eq!(org.unwrap().org_id, "org-1".to_string());
+    }
+
+    #[tokio::test]
+    async fn committed_target_and_active_frontiers_diverge_until_activation() {
+        let mut state = EphemeralServiceImpl::new(TestProcessingMode::default());
+        let org_info = org_info();
+        let table_name = "ephemeral-frontier-table".to_string();
+
+        state
+            .create_table(
+                &org_info,
+                &CreateTable {
+                    name: table_name.clone(),
+                    tags: HashMap::new(),
+                    serving: None,
+                    dynamodb: None,
+                    mongodb: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        state
+            .iceberg_commit(
+                &org_info,
+                &table_name,
+                &IcebergCommit {
+                    metadata: iceberg_metadata("s3://warehouse/table/data-0001.parquet", "1"),
+                    deletes_table_info: None,
+                    compactions: vec![],
+                },
+            )
+            .await
+            .unwrap();
+
+        let committed_checkpoint = MetadataStore::get_latest_committed_checkpoint(
+            &mut state,
+            &org_info,
+            &table_name,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            MetadataStore::get_latest_target_checkpoint(&mut state, &org_info, &table_name, None)
+                .await
+                .unwrap(),
+            Some(committed_checkpoint.clone())
+        );
+        assert_eq!(
+            MetadataStore::get_published_active_checkpoint(
+                &mut state,
+                &org_info,
+                &table_name,
+                None,
+            )
+            .await
+            .unwrap(),
+            None
+        );
+
+        assert!(
+            MetadataStore::advance_published_checkpoints(&mut state)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            MetadataStore::get_latest_target_checkpoint(&mut state, &org_info, &table_name, None)
+                .await
+                .unwrap(),
+            Some(committed_checkpoint.clone())
+        );
+        assert_eq!(
+            MetadataStore::get_published_active_checkpoint(
+                &mut state,
+                &org_info,
+                &table_name,
+                None,
+            )
+            .await
+            .unwrap(),
+            None
+        );
+
+        let cutover_state =
+            MetadataStore::get_checkpoint_cutover_state(&mut state, &org_info, &table_name, None)
+                .await
+                .unwrap();
+        let observed_at_ms = chrono::Utc::now().timestamp_millis();
+        MetadataStore::heartbeat_serving_node(
+            &mut state,
+            &org_info,
+            &ServingNodeLease {
+                node_id: "warm-cache".to_string(),
+                membership_epoch: cutover_state.epoch,
+                observed_at_ms,
+            },
+        )
+        .await
+        .unwrap();
+        MetadataStore::record_serving_node_activation(
+            &mut state,
+            &org_info,
+            &ServingNodeActivationAck {
+                selector: cutover_state.selector,
+                node_id: "warm-cache".to_string(),
+                epoch: cutover_state.epoch,
+                checkpoint_id: committed_checkpoint.clone(),
+                activated_at_ms: observed_at_ms + 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            MetadataStore::advance_published_checkpoints(&mut state)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            MetadataStore::get_published_active_checkpoint(
+                &mut state,
+                &org_info,
+                &table_name,
+                None,
+            )
+            .await
+            .unwrap(),
+            Some(committed_checkpoint)
+        );
     }
 }
