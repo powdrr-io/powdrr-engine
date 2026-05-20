@@ -5,13 +5,14 @@ use crate::data_contract::{
 use crate::elastic_search_ingest::JSON_MODE;
 use crate::util::log_err;
 use datafusion::arrow::datatypes::Schema;
+use datafusion::arrow::ipc::reader::FileReader as ArrowIpcFileReader;
 use datafusion::common::HashMap;
 use datafusion::config::ConfigOptions;
 use datafusion::datasource::{
     file_format::parquet::ParquetFormat,
     listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
 };
-use datafusion::execution::options::{ArrowReadOptions, JsonReadOptions};
+use datafusion::execution::options::JsonReadOptions;
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use datafusion::prelude::SessionConfig;
 use datafusion::{
@@ -51,6 +52,7 @@ use parquet_55::file::statistics::Statistics;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::Cursor;
 use std::string::ToString;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
@@ -1263,6 +1265,10 @@ enum CacheTrackerActorMessage {
         file_path: String,
         payload: Vec<u8>,
     },
+    FileGet {
+        respond_to: oneshot::Sender<Result<Vec<u8>, DataFusionError>>,
+        file_path: String,
+    },
     DropIcebergTable {
         respond_to: oneshot::Sender<Result<(), iceberg::Error>>,
         namespace: String,
@@ -1685,6 +1691,42 @@ impl CacheTrackerActor {
                 };
                 respond_to.send(retval).expect("Failed to send response");
             }
+            CacheTrackerActorMessage::FileGet {
+                respond_to,
+                file_path,
+            } => {
+                let retval = if file_path.starts_with("s3://") {
+                    let path_str = file_path.replace(S3_BASE_PATH, "");
+                    let path = match object_store::path::Path::from_url_path(path_str) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            respond_to
+                                .send(log_err(DataFusionError::ObjectStore(Box::new(e.into()))))
+                                .expect("Failed to send response");
+                            return;
+                        }
+                    };
+
+                    match self.s3_file_store.get(&path).await {
+                        Ok(result) => match result.bytes().await {
+                            Ok(bytes) => Ok(bytes.to_vec()),
+                            Err(e) => log_err(DataFusionError::ObjectStore(Box::new(e.into()))),
+                        },
+                        Err(e) => log_err(DataFusionError::ObjectStore(Box::new(e.into()))),
+                    }
+                } else {
+                    let final_file_path = if file_path.starts_with("file://") {
+                        file_path.replace("file://", "")
+                    } else {
+                        file_path
+                    };
+                    match std::fs::read(&final_file_path) {
+                        Ok(bytes) => Ok(bytes),
+                        Err(e) => log_err(DataFusionError::IoError(e)),
+                    }
+                };
+                respond_to.send(retval).expect("Failed to send response");
+            }
             CacheTrackerActorMessage::DropIcebergTable {
                 respond_to,
                 namespace,
@@ -2064,6 +2106,17 @@ impl LRUCacheHandle {
         recv.await.expect("Actor task has been killed")
     }
 
+    async fn file_get(&self, file_path: &String) -> Result<Vec<u8>, DataFusionError> {
+        let (send, recv) = oneshot::channel();
+        let msg = CacheTrackerActorMessage::FileGet {
+            respond_to: send,
+            file_path: file_path.clone(),
+        };
+
+        let _ = self.sender.send(msg).await;
+        recv.await.expect("Actor task has been killed")
+    }
+
     #[allow(dead_code)]
     async fn get_tables(&self) -> Vec<String> {
         let (send, recv) = oneshot::channel();
@@ -2412,12 +2465,35 @@ async fn load_json_file_as_table(
             }
         }
     } else {
-        let file_path = format!("{}.arrow", file_path_without_suffix);
+        let file_path = if file_path_without_suffix.ends_with(".arrow") {
+            file_path_without_suffix.clone()
+        } else {
+            format!("{}.arrow", file_path_without_suffix)
+        };
         tracing::info!("Loading Arrow file {}", file_path);
-        data_fusion_context
-            .register_arrow(local_name, &file_path, ArrowReadOptions::default())
-            .await
+        load_arrow_as_memtable(&file_path, local_name).await
     }
+}
+
+async fn load_arrow_as_memtable(
+    file_path: &String,
+    local_name: &String,
+) -> Result<(), DataFusionError> {
+    let file_contents = LRU_CACHE_HANDLE.file_get(file_path).await?;
+    let arrow_reader = ArrowIpcFileReader::try_new(Cursor::new(file_contents), None)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    let record_batches = arrow_reader
+        .collect::<arrow::error::Result<Vec<RecordBatch>>>()
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+    if record_batches.is_empty() {
+        return log_err(DataFusionError::Execution(format!(
+            "Arrow file {} contained no record batches",
+            file_path
+        )));
+    }
+
+    load_memtable_with_name(local_name, &record_batches).await
 }
 
 pub(crate) fn path_to_table_name(file_path: &String) -> String {
@@ -3178,15 +3254,19 @@ mod tests {
     use super::{
         IcebergLibMetadata, IcebergTableMetadataCache, IcebergTableRowGroupStatsTracker,
         ParquetRowGroupStatsCache, RecordBatch, ServingBulkCacheWarmupStats, drop,
-        execute_sql_async, load_files_as_table, record_serving_bulk_cache_warmup,
-        resolve_serving_liquid_cache_location, serving_bulk_cache_stats, serving_session_config,
+        execute_sql_async, load_file_as_table, load_files_as_table,
+        record_serving_bulk_cache_warmup, resolve_serving_liquid_cache_location,
+        serving_bulk_cache_stats, serving_session_config,
     };
     use crate::data_contract::{IcebergColumnStats, IcebergRowGroupStats};
+    use crate::elastic_search_ingest::WriteBuffer;
+    use crate::schema_massager::PowdrrSchema;
     use datafusion::arrow::array::{Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field};
     use datafusion::parquet::arrow::ArrowWriter;
     use iceberg::spec::Schema;
     use serde_json::Value;
+    use serde_json::json;
     use std::collections::HashSet;
     use std::fs::File;
     use std::path::PathBuf;
@@ -3440,6 +3520,46 @@ mod tests {
             .sum::<i64>();
 
         assert_eq!(count, 2);
+        drop(&table_name).await;
+    }
+
+    #[tokio::test]
+    async fn load_file_as_table_reads_local_arrow_speedboat_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let segment_path = temp_dir.path().join("segment");
+        let segment_path = segment_path.to_string_lossy().to_string();
+        let buffer = WriteBuffer::delete(vec![json!({
+            "_id": "doc-1",
+            "_id_seq_no": "doc-1:1",
+            "_version": 1
+        })]);
+        buffer.write_to_file(&segment_path).unwrap();
+
+        let table_name = "local_arrow_speedboat_test".to_string();
+        load_file_as_table(
+            &table_name,
+            &segment_path,
+            false,
+            Some(PowdrrSchema::deletes().to_arrow_schema()),
+        )
+        .await
+        .unwrap();
+
+        let sql = format!("SELECT COUNT(*) AS count FROM {}", table_name);
+        let batches = execute_sql_async(&sql).await.unwrap();
+        let count = batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0)
+            })
+            .sum::<i64>();
+
+        assert_eq!(count, 1);
         drop(&table_name).await;
     }
 
