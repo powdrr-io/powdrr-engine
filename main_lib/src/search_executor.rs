@@ -1,14 +1,15 @@
 use crate::elastic_search_commands::{SqlCommand, UpdateByQueryCommand};
 use crate::elastic_search_common::{
-    Command, CommandContext, ElasticSearchResponse, ParseError, ResultGeneratorFuture,
-    execute_command,
+    execute_command, Command, CommandContext, ElasticSearchResponse, ParseError,
+    ResultGeneratorFuture,
 };
 use crate::elastic_search_datetime_parser;
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::elastic_search_responses::{
-    AggregationResult, AverageAggregationResult, CardinalityAggregationResult,
-    FilterAggregationResult, HistogramAggregationBucket, HistogramAggregationResult, QueryFailure,
-    QueryResults, TermAggregationBucket, TermAggregationResult, compare_query_result_hits_desc,
+    compare_query_result_hits_desc, AggregationResult, AverageAggregationResult,
+    CardinalityAggregationResult, FilterAggregationResult, HistogramAggregationBucket,
+    HistogramAggregationResult, QueryFailure, QueryResults, TermAggregationBucket,
+    TermAggregationResult,
 };
 use crate::peers::{
     CheckpointDescriptor, PrivateExactConstraintGroup, PrivateInvocation,
@@ -223,7 +224,7 @@ impl SearchCommand {
         legacy_command: &SqlCommand,
     ) -> Vec<CheckpointDescriptor> {
         match STATE_PROVIDER
-            .get_active_servable_checkpoint(&legacy_command.table)
+            .get_published_active_servable_checkpoint(&legacy_command.table)
             .await
         {
             Ok(Some(checkpoint_id)) => {
@@ -235,7 +236,7 @@ impl SearchCommand {
             Ok(None) => vec![],
             Err(e) => {
                 tracing::error!(
-                    "Error getting latest checkpoint for table {}: {}",
+                    "Error getting active published checkpoint for table {}: {}",
                     legacy_command.table,
                     e
                 );

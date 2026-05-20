@@ -6,13 +6,13 @@ use std::pin::Pin;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{Body, body};
+use gotham::hyper::{body, Body};
 use gotham::mime;
 use gotham::state::{FromState, State};
 use hmac::{Hmac, Mac};
 use http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::data_access::{self, execute_sql_async, load_files_as_table};
@@ -22,7 +22,7 @@ use crate::data_contract::{
     TableMetadataCheckpoint,
 };
 use crate::elastic_search_endpoints::NamePathExtractor;
-use crate::lakehouse_serving::{ServingQueryError, ServingQueryResponse, execute_serving_query};
+use crate::lakehouse_serving::{execute_serving_query, ServingQueryError, ServingQueryResponse};
 use crate::peers::CheckpointDescriptor;
 use crate::schema_massager::{PowdrrDataType, PowdrrSchema};
 use crate::search_runtime::batches_to_serde_value;
@@ -1217,7 +1217,7 @@ async fn load_active_checkpoint(
     table_name: &str,
 ) -> Result<TableMetadataCheckpoint, DynamoDbError> {
     let checkpoint_id = STATE_PROVIDER
-        .get_active_servable_checkpoint(&table_name.to_string())
+        .get_published_active_servable_checkpoint(&table_name.to_string())
         .await
         .map_err(service_error)?
         .ok_or_else(|| {
@@ -3997,13 +3997,11 @@ mod tests {
             &list_tables_response.read_utf8_body().unwrap(),
         )
         .unwrap();
-        assert!(
-            list_tables_body["TableNames"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value == &json!(table_name))
-        );
+        assert!(list_tables_body["TableNames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == &json!(table_name)));
 
         let list_tables_unknown_field_response =
             perform_dynamodb_request(&test_server, "ListTables", json!({ "UnknownField": true }));

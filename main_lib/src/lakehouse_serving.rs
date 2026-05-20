@@ -3,11 +3,11 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
 
-use futures::FutureExt;
 use futures::stream::{self, StreamExt};
+use futures::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{Body, body};
+use gotham::hyper::{body, Body};
 use gotham::mime;
 use gotham::state::{FromState, State};
 use http::StatusCode;
@@ -503,7 +503,7 @@ async fn load_serving_context(
     };
 
     let checkpoint_id = match STATE_PROVIDER
-        .get_active_servable_checkpoint(&description.name)
+        .get_published_active_servable_checkpoint(&description.name)
         .await
     {
         Ok(Some(checkpoint_id)) => checkpoint_id,
@@ -2377,9 +2377,10 @@ impl ServingQueryError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ServingExecutionContext, build_serving_warmup_plan, build_sql, file_group_table_name,
-        group_files_by_schema, ordered_file_groups_for_top_k, plan_request, prune_candidate_files,
+        build_serving_warmup_plan, build_sql, file_group_table_name, group_files_by_schema,
+        ordered_file_groups_for_top_k, plan_request, prune_candidate_files,
         remaining_groups_cannot_beat_kth_row, request_matches_pattern, select_serving_warmup_files,
+        ServingExecutionContext,
     };
     use crate::data_access::{
         prime_parquet_row_group_stats_cache_for_test, reset_serving_metadata_caches_for_test,
