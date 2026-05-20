@@ -20,7 +20,8 @@ use crate::data_access::{self, execute_sql_async, load_files_as_table};
 use crate::data_contract::{
     CreateTable, ExtensionFile, FileDescriptor, IcebergAccessArtifact, IcebergColumnStats,
     IcebergFileStats, IcebergPartitionField, IcebergRowGroupStats, IcebergSortField,
-    ServingPattern, ServingTableConfig, TableDescription, TableMetadataCheckpoint,
+    ServingAggregateMeasure, ServingAggregateSpec, ServingPattern, ServingTableConfig,
+    TableDescription, TableMetadataCheckpoint,
 };
 use crate::elastic_search_endpoints::NamePathExtractor;
 use crate::peers::CheckpointDescriptor;
@@ -42,6 +43,7 @@ const ACCESS_ARTIFACT_KIND_FILE_STATS: &str = "file-stats";
 const ACCESS_ARTIFACT_KIND_PAGE_INDEX: &str = "page-index";
 const ACCESS_ARTIFACT_KIND_PARTITION_SPEC: &str = "partition-spec";
 const ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS: &str = "row-group-stats";
+const ACCESS_ARTIFACT_KIND_SECONDARY_PATTERN: &str = "secondary-pattern";
 const ACCESS_ARTIFACT_KIND_SORT_ORDER: &str = "sort-order";
 const DEFAULT_FAST_PATH_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_FAST_PATH_MAX_FILES: usize = 32;
@@ -248,6 +250,24 @@ struct ServingPlan {
     bloom_filter_row_groups_selected: usize,
     artifacts_considered: Vec<String>,
     artifacts_used: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct AggregateMeasurePlan {
+    function: AggregateFunction,
+    field: Option<String>,
+    alias: String,
+    partial_value_alias: String,
+    partial_count_alias: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AggregateFunction {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -690,6 +710,10 @@ fn build_serving_layout_advice(context: &ServingExecutionContext) -> ServingLayo
                 .cloned()
                 .collect::<Vec<_>>()
         };
+        let secondary_artifact_available = context
+            .access_artifacts
+            .iter()
+            .any(|artifact| artifact.name == secondary_pattern_artifact_name(&pattern.name));
         let recommendation = if !missing_identity_partition_eq_fields.is_empty() {
             Some(format!(
                 "Cluster or partition files on {} for pattern {}",
@@ -703,6 +727,16 @@ fn build_serving_layout_advice(context: &ServingExecutionContext) -> ServingLayo
                     field, pattern.name
                 )
             })
+        } else if pattern.aggregate.is_some() {
+            Some(format!(
+                "Build aggregate fragments or bitmap rollups for pattern {}",
+                pattern.name
+            ))
+        } else if pattern_is_secondary(pattern) && !secondary_artifact_available {
+            Some(format!(
+                "Build a declared secondary serving artifact for pattern {}",
+                pattern.name
+            ))
         } else if !exact_artifact_fields_missing.is_empty() {
             Some(format!(
                 "Publish exact_pruning/exact_index sidecars for {}",
@@ -974,11 +1008,18 @@ async fn load_serving_context(
     let extension_files = flatten_extension_files(&checkpoint);
     let exact_artifact_fields = exact_artifact_fields(&iceberg_metadata.table_schema);
     let mut access_artifacts = iceberg_metadata.access_artifacts.clone();
+    let sort_order = iceberg_metadata.sort_order.clone();
+    let serving = description.serving.clone().unwrap_or_default();
     append_exact_sidecar_artifacts(
         &mut access_artifacts,
         &files,
         &extension_files,
         &exact_artifact_fields,
+    );
+    append_secondary_pattern_artifacts(
+        &mut access_artifacts,
+        &serving,
+        &sort_order,
     );
     let metadata_snapshot_cached = iceberg_metadata
         .snapshot_id
@@ -997,7 +1038,7 @@ async fn load_serving_context(
         delete_files,
         file_stats,
         partition_spec: iceberg_metadata.partition_spec.clone(),
-        sort_order: iceberg_metadata.sort_order.clone(),
+        sort_order,
         access_artifacts,
         extension_files,
         exact_artifact_fields,
@@ -1013,8 +1054,14 @@ fn plan_request(
     let limit = request.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     let sql = build_sql("{table}", request, limit, !context.delete_files.is_empty())?;
     let declared_sort_order_match = sort_order_matches_request(&context.sort_order, request);
+    let matched_pattern = serving
+        .patterns
+        .iter()
+        .find(|pattern| request_matches_pattern(request, pattern, limit))
+        .map(|pattern| pattern.name.clone());
     let artifacts_considered = applicable_artifacts_for_request(
         request,
+        &serving.patterns,
         &context.access_artifacts,
         declared_sort_order_match,
     );
@@ -1056,11 +1103,6 @@ fn plan_request(
             push_unique_string(&mut artifacts_used, artifact.clone());
         }
     }
-    let matched_pattern = serving
-        .patterns
-        .iter()
-        .find(|pattern| request_matches_pattern(request, pattern, limit))
-        .map(|pattern| pattern.name.clone());
     let (classification, reason) = classify_request_with_admission(
         context,
         request,
@@ -1113,6 +1155,16 @@ async fn execute_plan(
     let (files, execution_artifacts_used) =
         prune_execution_files_with_exact_artifact(files, extension_files, request).await?;
     let execution_estimated_bytes = files.iter().map(|file| file.size).sum();
+
+    if request.aggregate.is_some() {
+        let rows = execute_aggregate_plan(&files, delete_files, request, limit).await?;
+        return Ok(ServingExecutionResult {
+            rows,
+            files_selected: files.len(),
+            estimated_bytes: execution_estimated_bytes,
+            artifacts_used: execution_artifacts_used,
+        });
+    }
 
     if let Some(sort) = request.order_by.first() {
         if let Some(ordered_groups) = ordered_file_groups_for_top_k(
@@ -1175,6 +1227,47 @@ async fn execute_parallel_plan(
     Ok(rows)
 }
 
+async fn execute_aggregate_plan(
+    files: &[FileDescriptor],
+    delete_files: &[String],
+    request: &ServingRequestPlan,
+    limit: usize,
+) -> Result<Vec<Value>, ServingQueryError> {
+    let aggregate = request.aggregate.as_ref().ok_or_else(|| {
+        ServingQueryError::new(
+            StatusCode::BAD_REQUEST,
+            "Aggregate serving query is missing aggregate specification",
+        )
+    })?;
+    let measure_plans = aggregate_measure_plans(aggregate)?;
+    let file_groups = group_files_by_schema(files);
+    if file_groups.is_empty() {
+        return Ok(empty_aggregate_rows(aggregate, &measure_plans));
+    }
+
+    let partial_sql = build_aggregate_sql("{table}", request, limit, !delete_files.is_empty(), true)?;
+    let delete_files = delete_files.to_vec();
+    let concurrency = file_groups.len().clamp(1, serving_file_parallelism());
+    let mut results = stream::iter(file_groups.into_iter().map(|files| {
+        let local_partial_sql = partial_sql.clone();
+        let local_delete_files = delete_files.clone();
+        async move { execute_file_group_plan(files, &local_partial_sql, &local_delete_files).await }
+    }))
+    .buffer_unordered(concurrency);
+
+    let mut merged = HashMap::<String, serde_json::Map<String, Value>>::new();
+    while let Some(result) = results.next().await {
+        merge_partial_aggregate_rows(
+            &mut merged,
+            result?,
+            aggregate,
+            &measure_plans,
+        )?;
+    }
+
+    finalize_aggregate_rows(merged, aggregate, &measure_plans, limit)
+}
+
 async fn execute_ordered_top_k_plan(
     file_groups: Vec<OrderedFileGroup>,
     delete_files: &[String],
@@ -1207,6 +1300,239 @@ async fn execute_ordered_top_k_plan(
     }
 
     Ok(rows)
+}
+
+fn merge_partial_aggregate_rows(
+    merged: &mut HashMap<String, serde_json::Map<String, Value>>,
+    rows: Vec<Value>,
+    aggregate: &ServingAggregateSpec,
+    measure_plans: &[AggregateMeasurePlan],
+) -> Result<(), ServingQueryError> {
+    for row in rows {
+        let Some(object) = row.as_object() else {
+            continue;
+        };
+        let key = aggregate_group_key(object, &aggregate.group_by);
+        let entry = merged.entry(key).or_insert_with(|| {
+            let mut map = serde_json::Map::new();
+            for field in aggregate.group_by.iter() {
+                map.insert(
+                    field.clone(),
+                    object.get(field).cloned().unwrap_or(Value::Null),
+                );
+            }
+            map
+        });
+
+        for plan in measure_plans.iter() {
+            match plan.function {
+                AggregateFunction::Count => {
+                    let partial_value = object
+                        .get(&plan.partial_value_alias)
+                        .and_then(value_as_f64)
+                        .unwrap_or(0.0);
+                    let existing = entry
+                        .get(&plan.alias)
+                        .and_then(value_as_f64)
+                        .unwrap_or(0.0);
+                    entry.insert(
+                        plan.alias.clone(),
+                        json_number_value(existing + partial_value),
+                    );
+                }
+                AggregateFunction::Sum => {
+                    if let Some(partial_value) = object
+                        .get(&plan.partial_value_alias)
+                        .and_then(value_as_f64)
+                    {
+                        let existing = entry
+                            .get(&plan.alias)
+                            .and_then(value_as_f64)
+                            .unwrap_or(0.0);
+                        entry.insert(
+                            plan.alias.clone(),
+                            json_number_value(existing + partial_value),
+                        );
+                    } else {
+                        entry.entry(plan.alias.clone()).or_insert(Value::Null);
+                    }
+                }
+                AggregateFunction::Avg => {
+                    let partial_sum = object
+                        .get(&plan.partial_value_alias)
+                        .and_then(value_as_f64)
+                        .unwrap_or(0.0);
+                    let partial_count = object
+                        .get(plan.partial_count_alias.as_ref().unwrap())
+                        .and_then(value_as_f64)
+                        .unwrap_or(0.0);
+                    let sum_key = format!("__avg_sum_{}", plan.alias);
+                    let count_key = format!("__avg_count_{}", plan.alias);
+                    let existing_sum = entry
+                        .get(&sum_key)
+                        .and_then(value_as_f64)
+                        .unwrap_or(0.0);
+                    let existing_count = entry
+                        .get(&count_key)
+                        .and_then(value_as_f64)
+                        .unwrap_or(0.0);
+                    entry.insert(sum_key, json_number_value(existing_sum + partial_sum));
+                    entry.insert(count_key, json_number_value(existing_count + partial_count));
+                }
+                AggregateFunction::Min => {
+                    merge_extreme_value(entry, &plan.alias, object.get(&plan.partial_value_alias), true);
+                }
+                AggregateFunction::Max => {
+                    merge_extreme_value(entry, &plan.alias, object.get(&plan.partial_value_alias), false);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn merge_extreme_value(
+    entry: &mut serde_json::Map<String, Value>,
+    alias: &str,
+    candidate: Option<&Value>,
+    is_min: bool,
+) {
+    let Some(candidate) = candidate else {
+        return;
+    };
+    if candidate.is_null() {
+        entry.entry(alias.to_string()).or_insert(Value::Null);
+        return;
+    }
+    match entry.get(alias) {
+        Some(existing) => {
+            if existing.is_null() {
+                entry.insert(alias.to_string(), candidate.clone());
+                return;
+            }
+            let ordering = compare_values(candidate, existing);
+            if (is_min && ordering == Ordering::Less) || (!is_min && ordering == Ordering::Greater) {
+                entry.insert(alias.to_string(), candidate.clone());
+            }
+        }
+        None => {
+            entry.insert(alias.to_string(), candidate.clone());
+        }
+    }
+}
+
+fn finalize_aggregate_rows(
+    merged: HashMap<String, serde_json::Map<String, Value>>,
+    aggregate: &ServingAggregateSpec,
+    measure_plans: &[AggregateMeasurePlan],
+    limit: usize,
+) -> Result<Vec<Value>, ServingQueryError> {
+    if merged.is_empty() {
+        return Ok(empty_aggregate_rows(aggregate, measure_plans));
+    }
+
+    let mut rows = merged
+        .into_values()
+        .map(|mut row| {
+            for plan in measure_plans.iter() {
+                match plan.function {
+                    AggregateFunction::Avg => {
+                        let sum_key = format!("__avg_sum_{}", plan.alias);
+                        let count_key = format!("__avg_count_{}", plan.alias);
+                        let sum = row.get(&sum_key).and_then(value_as_f64).unwrap_or(0.0);
+                        let count = row.get(&count_key).and_then(value_as_f64).unwrap_or(0.0);
+                        row.remove(&sum_key);
+                        row.remove(&count_key);
+                        row.insert(
+                            plan.alias.clone(),
+                            if count == 0.0 {
+                                Value::Null
+                            } else {
+                                json_number_value(sum / count)
+                            },
+                        );
+                    }
+                    AggregateFunction::Count => {
+                        row.entry(plan.alias.clone())
+                            .or_insert_with(|| json_number_value(0.0));
+                    }
+                    AggregateFunction::Sum
+                    | AggregateFunction::Min
+                    | AggregateFunction::Max => {
+                        row.entry(plan.alias.clone()).or_insert(Value::Null);
+                    }
+                }
+            }
+            Value::Object(row)
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| compare_grouped_rows(left, right, &aggregate.group_by));
+    if !aggregate.group_by.is_empty() && rows.len() > limit {
+        rows.truncate(limit);
+    }
+    Ok(rows)
+}
+
+fn empty_aggregate_rows(
+    aggregate: &ServingAggregateSpec,
+    measure_plans: &[AggregateMeasurePlan],
+) -> Vec<Value> {
+    if !aggregate.group_by.is_empty() {
+        return vec![];
+    }
+
+    let mut row = serde_json::Map::new();
+    for plan in measure_plans.iter() {
+        let value = match plan.function {
+            AggregateFunction::Count => json_number_value(0.0),
+            AggregateFunction::Sum
+            | AggregateFunction::Avg
+            | AggregateFunction::Min
+            | AggregateFunction::Max => Value::Null,
+        };
+        row.insert(plan.alias.clone(), value);
+    }
+    vec![Value::Object(row)]
+}
+
+fn aggregate_group_key(object: &serde_json::Map<String, Value>, group_by: &[String]) -> String {
+    let values = group_by
+        .iter()
+        .map(|field| object.get(field).cloned().unwrap_or(Value::Null))
+        .collect::<Vec<_>>();
+    serde_json::to_string(&values).unwrap_or_default()
+}
+
+fn compare_grouped_rows(left: &Value, right: &Value, group_by: &[String]) -> Ordering {
+    for field in group_by {
+        let ordering = compare_row_values(left.get(field), right.get(field), false);
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    Ordering::Equal
+}
+
+fn value_as_f64(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|numeric| numeric as f64))
+        .or_else(|| value.as_u64().map(|numeric| numeric as f64))
+}
+
+fn json_number_value(value: f64) -> Value {
+    if value.fract() == 0.0
+        && value.is_finite()
+        && value >= i64::MIN as f64
+        && value <= i64::MAX as f64
+    {
+        Value::Number(serde_json::Number::from(value as i64))
+    } else {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .unwrap_or(Value::Null)
+    }
 }
 
 fn merge_rows(
@@ -1407,6 +1733,7 @@ pub(crate) fn build_serving_cache_manager_plan(
                 push_unique_string(&mut plan.matched_patterns, pattern.name.clone());
                 for artifact in applicable_artifacts_for_request(
                     &step.request,
+                    &serving.patterns,
                     access_artifacts,
                     sort_order_matches_request(sort_order, &step.request),
                 ) {
@@ -1443,6 +1770,7 @@ pub(crate) fn build_serving_cache_manager_plan(
                     plan.targeted_ranges += 1;
                     for artifact in applicable_artifacts_for_request(
                         &step.request,
+                        &serving.patterns,
                         access_artifacts,
                         sort_order_matches_request(sort_order, &step.request),
                     ) {
@@ -1959,6 +2287,21 @@ fn validate_request(
         }
     }
 
+    if request.aggregate.is_some() {
+        if request.select.is_some() {
+            return Err(ServingQueryError::new(
+                StatusCode::BAD_REQUEST,
+                "Aggregate serving queries do not support select",
+            ));
+        }
+        if !request.order_by.is_empty() {
+            return Err(ServingQueryError::new(
+                StatusCode::BAD_REQUEST,
+                "Aggregate serving queries do not support ORDER BY yet",
+            ));
+        }
+    }
+
     for sort in request.order_by.iter() {
         if !schema_map.contains_key(&sort.field) {
             return Err(ServingQueryError::new(
@@ -1985,6 +2328,10 @@ fn validate_request(
             }
         };
         validate_filter(filter, &field.data_type)?;
+    }
+
+    if let Some(aggregate) = request.aggregate.as_ref() {
+        validate_aggregate_request(aggregate, &schema_map)?;
     }
 
     if request.limit.unwrap_or(DEFAULT_LIMIT) > MAX_LIMIT {
@@ -2085,8 +2432,204 @@ fn validate_literal(
     Ok(())
 }
 
+fn validate_aggregate_request(
+    aggregate: &ServingAggregateSpec,
+    schema_map: &HashMap<String, crate::schema_massager::PowdrrField>,
+) -> Result<(), ServingQueryError> {
+    if aggregate.measures.is_empty() {
+        return Err(ServingQueryError::new(
+            StatusCode::BAD_REQUEST,
+            "Aggregate serving queries must declare at least one measure",
+        ));
+    }
+
+    let mut seen_group_by = HashSet::new();
+    for field_name in aggregate.group_by.iter() {
+        if !seen_group_by.insert(field_name.clone()) {
+            return Err(ServingQueryError::new(
+                StatusCode::BAD_REQUEST,
+                &format!("Duplicate aggregate GROUP BY field {}", field_name),
+            ));
+        }
+        let field = schema_map.get(field_name).ok_or_else(|| {
+            ServingQueryError::new(
+                StatusCode::BAD_REQUEST,
+                &format!("Unknown aggregate GROUP BY field {}", field_name),
+            )
+        })?;
+        validate_scalar_serving_field_type(&field.data_type, field_name)?;
+    }
+
+    let mut seen_aliases = HashSet::new();
+    let mut seen_signatures = HashSet::new();
+    for measure in aggregate.measures.iter() {
+        let function = normalized_aggregate_function(&measure.function).ok_or_else(|| {
+            ServingQueryError::new(
+                StatusCode::BAD_REQUEST,
+                &format!("Unsupported aggregate function {}", measure.function),
+            )
+        })?;
+        let alias = aggregate_measure_alias_with_function(measure, function)?;
+        if !seen_aliases.insert(alias) {
+            return Err(ServingQueryError::new(
+                StatusCode::BAD_REQUEST,
+                "Aggregate measure aliases must be unique",
+            ));
+        }
+        let signature = aggregate_measure_signature_with_function(measure, function)?;
+        if !seen_signatures.insert(signature) {
+            return Err(ServingQueryError::new(
+                StatusCode::BAD_REQUEST,
+                "Duplicate aggregate measures are not supported",
+            ));
+        }
+
+        match function {
+            "count" => {
+                if measure.field.is_some() {
+                    return Err(ServingQueryError::new(
+                        StatusCode::BAD_REQUEST,
+                        "COUNT serving measures do not take a field",
+                    ));
+                }
+            }
+            "sum" | "avg" | "min" | "max" => {
+                let field_name = measure.field.as_ref().ok_or_else(|| {
+                    ServingQueryError::new(
+                        StatusCode::BAD_REQUEST,
+                        &format!("{} serving measures require a field", function.to_uppercase()),
+                    )
+                })?;
+                let field = schema_map.get(field_name).ok_or_else(|| {
+                    ServingQueryError::new(
+                        StatusCode::BAD_REQUEST,
+                        &format!("Unknown aggregate field {}", field_name),
+                    )
+                })?;
+                validate_scalar_serving_field_type(&field.data_type, field_name)?;
+                if matches!(function, "sum" | "avg")
+                    && !matches!(field.data_type, PowdrrDataType::Float | PowdrrDataType::Integer)
+                {
+                    return Err(ServingQueryError::new(
+                        StatusCode::BAD_REQUEST,
+                        &format!(
+                            "{} aggregate field {} must be numeric",
+                            function.to_uppercase(),
+                            field_name
+                        ),
+                    ));
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_scalar_serving_field_type(
+    data_type: &PowdrrDataType,
+    field_name: &str,
+) -> Result<(), ServingQueryError> {
+    match data_type {
+        PowdrrDataType::Boolean
+        | PowdrrDataType::Float
+        | PowdrrDataType::Integer
+        | PowdrrDataType::String => Ok(()),
+        PowdrrDataType::Object(_) | PowdrrDataType::Array(_) | PowdrrDataType::Null => {
+            Err(ServingQueryError::new(
+                StatusCode::BAD_REQUEST,
+                &format!("Field {} is not supported by the serving MVP", field_name),
+            ))
+        }
+    }
+}
+
+fn normalized_aggregate_function(function: &str) -> Option<&'static str> {
+    match function.to_ascii_lowercase().as_str() {
+        "count" => Some("count"),
+        "sum" => Some("sum"),
+        "avg" => Some("avg"),
+        "min" => Some("min"),
+        "max" => Some("max"),
+        _ => None,
+    }
+}
+
+fn aggregate_measure_signature_with_function(
+    measure: &ServingAggregateMeasure,
+    function: &str,
+) -> Result<(String, Option<String>), ServingQueryError> {
+    Ok((function.to_string(), measure.field.clone()))
+}
+
+fn aggregate_measure_alias_with_function(
+    measure: &ServingAggregateMeasure,
+    function: &str,
+) -> Result<String, ServingQueryError> {
+    if let Some(alias) = measure.alias.as_ref() {
+        if alias.is_empty() {
+            return Err(ServingQueryError::new(
+                StatusCode::BAD_REQUEST,
+                "Aggregate measure aliases must not be empty",
+            ));
+        }
+        return Ok(alias.clone());
+    }
+
+    match function {
+        "count" => Ok("count".to_string()),
+        "sum" | "avg" | "min" | "max" => {
+            let field = measure.field.as_ref().ok_or_else(|| {
+                ServingQueryError::new(
+                    StatusCode::BAD_REQUEST,
+                    &format!("{} serving measures require a field", function.to_uppercase()),
+                )
+            })?;
+            Ok(format!("{function}_{field}"))
+        }
+        _ => Err(ServingQueryError::new(
+            StatusCode::BAD_REQUEST,
+            &format!("Unsupported aggregate function {}", measure.function),
+        )),
+    }
+}
+
+fn aggregate_specs_match(
+    request: Option<&ServingAggregateSpec>,
+    pattern: Option<&ServingAggregateSpec>,
+) -> bool {
+    match (request, pattern) {
+        (None, None) => true,
+        (Some(request), Some(pattern)) => {
+            request.group_by == pattern.group_by
+                && request.measures.len() == pattern.measures.len()
+                && request
+                    .measures
+                    .iter()
+                    .zip(pattern.measures.iter())
+                    .all(|(left, right)| {
+                        match (
+                            normalized_aggregate_function(&left.function),
+                            normalized_aggregate_function(&right.function),
+                        ) {
+                            (Some(left_function), Some(right_function)) => {
+                                left_function == right_function && left.field == right.field
+                            }
+                            _ => false,
+                        }
+                    })
+        }
+        _ => false,
+    }
+}
+
 fn request_supported(request: &ServingRequestPlan) -> bool {
-    request.order_by.len() <= 1
+    if request.aggregate.is_some() {
+        request.order_by.is_empty()
+    } else {
+        request.order_by.len() <= 1
+    }
 }
 
 fn sort_order_matches_request(
@@ -2125,6 +2668,10 @@ fn request_matches_pattern(
             return false;
         }
     } else if request.select.is_none() && pattern.projection.is_some() {
+        return false;
+    }
+
+    if !aggregate_specs_match(request.aggregate.as_ref(), pattern.aggregate.as_ref()) {
         return false;
     }
 
@@ -2172,7 +2719,8 @@ fn request_matches_pattern(
 
 fn warmup_request_for_pattern(pattern: &ServingPattern) -> Option<(ServingRequestPlan, usize)> {
     let order_field = pattern.order_field.as_ref()?;
-    if !pattern.eq_fields.is_empty() || pattern.range_field.is_some() {
+    if !pattern.eq_fields.is_empty() || pattern.range_field.is_some() || pattern.aggregate.is_some()
+    {
         return None;
     }
 
@@ -2184,6 +2732,7 @@ fn warmup_request_for_pattern(pattern: &ServingPattern) -> Option<(ServingReques
         ServingRequestPlan {
             select: pattern.projection.clone(),
             filters: vec![],
+            aggregate: None,
             order_by: vec![crate::serving_plan::ServingSort {
                 field: order_field.clone(),
                 descending: pattern.descending,
@@ -2208,6 +2757,7 @@ fn request_for_cache_range_target(target: &ServingCacheRangeTarget) -> ServingRe
             lt: target.lt.clone(),
             lte: target.lte.clone(),
         }],
+        aggregate: None,
         order_by: target
             .limit
             .map(|_| {
@@ -2232,12 +2782,28 @@ fn push_unique_string(values: &mut Vec<String>, value: String) {
 
 fn applicable_artifacts_for_request(
     request: &ServingRequestPlan,
+    patterns: &[ServingPattern],
     artifacts: &[IcebergAccessArtifact],
     declared_sort_order_match: bool,
 ) -> Vec<String> {
     let mut matched = vec![];
+    let limit = request.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
 
     for artifact in artifacts {
+        if artifact.kind == ACCESS_ARTIFACT_KIND_SECONDARY_PATTERN {
+            let Some(pattern_name) = artifact
+                .name
+                .strip_prefix(&format!("{}:", ACCESS_ARTIFACT_KIND_SECONDARY_PATTERN))
+            else {
+                continue;
+            };
+            if patterns.iter().any(|pattern| {
+                pattern.name == pattern_name && request_matches_pattern(request, pattern, limit)
+            }) {
+                push_unique_string(&mut matched, artifact.name.clone());
+            }
+            continue;
+        }
         let matches_filter = request.filters.iter().any(|predicate| {
             if !artifact.fields.contains(&predicate.field) {
                 return false;
@@ -2258,7 +2824,20 @@ fn applicable_artifacts_for_request(
                     && artifact.fields.contains(&sort.field)
             })
             .unwrap_or(false);
-        if matches_filter || matches_sort {
+        let matches_aggregate = request
+            .aggregate
+            .as_ref()
+            .map(|aggregate| {
+                aggregate.group_by.iter().any(|field| artifact.fields.contains(field))
+                    || aggregate.measures.iter().any(|measure| {
+                        measure
+                            .field
+                            .as_ref()
+                            .is_some_and(|field| artifact.fields.contains(field))
+                    })
+            })
+            .unwrap_or(false);
+        if matches_filter || matches_sort || matches_aggregate {
             push_unique_string(&mut matched, artifact.name.clone());
         }
     }
@@ -2283,6 +2862,21 @@ fn classify_request_with_admission(
         || pruned.files_selected > DEFAULT_SLOW_PATH_MAX_FILES
         || pruned.row_groups_selected > DEFAULT_SLOW_PATH_MAX_ROW_GROUPS
         || context.delete_files.len() > DEFAULT_SLOW_PATH_MAX_DELETE_FILES;
+
+    if request.aggregate.is_some() && matched_pattern.is_none() {
+        return (
+            ServingQueryClassification::Rejected,
+            Some(format_admission_reason(
+                "No declared aggregate serving pattern matched this query",
+                context,
+                request,
+                declared_sort_order_match,
+                artifacts_considered,
+                artifacts_used,
+                pruned,
+            )),
+        );
+    }
 
     if exceeds_slow_budget {
         return (
@@ -2389,6 +2983,34 @@ fn suggested_actions_for_request(
         suggestions.push(
             "publish exact_pruning or exact_index sidecars for exact-match fields".to_string(),
         );
+    }
+    if request.aggregate.is_some() {
+        suggestions.push(
+            "declare aggregate fragments or a bitmap/rollup artifact for this aggregate pattern"
+                .to_string(),
+        );
+    }
+    if let Some(pattern_name) = context
+        .description
+        .serving
+        .as_ref()
+        .and_then(|serving| {
+            serving
+                .patterns
+                .iter()
+                .find(|pattern| request_matches_pattern(request, pattern, request.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT)))
+                .map(|pattern| pattern.name.clone())
+        })
+    {
+        let secondary_artifact = secondary_pattern_artifact_name(&pattern_name);
+        if !artifacts_considered.contains(&secondary_artifact)
+            && !request.aggregate.is_some()
+        {
+            suggestions.push(format!(
+                "build a declared secondary serving artifact for pattern {}",
+                pattern_name
+            ));
+        }
     }
     if let Some(sort) = request.order_by.first() {
         if !declared_sort_order_match {
@@ -2518,6 +3140,99 @@ fn append_exact_sidecar_artifacts(
     }
 
     access_artifacts.sort_by(|left, right| left.name.cmp(&right.name));
+}
+
+fn append_secondary_pattern_artifacts(
+    access_artifacts: &mut Vec<IcebergAccessArtifact>,
+    serving: &ServingTableConfig,
+    sort_order: &[IcebergSortField],
+) {
+    for pattern in serving.patterns.iter() {
+        if !pattern_is_secondary(pattern) {
+            continue;
+        }
+        if !secondary_pattern_is_supported(pattern, access_artifacts, sort_order) {
+            continue;
+        }
+        let name = secondary_pattern_artifact_name(&pattern.name);
+        if access_artifacts.iter().any(|artifact| artifact.name == name) {
+            continue;
+        }
+        let mut fields = pattern.eq_fields.clone();
+        if let Some(range_field) = pattern.range_field.as_ref() {
+            push_unique_string(&mut fields, range_field.clone());
+        }
+        if let Some(order_field) = pattern.order_field.as_ref() {
+            push_unique_string(&mut fields, order_field.clone());
+        }
+        access_artifacts.push(IcebergAccessArtifact {
+            name,
+            kind: ACCESS_ARTIFACT_KIND_SECONDARY_PATTERN.to_string(),
+            fields,
+            exact: false,
+            supports_eq: !pattern.eq_fields.is_empty(),
+            supports_range: pattern.range_field.is_some(),
+            supports_order: pattern.order_field.is_some(),
+        });
+    }
+    access_artifacts.sort_by(|left, right| left.name.cmp(&right.name));
+}
+
+fn pattern_is_secondary(pattern: &ServingPattern) -> bool {
+    pattern.aggregate.is_none()
+        && (pattern.eq_fields.len() > 1
+            || pattern.range_field.is_some()
+            || (!pattern.eq_fields.is_empty() && pattern.order_field.is_some()))
+}
+
+fn secondary_pattern_is_supported(
+    pattern: &ServingPattern,
+    access_artifacts: &[IcebergAccessArtifact],
+    sort_order: &[IcebergSortField],
+) -> bool {
+    pattern.eq_fields.iter().all(|field| {
+        artifact_supports_field_for_eq(access_artifacts, field)
+            || artifact_supports_field_for_range(access_artifacts, field)
+    }) && pattern
+        .range_field
+        .as_ref()
+        .map(|field| artifact_supports_field_for_range(access_artifacts, field))
+        .unwrap_or(true)
+        && pattern
+            .order_field
+            .as_ref()
+            .map(|field| sort_order_supports_field(sort_order, field))
+            .unwrap_or(true)
+}
+
+fn artifact_supports_field_for_eq(
+    access_artifacts: &[IcebergAccessArtifact],
+    field: &str,
+) -> bool {
+    access_artifacts.iter().any(|artifact| {
+        artifact.supports_eq
+            && artifact.fields.iter().any(|candidate| candidate == field)
+            && matches!(
+                artifact.kind.as_str(),
+                ACCESS_ARTIFACT_KIND_EXACT_INDEX
+                    | ACCESS_ARTIFACT_KIND_EXACT_PRUNING
+                    | ACCESS_ARTIFACT_KIND_PARTITION_SPEC
+            )
+    })
+}
+
+fn artifact_supports_field_for_range(
+    access_artifacts: &[IcebergAccessArtifact],
+    field: &str,
+) -> bool {
+    access_artifacts.iter().any(|artifact| {
+        artifact.supports_range
+            && artifact.fields.iter().any(|candidate| candidate == field)
+    })
+}
+
+fn secondary_pattern_artifact_name(pattern_name: &str) -> String {
+    format!("{}:{}", ACCESS_ARTIFACT_KIND_SECONDARY_PATTERN, pattern_name)
 }
 
 fn request_uses_exact_filters(request: &ServingRequestPlan) -> bool {
@@ -3050,6 +3765,10 @@ fn build_sql(
     limit: usize,
     include_delete_filter: bool,
 ) -> Result<String, ServingQueryError> {
+    if request.aggregate.is_some() {
+        return build_aggregate_sql(table_name, request, limit, include_delete_filter, false);
+    }
+
     let select = match normalized_select(request.select.clone()) {
         Some(select_fields) => select_fields
             .iter()
@@ -3087,6 +3806,153 @@ fn build_sql(
     }
     sql.push_str(&format!(" LIMIT {}", limit));
     Ok(sql)
+}
+
+fn build_aggregate_sql(
+    table_name: &str,
+    request: &ServingRequestPlan,
+    limit: usize,
+    include_delete_filter: bool,
+    partial: bool,
+) -> Result<String, ServingQueryError> {
+    let aggregate = request.aggregate.as_ref().ok_or_else(|| {
+        ServingQueryError::new(
+            StatusCode::BAD_REQUEST,
+            "Aggregate serving query is missing aggregate specification",
+        )
+    })?;
+    let measure_plans = aggregate_measure_plans(aggregate)?;
+    let mut select_parts = aggregate
+        .group_by
+        .iter()
+        .map(|field| format!("\"{}\"", escape_identifier(field)))
+        .collect::<Vec<_>>();
+    for plan in measure_plans.iter() {
+        match (plan.function, partial) {
+            (AggregateFunction::Count, false) => select_parts.push(format!(
+                "COUNT(*) AS \"{}\"",
+                escape_identifier(&plan.alias)
+            )),
+            (AggregateFunction::Count, true) => select_parts.push(format!(
+                "COUNT(*) AS \"{}\"",
+                escape_identifier(&plan.partial_value_alias)
+            )),
+            (AggregateFunction::Sum, false) => select_parts.push(format!(
+                "SUM(\"{}\") AS \"{}\"",
+                escape_identifier(plan.field.as_ref().unwrap()),
+                escape_identifier(&plan.alias)
+            )),
+            (AggregateFunction::Sum, true) => select_parts.push(format!(
+                "SUM(\"{}\") AS \"{}\"",
+                escape_identifier(plan.field.as_ref().unwrap()),
+                escape_identifier(&plan.partial_value_alias)
+            )),
+            (AggregateFunction::Avg, false) => select_parts.push(format!(
+                "AVG(\"{}\") AS \"{}\"",
+                escape_identifier(plan.field.as_ref().unwrap()),
+                escape_identifier(&plan.alias)
+            )),
+            (AggregateFunction::Avg, true) => {
+                select_parts.push(format!(
+                    "SUM(\"{}\") AS \"{}\"",
+                    escape_identifier(plan.field.as_ref().unwrap()),
+                    escape_identifier(&plan.partial_value_alias)
+                ));
+                select_parts.push(format!(
+                    "COUNT(\"{}\") AS \"{}\"",
+                    escape_identifier(plan.field.as_ref().unwrap()),
+                    escape_identifier(plan.partial_count_alias.as_ref().unwrap())
+                ));
+            }
+            (AggregateFunction::Min, false) => select_parts.push(format!(
+                "MIN(\"{}\") AS \"{}\"",
+                escape_identifier(plan.field.as_ref().unwrap()),
+                escape_identifier(&plan.alias)
+            )),
+            (AggregateFunction::Min, true) => select_parts.push(format!(
+                "MIN(\"{}\") AS \"{}\"",
+                escape_identifier(plan.field.as_ref().unwrap()),
+                escape_identifier(&plan.partial_value_alias)
+            )),
+            (AggregateFunction::Max, false) => select_parts.push(format!(
+                "MAX(\"{}\") AS \"{}\"",
+                escape_identifier(plan.field.as_ref().unwrap()),
+                escape_identifier(&plan.alias)
+            )),
+            (AggregateFunction::Max, true) => select_parts.push(format!(
+                "MAX(\"{}\") AS \"{}\"",
+                escape_identifier(plan.field.as_ref().unwrap()),
+                escape_identifier(&plan.partial_value_alias)
+            )),
+        }
+    }
+
+    let mut where_clauses = request
+        .filters
+        .iter()
+        .map(sql_for_filter)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut sql = format!("SELECT {} FROM {} t", select_parts.join(", "), table_name);
+    if include_delete_filter {
+        sql.push_str(" LEFT JOIN {deletes_table} dt ON dt._id_seq_no = t.\"_id_seq_no\"");
+        where_clauses.push("dt._id_seq_no IS NULL".to_string());
+    }
+    if !where_clauses.is_empty() {
+        sql.push_str(&format!(" WHERE {}", where_clauses.join(" AND ")));
+    }
+    if !aggregate.group_by.is_empty() {
+        sql.push_str(&format!(
+            " GROUP BY {}",
+            aggregate
+                .group_by
+                .iter()
+                .map(|field| format!("\"{}\"", escape_identifier(field)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    sql.push_str(&format!(
+        " LIMIT {}",
+        if aggregate.group_by.is_empty() { 1 } else { limit }
+    ));
+    Ok(sql)
+}
+
+fn aggregate_measure_plans(
+    aggregate: &ServingAggregateSpec,
+) -> Result<Vec<AggregateMeasurePlan>, ServingQueryError> {
+    aggregate
+        .measures
+        .iter()
+        .map(|measure| {
+            let function = normalized_aggregate_function(&measure.function).ok_or_else(|| {
+                ServingQueryError::new(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Unsupported aggregate function {}", measure.function),
+                )
+            })?;
+            let alias = aggregate_measure_alias_with_function(measure, function)?;
+            let function = match function {
+                "count" => AggregateFunction::Count,
+                "sum" => AggregateFunction::Sum,
+                "avg" => AggregateFunction::Avg,
+                "min" => AggregateFunction::Min,
+                "max" => AggregateFunction::Max,
+                _ => unreachable!(),
+            };
+            Ok(AggregateMeasurePlan {
+                function,
+                field: measure.field.clone(),
+                alias: alias.clone(),
+                partial_value_alias: format!("__partial_value_{}", alias),
+                partial_count_alias: if function == AggregateFunction::Avg {
+                    Some(format!("__partial_count_{}", alias))
+                } else {
+                    None
+                },
+            })
+        })
+        .collect()
 }
 
 fn sql_for_filter(filter: &ServingPredicate) -> Result<String, ServingQueryError> {
@@ -3223,18 +4089,23 @@ impl ServingQueryError {
 #[cfg(test)]
 mod tests {
     use super::{
+        ACCESS_ARTIFACT_KIND_EXACT_PRUNING, ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS,
         DEFAULT_FAST_PATH_MAX_DELETE_FILES, DEFAULT_SLOW_PATH_MAX_BYTES, ExactPruningFieldSummary,
-        ServingExecutionContext, build_serving_layout_advice, build_serving_warmup_plan, build_sql,
+        ServingExecutionContext, aggregate_measure_plans, append_secondary_pattern_artifacts,
+        build_serving_layout_advice, build_serving_warmup_plan, build_sql,
         exact_artifact_fields, exact_pruning_summary_may_match_request, file_group_table_name,
-        group_files_by_schema, ordered_file_groups_for_top_k, plan_request, prune_candidate_files,
-        remaining_groups_cannot_beat_kth_row, request_matches_pattern, select_serving_warmup_files,
+        finalize_aggregate_rows, group_files_by_schema, merge_partial_aggregate_rows,
+        ordered_file_groups_for_top_k, plan_request, prune_candidate_files,
+        remaining_groups_cannot_beat_kth_row, request_matches_pattern,
+        secondary_pattern_artifact_name, select_serving_warmup_files,
     };
     use crate::data_access::{
         prime_parquet_row_group_stats_cache_for_test, reset_serving_metadata_caches_for_test,
     };
     use crate::data_contract::{
-        FileDescriptor, IcebergColumnStats, IcebergFileStats, IcebergRowGroupStats, ServingPattern,
-        ServingTableConfig, TableDescription,
+        FileDescriptor, IcebergAccessArtifact, IcebergColumnStats, IcebergFileStats,
+        IcebergRowGroupStats, IcebergSortField, ServingAggregateMeasure, ServingAggregateSpec,
+        ServingPattern, ServingTableConfig, TableDescription,
     };
     use crate::peers::CheckpointDescriptor;
     use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
@@ -3365,6 +4236,50 @@ mod tests {
         }
     }
 
+    fn aggregate_spec() -> ServingAggregateSpec {
+        ServingAggregateSpec {
+            group_by: vec!["tenant".to_string()],
+            measures: vec![
+                ServingAggregateMeasure {
+                    function: "count".to_string(),
+                    field: None,
+                    alias: None,
+                },
+                ServingAggregateMeasure {
+                    function: "sum".to_string(),
+                    field: Some("score".to_string()),
+                    alias: None,
+                },
+                ServingAggregateMeasure {
+                    function: "avg".to_string(),
+                    field: Some("score".to_string()),
+                    alias: None,
+                },
+                ServingAggregateMeasure {
+                    function: "min".to_string(),
+                    field: Some("score".to_string()),
+                    alias: None,
+                },
+                ServingAggregateMeasure {
+                    function: "max".to_string(),
+                    field: Some("score".to_string()),
+                    alias: None,
+                },
+            ],
+        }
+    }
+
+    fn test_file_stats_for_aggregate() -> Vec<IcebergFileStats> {
+        vec![file_stats(
+            "file://first.parquet",
+            Some(10),
+            vec![
+                column_stats("tenant", Some(0), Some(json!("acme")), Some(json!("omega"))),
+                column_stats("score", Some(0), Some(json!(0)), Some(json!(100))),
+            ],
+        )]
+    }
+
     #[test]
     fn test_build_sql_for_range_top_n() {
         let sql = build_sql(
@@ -3380,6 +4295,7 @@ mod tests {
                     lt: None,
                     lte: None,
                 }],
+                aggregate: None,
                 order_by: vec![ServingSort {
                     field: "title".to_string(),
                     descending: false,
@@ -3404,6 +4320,7 @@ mod tests {
         let request = ServingRequestPlan {
             select: Some(vec!["title".to_string()]),
             filters: vec![],
+            aggregate: None,
             order_by: vec![ServingSort {
                 field: "title".to_string(),
                 descending: false,
@@ -3420,9 +4337,75 @@ mod tests {
             descending: false,
             max_limit: Some(10),
             projection: Some(vec!["title".to_string()]),
+            aggregate: None,
         };
 
         assert!(request_matches_pattern(&request, &pattern, 3));
+    }
+
+    #[test]
+    fn test_request_matches_aggregate_pattern() {
+        let request = ServingRequestPlan {
+            select: None,
+            filters: vec![ServingPredicate {
+                field: "tenant".to_string(),
+                eq: Some(json!("acme")),
+                in_values: None,
+                gt: None,
+                gte: None,
+                lt: None,
+                lte: None,
+            }],
+            aggregate: Some(aggregate_spec()),
+            order_by: vec![],
+            limit: Some(10),
+            allow_slow_path: false,
+            explain: false,
+        };
+        let pattern = ServingPattern {
+            name: "tenant_status_counts".to_string(),
+            eq_fields: vec!["tenant".to_string()],
+            range_field: None,
+            order_field: None,
+            descending: false,
+            max_limit: Some(10),
+            projection: None,
+            aggregate: Some(aggregate_spec()),
+        };
+
+        assert!(request_matches_pattern(&request, &pattern, 10));
+    }
+
+    #[test]
+    fn test_build_sql_for_grouped_aggregate() {
+        let sql = build_sql(
+            "{table}",
+            &ServingRequestPlan {
+                select: None,
+                filters: vec![ServingPredicate {
+                    field: "tenant".to_string(),
+                    eq: Some(json!("acme")),
+                    in_values: None,
+                    gt: None,
+                    gte: None,
+                    lt: None,
+                    lte: None,
+                }],
+                aggregate: Some(aggregate_spec()),
+                order_by: vec![],
+                limit: Some(10),
+                allow_slow_path: false,
+                explain: false,
+            },
+            10,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            sql,
+            "SELECT \"tenant\", COUNT(*) AS \"count\", SUM(\"score\") AS \"sum_score\", AVG(\"score\") AS \"avg_score\", MIN(\"score\") AS \"min_score\", MAX(\"score\") AS \"max_score\" FROM {table} t WHERE \"tenant\" = 'acme' GROUP BY \"tenant\" LIMIT 10"
+        );
     }
 
     #[test]
@@ -3437,6 +4420,7 @@ mod tests {
                     descending: false,
                     max_limit: Some(25),
                     projection: None,
+                    aggregate: None,
                 }],
             },
             vec![
@@ -3473,6 +4457,7 @@ mod tests {
                 lt: None,
                 lte: None,
             }],
+            aggregate: None,
             order_by: vec![],
             limit: Some(10),
             allow_slow_path: false,
@@ -3563,6 +4548,7 @@ mod tests {
                     descending: false,
                     max_limit: None,
                     projection: None,
+                    aggregate: None,
                 }],
             },
             vec![first, second],
@@ -3578,6 +4564,7 @@ mod tests {
                 lt: None,
                 lte: None,
             }],
+            aggregate: None,
             order_by: vec![],
             limit: Some(10),
             allow_slow_path: false,
@@ -3638,6 +4625,7 @@ mod tests {
                     descending: false,
                     max_limit: Some(25),
                     projection: None,
+                    aggregate: None,
                 }],
             },
             vec![
@@ -3665,6 +4653,7 @@ mod tests {
                 lt: None,
                 lte: None,
             }],
+            aggregate: None,
             order_by: vec![],
             limit: Some(10),
             allow_slow_path: false,
@@ -3729,6 +4718,7 @@ mod tests {
                     descending: false,
                     max_limit: Some(25),
                     projection: None,
+                    aggregate: None,
                 }],
             },
             vec![first],
@@ -3744,6 +4734,7 @@ mod tests {
                 lt: None,
                 lte: None,
             }],
+            aggregate: None,
             order_by: vec![],
             limit: Some(10),
             allow_slow_path: false,
@@ -3808,6 +4799,7 @@ mod tests {
                 lt: None,
                 lte: None,
             }],
+            aggregate: None,
             order_by: vec![],
             limit: Some(10),
             allow_slow_path: false,
@@ -3825,6 +4817,161 @@ mod tests {
     }
 
     #[test]
+    fn test_plan_request_rejects_aggregate_without_declared_pattern() {
+        let context = test_context(ServingTableConfig::default(), test_file_stats_for_aggregate());
+        let request = ServingRequestPlan {
+            select: None,
+            filters: vec![ServingPredicate {
+                field: "tenant".to_string(),
+                eq: Some(json!("acme")),
+                in_values: None,
+                gt: None,
+                gte: None,
+                lt: None,
+                lte: None,
+            }],
+            aggregate: Some(aggregate_spec()),
+            order_by: vec![],
+            limit: Some(10),
+            allow_slow_path: false,
+            explain: false,
+        };
+
+        let plan = plan_request(&context, &request).unwrap();
+
+        assert_eq!(plan.classification, ServingQueryClassification::Rejected);
+        assert!(plan
+            .reason
+            .as_ref()
+            .is_some_and(|reason| reason.contains("aggregate serving pattern")));
+    }
+
+    #[test]
+    fn test_merge_partial_aggregate_rows_merges_groups_correctly() {
+        let aggregate = aggregate_spec();
+        let measure_plans = aggregate_measure_plans(&aggregate).unwrap();
+        let mut merged = HashMap::new();
+
+        merge_partial_aggregate_rows(
+            &mut merged,
+            vec![
+                json!({
+                    "tenant": "acme",
+                    "__partial_value_count": 2,
+                    "__partial_value_sum_score": 30,
+                    "__partial_value_avg_score": 30,
+                    "__partial_count_avg_score": 2,
+                    "__partial_value_min_score": 10,
+                    "__partial_value_max_score": 20
+                }),
+                json!({
+                    "tenant": "omega",
+                    "__partial_value_count": 1,
+                    "__partial_value_sum_score": 5,
+                    "__partial_value_avg_score": 5,
+                    "__partial_count_avg_score": 1,
+                    "__partial_value_min_score": 5,
+                    "__partial_value_max_score": 5
+                }),
+            ],
+            &aggregate,
+            &measure_plans,
+        )
+        .unwrap();
+        merge_partial_aggregate_rows(
+            &mut merged,
+            vec![json!({
+                "tenant": "acme",
+                "__partial_value_count": 1,
+                "__partial_value_sum_score": 30,
+                "__partial_value_avg_score": 30,
+                "__partial_count_avg_score": 1,
+                "__partial_value_min_score": 30,
+                "__partial_value_max_score": 30
+            })],
+            &aggregate,
+            &measure_plans,
+        )
+        .unwrap();
+
+        let rows = finalize_aggregate_rows(merged, &aggregate, &measure_plans, 10).unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                json!({
+                    "tenant": "acme",
+                    "count": 3,
+                    "sum_score": 60,
+                    "avg_score": 20,
+                    "min_score": 10,
+                    "max_score": 30
+                }),
+                json!({
+                    "tenant": "omega",
+                    "count": 1,
+                    "sum_score": 5,
+                    "avg_score": 5,
+                    "min_score": 5,
+                    "max_score": 5
+                })
+            ]
+        );
+    }
+
+    #[test]
+    fn test_append_secondary_pattern_artifacts_adds_supported_pattern() {
+        let serving = ServingTableConfig {
+            patterns: vec![ServingPattern {
+                name: "tenant_recent".to_string(),
+                eq_fields: vec!["tenant".to_string()],
+                range_field: Some("score".to_string()),
+                order_field: Some("score".to_string()),
+                descending: true,
+                max_limit: Some(10),
+                projection: None,
+                aggregate: None,
+            }],
+        };
+        let mut access_artifacts = vec![
+            IcebergAccessArtifact {
+                name: ACCESS_ARTIFACT_KIND_EXACT_PRUNING.to_string(),
+                kind: ACCESS_ARTIFACT_KIND_EXACT_PRUNING.to_string(),
+                fields: vec!["tenant".to_string(), "score".to_string()],
+                exact: true,
+                supports_eq: true,
+                supports_range: false,
+                supports_order: false,
+            },
+            IcebergAccessArtifact {
+                name: ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS.to_string(),
+                kind: ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS.to_string(),
+                fields: vec!["score".to_string()],
+                exact: false,
+                supports_eq: true,
+                supports_range: true,
+                supports_order: false,
+            },
+        ];
+
+        append_secondary_pattern_artifacts(
+            &mut access_artifacts,
+            &serving,
+            &[IcebergSortField {
+                source_field_id: 1,
+                source_field_name: "score".to_string(),
+                transform: "identity".to_string(),
+                descending: true,
+                nulls_first: false,
+            }],
+        );
+
+        assert!(access_artifacts.iter().any(|artifact| {
+            artifact.name == secondary_pattern_artifact_name("tenant_recent")
+        }));
+    }
+
+    #[test]
     fn test_plan_request_demotes_fast_path_when_delete_files_are_high() {
         let mut context = test_context(
             ServingTableConfig {
@@ -3836,6 +4983,7 @@ mod tests {
                     descending: false,
                     max_limit: Some(25),
                     projection: None,
+                    aggregate: None,
                 }],
             },
             vec![file_stats(
@@ -3863,6 +5011,7 @@ mod tests {
                 lt: None,
                 lte: None,
             }],
+            aggregate: None,
             order_by: vec![],
             limit: Some(10),
             allow_slow_path: false,
@@ -3899,6 +5048,7 @@ mod tests {
                 lt: None,
                 lte: None,
             }],
+            aggregate: None,
             order_by: vec![],
             limit: Some(10),
             allow_slow_path: false,
@@ -3920,6 +5070,7 @@ mod tests {
                     descending: true,
                     max_limit: Some(10),
                     projection: None,
+                    aggregate: None,
                 }],
             },
             vec![file_stats(
@@ -3969,6 +5120,7 @@ mod tests {
                 lt: None,
                 lte: None,
             }],
+            aggregate: None,
             order_by: vec![],
             limit: Some(10),
             allow_slow_path: false,
@@ -4133,6 +5285,7 @@ mod tests {
                 lt: None,
                 lte: None,
             }],
+            aggregate: None,
             order_by: vec![ServingSort {
                 field: "score".to_string(),
                 descending: true,
@@ -4192,6 +5345,7 @@ mod tests {
         let request = ServingRequestPlan {
             select: None,
             filters: vec![],
+            aggregate: None,
             order_by: vec![ServingSort {
                 field: "score".to_string(),
                 descending: true,
@@ -4261,6 +5415,7 @@ mod tests {
                     descending: true,
                     max_limit: Some(10),
                     projection: None,
+                    aggregate: None,
                 }],
             },
             &files,
@@ -4319,6 +5474,7 @@ mod tests {
                     descending: true,
                     max_limit: Some(10),
                     projection: None,
+                    aggregate: None,
                 }],
             },
             &files,
@@ -4356,6 +5512,7 @@ mod tests {
                     descending: true,
                     max_limit: Some(10),
                     projection: None,
+                    aggregate: None,
                 }],
             },
             &files,
@@ -4420,6 +5577,7 @@ mod tests {
                     descending: true,
                     max_limit: Some(10),
                     projection: None,
+                    aggregate: None,
                 }],
             },
             &files,

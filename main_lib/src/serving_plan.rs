@@ -1,3 +1,4 @@
+use crate::data_contract::ServingAggregateSpec;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -39,6 +40,8 @@ pub struct ServingRequestPlan {
     pub select: Option<Vec<String>>,
     #[serde(default)]
     pub filters: Vec<ServingPredicate>,
+    #[serde(default)]
+    pub aggregate: Option<ServingAggregateSpec>,
     #[serde(default)]
     pub order_by: Vec<ServingSort>,
     #[serde(default)]
