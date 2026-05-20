@@ -1071,6 +1071,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raft_cutover_ignores_nodes_that_join_after_membership_is_captured() {
+        initialize_ids();
+
+        let mut raft = single_node_raft(
+            "raft-fixed-membership-late-joiner",
+            raft_test_mode(CompactionMode::Disabled),
+        )
+        .await;
+        let org_info = org_info();
+        let table_name = "late_joiner_logs".to_string();
+        let file_path = "s3://bucket/logs/late-joiner.parquet";
+
+        raft.heartbeat_serving_node(&org_info, &serving_lease("node-a"))
+            .await
+            .unwrap();
+        raft.speedboat_commit(&org_info, &speedboat_commit_for(&table_name, file_path))
+            .await
+            .unwrap();
+        assert!(raft.update_all_checkpoints().await.unwrap());
+
+        let target_checkpoint = raft
+            .get_latest_target_checkpoint(&org_info, &table_name, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let cutover_state = raft
+            .get_checkpoint_cutover_state(&org_info, &table_name, None)
+            .await
+            .unwrap();
+
+        raft.heartbeat_serving_node(&org_info, &serving_lease("node-b"))
+            .await
+            .unwrap();
+        raft.record_serving_node_activation(
+            &org_info,
+            &ServingNodeActivationAck {
+                selector: cutover_state.selector,
+                node_id: "node-a".to_string(),
+                epoch: cutover_state.epoch,
+                checkpoint_id: target_checkpoint.clone(),
+                activated_at_ms: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(raft.update_all_checkpoints().await.unwrap());
+        assert_eq!(
+            raft.get_latest_committed_checkpoint(&org_info, &table_name, None)
+                .await
+                .unwrap(),
+            Some(target_checkpoint)
+        );
+    }
+
+    #[tokio::test]
+    async fn raft_cutover_backfills_membership_when_target_arrives_before_live_nodes() {
+        initialize_ids();
+
+        let mut raft = single_node_raft(
+            "raft-fixed-membership-backfill",
+            raft_test_mode(CompactionMode::Disabled),
+        )
+        .await;
+        let org_info = org_info();
+        let table_name = "backfill_logs".to_string();
+        let file_path = "s3://bucket/logs/backfill.parquet";
+
+        raft.speedboat_commit(&org_info, &speedboat_commit_for(&table_name, file_path))
+            .await
+            .unwrap();
+        assert!(raft.update_all_checkpoints().await.unwrap());
+
+        let target_checkpoint = raft
+            .get_latest_target_checkpoint(&org_info, &table_name, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let cutover_state = raft
+            .get_checkpoint_cutover_state(&org_info, &table_name, None)
+            .await
+            .unwrap();
+
+        raft.heartbeat_serving_node(&org_info, &serving_lease("node-a"))
+            .await
+            .unwrap();
+        raft.record_serving_node_activation(
+            &org_info,
+            &ServingNodeActivationAck {
+                selector: cutover_state.selector,
+                node_id: "node-a".to_string(),
+                epoch: cutover_state.epoch,
+                checkpoint_id: target_checkpoint.clone(),
+                activated_at_ms: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(raft.update_all_checkpoints().await.unwrap());
+        assert_eq!(
+            raft.get_latest_committed_checkpoint(&org_info, &table_name, None)
+                .await
+                .unwrap(),
+            Some(target_checkpoint)
+        );
+    }
+
+    #[tokio::test]
     async fn raft_work_claims_update_replicated_snapshot_state() {
         initialize_ids();
 

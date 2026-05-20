@@ -11,8 +11,9 @@ use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::metadata_store::{
     CheckpointCutoverRequest, CheckpointCutoverState, CheckpointUpdateRequest,
     ClaimedCleanupWorkItem, ClaimedCompactionWorkItem, ClaimedExtensionWorkItem, CutoverEpoch,
-    MetadataClaimKind, MetadataStore, PublishedCheckpointRecord, PublishedCheckpointRole,
-    PublishedCheckpointSelector, ServingNodeActivationAck, ServingNodeLease,
+    CutoverMembershipView, MetadataClaimKind, MetadataStore, PublishedCheckpointRecord,
+    PublishedCheckpointRole, PublishedCheckpointSelector, ServingNodeActivationAck,
+    ServingNodeLease,
 };
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
@@ -31,6 +32,7 @@ type SerializedCommittedCheckpoints = HashMap<String, CommittedCheckpoints>;
 type PublishedCheckpoints = HashMap<String, String>;
 type CheckpointPublicationRequests = HashMap<String, CheckpointUpdateRequest>;
 type CheckpointCutoverEpochs = HashMap<String, CutoverEpoch>;
+type CutoverMembershipViews = HashMap<String, CutoverMembershipView>;
 type ServingNodeLeases = HashMap<String, ServingNodeLease>;
 type ServingNodeActivations = HashMap<String, HashMap<String, ServingNodeActivationAck>>;
 
@@ -45,6 +47,7 @@ pub struct EphemeralServiceSnapshot {
     published_checkpoint_id: PublishedCheckpoints,
     checkpoint_publication_requests: CheckpointPublicationRequests,
     checkpoint_cutover_epochs: CheckpointCutoverEpochs,
+    cutover_membership_views: CutoverMembershipViews,
     serving_node_leases: ServingNodeLeases,
     serving_node_activations: ServingNodeActivations,
     compaction_work_items: HashMap<String, CompactionWorkItemTracker>,
@@ -71,6 +74,7 @@ pub struct EphemeralServiceImpl {
     published_checkpoint_id: PublishedCheckpoints,
     checkpoint_publication_requests: CheckpointPublicationRequests,
     checkpoint_cutover_epochs: CheckpointCutoverEpochs,
+    cutover_membership_views: CutoverMembershipViews,
     serving_node_leases: ServingNodeLeases,
     serving_node_activations: ServingNodeActivations,
     compaction_work_items: HashMap<String, CompactionWorkItemTracker>,
@@ -104,6 +108,7 @@ impl EphemeralServiceImpl {
             published_checkpoint_id: snapshot.published_checkpoint_id,
             checkpoint_publication_requests: snapshot.checkpoint_publication_requests,
             checkpoint_cutover_epochs: snapshot.checkpoint_cutover_epochs,
+            cutover_membership_views: snapshot.cutover_membership_views,
             serving_node_leases: snapshot.serving_node_leases,
             serving_node_activations: snapshot.serving_node_activations,
             compaction_work_items: snapshot.compaction_work_items,
@@ -134,6 +139,7 @@ impl EphemeralServiceImpl {
             published_checkpoint_id: self.published_checkpoint_id.clone(),
             checkpoint_publication_requests: self.checkpoint_publication_requests.clone(),
             checkpoint_cutover_epochs: self.checkpoint_cutover_epochs.clone(),
+            cutover_membership_views: self.cutover_membership_views.clone(),
             serving_node_leases: self.serving_node_leases.clone(),
             serving_node_activations: self.serving_node_activations.clone(),
             compaction_work_items: self.compaction_work_items.clone(),
@@ -200,17 +206,6 @@ impl EphemeralServiceImpl {
             .unwrap_or_default()
     }
 
-    fn current_cutover_epoch(
-        &self,
-        table_name: &String,
-        extension: &Option<String>,
-    ) -> CutoverEpoch {
-        self.checkpoint_cutover_epochs
-            .get(&Self::selector_group_key(table_name, extension))
-            .copied()
-            .unwrap_or_default()
-    }
-
     fn bump_cutover_epoch(
         &mut self,
         table_name: &String,
@@ -234,6 +229,37 @@ impl EphemeralServiceImpl {
             .remove(&Self::selector_group_key(table_name, extension));
     }
 
+    fn get_cutover_membership_view(
+        &self,
+        table_name: &String,
+        extension: &Option<String>,
+    ) -> Option<&CutoverMembershipView> {
+        self.cutover_membership_views
+            .get(&Self::selector_group_key(table_name, extension))
+    }
+
+    fn store_cutover_membership_view(
+        &mut self,
+        table_name: &String,
+        extension: &Option<String>,
+        epoch: CutoverEpoch,
+        target_checkpoint_id: &String,
+        required_node_ids: Vec<String>,
+    ) {
+        self.cutover_membership_views.insert(
+            Self::selector_group_key(table_name, extension),
+            CutoverMembershipView {
+                selector: PublishedCheckpointSelector::target(
+                    table_name.clone(),
+                    extension.clone(),
+                ),
+                epoch,
+                target_checkpoint_id: target_checkpoint_id.clone(),
+                required_node_ids,
+            },
+        );
+    }
+
     fn prune_expired_serving_node_leases(&mut self) {
         let earliest_live_ms = Self::current_timestamp_ms() - LEASE_LENGTH_MS;
         self.serving_node_leases
@@ -243,6 +269,67 @@ impl EphemeralServiceImpl {
     fn live_serving_node_ids(&mut self) -> HashSet<String> {
         self.prune_expired_serving_node_leases();
         self.serving_node_leases.keys().cloned().collect()
+    }
+
+    fn capture_cutover_membership_for_target(
+        &mut self,
+        table_name: &String,
+        extension: &Option<String>,
+        target_checkpoint_id: &String,
+    ) {
+        if self
+            .get_cutover_membership_view(table_name, extension)
+            .map(|view| view.target_checkpoint_id == *target_checkpoint_id)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        let mut required_node_ids: Vec<String> = self.live_serving_node_ids().into_iter().collect();
+        required_node_ids.sort();
+        let epoch = self.bump_cutover_epoch(table_name, extension);
+        self.store_cutover_membership_view(
+            table_name,
+            extension,
+            epoch,
+            target_checkpoint_id,
+            required_node_ids,
+        );
+        self.clear_serving_node_activations(table_name, extension);
+    }
+
+    fn backfill_cutover_membership_for_target(
+        &mut self,
+        table_name: &String,
+        extension: &Option<String>,
+        target_checkpoint_id: &String,
+    ) {
+        let Some(existing_view) = self
+            .get_cutover_membership_view(table_name, extension)
+            .cloned()
+        else {
+            return;
+        };
+
+        if existing_view.target_checkpoint_id != *target_checkpoint_id
+            || !existing_view.required_node_ids.is_empty()
+        {
+            return;
+        }
+
+        let mut required_node_ids: Vec<String> = self.live_serving_node_ids().into_iter().collect();
+        required_node_ids.sort();
+        if required_node_ids.is_empty() {
+            return;
+        }
+
+        self.store_cutover_membership_view(
+            table_name,
+            extension,
+            existing_view.epoch,
+            target_checkpoint_id,
+            required_node_ids,
+        );
     }
 
     fn get_published_checkpoint_sync(
@@ -1310,8 +1397,7 @@ impl EphemeralServiceImpl {
             &extension,
             &checkpoint_id,
         );
-        self.bump_cutover_epoch(table_name, &extension);
-        self.clear_serving_node_activations(table_name, &extension);
+        self.capture_cutover_membership_for_target(table_name, &extension, &checkpoint_id);
         true
     }
 
@@ -1321,12 +1407,17 @@ impl EphemeralServiceImpl {
         extension: &Option<String>,
         target_checkpoint_id: &String,
     ) -> bool {
-        let live_nodes = self.live_serving_node_ids();
-        if live_nodes.is_empty() {
+        self.backfill_cutover_membership_for_target(table_name, extension, target_checkpoint_id);
+
+        let Some(view) = self
+            .get_cutover_membership_view(table_name, extension)
+            .cloned()
+        else {
+            return false;
+        };
+        if view.target_checkpoint_id != *target_checkpoint_id || view.required_node_ids.is_empty() {
             return false;
         }
-
-        let epoch = self.current_cutover_epoch(table_name, extension);
         let Some(acks) = self
             .serving_node_activations
             .get(&Self::selector_group_key(table_name, extension))
@@ -1334,9 +1425,9 @@ impl EphemeralServiceImpl {
             return false;
         };
 
-        live_nodes.into_iter().all(|node_id| {
+        view.required_node_ids.into_iter().all(|node_id| {
             acks.get(&node_id)
-                .map(|ack| ack.checkpoint_id == *target_checkpoint_id && ack.epoch == epoch)
+                .map(|ack| ack.checkpoint_id == *target_checkpoint_id && ack.epoch == view.epoch)
                 .unwrap_or(false)
         })
     }
@@ -1467,10 +1558,10 @@ impl MetadataStore for EphemeralServiceImpl {
                 &request.selector.extension,
                 &request.target_checkpoint_id,
             );
-            self.bump_cutover_epoch(&request.selector.table_name, &request.selector.extension);
-            self.clear_serving_node_activations(
+            self.capture_cutover_membership_for_target(
                 &request.selector.table_name,
                 &request.selector.extension,
+                &request.target_checkpoint_id,
             );
         }
         Ok(())
