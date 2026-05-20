@@ -39,6 +39,7 @@ mod prefetch;
 mod private_api;
 mod query_execution;
 mod query_path;
+pub mod read_plan;
 pub mod router;
 pub mod schema_massager;
 mod search_executor;
