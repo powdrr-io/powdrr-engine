@@ -130,7 +130,7 @@ Two important caveats:
 
 ### Prerequisites
 
-- Rust stable toolchain
+- Rust 1.92.0 toolchain
 - Docker and Docker Compose for local protocol stacks and benchmarks
 - Git worktree support if you plan to develop in this repo
 
