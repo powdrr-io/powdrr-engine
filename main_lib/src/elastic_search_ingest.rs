@@ -167,11 +167,10 @@ impl WriteBuffer {
         let fields = arrow_schema.fields.as_ref();
         let record_batch = serde_arrow::to_record_batch(fields, &self.lines).unwrap();
         let mut bytes = Vec::new();
-        let mut writer = FileWriter::try_new(&mut bytes, &record_batch.schema()).map_err(|e| {
-            IngestError {
+        let mut writer =
+            FileWriter::try_new(&mut bytes, &record_batch.schema()).map_err(|e| IngestError {
                 message: format!("{}", e),
-            }
-        })?;
+            })?;
         writer.write(&record_batch).map_err(|e| IngestError {
             message: format!("{}", e),
         })?;
