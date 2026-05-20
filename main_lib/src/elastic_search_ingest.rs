@@ -1,11 +1,11 @@
 use crate::data_access;
 use crate::data_contract::{
     AliasInfo, CreateIndexBody, CreateIndexResult, CreateIndexTemplateBody, CreateTable,
-    SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription,
+    SpeedboatCommit, SpeedboatCommitTableInfo, SpeedboatSegmentFile, TableDescription,
 };
 use crate::elastic_search_commands::LookupById;
 use crate::elastic_search_common::{
-    CommandContext, ElasticSearchResponse, MIME_ES_JSON, load_command_raw_result,
+    load_command_raw_result, CommandContext, ElasticSearchResponse, MIME_ES_JSON,
 };
 use crate::elastic_search_parser::UpdateBody;
 use crate::elastic_search_responses::{
@@ -15,27 +15,29 @@ use crate::elastic_search_storage_schema::{
     FullRecord, RecordDelete, RecordInput, SpeedboatCommitBuilder,
 };
 use crate::schema_massager::PowdrrSchema;
-use crate::search_runtime::{SerdeValueResult, df_to_serde_value};
-use crate::state_provider::{STATE_PROVIDER, ServiceApiError};
+use crate::search_runtime::{df_to_serde_value, SerdeValueResult};
+use crate::state_provider::{ServiceApiError, STATE_PROVIDER};
 use crate::util::{describe_table_log_error_then_none, log_err, log_service_err};
 use arrow_ipc::writer::StreamWriter;
 use arrow_json::LineDelimitedWriter;
 use datafusion::arrow::ipc::writer::FileWriter;
 use futures::FutureExt;
 use gotham::mime;
-use http::StatusCode;
 use http::header::LOCATION;
+use http::StatusCode;
 use idgenerator::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt::Display;
 use std::future::Future;
 use std::io::{Cursor, SeekFrom, Write};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{collections::HashMap, fs::File};
+use std::{collections::HashMap, fs, fs::File};
 use tokio::io::AsyncSeekExt;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::{mpsc, oneshot};
@@ -108,6 +110,7 @@ impl WriteBuffer {
 
     fn write_to_json_file(&self, file_name: &String) -> Result<u64, IngestError> {
         assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
+        ensure_local_parent_dir(file_name)?;
         let mut file_write = File::create(file_name).expect("Cannot create file");
         for line in self.lines.iter() {
             match writeln!(&mut file_write, "{}", line) {
@@ -129,6 +132,7 @@ impl WriteBuffer {
     fn write_to_arrow_file(&self, file_name: &String) -> Result<u64, IngestError> {
         assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
         assert!(self.schema.is_some(), "Cannot write buffer without schema");
+        ensure_local_parent_dir(file_name)?;
         let arrow_schema = self.schema.as_ref().unwrap().to_arrow_schema();
         let fields = arrow_schema.fields.as_ref();
         let record_batch = serde_arrow::to_record_batch(fields, &self.lines).unwrap();
@@ -206,6 +210,29 @@ impl WriteBuffer {
         buffer
     }
 
+    fn stable_segment_id(&self, index: &String, label: &String) -> Result<String, IngestError> {
+        let mut hasher = Sha256::new();
+        hasher.update(index.as_bytes());
+        hasher.update([0]);
+        hasher.update(label.as_bytes());
+        hasher.update([0]);
+        if let Some(schema) = &self.schema {
+            let schema_bytes = serde_json::to_vec(schema).map_err(|e| IngestError {
+                message: format!("Failed to serialize speedboat schema for segment id: {e}"),
+            })?;
+            hasher.update(schema_bytes);
+        }
+        hasher.update([0xff]);
+        for line in &self.lines {
+            let line_bytes = serde_json::to_vec(line).map_err(|e| IngestError {
+                message: format!("Failed to serialize speedboat line for segment id: {e}"),
+            })?;
+            hasher.update((line_bytes.len() as u64).to_le_bytes());
+            hasher.update(line_bytes);
+        }
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
     pub(crate) fn schema(&self) -> Option<PowdrrSchema> {
         self.schema.clone()
     }
@@ -214,6 +241,15 @@ impl WriteBuffer {
     pub(crate) fn num_records(&self) -> usize {
         self.lines.len()
     }
+}
+
+fn ensure_local_parent_dir(file_name: &str) -> Result<(), IngestError> {
+    if let Some(parent) = Path::new(file_name).parent() {
+        fs::create_dir_all(parent).map_err(|e| IngestError {
+            message: format!("Failed to create local speedboat directory: {e}"),
+        })?;
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -568,29 +604,102 @@ pub(crate) async fn upsert_single(
 
 const USE_SPEEDBOAT_S3: bool = true;
 
+#[derive(Serialize)]
+struct SpeedboatOrphanMarker {
+    orphan_id: String,
+    table_name: String,
+    metadata_commit_error: String,
+    created_at_ms: i64,
+    speedboat_commit: SpeedboatCommit,
+}
+
+fn speedboat_orphan_marker_path(table: &String, orphan_id: &String) -> String {
+    if USE_SPEEDBOAT_S3 {
+        format!(
+            "{}/orphans/{}/{}.json",
+            data_access::s3_ingest_base_path(),
+            table,
+            orphan_id
+        )
+    } else {
+        format!("tests/data/ingest/orphans/{table}/{orphan_id}.json")
+    }
+}
+
+fn next_speedboat_segment(
+    buffer: &WriteBuffer,
+    index: &String,
+    label: &String,
+) -> Result<SpeedboatSegmentFile, IngestError> {
+    let segment_id = buffer.stable_segment_id(index, label)?;
+    let file_path = if USE_SPEEDBOAT_S3 {
+        format!(
+            "{}/{}/{}/{}",
+            data_access::s3_ingest_base_path(),
+            index,
+            label,
+            segment_id
+        )
+    } else {
+        format!("tests/data/ingest/{}/{}/{}", index, label, segment_id)
+    };
+    Ok(SpeedboatSegmentFile {
+        segment_id,
+        file_path,
+        size: 0,
+    })
+}
+
+async fn write_speedboat_orphan_marker(
+    table: &String,
+    speedboat_commit: &SpeedboatCommit,
+    error: &str,
+) -> Result<(), IngestError> {
+    let orphan_id = IdInstance::next_id().to_string();
+    let marker = SpeedboatOrphanMarker {
+        orphan_id: orphan_id.clone(),
+        table_name: table.clone(),
+        metadata_commit_error: error.to_string(),
+        created_at_ms: chrono::Utc::now().timestamp_millis(),
+        speedboat_commit: speedboat_commit.clone(),
+    };
+    let marker_bytes = serde_json::to_vec(&marker).map_err(|e| IngestError {
+        message: format!("Failed to serialize speedboat orphan marker: {e}"),
+    })?;
+
+    if USE_SPEEDBOAT_S3 {
+        let marker_path = speedboat_orphan_marker_path(table, &orphan_id);
+        data_access::put_s3_file(&marker_path, &marker_bytes)
+            .await
+            .map_err(|e| IngestError {
+                message: format!("Failed to write speedboat orphan marker: {e}"),
+            })?;
+    } else {
+        let marker_dir = format!("tests/data/ingest/orphans/{}", table);
+        fs::create_dir_all(&marker_dir).map_err(|e| IngestError {
+            message: format!("Failed to create speedboat orphan marker directory: {e}"),
+        })?;
+        let marker_path = speedboat_orphan_marker_path(table, &orphan_id);
+        fs::write(&marker_path, marker_bytes).map_err(|e| IngestError {
+            message: format!("Failed to write speedboat orphan marker: {e}"),
+        })?;
+    }
+
+    Ok(())
+}
+
 pub(crate) async fn write_to_file(
     buffer: &WriteBuffer,
     index: &String,
     label: &String,
-) -> Result<(String, u64), IngestError> {
+) -> Result<SpeedboatSegmentFile, IngestError> {
+    let mut segment = next_speedboat_segment(buffer, index, label)?;
     if USE_SPEEDBOAT_S3 {
-        let s3_path = format!(
-            "{}/{}-{}-{}",
-            data_access::s3_ingest_base_path(),
-            label,
-            index,
-            IdInstance::next_id().to_string()
-        );
-        let size = buffer.write_to_json_s3(&s3_path).await?;
-        Ok((s3_path, size))
+        let size = buffer.write_to_json_s3(&segment.file_path).await?;
+        segment.size = size;
+        Ok(segment)
     } else {
-        let file_path = format!(
-            "tests/data/ingest/{}-{}-{}",
-            label,
-            index,
-            IdInstance::next_id().to_string()
-        );
-        let write_to_file_result = buffer.write_to_file(&file_path);
+        let write_to_file_result = buffer.write_to_file(&segment.file_path);
         //tracing::info!("Ingest: op {} on table {} wrote {} records", label, index, buffer.num_records());
 
         let size = match write_to_file_result {
@@ -601,7 +710,8 @@ pub(crate) async fn write_to_file(
                 });
             }
         };
-        Ok((file_path, size))
+        segment.size = size;
+        Ok(segment)
     }
 }
 
@@ -614,35 +724,45 @@ pub(crate) async fn commit_speedboat(
 ) -> Result<(), IngestError> {
     let mut table_infos = vec![];
     if inserts_and_updates.lines.len() != 0 {
-        let (insert_update_path, size) =
-            write_to_file(inserts_and_updates, table, commit_type).await?;
-        table_infos.push(SpeedboatCommitTableInfo {
-            commit_type: commit_type.clone(),
-            table_name: table.clone(),
-            files: vec![insert_update_path],
-            sizes: vec![size],
-            schema: inserts_and_updates.schema.clone(),
-        });
+        let insert_update_segment = write_to_file(inserts_and_updates, table, commit_type).await?;
+        table_infos.push(SpeedboatCommitTableInfo::from_segments(
+            commit_type.clone(),
+            table.clone(),
+            vec![insert_update_segment],
+            inserts_and_updates.schema.clone(),
+        ));
     }
     if deletes.lines.len() != 0 {
-        let (deletes_path, size) = write_to_file(deletes, table, &"delete".to_string()).await?;
-        table_infos.push(SpeedboatCommitTableInfo {
-            commit_type: "delete".to_string(),
-            table_name: table.clone(),
-            files: vec![deletes_path],
-            sizes: vec![size],
-            schema: deletes.schema.clone(),
-        });
+        let delete_segment = write_to_file(deletes, table, &"delete".to_string()).await?;
+        table_infos.push(SpeedboatCommitTableInfo::from_segments(
+            "delete".to_string(),
+            table.clone(),
+            vec![delete_segment],
+            deletes.schema.clone(),
+        ));
     }
-    match STATE_PROVIDER
-        .speedboat_commit(&SpeedboatCommit {
-            type_files: table_infos,
-            compaction: compaction.clone(),
-        })
-        .await
-    {
+    let speedboat_commit = SpeedboatCommit {
+        type_files: table_infos,
+        compaction: compaction.clone(),
+    };
+    match STATE_PROVIDER.speedboat_commit(&speedboat_commit).await {
         Ok(_) => (),
-        Err(_) => panic!("nope"),
+        Err(error) => {
+            if let Err(marker_error) =
+                write_speedboat_orphan_marker(table, &speedboat_commit, &error.to_string()).await
+            {
+                tracing::error!(
+                    "Failed to persist speedboat orphan marker after metadata commit failure: {}",
+                    marker_error
+                );
+            }
+            return Err(IngestError {
+                message: format!(
+                    "Uploaded speedboat segments but failed to commit metadata: {}",
+                    error
+                ),
+            });
+        }
     }
 
     Ok(())
@@ -1474,7 +1594,10 @@ pub(crate) static INGEST_HANDLE: std::sync::LazyLock<IngestHandle> =
 #[cfg(test)]
 mod tests {
     use crate::data_contract::{CreateIndexTemplateBody, PropertyInfo};
-    use crate::elastic_search_ingest::IngestCommand;
+    use crate::elastic_search_ingest::{
+        next_speedboat_segment, speedboat_orphan_marker_path, IngestCommand, WriteBuffer,
+    };
+    use serde_json::json;
     use std::{collections::HashMap, fs};
 
     use super::CreateIndexBody;
@@ -1514,6 +1637,71 @@ mod tests {
             }
             _ => panic!("This should be a create"),
         }
+    }
+
+    #[test]
+    fn test_next_speedboat_segment_uses_segment_id_in_path() {
+        let buffer = WriteBuffer::delete(vec![json!({
+            "_id": "doc-1",
+            "_id_seq_no": "doc-1:1",
+            "_version": 1
+        })]);
+        let segment =
+            next_speedboat_segment(&buffer, &"logs".to_string(), &"commit".to_string()).unwrap();
+
+        assert!(segment.file_path.contains("/logs/commit/"));
+        assert!(segment.file_path.ends_with(&segment.segment_id));
+        assert_eq!(segment.size, 0);
+    }
+
+    #[test]
+    fn test_next_speedboat_segment_is_deterministic_for_same_buffer() {
+        let buffer = WriteBuffer::delete(vec![json!({
+            "_id": "doc-1",
+            "_id_seq_no": "doc-1:1",
+            "_version": 1
+        })]);
+
+        let first =
+            next_speedboat_segment(&buffer, &"logs".to_string(), &"commit".to_string()).unwrap();
+        let second =
+            next_speedboat_segment(&buffer, &"logs".to_string(), &"commit".to_string()).unwrap();
+
+        assert_eq!(first.segment_id, second.segment_id);
+        assert_eq!(first.file_path, second.file_path);
+    }
+
+    #[test]
+    fn test_write_to_file_creates_nested_parent_directories() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "powdrr-speedboat-write-buffer-{}",
+            idgenerator::IdInstance::next_id()
+        ));
+        let nested_path = temp_dir.join("table/commit/segment");
+        let nested_path_str = nested_path.display().to_string();
+        let buffer = WriteBuffer::delete(vec![json!({
+            "_id": "doc-1",
+            "_id_seq_no": "doc-1:1",
+            "_version": 1
+        })]);
+
+        let size = buffer.write_to_file(&nested_path_str).unwrap();
+
+        assert!(size > 0);
+        assert!(nested_path.with_extension("json").exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_speedboat_orphan_marker_path_uses_orphan_prefix() {
+        let marker_path =
+            speedboat_orphan_marker_path(&"logs".to_string(), &"orphan-1".to_string());
+
+        assert_eq!(
+            marker_path,
+            "s3://warehouse/default/ingest/orphans/logs/orphan-1.json"
+        );
     }
 
     #[test]

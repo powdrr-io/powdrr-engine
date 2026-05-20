@@ -11,8 +11,8 @@ use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use idgenerator::IdInstance;
 use modyne::expr::Filter;
 use modyne::{
-    Aggregate, Entity, EntityExt, Error, Item, ProjectionExt, QueryInput, QueryInputExt, Table,
-    expr, keys, model::TransactWrite, projections, read_projection,
+    expr, keys, model::TransactWrite, projections, read_projection, Aggregate, Entity, EntityExt,
+    Error, Item, ProjectionExt, QueryInput, QueryInputExt, Table,
 };
 use std::collections::HashMap;
 
@@ -1137,11 +1137,9 @@ impl DynamoDbConnector {
             cloned_checkpoint_to_replace.checkpoint_id = IdInstance::next_id().to_string();
             cloned_checkpoint_to_replace
                 .apply_compaction_for_replacement(compaction_commit, &commit.metadata);
-            assert!(
-                cloned_checkpoint_to_replace
-                    .original_checkpoint_id
-                    .is_none()
-            );
+            assert!(cloned_checkpoint_to_replace
+                .original_checkpoint_id
+                .is_none());
             cloned_checkpoint_to_replace.original_checkpoint_id =
                 Some(compaction_commit.checkpoint_id_to_replace.clone());
 
@@ -1389,6 +1387,7 @@ mod tests {
             type_files: vec![SpeedboatCommitTableInfo {
                 commit_type: "commit".to_string(),
                 table_name: "fake_table".to_string(),
+                segments: vec![],
                 files: vec!["fake_file".to_string()],
                 sizes: vec![100],
                 schema: None,
@@ -1495,6 +1494,7 @@ mod tests {
             type_files: vec![SpeedboatCommitTableInfo {
                 commit_type: "commit".to_string(),
                 table_name: "fake_table".to_string(),
+                segments: vec![],
                 files: vec!["fake_file".to_string()],
                 sizes: vec![100],
                 schema: Some(PowdrrSchema::minimal()),

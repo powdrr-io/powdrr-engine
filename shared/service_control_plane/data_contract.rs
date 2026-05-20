@@ -8,21 +8,75 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SpeedboatSegmentFile {
+    pub segment_id: String,
+    pub file_path: String,
+    pub size: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SpeedboatCommitTableInfo {
     pub commit_type: String,
     pub table_name: String,
+    #[serde(default)]
+    pub segments: Vec<SpeedboatSegmentFile>,
     pub files: Vec<String>,
     pub sizes: Vec<u64>,
     pub schema: Option<PowdrrSchema>,
 }
 
 impl SpeedboatCommitTableInfo {
+    fn synthetic_legacy_segment_id(file_path: &str) -> String {
+        let mut hasher = DefaultHasher::new();
+        file_path.hash(&mut hasher);
+        format!("legacy-{:x}", hasher.finish())
+    }
+
+    pub fn from_segments(
+        commit_type: String,
+        table_name: String,
+        segments: Vec<SpeedboatSegmentFile>,
+        schema: Option<PowdrrSchema>,
+    ) -> Self {
+        Self {
+            commit_type,
+            table_name,
+            files: segments
+                .iter()
+                .map(|segment| segment.file_path.clone())
+                .collect(),
+            sizes: segments.iter().map(|segment| segment.size).collect(),
+            segments,
+            schema,
+        }
+    }
+
+    pub fn segment_files(&self) -> Vec<SpeedboatSegmentFile> {
+        if !self.segments.is_empty() {
+            return self.segments.clone();
+        }
+
+        self.files
+            .iter()
+            .zip(self.sizes.iter())
+            .map(|(file_path, size)| SpeedboatSegmentFile {
+                segment_id: Self::synthetic_legacy_segment_id(file_path),
+                file_path: file_path.clone(),
+                size: *size,
+            })
+            .collect()
+    }
+
     pub fn as_file_set_payload(&self) -> FileSetPayload {
+        let segments = self.segment_files();
         FileSetPayload {
-            file_paths: self.files.clone(),
-            sizes: self.sizes.clone(),
+            file_paths: segments
+                .iter()
+                .map(|segment| segment.file_path.clone())
+                .collect(),
+            sizes: segments.iter().map(|segment| segment.size).collect(),
             schemas: vec![self.schema.as_ref().unwrap().clone()],
-            file_schemas: self.files.iter().map(|_| 0).collect(),
+            file_schemas: segments.iter().map(|_| 0).collect(),
         }
     }
 }
@@ -1107,3 +1161,52 @@ pub struct OrgInfo {
 
 pub const TEST_ACCESS_KEY: &str = "access_key";
 pub const TEST_SECRET_KEY: &str = "secret_key";
+
+#[cfg(test)]
+mod tests {
+    use super::{SpeedboatCommitTableInfo, SpeedboatSegmentFile};
+
+    #[test]
+    fn speedboat_table_info_prefers_explicit_segments() {
+        let table_info = SpeedboatCommitTableInfo::from_segments(
+            "commit".to_string(),
+            "logs".to_string(),
+            vec![SpeedboatSegmentFile {
+                segment_id: "segment-1".to_string(),
+                file_path: "s3://warehouse/default/ingest/logs/commit/segment-1".to_string(),
+                size: 42,
+            }],
+            None,
+        );
+
+        let segments = table_info.segment_files();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].segment_id, "segment-1");
+        assert_eq!(
+            segments[0].file_path,
+            "s3://warehouse/default/ingest/logs/commit/segment-1"
+        );
+        assert_eq!(segments[0].size, 42);
+    }
+
+    #[test]
+    fn speedboat_table_info_backfills_legacy_segment_ids() {
+        let table_info = SpeedboatCommitTableInfo {
+            commit_type: "commit".to_string(),
+            table_name: "logs".to_string(),
+            segments: vec![],
+            files: vec!["s3://warehouse/default/ingest/logs/commit/legacy".to_string()],
+            sizes: vec![123],
+            schema: None,
+        };
+
+        let segments = table_info.segment_files();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(
+            segments[0].file_path,
+            "s3://warehouse/default/ingest/logs/commit/legacy"
+        );
+        assert_eq!(segments[0].size, 123);
+        assert!(segments[0].segment_id.starts_with("legacy-"));
+    }
+}

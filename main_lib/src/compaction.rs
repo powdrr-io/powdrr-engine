@@ -10,30 +10,30 @@ use gotham::mime;
 use http::StatusCode;
 use iceberg::arrow::arrow_schema_to_schema;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
     DefaultLocationGenerator, FileNameGenerator,
 };
+use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use idgenerator::IdInstance;
 use parquet_55::file::properties::WriterProperties;
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::{error::Error, fmt};
 
-use crate::data_access::{IcebergLibMetadata, execute_sql};
+use crate::data_access::{execute_sql, IcebergLibMetadata};
 use crate::data_contract::{
     CompactionCommit, CompactionWorkItem, FileSetPayload, IcebergCommit, IcebergMetadata,
     SpeedboatCommitTableInfo,
 };
 use crate::elastic_search_common::{
-    Command, CommandContext, CommandError, ElasticSearchResponse, ResultGeneratorFuture,
-    execute_command,
+    execute_command, Command, CommandContext, CommandError, ElasticSearchResponse,
+    ResultGeneratorFuture,
 };
-use crate::elastic_search_ingest::{WriteBuffer, write_to_file};
+use crate::elastic_search_ingest::{write_to_file, WriteBuffer};
 use crate::peers::{PrivateCompactionInvocation, PrivateInvocation};
 use crate::schema_massager::{PowdrrSchema, SqlBuilder};
 use crate::search_runtime::df_to_serde_value;
@@ -378,19 +378,24 @@ impl Command for CompactionCommand {
             };
 
             let deletes_table_info = if deletes_buffer.num_records() > 0 {
-                let (deletes_path, size) = match write_to_file(&deletes_buffer, &public_table_name, &"delete".to_string()).await {
+                let delete_segment = match write_to_file(
+                    &deletes_buffer,
+                    &public_table_name,
+                    &"delete".to_string(),
+                )
+                .await
+                {
                     Ok(file) => file,
                     Err(e) => {
                         return Err(CommandError{ message: e.to_string() })
                     }
                 };
-                Some(SpeedboatCommitTableInfo {
-                    commit_type: "delete".to_string(),
-                    table_name: public_table_name.clone(),
-                    files: vec!(deletes_path),
-                    sizes: vec!(size),
-                    schema: deletes_buffer.schema(),
-                })
+                Some(SpeedboatCommitTableInfo::from_segments(
+                    "delete".to_string(),
+                    public_table_name.clone(),
+                    vec![delete_segment],
+                    deletes_buffer.schema(),
+                ))
             } else {
                 None
             };
