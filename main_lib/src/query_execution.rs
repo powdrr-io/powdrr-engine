@@ -28,7 +28,7 @@ pub(crate) struct QueryInputFile {
     pub extensions: Vec<QueryExtensionFileSpec>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) enum QuerySqlTemplate {
     Built(String),
     Structured {
@@ -37,7 +37,7 @@ pub(crate) enum QuerySqlTemplate {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct QueryExecutionPlan {
     // This is the protocol-neutral mixed-source read plan consumed by both
     // lakehouse serving and Elasticsearch/private reads.

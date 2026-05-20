@@ -14,8 +14,8 @@ use std::{
 
 use crate::data_access::{self, load_file_as_table};
 use crate::data_contract::{
-    ExtensionFile, ExtensionFileMetadata, FileDescriptor, IcebergColumnStats, IcebergFileStats,
-    IcebergMetadata, SpeedboatMetadata, TableMetadataCheckpoint,
+    ExtensionFile, ExtensionFileMetadata, FileDescriptor, IcebergFileStats, IcebergMetadata,
+    SpeedboatMetadata, TableMetadataCheckpoint,
 };
 use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_responses::{compare_query_result_hits_desc, QueryResultHit};
