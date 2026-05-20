@@ -1,5 +1,5 @@
 use crate::data_contract::{
-    CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody, LicenseType, OrgInfo,
+    CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody, LicenseType, OrgInfo, OrgSettings,
 };
 use crate::data_contract::{
     CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem,
@@ -85,6 +85,17 @@ impl DynamoDbStateProvider {
         self.service_impl
             .upsert_table_metadata(&self.fake_org_info, create_table)
             .await
+    }
+
+    pub async fn create_org(&mut self, settings: &OrgSettings) -> Result<(), ServiceApiError> {
+        self.service_impl.create_org(settings).await
+    }
+
+    pub async fn lookup_secret_access_key(
+        &mut self,
+        access_key: &String,
+    ) -> Result<Option<String>, ServiceApiError> {
+        self.service_impl.lookup_secret_access_key(access_key).await
     }
 
     pub async fn describe_table(

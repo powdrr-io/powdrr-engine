@@ -312,7 +312,6 @@ impl EphemeralServiceImpl {
             })
             .collect()
     }
-
     fn checkpoints_needing_extension_work(
         &self,
         table_name: &String,

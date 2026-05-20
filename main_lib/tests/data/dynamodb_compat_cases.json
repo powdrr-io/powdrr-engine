@@ -1,0 +1,289 @@
+{
+  "operations": [
+    {
+      "operation": "BatchExecuteStatement",
+      "mode": "explicit_error",
+      "description": "Unsupported PartiQL batch execution must fail explicitly."
+    },
+    {
+      "operation": "BatchGetItem",
+      "mode": "differential_supported",
+      "description": "Read-only batch lookup must match DynamoDB behavior."
+    },
+    {
+      "operation": "BatchWriteItem",
+      "mode": "explicit_error",
+      "description": "Write APIs are intentionally unsupported and must fail explicitly."
+    },
+    {
+      "operation": "CreateBackup",
+      "mode": "explicit_error",
+      "description": "Backup management is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "CreateGlobalTable",
+      "mode": "explicit_error",
+      "description": "Global table management is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "CreateTable",
+      "mode": "explicit_error",
+      "description": "Control-plane table creation is unsupported on the wire protocol surface."
+    },
+    {
+      "operation": "DeleteBackup",
+      "mode": "explicit_error",
+      "description": "Backup deletion is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "DeleteItem",
+      "mode": "explicit_error",
+      "description": "Mutating item deletes are unsupported and must fail explicitly."
+    },
+    {
+      "operation": "DeleteResourcePolicy",
+      "mode": "explicit_error",
+      "description": "Resource policy APIs are unsupported and must fail explicitly."
+    },
+    {
+      "operation": "DeleteTable",
+      "mode": "explicit_error",
+      "description": "Wire-level table deletion is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "DescribeBackup",
+      "mode": "explicit_error",
+      "description": "Backup metadata APIs are unsupported and must fail explicitly."
+    },
+    {
+      "operation": "DescribeContinuousBackups",
+      "mode": "explicit_error",
+      "description": "Continuous backup metadata is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "DescribeContributorInsights",
+      "mode": "explicit_error",
+      "description": "Contributor Insights APIs are unsupported and must fail explicitly."
+    },
+    {
+      "operation": "DescribeEndpoints",
+      "mode": "explicit_error",
+      "description": "Endpoint discovery is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "DescribeExport",
+      "mode": "explicit_error",
+      "description": "Export metadata APIs are unsupported and must fail explicitly."
+    },
+    {
+      "operation": "DescribeGlobalTable",
+      "mode": "explicit_error",
+      "description": "Global table metadata APIs are unsupported and must fail explicitly."
+    },
+    {
+      "operation": "DescribeGlobalTableSettings",
+      "mode": "explicit_error",
+      "description": "Global table settings APIs are unsupported and must fail explicitly."
+    },
+    {
+      "operation": "DescribeImport",
+      "mode": "explicit_error",
+      "description": "Import metadata APIs are unsupported and must fail explicitly."
+    },
+    {
+      "operation": "DescribeKinesisStreamingDestination",
+      "mode": "explicit_error",
+      "description": "Kinesis streaming metadata APIs are unsupported and must fail explicitly."
+    },
+    {
+      "operation": "DescribeLimits",
+      "mode": "explicit_error",
+      "description": "Account-level limits are unsupported and must fail explicitly."
+    },
+    {
+      "operation": "DescribeTable",
+      "mode": "differential_supported",
+      "description": "Synthesized table metadata must match DynamoDB-compatible shapes."
+    },
+    {
+      "operation": "DescribeTableReplicaAutoScaling",
+      "mode": "explicit_error",
+      "description": "Replica autoscaling APIs are unsupported and must fail explicitly."
+    },
+    {
+      "operation": "DescribeTimeToLive",
+      "mode": "explicit_error",
+      "description": "TTL metadata APIs are unsupported and must fail explicitly."
+    },
+    {
+      "operation": "DisableKinesisStreamingDestination",
+      "mode": "explicit_error",
+      "description": "Kinesis streaming control APIs are unsupported and must fail explicitly."
+    },
+    {
+      "operation": "EnableKinesisStreamingDestination",
+      "mode": "explicit_error",
+      "description": "Kinesis streaming control APIs are unsupported and must fail explicitly."
+    },
+    {
+      "operation": "ExecuteStatement",
+      "mode": "explicit_error",
+      "description": "PartiQL execution is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "ExecuteTransaction",
+      "mode": "explicit_error",
+      "description": "Transactional PartiQL is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "ExportTableToPointInTime",
+      "mode": "explicit_error",
+      "description": "Exports are unsupported and must fail explicitly."
+    },
+    {
+      "operation": "GetItem",
+      "mode": "differential_supported",
+      "description": "Point reads must match DynamoDB-compatible behavior."
+    },
+    {
+      "operation": "GetResourcePolicy",
+      "mode": "explicit_error",
+      "description": "Resource policy APIs are unsupported and must fail explicitly."
+    },
+    {
+      "operation": "ImportTable",
+      "mode": "explicit_error",
+      "description": "Imports are unsupported and must fail explicitly."
+    },
+    {
+      "operation": "ListBackups",
+      "mode": "explicit_error",
+      "description": "Backup listing is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "ListContributorInsights",
+      "mode": "explicit_error",
+      "description": "Contributor Insights listing is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "ListExports",
+      "mode": "explicit_error",
+      "description": "Export listing is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "ListGlobalTables",
+      "mode": "explicit_error",
+      "description": "Global table listing is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "ListImports",
+      "mode": "explicit_error",
+      "description": "Import listing is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "ListTables",
+      "mode": "differential_supported",
+      "description": "Dynamo-exposed table discovery must match DynamoDB-compatible behavior."
+    },
+    {
+      "operation": "ListTagsOfResource",
+      "mode": "explicit_error",
+      "description": "Tag listing is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "PutItem",
+      "mode": "explicit_error",
+      "description": "Mutating writes are unsupported and must fail explicitly."
+    },
+    {
+      "operation": "PutResourcePolicy",
+      "mode": "explicit_error",
+      "description": "Resource policy APIs are unsupported and must fail explicitly."
+    },
+    {
+      "operation": "Query",
+      "mode": "differential_supported",
+      "description": "Supported key-based queries must match DynamoDB-compatible behavior."
+    },
+    {
+      "operation": "RestoreTableFromBackup",
+      "mode": "explicit_error",
+      "description": "Table restore APIs are unsupported and must fail explicitly."
+    },
+    {
+      "operation": "RestoreTableToPointInTime",
+      "mode": "explicit_error",
+      "description": "Point-in-time restore is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "Scan",
+      "mode": "differential_supported",
+      "description": "Read-only scans must match DynamoDB-compatible behavior."
+    },
+    {
+      "operation": "TagResource",
+      "mode": "explicit_error",
+      "description": "Tag mutation is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "TransactGetItems",
+      "mode": "explicit_error",
+      "description": "Transactional reads are unsupported and must fail explicitly."
+    },
+    {
+      "operation": "TransactWriteItems",
+      "mode": "explicit_error",
+      "description": "Transactional writes are unsupported and must fail explicitly."
+    },
+    {
+      "operation": "UntagResource",
+      "mode": "explicit_error",
+      "description": "Tag mutation is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "UpdateContinuousBackups",
+      "mode": "explicit_error",
+      "description": "Continuous backup mutation is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "UpdateContributorInsights",
+      "mode": "explicit_error",
+      "description": "Contributor Insights mutation is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "UpdateGlobalTable",
+      "mode": "explicit_error",
+      "description": "Global table mutation is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "UpdateGlobalTableSettings",
+      "mode": "explicit_error",
+      "description": "Global table settings mutation is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "UpdateItem",
+      "mode": "explicit_error",
+      "description": "Item mutation is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "UpdateKinesisStreamingDestination",
+      "mode": "explicit_error",
+      "description": "Kinesis streaming mutation is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "UpdateTable",
+      "mode": "explicit_error",
+      "description": "Table mutation is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "UpdateTableReplicaAutoScaling",
+      "mode": "explicit_error",
+      "description": "Replica autoscaling mutation is unsupported and must fail explicitly."
+    },
+    {
+      "operation": "UpdateTimeToLive",
+      "mode": "explicit_error",
+      "description": "TTL mutation is unsupported and must fail explicitly."
+    }
+  ]
+}

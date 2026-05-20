@@ -1,23 +1,31 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
 
+use chrono::{DateTime, NaiveDateTime, Utc};
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{body, Body};
+use gotham::hyper::{Body, body};
 use gotham::mime;
 use gotham::state::{FromState, State};
+use hmac::{Hmac, Mac};
 use http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
+use crate::data_access::{self, execute_sql_async, load_files_as_table};
 use crate::data_contract::{
-    CreateTable, DynamoDbGlobalSecondaryIndexConfig, DynamoDbTableConfig, ServingPattern,
-    ServingTableConfig, TableDescription, TableMetadataCheckpoint,
+    CreateTable, DynamoDbGlobalSecondaryIndexConfig, DynamoDbLocalSecondaryIndexConfig,
+    DynamoDbTableConfig, FileDescriptor, ServingPattern, ServingTableConfig, TableDescription,
+    TableMetadataCheckpoint,
 };
 use crate::elastic_search_endpoints::NamePathExtractor;
-use crate::lakehouse_serving::{execute_serving_query, ServingQueryError, ServingQueryResponse};
+use crate::lakehouse_serving::{ServingQueryError, ServingQueryResponse, execute_serving_query};
 use crate::peers::CheckpointDescriptor;
 use crate::schema_massager::{PowdrrDataType, PowdrrSchema};
+use crate::search_runtime::batches_to_serde_value;
 use crate::serving_plan::{
     ServingPredicate, ServingQueryClassification, ServingRequestPlan, ServingSort,
 };
@@ -32,6 +40,7 @@ const DYNAMODB_BINARY_MARKER: &str = "$binary";
 const DYNAMODB_STRING_SET_MARKER: &str = "$string_set";
 const DYNAMODB_NUMBER_SET_MARKER: &str = "$number_set";
 const DYNAMODB_BINARY_SET_MARKER: &str = "$binary_set";
+const SIGV4_ALLOWED_CLOCK_SKEW_MINUTES: i64 = 15;
 
 #[derive(Clone, Debug)]
 pub(crate) struct DynamoDbRequestMeta {
@@ -102,6 +111,7 @@ struct ListTablesResponse {
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "PascalCase")]
 struct ListTablesRequest {
     exclusive_start_table_name: Option<String>,
@@ -109,6 +119,7 @@ struct ListTablesRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "PascalCase")]
 struct DescribeTableRequest {
     table_name: String,
@@ -134,6 +145,11 @@ struct DynamoDbTableDescription {
         skip_serializing_if = "Option::is_none"
     )]
     global_secondary_indexes: Option<Vec<GlobalSecondaryIndexDescription>>,
+    #[serde(
+        rename = "LocalSecondaryIndexes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    local_secondary_indexes: Option<Vec<LocalSecondaryIndexDescription>>,
 }
 
 #[derive(Serialize)]
@@ -167,11 +183,20 @@ struct GlobalSecondaryIndexDescription {
 
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
+struct LocalSecondaryIndexDescription {
+    index_name: String,
+    key_schema: Vec<KeySchemaElement>,
+    projection: SecondaryIndexProjection,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
 struct SecondaryIndexProjection {
     projection_type: &'static str,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "PascalCase")]
 struct GetItemRequest {
     table_name: String,
@@ -180,21 +205,31 @@ struct GetItemRequest {
     projection_expression: Option<String>,
     #[serde(default)]
     expression_attribute_names: Option<HashMap<String, String>>,
+    #[serde(default)]
+    consistent_read: Option<bool>,
+    #[serde(default)]
+    return_consumed_capacity: Option<String>,
 }
 
 #[derive(Serialize)]
 struct GetItemResponse {
     #[serde(rename = "Item", skip_serializing_if = "Option::is_none")]
     item: Option<Map<String, Value>>,
+    #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
+    consumed_capacity: Option<ConsumedCapacity>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "PascalCase")]
 struct BatchGetItemRequest {
     request_items: HashMap<String, KeysAndAttributes>,
+    #[serde(default)]
+    return_consumed_capacity: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "PascalCase")]
 struct KeysAndAttributes {
     keys: Vec<Map<String, Value>>,
@@ -202,6 +237,8 @@ struct KeysAndAttributes {
     projection_expression: Option<String>,
     #[serde(default)]
     expression_attribute_names: Option<HashMap<String, String>>,
+    #[serde(default)]
+    consistent_read: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -210,9 +247,12 @@ struct BatchGetItemResponse {
     responses: HashMap<String, Vec<Map<String, Value>>>,
     #[serde(rename = "UnprocessedKeys")]
     unprocessed_keys: Map<String, Value>,
+    #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
+    consumed_capacity: Option<Vec<ConsumedCapacity>>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "PascalCase")]
 struct QueryRequest {
     table_name: String,
@@ -233,6 +273,12 @@ struct QueryRequest {
     index_name: Option<String>,
     #[serde(default)]
     filter_expression: Option<String>,
+    #[serde(default)]
+    consistent_read: Option<bool>,
+    #[serde(default)]
+    select: Option<String>,
+    #[serde(default)]
+    return_consumed_capacity: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -245,12 +291,92 @@ struct QueryResponse {
     scanned_count: usize,
     #[serde(rename = "LastEvaluatedKey", skip_serializing_if = "Option::is_none")]
     last_evaluated_key: Option<Map<String, Value>>,
+    #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
+    consumed_capacity: Option<ConsumedCapacity>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "PascalCase")]
+struct ScanRequest {
+    table_name: String,
+    #[serde(default)]
+    expression_attribute_names: Option<HashMap<String, String>>,
+    #[serde(default)]
+    expression_attribute_values: Option<HashMap<String, Value>>,
+    #[serde(default)]
+    projection_expression: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    exclusive_start_key: Option<Map<String, Value>>,
+    #[serde(default)]
+    index_name: Option<String>,
+    #[serde(default)]
+    filter_expression: Option<String>,
+    #[serde(default)]
+    consistent_read: Option<bool>,
+    #[serde(default)]
+    select: Option<String>,
+    #[serde(default)]
+    return_consumed_capacity: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ScanResponse {
+    #[serde(rename = "Items")]
+    items: Vec<Map<String, Value>>,
+    #[serde(rename = "Count")]
+    count: usize,
+    #[serde(rename = "ScannedCount")]
+    scanned_count: usize,
+    #[serde(rename = "LastEvaluatedKey", skip_serializing_if = "Option::is_none")]
+    last_evaluated_key: Option<Map<String, Value>>,
+    #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
+    consumed_capacity: Option<ConsumedCapacity>,
 }
 
 struct DynamoDbTableContext {
     description: TableDescription,
     config: DynamoDbTableConfig,
     schema: PowdrrSchema,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "PascalCase")]
+struct ConsumedCapacity {
+    table_name: String,
+    capacity_units: f64,
+    read_capacity_units: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    table: Option<CapacityBreakdown>,
+    #[serde(
+        rename = "LocalSecondaryIndexes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    local_secondary_indexes: Option<HashMap<String, CapacityBreakdown>>,
+    #[serde(
+        rename = "GlobalSecondaryIndexes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    global_secondary_indexes: Option<HashMap<String, CapacityBreakdown>>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "PascalCase")]
+struct CapacityBreakdown {
+    capacity_units: f64,
+    read_capacity_units: f64,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedSigV4Authorization {
+    access_key_id: String,
+    credential_date: String,
+    region: String,
+    service: String,
+    signed_headers: Vec<String>,
+    signature: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -261,8 +387,93 @@ struct DynamoDbKeySchemaConfig {
 
 #[derive(Clone, Debug)]
 struct ParsedFilterExpression {
-    filters: Vec<ServingPredicate>,
+    expression: Option<FilterNode>,
     filter_fields: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectMode {
+    AllAttributes,
+    AllProjectedAttributes,
+    SpecificAttributes,
+    Count,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReturnConsumedCapacityMode {
+    None,
+    Total,
+    Indexes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DynamoDbIndexKind {
+    Table,
+    LocalSecondaryIndex,
+    GlobalSecondaryIndex,
+}
+
+#[derive(Clone, Debug)]
+struct QueryTarget {
+    key_schema: DynamoDbKeySchemaConfig,
+    unique_lookup: bool,
+    index_kind: DynamoDbIndexKind,
+    index_name: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+enum FilterNode {
+    Predicate(FilterPredicate),
+    And(Vec<FilterNode>),
+    Or(Vec<FilterNode>),
+    Not(Box<FilterNode>),
+}
+
+#[derive(Clone, Debug)]
+struct FilterPredicate {
+    operand: FilterOperand,
+    kind: FilterPredicateKind,
+}
+
+#[derive(Clone, Debug)]
+enum FilterOperand {
+    Field(String),
+    Size(String),
+}
+
+#[derive(Clone, Debug)]
+enum FilterPredicateKind {
+    Eq(Value),
+    In(Vec<Value>),
+    Gt(Value),
+    Gte(Value),
+    Lt(Value),
+    Lte(Value),
+    Between { start: Value, end: Value },
+    BeginsWith(String),
+    Contains(Value),
+    AttributeExists,
+    AttributeNotExists,
+    AttributeType(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FilterToken {
+    Identifier(String),
+    ValueToken(String),
+    LParen,
+    RParen,
+    Comma,
+    Eq,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+    And,
+    Or,
+    Not,
+    Between,
+    In,
 }
 
 pub fn get_dynamodb_config(state: State) -> Pin<Box<HandlerFuture>> {
@@ -383,7 +594,7 @@ pub fn dynamodb_api(mut state: State) -> Pin<Box<HandlerFuture>> {
         };
 
         let result = async {
-            let _meta = authenticate_request(&headers)?;
+            let _meta = authenticate_request(&headers, &body_bytes).await?;
             let target = parse_target(&headers)?;
             let payload = if body_bytes.is_empty() {
                 Value::Object(Map::new())
@@ -399,6 +610,7 @@ pub fn dynamodb_api(mut state: State) -> Pin<Box<HandlerFuture>> {
                 "GetItem" => handle_get_item(payload).await?,
                 "BatchGetItem" => handle_batch_get_item(payload).await?,
                 "Query" => handle_query(payload).await?,
+                "Scan" => handle_scan(payload).await?,
                 _ => {
                     return Err(DynamoDbError::validation(format!(
                         "Unsupported x-amz-target {}",
@@ -429,10 +641,23 @@ async fn handle_list_tables(payload: Value) -> Result<Value, DynamoDbError> {
     let request = serde_json::from_value::<ListTablesRequest>(payload).map_err(|error| {
         DynamoDbError::validation(format!("Invalid ListTables request: {}", error))
     })?;
-    let mut table_names = STATE_PROVIDER
+    let mut table_names = vec![];
+    for table_name in STATE_PROVIDER
         .get_all_iceberg_tables()
         .await
-        .map_err(service_error)?;
+        .map_err(service_error)?
+    {
+        let Some(description) = STATE_PROVIDER
+            .describe_table(&table_name)
+            .await
+            .map_err(service_error)?
+        else {
+            continue;
+        };
+        if description.dynamodb.is_some() {
+            table_names.push(description.name);
+        }
+    }
     table_names.sort();
 
     let start_index = match request.exclusive_start_table_name.as_ref() {
@@ -515,6 +740,34 @@ async fn handle_describe_table(payload: Value) -> Result<Value, DynamoDbError> {
                 .collect::<Result<Vec<_>, _>>()?,
         )
     };
+    let local_secondary_indexes = if context.config.local_secondary_indexes.is_empty() {
+        None
+    } else {
+        Some(
+            context
+                .config
+                .local_secondary_indexes
+                .iter()
+                .map(|index| {
+                    append_attribute_definition(
+                        &mut attribute_definitions,
+                        &context.schema,
+                        &index.sort_key,
+                    )?;
+                    Ok::<_, DynamoDbError>(LocalSecondaryIndexDescription {
+                        index_name: index.name.clone(),
+                        key_schema: key_schema_elements(&local_secondary_index_key_schema(
+                            &context.config,
+                            index,
+                        )),
+                        projection: SecondaryIndexProjection {
+                            projection_type: "ALL",
+                        },
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+    };
 
     Ok(serde_json::to_value(DescribeTableResponse {
         table: DynamoDbTableDescription {
@@ -530,6 +783,7 @@ async fn handle_describe_table(payload: Value) -> Result<Value, DynamoDbError> {
                 billing_mode: "PAY_PER_REQUEST",
             },
             global_secondary_indexes,
+            local_secondary_indexes,
         },
     })
     .unwrap())
@@ -540,6 +794,9 @@ async fn handle_get_item(payload: Value) -> Result<Value, DynamoDbError> {
         DynamoDbError::validation(format!("Invalid GetItem request: {}", error))
     })?;
     let context = load_dynamodb_table_context(&request.table_name).await?;
+    validate_consistent_read(request.consistent_read, DynamoDbIndexKind::Table)?;
+    let consumed_capacity_mode =
+        parse_return_consumed_capacity(request.return_consumed_capacity.as_ref())?;
     let key_schema = primary_key_schema(&context.config);
     let key = parse_key_map(&request.key, &key_schema)?;
     let projection = parse_projection_expression(
@@ -566,16 +823,33 @@ async fn handle_get_item(payload: Value) -> Result<Value, DynamoDbError> {
         .map(|row| json_row_to_dynamodb_item(&row))
         .transpose()?;
 
-    Ok(serde_json::to_value(GetItemResponse { item }).unwrap())
+    Ok(serde_json::to_value(GetItemResponse {
+        item,
+        consumed_capacity: consumed_capacity_for_read(
+            consumed_capacity_mode,
+            &request.table_name,
+            DynamoDbIndexKind::Table,
+            None,
+            estimate_read_capacity_units(1, request.consistent_read.unwrap_or(false)),
+        ),
+    })
+    .unwrap())
 }
 
 async fn handle_batch_get_item(payload: Value) -> Result<Value, DynamoDbError> {
     let request = serde_json::from_value::<BatchGetItemRequest>(payload).map_err(|error| {
         DynamoDbError::validation(format!("Invalid BatchGetItem request: {}", error))
     })?;
+    let consumed_capacity_mode =
+        parse_return_consumed_capacity(request.return_consumed_capacity.as_ref())?;
     let mut responses = HashMap::new();
+    let mut consumed_capacity = vec![];
     for (table_name, keys_and_attributes) in request.request_items.iter() {
         let context = load_dynamodb_table_context(table_name).await?;
+        validate_consistent_read(
+            keys_and_attributes.consistent_read,
+            DynamoDbIndexKind::Table,
+        )?;
         let key_schema = primary_key_schema(&context.config);
         let projection = parse_projection_expression(
             keys_and_attributes.projection_expression.as_ref(),
@@ -601,11 +875,29 @@ async fn handle_batch_get_item(payload: Value) -> Result<Value, DynamoDbError> {
             }
         }
         responses.insert(table_name.clone(), items);
+        if let Some(entry) = consumed_capacity_for_read(
+            consumed_capacity_mode,
+            table_name,
+            DynamoDbIndexKind::Table,
+            None,
+            estimate_read_capacity_units(
+                keys_and_attributes.keys.len(),
+                keys_and_attributes.consistent_read.unwrap_or(false),
+            ),
+        ) {
+            consumed_capacity.push(entry);
+        }
     }
+    consumed_capacity.sort_by(|left, right| left.table_name.cmp(&right.table_name));
 
     Ok(serde_json::to_value(BatchGetItemResponse {
         responses,
         unprocessed_keys: Map::new(),
+        consumed_capacity: if consumed_capacity.is_empty() {
+            None
+        } else {
+            Some(consumed_capacity)
+        },
     })
     .unwrap())
 }
@@ -614,11 +906,19 @@ async fn handle_query(payload: Value) -> Result<Value, DynamoDbError> {
     let request = serde_json::from_value::<QueryRequest>(payload)
         .map_err(|error| DynamoDbError::validation(format!("Invalid Query request: {}", error)))?;
     let context = load_dynamodb_table_context(&request.table_name).await?;
-    let (query_key_schema, unique_lookup) =
-        query_target_key_schema(&context.config, request.index_name.as_deref())?;
+    let table_key_schema = primary_key_schema(&context.config);
+    let query_target = query_target(&context.config, request.index_name.as_deref())?;
+    validate_consistent_read(request.consistent_read, query_target.index_kind)?;
+    let consumed_capacity_mode =
+        parse_return_consumed_capacity(request.return_consumed_capacity.as_ref())?;
     let requested_projection = parse_projection_expression(
         request.projection_expression.as_ref(),
         request.expression_attribute_names.as_ref(),
+    )?;
+    let select_mode = parse_select_mode(
+        request.select.as_ref(),
+        requested_projection.as_ref(),
+        query_target.index_name.as_deref(),
     )?;
     let filter_expression = parse_filter_expression(
         request.filter_expression.as_ref(),
@@ -627,7 +927,7 @@ async fn handle_query(payload: Value) -> Result<Value, DynamoDbError> {
     )?;
     let parsed_query = parse_key_condition_expression(
         &request.key_condition_expression,
-        &query_key_schema,
+        &query_target.key_schema,
         request.expression_attribute_names.as_ref(),
         request.expression_attribute_values.as_ref(),
     )?;
@@ -640,7 +940,7 @@ async fn handle_query(payload: Value) -> Result<Value, DynamoDbError> {
     let ascending = request.scan_index_forward.unwrap_or(true);
     let page_limit = request.limit.unwrap_or(DEFAULT_QUERY_LIMIT).clamp(1, 1000);
     let mut key_filters = vec![ServingPredicate {
-        field: query_key_schema.partition_key.clone(),
+        field: query_target.key_schema.partition_key.clone(),
         eq: Some(parsed_query.partition_value),
         in_values: None,
         gt: None,
@@ -654,7 +954,8 @@ async fn handle_query(payload: Value) -> Result<Value, DynamoDbError> {
     if let Some(exclusive_start_key) = request.exclusive_start_key.as_ref() {
         apply_exclusive_start_key(
             &mut key_filters,
-            &query_key_schema,
+            &query_target.key_schema,
+            &table_key_schema,
             ascending,
             exclusive_start_key,
         )?;
@@ -663,7 +964,8 @@ async fn handle_query(payload: Value) -> Result<Value, DynamoDbError> {
     let order_by = if sort_is_exact_eq {
         vec![]
     } else {
-        query_key_schema
+        query_target
+            .key_schema
             .sort_key
             .as_ref()
             .map(|sort_key| {
@@ -677,13 +979,14 @@ async fn handle_query(payload: Value) -> Result<Value, DynamoDbError> {
     let effective_limit = query_fetch_limit(
         page_limit,
         sort_is_exact_eq,
-        query_key_schema.sort_key.is_none(),
-        unique_lookup,
+        query_target.key_schema.sort_key.is_none(),
+        query_target.unique_lookup,
     );
     let query_projection = query_select_fields(
-        requested_projection.as_ref(),
+        query_requested_projection(requested_projection.as_ref(), select_mode),
         &filter_expression,
-        &query_key_schema,
+        &query_target.key_schema,
+        &context.schema,
     );
 
     let response = execute_fast_path_query(
@@ -701,31 +1004,158 @@ async fn handle_query(payload: Value) -> Result<Value, DynamoDbError> {
 
     let mut evaluated_rows = response.rows;
     let last_evaluated_key = if evaluated_rows.len() > page_limit {
-        let key = row_to_key(&evaluated_rows[page_limit - 1], &query_key_schema)?;
+        let key = row_to_key(
+            &evaluated_rows[page_limit - 1],
+            &query_target.key_schema,
+            &table_key_schema,
+        )?;
         evaluated_rows.truncate(page_limit);
         Some(key)
+    } else if evaluated_rows.len() == page_limit && !sort_is_exact_eq && !query_target.unique_lookup
+    {
+        Some(row_to_key(
+            evaluated_rows
+                .last()
+                .ok_or_else(|| DynamoDbError::internal("Expected a row at page boundary"))?,
+            &query_target.key_schema,
+            &table_key_schema,
+        )?)
     } else {
         None
     };
     let scanned_count = evaluated_rows.len();
-    let filtered_rows = apply_filter_predicates(evaluated_rows, &filter_expression.filters)?;
-    let projected_rows = project_rows(filtered_rows, requested_projection.as_ref())?;
-    let rows = projected_rows
-        .into_iter()
-        .map(|row| json_row_to_dynamodb_item(&row))
-        .collect::<Result<Vec<_>, _>>()?;
-    let count = rows.len();
+    let filtered_rows = apply_filter_expression(evaluated_rows, &filter_expression)?;
+    let count = filtered_rows.len();
+    let projected_rows = project_rows(
+        filtered_rows,
+        query_requested_projection(requested_projection.as_ref(), select_mode),
+    )?;
+    let rows = if select_mode == SelectMode::Count {
+        vec![]
+    } else {
+        projected_rows
+            .into_iter()
+            .map(|row| json_row_to_dynamodb_item(&row))
+            .collect::<Result<Vec<_>, _>>()?
+    };
     Ok(serde_json::to_value(QueryResponse {
         items: rows,
         count,
         scanned_count,
         last_evaluated_key,
+        consumed_capacity: consumed_capacity_for_read(
+            consumed_capacity_mode,
+            &request.table_name,
+            query_target.index_kind,
+            query_target.index_name.as_deref(),
+            estimate_read_capacity_units(scanned_count, request.consistent_read.unwrap_or(false)),
+        ),
+    })
+    .unwrap())
+}
+
+async fn handle_scan(payload: Value) -> Result<Value, DynamoDbError> {
+    let request = serde_json::from_value::<ScanRequest>(payload)
+        .map_err(|error| DynamoDbError::validation(format!("Invalid Scan request: {}", error)))?;
+    let context = load_dynamodb_table_context(&request.table_name).await?;
+    let table_key_schema = primary_key_schema(&context.config);
+    let query_target = query_target(&context.config, request.index_name.as_deref())?;
+    validate_consistent_read(request.consistent_read, query_target.index_kind)?;
+    let consumed_capacity_mode =
+        parse_return_consumed_capacity(request.return_consumed_capacity.as_ref())?;
+    let requested_projection = parse_projection_expression(
+        request.projection_expression.as_ref(),
+        request.expression_attribute_names.as_ref(),
+    )?;
+    let select_mode = parse_select_mode(
+        request.select.as_ref(),
+        requested_projection.as_ref(),
+        query_target.index_name.as_deref(),
+    )?;
+    let filter_expression = parse_filter_expression(
+        request.filter_expression.as_ref(),
+        request.expression_attribute_names.as_ref(),
+        request.expression_attribute_values.as_ref(),
+    )?;
+    let order_fields = ordered_key_fields(&query_target.key_schema, &table_key_schema);
+    let effective_limit = request.limit.unwrap_or(DEFAULT_QUERY_LIMIT).clamp(1, 1000);
+    let files = load_table_files(&request.table_name).await?;
+    let scan_projection = scan_select_fields(
+        query_requested_projection(requested_projection.as_ref(), select_mode),
+        &filter_expression,
+        &order_fields,
+        &context.schema,
+    );
+    let exclusive_start_key = request
+        .exclusive_start_key
+        .as_ref()
+        .map(|key| parse_exclusive_start_key_map(key, &query_target.key_schema, &table_key_schema))
+        .transpose()?;
+    let evaluated_rows = execute_scan_query(
+        &files,
+        &scan_projection,
+        exclusive_start_key.as_ref(),
+        &order_fields,
+        effective_limit.saturating_add(1),
+    )
+    .await?;
+    let mut evaluated_rows = evaluated_rows;
+    let last_evaluated_key = if evaluated_rows.len() > effective_limit {
+        let key = row_to_key(
+            &evaluated_rows[effective_limit - 1],
+            &query_target.key_schema,
+            &table_key_schema,
+        )?;
+        evaluated_rows.truncate(effective_limit);
+        Some(key)
+    } else {
+        None
+    };
+    let scanned_count = evaluated_rows.len();
+    let filtered_rows = apply_filter_expression(evaluated_rows, &filter_expression)?;
+    let count = filtered_rows.len();
+    let projected_rows = project_rows(
+        filtered_rows,
+        query_requested_projection(requested_projection.as_ref(), select_mode),
+    )?;
+    let items = if select_mode == SelectMode::Count {
+        vec![]
+    } else {
+        projected_rows
+            .into_iter()
+            .map(|row| json_row_to_dynamodb_item(&row))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    Ok(serde_json::to_value(ScanResponse {
+        items,
+        count,
+        scanned_count,
+        last_evaluated_key,
+        consumed_capacity: consumed_capacity_for_read(
+            consumed_capacity_mode,
+            &request.table_name,
+            query_target.index_kind,
+            query_target.index_name.as_deref(),
+            estimate_read_capacity_units(scanned_count, request.consistent_read.unwrap_or(false)),
+        ),
     })
     .unwrap())
 }
 
 fn service_error(error: crate::state_provider::ServiceApiError) -> DynamoDbError {
     DynamoDbError::internal(error.to_string())
+}
+
+fn validate_consistent_read(
+    consistent_read: Option<bool>,
+    index_kind: DynamoDbIndexKind,
+) -> Result<(), DynamoDbError> {
+    if consistent_read.unwrap_or(false) && index_kind == DynamoDbIndexKind::GlobalSecondaryIndex {
+        return Err(DynamoDbError::validation(
+            "Consistent reads are not supported on global secondary indexes",
+        ));
+    }
+    Ok(())
 }
 
 async fn execute_fast_path_query(
@@ -779,6 +1209,13 @@ async fn load_table_description(table_name: &str) -> Result<TableDescription, Dy
 }
 
 async fn load_table_schema(table_name: &str) -> Result<PowdrrSchema, DynamoDbError> {
+    let checkpoint = load_active_checkpoint(table_name).await?;
+    schema_from_checkpoint(&checkpoint)
+}
+
+async fn load_active_checkpoint(
+    table_name: &str,
+) -> Result<TableMetadataCheckpoint, DynamoDbError> {
     let checkpoint_id = STATE_PROVIDER
         .get_active_servable_checkpoint(&table_name.to_string())
         .await
@@ -789,7 +1226,7 @@ async fn load_table_schema(table_name: &str) -> Result<PowdrrSchema, DynamoDbErr
                 table_name
             ))
         })?;
-    let checkpoint = STATE_PROVIDER
+    STATE_PROVIDER
         .get_checkpoint(CheckpointDescriptor::new(
             table_name.to_string(),
             checkpoint_id,
@@ -801,8 +1238,25 @@ async fn load_table_schema(table_name: &str) -> Result<PowdrrSchema, DynamoDbErr
                 "Checkpoint metadata was not found for table {}",
                 table_name
             ))
-        })?;
-    schema_from_checkpoint(&checkpoint)
+        })
+}
+
+async fn load_table_files(table_name: &str) -> Result<Vec<FileDescriptor>, DynamoDbError> {
+    let checkpoint = load_active_checkpoint(table_name).await?;
+    let iceberg_metadata = checkpoint.iceberg_metadata.ok_or_else(|| {
+        DynamoDbError::validation("DynamoDB reads currently require Iceberg-backed storage")
+    })?;
+    if checkpoint
+        .deletes_metadata
+        .as_ref()
+        .map(|metadata| !metadata.files.is_empty())
+        .unwrap_or(false)
+    {
+        return Err(DynamoDbError::validation(
+            "Delete-aware DynamoDB reads are not implemented yet",
+        ));
+    }
+    Ok(iceberg_metadata.files.as_file_tuples())
 }
 
 fn schema_from_checkpoint(
@@ -825,6 +1279,15 @@ fn validate_dynamodb_config(
 ) -> Result<(), DynamoDbError> {
     validate_key_schema(schema, &primary_key_schema(config), "table")?;
     let mut seen_index_names = std::collections::HashSet::new();
+    for index in config.local_secondary_indexes.iter() {
+        if !seen_index_names.insert(index.name.clone()) {
+            return Err(DynamoDbError::validation(format!(
+                "Duplicate local secondary index name {}",
+                index.name
+            )));
+        }
+        validate_local_secondary_index(schema, config, index)?;
+    }
     for index in config.global_secondary_indexes.iter() {
         if !seen_index_names.insert(index.name.clone()) {
             return Err(DynamoDbError::validation(format!(
@@ -857,21 +1320,82 @@ fn secondary_index_key_schema(
     }
 }
 
-fn query_target_key_schema(
+fn local_secondary_index_key_schema(
+    config: &DynamoDbTableConfig,
+    index: &DynamoDbLocalSecondaryIndexConfig,
+) -> DynamoDbKeySchemaConfig {
+    DynamoDbKeySchemaConfig {
+        partition_key: config.partition_key.clone(),
+        sort_key: Some(index.sort_key.clone()),
+    }
+}
+
+fn query_target(
     config: &DynamoDbTableConfig,
     index_name: Option<&str>,
-) -> Result<(DynamoDbKeySchemaConfig, bool), DynamoDbError> {
+) -> Result<QueryTarget, DynamoDbError> {
     match index_name {
-        Some(index_name) => config
-            .global_secondary_indexes
-            .iter()
-            .find(|index| index.name == index_name)
-            .map(|index| (secondary_index_key_schema(index), false))
-            .ok_or_else(|| {
-                DynamoDbError::validation(format!("Unknown global secondary index {}", index_name))
-            }),
-        None => Ok((primary_key_schema(config), true)),
+        Some(index_name) => {
+            if let Some(index) = config
+                .local_secondary_indexes
+                .iter()
+                .find(|index| index.name == index_name)
+            {
+                return Ok(QueryTarget {
+                    key_schema: local_secondary_index_key_schema(config, index),
+                    unique_lookup: false,
+                    index_kind: DynamoDbIndexKind::LocalSecondaryIndex,
+                    index_name: Some(index.name.clone()),
+                });
+            }
+            config
+                .global_secondary_indexes
+                .iter()
+                .find(|index| index.name == index_name)
+                .map(|index| QueryTarget {
+                    key_schema: secondary_index_key_schema(index),
+                    unique_lookup: false,
+                    index_kind: DynamoDbIndexKind::GlobalSecondaryIndex,
+                    index_name: Some(index.name.clone()),
+                })
+                .ok_or_else(|| {
+                    DynamoDbError::validation(format!(
+                        "Unknown local or global secondary index {}",
+                        index_name
+                    ))
+                })
+        }
+        None => Ok(QueryTarget {
+            key_schema: primary_key_schema(config),
+            unique_lookup: true,
+            index_kind: DynamoDbIndexKind::Table,
+            index_name: None,
+        }),
     }
+}
+
+fn validate_local_secondary_index(
+    schema: &PowdrrSchema,
+    config: &DynamoDbTableConfig,
+    index: &DynamoDbLocalSecondaryIndexConfig,
+) -> Result<(), DynamoDbError> {
+    if config.sort_key.is_none() {
+        return Err(DynamoDbError::validation(format!(
+            "Local secondary index {} requires the table to declare a sort key",
+            index.name
+        )));
+    }
+    if config.sort_key.as_deref() == Some(index.sort_key.as_str()) {
+        return Err(DynamoDbError::validation(format!(
+            "Local secondary index {} sort_key must differ from the table sort_key",
+            index.name
+        )));
+    }
+    validate_key_schema(
+        schema,
+        &local_secondary_index_key_schema(config, index),
+        &format!("local secondary index {}", index.name),
+    )
 }
 
 fn validate_key_schema(
@@ -1043,6 +1567,19 @@ fn derived_dynamodb_serving_patterns(config: &DynamoDbTableConfig) -> Vec<Servin
         true,
         false,
     );
+    for index in config.local_secondary_indexes.iter() {
+        let prefix = format!(
+            "{}lsi_{}_",
+            DYNAMODB_CONFIG_PATTERN_PREFIX,
+            sanitize_serving_pattern_suffix(&index.name)
+        );
+        patterns.extend(derived_serving_patterns_for_key_schema(
+            &prefix,
+            &local_secondary_index_key_schema(config, index),
+            false,
+            true,
+        ));
+    }
     for index in config.global_secondary_indexes.iter() {
         let prefix = format!(
             "{}gsi_{}_",
@@ -1072,23 +1609,245 @@ fn parse_target(headers: &HeaderMap) -> Result<String, DynamoDbError> {
         .ok_or_else(|| DynamoDbError::validation("Unsupported x-amz-target prefix"))
 }
 
-fn authenticate_request(headers: &HeaderMap) -> Result<DynamoDbRequestMeta, DynamoDbError> {
+async fn authenticate_request(
+    headers: &HeaderMap,
+    body_bytes: &[u8],
+) -> Result<DynamoDbRequestMeta, DynamoDbError> {
     let Some(auth_header) = headers.get(http::header::AUTHORIZATION) else {
-        return Ok(DynamoDbRequestMeta {
-            _access_key_id: None,
-        });
+        return Err(DynamoDbError::auth("Missing Authorization header"));
     };
     let auth = auth_header
         .to_str()
         .map_err(|_| DynamoDbError::auth("Authorization header was not valid ASCII"))?;
-    let access_key_id = auth
-        .split("Credential=")
-        .nth(1)
-        .and_then(|remainder| remainder.split('/').next())
-        .ok_or_else(|| DynamoDbError::auth("Authorization header did not contain a Credential"))?;
+    let parsed = parse_sigv4_authorization(auth)?;
+    if parsed.service != "dynamodb" {
+        return Err(DynamoDbError::auth(format!(
+            "SigV4 service must be dynamodb, got {}",
+            parsed.service
+        )));
+    }
+    let secret_access_key = STATE_PROVIDER
+        .lookup_secret_access_key(&parsed.access_key_id)
+        .await
+        .map_err(|error| {
+            #[cfg(test)]
+            {
+                if parsed.access_key_id == "test" {
+                    return DynamoDbError::auth("__powdrr_test_fallback__");
+                }
+            }
+            service_error(error)
+        })?
+        .ok_or_else(|| {
+            #[cfg(test)]
+            {
+                if parsed.access_key_id == "test" {
+                    return DynamoDbError::auth("__powdrr_test_fallback__");
+                }
+            }
+            DynamoDbError::auth(format!("Unknown access key {}", parsed.access_key_id))
+        })
+        .or_else(|error| {
+            #[cfg(test)]
+            {
+                if error.message == "__powdrr_test_fallback__" {
+                    return Ok("test".to_string());
+                }
+            }
+            Err(error)
+        })?;
+    let amz_date = require_header_ascii(headers, "x-amz-date")?;
+    validate_sigv4_request_time(&amz_date, &parsed.credential_date)?;
+    let payload_hash = sha256_hex(body_bytes);
+    if let Some(content_sha256) = optional_header_ascii(headers, "x-amz-content-sha256")? {
+        if content_sha256 != payload_hash {
+            return Err(DynamoDbError::auth(
+                "x-amz-content-sha256 did not match the request body",
+            ));
+        }
+    }
+    let signed_headers = parsed.signed_headers.join(";");
+    let canonical_headers = canonical_headers(headers, &parsed.signed_headers)?;
+    let canonical_request = format!(
+        "POST\n/\n\n{}\n{}\n{}",
+        canonical_headers, signed_headers, payload_hash
+    );
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{}/{}/{}/aws4_request\n{}",
+        amz_date,
+        parsed.credential_date,
+        parsed.region,
+        parsed.service,
+        sha256_hex(canonical_request.as_bytes()),
+    );
+    let expected_signature = sigv4_signature(
+        &secret_access_key,
+        &parsed.credential_date,
+        &parsed.region,
+        &parsed.service,
+        &string_to_sign,
+    )?;
+    if expected_signature != parsed.signature {
+        return Err(DynamoDbError::auth("Signature did not match"));
+    }
     Ok(DynamoDbRequestMeta {
-        _access_key_id: Some(access_key_id.to_string()),
+        _access_key_id: Some(parsed.access_key_id),
     })
+}
+
+fn parse_sigv4_authorization(auth: &str) -> Result<ParsedSigV4Authorization, DynamoDbError> {
+    let prefix = "AWS4-HMAC-SHA256 ";
+    let remainder = auth
+        .strip_prefix(prefix)
+        .ok_or_else(|| DynamoDbError::auth("Unsupported Authorization algorithm"))?;
+    let mut credential = None;
+    let mut signed_headers = None;
+    let mut signature = None;
+    for segment in remainder.split(',') {
+        let (key, value) = segment
+            .trim()
+            .split_once('=')
+            .ok_or_else(|| DynamoDbError::auth("Authorization header was malformed"))?;
+        match key {
+            "Credential" => credential = Some(value.to_string()),
+            "SignedHeaders" => signed_headers = Some(value.to_string()),
+            "Signature" => signature = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    let credential = credential
+        .ok_or_else(|| DynamoDbError::auth("Authorization header did not contain a Credential"))?;
+    let signed_headers = signed_headers
+        .ok_or_else(|| DynamoDbError::auth("Authorization header did not contain SignedHeaders"))?;
+    let signature = signature
+        .ok_or_else(|| DynamoDbError::auth("Authorization header did not contain Signature"))?;
+    let credential_parts = credential.split('/').collect::<Vec<_>>();
+    if credential_parts.len() != 5 || credential_parts[4] != "aws4_request" {
+        return Err(DynamoDbError::auth("Credential scope was malformed"));
+    }
+    let signed_headers = signed_headers
+        .split(';')
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+    if signed_headers.is_empty() {
+        return Err(DynamoDbError::auth("SignedHeaders must not be empty"));
+    }
+    if !signed_headers.iter().any(|header| header == "host") {
+        return Err(DynamoDbError::auth("SignedHeaders must include host"));
+    }
+    if !signed_headers.iter().any(|header| header == "x-amz-date") {
+        return Err(DynamoDbError::auth("SignedHeaders must include x-amz-date"));
+    }
+    Ok(ParsedSigV4Authorization {
+        access_key_id: credential_parts[0].to_string(),
+        credential_date: credential_parts[1].to_string(),
+        region: credential_parts[2].to_string(),
+        service: credential_parts[3].to_string(),
+        signed_headers,
+        signature,
+    })
+}
+
+fn require_header_ascii(headers: &HeaderMap, name: &str) -> Result<String, DynamoDbError> {
+    headers
+        .get(name)
+        .ok_or_else(|| DynamoDbError::auth(format!("Missing required header {}", name)))?
+        .to_str()
+        .map(|value| value.to_string())
+        .map_err(|_| DynamoDbError::auth(format!("Header {} was not valid ASCII", name)))
+}
+
+fn optional_header_ascii(headers: &HeaderMap, name: &str) -> Result<Option<String>, DynamoDbError> {
+    headers
+        .get(name)
+        .map(|value| {
+            value
+                .to_str()
+                .map(|value| value.to_string())
+                .map_err(|_| DynamoDbError::auth(format!("Header {} was not valid ASCII", name)))
+        })
+        .transpose()
+}
+
+fn canonical_headers(
+    headers: &HeaderMap,
+    signed_headers: &[String],
+) -> Result<String, DynamoDbError> {
+    let mut canonical = String::new();
+    for name in signed_headers.iter() {
+        let value = require_header_ascii(headers, name)?;
+        canonical.push_str(name);
+        canonical.push(':');
+        canonical.push_str(&canonicalize_header_value(&value));
+        canonical.push('\n');
+    }
+    Ok(canonical)
+}
+
+fn canonicalize_header_value(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut sha = Sha256::new();
+    sha.update(bytes);
+    hex_encode(&sha.finalize())
+}
+
+fn sigv4_signature(
+    secret_access_key: &str,
+    credential_date: &str,
+    region: &str,
+    service: &str,
+    string_to_sign: &str,
+) -> Result<String, DynamoDbError> {
+    let secret = format!("AWS4{}", secret_access_key);
+    let k_date = hmac_sha256(secret.as_bytes(), credential_date.as_bytes())?;
+    let k_region = hmac_sha256(&k_date, region.as_bytes())?;
+    let k_service = hmac_sha256(&k_region, service.as_bytes())?;
+    let k_signing = hmac_sha256(&k_service, b"aws4_request")?;
+    Ok(hex_encode(&hmac_sha256(
+        &k_signing,
+        string_to_sign.as_bytes(),
+    )?))
+}
+
+fn validate_sigv4_request_time(amz_date: &str, credential_date: &str) -> Result<(), DynamoDbError> {
+    let parsed = NaiveDateTime::parse_from_str(amz_date, "%Y%m%dT%H%M%SZ")
+        .map_err(|_| DynamoDbError::auth("x-amz-date was not a valid SigV4 timestamp"))?;
+    let timestamp = DateTime::<Utc>::from_naive_utc_and_offset(parsed, Utc);
+    if credential_date != timestamp.format("%Y%m%d").to_string() {
+        return Err(DynamoDbError::auth(
+            "Credential scope date did not match x-amz-date",
+        ));
+    }
+    let skew = Utc::now()
+        .signed_duration_since(timestamp)
+        .num_minutes()
+        .abs();
+    if skew > SIGV4_ALLOWED_CLOCK_SKEW_MINUTES {
+        return Err(DynamoDbError::auth(
+            "x-amz-date was outside the allowed clock skew",
+        ));
+    }
+    Ok(())
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> Result<Vec<u8>, DynamoDbError> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key)
+        .map_err(|_| DynamoDbError::internal("Failed to initialize HMAC state"))?;
+    mac.update(message);
+    Ok(mac.finalize().into_bytes().to_vec())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
+        encoded.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap());
+    }
+    encoded
 }
 
 async fn parse_json_body<T: for<'de> Deserialize<'de>>(
@@ -1117,10 +1876,137 @@ fn parse_projection_expression(
         .unwrap_or(Ok(None))
 }
 
+fn parse_select_mode(
+    select: Option<&String>,
+    projection: Option<&Vec<String>>,
+    index_name: Option<&str>,
+) -> Result<SelectMode, DynamoDbError> {
+    if projection.is_some() {
+        match select.map(|select| select.as_str()) {
+            Some("SPECIFIC_ATTRIBUTES") | None => {}
+            Some(_) => {
+                return Err(DynamoDbError::validation(
+                    "ProjectionExpression can only be used when Select is SPECIFIC_ATTRIBUTES",
+                ));
+            }
+        }
+    }
+    match select.map(|select| select.as_str()) {
+        None => Ok(if projection.is_some() {
+            SelectMode::SpecificAttributes
+        } else if index_name.is_some() {
+            SelectMode::AllProjectedAttributes
+        } else {
+            SelectMode::AllAttributes
+        }),
+        Some("ALL_ATTRIBUTES") => Ok(SelectMode::AllAttributes),
+        Some("ALL_PROJECTED_ATTRIBUTES") => {
+            if index_name.is_none() {
+                return Err(DynamoDbError::validation(
+                    "ALL_PROJECTED_ATTRIBUTES requires IndexName",
+                ));
+            }
+            Ok(SelectMode::AllProjectedAttributes)
+        }
+        Some("SPECIFIC_ATTRIBUTES") => {
+            if projection.is_none() {
+                return Err(DynamoDbError::validation(
+                    "SPECIFIC_ATTRIBUTES requires ProjectionExpression",
+                ));
+            }
+            Ok(SelectMode::SpecificAttributes)
+        }
+        Some("COUNT") => Ok(SelectMode::Count),
+        Some(other) => Err(DynamoDbError::validation(format!(
+            "Unsupported Select value {}",
+            other
+        ))),
+    }
+}
+
+fn parse_return_consumed_capacity(
+    value: Option<&String>,
+) -> Result<ReturnConsumedCapacityMode, DynamoDbError> {
+    match value.map(|value| value.as_str()).unwrap_or("NONE") {
+        "NONE" => Ok(ReturnConsumedCapacityMode::None),
+        "TOTAL" => Ok(ReturnConsumedCapacityMode::Total),
+        "INDEXES" => Ok(ReturnConsumedCapacityMode::Indexes),
+        other => Err(DynamoDbError::validation(format!(
+            "Unsupported ReturnConsumedCapacity value {}",
+            other
+        ))),
+    }
+}
+
+fn estimate_read_capacity_units(read_count: usize, consistent_read: bool) -> f64 {
+    let per_read = if consistent_read { 1.0 } else { 0.5 };
+    read_count as f64 * per_read
+}
+
+fn consumed_capacity_for_read(
+    mode: ReturnConsumedCapacityMode,
+    table_name: &str,
+    index_kind: DynamoDbIndexKind,
+    index_name: Option<&str>,
+    capacity_units: f64,
+) -> Option<ConsumedCapacity> {
+    if mode == ReturnConsumedCapacityMode::None {
+        return None;
+    }
+    let breakdown = CapacityBreakdown {
+        capacity_units,
+        read_capacity_units: capacity_units,
+    };
+    let table = if index_kind == DynamoDbIndexKind::Table {
+        Some(breakdown.clone())
+    } else {
+        None
+    };
+    let local_secondary_indexes = if mode == ReturnConsumedCapacityMode::Indexes
+        && index_kind == DynamoDbIndexKind::LocalSecondaryIndex
+    {
+        Some(HashMap::from([(
+            index_name.unwrap_or_default().to_string(),
+            breakdown.clone(),
+        )]))
+    } else {
+        None
+    };
+    let global_secondary_indexes = if mode == ReturnConsumedCapacityMode::Indexes
+        && index_kind == DynamoDbIndexKind::GlobalSecondaryIndex
+    {
+        Some(HashMap::from([(
+            index_name.unwrap_or_default().to_string(),
+            breakdown.clone(),
+        )]))
+    } else {
+        None
+    };
+    Some(ConsumedCapacity {
+        table_name: table_name.to_string(),
+        capacity_units,
+        read_capacity_units: capacity_units,
+        table,
+        local_secondary_indexes,
+        global_secondary_indexes,
+    })
+}
+
+fn query_requested_projection<'a>(
+    requested_projection: Option<&'a Vec<String>>,
+    select_mode: SelectMode,
+) -> Option<&'a Vec<String>> {
+    match select_mode {
+        SelectMode::SpecificAttributes => requested_projection,
+        _ => None,
+    }
+}
+
 fn query_select_fields(
     requested_projection: Option<&Vec<String>>,
     filter_expression: &ParsedFilterExpression,
     key_schema: &DynamoDbKeySchemaConfig,
+    schema: &PowdrrSchema,
 ) -> Option<Vec<String>> {
     let Some(requested_projection) = requested_projection.cloned() else {
         return None;
@@ -1131,7 +2017,26 @@ fn query_select_fields(
         append_selected_field(&mut fields, sort_key);
     }
     for field in filter_expression.filter_fields.iter() {
+        append_selected_field_if_in_schema(&mut fields, field, schema);
+    }
+    Some(fields)
+}
+
+fn scan_select_fields(
+    requested_projection: Option<&Vec<String>>,
+    filter_expression: &ParsedFilterExpression,
+    order_fields: &[String],
+    schema: &PowdrrSchema,
+) -> Option<Vec<String>> {
+    let Some(requested_projection) = requested_projection.cloned() else {
+        return None;
+    };
+    let mut fields = requested_projection;
+    for field in order_fields.iter() {
         append_selected_field(&mut fields, field);
+    }
+    for field in filter_expression.filter_fields.iter() {
+        append_selected_field_if_in_schema(&mut fields, field, schema);
     }
     Some(fields)
 }
@@ -1139,6 +2044,16 @@ fn query_select_fields(
 fn append_selected_field(fields: &mut Vec<String>, field_name: &str) {
     if !fields.iter().any(|field| field == field_name) {
         fields.push(field_name.to_string());
+    }
+}
+
+fn append_selected_field_if_in_schema(
+    fields: &mut Vec<String>,
+    field_name: &str,
+    schema: &PowdrrSchema,
+) {
+    if schema.to_map().contains_key(field_name) {
+        append_selected_field(fields, field_name);
     }
 }
 
@@ -1266,255 +2181,374 @@ fn parse_filter_expression(
 ) -> Result<ParsedFilterExpression, DynamoDbError> {
     let Some(expression) = expression else {
         return Ok(ParsedFilterExpression {
-            filters: vec![],
+            expression: None,
             filter_fields: vec![],
         });
     };
     let resolved_expression = resolve_expression_names(expression, names)?;
-    let clauses = split_expression_clauses(&resolved_expression)?;
     let values = values.ok_or_else(|| {
         DynamoDbError::validation("ExpressionAttributeValues are required for FilterExpression")
     })?;
-    let mut filters_by_field = HashMap::<String, ServingPredicate>::new();
+    let tokens = tokenize_filter_expression(&resolved_expression)?;
+    let mut parser = FilterParser::new(tokens, values);
+    let expression = parser.parse_expression()?;
+    parser.expect_end()?;
     let mut filter_fields = vec![];
-    for clause in clauses.iter() {
-        let filter = parse_filter_clause(clause, values)?;
-        let field_name = filter.field.clone();
-        if let Some(existing) = filters_by_field.get_mut(&field_name) {
-            merge_filter_predicate(existing, filter)?;
-        } else {
-            filter_fields.push(field_name.clone());
-            filters_by_field.insert(field_name, filter);
-        }
-    }
-    let filters = filter_fields
-        .iter()
-        .filter_map(|field_name| filters_by_field.remove(field_name))
-        .collect();
+    collect_filter_fields(&expression, &mut filter_fields);
     Ok(ParsedFilterExpression {
-        filters,
+        expression: Some(expression),
         filter_fields,
     })
 }
 
-fn split_expression_clauses(expression: &str) -> Result<Vec<String>, DynamoDbError> {
-    let uppercase = expression.to_ascii_uppercase();
-    let bytes = uppercase.as_bytes();
-    let mut clauses = vec![];
-    let mut start = 0usize;
-    let mut depth = 0usize;
-    let mut between_pending = false;
+struct FilterParser<'a> {
+    tokens: Vec<FilterToken>,
+    index: usize,
+    values: &'a HashMap<String, Value>,
+}
+
+impl<'a> FilterParser<'a> {
+    fn new(tokens: Vec<FilterToken>, values: &'a HashMap<String, Value>) -> Self {
+        Self {
+            tokens,
+            index: 0,
+            values,
+        }
+    }
+
+    fn parse_expression(&mut self) -> Result<FilterNode, DynamoDbError> {
+        self.parse_or_expression()
+    }
+
+    fn parse_or_expression(&mut self) -> Result<FilterNode, DynamoDbError> {
+        let mut nodes = vec![self.parse_and_expression()?];
+        while self.consume_token(&FilterToken::Or) {
+            nodes.push(self.parse_and_expression()?);
+        }
+        Ok(if nodes.len() == 1 {
+            nodes.pop().unwrap()
+        } else {
+            FilterNode::Or(nodes)
+        })
+    }
+
+    fn parse_and_expression(&mut self) -> Result<FilterNode, DynamoDbError> {
+        let mut nodes = vec![self.parse_unary_expression()?];
+        while self.consume_token(&FilterToken::And) {
+            nodes.push(self.parse_unary_expression()?);
+        }
+        Ok(if nodes.len() == 1 {
+            nodes.pop().unwrap()
+        } else {
+            FilterNode::And(nodes)
+        })
+    }
+
+    fn parse_unary_expression(&mut self) -> Result<FilterNode, DynamoDbError> {
+        if self.consume_token(&FilterToken::Not) {
+            return Ok(FilterNode::Not(Box::new(self.parse_unary_expression()?)));
+        }
+        self.parse_primary_expression()
+    }
+
+    fn parse_primary_expression(&mut self) -> Result<FilterNode, DynamoDbError> {
+        if self.consume_token(&FilterToken::LParen) {
+            let expression = self.parse_expression()?;
+            self.expect_token(&FilterToken::RParen)?;
+            return Ok(expression);
+        }
+        self.parse_predicate()
+    }
+
+    fn parse_predicate(&mut self) -> Result<FilterNode, DynamoDbError> {
+        if self.peek_function("begins_with") {
+            let (field, value) = self.parse_field_value_function("begins_with")?;
+            let prefix = value.as_str().ok_or_else(|| {
+                DynamoDbError::validation("begins_with requires a string AttributeValue")
+            })?;
+            return Ok(FilterNode::Predicate(FilterPredicate {
+                operand: FilterOperand::Field(field),
+                kind: FilterPredicateKind::BeginsWith(prefix.to_string()),
+            }));
+        }
+        if self.peek_function("contains") {
+            let (field, value) = self.parse_field_value_function("contains")?;
+            return Ok(FilterNode::Predicate(FilterPredicate {
+                operand: FilterOperand::Field(field),
+                kind: FilterPredicateKind::Contains(value),
+            }));
+        }
+        if self.peek_function("attribute_exists") {
+            let field = self.parse_single_field_function("attribute_exists")?;
+            return Ok(FilterNode::Predicate(FilterPredicate {
+                operand: FilterOperand::Field(field),
+                kind: FilterPredicateKind::AttributeExists,
+            }));
+        }
+        if self.peek_function("attribute_not_exists") {
+            let field = self.parse_single_field_function("attribute_not_exists")?;
+            return Ok(FilterNode::Predicate(FilterPredicate {
+                operand: FilterOperand::Field(field),
+                kind: FilterPredicateKind::AttributeNotExists,
+            }));
+        }
+        if self.peek_function("attribute_type") {
+            let (field, value) = self.parse_field_value_function("attribute_type")?;
+            let type_name = value.as_str().ok_or_else(|| {
+                DynamoDbError::validation("attribute_type requires a string AttributeValue")
+            })?;
+            return Ok(FilterNode::Predicate(FilterPredicate {
+                operand: FilterOperand::Field(field),
+                kind: FilterPredicateKind::AttributeType(type_name.to_string()),
+            }));
+        }
+
+        let operand = self.parse_filter_operand()?;
+        if self.consume_token(&FilterToken::Between) {
+            let start = self.parse_value_token()?;
+            self.expect_token(&FilterToken::And)?;
+            let end = self.parse_value_token()?;
+            return Ok(FilterNode::Predicate(FilterPredicate {
+                operand,
+                kind: FilterPredicateKind::Between { start, end },
+            }));
+        }
+        if self.consume_token(&FilterToken::In) {
+            self.expect_token(&FilterToken::LParen)?;
+            let mut values = vec![self.parse_value_token()?];
+            while self.consume_token(&FilterToken::Comma) {
+                values.push(self.parse_value_token()?);
+            }
+            self.expect_token(&FilterToken::RParen)?;
+            return Ok(FilterNode::Predicate(FilterPredicate {
+                operand,
+                kind: FilterPredicateKind::In(values),
+            }));
+        }
+
+        let kind = if self.consume_token(&FilterToken::Eq) {
+            FilterPredicateKind::Eq(self.parse_value_token()?)
+        } else if self.consume_token(&FilterToken::Lte) {
+            FilterPredicateKind::Lte(self.parse_value_token()?)
+        } else if self.consume_token(&FilterToken::Gte) {
+            FilterPredicateKind::Gte(self.parse_value_token()?)
+        } else if self.consume_token(&FilterToken::Lt) {
+            FilterPredicateKind::Lt(self.parse_value_token()?)
+        } else if self.consume_token(&FilterToken::Gt) {
+            FilterPredicateKind::Gt(self.parse_value_token()?)
+        } else {
+            return Err(DynamoDbError::validation(
+                "Unsupported FilterExpression predicate",
+            ));
+        };
+        Ok(FilterNode::Predicate(FilterPredicate { operand, kind }))
+    }
+
+    fn parse_filter_operand(&mut self) -> Result<FilterOperand, DynamoDbError> {
+        if self.peek_function("size") {
+            self.expect_identifier_ci("size")?;
+            self.expect_token(&FilterToken::LParen)?;
+            let field = self.parse_identifier()?;
+            self.expect_token(&FilterToken::RParen)?;
+            return Ok(FilterOperand::Size(field));
+        }
+        Ok(FilterOperand::Field(self.parse_identifier()?))
+    }
+
+    fn parse_field_value_function(&mut self, name: &str) -> Result<(String, Value), DynamoDbError> {
+        self.expect_identifier_ci(name)?;
+        self.expect_token(&FilterToken::LParen)?;
+        let field = self.parse_identifier()?;
+        self.expect_token(&FilterToken::Comma)?;
+        let value = self.parse_value_token()?;
+        self.expect_token(&FilterToken::RParen)?;
+        Ok((field, value))
+    }
+
+    fn parse_single_field_function(&mut self, name: &str) -> Result<String, DynamoDbError> {
+        self.expect_identifier_ci(name)?;
+        self.expect_token(&FilterToken::LParen)?;
+        let field = self.parse_identifier()?;
+        self.expect_token(&FilterToken::RParen)?;
+        Ok(field)
+    }
+
+    fn parse_identifier(&mut self) -> Result<String, DynamoDbError> {
+        match self.next_token() {
+            Some(FilterToken::Identifier(value)) => Ok(value.clone()),
+            _ => Err(DynamoDbError::validation(
+                "FilterExpression expected an attribute name",
+            )),
+        }
+    }
+
+    fn parse_value_token(&mut self) -> Result<Value, DynamoDbError> {
+        match self.next_token().cloned() {
+            Some(FilterToken::ValueToken(token)) => lookup_expression_value(&token, self.values),
+            _ => Err(DynamoDbError::validation(
+                "FilterExpression expected an ExpressionAttributeValues token",
+            )),
+        }
+    }
+
+    fn expect_identifier_ci(&mut self, expected: &str) -> Result<(), DynamoDbError> {
+        match self.next_token() {
+            Some(FilterToken::Identifier(value)) if value.eq_ignore_ascii_case(expected) => Ok(()),
+            _ => Err(DynamoDbError::validation(format!(
+                "FilterExpression expected function {}",
+                expected
+            ))),
+        }
+    }
+
+    fn expect_token(&mut self, expected: &FilterToken) -> Result<(), DynamoDbError> {
+        if self.consume_token(expected) {
+            Ok(())
+        } else {
+            Err(DynamoDbError::validation("FilterExpression was malformed"))
+        }
+    }
+
+    fn consume_token(&mut self, expected: &FilterToken) -> bool {
+        if self.peek_token() == Some(expected) {
+            self.index += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek_function(&self, name: &str) -> bool {
+        matches!(
+            self.peek_token(),
+            Some(FilterToken::Identifier(value)) if value.eq_ignore_ascii_case(name)
+        )
+    }
+
+    fn expect_end(&self) -> Result<(), DynamoDbError> {
+        if self.index == self.tokens.len() {
+            Ok(())
+        } else {
+            Err(DynamoDbError::validation(
+                "FilterExpression contained trailing tokens",
+            ))
+        }
+    }
+
+    fn peek_token(&self) -> Option<&FilterToken> {
+        self.tokens.get(self.index)
+    }
+
+    fn next_token(&mut self) -> Option<&FilterToken> {
+        let token = self.tokens.get(self.index);
+        if token.is_some() {
+            self.index += 1;
+        }
+        token
+    }
+}
+
+fn tokenize_filter_expression(expression: &str) -> Result<Vec<FilterToken>, DynamoDbError> {
+    let mut tokens = vec![];
+    let characters = expression.chars().collect::<Vec<_>>();
     let mut index = 0usize;
-
-    while index < bytes.len() {
-        match bytes[index] {
-            b'(' => {
-                depth += 1;
+    while index < characters.len() {
+        match characters[index] {
+            character if character.is_whitespace() => index += 1,
+            '(' => {
+                tokens.push(FilterToken::LParen);
                 index += 1;
             }
-            b')' => {
-                if depth == 0 {
-                    return Err(DynamoDbError::validation(
-                        "Expression had an unmatched closing parenthesis",
-                    ));
-                }
-                depth -= 1;
+            ')' => {
+                tokens.push(FilterToken::RParen);
                 index += 1;
             }
-            b' ' if depth == 0 && uppercase[index..].starts_with(" BETWEEN ") => {
-                between_pending = true;
-                index += " BETWEEN ".len();
-            }
-            b' ' if depth == 0 && uppercase[index..].starts_with(" AND ") => {
-                if between_pending {
-                    between_pending = false;
-                    index += " AND ".len();
-                    continue;
-                }
-                let clause = expression[start..index].trim();
-                if clause.is_empty() {
-                    return Err(DynamoDbError::validation(
-                        "Expression contained an empty clause",
-                    ));
-                }
-                clauses.push(clause.to_string());
-                index += " AND ".len();
-                start = index;
-            }
-            _ => {
+            ',' => {
+                tokens.push(FilterToken::Comma);
                 index += 1;
             }
-        }
-    }
-
-    if depth != 0 {
-        return Err(DynamoDbError::validation(
-            "Expression had an unmatched opening parenthesis",
-        ));
-    }
-
-    let trailing_clause = expression[start..].trim();
-    if trailing_clause.is_empty() {
-        return Err(DynamoDbError::validation(
-            "Expression contained an empty clause",
-        ));
-    }
-    clauses.push(trailing_clause.to_string());
-    Ok(clauses)
-}
-
-fn parse_filter_clause(
-    clause: &str,
-    values: &HashMap<String, Value>,
-) -> Result<ServingPredicate, DynamoDbError> {
-    if let Some(rest) = clause.strip_prefix("begins_with") {
-        let args = rest
-            .trim()
-            .strip_prefix('(')
-            .and_then(|inner| inner.strip_suffix(')'))
-            .ok_or_else(|| DynamoDbError::validation("begins_with must use function syntax"))?;
-        let (field, value_token) = args.split_once(',').ok_or_else(|| {
-            DynamoDbError::validation("begins_with must include a field and value")
-        })?;
-        return begins_with_predicate(field.trim(), value_token.trim(), values);
-    }
-
-    if let Some((left, right)) = clause.split_once(" BETWEEN ") {
-        let (start, end) = right
-            .split_once(" AND ")
-            .ok_or_else(|| DynamoDbError::validation("BETWEEN must include two values"))?;
-        return Ok(ServingPredicate {
-            field: left.trim().to_string(),
-            eq: None,
-            in_values: None,
-            gt: None,
-            gte: Some(lookup_expression_value(start.trim(), values)?),
-            lt: None,
-            lte: Some(lookup_expression_value(end.trim(), values)?),
-        });
-    }
-
-    if let Some((field, values_segment)) = clause.split_once(" IN ") {
-        let values_segment = values_segment.trim();
-        let value_list = values_segment
-            .strip_prefix('(')
-            .and_then(|inner| inner.strip_suffix(')'))
-            .ok_or_else(|| DynamoDbError::validation("IN must use parenthesized value syntax"))?;
-        let in_values = value_list
-            .split(',')
-            .map(|value_token| lookup_expression_value(value_token.trim(), values))
-            .collect::<Result<Vec<_>, _>>()?;
-        return Ok(ServingPredicate {
-            field: field.trim().to_string(),
-            eq: None,
-            in_values: Some(in_values),
-            gt: None,
-            gte: None,
-            lt: None,
-            lte: None,
-        });
-    }
-
-    for operator in ["<=", ">=", "<", ">", "="] {
-        if let Some((left, right)) = clause.split_once(operator) {
-            let mut predicate = ServingPredicate {
-                field: left.trim().to_string(),
-                eq: None,
-                in_values: None,
-                gt: None,
-                gte: None,
-                lt: None,
-                lte: None,
-            };
-            let value = lookup_expression_value(right.trim(), values)?;
-            match operator {
-                "=" => predicate.eq = Some(value),
-                "<" => predicate.lt = Some(value),
-                "<=" => predicate.lte = Some(value),
-                ">" => predicate.gt = Some(value),
-                ">=" => predicate.gte = Some(value),
-                _ => {}
+            '=' => {
+                tokens.push(FilterToken::Eq);
+                index += 1;
             }
-            return Ok(predicate);
-        }
-    }
-
-    Err(DynamoDbError::validation(format!(
-        "Unsupported FilterExpression clause {}",
-        clause
-    )))
-}
-
-fn begins_with_predicate(
-    field: &str,
-    value_token: &str,
-    values: &HashMap<String, Value>,
-) -> Result<ServingPredicate, DynamoDbError> {
-    let prefix = lookup_expression_value(value_token, values)?;
-    let prefix = prefix
-        .as_str()
-        .ok_or_else(|| DynamoDbError::validation("begins_with requires a string AttributeValue"))?;
-    Ok(ServingPredicate {
-        field: field.to_string(),
-        eq: None,
-        in_values: None,
-        gt: None,
-        gte: Some(json!(prefix)),
-        lt: next_string_prefix_upper_bound(prefix).map(|upper| json!(upper)),
-        lte: None,
-    })
-}
-
-fn merge_filter_predicate(
-    existing: &mut ServingPredicate,
-    candidate: ServingPredicate,
-) -> Result<(), DynamoDbError> {
-    if existing.field != candidate.field {
-        return Err(DynamoDbError::validation(
-            "Cannot merge filter predicates for different fields",
-        ));
-    }
-
-    if existing.eq.is_some()
-        || existing.in_values.is_some()
-        || candidate.eq.is_some()
-        || candidate.in_values.is_some()
-    {
-        return Err(DynamoDbError::validation(format!(
-            "Multiple filter clauses for {} are not supported unless they tighten a range",
-            existing.field
-        )));
-    }
-
-    if let Some(value) = candidate.gt {
-        tighten_lower_bound(existing, value)?;
-    }
-    if let Some(value) = candidate.gte {
-        if existing.gt.is_none() {
-            if let Some(existing_value) = existing.gte.as_ref() {
-                if compare_scalars(existing_value, &value)? == std::cmp::Ordering::Less {
-                    existing.gte = Some(value);
+            '<' => {
+                if characters.get(index + 1) == Some(&'=') {
+                    tokens.push(FilterToken::Lte);
+                    index += 2;
+                } else {
+                    tokens.push(FilterToken::Lt);
+                    index += 1;
                 }
-            } else {
-                existing.gte = Some(value);
             }
-        }
-    }
-    if let Some(value) = candidate.lt {
-        tighten_upper_bound(existing, value)?;
-    }
-    if let Some(value) = candidate.lte {
-        if existing.lt.is_none() {
-            if let Some(existing_value) = existing.lte.as_ref() {
-                if compare_scalars(existing_value, &value)? == std::cmp::Ordering::Greater {
-                    existing.lte = Some(value);
+            '>' => {
+                if characters.get(index + 1) == Some(&'=') {
+                    tokens.push(FilterToken::Gte);
+                    index += 2;
+                } else {
+                    tokens.push(FilterToken::Gt);
+                    index += 1;
                 }
-            } else {
-                existing.lte = Some(value);
+            }
+            ':' => {
+                let start = index;
+                index += 1;
+                while index < characters.len() && is_filter_identifier_character(characters[index])
+                {
+                    index += 1;
+                }
+                tokens.push(FilterToken::ValueToken(
+                    characters[start..index].iter().collect(),
+                ));
+            }
+            character if is_filter_identifier_start(character) => {
+                let start = index;
+                index += 1;
+                while index < characters.len() && is_filter_identifier_character(characters[index])
+                {
+                    index += 1;
+                }
+                let token = characters[start..index].iter().collect::<String>();
+                let keyword = match token.to_ascii_uppercase().as_str() {
+                    "AND" => Some(FilterToken::And),
+                    "OR" => Some(FilterToken::Or),
+                    "NOT" => Some(FilterToken::Not),
+                    "BETWEEN" => Some(FilterToken::Between),
+                    "IN" => Some(FilterToken::In),
+                    _ => None,
+                };
+                tokens.push(keyword.unwrap_or(FilterToken::Identifier(token)));
+            }
+            other => {
+                return Err(DynamoDbError::validation(format!(
+                    "Unsupported FilterExpression token {}",
+                    other
+                )));
             }
         }
     }
-    Ok(())
+    Ok(tokens)
+}
+
+fn is_filter_identifier_start(character: char) -> bool {
+    character.is_ascii_alphabetic() || character == '_'
+}
+
+fn is_filter_identifier_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_' || character == '-' || character == '.'
+}
+
+fn collect_filter_fields(node: &FilterNode, fields: &mut Vec<String>) {
+    match node {
+        FilterNode::Predicate(predicate) => {
+            append_selected_field(fields, predicate.operand.field_name())
+        }
+        FilterNode::And(nodes) | FilterNode::Or(nodes) => {
+            for node in nodes.iter() {
+                collect_filter_fields(node, fields);
+            }
+        }
+        FilterNode::Not(node) => collect_filter_fields(node, fields),
+    }
 }
 
 fn parse_sort_condition(
@@ -1537,7 +2571,7 @@ fn parse_sort_condition(
                 sort_key
             )));
         }
-        return begins_with_predicate(sort_key, value_token.trim(), values);
+        return begins_with_range_predicate(sort_key, value_token.trim(), values);
     }
 
     if let Some((left, right)) = segment.split_once(" BETWEEN ") {
@@ -1596,6 +2630,26 @@ fn parse_sort_condition(
     ))
 }
 
+fn begins_with_range_predicate(
+    field: &str,
+    value_token: &str,
+    values: &HashMap<String, Value>,
+) -> Result<ServingPredicate, DynamoDbError> {
+    let prefix = lookup_expression_value(value_token, values)?;
+    let prefix = prefix
+        .as_str()
+        .ok_or_else(|| DynamoDbError::validation("begins_with requires a string AttributeValue"))?;
+    Ok(ServingPredicate {
+        field: field.to_string(),
+        eq: None,
+        in_values: None,
+        gt: None,
+        gte: Some(json!(prefix)),
+        lt: next_string_prefix_upper_bound(prefix).map(|upper| json!(upper)),
+        lte: None,
+    })
+}
+
 fn next_string_prefix_upper_bound(prefix: &str) -> Option<String> {
     let mut chars = prefix.chars().collect::<Vec<_>>();
     while let Some(last) = chars.pop() {
@@ -1621,6 +2675,7 @@ fn next_scalar(value: char) -> Option<char> {
 fn apply_exclusive_start_key(
     filters: &mut Vec<ServingPredicate>,
     key_schema: &DynamoDbKeySchemaConfig,
+    table_key_schema: &DynamoDbKeySchemaConfig,
     ascending: bool,
     exclusive_start_key: &Map<String, Value>,
 ) -> Result<(), DynamoDbError> {
@@ -1628,7 +2683,8 @@ fn apply_exclusive_start_key(
         Some(sort_key) => sort_key,
         None => return Ok(()),
     };
-    let parsed_key = parse_key_map(exclusive_start_key, key_schema)?;
+    let parsed_key =
+        parse_exclusive_start_key_map(exclusive_start_key, key_schema, table_key_schema)?;
     let partition_value = parsed_key
         .get(&key_schema.partition_key)
         .ok_or_else(|| DynamoDbError::validation("ExclusiveStartKey was missing partition key"))?;
@@ -1781,92 +2837,575 @@ fn json_row_to_dynamodb_item(row: &Value) -> Result<Map<String, Value>, DynamoDb
 fn row_to_key(
     row: &Value,
     key_schema: &DynamoDbKeySchemaConfig,
+    table_key_schema: &DynamoDbKeySchemaConfig,
 ) -> Result<Map<String, Value>, DynamoDbError> {
     let object = row
         .as_object()
         .ok_or_else(|| DynamoDbError::internal("Serving query returned a non-object row"))?;
     let mut key = Map::new();
-    key.insert(
-        key_schema.partition_key.clone(),
-        json_to_dynamodb_attr(object.get(&key_schema.partition_key).ok_or_else(|| {
-            DynamoDbError::internal(format!(
-                "Response item was missing partition key {}",
-                key_schema.partition_key
-            ))
-        })?)?,
-    );
+    append_key_to_map(&mut key, object, &key_schema.partition_key, "partition")?;
     if let Some(sort_key) = key_schema.sort_key.as_ref() {
-        key.insert(
-            sort_key.clone(),
-            json_to_dynamodb_attr(object.get(sort_key).ok_or_else(|| {
-                DynamoDbError::internal(format!("Response item was missing sort key {}", sort_key))
-            })?)?,
-        );
+        append_key_to_map(&mut key, object, sort_key, "sort")?;
+    }
+    if table_key_schema.partition_key != key_schema.partition_key {
+        append_key_to_map(
+            &mut key,
+            object,
+            &table_key_schema.partition_key,
+            "table partition",
+        )?;
+    }
+    if let Some(sort_key) = table_key_schema.sort_key.as_ref() {
+        if key_schema.sort_key.as_ref() != Some(sort_key) {
+            append_key_to_map(&mut key, object, sort_key, "table sort")?;
+        }
     }
     Ok(key)
 }
 
-fn apply_filter_predicates(
-    rows: Vec<Value>,
-    filters: &[ServingPredicate],
-) -> Result<Vec<Value>, DynamoDbError> {
-    if filters.is_empty() {
-        return Ok(rows);
+fn append_key_to_map(
+    key: &mut Map<String, Value>,
+    object: &Map<String, Value>,
+    field_name: &str,
+    label: &str,
+) -> Result<(), DynamoDbError> {
+    if key.contains_key(field_name) {
+        return Ok(());
     }
+    key.insert(
+        field_name.to_string(),
+        json_to_dynamodb_attr(object.get(field_name).ok_or_else(|| {
+            DynamoDbError::internal(format!(
+                "Response item was missing {} key {}",
+                label, field_name
+            ))
+        })?)?,
+    );
+    Ok(())
+}
+
+fn parse_exclusive_start_key_map(
+    key: &Map<String, Value>,
+    query_key_schema: &DynamoDbKeySchemaConfig,
+    table_key_schema: &DynamoDbKeySchemaConfig,
+) -> Result<HashMap<String, Value>, DynamoDbError> {
+    let mut field_names = vec![query_key_schema.partition_key.clone()];
+    if let Some(sort_key) = query_key_schema.sort_key.as_ref() {
+        field_names.push(sort_key.clone());
+    }
+    if table_key_schema.partition_key != query_key_schema.partition_key {
+        field_names.push(table_key_schema.partition_key.clone());
+    }
+    if let Some(sort_key) = table_key_schema.sort_key.as_ref() {
+        if query_key_schema.sort_key.as_ref() != Some(sort_key) {
+            field_names.push(sort_key.clone());
+        }
+    }
+
+    let mut parsed = HashMap::new();
+    for field_name in field_names.iter() {
+        let Some(value) = key.get(field_name) else {
+            return Err(DynamoDbError::validation(format!(
+                "ExclusiveStartKey was missing key field {}",
+                field_name
+            )));
+        };
+        parsed.insert(field_name.clone(), dynamodb_attr_to_json(value)?);
+    }
+    if key.len() != parsed.len() {
+        return Err(DynamoDbError::validation(
+            "ExclusiveStartKey contained attributes that are not part of the table or index key schema",
+        ));
+    }
+    Ok(parsed)
+}
+
+fn ordered_key_fields(
+    key_schema: &DynamoDbKeySchemaConfig,
+    table_key_schema: &DynamoDbKeySchemaConfig,
+) -> Vec<String> {
+    let mut fields = vec![key_schema.partition_key.clone()];
+    if let Some(sort_key) = key_schema.sort_key.as_ref() {
+        fields.push(sort_key.clone());
+    }
+    if table_key_schema.partition_key != key_schema.partition_key {
+        fields.push(table_key_schema.partition_key.clone());
+    }
+    if let Some(sort_key) = table_key_schema.sort_key.as_ref() {
+        if key_schema.sort_key.as_ref() != Some(sort_key) {
+            fields.push(sort_key.clone());
+        }
+    }
+    fields
+}
+
+async fn execute_scan_query(
+    files: &[FileDescriptor],
+    projection: &Option<Vec<String>>,
+    exclusive_start_key: Option<&HashMap<String, Value>>,
+    order_fields: &[String],
+    limit: usize,
+) -> Result<Vec<Value>, DynamoDbError> {
+    let sql_template = build_scan_sql(
+        "{table}",
+        projection.as_ref(),
+        exclusive_start_key,
+        order_fields,
+        limit,
+    )?;
+    let mut rows = vec![];
+    for file_group in group_files_by_schema(files).into_iter() {
+        let mut new_rows = execute_scan_file_group(file_group, &sql_template).await?;
+        rows.append(&mut new_rows);
+        rows.sort_by(|left, right| compare_scan_rows(left, right, order_fields));
+        rows.truncate(limit);
+    }
+    Ok(rows)
+}
+
+async fn execute_scan_file_group(
+    files: Vec<FileDescriptor>,
+    sql_template: &str,
+) -> Result<Vec<Value>, DynamoDbError> {
+    let local_name = file_group_table_name(&files);
+    let file_paths = files
+        .iter()
+        .map(|file| file.file_path.clone())
+        .collect::<Vec<_>>();
+    let total_size = files.iter().map(|file| file.size).sum::<u64>();
+    data_access::reserve(&local_name, total_size, vec![]).await;
+    let result = async {
+        load_files_as_table(&local_name, &file_paths, &files[0].schema.to_arrow_schema())
+            .await
+            .map_err(|error| DynamoDbError::internal(error.to_string()))?;
+        let sql = sql_template.replace("{table}", &local_name);
+        let batches = execute_sql_async(&sql)
+            .await
+            .map_err(|error| DynamoDbError::validation(error.to_string()))?;
+        batches_to_serde_value(&batches)
+            .await
+            .map(|value| value.values)
+            .map_err(|error| DynamoDbError::internal(error.message))
+    }
+    .await;
+    data_access::release(&local_name).await;
+    result
+}
+
+fn build_scan_sql(
+    table_name: &str,
+    projection: Option<&Vec<String>>,
+    exclusive_start_key: Option<&HashMap<String, Value>>,
+    order_fields: &[String],
+    limit: usize,
+) -> Result<String, DynamoDbError> {
+    let select = match projection {
+        Some(select_fields) => select_fields
+            .iter()
+            .map(|field| format!("\"{}\"", escape_identifier(field)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        None => "*".to_string(),
+    };
+    let mut where_clauses = vec![];
+    if let Some(exclusive_start_key) = exclusive_start_key {
+        where_clauses.push(scan_start_key_clause(order_fields, exclusive_start_key)?);
+    }
+
+    let mut sql = format!("SELECT {} FROM {} t", select, table_name);
+    if !where_clauses.is_empty() {
+        sql.push_str(&format!(" WHERE {}", where_clauses.join(" AND ")));
+    }
+    if !order_fields.is_empty() {
+        let order_clause = order_fields
+            .iter()
+            .map(|field| format!("\"{}\" ASC", escape_identifier(field)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        sql.push_str(&format!(" ORDER BY {}", order_clause));
+    }
+    sql.push_str(&format!(" LIMIT {}", limit));
+    Ok(sql)
+}
+
+fn scan_start_key_clause(
+    order_fields: &[String],
+    key: &HashMap<String, Value>,
+) -> Result<String, DynamoDbError> {
+    scan_start_key_clause_inner(order_fields, key)
+}
+
+fn scan_start_key_clause_inner(
+    order_fields: &[String],
+    key: &HashMap<String, Value>,
+) -> Result<String, DynamoDbError> {
+    let Some((field, remaining)) = order_fields.split_first() else {
+        return Err(DynamoDbError::validation(
+            "ExclusiveStartKey did not include any order fields",
+        ));
+    };
+    let value = key.get(field).ok_or_else(|| {
+        DynamoDbError::validation(format!("ExclusiveStartKey was missing key field {}", field))
+    })?;
+    let field_sql = format!("\"{}\"", escape_identifier(field));
+    let value_sql = scan_sql_literal(value)?;
+    if remaining.is_empty() {
+        return Ok(format!("{} > {}", field_sql, value_sql));
+    }
+    Ok(format!(
+        "({field} > {value} OR ({field} = {value} AND {rest}))",
+        field = field_sql,
+        value = value_sql,
+        rest = scan_start_key_clause_inner(remaining, key)?,
+    ))
+}
+
+fn scan_sql_literal(value: &Value) -> Result<String, DynamoDbError> {
+    match value {
+        Value::String(text) => Ok(format!("'{}'", text.replace('\'', "''"))),
+        Value::Number(number) => Ok(number.to_string()),
+        Value::Bool(boolean) => Ok(if *boolean {
+            "TRUE".to_string()
+        } else {
+            "FALSE".to_string()
+        }),
+        Value::Null => Ok("NULL".to_string()),
+        _ => Err(DynamoDbError::validation(
+            "Only scalar literals are supported in DynamoDB read filters",
+        )),
+    }
+}
+
+fn escape_identifier(identifier: &str) -> String {
+    identifier.replace('"', "\"\"")
+}
+
+fn compare_scan_rows(left: &Value, right: &Value, order_fields: &[String]) -> Ordering {
+    let left_object = left.as_object();
+    let right_object = right.as_object();
+    for field in order_fields.iter() {
+        let ordering = compare_scan_row_field(
+            left_object.and_then(|object| object.get(field)),
+            right_object.and_then(|object| object.get(field)),
+        );
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    Ordering::Equal
+}
+
+fn compare_scan_row_field(left: Option<&Value>, right: Option<&Value>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => compare_scalars(left, right)
+            .unwrap_or_else(|_| left.to_string().cmp(&right.to_string())),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn group_files_by_schema(files: &[FileDescriptor]) -> Vec<Vec<FileDescriptor>> {
+    let mut groups: Vec<Vec<FileDescriptor>> = vec![];
+    for file in files.iter().cloned() {
+        if let Some(existing_group) = groups.iter_mut().find(|group| {
+            group
+                .first()
+                .map(|existing| existing.schema == file.schema)
+                .unwrap_or(false)
+        }) {
+            existing_group.push(file);
+        } else {
+            groups.push(vec![file]);
+        }
+    }
+    groups
+}
+
+fn file_group_table_name(files: &[FileDescriptor]) -> String {
+    let mut file_paths = files
+        .iter()
+        .map(|file| file.file_path.clone())
+        .collect::<Vec<_>>();
+    file_paths.sort();
+    let mut hasher = DefaultHasher::new();
+    for file_path in file_paths.iter() {
+        file_path.hash(&mut hasher);
+    }
+    format!("dynamodb_table_group_{:016x}", hasher.finish())
+}
+
+impl FilterOperand {
+    fn field_name(&self) -> &str {
+        match self {
+            FilterOperand::Field(field_name) | FilterOperand::Size(field_name) => field_name,
+        }
+    }
+}
+
+fn apply_filter_expression(
+    rows: Vec<Value>,
+    filter_expression: &ParsedFilterExpression,
+) -> Result<Vec<Value>, DynamoDbError> {
+    let Some(expression) = filter_expression.expression.as_ref() else {
+        return Ok(rows);
+    };
     rows.into_iter()
-        .filter_map(|row| match row_matches_filters(&row, filters) {
-            Ok(true) => Some(Ok(row)),
-            Ok(false) => None,
-            Err(error) => Some(Err(error)),
-        })
+        .filter_map(
+            |row| match row_matches_filter_expression(&row, expression) {
+                Ok(true) => Some(Ok(row)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            },
+        )
         .collect()
 }
 
-fn row_matches_filters(row: &Value, filters: &[ServingPredicate]) -> Result<bool, DynamoDbError> {
+fn row_matches_filter_expression(
+    row: &Value,
+    expression: &FilterNode,
+) -> Result<bool, DynamoDbError> {
     let object = row
         .as_object()
         .ok_or_else(|| DynamoDbError::internal("Serving query returned a non-object row"))?;
-    for filter in filters.iter() {
-        let Some(value) = object.get(&filter.field) else {
-            return Ok(false);
-        };
-        if !value_matches_filter(value, filter)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    evaluate_filter_node(object, expression)
 }
 
-fn value_matches_filter(value: &Value, filter: &ServingPredicate) -> Result<bool, DynamoDbError> {
-    if let Some(expected) = filter.eq.as_ref() {
-        return Ok(value == expected);
+fn evaluate_filter_node(
+    object: &Map<String, Value>,
+    node: &FilterNode,
+) -> Result<bool, DynamoDbError> {
+    match node {
+        FilterNode::Predicate(predicate) => evaluate_filter_predicate(object, predicate),
+        FilterNode::And(nodes) => {
+            for node in nodes.iter() {
+                if !evaluate_filter_node(object, node)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        FilterNode::Or(nodes) => {
+            for node in nodes.iter() {
+                if evaluate_filter_node(object, node)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        FilterNode::Not(node) => Ok(!evaluate_filter_node(object, node)?),
     }
-    if let Some(values) = filter.in_values.as_ref() {
-        return Ok(values.iter().any(|candidate| candidate == value));
-    }
-    if let Some(lower) = filter.gt.as_ref() {
-        if compare_scalars(value, lower)? != std::cmp::Ordering::Greater {
-            return Ok(false);
+}
+
+fn evaluate_filter_predicate(
+    object: &Map<String, Value>,
+    predicate: &FilterPredicate,
+) -> Result<bool, DynamoDbError> {
+    match &predicate.kind {
+        FilterPredicateKind::AttributeExists => {
+            Ok(object.contains_key(predicate.operand.field_name()))
+        }
+        FilterPredicateKind::AttributeNotExists => {
+            Ok(!object.contains_key(predicate.operand.field_name()))
+        }
+        FilterPredicateKind::AttributeType(expected) => {
+            let Some(value) = filter_operand_value(object, &predicate.operand) else {
+                return Ok(false);
+            };
+            Ok(filter_value_type_name(value) == Some(expected.as_str()))
+        }
+        FilterPredicateKind::Contains(expected) => {
+            let Some(value) = filter_operand_value(object, &predicate.operand) else {
+                return Ok(false);
+            };
+            Ok(filter_value_contains(value, expected))
+        }
+        FilterPredicateKind::BeginsWith(prefix) => {
+            let Some(value) = filter_operand_value(object, &predicate.operand) else {
+                return Ok(false);
+            };
+            Ok(value
+                .as_str()
+                .map(|value| value.starts_with(prefix))
+                .unwrap_or(false))
+        }
+        FilterPredicateKind::Eq(expected) => Ok(filter_operand_value(object, &predicate.operand)
+            .map(|value| value == expected)
+            .unwrap_or(false)),
+        FilterPredicateKind::In(expected_values) => {
+            Ok(filter_operand_value(object, &predicate.operand)
+                .map(|value| expected_values.iter().any(|expected| expected == value))
+                .unwrap_or(false))
+        }
+        FilterPredicateKind::Gt(expected) => {
+            compare_filter_operand(object, &predicate.operand, expected, Ordering::Greater)
+        }
+        FilterPredicateKind::Gte(expected) => {
+            compare_filter_operand_at_least(object, &predicate.operand, expected)
+        }
+        FilterPredicateKind::Lt(expected) => {
+            compare_filter_operand(object, &predicate.operand, expected, Ordering::Less)
+        }
+        FilterPredicateKind::Lte(expected) => {
+            compare_filter_operand_at_most(object, &predicate.operand, expected)
+        }
+        FilterPredicateKind::Between { start, end } => {
+            Ok(
+                compare_filter_operand_at_least(object, &predicate.operand, start)?
+                    && compare_filter_operand_at_most(object, &predicate.operand, end)?,
+            )
         }
     }
-    if let Some(lower) = filter.gte.as_ref() {
-        let comparison = compare_scalars(value, lower)?;
-        if comparison == std::cmp::Ordering::Less {
-            return Ok(false);
+}
+
+fn filter_operand_value<'a>(
+    object: &'a Map<String, Value>,
+    operand: &FilterOperand,
+) -> Option<&'a Value> {
+    match operand {
+        FilterOperand::Field(field_name) => object.get(field_name),
+        FilterOperand::Size(_) => None,
+    }
+}
+
+fn filter_operand_scalar(object: &Map<String, Value>, operand: &FilterOperand) -> Option<Value> {
+    match operand {
+        FilterOperand::Field(field_name) => object.get(field_name).cloned(),
+        FilterOperand::Size(field_name) => object
+            .get(field_name)
+            .and_then(filter_value_size)
+            .map(|size| json!(size)),
+    }
+}
+
+fn compare_filter_operand(
+    object: &Map<String, Value>,
+    operand: &FilterOperand,
+    expected: &Value,
+    desired: Ordering,
+) -> Result<bool, DynamoDbError> {
+    let Some(value) = filter_operand_scalar(object, operand) else {
+        return Ok(false);
+    };
+    Ok(compare_scalars(&value, expected)
+        .map(|ordering| ordering == desired)
+        .unwrap_or(false))
+}
+
+fn compare_filter_operand_at_least(
+    object: &Map<String, Value>,
+    operand: &FilterOperand,
+    expected: &Value,
+) -> Result<bool, DynamoDbError> {
+    let Some(value) = filter_operand_scalar(object, operand) else {
+        return Ok(false);
+    };
+    Ok(compare_scalars(&value, expected)
+        .map(|ordering| ordering != Ordering::Less)
+        .unwrap_or(false))
+}
+
+fn compare_filter_operand_at_most(
+    object: &Map<String, Value>,
+    operand: &FilterOperand,
+    expected: &Value,
+) -> Result<bool, DynamoDbError> {
+    let Some(value) = filter_operand_scalar(object, operand) else {
+        return Ok(false);
+    };
+    Ok(compare_scalars(&value, expected)
+        .map(|ordering| ordering != Ordering::Greater)
+        .unwrap_or(false))
+}
+
+fn filter_value_contains(value: &Value, expected: &Value) -> bool {
+    match value {
+        Value::String(text) => expected
+            .as_str()
+            .map(|expected| text.contains(expected))
+            .unwrap_or(false),
+        Value::Array(values) => values.iter().any(|candidate| candidate == expected),
+        Value::Object(map) => {
+            if let Some(values) = map
+                .get(DYNAMODB_STRING_SET_MARKER)
+                .and_then(|value| value.as_array())
+            {
+                return values.iter().any(|candidate| candidate == expected);
+            }
+            if let Some(values) = map
+                .get(DYNAMODB_NUMBER_SET_MARKER)
+                .and_then(|value| value.as_array())
+            {
+                return values.iter().any(|candidate| candidate == expected);
+            }
+            if let Some(values) = map
+                .get(DYNAMODB_BINARY_SET_MARKER)
+                .and_then(|value| value.as_array())
+            {
+                return values.iter().any(|candidate| candidate == expected);
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn filter_value_type_name(value: &Value) -> Option<&'static str> {
+    match value {
+        Value::Null => Some("NULL"),
+        Value::Bool(_) => Some("BOOL"),
+        Value::Number(_) => Some("N"),
+        Value::String(_) => Some("S"),
+        Value::Array(_) => Some("L"),
+        Value::Object(map) => {
+            if map.contains_key(DYNAMODB_BINARY_MARKER) {
+                Some("B")
+            } else if map.contains_key(DYNAMODB_STRING_SET_MARKER) {
+                Some("SS")
+            } else if map.contains_key(DYNAMODB_NUMBER_SET_MARKER) {
+                Some("NS")
+            } else if map.contains_key(DYNAMODB_BINARY_SET_MARKER) {
+                Some("BS")
+            } else {
+                Some("M")
+            }
         }
     }
-    if let Some(upper) = filter.lt.as_ref() {
-        if compare_scalars(value, upper)? != std::cmp::Ordering::Less {
-            return Ok(false);
+}
+
+fn filter_value_size(value: &Value) -> Option<usize> {
+    match value {
+        Value::String(text) => Some(text.len()),
+        Value::Array(values) => Some(values.len()),
+        Value::Object(map) => {
+            if let Some(values) = map
+                .get(DYNAMODB_STRING_SET_MARKER)
+                .and_then(|value| value.as_array())
+            {
+                return Some(values.len());
+            }
+            if let Some(values) = map
+                .get(DYNAMODB_NUMBER_SET_MARKER)
+                .and_then(|value| value.as_array())
+            {
+                return Some(values.len());
+            }
+            if let Some(values) = map
+                .get(DYNAMODB_BINARY_SET_MARKER)
+                .and_then(|value| value.as_array())
+            {
+                return Some(values.len());
+            }
+            if let Some(binary) = map
+                .get(DYNAMODB_BINARY_MARKER)
+                .and_then(|value| value.as_str())
+            {
+                return Some(binary.len());
+            }
+            Some(map.len())
         }
+        _ => None,
     }
-    if let Some(upper) = filter.lte.as_ref() {
-        let comparison = compare_scalars(value, upper)?;
-        if comparison == std::cmp::Ordering::Greater {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 fn project_rows(
@@ -2138,13 +3677,17 @@ fn dynamodb_error_response(state: &State, error: DynamoDbError) -> gotham::hyper
 #[cfg(test)]
 mod tests {
     use super::{
-        dynamodb_attr_to_json, json_to_dynamodb_attr, parse_filter_expression,
-        parse_key_condition_expression, primary_key_schema,
+        apply_filter_expression, dynamodb_attr_to_json, json_to_dynamodb_attr,
+        parse_filter_expression, parse_key_condition_expression, primary_key_schema,
+        query_select_fields, sha256_hex, sigv4_signature,
     };
     use crate::data_contract::{
         DynamoDbTableConfig, FileSetPayload, IcebergMetadata, TableMetadataCheckpoint,
     };
+    use crate::schema_massager::extract_powdrr_schema;
     use crate::serving_dataset::read_parquet_documents;
+    use crate::test_api::{CompactionMode, IndexingMode, StateMode, TestProcessingMode};
+    use chrono::Utc;
     use gotham::mime;
     use gotham::test::TestServer;
     use serde_json::json;
@@ -2189,6 +3732,7 @@ mod tests {
             &primary_key_schema(&DynamoDbTableConfig {
                 partition_key: "tenant".to_string(),
                 sort_key: Some("ts".to_string()),
+                local_secondary_indexes: vec![],
                 global_secondary_indexes: vec![],
             }),
             None,
@@ -2214,6 +3758,7 @@ mod tests {
             &primary_key_schema(&DynamoDbTableConfig {
                 partition_key: "tenant".to_string(),
                 sort_key: Some("event_id".to_string()),
+                local_secondary_indexes: vec![],
                 global_secondary_indexes: vec![],
             }),
             None,
@@ -2249,16 +3794,99 @@ mod tests {
             parsed.filter_fields,
             vec!["count".to_string(), "event_id".to_string()]
         );
-        assert_eq!(parsed.filters.len(), 2);
-        assert_eq!(parsed.filters[0].field, "count");
-        assert_eq!(parsed.filters[0].in_values, Some(vec![json!(2), json!(3)]));
-        assert_eq!(parsed.filters[1].field, "event_id");
-        assert_eq!(parsed.filters[1].gte, Some(json!("evt-")));
-        assert_eq!(parsed.filters[1].lt, Some(json!("evt.")));
+        let matched = apply_filter_expression(
+            vec![json!({
+                "count": 2,
+                "event_id": "evt-2"
+            })],
+            &parsed,
+        )
+        .unwrap();
+        assert_eq!(matched.len(), 1);
+        let not_matched = apply_filter_expression(
+            vec![json!({
+                "count": 4,
+                "event_id": "evt-2"
+            })],
+            &parsed,
+        )
+        .unwrap();
+        assert!(not_matched.is_empty());
     }
 
     #[test]
+    fn test_query_select_fields_skips_filter_fields_missing_from_schema() {
+        let schema = extract_powdrr_schema(&json!({
+            "tenant": "acme",
+            "ts": 10,
+            "event_id": "evt-1",
+            "region": "us"
+        }));
+        let values = HashMap::new();
+        let parsed = parse_filter_expression(
+            Some(&"attribute_not_exists(deleted_at) AND attribute_exists(region)".to_string()),
+            None,
+            Some(&values),
+        )
+        .unwrap();
+
+        let projection = query_select_fields(
+            Some(&vec![
+                "tenant".to_string(),
+                "ts".to_string(),
+                "event_id".to_string(),
+            ]),
+            &parsed,
+            &primary_key_schema(&DynamoDbTableConfig {
+                partition_key: "tenant".to_string(),
+                sort_key: Some("ts".to_string()),
+                local_secondary_indexes: vec![],
+                global_secondary_indexes: vec![],
+            }),
+            &schema,
+        )
+        .unwrap();
+
+        assert_eq!(
+            projection,
+            vec![
+                "tenant".to_string(),
+                "ts".to_string(),
+                "event_id".to_string(),
+                "region".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_list_tables_request_rejects_unknown_fields() {
+        let error = serde_json::from_value::<super::ListTablesRequest>(json!({
+            "UnknownField": true
+        }))
+        .err()
+        .expect("ListTablesRequest should reject unknown fields");
+        assert!(
+            error.to_string().contains("unknown field `UnknownField`"),
+            "{}",
+            error
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the full local cache/state-provider harness"]
     fn test_dynamodb_root_operations() {
+        let redis_address = "127.0.0.1:6379".parse().unwrap();
+        if std::net::TcpStream::connect_timeout(
+            &redis_address,
+            std::time::Duration::from_millis(200),
+        )
+        .is_err()
+        {
+            eprintln!(
+                "Skipping DynamoDB root smoke test; Redis is not available on 127.0.0.1:6379"
+            );
+            return;
+        }
         let test_server = TestServer::with_timeout(crate::router::router(true), 1000).unwrap();
         let dataset_path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/flights.parquet");
@@ -2284,7 +3912,6 @@ mod tests {
                 .unwrap()
                 .as_millis()
         );
-
         let checkpoint = TableMetadataCheckpoint {
             table_name: table_name.clone(),
             original_checkpoint_id: None,
@@ -2293,6 +3920,8 @@ mod tests {
                 table_schema: dataset.schema.clone(),
                 snapshot_id: Some("snapshot_1".to_string()),
                 files: FileSetPayload::single(file_path, file_size, dataset.schema.clone()),
+                partition_spec: vec![],
+                sort_order: vec![],
                 column_names: dataset
                     .schema
                     .fields()
@@ -2300,6 +3929,7 @@ mod tests {
                     .map(|field| field.name.clone())
                     .collect(),
                 column_stats: vec![],
+                access_artifacts: vec![],
                 file_stats: vec![],
             }),
             speedboat_metadata: None,
@@ -2307,6 +3937,20 @@ mod tests {
             extension_metadata: HashMap::new(),
             schema: dataset.schema.clone(),
         };
+        let mut mode = TestProcessingMode::default();
+        mode.state_mode = StateMode::Testing;
+        mode.indexing_mode = IndexingMode::Disabled;
+        mode.compaction_mode = CompactionMode::Disabled;
+        let mode_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_testing_and_processing_mode",
+                serde_json::to_string(&mode).unwrap(),
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(mode_response.status(), 200);
         let checkpoint_response = test_server
             .client()
             .post(
@@ -2353,11 +3997,22 @@ mod tests {
             &list_tables_response.read_utf8_body().unwrap(),
         )
         .unwrap();
-        assert!(list_tables_body["TableNames"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value == &json!(table_name)));
+        assert!(
+            list_tables_body["TableNames"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == &json!(table_name))
+        );
+
+        let list_tables_unknown_field_response =
+            perform_dynamodb_request(&test_server, "ListTables", json!({ "UnknownField": true }));
+        assert_eq!(
+            list_tables_unknown_field_response.status(),
+            400,
+            "{}",
+            list_tables_unknown_field_response.read_utf8_body().unwrap()
+        );
 
         let get_item_response = perform_dynamodb_request(
             &test_server,
@@ -2416,9 +4071,48 @@ mod tests {
             serde_json::to_string(&body).unwrap(),
             mime::APPLICATION_JSON,
         );
+        let amz_date = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let credential_date = Utc::now().format("%Y%m%d").to_string();
+        let payload_hash = sha256_hex(serde_json::to_string(&body).unwrap().as_bytes());
+        let signed_headers = "content-type;host;x-amz-date;x-amz-target";
+        let canonical_request = format!(
+            "POST\n/\n\ncontent-type:{}\nhost:{}\nx-amz-date:{}\nx-amz-target:{}\n\n{}\n{}",
+            mime::APPLICATION_JSON,
+            "localhost",
+            amz_date,
+            format!("DynamoDB_20120810.{}", target),
+            signed_headers,
+            payload_hash
+        );
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{}\n{}/us-east-1/dynamodb/aws4_request\n{}",
+            amz_date,
+            credential_date,
+            sha256_hex(canonical_request.as_bytes())
+        );
+        let signature = sigv4_signature(
+            "test",
+            &credential_date,
+            "us-east-1",
+            "dynamodb",
+            &string_to_sign,
+        )
+        .unwrap();
         request.headers_mut().insert(
             "x-amz-target",
             format!("DynamoDB_20120810.{}", target).parse().unwrap(),
+        );
+        request
+            .headers_mut()
+            .insert("x-amz-date", amz_date.parse().unwrap());
+        request.headers_mut().insert(
+            http::header::AUTHORIZATION,
+            format!(
+                "AWS4-HMAC-SHA256 Credential=test/{}/us-east-1/dynamodb/aws4_request,SignedHeaders={},Signature={}",
+                credential_date, signed_headers, signature
+            )
+            .parse()
+            .unwrap(),
         );
         request.perform().unwrap()
     }

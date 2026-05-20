@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::serving_plan::{ServingPredicate, ServingRequestPlan};
 
@@ -447,8 +447,8 @@ mod tests {
     use crate::serving_plan::{ServingPredicate, ServingRequestPlan, ServingSort};
 
     use super::{
-        from_mongodb_find, to_elasticsearch_search, to_mongodb_find, MongoFindCommand,
-        MongoFindRequest,
+        MongoFindCommand, MongoFindRequest, from_mongodb_find, to_elasticsearch_search,
+        to_mongodb_find,
     };
 
     #[test]
@@ -631,10 +631,12 @@ mod tests {
             no_cursor_timeout: None,
         };
 
-        assert!(from_mongodb_find(&command)
-            .unwrap_err()
-            .message
-            .contains("skip is not supported"));
+        assert!(
+            from_mongodb_find(&command)
+                .unwrap_err()
+                .message
+                .contains("skip is not supported")
+        );
     }
 
     #[test]
@@ -651,9 +653,11 @@ mod tests {
             no_cursor_timeout: None,
         };
 
-        assert!(from_mongodb_find(&command)
-            .unwrap_err()
-            .message
-            .contains("Unsupported Mongo filter operator $regex"));
+        assert!(
+            from_mongodb_find(&command)
+                .unwrap_err()
+                .message
+                .contains("Unsupported Mongo filter operator $regex")
+        );
     }
 }

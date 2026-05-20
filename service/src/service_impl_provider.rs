@@ -782,7 +782,6 @@ impl ServiceImpl {
     ) -> Result<(), ServiceImplError> {
         metadata_store_func_impl!(self, record_serving_node_activation(org_info, ack))
     }
-
     pub async fn get_checkpoint(
         &mut self,
         org_info: &OrgInfo,
@@ -1262,7 +1261,6 @@ impl ServiceImplHandle {
             ack = ack.clone()
         )
     }
-
     pub async fn get_checkpoint(
         &self,
         org_info: &OrgInfo,
@@ -1288,7 +1286,6 @@ impl ServiceImplHandle {
             extension_type = extension_type.clone()
         )
     }
-
     pub async fn get_compaction_work_items(
         &self,
         org_info: &OrgInfo,

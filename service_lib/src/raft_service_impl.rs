@@ -650,7 +650,6 @@ impl MetadataStore for RaftServiceImpl {
             )
         })
     }
-
     async fn claim_extension_work_items(
         &mut self,
         org_info: &OrgInfo,
@@ -754,6 +753,7 @@ mod tests {
             type_files: vec![SpeedboatCommitTableInfo {
                 commit_type: "commit".to_string(),
                 table_name: table_name.to_string(),
+                segments: vec![],
                 files: vec![file_path.to_string()],
                 sizes: vec![1],
                 schema: Some(PowdrrSchema::minimal()),
@@ -773,8 +773,11 @@ mod tests {
                 table_schema: schema.clone(),
                 snapshot_id: Some(snapshot_id.to_string()),
                 files: FileSetPayload::single(file_path.to_string(), 1, schema),
+                partition_spec: vec![],
+                sort_order: vec![],
                 column_names: vec![],
                 column_stats: vec![],
+                access_artifacts: vec![],
                 file_stats: vec![],
             },
             deletes_table_info: None,

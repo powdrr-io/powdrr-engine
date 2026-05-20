@@ -583,11 +583,21 @@ pub fn router(include_test_apis: bool) -> Router {
             .with_path_extractor::<NameIdPathExtractor>()
             .to(elastic_search_endpoints::es_create_with_id);
         route
+            .post("/:name/_doc")
+            .with_path_extractor::<NamePathExtractor>()
+            .to(elastic_search_endpoints::es_index_auto_id);
+        route
             .post("/:name/_doc/:id")
-            .to(elastic_search_endpoints::es_unsupported_update_api);
+            .with_path_extractor::<NameIdPathExtractor>()
+            .to(elastic_search_endpoints::es_index_with_id);
+        route
+            .put("/:name/_doc/:id")
+            .with_path_extractor::<NameIdPathExtractor>()
+            .to(elastic_search_endpoints::es_index_with_id);
         route
             .post("/:name/_update/:id")
-            .to(elastic_search_endpoints::es_unsupported_update_api);
+            .with_path_extractor::<NameIdPathExtractor>()
+            .to(elastic_search_endpoints::es_update_with_id);
         route
             .get("/:name/_doc/:id")
             .with_path_extractor::<NameIdPathExtractor>()
@@ -693,8 +703,8 @@ pub(crate) mod tests {
     use std::{env, str};
 
     use crate::data_contract::{
-        CreateTable, FileSetPayload, IcebergFileStats, IcebergMetadata, SpeedboatMetadata,
-        TableMetadataCheckpoint,
+        CreateTable, DeletesMetadata, FileSetPayload, IcebergFileStats, IcebergMetadata,
+        SpeedboatMetadata, TableMetadataCheckpoint,
     };
     use crate::elastic_search_responses::{QueryResultTotal, QueryResults};
     use crate::lakehouse_serving::ServingConfigResponse;
@@ -767,6 +777,30 @@ pub(crate) mod tests {
         writer.close().unwrap();
     }
 
+    fn write_serving_delete_test_parquet(path: &Path) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_id_seq_no", DataType::Utf8, false),
+            Field::new("snippet", DataType::Utf8, false),
+            Field::new("searchTerms", DataType::Utf8, false),
+            Field::new("title", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["doc_1_1", "doc_2_1", "doc_3_1"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["s1", "s2", "s3"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["term-a", "term-b", "term-c"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["alpha", "bravo", "charlie"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let file = fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
     fn add_mongo_parquet_checkpoint(test_server: &TestServer, table_name: &str) -> TempDir {
         let schema = PowdrrSchema::from(&vec![
             PowdrrField {
@@ -793,12 +827,16 @@ pub(crate) mod tests {
                     fs::metadata(&parquet_path).unwrap().len(),
                     schema.clone(),
                 ),
+                partition_spec: vec![],
+                sort_order: vec![],
                 column_names: vec![],
                 column_stats: vec![],
+                access_artifacts: vec![],
                 file_stats: vec![IcebergFileStats {
                     file_path: format!("file://{}", parquet_path.display()),
                     record_count: Some(2),
                     columns: vec![],
+                    partition_values: vec![],
                     row_groups: vec![],
                 }],
             }),
@@ -968,8 +1006,11 @@ pub(crate) mod tests {
                 table_schema: schema.clone(),
                 snapshot_id: Some("snapshot_1".to_string()),
                 files: FileSetPayload::single(file_path, 1, schema.clone()),
+                partition_spec: vec![],
+                sort_order: vec![],
                 column_names: vec![],
                 column_stats: vec![],
+                access_artifacts: vec![],
                 file_stats: vec![],
             }),
             speedboat_metadata: None,
@@ -1051,6 +1092,133 @@ pub(crate) mod tests {
             "title_top_n"
         );
         assert_eq!(response_obj["rows"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_serving_query_honors_delete_metadata() {
+        let test_server = &*TEST_SERVER;
+
+        set_testing_and_processing_mode(test_server);
+
+        let schema = PowdrrSchema::from(&vec![
+            PowdrrField {
+                name: "_id_seq_no".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "snippet".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "searchTerms".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+            PowdrrField {
+                name: "title".to_string(),
+                data_type: PowdrrDataType::String,
+            },
+        ]);
+
+        let temp_dir = TempDir::new().unwrap();
+        let parquet_path = temp_dir.path().join("serve_flights_with_deletes.parquet");
+        write_serving_delete_test_parquet(&parquet_path);
+        let delete_path = temp_dir
+            .path()
+            .join("serve_flights_with_deletes.delete.json");
+        fs::write(&delete_path, "{\"_id_seq_no\":\"doc_1_1\"}\n").unwrap();
+        let file_path = format!("file://{}", parquet_path.display());
+
+        let checkpoint = TableMetadataCheckpoint {
+            table_name: "serve_flights_with_deletes".to_string(),
+            original_checkpoint_id: None,
+            checkpoint_id: "serve_checkpoint_with_deletes_0".to_string(),
+            iceberg_metadata: Some(IcebergMetadata {
+                table_schema: schema.clone(),
+                snapshot_id: Some("snapshot_with_deletes_1".to_string()),
+                files: FileSetPayload::single(
+                    file_path,
+                    fs::metadata(&parquet_path).unwrap().len(),
+                    schema.clone(),
+                ),
+                partition_spec: vec![],
+                sort_order: vec![],
+                column_names: vec![],
+                column_stats: vec![],
+                access_artifacts: vec![],
+                file_stats: vec![],
+            }),
+            speedboat_metadata: None,
+            deletes_metadata: Some(DeletesMetadata {
+                files: vec![format!("file://{}", delete_path.display())],
+            }),
+            extension_metadata: HashMap::new(),
+            schema: schema.clone(),
+        };
+
+        test_server
+            .client()
+            .post(
+                "http://localhost/_test/v1/_add_checkpoint",
+                serde_json::to_string(&checkpoint).unwrap(),
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        let config_response = test_server
+            .client()
+            .put(
+                "http://localhost/serve_flights_with_deletes/_serve/config",
+                r#"{
+                  "patterns": [
+                    {
+                      "name": "title_top_n",
+                      "order_field": "title",
+                      "descending": false,
+                      "max_limit": 10,
+                      "projection": ["title"]
+                    }
+                  ]
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(config_response.status(), 200);
+
+        let query_response = test_server
+            .client()
+            .post(
+                "http://localhost/serve_flights_with_deletes/_serve",
+                r#"{
+                  "select": ["title"],
+                  "order_by": [{ "field": "title", "descending": false }],
+                  "limit": 2
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(query_response.status(), 200);
+        let response_obj: serde_json::Value =
+            serde_json::from_str(&query_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ServingQueryClassification>(
+                response_obj["classification"].clone()
+            )
+            .unwrap(),
+            ServingQueryClassification::FastPath
+        );
+        assert_eq!(
+            response_obj["matched_pattern"].as_str().unwrap(),
+            "title_top_n"
+        );
+        let rows = response_obj["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["title"], json!("bravo"));
+        assert_eq!(rows[1]["title"], json!("charlie"));
     }
 
     #[test]
@@ -1922,7 +2090,7 @@ pub(crate) mod tests {
                 serde_json::to_string(&TestProcessingMode {
                     state_mode: StateMode::Testing,
                     storage_mode: StorageMode::default(),
-                    cache_mode: CacheMode::Native,
+                    cache_mode: CacheMode::Redis(None),
                     peer_mode: PeerMode::SelfOnly,
                     indexing_mode: IndexingMode::Sync,
                     compaction_mode: CompactionMode::Disabled,
@@ -2480,6 +2648,27 @@ pub(crate) mod tests {
             serde_json::from_str(&ids_query_response.read_utf8_body().unwrap()).unwrap();
         assert_eq!(ids_query_json["hits"]["total"]["value"], 2);
 
+        let multi_match_query_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs,_events_does_not_exist/_search?ignore_unavailable=true",
+                r#"{
+                  "query": {
+                    "multi_match": {
+                      "query": "Login",
+                      "fields": ["message"]
+                    }
+                  }
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(multi_match_query_response.status(), 200);
+        let multi_match_query_json: Value =
+            serde_json::from_str(&multi_match_query_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(multi_match_query_json["hits"]["total"]["value"], 4);
+
         let mget_table_response = test_server
             .client()
             .post(
@@ -2822,6 +3011,239 @@ pub(crate) mod tests {
             json!(4.0)
         );
 
+        let multi_index_cardinality_agg_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs,events_extra/_search",
+                r#"{
+                  "size": 0,
+                  "aggs": {
+                    "distinct_messages": {
+                      "cardinality": {
+                        "field": "message"
+                      }
+                    }
+                  }
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(multi_index_cardinality_agg_response.status(), 200);
+        let multi_index_cardinality_agg_json: Value = serde_json::from_str(
+            &multi_index_cardinality_agg_response
+                .read_utf8_body()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            multi_index_cardinality_agg_json["aggregations"]["distinct_messages"]["value"],
+            json!(9)
+        );
+
+        let multi_index_date_histogram_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs,events_extra/_search",
+                r#"{
+                  "size": 0,
+                  "aggs": {
+                    "per_day": {
+                      "date_histogram": {
+                        "field": "@timestamp",
+                        "fixed_interval": "1d"
+                      }
+                    }
+                  }
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(multi_index_date_histogram_response.status(), 200);
+        let multi_index_date_histogram_json: Value = serde_json::from_str(
+            &multi_index_date_histogram_response
+                .read_utf8_body()
+                .unwrap(),
+        )
+        .unwrap();
+        let histogram_buckets =
+            multi_index_date_histogram_json["aggregations"]["per_day"]["buckets"]
+                .as_array()
+                .unwrap();
+        assert_eq!(histogram_buckets.len(), 5);
+        assert_eq!(
+            histogram_buckets[0]["key_as_string"],
+            json!("2099-03-07T00:00:00.000Z")
+        );
+        assert_eq!(histogram_buckets[0]["doc_count"], json!(1));
+        assert_eq!(
+            histogram_buckets[1]["key_as_string"],
+            json!("2099-03-08T00:00:00.000Z")
+        );
+        assert_eq!(histogram_buckets[1]["doc_count"], json!(4));
+        assert_eq!(
+            histogram_buckets[2]["key_as_string"],
+            json!("2099-03-09T00:00:00.000Z")
+        );
+        assert_eq!(histogram_buckets[2]["doc_count"], json!(2));
+
+        let multi_index_query_string_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs,events_extra/_search",
+                r#"{
+                  "sort": [
+                    {
+                      "index_col": {
+                        "order": "asc"
+                      }
+                    }
+                  ],
+                  "query": {
+                    "query_string": {
+                      "query": "Archive OR logout",
+                      "fields": ["message"],
+                      "default_operator": "OR"
+                    }
+                  }
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(multi_index_query_string_response.status(), 200);
+        let multi_index_query_string_json: Value =
+            serde_json::from_str(&multi_index_query_string_response.read_utf8_body().unwrap())
+                .unwrap();
+        assert_eq!(
+            multi_index_query_string_json["hits"]["hits"][0]["_source"]["message"],
+            json!("Archive login pending")
+        );
+        assert_eq!(
+            multi_index_query_string_json["hits"]["hits"][1]["_source"]["message"],
+            json!("Logout successful")
+        );
+
+        let bounded_histogram_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs,events_extra/_search",
+                r#"{
+                  "size": 0,
+                  "aggs": {
+                    "per_day": {
+                      "date_histogram": {
+                        "field": "@timestamp",
+                        "fixed_interval": "1d",
+                        "min_doc_count": 0,
+                        "extended_bounds": {
+                          "min": "2099-03-06T00:00:00.000Z",
+                          "max": "2099-03-12T00:00:00.000Z"
+                        }
+                      }
+                    }
+                  }
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(bounded_histogram_response.status(), 200);
+        let bounded_histogram_json: Value =
+            serde_json::from_str(&bounded_histogram_response.read_utf8_body().unwrap()).unwrap();
+        let bounded_histogram_buckets =
+            bounded_histogram_json["aggregations"]["per_day"]["buckets"]
+                .as_array()
+                .unwrap();
+        assert_eq!(bounded_histogram_buckets.len(), 7);
+        assert_eq!(
+            bounded_histogram_buckets[0]["key_as_string"],
+            json!("2099-03-06T00:00:00.000Z")
+        );
+        assert_eq!(bounded_histogram_buckets[0]["doc_count"], json!(0));
+        assert_eq!(
+            bounded_histogram_buckets[6]["key_as_string"],
+            json!("2099-03-12T00:00:00.000Z")
+        );
+        assert_eq!(bounded_histogram_buckets[6]["doc_count"], json!(0));
+
+        let multi_index_terms_subagg_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs,events_extra/_search",
+                r#"{
+                  "size": 0,
+                  "aggs": {
+                    "by_boolean": {
+                      "terms": {
+                        "field": "boolean",
+                        "size": 10
+                      },
+                      "aggs": {
+                        "avg_index_col": {
+                          "avg": {
+                            "field": "index_col"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(multi_index_terms_subagg_response.status(), 200);
+        let multi_index_terms_subagg_json: Value =
+            serde_json::from_str(&multi_index_terms_subagg_response.read_utf8_body().unwrap())
+                .unwrap();
+        let terms_buckets = multi_index_terms_subagg_json["aggregations"]["by_boolean"]["buckets"]
+            .as_array()
+            .unwrap();
+        assert_eq!(terms_buckets.len(), 1);
+        assert_eq!(terms_buckets[0]["key"], json!("true"));
+        assert_eq!(terms_buckets[0]["doc_count"], json!(9));
+        assert_eq!(terms_buckets[0]["avg_index_col"]["value"], json!(4.0));
+
+        let ordered_terms_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs,events_extra/_search",
+                r#"{
+                  "size": 0,
+                  "aggs": {
+                    "by_message": {
+                      "terms": {
+                        "field": "message",
+                        "size": 3,
+                        "order": {
+                          "_key": "asc"
+                        }
+                      }
+                    }
+                  }
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(ordered_terms_response.status(), 200);
+        let ordered_terms_json: Value =
+            serde_json::from_str(&ordered_terms_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(
+            ordered_terms_json["aggregations"]["by_message"]["buckets"][0]["key"],
+            json!("Archive login complete")
+        );
+        assert_eq!(
+            ordered_terms_json["aggregations"]["by_message"]["buckets"][1]["key"],
+            json!("Archive login pending")
+        );
+        assert_eq!(
+            ordered_terms_json["aggregations"]["by_message"]["buckets"][2]["key"],
+            json!("Archive logout successful")
+        );
+
         let invalid_search_after_response = test_server
             .client()
             .post(
@@ -2967,8 +3389,11 @@ pub(crate) mod tests {
                 table_schema: schema.clone(),
                 snapshot_id: Some("fake_iceberg_snapshot".to_string()),
                 files: FileSetPayload::single(file_path, 1, schema.clone()),
+                partition_spec: vec![],
+                sort_order: vec![],
                 column_names: vec![],
                 column_stats: vec![],
+                access_artifacts: vec![],
                 file_stats: vec![],
             }),
             speedboat_metadata: None,
@@ -3897,6 +4322,752 @@ pub(crate) mod tests {
                 panic!("Failed {}", e)
             }
         }
+    }
+
+    #[test]
+    fn test_es_index_single_auto_id() {
+        let test_server = &*TEST_SERVER;
+
+        set_testing_and_processing_mode(test_server);
+
+        let body_create_index = r#"{
+            "settings" : {
+                "index": {
+                "number_of_shards" : 2,
+                "number_of_replicas" : 1
+            } } }"#;
+
+        let response_create_index = test_server
+            .client()
+            .put(
+                "http://localhost/logs",
+                body_create_index,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(response_create_index.status(), 200);
+
+        let test_val = r#"{
+            "@timestamp": "2099-11-15T13:12:00",
+            "message": "GET /search HTTP/1.1 200 1070000",
+            "user": {
+                "id": "kimchy"
+            }
+            }"#;
+
+        let index_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs/_doc",
+                test_val,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(index_response.status(), 201);
+        let index_json: Value =
+            serde_json::from_str(&index_response.read_utf8_body().unwrap()).unwrap();
+        let doc_id = index_json["_id"].as_str().unwrap().to_string();
+        assert_eq!(index_json["_version"], json!(1));
+
+        let process_work_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_process_work",
+                "",
+                mime::TEXT_PLAIN,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(process_work_response.status(), 200);
+
+        let get_response = test_server
+            .client()
+            .get(&format!("http://localhost/logs/_doc/{}", doc_id))
+            .perform()
+            .unwrap();
+
+        assert_eq!(get_response.status(), 200);
+        let get_json: Value =
+            serde_json::from_str(&get_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(get_json["_id"], json!(doc_id));
+        assert_eq!(
+            get_json["_source"]["message"],
+            json!("GET /search HTTP/1.1 200 1070000")
+        );
+    }
+
+    #[test]
+    fn test_es_put_doc_with_id_replaces_existing_doc() {
+        let test_server = &*TEST_SERVER;
+
+        set_testing_and_processing_mode(test_server);
+
+        let body_create_index = r#"{
+            "settings" : {
+                "index": {
+                "number_of_shards" : 2,
+                "number_of_replicas" : 1
+            } } }"#;
+
+        let response_create_index = test_server
+            .client()
+            .put(
+                "http://localhost/logs",
+                body_create_index,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(response_create_index.status(), 200);
+
+        let original_doc = r#"{
+            "@timestamp": "2099-11-15T13:12:00",
+            "message": "original message",
+            "user": {
+                "id": "kimchy"
+            }
+            }"#;
+        let replacement_doc = r#"{
+            "@timestamp": "2099-11-15T13:13:00",
+            "message": "replacement message",
+            "user": {
+                "id": "kimchy"
+            }
+            }"#;
+
+        let first_index_response = test_server
+            .client()
+            .put(
+                "http://localhost/logs/_doc/my_id",
+                original_doc,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(first_index_response.status(), 201);
+
+        let first_process_work_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_process_work",
+                "",
+                mime::TEXT_PLAIN,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(first_process_work_response.status(), 200);
+
+        let second_index_response = test_server
+            .client()
+            .put(
+                "http://localhost/logs/_doc/my_id",
+                replacement_doc,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(second_index_response.status(), 200);
+        let second_index_json: Value =
+            serde_json::from_str(&second_index_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(second_index_json["_id"], json!("my_id"));
+        assert_eq!(second_index_json["_version"], json!(2));
+
+        let second_process_work_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_process_work",
+                "",
+                mime::TEXT_PLAIN,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(second_process_work_response.status(), 200);
+
+        let get_response = test_server
+            .client()
+            .get("http://localhost/logs/_doc/my_id")
+            .perform()
+            .unwrap();
+
+        assert_eq!(get_response.status(), 200);
+        let get_json: Value =
+            serde_json::from_str(&get_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(get_json["_version"], json!(2));
+        assert_eq!(get_json["_source"]["message"], json!("replacement message"));
+
+        let old_search_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs/_search",
+                r#"{
+                  "query": {
+                    "match": {
+                      "message": {
+                        "query": "original"
+                      }
+                    }
+                  }
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        let old_search_json: Value =
+            serde_json::from_str(&old_search_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(old_search_json["hits"]["total"]["value"], json!(0));
+
+        let new_search_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs/_search",
+                r#"{
+                  "query": {
+                    "match": {
+                      "message": {
+                        "query": "replacement"
+                      }
+                    }
+                  }
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        let new_search_json: Value =
+            serde_json::from_str(&new_search_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(new_search_json["hits"]["total"]["value"], json!(1));
+        assert_eq!(
+            new_search_json["hits"]["hits"][0]["_source"]["message"],
+            json!("replacement message")
+        );
+    }
+
+    #[test]
+    fn test_es_bulk_index_replaces_existing_doc_after_refresh() {
+        let test_server = &*TEST_SERVER;
+
+        set_testing_and_processing_mode(test_server);
+
+        let body_create_index = r#"{
+            "settings" : {
+                "index": {
+                "number_of_shards" : 2,
+                "number_of_replicas" : 1
+            } } }"#;
+
+        let response_create_index = test_server
+            .client()
+            .put(
+                "http://localhost/logs",
+                body_create_index,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(response_create_index.status(), 200);
+
+        let first_bulk_body = make_index_bulk_body(
+            "logs".to_string(),
+            vec![(
+                "my_id".to_string(),
+                r#"{
+                    "@timestamp": "2099-11-15T13:12:00",
+                    "message": "bulk original message",
+                    "user": {
+                        "id": "kimchy"
+                    }
+                }"#
+                .to_string(),
+            )],
+        );
+        let first_bulk_response = test_server
+            .client()
+            .post(
+                "http://localhost/_bulk",
+                first_bulk_body,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(first_bulk_response.status(), 200);
+
+        let first_process_work_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_process_work",
+                "",
+                mime::TEXT_PLAIN,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(first_process_work_response.status(), 200);
+
+        let second_bulk_body = make_index_bulk_body(
+            "logs".to_string(),
+            vec![(
+                "my_id".to_string(),
+                r#"{
+                    "@timestamp": "2099-11-15T13:13:00",
+                    "message": "bulk replacement message",
+                    "user": {
+                        "id": "kimchy"
+                    }
+                }"#
+                .to_string(),
+            )],
+        );
+        let second_bulk_response = test_server
+            .client()
+            .post(
+                "http://localhost/_bulk",
+                second_bulk_body,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(second_bulk_response.status(), 200);
+
+        let second_process_work_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_process_work",
+                "",
+                mime::TEXT_PLAIN,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(second_process_work_response.status(), 200);
+
+        let get_response = test_server
+            .client()
+            .get("http://localhost/logs/_doc/my_id")
+            .perform()
+            .unwrap();
+
+        assert_eq!(get_response.status(), 200);
+        let get_json: Value =
+            serde_json::from_str(&get_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(get_json["_version"], json!(2));
+        assert_eq!(
+            get_json["_source"]["message"],
+            json!("bulk replacement message")
+        );
+
+        let old_search_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs/_search",
+                r#"{
+                  "query": {
+                    "match": {
+                      "message": {
+                        "query": "bulk original"
+                      }
+                    }
+                  }
+                }"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        let old_search_json: Value =
+            serde_json::from_str(&old_search_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(old_search_json["hits"]["total"]["value"], json!(0));
+    }
+
+    #[test]
+    fn test_es_update_single_merges_existing_doc() {
+        let test_server = &*TEST_SERVER;
+
+        set_testing_and_processing_mode(test_server);
+
+        let body_create_index = r#"{
+            "settings" : {
+                "index": {
+                "number_of_shards" : 2,
+                "number_of_replicas" : 1
+            } } }"#;
+
+        let response_create_index = test_server
+            .client()
+            .put(
+                "http://localhost/logs",
+                body_create_index,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(response_create_index.status(), 200);
+
+        let original_doc = r#"{
+            "@timestamp": "2099-11-15T13:12:00",
+            "message": "original message",
+            "user": {
+                "id": "kimchy"
+            }
+            }"#;
+        let update_doc = r#"{
+            "doc": {
+                "message": "patched message",
+                "user": {
+                    "name": "greg"
+                }
+            }
+            }"#;
+
+        let create_response = test_server
+            .client()
+            .put(
+                "http://localhost/logs/_doc/my_id",
+                original_doc,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(create_response.status(), 201);
+
+        let process_work_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_process_work",
+                "",
+                mime::TEXT_PLAIN,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(process_work_response.status(), 200);
+
+        let update_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs/_update/my_id",
+                update_doc,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(update_response.status(), 200);
+        let update_json: Value =
+            serde_json::from_str(&update_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(update_json["_version"], json!(2));
+
+        let second_process_work_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_process_work",
+                "",
+                mime::TEXT_PLAIN,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(second_process_work_response.status(), 200);
+
+        let get_response = test_server
+            .client()
+            .get("http://localhost/logs/_doc/my_id")
+            .perform()
+            .unwrap();
+
+        assert_eq!(get_response.status(), 200);
+        let get_json: Value =
+            serde_json::from_str(&get_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(get_json["_version"], json!(2));
+        assert_eq!(get_json["_source"]["message"], json!("patched message"));
+        assert_eq!(get_json["_source"]["user"]["id"], json!("kimchy"));
+        assert_eq!(get_json["_source"]["user"]["name"], json!("greg"));
+    }
+
+    #[test]
+    fn test_es_update_single_doc_as_upsert_creates_missing_doc() {
+        let test_server = &*TEST_SERVER;
+
+        set_testing_and_processing_mode(test_server);
+
+        let body_create_index = r#"{
+            "settings" : {
+                "index": {
+                "number_of_shards" : 2,
+                "number_of_replicas" : 1
+            } } }"#;
+
+        let response_create_index = test_server
+            .client()
+            .put(
+                "http://localhost/logs",
+                body_create_index,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(response_create_index.status(), 200);
+
+        let update_doc = r#"{
+            "doc": {
+                "@timestamp": "2099-11-15T13:12:00",
+                "message": "created via update",
+                "user": {
+                    "id": "kimchy"
+                }
+            },
+            "doc_as_upsert": true
+            }"#;
+
+        let update_response = test_server
+            .client()
+            .post(
+                "http://localhost/logs/_update/upsert_id",
+                update_doc,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(update_response.status(), 201);
+        let update_json: Value =
+            serde_json::from_str(&update_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(update_json["_version"], json!(1));
+
+        let process_work_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_process_work",
+                "",
+                mime::TEXT_PLAIN,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(process_work_response.status(), 200);
+
+        let get_response = test_server
+            .client()
+            .get("http://localhost/logs/_doc/upsert_id")
+            .perform()
+            .unwrap();
+
+        assert_eq!(get_response.status(), 200);
+        let get_json: Value =
+            serde_json::from_str(&get_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(get_json["_version"], json!(1));
+        assert_eq!(get_json["_source"]["message"], json!("created via update"));
+    }
+
+    #[test]
+    fn test_es_bulk_update_merges_existing_doc_after_refresh() {
+        let test_server = &*TEST_SERVER;
+
+        set_testing_and_processing_mode(test_server);
+
+        let body_create_index = r#"{
+            "settings" : {
+                "index": {
+                "number_of_shards" : 2,
+                "number_of_replicas" : 1
+            } } }"#;
+
+        let response_create_index = test_server
+            .client()
+            .put(
+                "http://localhost/logs",
+                body_create_index,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(response_create_index.status(), 200);
+
+        let original_doc = r#"{
+            "@timestamp": "2099-11-15T13:12:00",
+            "message": "bulk original message",
+            "user": {
+                "id": "kimchy"
+            }
+            }"#;
+
+        let create_response = test_server
+            .client()
+            .put(
+                "http://localhost/logs/_doc/my_id",
+                original_doc,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(create_response.status(), 201);
+
+        let first_process_work_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_process_work",
+                "",
+                mime::TEXT_PLAIN,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(first_process_work_response.status(), 200);
+
+        let bulk_body = make_update_bulk_body(
+            "logs".to_string(),
+            vec![(
+                "my_id".to_string(),
+                r#"{
+                    "doc": {
+                        "message": "bulk patched message",
+                        "user": {
+                            "name": "greg"
+                        }
+                    }
+                }"#
+                .to_string(),
+            )],
+        );
+        let bulk_response = test_server
+            .client()
+            .post("http://localhost/_bulk", bulk_body, mime::APPLICATION_JSON)
+            .perform()
+            .unwrap();
+
+        assert_eq!(bulk_response.status(), 200);
+
+        let second_process_work_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_process_work",
+                "",
+                mime::TEXT_PLAIN,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(second_process_work_response.status(), 200);
+
+        let get_response = test_server
+            .client()
+            .get("http://localhost/logs/_doc/my_id")
+            .perform()
+            .unwrap();
+
+        assert_eq!(get_response.status(), 200);
+        let get_json: Value =
+            serde_json::from_str(&get_response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(get_json["_version"], json!(2));
+        assert_eq!(
+            get_json["_source"]["message"],
+            json!("bulk patched message")
+        );
+        assert_eq!(get_json["_source"]["user"]["id"], json!("kimchy"));
+        assert_eq!(get_json["_source"]["user"]["name"], json!("greg"));
+    }
+
+    #[test]
+    fn test_es_bulk_delete_removes_existing_doc_after_refresh() {
+        let test_server = &*TEST_SERVER;
+
+        set_testing_and_processing_mode(test_server);
+
+        let body_create_index = r#"{
+            "settings" : {
+                "index": {
+                "number_of_shards" : 2,
+                "number_of_replicas" : 1
+            } } }"#;
+
+        let response_create_index = test_server
+            .client()
+            .put(
+                "http://localhost/logs",
+                body_create_index,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(response_create_index.status(), 200);
+
+        let original_doc = r#"{
+            "@timestamp": "2099-11-15T13:12:00",
+            "message": "bulk delete message",
+            "user": {
+                "id": "kimchy"
+            }
+            }"#;
+
+        let create_response = test_server
+            .client()
+            .put(
+                "http://localhost/logs/_doc/my_id",
+                original_doc,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(create_response.status(), 201);
+
+        let first_process_work_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_process_work",
+                "",
+                mime::TEXT_PLAIN,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(first_process_work_response.status(), 200);
+
+        let bulk_body = make_delete_bulk_body("logs".to_string(), vec!["my_id".to_string()]);
+        let bulk_response = test_server
+            .client()
+            .post("http://localhost/_bulk", bulk_body, mime::APPLICATION_JSON)
+            .perform()
+            .unwrap();
+
+        assert_eq!(bulk_response.status(), 200);
+
+        let second_process_work_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_process_work",
+                "",
+                mime::TEXT_PLAIN,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(second_process_work_response.status(), 200);
+
+        let get_response = test_server
+            .client()
+            .get("http://localhost/logs/_doc/my_id")
+            .perform()
+            .unwrap();
+
+        assert_eq!(get_response.status(), 404);
     }
 
     #[test]
@@ -5010,6 +6181,62 @@ pub(crate) mod tests {
             .map(|(v, c)| format!("{}{}", v, c))
             .collect::<Vec<String>>();
         together.join("")
+    }
+
+    fn make_index_bulk_body(index: String, values: Vec<(String, String)>) -> String {
+        let index_lines = values
+            .iter()
+            .map(|(id, _)| {
+                format!(
+                    "{{\"index\":{{\"_index\":\"{}\",\"_id\":\"{}\"}}}}\n",
+                    index, id
+                )
+            })
+            .collect::<Vec<String>>();
+        let source_lines = values
+            .iter()
+            .map(|(_, value)| format!("{}\n", value.replace("\n", "")))
+            .collect::<Vec<String>>();
+        index_lines
+            .iter()
+            .zip(source_lines.iter())
+            .map(|(index_line, source_line)| format!("{index_line}{source_line}"))
+            .collect::<Vec<String>>()
+            .join("")
+    }
+
+    fn make_update_bulk_body(index: String, values: Vec<(String, String)>) -> String {
+        let update_lines = values
+            .iter()
+            .map(|(id, _)| {
+                format!(
+                    "{{\"update\":{{\"_index\":\"{}\",\"_id\":\"{}\"}}}}\n",
+                    index, id
+                )
+            })
+            .collect::<Vec<String>>();
+        let body_lines = values
+            .iter()
+            .map(|(_, value)| format!("{}\n", value.replace("\n", "")))
+            .collect::<Vec<String>>();
+        update_lines
+            .iter()
+            .zip(body_lines.iter())
+            .map(|(update_line, body_line)| format!("{update_line}{body_line}"))
+            .collect::<Vec<String>>()
+            .join("")
+    }
+
+    fn make_delete_bulk_body(index: String, ids: Vec<String>) -> String {
+        ids.iter()
+            .map(|id| {
+                format!(
+                    "{{\"delete\":{{\"_index\":\"{}\",\"_id\":\"{}\"}}}}\n",
+                    index, id
+                )
+            })
+            .collect::<Vec<String>>()
+            .join("")
     }
 
     #[test]

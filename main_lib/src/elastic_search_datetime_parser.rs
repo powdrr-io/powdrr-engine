@@ -1,13 +1,12 @@
-use std::{error::Error, fmt::Display, iter::zip};
-use std::ops::Add;
 use chrono::{DateTime, DurationRound, SecondsFormat, Utc};
+use std::ops::Add;
+use std::{error::Error, fmt::Display, iter::zip};
 
 #[derive(Clone, PartialEq, Debug)]
 enum TokenKind {
     Identifier,
     Keyword,
 }
-
 
 #[derive(Clone)]
 pub(crate) struct Token {
@@ -37,14 +36,17 @@ const WHITESPACE: [&str; 2] = [" ", "\n"];
 #[allow(dead_code)]
 const EXPRESSION_ENDERS: [&str; 0] = [];
 
-
 impl Token {
     fn new(val: String, line: usize, pos: usize) -> Self {
         Token {
-            kind: if KEYWORDS.contains(&val.as_str()) { TokenKind::Keyword } else { TokenKind::Identifier },
+            kind: if KEYWORDS.contains(&val.as_str()) {
+                TokenKind::Keyword
+            } else {
+                TokenKind::Identifier
+            },
             value: val,
             line: line,
-            pos: pos
+            pos: pos,
         }
     }
 
@@ -53,26 +55,24 @@ impl Token {
             kind: TokenKind::Keyword,
             value: val,
             line: line,
-            pos: pos
+            pos: pos,
         }
     }
 }
-
 
 // Returns the string ends that matches the start
 fn is_string_literal_start(command_str: &String, current_index: usize) -> Option<(usize, &str)> {
     for pair in zip(STRING_LITERAL_BEGINS, STRING_LITERAL_ENDS) {
         if &command_str[current_index..current_index + pair.0.len()] == pair.0 {
-            return Some((pair.0.len(), pair.1))
+            return Some((pair.0.len(), pair.1));
         }
     }
     None
 }
 
-
 impl ParserContext {
     fn new(script: &String) -> Self {
-        let mut tokens: Vec<Token> = vec!();
+        let mut tokens: Vec<Token> = vec![];
         let mut token_start_index: usize = 0;
         let mut token_start_line: usize = 1;
         let mut token_start_pos: usize = 1;
@@ -82,12 +82,20 @@ impl ParserContext {
         let mut end_string_literal: Option<&str> = None;
 
         while current_index < script.len() {
-            let current_val = &script[current_index..current_index+1];
-            let current_val_2 = if current_index + 1 < script.len() { &script[current_index..current_index+2] } else { "" };
+            let current_val = &script[current_index..current_index + 1];
+            let current_val_2 = if current_index + 1 < script.len() {
+                &script[current_index..current_index + 2]
+            } else {
+                ""
+            };
             match end_string_literal {
                 Some(end) => {
                     if current_val == end {
-                        let token = Token::new(script[token_start_index..current_index + end.len()].to_string(), token_start_index, token_start_pos);
+                        let token = Token::new(
+                            script[token_start_index..current_index + end.len()].to_string(),
+                            token_start_index,
+                            token_start_pos,
+                        );
                         tokens.push(token);
                         end_string_literal = None;
                         current_index += end.len();
@@ -103,11 +111,15 @@ impl ParserContext {
                         current_index += 1;
                         current_pos += 1;
                     }
-                },
+                }
                 None => {
                     let literal_info = is_string_literal_start(script, current_index);
                     if WHITESPACE.contains(&current_val) {
-                        let token = Token::new(script[token_start_index..current_index].to_string(), token_start_line, token_start_pos);
+                        let token = Token::new(
+                            script[token_start_index..current_index].to_string(),
+                            token_start_line,
+                            token_start_pos,
+                        );
                         tokens.push(token);
                         current_index += 1;
                         if current_val == "\n" {
@@ -120,9 +132,14 @@ impl ParserContext {
                         token_start_line = current_line;
                         token_start_pos = current_pos;
                     } else if DELIMITER_CONTAINING_KEYWORDS.contains(&current_val_2) {
-                        let token = Token::new(script[token_start_index..current_index].to_string(), token_start_line, token_start_pos);
+                        let token = Token::new(
+                            script[token_start_index..current_index].to_string(),
+                            token_start_line,
+                            token_start_pos,
+                        );
                         tokens.push(token);
-                        let delimiter_token = Token::keyword(current_val_2.to_string(), current_line, current_pos);
+                        let delimiter_token =
+                            Token::keyword(current_val_2.to_string(), current_line, current_pos);
                         tokens.push(delimiter_token);
                         current_index += 2;
                         current_pos += 2;
@@ -130,9 +147,14 @@ impl ParserContext {
                         token_start_line = current_line;
                         token_start_pos = current_pos;
                     } else if DELIMITERS.contains(&current_val) {
-                        let token = Token::new(script[token_start_index..current_index].to_string(), token_start_line, token_start_pos);
+                        let token = Token::new(
+                            script[token_start_index..current_index].to_string(),
+                            token_start_line,
+                            token_start_pos,
+                        );
                         tokens.push(token);
-                        let delimiter_token = Token::keyword(current_val.to_string(), current_line, current_pos);
+                        let delimiter_token =
+                            Token::keyword(current_val.to_string(), current_line, current_pos);
                         tokens.push(delimiter_token);
                         current_index += 1;
                         current_pos += 1;
@@ -140,13 +162,17 @@ impl ParserContext {
                         token_start_line = current_line;
                         token_start_pos = current_pos;
                     } else if literal_info.is_some() {
-                        let token = Token::new(script[token_start_index..current_index].to_string(), token_start_line, token_start_pos);
+                        let token = Token::new(
+                            script[token_start_index..current_index].to_string(),
+                            token_start_line,
+                            token_start_pos,
+                        );
                         tokens.push(token);
                         token_start_index = current_index;
                         token_start_line = current_line;
                         token_start_pos = current_pos;
                         end_string_literal = Some(literal_info.unwrap().1);
-                        current_index +=  literal_info.unwrap().0;
+                        current_index += literal_info.unwrap().0;
                         current_pos += literal_info.unwrap().0;
                     } else {
                         current_pos += 1;
@@ -156,11 +182,19 @@ impl ParserContext {
             }
         }
 
-        let token = Token::new(script[token_start_index..current_index].to_string(), token_start_line, token_start_pos);
+        let token = Token::new(
+            script[token_start_index..current_index].to_string(),
+            token_start_line,
+            token_start_pos,
+        );
         tokens.push(token);
 
         ParserContext {
-            tokens: tokens.iter().filter(|x|x.value.len() > 0).map(|x|x.clone()).collect(),
+            tokens: tokens
+                .iter()
+                .filter(|x| x.value.len() > 0)
+                .map(|x| x.clone())
+                .collect(),
             current_pos: 0,
         }
     }
@@ -189,7 +223,6 @@ impl ParserContext {
         self.current_pos += 1;
         assert_eq!(val.value, value);
     }
-
 }
 
 #[derive(Clone)]
@@ -202,7 +235,6 @@ impl TranslationContext {
         self.now.clone()
     }
 }
-
 
 #[derive(Debug)]
 pub(crate) struct TranslationError {
@@ -220,13 +252,11 @@ impl Display for TranslationError {
 
 impl Error for TranslationError {}
 
-
 trait Expression {
     fn translate(&self, context: &TranslationContext) -> Result<DateTime<Utc>, TranslationError>;
 }
 
-struct NowExpression {
-}
+struct NowExpression {}
 
 impl Expression for NowExpression {
     fn translate(&self, context: &TranslationContext) -> Result<DateTime<Utc>, TranslationError> {
@@ -250,15 +280,27 @@ impl Expression for FloorExpression {
     fn translate(&self, context: &TranslationContext) -> Result<DateTime<Utc>, TranslationError> {
         let left_val = self.left_expr.translate(context)?;
         let final_val = match self.unit {
-            DateUnit::Day => left_val.add(chrono::Duration::hours(-12)).duration_round(chrono::Duration::days(1)),
-            DateUnit::Hour => left_val.add(chrono::Duration::minutes(-30)).duration_round(chrono::Duration::hours(1)),
-            DateUnit::Minute => left_val.add(chrono::Duration::seconds(-30)).duration_round(chrono::Duration::minutes(1)),
-            DateUnit::Week => left_val.add(chrono::Duration::hours(-84)).duration_round(chrono::Duration::weeks(1)),
+            DateUnit::Day => left_val
+                .add(chrono::Duration::hours(-12))
+                .duration_round(chrono::Duration::days(1)),
+            DateUnit::Hour => left_val
+                .add(chrono::Duration::minutes(-30))
+                .duration_round(chrono::Duration::hours(1)),
+            DateUnit::Minute => left_val
+                .add(chrono::Duration::seconds(-30))
+                .duration_round(chrono::Duration::minutes(1)),
+            DateUnit::Week => left_val
+                .add(chrono::Duration::hours(-84))
+                .duration_round(chrono::Duration::weeks(1)),
         };
 
         match final_val {
             Ok(val) => Ok(val),
-            Err(err) => Err(TranslationError{ message: format!("{}", err), line: 0, pos: 0}),
+            Err(err) => Err(TranslationError {
+                message: format!("{}", err),
+                line: 0,
+                pos: 0,
+            }),
         }
     }
 }
@@ -271,7 +313,7 @@ enum ArithmeticOperator {
 struct ArithmeticExpression {
     left_expr: Box<dyn Expression>,
     op: ArithmeticOperator,
-    right_expr: IntervalExpression
+    right_expr: IntervalExpression,
 }
 
 impl Expression for ArithmeticExpression {
@@ -282,7 +324,7 @@ impl Expression for ArithmeticExpression {
             ArithmeticOperator::Add => {
                 let final_val = left_val + right_val;
                 Ok(final_val)
-            },
+            }
             ArithmeticOperator::Sub => {
                 let final_val = left_val - right_val;
                 Ok(final_val)
@@ -307,37 +349,32 @@ impl IntervalExpression {
     }
 }
 
-
 pub(crate) fn evaluate(dt_spec: &String, now: &DateTime<Utc>) -> Result<String, TranslationError> {
     let mut parser_context = ParserContext::new(dt_spec);
 
     let expression = parse_top_level_expression(&mut parser_context)?;
 
-    let translation_context = TranslationContext{ now: now.clone() };
+    let translation_context = TranslationContext { now: now.clone() };
     let final_dt = expression.translate(&translation_context)?;
 
     Ok(final_dt.to_rfc3339_opts(SecondsFormat::Millis, true))
 }
 
-fn parse_top_level_expression(parser_context: &mut ParserContext) -> Result<Box<dyn Expression>, TranslationError> {
+fn parse_top_level_expression(
+    parser_context: &mut ParserContext,
+) -> Result<Box<dyn Expression>, TranslationError> {
     parser_context.pop_validate("now");
 
-    let expr = Box::new(NowExpression{});
+    let expr = Box::new(NowExpression {});
 
     if !parser_context.has_more() {
         return Ok(expr);
     }
 
     let expr = match parser_context.peek().value.as_str() {
-        "-" => {
-            parse_arithmetic_expression(parser_context, expr)
-        },
-        "+" => {
-            parse_arithmetic_expression(parser_context, expr)
-        },
-        "/" => {
-            parse_floor_expression(parser_context, expr)
-        }
+        "-" => parse_arithmetic_expression(parser_context, expr),
+        "+" => parse_arithmetic_expression(parser_context, expr),
+        "/" => parse_floor_expression(parser_context, expr),
         _ => {
             panic!("Unexpected token");
         }
@@ -355,7 +392,7 @@ fn parse_date_unit(value: &str) -> DateUnit {
         _ => {
             todo!();
         }
-    }   
+    }
 }
 
 fn parse_interval(value: &str) -> Result<(i64, DateUnit), TranslationError> {
@@ -373,15 +410,20 @@ fn parse_interval(value: &str) -> Result<(i64, DateUnit), TranslationError> {
     Ok((quantity, parse_date_unit(&value[current_index..])))
 }
 
-fn parse_interval_expression(parser_context: &mut ParserContext) -> Result<IntervalExpression, TranslationError> {
+fn parse_interval_expression(
+    parser_context: &mut ParserContext,
+) -> Result<IntervalExpression, TranslationError> {
     let val = parser_context.pop();
 
     let (quantity, unit) = parse_interval(&val.value.as_str())?;
 
-    Ok(IntervalExpression{ quantity, unit })
+    Ok(IntervalExpression { quantity, unit })
 }
 
-fn parse_arithmetic_expression(parser_context: &mut ParserContext, left_expr: Box<dyn Expression>) -> Result<Box<dyn Expression>, TranslationError> {
+fn parse_arithmetic_expression(
+    parser_context: &mut ParserContext,
+    left_expr: Box<dyn Expression>,
+) -> Result<Box<dyn Expression>, TranslationError> {
     let op_token = parser_context.pop();
 
     let op = match op_token.value.as_str() {
@@ -391,38 +433,80 @@ fn parse_arithmetic_expression(parser_context: &mut ParserContext, left_expr: Bo
             panic!("Unexpected token");
         }
     };
-    
+
     let right_expr = parse_interval_expression(parser_context)?;
-    
-    Ok(Box::new(ArithmeticExpression{ left_expr, op, right_expr}))
+
+    Ok(Box::new(ArithmeticExpression {
+        left_expr,
+        op,
+        right_expr,
+    }))
 }
 
-fn parse_floor_expression(parser_context: &mut ParserContext, left_expr: Box<dyn Expression>) -> Result<Box<dyn Expression>, TranslationError> {
+fn parse_floor_expression(
+    parser_context: &mut ParserContext,
+    left_expr: Box<dyn Expression>,
+) -> Result<Box<dyn Expression>, TranslationError> {
     parser_context.pop_validate("/");
-    
+
     let unit = parse_date_unit(&parser_context.pop().value.as_str());
-    
-    Ok(Box::new(FloorExpression{ left_expr, unit }))
+
+    Ok(Box::new(FloorExpression { left_expr, unit }))
 }
 
 #[cfg(test)]
 mod tests {
-    use chrono::DateTime;
     use crate::elastic_search_datetime_parser::evaluate;
+    use chrono::DateTime;
 
     #[test]
     fn test_evaluate() {
-        let now = DateTime::parse_from_rfc3339("2025-06-29T13:42:46.228Z").unwrap().to_utc();
-        assert_eq!(evaluate(&"now".to_string(), &now).unwrap(), "2025-06-29T13:42:46.228Z");
-        assert_eq!(evaluate(&"now/d".to_string(), &now).unwrap(), "2025-06-29T00:00:00.000Z");
-        assert_eq!(evaluate(&"now/h".to_string(), &now).unwrap(), "2025-06-29T13:00:00.000Z");
-        assert_eq!(evaluate(&"now/m".to_string(), &now).unwrap(), "2025-06-29T13:42:00.000Z");
-        assert_eq!(evaluate(&"now/w".to_string(), &now).unwrap(), "2025-06-26T00:00:00.000Z");
-        assert_eq!(evaluate(&"now-1d".to_string(), &now).unwrap(), "2025-06-28T13:42:46.228Z");
-        assert_eq!(evaluate(&"now+1d".to_string(), &now).unwrap(), "2025-06-30T13:42:46.228Z");
-        assert_eq!(evaluate(&"now+2d".to_string(), &now).unwrap(), "2025-07-01T13:42:46.228Z");
-        assert_eq!(evaluate(&"now+2h".to_string(), &now).unwrap(), "2025-06-29T15:42:46.228Z");
-        assert_eq!(evaluate(&"now-1w".to_string(), &now).unwrap(), "2025-06-22T13:42:46.228Z");
-        assert_eq!(evaluate(&"now+5m".to_string(), &now).unwrap(), "2025-06-29T13:47:46.228Z");
+        let now = DateTime::parse_from_rfc3339("2025-06-29T13:42:46.228Z")
+            .unwrap()
+            .to_utc();
+        assert_eq!(
+            evaluate(&"now".to_string(), &now).unwrap(),
+            "2025-06-29T13:42:46.228Z"
+        );
+        assert_eq!(
+            evaluate(&"now/d".to_string(), &now).unwrap(),
+            "2025-06-29T00:00:00.000Z"
+        );
+        assert_eq!(
+            evaluate(&"now/h".to_string(), &now).unwrap(),
+            "2025-06-29T13:00:00.000Z"
+        );
+        assert_eq!(
+            evaluate(&"now/m".to_string(), &now).unwrap(),
+            "2025-06-29T13:42:00.000Z"
+        );
+        assert_eq!(
+            evaluate(&"now/w".to_string(), &now).unwrap(),
+            "2025-06-26T00:00:00.000Z"
+        );
+        assert_eq!(
+            evaluate(&"now-1d".to_string(), &now).unwrap(),
+            "2025-06-28T13:42:46.228Z"
+        );
+        assert_eq!(
+            evaluate(&"now+1d".to_string(), &now).unwrap(),
+            "2025-06-30T13:42:46.228Z"
+        );
+        assert_eq!(
+            evaluate(&"now+2d".to_string(), &now).unwrap(),
+            "2025-07-01T13:42:46.228Z"
+        );
+        assert_eq!(
+            evaluate(&"now+2h".to_string(), &now).unwrap(),
+            "2025-06-29T15:42:46.228Z"
+        );
+        assert_eq!(
+            evaluate(&"now-1w".to_string(), &now).unwrap(),
+            "2025-06-22T13:42:46.228Z"
+        );
+        assert_eq!(
+            evaluate(&"now+5m".to_string(), &now).unwrap(),
+            "2025-06-29T13:47:46.228Z"
+        );
     }
 }

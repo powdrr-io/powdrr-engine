@@ -1,16 +1,15 @@
 use std::collections::HashSet;
 
 use crate::data_access;
-use serde::{Deserialize, Serialize};
 use crate::elastic_search_common::call_peers;
-use crate::state_provider::STATE_PROVIDER;
 use crate::peers::{CheckpointDescriptor, PrivateInvocation, PrivatePrefetchInvocation};
-
+use crate::state_provider::STATE_PROVIDER;
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct PrefetchCommand {
     required_extensions: Vec<String>,
-    checkpoints: Vec<CheckpointDescriptor>
+    checkpoints: Vec<CheckpointDescriptor>,
 }
 
 pub(crate) async fn warm_iceberg_checkpoints(
@@ -60,13 +59,14 @@ pub(crate) async fn warm_iceberg_checkpoints(
     Ok(())
 }
 
-pub(crate) async fn perform_prefetch(required_extensions: &Vec<String>, checkpoints: &Vec<CheckpointDescriptor>) -> Result<(), std::io::Error> {
-    let prefetch_invocation = PrivateInvocation::Prefetch(
-        PrivatePrefetchInvocation {
-            required_extensions: required_extensions.clone(),
-            checkpoints: checkpoints.clone()
-        }
-    );
+pub(crate) async fn perform_prefetch(
+    required_extensions: &Vec<String>,
+    checkpoints: &Vec<CheckpointDescriptor>,
+) -> Result<(), std::io::Error> {
+    let prefetch_invocation = PrivateInvocation::Prefetch(PrivatePrefetchInvocation {
+        required_extensions: required_extensions.clone(),
+        checkpoints: checkpoints.clone(),
+    });
     tracing::info!("!!!!!!!!!!!!!!!!!!!! Prefetching Start !!!!!!!!!!!!!!!!!!!!!!!");
     match call_peers(&prefetch_invocation).await {
         Ok(_) => {}
@@ -76,7 +76,17 @@ pub(crate) async fn perform_prefetch(required_extensions: &Vec<String>, checkpoi
         }
     }
     tracing::info!("!!!!!!!!!!!!!!!!!!!! Prefetching End !!!!!!!!!!!!!!!!!!!!!!!");
-    match STATE_PROVIDER.set_prefetch_checkpoints(checkpoints, if required_extensions.len() == 0 { None } else { Some(required_extensions[0].clone()) }).await {
+    match STATE_PROVIDER
+        .set_prefetch_checkpoints(
+            checkpoints,
+            if required_extensions.len() == 0 {
+                None
+            } else {
+                Some(required_extensions[0].clone())
+            },
+        )
+        .await
+    {
         Ok(_) => {}
         Err(e) => {
             tracing::error!("Error during prefetching: {}", e);

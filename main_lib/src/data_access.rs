@@ -1,4 +1,7 @@
-use crate::data_contract::{IcebergColumnStats, IcebergFileStats, IcebergRowGroupStats};
+use crate::data_contract::{
+    IcebergAccessArtifact, IcebergColumnStats, IcebergFileStats, IcebergPartitionField,
+    IcebergPartitionValue, IcebergRowGroupStats, IcebergSortField,
+};
 use crate::elastic_search_ingest::JSON_MODE;
 use crate::util::log_err;
 use datafusion::arrow::datatypes::Schema;
@@ -9,12 +12,13 @@ use datafusion::datasource::{
     listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
 };
 use datafusion::execution::options::{ArrowReadOptions, JsonReadOptions};
+use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use datafusion::prelude::SessionConfig;
 use datafusion::{
     arrow,
     arrow::array::RecordBatch,
     error::DataFusionError,
-    prelude::{DataFrame, ParquetReadOptions, SessionContext},
+    prelude::{DataFrame, SessionContext},
 };
 use futures::stream::{self, StreamExt};
 use futures_util::TryStreamExt;
@@ -27,6 +31,8 @@ use iceberg::transaction::ApplyTransactionAction;
 use iceberg::{NamespaceIdent, TableCreation, TableIdent};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use idgenerator::IdInstance;
+#[cfg(target_os = "linux")]
+use liquid_cache_datafusion::cache::LiquidCacheParquetRef;
 #[cfg(target_os = "linux")]
 use liquid_cache_parquet::LiquidCacheLocalBuilder;
 #[cfg(target_os = "linux")]
@@ -44,12 +50,14 @@ use parquet_55::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
 use parquet_55::file::statistics::Statistics;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::string::ToString;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
-use std::{path::Path, sync::Arc};
-#[cfg(target_os = "linux")]
-use tempfile::TempDir;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinSet;
@@ -63,6 +71,18 @@ const S3_REGION_VALUE: &str = "us-east-1";
 const PARQUET_ROW_GROUP_STATS_CACHE_MAX_ENTRIES: usize = 2048;
 const ICEBERG_TABLE_METADATA_CACHE_MAX_ENTRIES: usize = 256;
 const ICEBERG_ROW_GROUP_STATS_LOAD_PARALLELISM_MAX: usize = 16;
+const ACCESS_ARTIFACT_KIND_BLOOM_FILTER: &str = "bloom-filter";
+const ACCESS_ARTIFACT_KIND_FILE_STATS: &str = "file-stats";
+const ACCESS_ARTIFACT_KIND_PAGE_INDEX: &str = "page-index";
+const ACCESS_ARTIFACT_KIND_PARTITION_SPEC: &str = "partition-spec";
+const ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS: &str = "row-group-stats";
+const ACCESS_ARTIFACT_KIND_SORT_ORDER: &str = "sort-order";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const SERVING_LIQUID_CACHE_DIR_ENV_VAR: &str = "POWDRR_SERVING_CACHE_DIR";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const SERVING_LIQUID_CACHE_ROOT_DIR_NAME: &str = "powdrr-engine";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const SERVING_LIQUID_CACHE_NAMESPACE_DIR_NAME: &str = "serving-liquid-cache";
 
 #[derive(Default)]
 struct ParquetRowGroupStatsCache {
@@ -352,6 +372,15 @@ pub(crate) fn reset_serving_metadata_caches_for_test() {
     clear_parquet_row_group_stats_cache();
     clear_iceberg_table_metadata_cache();
     clear_iceberg_table_row_group_stats_tracker();
+    clear_serving_bulk_cache_warmup();
+    clear_serving_cache_manager_operation();
+}
+
+pub(crate) fn evict_serving_metadata_for_files(file_paths: &[String]) {
+    for file_path in file_paths {
+        remove_file_from_iceberg_table_row_group_stats(file_path);
+        invalidate_iceberg_table_metadata_for_file(file_path);
+    }
 }
 
 #[derive(Default)]
@@ -462,11 +491,218 @@ fn clear_iceberg_table_row_group_stats_tracker() {
         .clear();
 }
 
+fn collect_iceberg_partition_spec(table: &Table) -> Vec<IcebergPartitionField> {
+    let schema = table.metadata().current_schema();
+    let mut partition_fields = table
+        .metadata()
+        .default_partition_spec()
+        .fields()
+        .iter()
+        .filter_map(|field| {
+            let source_field_name = schema.name_by_field_id(field.source_id)?.to_string();
+            Some(IcebergPartitionField {
+                source_field_id: field.source_id,
+                source_field_name,
+                field_id: field.field_id,
+                field_name: field.name.clone(),
+                transform: field.transform.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    partition_fields.sort_by(|left, right| left.field_id.cmp(&right.field_id));
+    partition_fields
+}
+
+fn collect_iceberg_sort_order(table: &Table) -> Vec<IcebergSortField> {
+    let schema = table.metadata().current_schema();
+    let mut sort_fields = table
+        .metadata()
+        .default_sort_order()
+        .fields
+        .iter()
+        .filter_map(|field| {
+            let source_field_name = schema.name_by_field_id(field.source_id)?.to_string();
+            Some(IcebergSortField {
+                source_field_id: field.source_id,
+                source_field_name,
+                transform: field.transform.to_string(),
+                descending: matches!(field.direction, iceberg::spec::SortDirection::Descending),
+                nulls_first: matches!(field.null_order, iceberg::spec::NullOrder::First),
+            })
+        })
+        .collect::<Vec<_>>();
+    sort_fields.sort_by(|left, right| left.source_field_id.cmp(&right.source_field_id));
+    sort_fields
+}
+
+fn collect_iceberg_partition_values(
+    data_file: &DataFile,
+    partition_spec: &iceberg::spec::PartitionSpec,
+    schema: &iceberg::spec::Schema,
+) -> Vec<IcebergPartitionValue> {
+    let partition_fields = data_file.partition().fields();
+    let mut values = partition_spec
+        .fields()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, field)| {
+            let source_field = schema.field_by_id(field.source_id)?;
+            let source_field_name = schema.name_by_field_id(field.source_id)?.to_string();
+            let partition_type = field
+                .transform
+                .result_type(source_field.field_type.as_ref())
+                .ok()?;
+            let value = partition_fields
+                .get(index)
+                .and_then(|value| value.as_ref())
+                .and_then(|value| value.clone().try_into_json(&partition_type).ok());
+            Some(IcebergPartitionValue {
+                source_field_name,
+                field_name: field.name.clone(),
+                transform: field.transform.to_string(),
+                value,
+            })
+        })
+        .collect::<Vec<_>>();
+    values.sort_by(|left, right| left.field_name.cmp(&right.field_name));
+    values
+}
+
+fn collect_iceberg_access_artifacts(
+    partition_spec: &[IcebergPartitionField],
+    sort_order: &[IcebergSortField],
+    file_stats: &[IcebergFileStats],
+) -> Vec<IcebergAccessArtifact> {
+    let mut artifacts = Vec::new();
+    let mut tracked_names = HashSet::new();
+
+    let mut add_artifact = |artifact: IcebergAccessArtifact| {
+        if tracked_names.insert(artifact.name.clone()) {
+            artifacts.push(artifact);
+        }
+    };
+
+    let stat_fields = file_stats
+        .iter()
+        .flat_map(|stats| stats.columns.iter().map(|column| column.field_name.clone()))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if !stat_fields.is_empty() {
+        add_artifact(IcebergAccessArtifact {
+            name: ACCESS_ARTIFACT_KIND_FILE_STATS.to_string(),
+            kind: ACCESS_ARTIFACT_KIND_FILE_STATS.to_string(),
+            fields: stat_fields.clone(),
+            exact: false,
+            supports_eq: true,
+            supports_range: true,
+            supports_order: false,
+        });
+    }
+
+    let row_group_fields = file_stats
+        .iter()
+        .flat_map(|stats| {
+            stats
+                .row_groups
+                .iter()
+                .flat_map(|row_group| {
+                    row_group
+                        .columns
+                        .iter()
+                        .map(|column| column.field_name.clone())
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if !row_group_fields.is_empty() {
+        add_artifact(IcebergAccessArtifact {
+            name: ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS.to_string(),
+            kind: ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS.to_string(),
+            fields: row_group_fields.clone(),
+            exact: false,
+            supports_eq: true,
+            supports_range: true,
+            supports_order: false,
+        });
+    }
+
+    if file_stats.iter().any(|stats| {
+        stats
+            .row_groups
+            .iter()
+            .any(|row_group| row_group.page_index_present)
+    }) {
+        add_artifact(IcebergAccessArtifact {
+            name: ACCESS_ARTIFACT_KIND_PAGE_INDEX.to_string(),
+            kind: ACCESS_ARTIFACT_KIND_PAGE_INDEX.to_string(),
+            fields: row_group_fields.clone(),
+            exact: false,
+            supports_eq: true,
+            supports_range: true,
+            supports_order: false,
+        });
+    }
+
+    if file_stats.iter().any(|stats| {
+        stats
+            .row_groups
+            .iter()
+            .any(|row_group| row_group.bloom_filter_present)
+    }) {
+        add_artifact(IcebergAccessArtifact {
+            name: ACCESS_ARTIFACT_KIND_BLOOM_FILTER.to_string(),
+            kind: ACCESS_ARTIFACT_KIND_BLOOM_FILTER.to_string(),
+            fields: row_group_fields.clone(),
+            exact: false,
+            supports_eq: true,
+            supports_range: false,
+            supports_order: false,
+        });
+    }
+
+    for field in partition_spec {
+        add_artifact(IcebergAccessArtifact {
+            name: format!(
+                "{}:{}",
+                ACCESS_ARTIFACT_KIND_PARTITION_SPEC, field.field_name
+            ),
+            kind: ACCESS_ARTIFACT_KIND_PARTITION_SPEC.to_string(),
+            fields: vec![field.source_field_name.clone()],
+            exact: field.transform == "identity",
+            supports_eq: true,
+            supports_range: field.transform == "identity",
+            supports_order: false,
+        });
+    }
+
+    for field in sort_order {
+        add_artifact(IcebergAccessArtifact {
+            name: format!(
+                "{}:{}",
+                ACCESS_ARTIFACT_KIND_SORT_ORDER, field.source_field_name
+            ),
+            kind: ACCESS_ARTIFACT_KIND_SORT_ORDER.to_string(),
+            fields: vec![field.source_field_name.clone()],
+            exact: false,
+            supports_eq: false,
+            supports_range: false,
+            supports_order: true,
+        });
+    }
+
+    artifacts.sort_by(|left, right| left.name.cmp(&right.name));
+    artifacts
+}
+
 #[derive(Clone)]
 struct PendingIcebergFileStats {
     file_path: String,
     record_count: Option<u64>,
     columns: Vec<IcebergColumnStats>,
+    partition_values: Vec<IcebergPartitionValue>,
 }
 
 fn iceberg_row_group_stats_load_parallelism() -> usize {
@@ -573,6 +809,16 @@ impl CPURuntime {
 static CPU_RUNTIME: std::sync::LazyLock<CPURuntime> =
     std::sync::LazyLock::new(|| CPURuntime::try_new().unwrap());
 
+fn serving_session_config() -> SessionConfig {
+    let options = ConfigOptions::default();
+    let mut config = SessionConfig::from(options)
+        .with_parquet_pruning(true)
+        .with_parquet_bloom_filter_pruning(true)
+        .with_parquet_page_index_pruning(true);
+    config.options_mut().execution.parquet.pushdown_filters = true;
+    config
+}
+
 fn create_store(address: &String) -> Arc<AmazonS3> {
     let io_runtime = Handle::current();
     let s3_file_system: object_store::aws::AmazonS3 = AmazonS3Builder::new()
@@ -591,30 +837,304 @@ fn create_store(address: &String) -> Arc<AmazonS3> {
 
 const S3_BASE_PATH: &str = "s3://warehouse";
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ServingLiquidCacheLocation {
+    root_dir: PathBuf,
+    namespace: String,
+    cache_dir: PathBuf,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServingBulkCacheWarmupStats {
+    #[serde(default)]
+    pub table: String,
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
+    #[serde(default)]
+    pub targeted: bool,
+    #[serde(default)]
+    pub matched_patterns: Vec<String>,
+    #[serde(default)]
+    pub shaped_queries: usize,
+    #[serde(default)]
+    pub files_considered: usize,
+    #[serde(default)]
+    pub files_selected: usize,
+    #[serde(default)]
+    pub estimated_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServingCacheManagerOperationStats {
+    #[serde(default)]
+    pub table: String,
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
+    #[serde(default)]
+    pub warmed_files: usize,
+    #[serde(default)]
+    pub evicted_files: usize,
+    #[serde(default)]
+    pub targeted_ranges: usize,
+    #[serde(default)]
+    pub matched_patterns: Vec<String>,
+    #[serde(default)]
+    pub matched_artifacts: Vec<String>,
+    #[serde(default)]
+    pub metadata_refreshed: bool,
+    #[serde(default)]
+    pub bulk_cache_flushed: bool,
+    #[serde(default)]
+    pub bulk_cache_reset: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServingBulkCacheStats {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub persistent: bool,
+    #[serde(default)]
+    pub memory_usage_bytes: u64,
+    #[serde(default)]
+    pub disk_usage_bytes: u64,
+    #[serde(default)]
+    pub last_manager_operation: Option<ServingCacheManagerOperationStats>,
+    #[serde(default)]
+    pub last_warmup: Option<ServingBulkCacheWarmupStats>,
+}
+
 #[cfg(target_os = "linux")]
-fn create_session(file_store: Arc<AmazonS3>) -> SessionContext {
-    let options = ConfigOptions::default();
-    // UNCOMMENT TO ENABLE 'SHOW TABLES'
-    //options.set("datafusion.catalog.information_schema", "true").unwrap();
+#[derive(Clone)]
+struct ServingLiquidCacheRuntime {
+    location: ServingLiquidCacheLocation,
+    cache: LiquidCacheParquetRef,
+}
 
-    let config = SessionConfig::from(options);
+#[cfg(target_os = "linux")]
+static SERVING_LIQUID_CACHE_RUNTIME: LazyLock<Mutex<Option<ServingLiquidCacheRuntime>>> =
+    LazyLock::new(|| Mutex::new(None));
 
-    let temp_dir = TempDir::new().unwrap();
+static LAST_SERVING_BULK_CACHE_WARMUP: LazyLock<Mutex<Option<ServingBulkCacheWarmupStats>>> =
+    LazyLock::new(|| Mutex::new(None));
+static LAST_SERVING_CACHE_MANAGER_OPERATION: LazyLock<
+    Mutex<Option<ServingCacheManagerOperationStats>>,
+> = LazyLock::new(|| Mutex::new(None));
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn resolve_serving_liquid_cache_location(
+    explicit_root: Option<PathBuf>,
+    xdg_cache_home: Option<PathBuf>,
+    home_dir: Option<PathBuf>,
+    temp_dir: PathBuf,
+    bucket_name: &str,
+    s3_endpoint: &str,
+) -> ServingLiquidCacheLocation {
+    let root_dir = explicit_root.unwrap_or_else(|| {
+        xdg_cache_home
+            .map(|path| path.join(SERVING_LIQUID_CACHE_ROOT_DIR_NAME))
+            .or_else(|| {
+                home_dir.map(|path| path.join(".cache").join(SERVING_LIQUID_CACHE_ROOT_DIR_NAME))
+            })
+            .unwrap_or_else(|| temp_dir.join(SERVING_LIQUID_CACHE_ROOT_DIR_NAME))
+            .join(SERVING_LIQUID_CACHE_NAMESPACE_DIR_NAME)
+    });
+    let scope = format!("{bucket_name}@{s3_endpoint}");
+    let namespace = format!(
+        "{}-{:016x}",
+        sanitize_cache_namespace_component(bucket_name),
+        stable_cache_namespace_hash(&scope)
+    );
+    let cache_dir = root_dir.join(&namespace);
+
+    ServingLiquidCacheLocation {
+        root_dir,
+        namespace,
+        cache_dir,
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn current_serving_liquid_cache_location(
+    bucket_name: &str,
+    s3_endpoint: &str,
+) -> ServingLiquidCacheLocation {
+    resolve_serving_liquid_cache_location(
+        std::env::var_os(SERVING_LIQUID_CACHE_DIR_ENV_VAR).map(PathBuf::from),
+        std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+        std::env::temp_dir(),
+        bucket_name,
+        s3_endpoint,
+    )
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn stable_cache_namespace_hash(value: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn sanitize_cache_namespace_component(value: &str) -> String {
+    let mut sanitized = String::new();
+    let mut last_was_separator = false;
+
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            sanitized.push(character.to_ascii_lowercase());
+            last_was_separator = false;
+            continue;
+        }
+
+        if !last_was_separator && !sanitized.is_empty() {
+            sanitized.push('-');
+            last_was_separator = true;
+        }
+    }
+
+    let trimmed = sanitized.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "cache".to_string()
+    } else {
+        trimmed
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_serving_liquid_cache_runtime(runtime: ServingLiquidCacheRuntime) {
+    SERVING_LIQUID_CACHE_RUNTIME
+        .lock()
+        .unwrap()
+        .replace(runtime);
+}
+
+#[cfg(target_os = "linux")]
+fn current_serving_liquid_cache_runtime() -> Option<ServingLiquidCacheRuntime> {
+    SERVING_LIQUID_CACHE_RUNTIME.lock().unwrap().clone()
+}
+
+fn current_serving_bulk_cache_warmup() -> Option<ServingBulkCacheWarmupStats> {
+    LAST_SERVING_BULK_CACHE_WARMUP.lock().unwrap().clone()
+}
+
+fn current_serving_cache_manager_operation() -> Option<ServingCacheManagerOperationStats> {
+    LAST_SERVING_CACHE_MANAGER_OPERATION.lock().unwrap().clone()
+}
+
+fn clear_serving_bulk_cache_warmup() {
+    LAST_SERVING_BULK_CACHE_WARMUP.lock().unwrap().take();
+}
+
+fn clear_serving_cache_manager_operation() {
+    LAST_SERVING_CACHE_MANAGER_OPERATION.lock().unwrap().take();
+}
+
+pub(crate) fn record_serving_bulk_cache_warmup(stats: ServingBulkCacheWarmupStats) {
+    LAST_SERVING_BULK_CACHE_WARMUP
+        .lock()
+        .unwrap()
+        .replace(stats);
+}
+
+pub(crate) fn record_serving_cache_manager_operation(stats: ServingCacheManagerOperationStats) {
+    LAST_SERVING_CACHE_MANAGER_OPERATION
+        .lock()
+        .unwrap()
+        .replace(stats);
+}
+
+pub(crate) fn serving_bulk_cache_stats() -> ServingBulkCacheStats {
+    let last_warmup = current_serving_bulk_cache_warmup();
+    let last_manager_operation = current_serving_cache_manager_operation();
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(runtime) = current_serving_liquid_cache_runtime() {
+            return ServingBulkCacheStats {
+                enabled: true,
+                persistent: true,
+                memory_usage_bytes: runtime.cache.memory_usage_bytes() as u64,
+                disk_usage_bytes: runtime.cache.disk_usage_bytes() as u64,
+                last_manager_operation,
+                last_warmup,
+            };
+        }
+    }
+
+    ServingBulkCacheStats {
+        last_manager_operation,
+        last_warmup,
+        ..ServingBulkCacheStats::default()
+    }
+}
+
+pub(crate) async fn flush_serving_bulk_cache() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(runtime) = current_serving_liquid_cache_runtime() else {
+            return Ok(());
+        };
+
+        let before_memory = runtime.cache.memory_usage_bytes();
+        let before_disk = runtime.cache.disk_usage_bytes();
+        runtime.cache.flush_data().await.map_err(|_| {
+            format!(
+                "Failed to flush serving LiquidCache data to {}",
+                runtime.location.cache_dir.display()
+            )
+        })?;
+        tracing::info!(
+            cache_dir = %runtime.location.cache_dir.display(),
+            cache_namespace = runtime.location.namespace,
+            memory_before_bytes = before_memory,
+            disk_before_bytes = before_disk,
+            memory_after_bytes = runtime.cache.memory_usage_bytes(),
+            disk_after_bytes = runtime.cache.disk_usage_bytes(),
+            "Flushed serving LiquidCache data to disk"
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn create_session(file_store: Arc<AmazonS3>, s3_endpoint: &str) -> SessionContext {
+    let config = serving_session_config();
+    let cache_location = current_serving_liquid_cache_location("warehouse", s3_endpoint);
+    std::fs::create_dir_all(&cache_location.cache_dir).unwrap_or_else(|error| {
+        panic!(
+            "Failed to create serving LiquidCache directory {}: {}",
+            cache_location.cache_dir.display(),
+            error
+        )
+    });
+    tracing::info!(
+        cache_dir = %cache_location.cache_dir.display(),
+        cache_namespace = cache_location.namespace,
+        "Using persistent serving LiquidCache directory"
+    );
 
     let build_cache = async {
         LiquidCacheLocalBuilder::new()
             .with_max_memory_bytes(10 * 1024 * 1024 * 1024) // 10GB
-            .with_cache_dir(temp_dir.path().to_path_buf())
+            .with_cache_dir(cache_location.cache_dir.clone())
             .with_cache_policy(Box::new(LiquidPolicy::new()))
             .with_squeeze_policy(Box::new(Evict))
             .build(config)
             .await
     };
 
-    let (ctx, _) = match tokio::task::block_in_place(|| Handle::current().block_on(build_cache)) {
+    let (ctx, cache) = match tokio::task::block_in_place(|| Handle::current().block_on(build_cache))
+    {
         Ok(ctx) => ctx,
         Err(e) => panic!("Failed to create session: {}", e),
     };
+    set_serving_liquid_cache_runtime(ServingLiquidCacheRuntime {
+        location: cache_location.clone(),
+        cache,
+    });
 
     //let ctx = SessionContext::new_with_config(config);
 
@@ -626,9 +1146,8 @@ fn create_session(file_store: Arc<AmazonS3>) -> SessionContext {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn create_session(file_store: Arc<AmazonS3>) -> SessionContext {
-    let options = ConfigOptions::default();
-    let config = SessionConfig::from(options);
+fn create_session(file_store: Arc<AmazonS3>, _s3_endpoint: &str) -> SessionContext {
+    let config = serving_session_config();
     let ctx = SessionContext::new_with_config(config);
     let s3_url = Url::parse(S3_BASE_PATH).unwrap();
 
@@ -666,10 +1185,13 @@ pub struct IcebergLibMetadata {
     pub sizes: Vec<u64>,
     pub schemas: Vec<Arc<iceberg::spec::Schema>>,
     pub compactions: Vec<String>,
+    pub partition_spec: Vec<IcebergPartitionField>,
+    pub sort_order: Vec<IcebergSortField>,
     pub column_names: Vec<String>,
     // per file, per column lower and upper bounds
     // TODO: this needs to be generalized to support bloom filters
     pub column_stats: Vec<(String, String)>,
+    pub access_artifacts: Vec<IcebergAccessArtifact>,
     pub file_stats: Vec<IcebergFileStats>,
 }
 
@@ -804,7 +1326,7 @@ impl CacheTrackerActor {
             top_level_to_delete: vec![],
             existing_tables: vec![],
             s3_file_store: file_store.clone(),
-            data_fusion_context: create_session(file_store),
+            data_fusion_context: create_session(file_store, DEFAULT_S3_ENDPOINT_VALUE),
             rest_catalog: Arc::new(RestCatalog::new(get_iceberg_catalog_config(
                 &DEFAULT_ICEBERG_ENDPOINT_VALUE.to_string(),
                 &DEFAULT_S3_ENDPOINT_VALUE.to_string(),
@@ -868,8 +1390,14 @@ impl CacheTrackerActor {
                     .len()
                         > 0
                 );
+                if let Err(error) = flush_serving_bulk_cache().await {
+                    tracing::warn!(
+                        error = %error,
+                        "Failed to flush serving LiquidCache before rebuilding session"
+                    );
+                }
                 self.s3_file_store = create_store(&endpoint);
-                self.data_fusion_context = create_session(self.s3_file_store.clone());
+                self.data_fusion_context = create_session(self.s3_file_store.clone(), &endpoint);
                 self.rest_catalog = Arc::new(RestCatalog::new(get_iceberg_catalog_config(
                     &iceberg_rest_endpont,
                     &endpoint,
@@ -883,6 +1411,8 @@ impl CacheTrackerActor {
                 clear_parquet_row_group_stats_cache();
                 clear_iceberg_table_metadata_cache();
                 clear_iceberg_table_row_group_stats_tracker();
+                clear_serving_bulk_cache_warmup();
+                clear_serving_cache_manager_operation();
                 let _ = respond_to.send(());
             }
             CacheTrackerActorMessage::Reserve {
@@ -1712,18 +2242,67 @@ async fn load_parquet_file_as_table(
             }
         }
     } else {
-        let result = data_fusion_context
-            .register_parquet(local_name, file_path, ParquetReadOptions::new())
-            .await;
-        match result {
-            Err(e) => {
-                if e.message().contains("already exists") {
-                    Ok(())
-                } else {
-                    log_err(e)
-                }
+        load_local_parquet_files_as_table(data_fusion_context, &vec![file_path.clone()], local_name)
+    }
+}
+
+fn normalize_local_file_path(file_path: &str) -> &str {
+    file_path.strip_prefix("file://").unwrap_or(file_path)
+}
+
+fn read_local_parquet_batches(
+    file_path: &str,
+) -> Result<(Arc<arrow::datatypes::Schema>, Vec<RecordBatch>), DataFusionError> {
+    let local_file_path = normalize_local_file_path(file_path);
+    let file = std::fs::File::open(local_file_path)
+        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|error| DataFusionError::ArrowError(Box::new(error.into()), None))?;
+    let schema = builder.schema().clone();
+    let reader = builder
+        .build()
+        .map_err(|error| DataFusionError::ArrowError(Box::new(error.into()), None))?;
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| DataFusionError::ArrowError(Box::new(error), None))?;
+    Ok((schema, batches))
+}
+
+fn load_local_parquet_files_as_table(
+    data_fusion_context: &SessionContext,
+    file_paths: &Vec<String>,
+    local_name: &String,
+) -> Result<(), DataFusionError> {
+    let mut table_schema: Option<Arc<arrow::datatypes::Schema>> = None;
+    let mut partitions = Vec::with_capacity(file_paths.len());
+
+    for file_path in file_paths {
+        let (schema, batches) = read_local_parquet_batches(file_path)?;
+        if let Some(existing_schema) = table_schema.as_ref() {
+            if existing_schema.as_ref() != schema.as_ref() {
+                return Err(DataFusionError::Execution(format!(
+                    "Local parquet files for {} did not share a schema",
+                    local_name
+                )));
             }
-            _ => Ok(()),
+        } else {
+            table_schema = Some(schema);
+        }
+        partitions.push(batches);
+    }
+
+    let table = Arc::new(datafusion::datasource::MemTable::try_new(
+        table_schema.expect("local parquet load requires at least one file"),
+        partitions,
+    )?);
+    match data_fusion_context.register_table(local_name, table) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if e.message().contains("already exists") {
+                Ok(())
+            } else {
+                log_err(e)
+            }
         }
     }
 }
@@ -1746,6 +2325,17 @@ async fn load_parquet_files_as_table(
         return log_err(DataFusionError::Execution(
             "No parquet files were provided".to_string(),
         ));
+    }
+
+    if file_paths.len() == 1 {
+        return load_parquet_file_as_table(data_fusion_context, &file_paths[0], local_name).await;
+    }
+
+    if file_paths
+        .iter()
+        .all(|file_path| !file_path.starts_with("s3:"))
+    {
+        return load_local_parquet_files_as_table(data_fusion_context, file_paths, local_name);
     }
 
     tracing::info!(
@@ -2158,7 +2748,11 @@ async fn load_iceberg_table_metadata_worker(
         return Ok(metadata);
     }
 
+    let partition_spec = collect_iceberg_partition_spec(&table);
+    let sort_order = collect_iceberg_sort_order(&table);
     let file_stats = load_iceberg_file_stats(&table, current_snapshot).await?;
+    let access_artifacts =
+        collect_iceberg_access_artifacts(&partition_spec, &sort_order, &file_stats);
     let current_files = file_stats
         .iter()
         .map(|stats| stats.file_path.clone())
@@ -2213,8 +2807,11 @@ async fn load_iceberg_table_metadata_worker(
         sizes: sizes,
         schemas: schemas,
         compactions: vec![],
+        partition_spec,
+        sort_order,
         column_names: vec![],
         column_stats: vec![],
+        access_artifacts,
         file_stats,
     };
     cache_iceberg_table_metadata(namespace, name, &metadata);
@@ -2232,6 +2829,7 @@ async fn load_iceberg_file_stats(
         .load_manifest_list(table.file_io(), table.metadata())
         .await?;
     let current_schema = table.metadata().current_schema().clone();
+    let current_partition_spec = table.metadata().default_partition_spec().clone();
     let mut pending_file_stats = vec![];
 
     for manifest_file in manifest_list.entries().iter() {
@@ -2251,6 +2849,11 @@ async fn load_iceberg_file_stats(
                 file_path: data_file.file_path().to_string(),
                 record_count: Some(data_file.record_count()),
                 columns: collect_iceberg_column_stats(data_file, &current_schema),
+                partition_values: collect_iceberg_partition_values(
+                    data_file,
+                    current_partition_spec.as_ref(),
+                    &current_schema,
+                ),
             });
         }
     }
@@ -2279,6 +2882,7 @@ async fn load_iceberg_file_stats(
                     file_path: pending.file_path,
                     record_count: pending.record_count,
                     columns: pending.columns,
+                    partition_values: pending.partition_values,
                     row_groups,
                 }
             }
@@ -2573,13 +3177,21 @@ pub(crate) fn s3_ingest_base_path() -> String {
 mod tests {
     use super::{
         IcebergLibMetadata, IcebergTableMetadataCache, IcebergTableRowGroupStatsTracker,
-        ParquetRowGroupStatsCache,
+        ParquetRowGroupStatsCache, RecordBatch, ServingBulkCacheWarmupStats, drop,
+        execute_sql_async, load_files_as_table, record_serving_bulk_cache_warmup,
+        resolve_serving_liquid_cache_location, serving_bulk_cache_stats, serving_session_config,
     };
     use crate::data_contract::{IcebergColumnStats, IcebergRowGroupStats};
+    use datafusion::arrow::array::{Int64Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::parquet::arrow::ArrowWriter;
     use iceberg::spec::Schema;
     use serde_json::Value;
     use std::collections::HashSet;
+    use std::fs::File;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use tempfile::TempDir;
 
     fn sample_row_group_stats(index: usize) -> Vec<IcebergRowGroupStats> {
         vec![IcebergRowGroupStats {
@@ -2613,8 +3225,11 @@ mod tests {
             sizes: file_paths.iter().map(|_| 128).collect(),
             schemas: file_paths.iter().map(|_| schema.clone()).collect(),
             compactions: vec![],
+            partition_spec: vec![],
+            sort_order: vec![],
             column_names: vec![],
             column_stats: vec![],
+            access_artifacts: vec![],
             file_stats: vec![],
         }
     }
@@ -2635,6 +3250,39 @@ mod tests {
     }
 
     #[test]
+    fn serving_bulk_cache_stats_exposes_last_warmup_summary() {
+        super::clear_serving_bulk_cache_warmup();
+        record_serving_bulk_cache_warmup(ServingBulkCacheWarmupStats {
+            table: "events".to_string(),
+            snapshot_id: Some("snapshot_1".to_string()),
+            targeted: true,
+            matched_patterns: vec!["top_scores".to_string()],
+            shaped_queries: 1,
+            files_considered: 8,
+            files_selected: 2,
+            estimated_bytes: 300,
+        });
+
+        let stats = serving_bulk_cache_stats();
+
+        assert_eq!(
+            stats.last_warmup,
+            Some(ServingBulkCacheWarmupStats {
+                table: "events".to_string(),
+                snapshot_id: Some("snapshot_1".to_string()),
+                targeted: true,
+                matched_patterns: vec!["top_scores".to_string()],
+                shaped_queries: 1,
+                files_considered: 8,
+                files_selected: 2,
+                estimated_bytes: 300,
+            })
+        );
+
+        super::clear_serving_bulk_cache_warmup();
+    }
+
+    #[test]
     fn parquet_row_group_stats_cache_remove_and_clear() {
         let mut cache = ParquetRowGroupStatsCache::new(4);
         cache.insert("s3://warehouse/a.parquet", sample_row_group_stats(1));
@@ -2646,6 +3294,16 @@ mod tests {
 
         cache.clear();
         assert!(cache.get("s3://warehouse/b.parquet").is_none());
+    }
+
+    #[test]
+    fn serving_session_config_enables_parquet_filter_pushdown() {
+        let config = serving_session_config();
+
+        assert!(config.parquet_pruning());
+        assert!(config.parquet_bloom_filter_pruning());
+        assert!(config.parquet_page_index_pruning());
+        assert!(config.options().execution.parquet.pushdown_filters);
     }
 
     #[test]
@@ -2736,5 +3394,139 @@ mod tests {
 
         assert!(cache.get("default/logs", 10).is_none());
         assert!(cache.get("default/metrics", 11).is_some());
+    }
+
+    #[tokio::test]
+    async fn load_files_as_table_reads_single_local_parquet_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let parquet_path = temp_dir.path().join("single-file.parquet");
+
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            Field::new("tenant", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["acme", "globex"])),
+                Arc::new(Int64Array::from(vec![10_i64, 20_i64])),
+            ],
+        )
+        .unwrap();
+
+        let file = File::create(&parquet_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let table_name = "single_local_parquet_test".to_string();
+        let file_url = format!("file://{}", parquet_path.display());
+        load_files_as_table(&table_name, &vec![file_url], schema.as_ref())
+            .await
+            .unwrap();
+
+        let sql = format!("SELECT COUNT(*) AS count FROM {}", table_name);
+        let batches = execute_sql_async(&sql).await.unwrap();
+        let count = batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0)
+            })
+            .sum::<i64>();
+
+        assert_eq!(count, 2);
+        drop(&table_name).await;
+    }
+
+    #[test]
+    fn serving_liquid_cache_location_prefers_explicit_root() {
+        let location = resolve_serving_liquid_cache_location(
+            Some(PathBuf::from("/var/cache/powdrr-serving")),
+            Some(PathBuf::from("/xdg-cache")),
+            Some(PathBuf::from("/home/tester")),
+            PathBuf::from("/tmp"),
+            "warehouse",
+            "http://localhost:9000",
+        );
+
+        assert_eq!(
+            location.root_dir,
+            PathBuf::from("/var/cache/powdrr-serving")
+        );
+        assert!(
+            location
+                .cache_dir
+                .starts_with(PathBuf::from("/var/cache/powdrr-serving"))
+        );
+    }
+
+    #[test]
+    fn serving_liquid_cache_location_uses_xdg_then_home_then_temp() {
+        let xdg_location = resolve_serving_liquid_cache_location(
+            None,
+            Some(PathBuf::from("/xdg-cache")),
+            Some(PathBuf::from("/home/tester")),
+            PathBuf::from("/tmp"),
+            "warehouse",
+            "http://localhost:9000",
+        );
+        assert_eq!(
+            xdg_location.root_dir,
+            PathBuf::from("/xdg-cache/powdrr-engine/serving-liquid-cache")
+        );
+
+        let home_location = resolve_serving_liquid_cache_location(
+            None,
+            None,
+            Some(PathBuf::from("/home/tester")),
+            PathBuf::from("/tmp"),
+            "warehouse",
+            "http://localhost:9000",
+        );
+        assert_eq!(
+            home_location.root_dir,
+            PathBuf::from("/home/tester/.cache/powdrr-engine/serving-liquid-cache")
+        );
+
+        let temp_location = resolve_serving_liquid_cache_location(
+            None,
+            None,
+            None,
+            PathBuf::from("/tmp"),
+            "warehouse",
+            "http://localhost:9000",
+        );
+        assert_eq!(
+            temp_location.root_dir,
+            PathBuf::from("/tmp/powdrr-engine/serving-liquid-cache")
+        );
+    }
+
+    #[test]
+    fn serving_liquid_cache_location_namespaces_by_backing_store() {
+        let first = resolve_serving_liquid_cache_location(
+            Some(PathBuf::from("/var/cache/powdrr-serving")),
+            None,
+            None,
+            PathBuf::from("/tmp"),
+            "warehouse",
+            "http://localhost:9000",
+        );
+        let second = resolve_serving_liquid_cache_location(
+            Some(PathBuf::from("/var/cache/powdrr-serving")),
+            None,
+            None,
+            PathBuf::from("/tmp"),
+            "warehouse",
+            "http://localhost:9001",
+        );
+
+        assert_ne!(first.namespace, second.namespace);
+        assert_ne!(first.cache_dir, second.cache_dir);
     }
 }

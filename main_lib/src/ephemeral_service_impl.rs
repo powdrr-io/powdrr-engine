@@ -25,6 +25,7 @@ type CommittedCheckpoints = HashMap<String, String>;
 
 pub struct EphemeralServiceImpl {
     mode: TestProcessingMode,
+    org_settings: HashMap<String, OrgSettings>,
     tables: HashMap<String, TableDescription>,
     // alias name -> table name
     table_aliases: HashMap<String, String>,
@@ -46,6 +47,7 @@ impl EphemeralServiceImpl {
     pub fn new(mode: TestProcessingMode) -> Self {
         EphemeralServiceImpl {
             mode: mode,
+            org_settings: HashMap::new(),
             tables: HashMap::new(),
             table_aliases: HashMap::new(),
             table_templates: HashMap::new(),
@@ -1003,17 +1005,44 @@ impl EphemeralServiceImpl {
     }
 
     pub async fn create_org(&mut self, _settings: &OrgSettings) -> Result<(), ServiceApiError> {
-        // Ephemeral service doesn't track orgs
+        self.org_settings
+            .insert(_settings.org_id.clone(), _settings.clone());
         Ok(())
     }
 
     pub async fn lookup_org(
         &mut self,
-        _access_key: &String,
-        _secret_key: &String,
+        access_key: &String,
+        secret_key: &String,
     ) -> Result<Option<OrgInfo>, ServiceApiError> {
-        // Ephemeral service doesn't track orgs
+        for settings in self.org_settings.values() {
+            if settings.creds.iter().any(|creds| {
+                &creds.access_key_id == access_key && &creds.secret_access_key == secret_key
+            }) {
+                return Ok(Some(settings.to_org_info()));
+            }
+        }
         Ok(None)
+    }
+
+    pub async fn lookup_secret_access_key(
+        &mut self,
+        access_key: &String,
+    ) -> Result<Option<String>, ServiceApiError> {
+        let mut matches = self
+            .org_settings
+            .values()
+            .flat_map(|settings| settings.creds.iter())
+            .filter(|creds| &creds.access_key_id == access_key)
+            .map(|creds| creds.secret_access_key.clone());
+        let first = matches.next();
+        if matches.next().is_some() {
+            return Err(ServiceApiError::new(format!(
+                "Multiple org credentials share access key {}",
+                access_key
+            )));
+        }
+        Ok(first)
     }
 }
 

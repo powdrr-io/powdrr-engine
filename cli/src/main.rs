@@ -1,7 +1,8 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use powdrr_lib::local_cli::{
-    LocalParquetBuildRequest, LocalParquetQueryRequest, LocalQueryAnalysisRequest,
-    LocalQueryLanguage, analyze_local_query, build_local_parquet_cache, query_local_parquet_cache,
+    LocalParquetBuildRequest, LocalParquetQueryRequest, LocalParquetValidateRequest,
+    LocalQueryAnalysisRequest, LocalQueryLanguage, analyze_local_query, build_local_parquet_cache,
+    query_local_parquet_cache, validate_local_parquet_source,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -28,6 +29,7 @@ struct ElasticCommand {
 #[derive(Subcommand)]
 enum ElasticSubcommand {
     Build(BuildArgs),
+    Validate(ValidateArgs),
     Query(QueryArgs),
     Analyze(AnalyzeArgs),
 }
@@ -44,6 +46,16 @@ struct BuildArgs {
     doc_id_field: String,
     #[arg(long, default_value_t = false)]
     replace: bool,
+}
+
+#[derive(Args)]
+struct ValidateArgs {
+    #[arg(long)]
+    source: String,
+    #[arg(long, default_value = "_id_seq_no")]
+    doc_id_field: String,
+    #[arg(long)]
+    scratch_dir: Option<PathBuf>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -88,6 +100,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     table_name: args.table,
                     doc_id_field: args.doc_id_field,
                     replace: args.replace,
+                })
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+            ElasticSubcommand::Validate(args) => {
+                let result = validate_local_parquet_source(&LocalParquetValidateRequest {
+                    source: args.source,
+                    doc_id_field: args.doc_id_field,
+                    scratch_dir: args.scratch_dir,
                 })
                 .await?;
                 println!("{}", serde_json::to_string_pretty(&result)?);

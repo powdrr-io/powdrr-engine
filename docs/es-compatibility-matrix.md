@@ -51,12 +51,18 @@ The manifest file turns this into an enforceable surface contract:
 | Search | `bool.filter` plus `should` and `minimum_should_match` returns filtered hits | `bool_filter_should_minimum_should_match_returns_filtered_hits` | Yes | Yes | Freezes a Kibana-like bool pattern |
 | Search | `range` query on `@timestamp` returns expected hits | `range_query_on_timestamp_returns_expected_hits` | Yes | Yes | Important for future shard-pruning and doc-values work |
 | Search | `simple_query_string` with a single term returns the expected hits | `simple_query_string_with_and_operator_returns_expected_hit` | Yes | Yes | Freezes the currently working parser path before engine swap |
+| Search | `multi_match` over `logs-*` returns the expected multi-index hits | `logs_wildcard_multi_match_returns_expected_hits` | Yes | Yes | First workload-level multi-index text search contract |
+| Search | restricted `query_string` over `logs-*` returns the expected field-filtered hit set | `logs_wildcard_query_string_returns_expected_hits` | Yes | Yes | First differential contract for fielded `OR` query-string log filters |
 | Search | field sort returns hits in descending numeric order | `field_sort_returns_expected_descending_hit_order` | Yes | Yes | Covers the typed node-local/controller merge path for explicit sorts |
+| Search | wildcard multi-index sorted pagination with `search_after` returns the expected next page | `logs_wildcard_search_after_returns_expected_hits` | Yes | Yes | Freezes the current typed wildcard merge path |
 | Search | zero-hit query on an existing index returns zero total hits | `zero_hit_query_on_existing_index_returns_zero_total` | Yes | Yes | Guards empty-result behavior |
 | Document lifecycle | `POST /:index/_create/:id` conflicts after refresh | `create_with_id_conflict_after_refresh` | Yes | Yes | Captures current create-vs-existing semantics |
+| Document lifecycle | `POST /:index/_doc` creates a document with an auto-generated id | `post_doc_auto_id_returns_created` | Yes | Yes | Full-document index semantics only; the fixture checks creation status, id allocation, and version `1` |
+| Document lifecycle | `PUT /:index/_doc/:id` replaces an existing document and increments the version | `put_doc_with_id_replaces_existing_doc` | Yes | Yes | Covers full-document replacement, not partial update semantics |
 | Document lifecycle | `GET /:index/_doc/:id` returns stored source | `get_existing_doc_returns_source` | Yes | Yes | Freezes current `_doc` retrieval behavior |
 | Document lifecycle | `DELETE /:index/_doc/:id` succeeds for existing doc | `delete_existing_doc_returns_200` | Yes | Yes | Status-only for first cut |
 | Document lifecycle | `GET /:index/_doc/:id` returns `404` after delete and refresh | `get_deleted_doc_returns_404` | Yes | Yes | Captures delete visibility |
+| Document lifecycle | `_bulk` `index` replaces an existing document and refreshed reads return the replacement source | `bulk_index_replaces_existing_doc_after_refresh` | Yes | Yes | Pins replacement visibility for the current speedboat-backed write path |
 | Mutations | `_update_by_query` scripted field becomes searchable after refresh | `update_by_query_scripted_field_becomes_searchable_after_refresh` | Yes | Yes | Freezes the supported update-by-query subset |
 | Index metadata | `PUT /_aliases` allows subsequent search via alias name | `alias_update_allows_search_via_alias_name` | Yes | Yes | Covers alias routing even though `GET /_alias` is still stubbed |
 | Templates | `HEAD /_index_template/:name` returns `200` after create | `index_template_head_returns_200_after_create` | Yes | Yes | Captures template existence checks |
@@ -67,9 +73,28 @@ The manifest file turns this into an enforceable surface contract:
 | Batch reads | `_mget` and `_msearch` are covered on both global and index-scoped routes | `table_mget_returns_found_and_missing_docs` and related ids | Yes | Yes | Keeps batched client read flows stable |
 | Document lifecycle | `HEAD /:index/_doc/:id` returns `200` for existing docs | `head_existing_doc_returns_200` | Yes | Yes | Complements existing GET and DELETE coverage |
 | Local-only admin | nodes, license, xpack, PIT, pipeline simulation, ILM, monitoring bulk | manifest-backed local-only fixtures | Yes | No | Useful for clients, but not yet frozen against real Elasticsearch |
-| Unsupported | scroll, search template, async search, cat APIs, GET pipeline, `_update/:id` | manifest-backed unsupported fixtures | Yes | No | Every such route must now fail with a clear checked error payload |
+| Unsupported | scroll, search template, async search, cat APIs, GET pipeline | manifest-backed unsupported fixtures | Yes | No | Every such route must now fail with a clear checked error payload |
 | Aggregations | `terms` aggregation over string fields returns expected bucket keys and doc counts | `terms_aggregation_returns_expected_bucket_keys_and_counts` | Yes | No | Current local behavior depends on aggregating over analyzed text fields, which Elasticsearch rejects without exact-field mapping or fielddata |
 | Aggregations | `avg` plus filtered sub-aggregation returns expected metric values | `avg_and_filter_subaggregation_return_expected_values` | Yes | Yes | Uses exact alphanumeric string terms to avoid analyzed-text drift between Powdrr and Elasticsearch |
+| Aggregations | `date_histogram` with `min_doc_count` and `extended_bounds` over `logs-*` returns empty boundary and gap buckets | `logs_wildcard_date_histogram_with_bounds_returns_expected_buckets` | Yes | Yes | Freezes empty-bucket generation on the typed histogram merge path |
+| Aggregations | `date_histogram` over `logs-*` returns expected per-day buckets | `logs_wildcard_date_histogram_returns_expected_buckets` | Yes | Yes | First differential workload histogram contract |
+| Aggregations | `cardinality` over `logs-*` returns the expected distinct value count | `logs_wildcard_cardinality_returns_expected_value` | Yes | Yes | Uses exact merge semantics in the typed path |
+| Aggregations | `terms` over `logs-*` respects `_key` ordering and the configured missing bucket | `logs_wildcard_terms_order_and_missing_return_expected_buckets` | Yes | Yes | Pins the new terms bucket ordering and missing-value behavior |
+| Aggregations | `terms` with per-bucket `avg` sub-aggregations over `logs-*` returns the expected merged buckets | `logs_wildcard_terms_subaggregation_returns_expected_buckets` | Yes | Yes | First differential contract for typed bucket sub-aggregation merge |
+
+## Current Write Limits
+
+The current ES-compatible write surface is still intentionally narrow:
+
+- `/_doc` supports full-document index/replace, and `POST /:index/_update/:id`
+  supports `doc`, `upsert`, and `doc_as_upsert` flows.
+- `_bulk` is now frozen for `create`, `index`, `update`, and `delete`, but only
+  for the document-based flows covered by the fixture corpus.
+- scripted updates, `scripted_upsert`, refresh flags, optimistic-concurrency
+  request params such as `if_seq_no` and `if_primary_term`, and persisted
+  ingest pipelines are not covered yet.
+- bulk per-item response parity is still not frozen; the compatibility fixtures
+  assert refreshed document state rather than exact item payload details.
 
 ## Surface Rules
 
@@ -86,11 +111,14 @@ the manifest coverage test fails.
 
 The next compatibility additions should focus on remaining differential drift:
 
-1. richer DSL: `terms`, `ids`, `multi_match`, and narrower `query_string`
-2. more aggregation parity: `missing`, `cardinality`, `date_histogram`, range buckets
-3. official client smoke tests for JS, Python, and Go
-4. broader multi-index differential coverage
-5. explicit unsupported contracts for any remaining ambiguous write/admin routes
+The broader workload milestone for that next phase is documented in
+`docs/es-log-workload-plan.md`.
+
+1. broader `query_string` parity beyond the restricted logs workload subset
+2. more aggregation parity: range buckets, richer bucket ordering, and remaining dashboard options
+3. official client smoke tests for Python and Go
+4. broader multi-index differential coverage beyond the first `logs-*` workload
+5. exact workload benchmarks for the saved-search and dashboard fixture set
 
 ## Differential Test Mode
 
@@ -98,6 +126,12 @@ For a full local differential run, use the dedicated compatibility stack:
 
 ```bash
 bash scripts/run_es_compat_local.sh
+```
+
+For the workload latency comparison against real Elasticsearch, use:
+
+```bash
+bash scripts/run_es_workload_bench_local.sh
 ```
 
 That script starts Redis, MinIO, the Iceberg REST catalog, LocalStack, and a

@@ -1,19 +1,21 @@
 use crate::elastic_search_commands::{SqlCommand, UpdateByQueryCommand};
 use crate::elastic_search_common::{
-    execute_command, Command, CommandContext, ElasticSearchResponse, ParseError,
-    ResultGeneratorFuture,
+    Command, CommandContext, ElasticSearchResponse, ParseError, ResultGeneratorFuture,
+    execute_command,
 };
 use crate::elastic_search_datetime_parser;
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::elastic_search_responses::{
-    compare_query_result_hits_desc, AggregationResult, AverageAggregationResult,
-    FilterAggregationResult, QueryFailure, QueryResults, TermAggregationBucket,
-    TermAggregationResult,
+    AggregationResult, AverageAggregationResult, CardinalityAggregationResult,
+    FilterAggregationResult, HistogramAggregationBucket, HistogramAggregationResult, QueryFailure,
+    QueryResults, TermAggregationBucket, TermAggregationResult, compare_query_result_hits_desc,
 };
 use crate::peers::{
-    CheckpointDescriptor, PrivateInvocation, PrivateSearchAggregationFilterSpec,
-    PrivateSearchAggregationPartial, PrivateSearchAggregationSpec, PrivateSearchInvocation,
-    PrivateSearchSortSpec,
+    CheckpointDescriptor, PrivateExactConstraintGroup, PrivateInvocation,
+    PrivateSearchAggregationFilterSpec, PrivateSearchAggregationPartial,
+    PrivateSearchAggregationSpec, PrivateSearchDateHistogramExtendedBoundsSpec,
+    PrivateSearchInvocation, PrivateSearchRangeConstraint, PrivateSearchSortSpec,
+    PrivateSearchTermsOrderSpec,
 };
 use crate::schema_massager::{FieldExpression, SqlBuilder, SqlExpression};
 use crate::search_plan;
@@ -24,9 +26,10 @@ use crate::search_runtime::{
 };
 use crate::state_provider::STATE_PROVIDER;
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, SecondsFormat, Utc};
 use futures::future::try_join_all;
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -119,6 +122,10 @@ pub(crate) struct SearchCommand {
     execution_strategy: SearchExecutionStrategy,
     typed_aggregation_specs: Option<Vec<PrivateSearchAggregationSpec>>,
     typed_sort_specs: Vec<PrivateSearchSortSpec>,
+    exact_sql: Option<crate::schema_massager::SqlQuery>,
+    exact_constraints: Vec<PrivateExactConstraintGroup>,
+    range_constraints: Vec<PrivateSearchRangeConstraint>,
+    exact_doc_id_field_name: Option<String>,
     backend: SearchBackend,
 }
 
@@ -161,6 +168,11 @@ impl SearchCommand {
         )
     }
 
+    #[allow(dead_code)]
+    fn supports_exact_sidecar(&self) -> bool {
+        self.exact_sql.is_some()
+    }
+
     pub(crate) fn performance_assessment(&self) -> SearchPerformanceAssessment {
         match self.execution_strategy {
             SearchExecutionStrategy::TypedNodeMerge(result_order) => SearchPerformanceAssessment {
@@ -182,9 +194,21 @@ impl SearchCommand {
         } else {
             self.execution_plan.merge.from as usize + self.execution_plan.merge.size
         };
+        let mut required_extensions = legacy_command.required_extensions();
+        if self.exact_sql.is_some()
+            && !required_extensions
+                .iter()
+                .any(|extension| extension == "es")
+        {
+            required_extensions.push("es".to_string());
+        }
         Some(PrivateSearchInvocation {
             sql: legacy_command.sql.clone(),
-            required_extensions: legacy_command.required_extensions(),
+            exact_sql: self.exact_sql.clone(),
+            exact_constraints: self.exact_constraints.clone(),
+            range_constraints: self.range_constraints.clone(),
+            exact_doc_id_field_name: self.exact_doc_id_field_name.clone(),
+            required_extensions,
             checkpoints,
             table: legacy_command.table.clone(),
             size,
@@ -277,16 +301,10 @@ fn legacy_sql_fanout_reason(command: &SearchCommand) -> String {
 
 fn aggregation_legacy_path_reason(plan: &search_plan::AggregationPlan) -> Option<String> {
     match &plan.spec {
-        search_plan::AggregationPlanSpec::Terms(terms_plan) => {
-            if terms_plan.sub_aggregations.is_empty() {
-                None
-            } else {
-                Some(format!(
-                    "Terms aggregation `{}` has sub-aggregations, which currently use the legacy SQL fanout path.",
-                    plan.name
-                ))
-            }
-        }
+        search_plan::AggregationPlanSpec::Terms(terms_plan) => terms_plan
+            .sub_aggregations
+            .iter()
+            .find_map(aggregation_legacy_path_reason),
         search_plan::AggregationPlanSpec::Average(_) => None,
         search_plan::AggregationPlanSpec::Filter(filter_plan) => {
             if !matches!(
@@ -307,14 +325,11 @@ fn aggregation_legacy_path_reason(plan: &search_plan::AggregationPlan) -> Option
             "Missing aggregation `{}` currently uses the legacy SQL fanout path.",
             plan.name
         )),
-        search_plan::AggregationPlanSpec::DateHistogram(_) => Some(format!(
-            "Date histogram aggregation `{}` currently uses the legacy SQL fanout path.",
-            plan.name
-        )),
-        search_plan::AggregationPlanSpec::Cardinality(_) => Some(format!(
-            "Cardinality aggregation `{}` currently uses the legacy SQL fanout path.",
-            plan.name
-        )),
+        search_plan::AggregationPlanSpec::DateHistogram(histogram_plan) => histogram_plan
+            .sub_aggregations
+            .iter()
+            .find_map(aggregation_legacy_path_reason),
+        search_plan::AggregationPlanSpec::Cardinality(_) => None,
         search_plan::AggregationPlanSpec::Range(_) => Some(format!(
             "Range aggregation `{}` currently uses the legacy SQL fanout path.",
             plan.name
@@ -633,7 +648,10 @@ pub(crate) fn search_plan_to_command_with_options(
 ) -> Result<SearchCommand, ParseError> {
     let backend =
         compile_legacy_sql_command(&plan, query, doc_id_field_name, include_deletes_join)?;
-    let execution_plan = create_execution_plan(&plan, &backend);
+    let exact_constraints = compile_exact_constraint_groups(&plan)?;
+    let range_constraints = compile_range_constraints(&plan);
+    let exact_sql = compile_exact_sql_query(&plan, query, doc_id_field_name, include_deletes_join)?;
+    let execution_plan = create_execution_plan(&plan, &backend, exact_sql.is_some());
     let typed_aggregation_specs = private_search_aggregation_specs(&plan.aggregations);
     let typed_sort_specs = private_search_sort_specs(&plan.sort, &backend);
     let execution_strategy = choose_execution_strategy(
@@ -652,6 +670,11 @@ pub(crate) fn search_plan_to_command_with_options(
         execution_strategy,
         typed_aggregation_specs,
         typed_sort_specs: typed_sort_specs.unwrap_or_default(),
+        exact_sql,
+        exact_doc_id_field_name: (!exact_constraints.is_empty())
+            .then(|| doc_id_field_name.unwrap_or("_id_seq_no").to_string()),
+        exact_constraints,
+        range_constraints,
         backend: SearchBackend::LegacySql(backend),
     })
 }
@@ -803,17 +826,38 @@ fn private_search_aggregation_spec(
                 name: plan.name.clone(),
                 field: terms_plan.field.clone(),
                 size: terms_plan.size,
-                sub_aggregations: if terms_plan.sub_aggregations.is_empty() {
-                    vec![]
-                } else {
-                    return None;
-                },
+                order: private_search_terms_order(terms_plan.order.as_ref()),
+                missing: terms_plan.missing.clone(),
+                sub_aggregations: private_search_aggregation_specs(&terms_plan.sub_aggregations)?,
             })
         }
         search_plan::AggregationPlanSpec::Average(avg_plan) => {
             Some(PrivateSearchAggregationSpec::Average {
                 name: plan.name.clone(),
                 field: avg_plan.field.clone(),
+            })
+        }
+        search_plan::AggregationPlanSpec::Cardinality(cardinality_plan) => {
+            Some(PrivateSearchAggregationSpec::Cardinality {
+                name: plan.name.clone(),
+                field: cardinality_plan.field.clone(),
+            })
+        }
+        search_plan::AggregationPlanSpec::DateHistogram(histogram_plan) => {
+            Some(PrivateSearchAggregationSpec::DateHistogram {
+                name: plan.name.clone(),
+                field: histogram_plan.field.clone(),
+                fixed_interval: histogram_plan.fixed_interval.clone(),
+                min_doc_count: histogram_plan.min_doc_count,
+                extended_bounds: histogram_plan.extended_bounds.as_ref().map(|bounds| {
+                    PrivateSearchDateHistogramExtendedBoundsSpec {
+                        min: bounds.min.clone(),
+                        max: bounds.max.clone(),
+                    }
+                }),
+                sub_aggregations: private_search_aggregation_specs(
+                    &histogram_plan.sub_aggregations,
+                )?,
             })
         }
         search_plan::AggregationPlanSpec::Filter(filter_plan) => {
@@ -824,6 +868,20 @@ fn private_search_aggregation_spec(
             })
         }
         _ => None,
+    }
+}
+
+fn private_search_terms_order(
+    order: Option<&search_plan::TermsOrderPlan>,
+) -> Option<PrivateSearchTermsOrderSpec> {
+    match order {
+        Some(search_plan::TermsOrderPlan::CountAsc) => Some(PrivateSearchTermsOrderSpec::CountAsc),
+        Some(search_plan::TermsOrderPlan::CountDesc) => {
+            Some(PrivateSearchTermsOrderSpec::CountDesc)
+        }
+        Some(search_plan::TermsOrderPlan::KeyAsc) => Some(PrivateSearchTermsOrderSpec::KeyAsc),
+        Some(search_plan::TermsOrderPlan::KeyDesc) => Some(PrivateSearchTermsOrderSpec::KeyDesc),
+        None => None,
     }
 }
 
@@ -874,6 +932,8 @@ fn typed_aggregation_name(spec: &PrivateSearchAggregationSpec) -> String {
     match spec {
         PrivateSearchAggregationSpec::Terms { name, .. } => name.clone(),
         PrivateSearchAggregationSpec::Average { name, .. } => name.clone(),
+        PrivateSearchAggregationSpec::Cardinality { name, .. } => name.clone(),
+        PrivateSearchAggregationSpec::DateHistogram { name, .. } => name.clone(),
         PrivateSearchAggregationSpec::Filter { name, .. } => name.clone(),
     }
 }
@@ -976,6 +1036,8 @@ fn typed_aggregation_partial_name(partial: &PrivateSearchAggregationPartial) -> 
     match partial {
         PrivateSearchAggregationPartial::Terms { name, .. } => name.as_str(),
         PrivateSearchAggregationPartial::Average { name, .. } => name.as_str(),
+        PrivateSearchAggregationPartial::Cardinality { name, .. } => name.as_str(),
+        PrivateSearchAggregationPartial::DateHistogram { name, .. } => name.as_str(),
         PrivateSearchAggregationPartial::Filter { name, .. } => name.as_str(),
     }
 }
@@ -987,6 +1049,7 @@ fn merge_typed_aggregation_partial(
     match spec {
         PrivateSearchAggregationSpec::Terms {
             size,
+            order,
             sub_aggregations,
             ..
         } => {
@@ -1009,17 +1072,19 @@ fn merge_typed_aggregation_partial(
             let mut buckets = merged_buckets
                 .into_iter()
                 .map(
-                    |(key, (doc_count, _sub_partials_by_node))| TermAggregationBucket {
+                    |(key, (doc_count, sub_partials_by_node))| TermAggregationBucket {
                         key,
                         doc_count,
+                        aggs: if sub_aggregations.is_empty() {
+                            Default::default()
+                        } else {
+                            merge_typed_aggregation_partials(sub_partials_by_node, sub_aggregations)
+                        },
                     },
                 )
                 .collect::<Vec<_>>();
             buckets.sort_by(|left, right| {
-                right
-                    .doc_count
-                    .cmp(&left.doc_count)
-                    .then_with(|| left.key.cmp(&right.key))
+                compare_terms_aggregation_buckets(left, right, order.as_ref())
             });
             buckets.truncate(size.unwrap_or(10) as usize);
 
@@ -1027,12 +1092,68 @@ fn merge_typed_aggregation_partial(
                 doc_count_error_upper_bound: 0,
                 sum_other_doc_count: 0,
                 buckets,
-                aggs: if sub_aggregations.is_empty() {
-                    Default::default()
-                } else {
-                    merge_typed_aggregation_partials(vec![], sub_aggregations)
-                },
+                aggs: Default::default(),
             })
+        }
+        PrivateSearchAggregationSpec::Cardinality { .. } => {
+            let value = partials
+                .iter()
+                .flat_map(|partial| match partial {
+                    PrivateSearchAggregationPartial::Cardinality { values, .. } => values.clone(),
+                    _ => vec![],
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .len() as u64;
+            AggregationResult::Cardinality(CardinalityAggregationResult {
+                value,
+                aggs: Default::default(),
+            })
+        }
+        PrivateSearchAggregationSpec::DateHistogram {
+            fixed_interval,
+            min_doc_count,
+            extended_bounds,
+            sub_aggregations,
+            ..
+        } => {
+            let mut merged_buckets = std::collections::BTreeMap::<
+                i64,
+                (String, u64, Vec<Vec<PrivateSearchAggregationPartial>>),
+            >::new();
+            for partial in partials.iter() {
+                if let PrivateSearchAggregationPartial::DateHistogram { buckets, .. } = partial {
+                    for bucket in buckets.iter() {
+                        let entry = merged_buckets
+                            .entry(bucket.key)
+                            .or_insert_with(|| (bucket.key_as_string.clone(), 0, vec![]));
+                        entry.1 += bucket.doc_count;
+                        entry.2.push(bucket.sub_aggregations.clone());
+                    }
+                }
+            }
+
+            let mut buckets = merged_buckets
+                .into_iter()
+                .map(|(key, (key_as_string, doc_count, sub_partials_by_node))| {
+                    HistogramAggregationBucket {
+                        key,
+                        key_as_string,
+                        doc_count,
+                        aggs: if sub_aggregations.is_empty() {
+                            Default::default()
+                        } else {
+                            merge_typed_aggregation_partials(sub_partials_by_node, sub_aggregations)
+                        },
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            if min_doc_count.unwrap_or(0) == 0 {
+                buckets =
+                    fill_empty_histogram_buckets(buckets, fixed_interval, extended_bounds.as_ref());
+            }
+
+            AggregationResult::Histogram(HistogramAggregationResult { buckets })
         }
         PrivateSearchAggregationSpec::Average { .. } => {
             let (sum, count) =
@@ -1075,6 +1196,124 @@ fn merge_typed_aggregation_partial(
     }
 }
 
+fn compare_terms_aggregation_buckets(
+    left: &TermAggregationBucket,
+    right: &TermAggregationBucket,
+    order: Option<&PrivateSearchTermsOrderSpec>,
+) -> std::cmp::Ordering {
+    match order.unwrap_or(&PrivateSearchTermsOrderSpec::CountDesc) {
+        PrivateSearchTermsOrderSpec::CountAsc => left
+            .doc_count
+            .cmp(&right.doc_count)
+            .then_with(|| left.key.cmp(&right.key)),
+        PrivateSearchTermsOrderSpec::CountDesc => right
+            .doc_count
+            .cmp(&left.doc_count)
+            .then_with(|| left.key.cmp(&right.key)),
+        PrivateSearchTermsOrderSpec::KeyAsc => left.key.cmp(&right.key),
+        PrivateSearchTermsOrderSpec::KeyDesc => right.key.cmp(&left.key),
+    }
+}
+
+fn fill_empty_histogram_buckets(
+    buckets: Vec<HistogramAggregationBucket>,
+    fixed_interval: &str,
+    extended_bounds: Option<&PrivateSearchDateHistogramExtendedBoundsSpec>,
+) -> Vec<HistogramAggregationBucket> {
+    let Some(interval_ms) = parse_histogram_fixed_interval_millis(fixed_interval) else {
+        return buckets;
+    };
+    if buckets.is_empty() && extended_bounds.is_none() {
+        return buckets;
+    }
+
+    let mut buckets_by_key = buckets
+        .into_iter()
+        .map(|bucket| (bucket.key, bucket))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let observed_start = buckets_by_key.keys().next().copied();
+    let observed_end = buckets_by_key.keys().next_back().copied();
+    let extended_start =
+        extended_bounds.and_then(|bounds| histogram_bound_to_bucket_key(&bounds.min, interval_ms));
+    let extended_end =
+        extended_bounds.and_then(|bounds| histogram_bound_to_bucket_key(&bounds.max, interval_ms));
+
+    let start = match (observed_start, extended_start) {
+        (Some(observed), Some(extended)) => observed.min(extended),
+        (Some(observed), None) => observed,
+        (None, Some(extended)) => extended,
+        (None, None) => return vec![],
+    };
+    let end = match (observed_end, extended_end) {
+        (Some(observed), Some(extended)) => observed.max(extended),
+        (Some(observed), None) => observed,
+        (None, Some(extended)) => extended,
+        (None, None) => return vec![],
+    };
+
+    let mut filled = Vec::new();
+    let mut cursor = start;
+    while cursor <= end {
+        if let Some(bucket) = buckets_by_key.remove(&cursor) {
+            filled.push(bucket);
+        } else {
+            filled.push(HistogramAggregationBucket {
+                key: cursor,
+                key_as_string: timestamp_millis_to_key_as_string(cursor),
+                doc_count: 0,
+                aggs: Default::default(),
+            });
+        }
+        let Some(next_cursor) = cursor.checked_add(interval_ms) else {
+            break;
+        };
+        cursor = next_cursor;
+    }
+    filled
+}
+
+fn parse_histogram_fixed_interval_millis(interval: &str) -> Option<i64> {
+    if interval.len() < 2 {
+        return None;
+    }
+    let (value, unit) = interval.split_at(interval.len() - 1);
+    let quantity = value.parse::<i64>().ok()?;
+    let multiplier = match unit {
+        "s" => 1_000,
+        "m" => 60 * 1_000,
+        "h" => 60 * 60 * 1_000,
+        "d" => 24 * 60 * 60 * 1_000,
+        "w" => 7 * 24 * 60 * 60 * 1_000,
+        _ => return None,
+    };
+    quantity.checked_mul(multiplier)
+}
+
+fn histogram_bound_to_bucket_key(value: &Value, interval_ms: i64) -> Option<i64> {
+    let timestamp_ms = histogram_bound_to_timestamp_millis(value)?;
+    Some(timestamp_ms - timestamp_ms.rem_euclid(interval_ms))
+}
+
+fn histogram_bound_to_timestamp_millis(value: &Value) -> Option<i64> {
+    if let Some(timestamp_ms) = value.as_i64() {
+        return Some(timestamp_ms);
+    }
+    if let Some(timestamp_ms) = value.as_u64() {
+        return i64::try_from(timestamp_ms).ok();
+    }
+    let timestamp = value.as_str()?;
+    DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .map(|datetime| datetime.with_timezone(&Utc).timestamp_millis())
+}
+
+fn timestamp_millis_to_key_as_string(timestamp_ms: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(timestamp_ms)
+        .unwrap()
+        .to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
 fn compile_legacy_sql_command(
     plan: &search_plan::SearchPlan,
     query: &QueryStringSearch,
@@ -1115,6 +1354,308 @@ fn compile_legacy_sql_command(
     })
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct ExactConstraintGroup {
+    field: String,
+    values: Vec<Value>,
+}
+
+fn compile_exact_constraint_groups(
+    plan: &search_plan::SearchPlan,
+) -> Result<Vec<PrivateExactConstraintGroup>, ParseError> {
+    let Some(query_plan) = &plan.query else {
+        return Ok(vec![]);
+    };
+    let Some(groups) = exact_constraint_groups_for_query(query_plan) else {
+        return Ok(vec![]);
+    };
+
+    groups
+        .into_iter()
+        .map(|group| {
+            let mut values = group
+                .values
+                .iter()
+                .map(exact_value_to_index_string)
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| ParseError {
+                    message:
+                        "Exact-match sidecar only supports string, numeric, and boolean values"
+                            .to_string(),
+                })?;
+            values.sort();
+            values.dedup();
+            Ok(PrivateExactConstraintGroup {
+                field: group.field,
+                values,
+            })
+        })
+        .collect()
+}
+
+fn compile_exact_sql_query(
+    plan: &search_plan::SearchPlan,
+    query: &QueryStringSearch,
+    doc_id_field_name: Option<&str>,
+    include_deletes_join: bool,
+) -> Result<Option<crate::schema_massager::SqlQuery>, ParseError> {
+    let Some(query_plan) = &plan.query else {
+        return Ok(None);
+    };
+    let Some(groups) = exact_constraint_groups_for_query(query_plan) else {
+        return Ok(None);
+    };
+    if groups.is_empty() {
+        return Ok(None);
+    }
+
+    let doc_id_field_name = doc_id_field_name.unwrap_or("_id_seq_no");
+    let normalized_doc_id_field_name = doc_id_field_name.replace(".", "_");
+    let mut builder =
+        SqlBuilder::for_query_with_options(true, doc_id_field_name, include_deletes_join);
+
+    for (index, group) in groups.iter().enumerate() {
+        let alias = format!("ei{index}");
+        builder.joins.push(format!(
+            "INNER JOIN {{target_table}}_exact_index {alias} ON {alias}.doc_id = t.\"{normalized_doc_id_field_name}\""
+        ));
+        builder.filter(SqlExpression::Comparison(
+            Box::new(SqlExpression::FieldRef(
+                alias.clone(),
+                "field_name".to_string(),
+            )),
+            "=".to_string(),
+            Box::new(SqlExpression::LiteralString(group.field.clone())),
+        ));
+
+        let mut values = group
+            .values
+            .iter()
+            .map(exact_value_to_index_string)
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| ParseError {
+                message: "Exact-match sidecar only supports string, numeric, and boolean values"
+                    .to_string(),
+            })?;
+        values.sort();
+        values.dedup();
+
+        if values.len() == 1 {
+            builder.filter(SqlExpression::Comparison(
+                Box::new(SqlExpression::FieldRef(
+                    alias.clone(),
+                    "field_value".to_string(),
+                )),
+                "=".to_string(),
+                Box::new(SqlExpression::LiteralString(values[0].clone())),
+            ));
+        } else {
+            builder.filter(SqlExpression::In(
+                Box::new(SqlExpression::FieldRef(
+                    alias.clone(),
+                    "field_value".to_string(),
+                )),
+                values
+                    .into_iter()
+                    .map(SqlExpression::LiteralString)
+                    .collect::<Vec<_>>(),
+            ));
+        }
+    }
+
+    append_sort_projection_fields(&mut builder, &plan.sort);
+
+    let table_name = match &plan.target {
+        search_plan::SearchTarget::Table(table_name) => table_name,
+        search_plan::SearchTarget::Pit(_) => return Ok(None),
+    };
+
+    Ok(Some(
+        SqlCommand {
+            sql: builder.build(),
+            table: table_name.clone(),
+            calculate_score: false,
+            aggs: aggregation_plans_to_runtime(None, &plan.aggregations),
+            query_params: query.clone(),
+        }
+        .sql,
+    ))
+}
+
+fn exact_constraint_groups_for_query(
+    query: &search_plan::QueryPlan,
+) -> Option<Vec<ExactConstraintGroup>> {
+    match query {
+        search_plan::QueryPlan::Term(term_plan) => exact_constraint_groups_for_term(term_plan),
+        search_plan::QueryPlan::Bool(bool_plan) => exact_constraint_groups_for_bool(bool_plan),
+        _ => None,
+    }
+}
+
+fn exact_constraint_groups_for_term(
+    term_plan: &search_plan::TermPlan,
+) -> Option<Vec<ExactConstraintGroup>> {
+    if term_plan.clauses.len() != 1 {
+        return None;
+    }
+    let clause = term_plan.clauses.first()?;
+    exact_value_to_index_string(&clause.value)?;
+    Some(vec![ExactConstraintGroup {
+        field: clause.field.clone(),
+        values: vec![clause.value.clone()],
+    }])
+}
+
+fn exact_constraint_groups_for_bool(
+    bool_plan: &search_plan::BoolPlan,
+) -> Option<Vec<ExactConstraintGroup>> {
+    if !bool_plan.must_not.is_empty() {
+        return None;
+    }
+
+    let mut groups = Vec::new();
+    for query in bool_plan.must.iter().chain(bool_plan.filter.iter()) {
+        let next_groups = exact_constraint_groups_for_query(query)?;
+        groups = merge_exact_constraint_groups(groups, next_groups)?;
+    }
+
+    if !bool_plan.should.is_empty() {
+        let effective_minimum_should_match = bool_plan.minimum_should_match.unwrap_or_else(|| {
+            if bool_plan.must.is_empty() && bool_plan.filter.is_empty() {
+                1
+            } else {
+                0
+            }
+        });
+        if effective_minimum_should_match != 1 {
+            return None;
+        }
+        let should_group = exact_should_group(&bool_plan.should)?;
+        groups = merge_exact_constraint_groups(groups, vec![should_group])?;
+    }
+
+    if groups.is_empty() {
+        None
+    } else {
+        Some(groups)
+    }
+}
+
+fn exact_should_group(queries: &[search_plan::QueryPlan]) -> Option<ExactConstraintGroup> {
+    let mut field_name = None::<String>;
+    let mut values = Vec::new();
+
+    for query in queries {
+        let mut groups = exact_constraint_groups_for_query(query)?;
+        if groups.len() != 1 {
+            return None;
+        }
+        let group = groups.pop().unwrap();
+        match &field_name {
+            Some(existing) if existing != &group.field => return None,
+            Some(_) => (),
+            None => field_name = Some(group.field.clone()),
+        }
+        for value in group.values {
+            if !values.iter().any(|existing| existing == &value) {
+                values.push(value);
+            }
+        }
+    }
+
+    let field = field_name?;
+    values.sort_by(|left, right| left.to_string().cmp(&right.to_string()));
+    Some(ExactConstraintGroup { field, values })
+}
+
+fn merge_exact_constraint_groups(
+    mut left: Vec<ExactConstraintGroup>,
+    right: Vec<ExactConstraintGroup>,
+) -> Option<Vec<ExactConstraintGroup>> {
+    for incoming in right {
+        if let Some(existing) = left.iter_mut().find(|group| group.field == incoming.field) {
+            let allowed = incoming
+                .values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<BTreeSet<_>>();
+            let intersection = existing
+                .values
+                .iter()
+                .filter(|value| allowed.contains(&value.to_string()))
+                .cloned()
+                .collect::<Vec<_>>();
+            if intersection.is_empty() {
+                return None;
+            }
+            existing.values = intersection;
+        } else {
+            left.push(incoming);
+        }
+    }
+    left.sort_by(|left_group, right_group| left_group.field.cmp(&right_group.field));
+    Some(left)
+}
+
+fn exact_value_to_index_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn compile_range_constraints(plan: &search_plan::SearchPlan) -> Vec<PrivateSearchRangeConstraint> {
+    let Some(query_plan) = &plan.query else {
+        return vec![];
+    };
+
+    let mut constraints = vec![];
+    collect_mandatory_range_constraints(query_plan, &mut constraints);
+    constraints
+}
+
+fn collect_mandatory_range_constraints(
+    query: &search_plan::QueryPlan,
+    constraints: &mut Vec<PrivateSearchRangeConstraint>,
+) {
+    match query {
+        search_plan::QueryPlan::Range(range_plan) => {
+            for clause in &range_plan.clauses {
+                let mut constraint = PrivateSearchRangeConstraint {
+                    field: clause.field.clone(),
+                    gt: None,
+                    gte: None,
+                    lt: None,
+                    lte: None,
+                };
+                match &clause.operator {
+                    search_plan::RangeOperatorPlan::Gt(value) => {
+                        constraint.gt = Some(value.clone())
+                    }
+                    search_plan::RangeOperatorPlan::Gte(value) => {
+                        constraint.gte = Some(value.clone())
+                    }
+                    search_plan::RangeOperatorPlan::Lt(value) => {
+                        constraint.lt = Some(value.clone())
+                    }
+                    search_plan::RangeOperatorPlan::Lte(value) => {
+                        constraint.lte = Some(value.clone())
+                    }
+                }
+                constraints.push(constraint);
+            }
+        }
+        search_plan::QueryPlan::Bool(bool_plan) => {
+            for query in bool_plan.must.iter().chain(bool_plan.filter.iter()) {
+                collect_mandatory_range_constraints(query, constraints);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn append_sort_projection_fields(builder: &mut SqlBuilder, sorts: &[search_plan::SortPlan]) {
     for sort in sorts {
         let field = match sort {
@@ -1150,13 +1691,18 @@ fn append_sort_projection_fields(builder: &mut SqlBuilder, sorts: &[search_plan:
 fn create_execution_plan(
     plan: &search_plan::SearchPlan,
     backend: &SqlCommand,
+    exact_sql: bool,
 ) -> SearchExecutionPlan {
     let segment = SearchSegmentExecutionPlan::LegacySql(LegacySqlSegmentPlan {
         segment_id: "segment-000".to_string(),
         table: backend.table.clone(),
         sql: backend.sql.clone(),
         calculate_score: backend.calculate_score,
-        required_extension: backend.calculate_score.then(|| "es".to_string()),
+        required_extension: if backend.calculate_score || exact_sql {
+            Some("es".to_string())
+        } else {
+            None
+        },
     });
 
     SearchExecutionPlan {
@@ -1248,6 +1794,7 @@ mod tests {
         );
 
         assert!(command.supports_typed_node_merge());
+        assert!(!command.supports_exact_sidecar());
     }
 
     #[test]
@@ -1268,6 +1815,40 @@ mod tests {
     }
 
     #[test]
+    fn test_multi_match_query_uses_typed_node_merge_path() {
+        let command = parse_search_command(
+            r#"{
+  "query": {
+    "multi_match": {
+      "query": "login",
+      "fields": ["message", "message.keyword"]
+    }
+  }
+}"#,
+        );
+
+        assert!(command.supports_typed_node_merge());
+    }
+
+    #[test]
+    fn test_query_string_query_uses_typed_node_merge_path() {
+        let command = parse_search_command(
+            r#"{
+  "query": {
+    "query_string": {
+      "query": "service:auth OR service:api",
+      "fields": ["message"],
+      "default_operator": "OR"
+    }
+  }
+}"#,
+        );
+
+        assert!(command.supports_typed_node_merge());
+        assert!(command.supports_exact_sidecar());
+    }
+
+    #[test]
     fn test_range_query_uses_typed_node_merge_path() {
         let command = parse_search_command(
             r#"{
@@ -1285,18 +1866,56 @@ mod tests {
     }
 
     #[test]
+    fn test_range_constraints_are_compiled_for_private_search_pruning() {
+        let command = parse_search_command(
+            r#"{
+  "query": {
+    "bool": {
+      "filter": [
+        {
+          "term": {
+            "service": "auth"
+          }
+        },
+        {
+          "range": {
+            "@timestamp": {
+              "gte": 100
+            }
+          }
+        }
+      ]
+    }
+  }
+}"#,
+        );
+
+        assert_eq!(
+            command.range_constraints,
+            vec![crate::peers::PrivateSearchRangeConstraint {
+                field: "@timestamp".to_string(),
+                gt: None,
+                gte: Some(serde_json::Value::from(100)),
+                lt: None,
+                lte: None,
+            }]
+        );
+    }
+
+    #[test]
     fn test_term_query_uses_typed_node_merge_path() {
         let command = parse_search_command(
             r#"{
   "query": {
     "term": {
-      "index_col": 2
+      "service": "auth"
     }
   }
 }"#,
         );
 
         assert!(command.supports_typed_node_merge());
+        assert!(command.supports_exact_sidecar());
     }
 
     #[test]
@@ -1305,13 +1924,14 @@ mod tests {
             r#"{
   "query": {
     "terms": {
-      "index_col": [2, 5]
+      "service": ["auth", "api"]
     }
   }
 }"#,
         );
 
         assert!(command.supports_typed_node_merge());
+        assert!(command.supports_exact_sidecar());
     }
 
     #[test]
@@ -1363,6 +1983,110 @@ mod tests {
       "filter": { "term": { "type": "tshirt" } },
       "aggs": {
         "avg_price": { "avg": { "field": "price" } }
+      }
+    }
+  }
+}"#,
+        );
+
+        assert!(command.supports_typed_node_merge());
+    }
+
+    #[test]
+    fn test_cardinality_aggregation_uses_typed_node_merge_path() {
+        let command = parse_search_command(
+            r#"{
+  "aggs": {
+    "distinct_messages": {
+      "cardinality": {
+        "field": "message"
+      }
+    }
+  }
+}"#,
+        );
+
+        assert!(command.supports_typed_node_merge());
+    }
+
+    #[test]
+    fn test_date_histogram_aggregation_uses_typed_node_merge_path() {
+        let command = parse_search_command(
+            r#"{
+  "aggs": {
+    "per_day": {
+      "date_histogram": {
+        "field": "@timestamp",
+        "fixed_interval": "1d"
+      }
+    }
+  }
+}"#,
+        );
+
+        assert!(command.supports_typed_node_merge());
+    }
+
+    #[test]
+    fn test_date_histogram_options_use_typed_node_merge_path() {
+        let command = parse_search_command(
+            r#"{
+  "aggs": {
+    "per_day": {
+      "date_histogram": {
+        "field": "@timestamp",
+        "fixed_interval": "1d",
+        "min_doc_count": 0,
+        "extended_bounds": {
+          "min": "2099-03-07T00:00:00.000Z",
+          "max": "2099-03-10T00:00:00.000Z"
+        }
+      }
+    }
+  }
+}"#,
+        );
+
+        assert!(command.supports_typed_node_merge());
+    }
+
+    #[test]
+    fn test_terms_subaggregation_uses_typed_node_merge_path() {
+        let command = parse_search_command(
+            r#"{
+  "aggs": {
+    "by_service": {
+      "terms": {
+        "field": "service"
+      },
+      "aggs": {
+        "avg_index_col": {
+          "avg": {
+            "field": "index_col"
+          }
+        }
+      }
+    }
+  }
+}"#,
+        );
+
+        assert!(command.supports_typed_node_merge());
+    }
+
+    #[test]
+    fn test_terms_order_and_missing_use_typed_node_merge_path() {
+        let command = parse_search_command(
+            r#"{
+  "aggs": {
+    "by_service": {
+      "terms": {
+        "field": "service",
+        "size": 10,
+        "order": {
+          "_key": "asc"
+        },
+        "missing": "unknown"
       }
     }
   }
@@ -1443,6 +2167,33 @@ mod tests {
         "ranges": [
           { "from": "0", "to": "100" }
         ]
+      }
+    }
+  }
+}"#,
+        );
+
+        assert!(!command.supports_typed_node_merge());
+    }
+
+    #[test]
+    fn test_terms_subaggregation_with_unsupported_nested_range_stays_on_legacy_path() {
+        let command = parse_search_command(
+            r#"{
+  "aggs": {
+    "by_service": {
+      "terms": {
+        "field": "service"
+      },
+      "aggs": {
+        "price_ranges": {
+          "range": {
+            "field": "price",
+            "ranges": [
+              { "from": "0", "to": "100" }
+            ]
+          }
+        }
       }
     }
   }

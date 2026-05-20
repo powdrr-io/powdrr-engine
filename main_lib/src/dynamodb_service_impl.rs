@@ -22,8 +22,8 @@ use crate::state_provider::ServiceApiError;
 use crate::test_api::{StateMode, TestProcessingMode};
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_dynamodb::Client;
-use modyne::TestTableExt;
 use modyne::model::TransactWrite;
+use modyne::TestTableExt;
 use std::collections::{HashMap, HashSet};
 
 const LEASE_LENGTH_MS: i64 = 60 * 1000; // 1 minute
@@ -195,13 +195,17 @@ impl DynamoDBServiceImpl {
         org_info: &OrgInfo,
         metadata: &TableMetadataCheckpoint,
     ) -> Result<(), ServiceApiError> {
-        self.create_table(org_info, &CreateTable {
-            name: metadata.table_name.clone(),
-            tags: Default::default(),
-            serving: None,
-            dynamodb: None,
-            mongodb: None,
-        }).await?;
+        self.create_table(
+            org_info,
+            &CreateTable {
+                name: metadata.table_name.clone(),
+                tags: Default::default(),
+                serving: None,
+                dynamodb: None,
+                mongodb: None,
+            },
+        )
+        .await?;
         if metadata.speedboat_metadata.is_some() {
             self.speedboat_commit(
                 org_info,
@@ -209,6 +213,7 @@ impl DynamoDBServiceImpl {
                     type_files: vec![SpeedboatCommitTableInfo {
                         commit_type: "commit".to_string(),
                         table_name: metadata.table_name.clone(),
+                        segments: vec![],
                         files: metadata
                             .speedboat_metadata
                             .as_ref()
@@ -1181,6 +1186,45 @@ impl DynamoDBServiceImpl {
             .await
             .map_err(from_modyne)
     }
+
+    pub async fn lookup_secret_access_key(
+        &mut self,
+        access_key_id: &String,
+    ) -> Result<Option<String>, ServiceApiError> {
+        let entities = self
+            .connector
+            .fetch_entities(
+                &MANAGEMENT_ORG_ID.to_string(),
+                &"org_settings".to_string(),
+                None,
+            )
+            .await
+            .map_err(from_modyne)?;
+        let mut matched_secret = None;
+        for entity in entities.entities {
+            let Some(settings) = self
+                .connector
+                .describe_org_settings(&MANAGEMENT_ORG_ID.to_string(), &entity.entity_id)
+                .await
+                .map_err(from_modyne)?
+            else {
+                continue;
+            };
+            for creds in settings.creds.iter() {
+                if &creds.access_key_id != access_key_id {
+                    continue;
+                }
+                if matched_secret.is_some() {
+                    return Err(ServiceApiError::new(format!(
+                        "Multiple org credentials share access key {}",
+                        access_key_id
+                    )));
+                }
+                matched_secret = Some(creds.secret_access_key.clone());
+            }
+        }
+        Ok(matched_secret)
+    }
 }
 
 #[async_trait::async_trait]
@@ -1321,8 +1365,11 @@ mod tests {
             table_schema: schema.clone(),
             snapshot_id: Some(snapshot_id.to_string()),
             files: FileSetPayload::single(file_path.clone(), 128, schema),
+            partition_spec: vec![],
+            sort_order: vec![],
             column_names: vec![],
             column_stats: vec![],
+            access_artifacts: vec![],
             file_stats: vec![],
         }
     }

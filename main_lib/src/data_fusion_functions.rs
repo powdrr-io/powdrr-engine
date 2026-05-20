@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use datafusion::{
     arrow::array::{ArrayRef, Float64Array},
-    common::cast::as_float64_array, error::DataFusionError, logical_expr::ColumnarValue
+    common::cast::as_float64_array,
+    error::DataFusionError,
+    logical_expr::ColumnarValue,
 };
-
-
 
 // First, declare the actual implementation of the calculation
 #[allow(dead_code)]
@@ -47,8 +47,6 @@ fn pow_udf(args: &[ColumnarValue]) -> Result<ColumnarValue, DataFusionError> {
     Ok(ColumnarValue::from(Arc::new(array) as ArrayRef))
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -58,7 +56,10 @@ mod tests {
             array::{ArrayRef, Float32Array, Float64Array},
             datatypes::DataType,
             record_batch::RecordBatch,
-        }, error::DataFusionError, logical_expr::Volatility, prelude::{col, create_udf, SessionContext}
+        },
+        error::DataFusionError,
+        logical_expr::Volatility,
+        prelude::{SessionContext, col, create_udf},
     };
 
     use crate::data_fusion_functions::pow_udf;
@@ -68,10 +69,10 @@ mod tests {
         let a: ArrayRef = Arc::new(Float32Array::from(vec![2.1, 3.1, 4.1, 5.1]));
         let b: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0]));
         let batch = RecordBatch::try_from_iter(vec![("a", a), ("b", b)])?;
-    
+
         // declare a new context. In spark API, this corresponds to a new spark SQLsession
         let ctx = SessionContext::new();
-    
+
         // declare a table in memory. In spark API, this corresponds to createDataFrame(...).
         ctx.register_batch("t", batch)?;
         Ok(ctx)
@@ -81,7 +82,7 @@ mod tests {
     async fn test_udf_pow() -> () {
         let ctx = match create_context() {
             Ok(ctx) => ctx,
-            Err(_) => panic!("nope")
+            Err(_) => panic!("nope"),
         };
 
         // Next:
@@ -109,13 +110,13 @@ mod tests {
         // get a DataFrame from the context
         let df = match ctx.table("t").await {
             Ok(df) => df,
-            Err(_) => panic!("nope")
+            Err(_) => panic!("nope"),
         };
 
         // if we do not have `pow` in the scope and we registered it, we can get it from the registry
         let pow = match df.registry().udf("pow") {
             Ok(pow) => pow,
-            Err(_) => panic!("nope")
+            Err(_) => panic!("nope"),
         };
         // equivalent to expr
         let expr1 = pow.call(vec![col("a"), col("b")]);
@@ -135,22 +136,21 @@ mod tests {
         // print the results
         match df.show().await {
             Ok(_) => (),
-            Err(_) => panic!("nope")
+            Err(_) => panic!("nope"),
         };
 
         // Given that `pow` is registered in the context, we can also use it in SQL:
         let sql_df = match ctx.sql("SELECT pow(a, b) FROM t").await {
             Ok(df) => df,
-            Err(_) => panic!("nope")            
+            Err(_) => panic!("nope"),
         };
 
         // print the results
         match sql_df.show().await {
             Ok(_) => (),
-            Err(_) => panic!("nope")
+            Err(_) => panic!("nope"),
         };
 
         ()
     }
 }
-

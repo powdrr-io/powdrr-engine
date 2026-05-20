@@ -2,7 +2,7 @@ use crate::elastic_search_commands::UpdateByQueryCommand;
 use crate::elastic_search_common::ParseError;
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::search_executor::{
-    search_plan_to_command, update_by_query_plan_to_command, SearchCommand,
+    SearchCommand, search_plan_to_command, update_by_query_plan_to_command,
 };
 use crate::search_plan;
 use crate::search_runtime::ScriptBlock;
@@ -82,6 +82,8 @@ pub(crate) struct AggTerms {
 pub(crate) struct AggSpecTermsBody {
     field: String,
     size: Option<u32>,
+    order: Option<HashMap<String, String>>,
+    missing: Option<Value>,
     #[serde(default = "default_as_true")]
     show_term_doc_count_error: bool,
 }
@@ -152,6 +154,14 @@ pub(crate) struct AggSpecFilter {
 pub(crate) struct AggSpecDateHistogramBody {
     field: String,
     fixed_interval: String,
+    min_doc_count: Option<u64>,
+    extended_bounds: Option<AggSpecDateHistogramExtendedBoundsBody>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct AggSpecDateHistogramExtendedBoundsBody {
+    min: Value,
+    max: Value,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -222,11 +232,13 @@ struct PitInfo {
 #[serde(untagged)]
 pub(crate) enum Query {
     Match(Match),
+    MultiMatch(MultiMatch),
     Bool(Bool),
     Term(Term),
     Terms(Terms),
     Ids(Ids),
     Exists(Exists),
+    QueryString(QueryString),
     SimpleQueryString(SimpleQueryString),
     Range(Range),
 }
@@ -235,6 +247,17 @@ pub(crate) enum Query {
 pub(crate) struct Match {
     #[serde(rename = "match")]
     _match: HashMap<String, FieldMatch>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct MultiMatch {
+    multi_match: MultiMatchBody,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct MultiMatchBody {
+    query: String,
+    fields: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -386,6 +409,18 @@ pub(crate) struct SimpleQueryStringBody {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct QueryString {
+    query_string: QueryStringBody,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct QueryStringBody {
+    query: String,
+    fields: Option<Vec<String>>,
+    default_operator: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct UpdateByQueryBody {
     query: Query,
     script: ScriptBlock,
@@ -429,7 +464,7 @@ fn to_search_plan(
         search_after: body.search_after.clone(),
         seq_no_primary_term: body.seq_no_primary_term,
         query: body.query.as_ref().map(to_query_plan).transpose()?,
-        aggregations: aggs_to_plan(&body.aggs),
+        aggregations: aggs_to_plan(&body.aggs)?,
         sort: sort_section_to_plans(&body.sort),
     })
 }
@@ -480,6 +515,40 @@ fn to_query_plan(query: &Query) -> Result<search_plan::QueryPlan, ParseError> {
             Ok(search_plan::QueryPlan::Match(search_plan::MatchPlan {
                 clauses,
             }))
+        }
+        Query::MultiMatch(multi_match) => {
+            if multi_match.multi_match.fields.is_empty() {
+                return Err(ParseError {
+                    message: "`multi_match` query requires at least one field".to_string(),
+                });
+            }
+
+            let mut should = multi_match
+                .multi_match
+                .fields
+                .iter()
+                .map(|field| {
+                    search_plan::QueryPlan::Match(search_plan::MatchPlan {
+                        clauses: vec![search_plan::MatchClausePlan {
+                            field: field.clone(),
+                            query: multi_match.multi_match.query.clone(),
+                        }],
+                    })
+                })
+                .collect::<Vec<_>>();
+            should.sort_by(|left, right| format!("{left:?}").cmp(&format!("{right:?}")));
+
+            if should.len() == 1 {
+                Ok(should.pop().unwrap())
+            } else {
+                Ok(search_plan::QueryPlan::Bool(search_plan::BoolPlan {
+                    filter: vec![],
+                    should,
+                    must: vec![],
+                    must_not: vec![],
+                    minimum_should_match: Some(1),
+                }))
+            }
         }
         Query::Bool(bool_obj) => Ok(search_plan::QueryPlan::Bool(search_plan::BoolPlan {
             filter: bool_obj
@@ -549,6 +618,7 @@ fn to_query_plan(query: &Query) -> Result<search_plan::QueryPlan, ParseError> {
         Query::Exists(exists_obj) => Ok(search_plan::QueryPlan::Exists(search_plan::ExistsPlan {
             field: exists_obj.exists.field.clone(),
         })),
+        Query::QueryString(query_string) => query_string_to_plan(&query_string.query_string),
         Query::Range(range_obj) => {
             let mut clauses = range_obj
                 .range
@@ -575,6 +645,414 @@ fn to_query_plan(query: &Query) -> Result<search_plan::QueryPlan, ParseError> {
             },
         )),
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum QueryStringToken {
+    LParen,
+    RParen,
+    And,
+    Or,
+    Word(String),
+    Quoted(String),
+}
+
+fn query_string_to_plan(body: &QueryStringBody) -> Result<search_plan::QueryPlan, ParseError> {
+    let default_operator = body
+        .default_operator
+        .clone()
+        .unwrap_or_else(|| "OR".to_string())
+        .to_ascii_uppercase();
+    if default_operator != "AND" && default_operator != "OR" {
+        return Err(ParseError {
+            message: "`query_string.default_operator` only supports `AND` or `OR`".to_string(),
+        });
+    }
+
+    let tokens = tokenize_query_string(&body.query)?;
+    if tokens.is_empty() {
+        return Err(ParseError {
+            message: "`query_string.query` cannot be empty".to_string(),
+        });
+    }
+    let tokens = insert_implicit_query_string_operators(&tokens, &default_operator);
+    let mut index = 0;
+    let plan = parse_query_string_or(&tokens, &mut index, body.fields.as_ref())?;
+    if index != tokens.len() {
+        return Err(ParseError {
+            message: "unsupported trailing token in `query_string`".to_string(),
+        });
+    }
+    Ok(plan)
+}
+
+fn tokenize_query_string(query: &str) -> Result<Vec<QueryStringToken>, ParseError> {
+    let mut tokens = Vec::new();
+    let chars = query.chars().collect::<Vec<_>>();
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch.is_whitespace() {
+            index += 1;
+            continue;
+        }
+        if ch == '(' {
+            tokens.push(QueryStringToken::LParen);
+            index += 1;
+            continue;
+        }
+        if ch == ')' {
+            tokens.push(QueryStringToken::RParen);
+            index += 1;
+            continue;
+        }
+        if ch == '"' {
+            index += 1;
+            let mut value = String::new();
+            let mut terminated = false;
+            while index < chars.len() {
+                let current = chars[index];
+                if current == '\\' && index + 1 < chars.len() {
+                    value.push(chars[index + 1]);
+                    index += 2;
+                    continue;
+                }
+                if current == '"' {
+                    terminated = true;
+                    index += 1;
+                    break;
+                }
+                value.push(current);
+                index += 1;
+            }
+            if !terminated {
+                return Err(ParseError {
+                    message: "unterminated quoted string in `query_string`".to_string(),
+                });
+            }
+            tokens.push(QueryStringToken::Quoted(value));
+            continue;
+        }
+
+        let start = index;
+        while index < chars.len()
+            && !chars[index].is_whitespace()
+            && chars[index] != '('
+            && chars[index] != ')'
+        {
+            index += 1;
+        }
+        let raw = chars[start..index].iter().collect::<String>();
+        let token = match raw.to_ascii_uppercase().as_str() {
+            "AND" => QueryStringToken::And,
+            "OR" => QueryStringToken::Or,
+            _ => QueryStringToken::Word(raw),
+        };
+        tokens.push(token);
+    }
+    Ok(tokens)
+}
+
+fn insert_implicit_query_string_operators(
+    tokens: &[QueryStringToken],
+    default_operator: &str,
+) -> Vec<QueryStringToken> {
+    let implicit = if default_operator == "AND" {
+        QueryStringToken::And
+    } else {
+        QueryStringToken::Or
+    };
+
+    let mut expanded = Vec::with_capacity(tokens.len() * 2);
+    for token in tokens.iter() {
+        if let Some(previous) = expanded.last() {
+            if query_string_token_can_end_primary(previous)
+                && query_string_token_can_start_primary(token)
+            {
+                expanded.push(implicit.clone());
+            }
+        }
+        expanded.push(token.clone());
+    }
+    expanded
+}
+
+fn query_string_token_can_end_primary(token: &QueryStringToken) -> bool {
+    matches!(
+        token,
+        QueryStringToken::Quoted(_) | QueryStringToken::RParen
+    ) || matches!(token, QueryStringToken::Word(word) if !word.ends_with(':'))
+}
+
+fn query_string_token_can_start_primary(token: &QueryStringToken) -> bool {
+    matches!(
+        token,
+        QueryStringToken::Word(_) | QueryStringToken::Quoted(_) | QueryStringToken::LParen
+    )
+}
+
+fn parse_query_string_or(
+    tokens: &[QueryStringToken],
+    index: &mut usize,
+    fields: Option<&Vec<String>>,
+) -> Result<search_plan::QueryPlan, ParseError> {
+    let mut should = vec![parse_query_string_and(tokens, index, fields)?];
+    while *index < tokens.len() && matches!(tokens[*index], QueryStringToken::Or) {
+        *index += 1;
+        should.push(parse_query_string_and(tokens, index, fields)?);
+    }
+    if should.len() == 1 {
+        Ok(should.pop().unwrap())
+    } else {
+        Ok(search_plan::QueryPlan::Bool(search_plan::BoolPlan {
+            filter: vec![],
+            should,
+            must: vec![],
+            must_not: vec![],
+            minimum_should_match: Some(1),
+        }))
+    }
+}
+
+fn parse_query_string_and(
+    tokens: &[QueryStringToken],
+    index: &mut usize,
+    fields: Option<&Vec<String>>,
+) -> Result<search_plan::QueryPlan, ParseError> {
+    let mut must = vec![parse_query_string_primary(tokens, index, fields)?];
+    while *index < tokens.len() && matches!(tokens[*index], QueryStringToken::And) {
+        *index += 1;
+        must.push(parse_query_string_primary(tokens, index, fields)?);
+    }
+    if must.len() == 1 {
+        Ok(must.pop().unwrap())
+    } else {
+        Ok(search_plan::QueryPlan::Bool(search_plan::BoolPlan {
+            filter: vec![],
+            should: vec![],
+            must,
+            must_not: vec![],
+            minimum_should_match: None,
+        }))
+    }
+}
+
+fn parse_query_string_primary(
+    tokens: &[QueryStringToken],
+    index: &mut usize,
+    fields: Option<&Vec<String>>,
+) -> Result<search_plan::QueryPlan, ParseError> {
+    let Some(token) = tokens.get(*index) else {
+        return Err(ParseError {
+            message: "unexpected end of `query_string` expression".to_string(),
+        });
+    };
+
+    match token {
+        QueryStringToken::LParen => {
+            *index += 1;
+            let plan = parse_query_string_or(tokens, index, fields)?;
+            match tokens.get(*index) {
+                Some(QueryStringToken::RParen) => {
+                    *index += 1;
+                    Ok(plan)
+                }
+                _ => Err(ParseError {
+                    message: "unclosed parenthesis in `query_string`".to_string(),
+                }),
+            }
+        }
+        QueryStringToken::Word(word) => {
+            *index += 1;
+            query_string_word_to_plan(word, tokens, index, fields)
+        }
+        QueryStringToken::Quoted(value) => {
+            *index += 1;
+            lower_bare_query_string_term(value, fields)
+        }
+        QueryStringToken::And | QueryStringToken::Or | QueryStringToken::RParen => {
+            Err(ParseError {
+                message: "unsupported operator placement in `query_string`".to_string(),
+            })
+        }
+    }
+}
+
+fn query_string_word_to_plan(
+    word: &str,
+    tokens: &[QueryStringToken],
+    index: &mut usize,
+    fields: Option<&Vec<String>>,
+) -> Result<search_plan::QueryPlan, ParseError> {
+    if word.eq_ignore_ascii_case("NOT") || word.starts_with('-') || word.starts_with('+') {
+        return Err(ParseError {
+            message:
+                "restricted `query_string` does not support NOT, required, or prohibited clauses"
+                    .to_string(),
+        });
+    }
+    reject_unsupported_query_string_fragment(word)?;
+
+    if let Some(field) = word.strip_suffix(':') {
+        let Some(value_token) = tokens.get(*index) else {
+            return Err(ParseError {
+                message: "fielded `query_string` clause is missing a value".to_string(),
+            });
+        };
+        *index += 1;
+        let value = query_string_value_token(value_token)?;
+        return lower_fielded_query_string_clause(field, &value);
+    }
+
+    if let Some((field, value)) = word.split_once(':') {
+        return lower_fielded_query_string_clause(field, value);
+    }
+
+    lower_bare_query_string_term(word, fields)
+}
+
+fn query_string_value_token(token: &QueryStringToken) -> Result<String, ParseError> {
+    match token {
+        QueryStringToken::Word(word) => {
+            reject_unsupported_query_string_fragment(word)?;
+            Ok(word.clone())
+        }
+        QueryStringToken::Quoted(value) => Ok(value.clone()),
+        _ => Err(ParseError {
+            message: "fielded `query_string` clause requires a literal value".to_string(),
+        }),
+    }
+}
+
+fn reject_unsupported_query_string_fragment(fragment: &str) -> Result<(), ParseError> {
+    if fragment.contains('*')
+        || fragment.contains('?')
+        || fragment.contains('~')
+        || fragment.contains('^')
+    {
+        return Err(ParseError {
+            message: "restricted `query_string` does not support wildcards, fuzziness, or boosts"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn lower_bare_query_string_term(
+    value: &str,
+    fields: Option<&Vec<String>>,
+) -> Result<search_plan::QueryPlan, ParseError> {
+    let Some(fields) = fields else {
+        return Err(ParseError {
+            message: "restricted `query_string` requires `fields` for bare terms".to_string(),
+        });
+    };
+    if fields.is_empty() {
+        return Err(ParseError {
+            message: "restricted `query_string` requires at least one field".to_string(),
+        });
+    }
+
+    let mut should = fields
+        .iter()
+        .map(|field| lower_fielded_query_string_clause(field, value))
+        .collect::<Result<Vec<_>, _>>()?;
+    should.sort_by(|left, right| format!("{left:?}").cmp(&format!("{right:?}")));
+
+    if should.len() == 1 {
+        Ok(should.pop().unwrap())
+    } else {
+        Ok(search_plan::QueryPlan::Bool(search_plan::BoolPlan {
+            filter: vec![],
+            should,
+            must: vec![],
+            must_not: vec![],
+            minimum_should_match: Some(1),
+        }))
+    }
+}
+
+fn lower_fielded_query_string_clause(
+    field: &str,
+    value: &str,
+) -> Result<search_plan::QueryPlan, ParseError> {
+    if field.is_empty() {
+        return Err(ParseError {
+            message: "restricted `query_string` requires a non-empty field".to_string(),
+        });
+    }
+    reject_unsupported_query_string_fragment(field)?;
+    if let Some(term_value) = query_string_value_to_term_value(field, value) {
+        return Ok(search_plan::QueryPlan::Term(search_plan::TermPlan {
+            clauses: vec![search_plan::TermClausePlan {
+                field: field.to_string(),
+                value: term_value,
+            }],
+        }));
+    }
+
+    Ok(search_plan::QueryPlan::Match(search_plan::MatchPlan {
+        clauses: vec![search_plan::MatchClausePlan {
+            field: field.to_string(),
+            query: value.to_string(),
+        }],
+    }))
+}
+
+fn query_string_value_to_term_value(field: &str, value: &str) -> Option<Value> {
+    if value.eq_ignore_ascii_case("true") {
+        return Some(Value::Bool(true));
+    }
+    if value.eq_ignore_ascii_case("false") {
+        return Some(Value::Bool(false));
+    }
+    if field_uses_exact_match_for_strings(field) {
+        return Some(Value::String(value.to_string()));
+    }
+    if value.starts_with('"') || value.contains(' ') {
+        return None;
+    }
+    if let Ok(parsed) = value.parse::<i64>() {
+        return Some(Value::from(parsed));
+    }
+    if let Ok(parsed) = value.parse::<f64>() {
+        if parsed.is_finite() {
+            return serde_json::Number::from_f64(parsed).map(Value::Number);
+        }
+    }
+    Some(Value::String(value.to_string()))
+}
+
+fn field_uses_exact_match_for_strings(value: &str) -> bool {
+    value == "_id" || value.ends_with(".keyword")
+}
+
+fn terms_order_to_plan(
+    order: Option<&HashMap<String, String>>,
+) -> Result<Option<search_plan::TermsOrderPlan>, ParseError> {
+    let Some(order) = order else {
+        return Ok(None);
+    };
+    if order.len() != 1 {
+        return Err(ParseError {
+            message: "`terms.order` only supports a single `_count` or `_key` entry".to_string(),
+        });
+    }
+    let (field, direction) = order.iter().next().unwrap();
+    let direction = direction.to_ascii_lowercase();
+    let plan = match (field.as_str(), direction.as_str()) {
+        ("_count", "asc") => search_plan::TermsOrderPlan::CountAsc,
+        ("_count", "desc") => search_plan::TermsOrderPlan::CountDesc,
+        ("_key", "asc") => search_plan::TermsOrderPlan::KeyAsc,
+        ("_key", "desc") => search_plan::TermsOrderPlan::KeyDesc,
+        _ => {
+            return Err(ParseError {
+                message: "`terms.order` only supports `_count` or `_key` with `asc` or `desc`"
+                    .to_string(),
+            });
+        }
+    };
+    Ok(Some(plan))
 }
 
 fn term_values_to_query_plan(
@@ -648,74 +1126,89 @@ fn sort_type_to_plan(sort: &SortType) -> search_plan::SortPlan {
     }
 }
 
-fn aggs_to_plan(aggs: &Option<HashMap<String, AggSpec>>) -> Vec<search_plan::AggregationPlan> {
+fn aggs_to_plan(
+    aggs: &Option<HashMap<String, AggSpec>>,
+) -> Result<Vec<search_plan::AggregationPlan>, ParseError> {
     let Some(aggs) = aggs else {
-        return vec![];
+        return Ok(vec![]);
     };
 
     let mut plans = aggs
         .iter()
         .map(|(name, spec)| agg_spec_to_plan(name, spec))
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     plans.sort_by(|left, right| left.name.cmp(&right.name));
-    plans
+    Ok(plans)
 }
 
-fn agg_spec_to_plan(name: &str, spec: &AggSpec) -> search_plan::AggregationPlan {
-    let spec = match spec {
-        AggSpec::Terms(terms) => {
-            search_plan::AggregationPlanSpec::Terms(search_plan::TermsAggregationPlan {
-                field: terms.terms.field.clone(),
-                size: terms.terms.size,
-                show_term_doc_count_error: terms.terms.show_term_doc_count_error,
-                sub_aggregations: aggs_to_plan(&terms.aggs),
-            })
-        }
-        AggSpec::Missing(missing) => {
-            search_plan::AggregationPlanSpec::Missing(search_plan::MissingAggregationPlan {
-                field: missing.missing.field.clone(),
-                size: missing.missing.size,
-                show_term_doc_count_error: missing.missing.show_term_doc_count_error,
-                sub_aggregations: aggs_to_plan(&missing.aggs),
-            })
-        }
-        AggSpec::Filter(filter) => {
-            search_plan::AggregationPlanSpec::Filter(search_plan::FilterAggregationPlan {
-                filter: aggregation_filter_to_plan(&filter.filter),
-                sub_aggregations: aggs_to_plan(&filter.aggs),
-            })
-        }
-        AggSpec::DateHistogram(histogram) => search_plan::AggregationPlanSpec::DateHistogram(
-            search_plan::DateHistogramAggregationPlan {
-                field: histogram.date_histogram.field.clone(),
-                fixed_interval: histogram.date_histogram.fixed_interval.clone(),
-                sub_aggregations: aggs_to_plan(&histogram.aggs),
-            },
-        ),
-        AggSpec::Cardinality(cardinality) => {
-            search_plan::AggregationPlanSpec::Cardinality(search_plan::CardinalityAggregationPlan {
-                field: cardinality.cardinality.field.clone(),
-                sub_aggregations: aggs_to_plan(&cardinality.aggs),
-            })
-        }
-        AggSpec::Range(range) => {
-            search_plan::AggregationPlanSpec::Range(search_plan::RangeAggregationPlan {
-                range: aggregation_range_to_plan(&range.range),
-                sub_aggregations: aggs_to_plan(&range.aggs),
-            })
-        }
-        AggSpec::Average(average) => {
-            search_plan::AggregationPlanSpec::Average(search_plan::AverageAggregationPlan {
-                field: average.avg.field.clone(),
-                sub_aggregations: aggs_to_plan(&average.aggs),
-            })
-        }
-    };
+fn agg_spec_to_plan(
+    name: &str,
+    spec: &AggSpec,
+) -> Result<search_plan::AggregationPlan, ParseError> {
+    let spec =
+        match spec {
+            AggSpec::Terms(terms) => {
+                search_plan::AggregationPlanSpec::Terms(search_plan::TermsAggregationPlan {
+                    field: terms.terms.field.clone(),
+                    size: terms.terms.size,
+                    order: terms_order_to_plan(terms.terms.order.as_ref())?,
+                    missing: terms.terms.missing.clone(),
+                    show_term_doc_count_error: terms.terms.show_term_doc_count_error,
+                    sub_aggregations: aggs_to_plan(&terms.aggs)?,
+                })
+            }
+            AggSpec::Missing(missing) => {
+                search_plan::AggregationPlanSpec::Missing(search_plan::MissingAggregationPlan {
+                    field: missing.missing.field.clone(),
+                    size: missing.missing.size,
+                    show_term_doc_count_error: missing.missing.show_term_doc_count_error,
+                    sub_aggregations: aggs_to_plan(&missing.aggs)?,
+                })
+            }
+            AggSpec::Filter(filter) => {
+                search_plan::AggregationPlanSpec::Filter(search_plan::FilterAggregationPlan {
+                    filter: aggregation_filter_to_plan(&filter.filter),
+                    sub_aggregations: aggs_to_plan(&filter.aggs)?,
+                })
+            }
+            AggSpec::DateHistogram(histogram) => search_plan::AggregationPlanSpec::DateHistogram(
+                search_plan::DateHistogramAggregationPlan {
+                    field: histogram.date_histogram.field.clone(),
+                    fixed_interval: histogram.date_histogram.fixed_interval.clone(),
+                    min_doc_count: histogram.date_histogram.min_doc_count,
+                    extended_bounds: histogram.date_histogram.extended_bounds.as_ref().map(
+                        |bounds| search_plan::DateHistogramExtendedBoundsPlan {
+                            min: bounds.min.clone(),
+                            max: bounds.max.clone(),
+                        },
+                    ),
+                    sub_aggregations: aggs_to_plan(&histogram.aggs)?,
+                },
+            ),
+            AggSpec::Cardinality(cardinality) => search_plan::AggregationPlanSpec::Cardinality(
+                search_plan::CardinalityAggregationPlan {
+                    field: cardinality.cardinality.field.clone(),
+                    sub_aggregations: aggs_to_plan(&cardinality.aggs)?,
+                },
+            ),
+            AggSpec::Range(range) => {
+                search_plan::AggregationPlanSpec::Range(search_plan::RangeAggregationPlan {
+                    range: aggregation_range_to_plan(&range.range),
+                    sub_aggregations: aggs_to_plan(&range.aggs)?,
+                })
+            }
+            AggSpec::Average(average) => {
+                search_plan::AggregationPlanSpec::Average(search_plan::AverageAggregationPlan {
+                    field: average.avg.field.clone(),
+                    sub_aggregations: aggs_to_plan(&average.aggs)?,
+                })
+            }
+        };
 
-    search_plan::AggregationPlan {
+    Ok(search_plan::AggregationPlan {
         name: name.to_string(),
         spec,
-    }
+    })
 }
 
 fn aggregation_filter_to_plan(filter: &AggSpecFilterBody) -> search_plan::AggregationFilterPlan {
@@ -781,10 +1274,10 @@ fn to_field_term(body: &FieldMatch) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{to_command, SearchBody};
+    use super::{SearchBody, to_command};
     use crate::elastic_search_endpoints::QueryStringSearch;
     use crate::elastic_search_parser::{
-        parse, parse_search_plan, parse_update_by_query_plan, UpdateByQueryBody,
+        UpdateByQueryBody, parse, parse_search_plan, parse_update_by_query_plan,
     };
     use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
     use crate::search_plan;
@@ -875,6 +1368,58 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_search_plan_multi_match() {
+        let plan = parse_search_plan(
+            Some("foo".to_string()),
+            &r#"
+{
+   "query": {
+     "multi_match": {
+       "query": "login",
+       "fields": ["message", "message.keyword"]
+     }
+   }
+}"#
+            .to_string(),
+        )
+        .unwrap();
+
+        match plan.query.unwrap() {
+            search_plan::QueryPlan::Bool(bool_plan) => {
+                assert_eq!(bool_plan.should.len(), 2);
+                assert_eq!(bool_plan.minimum_should_match, Some(1));
+            }
+            _ => panic!("Expected bool plan"),
+        }
+    }
+
+    #[test]
+    fn test_parse_search_plan_query_string() {
+        let plan = parse_search_plan(
+            Some("foo".to_string()),
+            &r#"
+{
+   "query": {
+     "query_string": {
+       "query": "service:auth AND Login",
+       "fields": ["message"],
+       "default_operator": "OR"
+     }
+   }
+}"#
+            .to_string(),
+        )
+        .unwrap();
+
+        match plan.query.unwrap() {
+            search_plan::QueryPlan::Bool(bool_plan) => {
+                assert_eq!(bool_plan.must.len(), 2);
+            }
+            _ => panic!("Expected bool plan"),
+        }
+    }
+
+    #[test]
     fn test_parse_search_plan_ids() {
         let plan = parse_search_plan(
             Some("foo".to_string()),
@@ -897,6 +1442,26 @@ mod tests {
             }
             _ => panic!("Expected bool plan"),
         }
+    }
+
+    #[test]
+    fn test_parse_search_plan_query_string_rejects_wildcards() {
+        let error = parse_search_plan(
+            Some("foo".to_string()),
+            &r#"
+{
+   "query": {
+     "query_string": {
+       "query": "serv*",
+       "fields": ["message"]
+     }
+   }
+}"#
+            .to_string(),
+        )
+        .unwrap_err();
+
+        assert!(error.message.contains("does not support wildcards"));
     }
 
     #[test]
@@ -1433,6 +1998,66 @@ mod tests {
         };
 
         //let _command = to_command(Some("foobar".to_string()), &parse_result);
+
+        let histogram_plan = parse_search_plan(
+            Some("logs".to_string()),
+            &r#"{
+  "aggs": {
+    "per_day": {
+      "date_histogram": {
+        "field": "@timestamp",
+        "fixed_interval": "1d",
+        "min_doc_count": 0,
+        "extended_bounds": {
+          "min": "2099-03-07T00:00:00.000Z",
+          "max": "2099-03-10T00:00:00.000Z"
+        }
+      }
+    }
+  }
+}"#
+            .to_string(),
+        )
+        .unwrap();
+
+        match &histogram_plan.aggregations[0].spec {
+            search_plan::AggregationPlanSpec::DateHistogram(histogram) => {
+                assert_eq!(histogram.min_doc_count, Some(0));
+                assert!(histogram.extended_bounds.is_some());
+            }
+            _ => panic!("Expected date histogram plan"),
+        }
+
+        let terms_plan = parse_search_plan(
+            Some("logs".to_string()),
+            &r#"{
+  "aggs": {
+    "by_service": {
+      "terms": {
+        "field": "service",
+        "size": 10,
+        "order": {
+          "_key": "asc"
+        },
+        "missing": "unknown"
+      }
+    }
+  }
+}"#
+            .to_string(),
+        )
+        .unwrap();
+
+        match &terms_plan.aggregations[0].spec {
+            search_plan::AggregationPlanSpec::Terms(terms) => {
+                assert_eq!(terms.order, Some(search_plan::TermsOrderPlan::KeyAsc));
+                assert_eq!(
+                    terms.missing,
+                    Some(serde_json::Value::String("unknown".to_string()))
+                );
+            }
+            _ => panic!("Expected terms plan"),
+        }
 
         let test_val = r#"
         {

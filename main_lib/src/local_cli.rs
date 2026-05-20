@@ -4,7 +4,10 @@ use crate::data_contract::{
 use crate::elastic_search_common::CommandContext;
 use crate::elastic_search_index::{IndexError, create_index_inner_with_doc_id};
 use crate::elastic_search_parser;
-use crate::schema_massager::{PowdrrSchema, to_powdrr_schema};
+use crate::elastic_table_validation::{
+    ElasticTableValidation, ElasticTableValidationError, validate_elastic_table_files,
+};
+use crate::schema_massager::{PowdrrDataType, PowdrrSchema, to_powdrr_schema};
 use crate::search_executor;
 use crate::state_provider::STATE_PROVIDER;
 use crate::test_api::PeerModeType;
@@ -48,6 +51,22 @@ pub struct LocalParquetBuildResult {
     pub table_name: String,
     pub doc_id_field: String,
     pub file_count: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct LocalParquetValidateRequest {
+    pub source: String,
+    pub doc_id_field: String,
+    pub scratch_dir: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LocalParquetValidateResult {
+    pub source: String,
+    pub doc_id_field: String,
+    pub doc_id_type: PowdrrDataType,
+    pub file_count: usize,
+    pub indexed_string_fields: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +149,12 @@ impl From<IndexError> for LocalCliError {
     }
 }
 
+impl From<ElasticTableValidationError> for LocalCliError {
+    fn from(value: ElasticTableValidationError) -> Self {
+        Self::new(value.to_string())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CacheManifest {
     version: u32,
@@ -181,7 +206,7 @@ pub async fn build_local_parquet_cache(
         )));
     }
 
-    let file_descriptors =
+    let (file_descriptors, _) =
         validate_and_describe_cached_files(&cached_file_paths, &request.doc_id_field)?;
     let dummy_speedboat_files = vec![];
     create_index_inner_with_doc_id(
@@ -217,6 +242,92 @@ pub async fn build_local_parquet_cache(
     })
 }
 
+pub async fn validate_local_parquet_source(
+    request: &LocalParquetValidateRequest,
+) -> Result<LocalParquetValidateResult, LocalCliError> {
+    let report = if request.source.starts_with("s3://") {
+        let scratch_root = request
+            .scratch_dir
+            .clone()
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("powdrr-elastic-validate-{}", IdInstance::next_id()));
+        fs::create_dir_all(&scratch_root).map_err(|error| {
+            LocalCliError::from_io(
+                &format!(
+                    "Failed to create scratch directory {}",
+                    scratch_root.display()
+                ),
+                error,
+            )
+        })?;
+        let files_dir = scratch_root.join(FILES_DIR_NAME);
+        fs::create_dir_all(&files_dir).map_err(|error| {
+            LocalCliError::from_io(
+                &format!(
+                    "Failed to create scratch files directory {}",
+                    files_dir.display()
+                ),
+                error,
+            )
+        })?;
+
+        let validation_result = async {
+            let cached_file_paths = cache_s3_source(&request.source, &files_dir).await?;
+            if cached_file_paths.is_empty() {
+                return Err(LocalCliError::new(format!(
+                    "No parquet files found in source {}",
+                    request.source
+                )));
+            }
+            let (_, report) =
+                validate_and_describe_cached_files(&cached_file_paths, &request.doc_id_field)?;
+            Ok(report)
+        }
+        .await;
+
+        let cleanup_result = fs::remove_dir_all(&scratch_root);
+        match (validation_result, cleanup_result) {
+            (Ok(report), Ok(_)) => report,
+            (Ok(_), Err(error)) => {
+                return Err(LocalCliError::from_io(
+                    &format!(
+                        "Failed to remove scratch directory {}",
+                        scratch_root.display()
+                    ),
+                    error,
+                ));
+            }
+            (Err(error), _) => return Err(error),
+        }
+    } else {
+        let source_path = PathBuf::from(&request.source);
+        let canonical_source = source_path.canonicalize().map_err(|error| {
+            LocalCliError::from_io(
+                &format!("Failed to resolve local source {}", source_path.display()),
+                error,
+            )
+        })?;
+        let source_files = collect_local_source_files(&canonical_source)?;
+        if source_files.is_empty() {
+            return Err(LocalCliError::new(format!(
+                "No parquet files found in source {}",
+                request.source
+            )));
+        }
+        let source_paths = source_files
+            .iter()
+            .map(|source_file| source_file.source_path.clone())
+            .collect::<Vec<PathBuf>>();
+        let (_, report) = validate_and_describe_cached_files(&source_paths, &request.doc_id_field)?;
+        report
+    };
+
+    Ok(LocalParquetValidateResult::from_report(
+        request.source.clone(),
+        report,
+    ))
+}
+
 pub async fn query_local_parquet_cache(
     request: &LocalParquetQueryRequest,
 ) -> Result<LocalQueryResponse, LocalCliError> {
@@ -236,7 +347,7 @@ pub async fn query_local_parquet_cache(
         .map(|relative| canonical_cache_dir.join(relative))
         .collect::<Vec<PathBuf>>();
 
-    let file_descriptors =
+    let (file_descriptors, _) =
         validate_and_describe_cached_files(&cached_file_paths, &manifest.doc_id_field)?;
     let dummy_speedboat_files = vec![];
     create_index_inner_with_doc_id(
@@ -627,7 +738,7 @@ fn ensure_parent_dir(path: &Path) -> Result<(), LocalCliError> {
 fn validate_and_describe_cached_files(
     cached_file_paths: &[PathBuf],
     doc_id_field: &str,
-) -> Result<Vec<FileDescriptor>, LocalCliError> {
+) -> Result<(Vec<FileDescriptor>, ElasticTableValidation), LocalCliError> {
     let mut descriptors = Vec::with_capacity(cached_file_paths.len());
     for path in cached_file_paths.iter() {
         let file = fs::File::open(path).map_err(|error| {
@@ -665,7 +776,20 @@ fn validate_and_describe_cached_files(
             size,
         });
     }
-    Ok(descriptors)
+    let report = validate_elastic_table_files(&descriptors, doc_id_field)?;
+    Ok((descriptors, report))
+}
+
+impl LocalParquetValidateResult {
+    fn from_report(source: String, report: ElasticTableValidation) -> Self {
+        Self {
+            source,
+            doc_id_field: report.doc_id_field,
+            doc_id_type: report.doc_id_type,
+            file_count: report.file_count,
+            indexed_string_fields: report.indexed_string_fields,
+        }
+    }
 }
 
 fn build_checkpoint(
@@ -700,8 +824,11 @@ fn build_checkpoint(
             table_schema: merged_schema.clone(),
             snapshot_id: None,
             files: file_set,
+            partition_spec: vec![],
+            sort_order: vec![],
             column_names: vec![],
             column_stats: vec![],
+            access_artifacts: vec![],
             file_stats: vec![],
         }),
         speedboat_metadata: None,
@@ -744,9 +871,11 @@ fn read_manifest(cache_dir: &Path) -> Result<CacheManifest, LocalCliError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LocalParquetBuildRequest, LocalParquetQueryRequest, LocalQueryLanguage,
-        build_local_parquet_cache, query_local_parquet_cache,
+        LocalParquetBuildRequest, LocalParquetQueryRequest, LocalParquetValidateRequest,
+        LocalQueryLanguage, build_local_parquet_cache, query_local_parquet_cache,
+        validate_local_parquet_source,
     };
+    use crate::schema_massager::PowdrrDataType;
     use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
@@ -768,6 +897,24 @@ mod tests {
                 Arc::new(Int64Array::from(vec![1_i64, 2_i64])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["login failed", "payment accepted"])) as ArrayRef,
             ],
+        )
+        .unwrap();
+
+        let file = fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    fn write_doc_only_parquet(path: &Path) {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "doc_id",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2_i64])) as ArrayRef],
         )
         .unwrap();
 
@@ -818,6 +965,49 @@ mod tests {
         assert_eq!(
             parsed["hits"]["hits"][0]["_source"]["message"],
             "login failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_local_source_reports_indexed_fields() {
+        let source_dir = TempDir::new().unwrap();
+        let parquet_path = source_dir.path().join("events.parquet");
+        write_test_parquet(&parquet_path);
+
+        let report = validate_local_parquet_source(&LocalParquetValidateRequest {
+            source: source_dir.path().display().to_string(),
+            doc_id_field: "doc_id".to_string(),
+            scratch_dir: None,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(report.file_count, 1);
+        assert_eq!(report.doc_id_type, PowdrrDataType::Integer);
+        assert_eq!(report.indexed_string_fields, vec!["message".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn build_local_cache_rejects_files_without_searchable_columns() {
+        let source_dir = TempDir::new().unwrap();
+        let cache_dir = TempDir::new().unwrap();
+        let parquet_path = source_dir.path().join("events.parquet");
+        write_doc_only_parquet(&parquet_path);
+
+        let error = build_local_parquet_cache(&LocalParquetBuildRequest {
+            source: source_dir.path().display().to_string(),
+            cache_dir: cache_dir.path().join("cache"),
+            table_name: "events".to_string(),
+            doc_id_field: "doc_id".to_string(),
+            replace: true,
+        })
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("no searchable top-level string columns")
         );
     }
 }

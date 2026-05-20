@@ -21,6 +21,7 @@ mod elastic_search_parser;
 pub mod elastic_search_pipeline;
 mod elastic_search_responses;
 mod elastic_search_storage_schema;
+mod elastic_table_validation;
 mod ephemeral_fetch_tracker;
 pub mod ephemeral_service_impl;
 mod ephemeral_state_provider;

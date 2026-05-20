@@ -23,8 +23,8 @@ use crate::state_provider::ServiceApiError;
 use crate::test_api::{StateMode, TestProcessingMode};
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_dynamodb::Client;
-use modyne::TestTableExt;
 use modyne::model::TransactWrite;
+use modyne::TestTableExt;
 use std::collections::{HashMap, HashSet};
 
 const LEASE_LENGTH_MS: i64 = 60 * 1000; // 1 minute
@@ -456,6 +456,7 @@ impl DynamoDBServiceImpl {
                     type_files: vec![SpeedboatCommitTableInfo {
                         commit_type: "commit".to_string(),
                         table_name: metadata.table_name.clone(),
+                        segments: vec![],
                         files: metadata
                             .speedboat_metadata
                             .as_ref()

@@ -8,21 +8,75 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SpeedboatSegmentFile {
+    pub segment_id: String,
+    pub file_path: String,
+    pub size: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SpeedboatCommitTableInfo {
     pub commit_type: String,
     pub table_name: String,
+    #[serde(default)]
+    pub segments: Vec<SpeedboatSegmentFile>,
     pub files: Vec<String>,
     pub sizes: Vec<u64>,
     pub schema: Option<PowdrrSchema>,
 }
 
 impl SpeedboatCommitTableInfo {
+    fn synthetic_legacy_segment_id(file_path: &str) -> String {
+        let mut hasher = DefaultHasher::new();
+        file_path.hash(&mut hasher);
+        format!("legacy-{:x}", hasher.finish())
+    }
+
+    pub fn from_segments(
+        commit_type: String,
+        table_name: String,
+        segments: Vec<SpeedboatSegmentFile>,
+        schema: Option<PowdrrSchema>,
+    ) -> Self {
+        Self {
+            commit_type,
+            table_name,
+            files: segments
+                .iter()
+                .map(|segment| segment.file_path.clone())
+                .collect(),
+            sizes: segments.iter().map(|segment| segment.size).collect(),
+            segments,
+            schema,
+        }
+    }
+
+    pub fn segment_files(&self) -> Vec<SpeedboatSegmentFile> {
+        if !self.segments.is_empty() {
+            return self.segments.clone();
+        }
+
+        self.files
+            .iter()
+            .zip(self.sizes.iter())
+            .map(|(file_path, size)| SpeedboatSegmentFile {
+                segment_id: Self::synthetic_legacy_segment_id(file_path),
+                file_path: file_path.clone(),
+                size: *size,
+            })
+            .collect()
+    }
+
     pub fn as_file_set_payload(&self) -> FileSetPayload {
+        let segments = self.segment_files();
         FileSetPayload {
-            file_paths: self.files.clone(),
-            sizes: self.sizes.clone(),
+            file_paths: segments
+                .iter()
+                .map(|segment| segment.file_path.clone())
+                .collect(),
+            sizes: segments.iter().map(|segment| segment.size).collect(),
             schemas: vec![self.schema.as_ref().unwrap().clone()],
-            file_schemas: self.files.iter().map(|_| 0).collect(),
+            file_schemas: segments.iter().map(|_| 0).collect(),
         }
     }
 }
@@ -66,6 +120,51 @@ pub struct IcebergColumnStats {
     pub upper_bound: Option<Value>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct IcebergPartitionField {
+    pub source_field_id: i32,
+    pub source_field_name: String,
+    pub field_id: i32,
+    pub field_name: String,
+    pub transform: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct IcebergPartitionValue {
+    pub source_field_name: String,
+    pub field_name: String,
+    pub transform: String,
+    #[serde(default)]
+    pub value: Option<Value>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct IcebergSortField {
+    pub source_field_id: i32,
+    pub source_field_name: String,
+    pub transform: String,
+    #[serde(default)]
+    pub descending: bool,
+    #[serde(default)]
+    pub nulls_first: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct IcebergAccessArtifact {
+    pub name: String,
+    pub kind: String,
+    #[serde(default)]
+    pub fields: Vec<String>,
+    #[serde(default)]
+    pub exact: bool,
+    #[serde(default)]
+    pub supports_eq: bool,
+    #[serde(default)]
+    pub supports_range: bool,
+    #[serde(default)]
+    pub supports_order: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct IcebergRowGroupStats {
     pub row_group_index: usize,
@@ -89,6 +188,8 @@ pub struct IcebergFileStats {
     #[serde(default)]
     pub columns: Vec<IcebergColumnStats>,
     #[serde(default)]
+    pub partition_values: Vec<IcebergPartitionValue>,
+    #[serde(default)]
     pub row_groups: Vec<IcebergRowGroupStats>,
 }
 
@@ -97,10 +198,16 @@ pub struct IcebergMetadata {
     pub table_schema: PowdrrSchema,
     pub snapshot_id: Option<String>,
     pub files: FileSetPayload,
+    #[serde(default)]
+    pub partition_spec: Vec<IcebergPartitionField>,
+    #[serde(default)]
+    pub sort_order: Vec<IcebergSortField>,
     pub column_names: Vec<String>,
     // per file, per column lower and upper bounds
     // TODO: this needs to be generalized to support bloom filters
     pub column_stats: Vec<(String, String)>,
+    #[serde(default)]
+    pub access_artifacts: Vec<IcebergAccessArtifact>,
     #[serde(default)]
     pub file_stats: Vec<IcebergFileStats>,
 }
@@ -339,13 +446,25 @@ impl TableMetadataCheckpoint {
                 table_schema: iceberg_metadata.table_schema.clone(),
                 snapshot_id: None,
                 files: file_payload,
+                partition_spec: iceberg_metadata.partition_spec.clone(),
+                sort_order: iceberg_metadata.sort_order.clone(),
                 column_names: vec![],
                 column_stats: vec![],
+                access_artifacts: iceberg_metadata.access_artifacts.clone(),
                 file_stats,
             });
         } else {
             let metadata = self.iceberg_metadata.as_mut().unwrap();
             metadata.files.merge_inplace(&file_payload);
+            if metadata.partition_spec.is_empty() {
+                metadata.partition_spec = iceberg_metadata.partition_spec.clone();
+            }
+            if metadata.sort_order.is_empty() {
+                metadata.sort_order = iceberg_metadata.sort_order.clone();
+            }
+            if metadata.access_artifacts.is_empty() {
+                metadata.access_artifacts = iceberg_metadata.access_artifacts.clone();
+            }
             for stat in file_stats {
                 if !metadata
                     .file_stats
@@ -594,10 +713,18 @@ pub struct DynamoDbGlobalSecondaryIndexConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct DynamoDbLocalSecondaryIndexConfig {
+    pub name: String,
+    pub sort_key: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct DynamoDbTableConfig {
     pub partition_key: String,
     #[serde(default)]
     pub sort_key: Option<String>,
+    #[serde(default)]
+    pub local_secondary_indexes: Vec<DynamoDbLocalSecondaryIndexConfig>,
     #[serde(default)]
     pub global_secondary_indexes: Vec<DynamoDbGlobalSecondaryIndexConfig>,
 }
@@ -1034,3 +1161,52 @@ pub struct OrgInfo {
 
 pub const TEST_ACCESS_KEY: &str = "access_key";
 pub const TEST_SECRET_KEY: &str = "secret_key";
+
+#[cfg(test)]
+mod tests {
+    use super::{SpeedboatCommitTableInfo, SpeedboatSegmentFile};
+
+    #[test]
+    fn speedboat_table_info_prefers_explicit_segments() {
+        let table_info = SpeedboatCommitTableInfo::from_segments(
+            "commit".to_string(),
+            "logs".to_string(),
+            vec![SpeedboatSegmentFile {
+                segment_id: "segment-1".to_string(),
+                file_path: "s3://warehouse/default/ingest/logs/commit/segment-1".to_string(),
+                size: 42,
+            }],
+            None,
+        );
+
+        let segments = table_info.segment_files();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].segment_id, "segment-1");
+        assert_eq!(
+            segments[0].file_path,
+            "s3://warehouse/default/ingest/logs/commit/segment-1"
+        );
+        assert_eq!(segments[0].size, 42);
+    }
+
+    #[test]
+    fn speedboat_table_info_backfills_legacy_segment_ids() {
+        let table_info = SpeedboatCommitTableInfo {
+            commit_type: "commit".to_string(),
+            table_name: "logs".to_string(),
+            segments: vec![],
+            files: vec!["s3://warehouse/default/ingest/logs/commit/legacy".to_string()],
+            sizes: vec![123],
+            schema: None,
+        };
+
+        let segments = table_info.segment_files();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(
+            segments[0].file_path,
+            "s3://warehouse/default/ingest/logs/commit/legacy"
+        );
+        assert_eq!(segments[0].size, 123);
+        assert!(segments[0].segment_id.starts_with("legacy-"));
+    }
+}

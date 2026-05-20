@@ -1,6 +1,6 @@
 {
   "handlers": [
-    { "handler": "elastic_search_endpoints::es_bulk_ingest", "coverage": "differential", "fixtures": ["bulk_match_search_returns_expected_hits"] },
+    { "handler": "elastic_search_endpoints::es_bulk_ingest", "coverage": "differential", "fixtures": ["bulk_match_search_returns_expected_hits", "bulk_index_replaces_existing_doc_after_refresh", "bulk_update_merges_existing_doc_after_refresh", "bulk_delete_existing_doc_returns_404_after_refresh"] },
     { "handler": "elastic_search_endpoints::es_cluster_health", "coverage": "differential", "fixtures": ["cluster_health_named_route_returns_green_status"] },
     { "handler": "elastic_search_endpoints::es_cluster_settings", "coverage": "differential", "fixtures": ["cluster_settings_include_defaults_returns_defaults"] },
     { "handler": "elastic_search_endpoints::es_count", "coverage": "differential", "fixtures": ["global_count_returns_filtered_doc_total"] },
@@ -26,7 +26,9 @@
     { "handler": "elastic_search_endpoints::es_head_index_alias", "coverage": "differential", "fixtures": ["head_index_alias_returns_200_after_alias_create"] },
     { "handler": "elastic_search_endpoints::es_head_template", "coverage": "differential", "fixtures": ["index_template_head_returns_200_after_create"] },
     { "handler": "elastic_search_endpoints::es_head_with_id", "coverage": "differential", "fixtures": ["head_existing_doc_returns_200"] },
+    { "handler": "elastic_search_endpoints::es_index_auto_id", "coverage": "differential", "fixtures": ["post_doc_auto_id_returns_created"] },
     { "handler": "elastic_search_endpoints::es_index_pit", "coverage": "local_only", "fixtures": ["index_pit_returns_id"] },
+    { "handler": "elastic_search_endpoints::es_index_with_id", "coverage": "differential", "fixtures": ["put_doc_with_id_replaces_existing_doc"] },
     { "handler": "elastic_search_endpoints::es_license", "coverage": "local_only", "fixtures": ["license_returns_basic_license"] },
     { "handler": "elastic_search_endpoints::es_mget", "coverage": "differential", "fixtures": ["global_mget_returns_found_and_missing_docs"] },
     { "handler": "elastic_search_endpoints::es_mget_table", "coverage": "differential", "fixtures": ["table_mget_returns_found_and_missing_docs"] },
@@ -48,8 +50,8 @@
     { "handler": "elastic_search_endpoints::es_unsupported_named_pipeline_simulate", "coverage": "unsupported", "fixtures": ["simulate_named_pipeline_returns_clear_unsupported_message"] },
     { "handler": "elastic_search_endpoints::es_unsupported_search_scroll", "coverage": "unsupported", "fixtures": ["search_scroll_returns_clear_unsupported_message"] },
     { "handler": "elastic_search_endpoints::es_unsupported_search_template", "coverage": "unsupported", "fixtures": ["search_template_returns_clear_unsupported_message"] },
-    { "handler": "elastic_search_endpoints::es_unsupported_update_api", "coverage": "unsupported", "fixtures": ["update_api_returns_clear_unsupported_message", "post_doc_with_id_returns_clear_unsupported_message"] },
     { "handler": "elastic_search_endpoints::es_update_aliases", "coverage": "differential", "fixtures": ["alias_update_allows_search_via_alias_name"] },
+    { "handler": "elastic_search_endpoints::es_update_with_id", "coverage": "differential", "fixtures": ["update_with_id_merges_doc_after_refresh", "update_with_id_doc_as_upsert_creates_missing_doc"] },
     { "handler": "elastic_search_endpoints::es_update_by_query", "coverage": "differential", "fixtures": ["update_by_query_scripted_field_becomes_searchable_after_refresh"] },
     { "handler": "elastic_search_endpoints::es_xpack", "coverage": "local_only", "fixtures": ["xpack_returns_feature_listing"] },
     { "handler": "elastic_search_lifetime_policy::es_get_ilm_policy", "coverage": "local_only", "fixtures": ["ilm_policy_get_returns_empty_object_after_create"] },

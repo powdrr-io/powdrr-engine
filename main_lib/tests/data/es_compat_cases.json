@@ -704,6 +704,651 @@
       ]
     },
     {
+      "id": "logs_wildcard_multi_match_returns_expected_hits",
+      "description": "A multi_match query over logs-* returns the expected hits across two indices",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/logs-{{index}}",
+            "body": "{\"mappings\":{\"properties\":{\"@timestamp\":{\"type\":\"date\"},\"message\":{\"type\":\"text\"},\"index_col\":{\"type\":\"long\"},\"service\":{\"type\":\"keyword\"}}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/logs-{{other_index}}",
+            "body": "{\"mappings\":{\"properties\":{\"@timestamp\":{\"type\":\"date\"},\"message\":{\"type\":\"text\"},\"index_col\":{\"type\":\"long\"},\"service\":{\"type\":\"keyword\"}}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"logs-{{index}}\",\"_id\":\"doc-1\"}}\n{\"@timestamp\":\"2099-03-08T11:04:05.000Z\",\"index_col\":1,\"service\":\"auth\",\"message\":\"Login attempt failed\"}\n{\"create\":{\"_index\":\"logs-{{index}}\",\"_id\":\"doc-2\"}}\n{\"@timestamp\":\"2099-03-09T11:07:08.000Z\",\"index_col\":2,\"service\":\"auth\",\"message\":\"Logout successful\"}\n{\"create\":{\"_index\":\"logs-{{other_index}}\",\"_id\":\"doc-3\"}}\n{\"@timestamp\":\"2099-03-08T13:06:07.000Z\",\"index_col\":7,\"service\":\"api\",\"message\":\"Login successful\"}\n{\"create\":{\"_index\":\"logs-{{other_index}}\",\"_id\":\"doc-4\"}}\n{\"@timestamp\":\"2099-03-09T15:08:09.000Z\",\"index_col\":8,\"service\":\"api\",\"message\":\"Password reset\"}\n",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/logs-{{index}}*/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/logs-{{index}}*/_search",
+        "body": "{\"query\":{\"multi_match\":{\"query\":\"Login\",\"fields\":[\"message\"]}},\"sort\":[{\"index_col\":{\"order\":\"asc\"}}]}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number", "path": "hits.total.value", "value": 2 },
+        {
+          "kind": "json_path_string_set",
+          "path": "hits.hits[*]._source.message",
+          "values": ["Login attempt failed", "Login successful"]
+        },
+        {
+          "kind": "json_path_number_list",
+          "path": "hits.hits[*].sort[*]",
+          "values": [1, 7]
+        }
+      ]
+    },
+    {
+      "id": "logs_wildcard_query_string_returns_expected_hits",
+      "description": "A restricted query_string over logs-* returns the expected field-filtered hit set",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/logs-{{index}}",
+            "body": "{\"mappings\":{\"properties\":{\"@timestamp\":{\"type\":\"date\"},\"message\":{\"type\":\"text\"},\"index_col\":{\"type\":\"long\"},\"service\":{\"type\":\"keyword\"}}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/logs-{{other_index}}",
+            "body": "{\"mappings\":{\"properties\":{\"@timestamp\":{\"type\":\"date\"},\"message\":{\"type\":\"text\"},\"index_col\":{\"type\":\"long\"},\"service\":{\"type\":\"keyword\"}}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"logs-{{index}}\",\"_id\":\"doc-1\"}}\n{\"@timestamp\":\"2099-03-08T11:04:05.000Z\",\"index_col\":1,\"service\":\"auth\",\"message\":\"Login attempt failed\"}\n{\"create\":{\"_index\":\"logs-{{index}}\",\"_id\":\"doc-2\"}}\n{\"@timestamp\":\"2099-03-09T11:07:08.000Z\",\"index_col\":2,\"service\":\"auth\",\"message\":\"Logout successful\"}\n{\"create\":{\"_index\":\"logs-{{other_index}}\",\"_id\":\"doc-3\"}}\n{\"@timestamp\":\"2099-03-10T13:06:07.000Z\",\"index_col\":7,\"service\":\"api\",\"message\":\"Login successful\"}\n{\"create\":{\"_index\":\"logs-{{other_index}}\",\"_id\":\"doc-4\"}}\n{\"@timestamp\":\"2099-03-11T15:08:09.000Z\",\"index_col\":8,\"service\":\"api\",\"message\":\"Password reset\"}\n",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/logs-{{index}}*/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/logs-{{index}}*/_search",
+        "body": "{\"query\":{\"query_string\":{\"query\":\"service:auth OR service:api\",\"fields\":[\"message\"],\"default_operator\":\"OR\"}},\"sort\":[{\"index_col\":{\"order\":\"asc\"}}]}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number", "path": "hits.total.value", "value": 4 },
+        {
+          "kind": "json_path_string_set",
+          "path": "hits.hits[*]._source.message",
+          "values": [
+            "Login attempt failed",
+            "Logout successful",
+            "Login successful",
+            "Password reset"
+          ]
+        },
+        {
+          "kind": "json_path_number_list",
+          "path": "hits.hits[*].sort[*]",
+          "values": [1, 2, 7, 8]
+        }
+      ]
+    },
+    {
+      "id": "logs_wildcard_search_after_returns_expected_hits",
+      "description": "A sorted logs-* query paginates with search_after across multiple indices",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/logs-{{index}}",
+            "body": "{\"mappings\":{\"properties\":{\"@timestamp\":{\"type\":\"date\"},\"message\":{\"type\":\"text\"},\"index_col\":{\"type\":\"long\"}}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/logs-{{other_index}}",
+            "body": "{\"mappings\":{\"properties\":{\"@timestamp\":{\"type\":\"date\"},\"message\":{\"type\":\"text\"},\"index_col\":{\"type\":\"long\"}}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"logs-{{index}}\",\"_id\":\"doc-1\"}}\n{\"@timestamp\":\"2099-03-08T11:04:05.000Z\",\"index_col\":1,\"message\":\"Login attempt failed\"}\n{\"create\":{\"_index\":\"logs-{{index}}\",\"_id\":\"doc-2\"}}\n{\"@timestamp\":\"2099-03-09T11:07:08.000Z\",\"index_col\":2,\"message\":\"Logout successful\"}\n{\"create\":{\"_index\":\"logs-{{other_index}}\",\"_id\":\"doc-3\"}}\n{\"@timestamp\":\"2099-03-08T13:06:07.000Z\",\"index_col\":7,\"message\":\"Login successful\"}\n{\"create\":{\"_index\":\"logs-{{other_index}}\",\"_id\":\"doc-4\"}}\n{\"@timestamp\":\"2099-03-09T15:08:09.000Z\",\"index_col\":8,\"message\":\"Password reset\"}\n",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/logs-{{index}}*/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/logs-{{index}}*/_search",
+        "body": "{\"size\":2,\"search_after\":[2],\"sort\":[{\"index_col\":{\"order\":\"asc\"}}]}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        {
+          "kind": "json_path_number_list",
+          "path": "hits.hits[*].sort[*]",
+          "values": [7, 8]
+        }
+      ]
+    },
+    {
+      "id": "logs_wildcard_date_histogram_with_bounds_returns_expected_buckets",
+      "description": "A date_histogram aggregation with min_doc_count and extended_bounds over logs-* returns empty boundary and gap buckets",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/logs-{{index}}",
+            "body": "{\"mappings\":{\"properties\":{\"@timestamp\":{\"type\":\"date\"},\"message\":{\"type\":\"text\"},\"index_col\":{\"type\":\"long\"}}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/logs-{{other_index}}",
+            "body": "{\"mappings\":{\"properties\":{\"@timestamp\":{\"type\":\"date\"},\"message\":{\"type\":\"text\"},\"index_col\":{\"type\":\"long\"}}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"logs-{{index}}\",\"_id\":\"doc-1\"}}\n{\"@timestamp\":\"2099-03-08T11:04:05.000Z\",\"index_col\":1,\"message\":\"Login attempt failed\"}\n{\"create\":{\"_index\":\"logs-{{index}}\",\"_id\":\"doc-2\"}}\n{\"@timestamp\":\"2099-03-08T11:07:08.000Z\",\"index_col\":2,\"message\":\"Logout successful\"}\n{\"create\":{\"_index\":\"logs-{{other_index}}\",\"_id\":\"doc-3\"}}\n{\"@timestamp\":\"2099-03-10T13:06:07.000Z\",\"index_col\":7,\"message\":\"Login successful\"}\n{\"create\":{\"_index\":\"logs-{{other_index}}\",\"_id\":\"doc-4\"}}\n{\"@timestamp\":\"2099-03-10T15:08:09.000Z\",\"index_col\":8,\"message\":\"Password reset\"}\n",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/logs-{{index}}*/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/logs-{{index}}*/_search",
+        "body": "{\"size\":0,\"aggs\":{\"per_day\":{\"date_histogram\":{\"field\":\"@timestamp\",\"fixed_interval\":\"1d\",\"min_doc_count\":0,\"extended_bounds\":{\"min\":\"2099-03-07T00:00:00.000Z\",\"max\":\"2099-03-11T00:00:00.000Z\"}}}}}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        {
+          "kind": "json_path_string_list",
+          "path": "aggregations.per_day.buckets[*].key_as_string",
+          "values": [
+            "2099-03-07T00:00:00.000Z",
+            "2099-03-08T00:00:00.000Z",
+            "2099-03-09T00:00:00.000Z",
+            "2099-03-10T00:00:00.000Z",
+            "2099-03-11T00:00:00.000Z"
+          ]
+        },
+        {
+          "kind": "json_path_number_list",
+          "path": "aggregations.per_day.buckets[*].doc_count",
+          "values": [0, 2, 0, 2, 0]
+        }
+      ]
+    },
+    {
+      "id": "logs_wildcard_date_histogram_returns_expected_buckets",
+      "description": "A date_histogram aggregation over logs-* returns the expected per-day buckets",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/logs-{{index}}",
+            "body": "{\"mappings\":{\"properties\":{\"@timestamp\":{\"type\":\"date\"},\"message\":{\"type\":\"text\"},\"index_col\":{\"type\":\"long\"}}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/logs-{{other_index}}",
+            "body": "{\"mappings\":{\"properties\":{\"@timestamp\":{\"type\":\"date\"},\"message\":{\"type\":\"text\"},\"index_col\":{\"type\":\"long\"}}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"logs-{{index}}\",\"_id\":\"doc-1\"}}\n{\"@timestamp\":\"2099-03-08T11:04:05.000Z\",\"index_col\":1,\"message\":\"Login attempt failed\"}\n{\"create\":{\"_index\":\"logs-{{index}}\",\"_id\":\"doc-2\"}}\n{\"@timestamp\":\"2099-03-09T11:07:08.000Z\",\"index_col\":2,\"message\":\"Logout successful\"}\n{\"create\":{\"_index\":\"logs-{{other_index}}\",\"_id\":\"doc-3\"}}\n{\"@timestamp\":\"2099-03-08T13:06:07.000Z\",\"index_col\":7,\"message\":\"Login successful\"}\n{\"create\":{\"_index\":\"logs-{{other_index}}\",\"_id\":\"doc-4\"}}\n{\"@timestamp\":\"2099-03-09T15:08:09.000Z\",\"index_col\":8,\"message\":\"Password reset\"}\n",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/logs-{{index}}*/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/logs-{{index}}*/_search",
+        "body": "{\"size\":0,\"aggs\":{\"per_day\":{\"date_histogram\":{\"field\":\"@timestamp\",\"fixed_interval\":\"1d\"}}}}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        {
+          "kind": "json_path_string_list",
+          "path": "aggregations.per_day.buckets[*].key_as_string",
+          "values": ["2099-03-08T00:00:00.000Z", "2099-03-09T00:00:00.000Z"]
+        },
+        {
+          "kind": "json_path_number_list",
+          "path": "aggregations.per_day.buckets[*].doc_count",
+          "values": [2, 2]
+        }
+      ]
+    },
+    {
+      "id": "logs_wildcard_cardinality_returns_expected_value",
+      "description": "A cardinality aggregation over logs-* returns the expected distinct field count",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/logs-{{index}}",
+            "body": "{\"mappings\":{\"properties\":{\"@timestamp\":{\"type\":\"date\"},\"service\":{\"type\":\"keyword\"},\"index_col\":{\"type\":\"long\"}}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/logs-{{other_index}}",
+            "body": "{\"mappings\":{\"properties\":{\"@timestamp\":{\"type\":\"date\"},\"service\":{\"type\":\"keyword\"},\"index_col\":{\"type\":\"long\"}}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"logs-{{index}}\",\"_id\":\"doc-1\"}}\n{\"@timestamp\":\"2099-03-08T11:04:05.000Z\",\"index_col\":1,\"service\":\"auth\"}\n{\"create\":{\"_index\":\"logs-{{index}}\",\"_id\":\"doc-2\"}}\n{\"@timestamp\":\"2099-03-09T11:07:08.000Z\",\"index_col\":2,\"service\":\"auth\"}\n{\"create\":{\"_index\":\"logs-{{other_index}}\",\"_id\":\"doc-3\"}}\n{\"@timestamp\":\"2099-03-08T13:06:07.000Z\",\"index_col\":7,\"service\":\"api\"}\n{\"create\":{\"_index\":\"logs-{{other_index}}\",\"_id\":\"doc-4\"}}\n{\"@timestamp\":\"2099-03-09T15:08:09.000Z\",\"index_col\":8,\"service\":\"billing\"}\n",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/logs-{{index}}*/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/logs-{{index}}*/_search",
+        "body": "{\"size\":0,\"aggs\":{\"distinct_services\":{\"cardinality\":{\"field\":\"service\"}}}}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number", "path": "aggregations.distinct_services.value", "value": 3 }
+      ]
+    },
+    {
+      "id": "logs_wildcard_terms_order_and_missing_return_expected_buckets",
+      "description": "A terms aggregation over logs-* respects _key ordering and the configured missing bucket",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/logs-{{index}}",
+            "body": "{\"mappings\":{\"properties\":{\"@timestamp\":{\"type\":\"date\"},\"service\":{\"type\":\"keyword\"},\"index_col\":{\"type\":\"long\"}}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/logs-{{other_index}}",
+            "body": "{\"mappings\":{\"properties\":{\"@timestamp\":{\"type\":\"date\"},\"service\":{\"type\":\"keyword\"},\"index_col\":{\"type\":\"long\"}}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"logs-{{index}}\",\"_id\":\"doc-1\"}}\n{\"@timestamp\":\"2099-03-08T11:04:05.000Z\",\"index_col\":1,\"service\":\"auth\"}\n{\"create\":{\"_index\":\"logs-{{index}}\",\"_id\":\"doc-2\"}}\n{\"@timestamp\":\"2099-03-09T11:07:08.000Z\",\"index_col\":2}\n{\"create\":{\"_index\":\"logs-{{other_index}}\",\"_id\":\"doc-3\"}}\n{\"@timestamp\":\"2099-03-10T13:06:07.000Z\",\"index_col\":7,\"service\":\"api\"}\n{\"create\":{\"_index\":\"logs-{{other_index}}\",\"_id\":\"doc-4\"}}\n{\"@timestamp\":\"2099-03-11T15:08:09.000Z\",\"index_col\":8}\n",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/logs-{{index}}*/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/logs-{{index}}*/_search",
+        "body": "{\"size\":0,\"aggs\":{\"by_service\":{\"terms\":{\"field\":\"service\",\"size\":10,\"order\":{\"_key\":\"asc\"},\"missing\":\"unknown\"}}}}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        {
+          "kind": "json_path_string_list",
+          "path": "aggregations.by_service.buckets[*].key",
+          "values": ["api", "auth", "unknown"]
+        },
+        {
+          "kind": "json_path_number_list",
+          "path": "aggregations.by_service.buckets[*].doc_count",
+          "values": [1, 1, 2]
+        }
+      ]
+    },
+    {
+      "id": "logs_wildcard_terms_subaggregation_returns_expected_buckets",
+      "description": "A terms aggregation with a metric sub-aggregation over logs-* returns the expected buckets",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/logs-{{index}}",
+            "body": "{\"mappings\":{\"properties\":{\"@timestamp\":{\"type\":\"date\"},\"service\":{\"type\":\"keyword\"},\"index_col\":{\"type\":\"long\"}}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/logs-{{other_index}}",
+            "body": "{\"mappings\":{\"properties\":{\"@timestamp\":{\"type\":\"date\"},\"service\":{\"type\":\"keyword\"},\"index_col\":{\"type\":\"long\"}}},\"settings\":{\"index\":{\"number_of_shards\":1,\"number_of_replicas\":0}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"create\":{\"_index\":\"logs-{{index}}\",\"_id\":\"doc-1\"}}\n{\"@timestamp\":\"2099-03-08T11:04:05.000Z\",\"index_col\":1,\"service\":\"auth\"}\n{\"create\":{\"_index\":\"logs-{{index}}\",\"_id\":\"doc-2\"}}\n{\"@timestamp\":\"2099-03-09T11:07:08.000Z\",\"index_col\":2,\"service\":\"api\"}\n{\"create\":{\"_index\":\"logs-{{other_index}}\",\"_id\":\"doc-3\"}}\n{\"@timestamp\":\"2099-03-08T13:06:07.000Z\",\"index_col\":6,\"service\":\"api\"}\n{\"create\":{\"_index\":\"logs-{{other_index}}\",\"_id\":\"doc-4\"}}\n{\"@timestamp\":\"2099-03-09T15:08:09.000Z\",\"index_col\":8,\"service\":\"billing\"}\n",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/logs-{{index}}*/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "path": "/logs-{{index}}*/_search",
+        "body": "{\"size\":0,\"aggs\":{\"by_service\":{\"terms\":{\"field\":\"service\",\"size\":10},\"aggs\":{\"avg_index_col\":{\"avg\":{\"field\":\"index_col\"}}}}}}",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        {
+          "kind": "json_path_string_list",
+          "path": "aggregations.by_service.buckets[*].key",
+          "values": ["api", "auth", "billing"]
+        },
+        {
+          "kind": "json_path_number_list",
+          "path": "aggregations.by_service.buckets[*].doc_count",
+          "values": [2, 1, 1]
+        },
+        {
+          "kind": "json_path_float_list",
+          "path": "aggregations.by_service.buckets[*].avg_index_col.value",
+          "values": [4.0, 1.0, 8.0],
+          "tolerance": 0.000001
+        }
+      ]
+    },
+    {
       "id": "zero_hit_query_on_existing_index_returns_zero_total",
       "description": "A query that matches nothing on an existing index reports zero hits",
       "differential_enabled": true,
@@ -1455,23 +2100,6 @@
         { "kind": "status", "value": 501 },
         { "kind": "json_path_string", "path": "error.type", "value": "unsupported_operation_exception" },
         { "kind": "body_contains", "value": "GET pipeline simulation is not supported" }
-      ]
-    },
-    {
-      "id": "update_api_returns_clear_unsupported_message",
-      "description": "POST /:index/_update/:id fails with a clear unsupported message",
-      "differential_enabled": false,
-      "setup_steps": [],
-      "request": {
-        "method": "POST",
-        "path": "/{{index}}/_update/my_id",
-        "body": "{\"doc\":{\"message\":\"updated\"}}",
-        "mime": "application/json"
-      },
-      "assertions": [
-        { "kind": "status", "value": 501 },
-        { "kind": "json_path_string", "path": "error.type", "value": "unsupported_operation_exception" },
-        { "kind": "body_contains", "value": "document update API is not supported" }
       ]
     },
     {
@@ -2399,20 +3027,527 @@
       ]
     },
     {
-      "id": "post_doc_with_id_returns_clear_unsupported_message",
-      "description": "POST /:index/_doc/:id fails with a clear unsupported message",
-      "differential_enabled": false,
-      "setup_steps": [],
+      "id": "post_doc_auto_id_returns_created",
+      "description": "POST /:index/_doc creates a document with an auto-generated id",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        }
+      ],
       "request": {
         "method": "POST",
-        "path": "/{{index}}/_doc/my_id",
-        "body": "{\"message\":\"hello\"}",
+        "path": "/{{index}}/_doc",
+        "body": "{ \"@timestamp\": \"2099-11-15T13:12:00\", \"message\": \"auto id create\", \"user\": { \"id\": \"kimchy\" } }",
         "mime": "application/json"
       },
       "assertions": [
-        { "kind": "status", "value": 501 },
-        { "kind": "json_path_string", "path": "error.type", "value": "unsupported_operation_exception" },
-        { "kind": "body_contains", "value": "document update API is not supported" }
+        { "kind": "status", "value": 201 },
+        { "kind": "json_path_exists", "path": "_id" },
+        { "kind": "json_path_number", "path": "_version", "value": 1 }
+      ]
+    },
+    {
+      "id": "put_doc_with_id_replaces_existing_doc",
+      "description": "PUT /:index/_doc/:id replaces an existing document and increments the version",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}/_doc/my_id",
+            "body": "{ \"@timestamp\": \"2099-11-15T13:12:00\", \"message\": \"original message\", \"user\": { \"id\": \"kimchy\" } }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "PUT",
+        "path": "/{{index}}/_doc/my_id",
+        "body": "{ \"@timestamp\": \"2099-11-15T13:13:00\", \"message\": \"replacement message\", \"user\": { \"id\": \"kimchy\" } }",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_string", "path": "_id", "value": "my_id" },
+        { "kind": "json_path_number", "path": "_version", "value": 2 }
+      ]
+    },
+    {
+      "id": "bulk_index_replaces_existing_doc_after_refresh",
+      "description": "Bulk index replaces an existing document and the refreshed read returns the replacement source",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"index\":{\"_index\":\"{{index}}\",\"_id\":\"my_id\"}}\n{ \"@timestamp\": \"2099-11-15T13:12:00\", \"message\": \"bulk original message\", \"user\": { \"id\": \"kimchy\" } }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"index\":{\"_index\":\"{{index}}\",\"_id\":\"my_id\"}}\n{ \"@timestamp\": \"2099-11-15T13:13:00\", \"message\": \"bulk replacement message\", \"user\": { \"id\": \"kimchy\" } }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/{{index}}/_doc/my_id",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number", "path": "_version", "value": 2 },
+        { "kind": "json_path_string", "path": "_source.message", "value": "bulk replacement message" }
+      ]
+    },
+    {
+      "id": "update_with_id_merges_doc_after_refresh",
+      "description": "POST /:index/_update/:id merges a partial document into the existing source",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}/_doc/my_id",
+            "body": "{ \"@timestamp\": \"2099-11-15T13:12:00\", \"message\": \"original message\", \"user\": { \"id\": \"kimchy\" } }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_update/my_id",
+            "body": "{ \"doc\": { \"message\": \"patched message\", \"user\": { \"name\": \"greg\" } } }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/{{index}}/_doc/my_id",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number", "path": "_version", "value": 2 },
+        { "kind": "json_path_string", "path": "_source.message", "value": "patched message" },
+        { "kind": "json_path_string", "path": "_source.user.id", "value": "kimchy" },
+        { "kind": "json_path_string", "path": "_source.user.name", "value": "greg" }
+      ]
+    },
+    {
+      "id": "update_with_id_doc_as_upsert_creates_missing_doc",
+      "description": "POST /:index/_update/:id with doc_as_upsert creates a missing document",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_update/upsert_id",
+            "body": "{ \"doc\": { \"@timestamp\": \"2099-11-15T13:12:00\", \"message\": \"created via update\", \"user\": { \"id\": \"kimchy\" } }, \"doc_as_upsert\": true }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/{{index}}/_doc/upsert_id",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number", "path": "_version", "value": 1 },
+        { "kind": "json_path_string", "path": "_source.message", "value": "created via update" }
+      ]
+    },
+    {
+      "id": "bulk_update_merges_existing_doc_after_refresh",
+      "description": "Bulk update merges a partial document into the existing source",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}/_doc/my_id",
+            "body": "{ \"@timestamp\": \"2099-11-15T13:12:00\", \"message\": \"bulk original message\", \"user\": { \"id\": \"kimchy\" } }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"update\":{\"_index\":\"{{index}}\",\"_id\":\"my_id\"}}\n{ \"doc\": { \"message\": \"bulk patched message\", \"user\": { \"name\": \"greg\" } } }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/{{index}}/_doc/my_id",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 200 },
+        { "kind": "json_path_number", "path": "_version", "value": 2 },
+        { "kind": "json_path_string", "path": "_source.message", "value": "bulk patched message" },
+        { "kind": "json_path_string", "path": "_source.user.id", "value": "kimchy" },
+        { "kind": "json_path_string", "path": "_source.user.name", "value": "greg" }
+      ]
+    },
+    {
+      "id": "bulk_delete_existing_doc_returns_404_after_refresh",
+      "description": "Bulk delete removes an existing document so the refreshed read returns 404",
+      "differential_enabled": true,
+      "setup_steps": [
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_testing_mode",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}",
+            "body": "{\"settings\":{\"index\":{\"number_of_shards\":2,\"number_of_replicas\":1}}}",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "PUT",
+            "path": "/{{index}}/_doc/my_id",
+            "body": "{ \"@timestamp\": \"2099-11-15T13:12:00\", \"message\": \"bulk delete message\", \"user\": { \"id\": \"kimchy\" } }",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["all"],
+          "request": {
+            "method": "POST",
+            "path": "/_bulk",
+            "body": "{\"delete\":{\"_index\":\"{{index}}\",\"_id\":\"my_id\"}}\n",
+            "mime": "application/json"
+          }
+        },
+        {
+          "targets": ["local"],
+          "request": {
+            "method": "PUT",
+            "path": "/_test/v1/_process_work",
+            "body": "",
+            "mime": "text/plain"
+          }
+        },
+        {
+          "targets": ["external"],
+          "request": {
+            "method": "POST",
+            "path": "/{{index}}/_refresh",
+            "body": "",
+            "mime": "application/json"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "path": "/{{index}}/_doc/my_id",
+        "body": "",
+        "mime": "application/json"
+      },
+      "assertions": [
+        { "kind": "status", "value": 404 }
       ]
     },
     {

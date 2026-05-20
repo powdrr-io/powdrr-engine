@@ -6,6 +6,7 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::Api;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::{error::Error, fmt::Display};
@@ -62,6 +63,10 @@ pub struct PrivateSqlInvocationExternal {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PrivateSearchInvocation {
     pub sql: SqlQuery,
+    pub exact_sql: Option<SqlQuery>,
+    pub exact_constraints: Vec<PrivateExactConstraintGroup>,
+    pub range_constraints: Vec<PrivateSearchRangeConstraint>,
+    pub exact_doc_id_field_name: Option<String>,
     pub required_extensions: Vec<String>,
     pub checkpoints: Vec<CheckpointDescriptor>,
     pub table: String,
@@ -91,23 +96,66 @@ pub struct PrivateSearchSortSpec {
     pub descending: bool,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PrivateExactConstraintGroup {
+    pub field: String,
+    pub values: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PrivateSearchRangeConstraint {
+    pub field: String,
+    pub gt: Option<Value>,
+    pub gte: Option<Value>,
+    pub lt: Option<Value>,
+    pub lte: Option<Value>,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub enum PrivateSearchAggregationSpec {
     Terms {
         name: String,
         field: String,
         size: Option<u32>,
+        order: Option<PrivateSearchTermsOrderSpec>,
+        missing: Option<Value>,
         sub_aggregations: Vec<PrivateSearchAggregationSpec>,
     },
     Average {
         name: String,
         field: String,
     },
+    Cardinality {
+        name: String,
+        field: String,
+    },
+    DateHistogram {
+        name: String,
+        field: String,
+        fixed_interval: String,
+        min_doc_count: Option<u64>,
+        extended_bounds: Option<PrivateSearchDateHistogramExtendedBoundsSpec>,
+        sub_aggregations: Vec<PrivateSearchAggregationSpec>,
+    },
     Filter {
         name: String,
         filter: PrivateSearchAggregationFilterSpec,
         sub_aggregations: Vec<PrivateSearchAggregationSpec>,
     },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum PrivateSearchTermsOrderSpec {
+    CountAsc,
+    CountDesc,
+    KeyAsc,
+    KeyDesc,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PrivateSearchDateHistogramExtendedBoundsSpec {
+    pub min: Value,
+    pub max: Value,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -126,6 +174,14 @@ pub enum PrivateSearchAggregationPartial {
         sum: f64,
         count: u64,
     },
+    Cardinality {
+        name: String,
+        values: Vec<String>,
+    },
+    DateHistogram {
+        name: String,
+        buckets: Vec<PrivateSearchHistogramBucketPartial>,
+    },
     Filter {
         name: String,
         doc_count: u64,
@@ -136,6 +192,14 @@ pub enum PrivateSearchAggregationPartial {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PrivateSearchTermsBucketPartial {
     pub key: String,
+    pub doc_count: u64,
+    pub sub_aggregations: Vec<PrivateSearchAggregationPartial>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PrivateSearchHistogramBucketPartial {
+    pub key: i64,
+    pub key_as_string: String,
     pub doc_count: u64,
     pub sub_aggregations: Vec<PrivateSearchAggregationPartial>,
 }
