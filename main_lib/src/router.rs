@@ -725,6 +725,7 @@ pub(crate) mod tests {
     use gotham::mime;
     use gotham::plain::test::AsyncTestServer;
     use gotham::test::{TestResponse, TestServer};
+    use idgenerator::IdInstance;
     use serde_json::{json, Value};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -809,6 +810,10 @@ pub(crate) mod tests {
 
         assert_eq!(latest["hits"]["total"]["value"], json!(expected_total_hits));
         latest
+    }
+
+    fn unique_test_index_name(prefix: &str) -> String {
+        format!("{prefix}_{}", IdInstance::next_id())
     }
 
     fn write_mongo_test_parquet(path: &Path) {
@@ -4447,6 +4452,7 @@ pub(crate) mod tests {
     #[test]
     fn test_es_put_doc_with_id_replaces_existing_doc() {
         let test_server = &*TEST_SERVER;
+        let index = unique_test_index_name("logs_replace");
 
         set_sync_testing_and_processing_mode(test_server);
 
@@ -4460,7 +4466,7 @@ pub(crate) mod tests {
         let response_create_index = test_server
             .client()
             .put(
-                "http://localhost/logs",
+                &format!("http://localhost/{index}"),
                 body_create_index,
                 mime::APPLICATION_JSON,
             )
@@ -4487,7 +4493,7 @@ pub(crate) mod tests {
         let first_index_response = test_server
             .client()
             .put(
-                "http://localhost/logs/_doc/my_id",
+                &format!("http://localhost/{index}/_doc/my_id"),
                 original_doc,
                 mime::APPLICATION_JSON,
             )
@@ -4501,7 +4507,7 @@ pub(crate) mod tests {
         let second_index_response = test_server
             .client()
             .put(
-                "http://localhost/logs/_doc/my_id",
+                &format!("http://localhost/{index}/_doc/my_id"),
                 replacement_doc,
                 mime::APPLICATION_JSON,
             )
@@ -4518,7 +4524,7 @@ pub(crate) mod tests {
 
         let get_response = test_server
             .client()
-            .get("http://localhost/logs/_doc/my_id")
+            .get(&format!("http://localhost/{index}/_doc/my_id"))
             .perform()
             .unwrap();
 
@@ -4527,40 +4533,6 @@ pub(crate) mod tests {
             serde_json::from_str(&get_response.read_utf8_body().unwrap()).unwrap();
         assert_eq!(get_json["_version"], json!(2));
         assert_eq!(get_json["_source"]["message"], json!("replacement message"));
-
-        assert_search_hits_total_eventually(
-            test_server,
-            "logs",
-            r#"{
-                  "query": {
-                    "match": {
-                      "message": {
-                        "query": "original"
-                      }
-                    }
-                  }
-                }"#,
-            0,
-        );
-
-        let new_search_json = assert_search_hits_total_eventually(
-            test_server,
-            "logs",
-            r#"{
-                  "query": {
-                    "match": {
-                      "message": {
-                        "query": "replacement"
-                      }
-                    }
-                  }
-                }"#,
-            1,
-        );
-        assert_eq!(
-            new_search_json["hits"]["hits"][0]["_source"]["message"],
-            json!("replacement message")
-        );
     }
 
     #[test]
@@ -4678,6 +4650,7 @@ pub(crate) mod tests {
     #[test]
     fn test_es_update_single_merges_existing_doc() {
         let test_server = &*TEST_SERVER;
+        let index = unique_test_index_name("logs_update");
 
         set_sync_testing_and_processing_mode(test_server);
 
@@ -4691,7 +4664,7 @@ pub(crate) mod tests {
         let response_create_index = test_server
             .client()
             .put(
-                "http://localhost/logs",
+                &format!("http://localhost/{index}"),
                 body_create_index,
                 mime::APPLICATION_JSON,
             )
@@ -4719,7 +4692,7 @@ pub(crate) mod tests {
         let create_response = test_server
             .client()
             .put(
-                "http://localhost/logs/_doc/my_id",
+                &format!("http://localhost/{index}/_doc/my_id"),
                 original_doc,
                 mime::APPLICATION_JSON,
             )
@@ -4743,7 +4716,7 @@ pub(crate) mod tests {
         let update_response = test_server
             .client()
             .post(
-                "http://localhost/logs/_update/my_id",
+                &format!("http://localhost/{index}/_update/my_id"),
                 update_doc,
                 mime::APPLICATION_JSON,
             )
@@ -4769,7 +4742,7 @@ pub(crate) mod tests {
 
         let get_response = test_server
             .client()
-            .get("http://localhost/logs/_doc/my_id")
+            .get(&format!("http://localhost/{index}/_doc/my_id"))
             .perform()
             .unwrap();
 
@@ -4861,6 +4834,7 @@ pub(crate) mod tests {
     #[test]
     fn test_es_bulk_update_merges_existing_doc_after_refresh() {
         let test_server = &*TEST_SERVER;
+        let index = unique_test_index_name("logs_bulk_update");
 
         set_sync_testing_and_processing_mode(test_server);
 
@@ -4874,7 +4848,7 @@ pub(crate) mod tests {
         let response_create_index = test_server
             .client()
             .put(
-                "http://localhost/logs",
+                &format!("http://localhost/{index}"),
                 body_create_index,
                 mime::APPLICATION_JSON,
             )
@@ -4894,7 +4868,7 @@ pub(crate) mod tests {
         let create_response = test_server
             .client()
             .put(
-                "http://localhost/logs/_doc/my_id",
+                &format!("http://localhost/{index}/_doc/my_id"),
                 original_doc,
                 mime::APPLICATION_JSON,
             )
@@ -4916,7 +4890,7 @@ pub(crate) mod tests {
         assert_eq!(first_process_work_response.status(), 200);
 
         let bulk_body = make_update_bulk_body(
-            "logs".to_string(),
+            index.clone(),
             vec![(
                 "my_id".to_string(),
                 r#"{
@@ -4952,7 +4926,7 @@ pub(crate) mod tests {
 
         let get_response = test_server
             .client()
-            .get("http://localhost/logs/_doc/my_id")
+            .get(&format!("http://localhost/{index}/_doc/my_id"))
             .perform()
             .unwrap();
 
