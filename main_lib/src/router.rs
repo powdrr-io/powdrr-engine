@@ -765,6 +765,54 @@ pub(crate) mod tests {
         set_testing_and_processing_mode_with_indexing(test_server, IndexingMode::Sync);
     }
 
+    fn process_pending_work(test_server: &TestServer) {
+        let process_work_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_process_work",
+                "",
+                mime::TEXT_PLAIN,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(process_work_response.status(), 200);
+    }
+
+    fn search_json(test_server: &TestServer, index: &str, body: &str) -> Value {
+        let response = test_server
+            .client()
+            .post(
+                &format!("http://localhost/{index}/_search"),
+                body,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        serde_json::from_str(&response.read_utf8_body().unwrap()).unwrap()
+    }
+
+    fn assert_search_hits_total_eventually(
+        test_server: &TestServer,
+        index: &str,
+        body: &str,
+        expected_total_hits: u64,
+    ) -> Value {
+        let mut latest = Value::Null;
+
+        for _ in 0..5 {
+            latest = search_json(test_server, index, body);
+            if latest["hits"]["total"]["value"] == json!(expected_total_hits) {
+                return latest;
+            }
+            process_pending_work(test_server);
+        }
+
+        assert_eq!(latest["hits"]["total"]["value"], json!(expected_total_hits));
+        latest
+    }
+
     fn write_mongo_test_parquet(path: &Path) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("_id_seq_no", DataType::Utf8, false),
@@ -4450,17 +4498,7 @@ pub(crate) mod tests {
 
         assert_eq!(first_index_response.status(), 201);
 
-        let first_process_work_response = test_server
-            .client()
-            .put(
-                "http://localhost/_test/v1/_process_work",
-                "",
-                mime::TEXT_PLAIN,
-            )
-            .perform()
-            .unwrap();
-
-        assert_eq!(first_process_work_response.status(), 200);
+        process_pending_work(test_server);
 
         let second_index_response = test_server
             .client()
@@ -4478,17 +4516,7 @@ pub(crate) mod tests {
         assert_eq!(second_index_json["_id"], json!("my_id"));
         assert_eq!(second_index_json["_version"], json!(2));
 
-        let second_process_work_response = test_server
-            .client()
-            .put(
-                "http://localhost/_test/v1/_process_work",
-                "",
-                mime::TEXT_PLAIN,
-            )
-            .perform()
-            .unwrap();
-
-        assert_eq!(second_process_work_response.status(), 200);
+        process_pending_work(test_server);
 
         let get_response = test_server
             .client()
@@ -4502,11 +4530,10 @@ pub(crate) mod tests {
         assert_eq!(get_json["_version"], json!(2));
         assert_eq!(get_json["_source"]["message"], json!("replacement message"));
 
-        let old_search_response = test_server
-            .client()
-            .post(
-                "http://localhost/logs/_search",
-                r#"{
+        assert_search_hits_total_eventually(
+            test_server,
+            "logs",
+            r#"{
                   "query": {
                     "match": {
                       "message": {
@@ -4515,19 +4542,13 @@ pub(crate) mod tests {
                     }
                   }
                 }"#,
-                mime::APPLICATION_JSON,
-            )
-            .perform()
-            .unwrap();
-        let old_search_json: Value =
-            serde_json::from_str(&old_search_response.read_utf8_body().unwrap()).unwrap();
-        assert_eq!(old_search_json["hits"]["total"]["value"], json!(0));
+            0,
+        );
 
-        let new_search_response = test_server
-            .client()
-            .post(
-                "http://localhost/logs/_search",
-                r#"{
+        let new_search_json = assert_search_hits_total_eventually(
+            test_server,
+            "logs",
+            r#"{
                   "query": {
                     "match": {
                       "message": {
@@ -4536,13 +4557,8 @@ pub(crate) mod tests {
                     }
                   }
                 }"#,
-                mime::APPLICATION_JSON,
-            )
-            .perform()
-            .unwrap();
-        let new_search_json: Value =
-            serde_json::from_str(&new_search_response.read_utf8_body().unwrap()).unwrap();
-        assert_eq!(new_search_json["hits"]["total"]["value"], json!(1));
+            1,
+        );
         assert_eq!(
             new_search_json["hits"]["hits"][0]["_source"]["message"],
             json!("replacement message")
@@ -4600,17 +4616,7 @@ pub(crate) mod tests {
 
         assert_eq!(first_bulk_response.status(), 200);
 
-        let first_process_work_response = test_server
-            .client()
-            .put(
-                "http://localhost/_test/v1/_process_work",
-                "",
-                mime::TEXT_PLAIN,
-            )
-            .perform()
-            .unwrap();
-
-        assert_eq!(first_process_work_response.status(), 200);
+        process_pending_work(test_server);
 
         let second_bulk_body = make_index_bulk_body(
             "logs".to_string(),
@@ -4638,17 +4644,7 @@ pub(crate) mod tests {
 
         assert_eq!(second_bulk_response.status(), 200);
 
-        let second_process_work_response = test_server
-            .client()
-            .put(
-                "http://localhost/_test/v1/_process_work",
-                "",
-                mime::TEXT_PLAIN,
-            )
-            .perform()
-            .unwrap();
-
-        assert_eq!(second_process_work_response.status(), 200);
+        process_pending_work(test_server);
 
         let get_response = test_server
             .client()
@@ -4665,11 +4661,10 @@ pub(crate) mod tests {
             json!("bulk replacement message")
         );
 
-        let old_search_response = test_server
-            .client()
-            .post(
-                "http://localhost/logs/_search",
-                r#"{
+        assert_search_hits_total_eventually(
+            test_server,
+            "logs",
+            r#"{
                   "query": {
                     "match": {
                       "message": {
@@ -4678,13 +4673,8 @@ pub(crate) mod tests {
                     }
                   }
                 }"#,
-                mime::APPLICATION_JSON,
-            )
-            .perform()
-            .unwrap();
-        let old_search_json: Value =
-            serde_json::from_str(&old_search_response.read_utf8_body().unwrap()).unwrap();
-        assert_eq!(old_search_json["hits"]["total"]["value"], json!(0));
+            0,
+        );
     }
 
     #[test]
