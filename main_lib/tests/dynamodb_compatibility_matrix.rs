@@ -1267,7 +1267,7 @@ async fn compare_update_item_operation(fixture: &DifferentialFixture) {
         .update_item()
         .table_name(&fixture.write_table_name)
         .set_key(Some(primary_key_item_from_parts("acme", json!(20))))
-        .update_expression("SET event_id = :event, active = :active ADD count :delta")
+        .update_expression("SET event_id = :event, active = :active ADD #count :delta")
         .condition_expression("attribute_exists(#pk) AND #count = :count")
         .expression_attribute_names("#pk", "tenant")
         .expression_attribute_names("#count", "count")
@@ -1284,7 +1284,7 @@ async fn compare_update_item_operation(fixture: &DifferentialFixture) {
         .update_item()
         .table_name(&fixture.write_table_name)
         .set_key(Some(primary_key_item_from_parts("acme", json!(20))))
-        .update_expression("SET event_id = :event, active = :active ADD count :delta")
+        .update_expression("SET event_id = :event, active = :active ADD #count :delta")
         .condition_expression("attribute_exists(#pk) AND #count = :count")
         .expression_attribute_names("#pk", "tenant")
         .expression_attribute_names("#count", "count")
@@ -1387,8 +1387,9 @@ async fn compare_update_item_operation(fixture: &DifferentialFixture) {
         .table_name(&fixture.write_table_name)
         .set_key(Some(primary_key_item_from_parts("acme", json!(50))))
         .update_expression(
-            "SET event_id = :event, region = :region, active = :active, count = :count",
+            "SET event_id = :event, region = :region, active = :active, #count = :count",
         )
+        .expression_attribute_names("#count", "count")
         .expression_attribute_values(":event", AttributeValue::S("evt-50".to_string()))
         .expression_attribute_values(":region", AttributeValue::S("eu-west-1".to_string()))
         .expression_attribute_values(":active", AttributeValue::Bool(true))
@@ -1403,8 +1404,9 @@ async fn compare_update_item_operation(fixture: &DifferentialFixture) {
         .table_name(&fixture.write_table_name)
         .set_key(Some(primary_key_item_from_parts("acme", json!(50))))
         .update_expression(
-            "SET event_id = :event, region = :region, active = :active, count = :count",
+            "SET event_id = :event, region = :region, active = :active, #count = :count",
         )
+        .expression_attribute_names("#count", "count")
         .expression_attribute_values(":event", AttributeValue::S("evt-50".to_string()))
         .expression_attribute_values(":region", AttributeValue::S("eu-west-1".to_string()))
         .expression_attribute_values(":active", AttributeValue::Bool(true))
@@ -1453,9 +1455,10 @@ async fn compare_update_item_operation(fixture: &DifferentialFixture) {
         .update_item()
         .table_name(&fixture.write_table_name)
         .set_key(Some(primary_key_item_from_parts("acme", json!(50))))
-        .update_expression("SET count = :count")
+        .update_expression("SET #count = :count")
         .condition_expression("attribute_not_exists(#pk)")
         .expression_attribute_names("#pk", "tenant")
+        .expression_attribute_names("#count", "count")
         .expression_attribute_values(":count", AttributeValue::N("99".to_string()))
         .send()
         .await
@@ -1466,9 +1469,10 @@ async fn compare_update_item_operation(fixture: &DifferentialFixture) {
         .update_item()
         .table_name(&fixture.write_table_name)
         .set_key(Some(primary_key_item_from_parts("acme", json!(50))))
-        .update_expression("SET count = :count")
+        .update_expression("SET #count = :count")
         .condition_expression("attribute_not_exists(#pk)")
         .expression_attribute_names("#pk", "tenant")
+        .expression_attribute_names("#count", "count")
         .expression_attribute_values(":count", AttributeValue::N("99".to_string()))
         .send()
         .await
