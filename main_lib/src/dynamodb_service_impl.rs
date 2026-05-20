@@ -22,8 +22,8 @@ use crate::state_provider::ServiceApiError;
 use crate::test_api::{StateMode, TestProcessingMode};
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_dynamodb::Client;
-use modyne::model::TransactWrite;
 use modyne::TestTableExt;
+use modyne::model::TransactWrite;
 use std::collections::{HashMap, HashSet};
 
 const LEASE_LENGTH_MS: i64 = 60 * 1000; // 1 minute
@@ -114,6 +114,13 @@ impl DynamoDBServiceImpl {
         }
     }
 
+    fn latest_active_checkpoint_key(table_name: &String, extension: &Option<String>) -> String {
+        match extension {
+            Some(x) => format!("published_checkpoint#active#{}#{}", table_name, x),
+            None => format!("published_checkpoint#active#{}", table_name),
+        }
+    }
+
     fn latest_extension_work_item_key(table_name: &String, extension: &String) -> String {
         format!("extension_work_item#{}#{}", table_name, extension)
     }
@@ -167,6 +174,107 @@ impl DynamoDBServiceImpl {
         Ok(requests)
     }
 
+    async fn get_checkpoint_id_from_latest_key(
+        &mut self,
+        org_id: &String,
+        key: &String,
+    ) -> Result<Option<String>, ServiceApiError> {
+        Ok(self
+            .connector
+            .describe_latest(org_id, key)
+            .await
+            .map_err(from_modyne)?
+            .map(|val| CheckpointDescriptor::from_full_name(&val.entity_id).full_checkpoint_id()))
+    }
+
+    async fn checkpoint_publication_request_exists(
+        &mut self,
+        org_id: &String,
+        table_name: &String,
+    ) -> Result<bool, ServiceApiError> {
+        Ok(self
+            .connector
+            .describe_latest(
+                &MANAGEMENT_ORG_ID.to_string(),
+                &Self::checkpoint_publication_request_key(org_id, table_name),
+            )
+            .await
+            .map_err(from_modyne)?
+            .map(|entity| entity.entity_id != Self::NO_WORK_ITEM)
+            .unwrap_or(false))
+    }
+
+    async fn get_active_checkpoint_id(
+        &mut self,
+        org_id: &String,
+        table_name: &String,
+        extension: &Option<String>,
+    ) -> Result<Option<String>, ServiceApiError> {
+        let active_key = Self::latest_active_checkpoint_key(table_name, extension);
+        match self
+            .get_checkpoint_id_from_latest_key(org_id, &active_key)
+            .await?
+        {
+            Some(checkpoint_id) => Ok(Some(checkpoint_id)),
+            None => {
+                if self
+                    .checkpoint_publication_request_exists(org_id, table_name)
+                    .await?
+                {
+                    Ok(None)
+                } else {
+                    self.get_checkpoint_id_from_latest_key(
+                        org_id,
+                        &Self::latest_checkpoint_key(table_name, extension),
+                    )
+                    .await
+                }
+            }
+        }
+    }
+
+    async fn set_active_checkpoint_id(
+        &mut self,
+        org_id: &String,
+        table_name: &String,
+        extension: &Option<String>,
+        checkpoint_id: &String,
+    ) -> Result<bool, ServiceApiError> {
+        let checkpoint_full_name =
+            CheckpointDescriptor::new(table_name.clone(), checkpoint_id.clone()).full_name();
+        let key = Self::latest_active_checkpoint_key(table_name, extension);
+        match self
+            .connector
+            .describe_latest(org_id, &key)
+            .await
+            .map_err(from_modyne)?
+        {
+            Some(existing) => {
+                if existing.entity_id == checkpoint_full_name {
+                    return Ok(false);
+                }
+                let transaction = DynamoDbConnector::bump_version(
+                    TransactWrite::new(),
+                    &existing,
+                    &checkpoint_full_name,
+                );
+                self.connector
+                    .commit_conditional_transaction(transaction)
+                    .await
+                    .map_err(from_modyne)
+            }
+            None => self
+                .connector
+                .create_latest(
+                    org_id,
+                    &key,
+                    &EntityVersionInfo::new(org_id, &key, &checkpoint_full_name),
+                )
+                .await
+                .map_err(from_modyne),
+        }
+    }
+
     async fn checkpoint_publication_still_pending(
         &mut self,
         org_id: &String,
@@ -182,12 +290,32 @@ impl DynamoDBServiceImpl {
             return Ok(true);
         }
 
-        Ok(!self
+        if !self
             .connector
             .oldest_available_checkpoint_waiting_for_extension(org_id, table_name, Some(1), None)
             .await
             .map_err(from_modyne)?
-            .is_empty())
+            .is_empty()
+        {
+            return Ok(true);
+        }
+
+        for extension in [None, Some("es".to_string())] {
+            let committed = self
+                .get_checkpoint_id_from_latest_key(
+                    org_id,
+                    &Self::latest_checkpoint_key(table_name, &extension),
+                )
+                .await?;
+            let active = self
+                .get_active_checkpoint_id(org_id, table_name, &extension)
+                .await?;
+            if committed != active {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     pub async fn add_checkpoint(
@@ -628,23 +756,30 @@ impl DynamoDBServiceImpl {
         table_name: &String,
         extensions: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
-        let value = self
-            .connector
-            .describe_latest(
+        let checkpoint_id = self
+            .get_checkpoint_id_from_latest_key(
                 &org_info.org_id,
                 &Self::latest_checkpoint_key(table_name, &extensions),
             )
-            .await
-            .map_err(from_modyne)?;
-        match value {
-            Some(val) => {
-                tracing::info!("Latest checkpoint for {}: {}", table_name, val.entity_id);
-                Ok(Some(
-                    CheckpointDescriptor::from_full_name(&val.entity_id).full_checkpoint_id(),
-                ))
-            }
-            None => Ok(None),
+            .await?;
+        if let Some(checkpoint_id) = checkpoint_id.as_ref() {
+            tracing::info!(
+                "Latest committed checkpoint for {}: {}",
+                table_name,
+                checkpoint_id
+            );
         }
+        Ok(checkpoint_id)
+    }
+
+    pub async fn get_published_active_checkpoint(
+        &mut self,
+        org_info: &OrgInfo,
+        table_name: &String,
+        extensions: Option<String>,
+    ) -> Result<Option<String>, ServiceApiError> {
+        self.get_active_checkpoint_id(&org_info.org_id, table_name, &extensions)
+            .await
     }
 
     pub async fn get_checkpoint(
@@ -899,10 +1034,44 @@ impl DynamoDBServiceImpl {
                 | self
                     .update_standard_checkpoint(&org_id, &table_name)
                     .await?;
+            if let Some(committed_checkpoint_id) = self
+                .get_checkpoint_id_from_latest_key(
+                    &org_id,
+                    &Self::latest_checkpoint_key(&table_name, &None),
+                )
+                .await?
+            {
+                work_done = work_done
+                    | self
+                        .set_active_checkpoint_id(
+                            &org_id,
+                            &table_name,
+                            &None,
+                            &committed_checkpoint_id,
+                        )
+                        .await?;
+            }
             work_done = work_done
                 | self
                     .update_extension_checkpoint(&org_id, &table_name)
                     .await?;
+            if let Some(committed_extension_checkpoint_id) = self
+                .get_checkpoint_id_from_latest_key(
+                    &org_id,
+                    &Self::latest_checkpoint_key(&table_name, &Some("es".to_string())),
+                )
+                .await?
+            {
+                work_done = work_done
+                    | self
+                        .set_active_checkpoint_id(
+                            &org_id,
+                            &table_name,
+                            &Some("es".to_string()),
+                            &committed_extension_checkpoint_id,
+                        )
+                        .await?;
+            }
 
             if !self
                 .checkpoint_publication_still_pending(&org_id, &table_name)
@@ -1272,9 +1441,6 @@ impl MetadataStore for DynamoDBServiceImpl {
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
-        // TODO: persist a distinct committed frontier for the DynamoDB metadata backend.
-        // Today this still resolves through the latest checkpoint pointer, which remains
-        // coupled to the published active frontier until that backend is tightened.
         DynamoDBServiceImpl::get_latest_committed_checkpoint(self, org_info, table_name, extension)
             .await
     }
@@ -1286,6 +1452,14 @@ impl MetadataStore for DynamoDBServiceImpl {
     ) -> Result<Option<PublishedCheckpointRecord>, ServiceApiError> {
         let checkpoint_id = match selector.role {
             PublishedCheckpointRole::Active => {
+                self.get_active_checkpoint_id(
+                    &org_info.org_id,
+                    &selector.table_name,
+                    &selector.extension,
+                )
+                .await?
+            }
+            PublishedCheckpointRole::Target => {
                 DynamoDBServiceImpl::get_latest_committed_checkpoint(
                     self,
                     org_info,
@@ -1294,7 +1468,6 @@ impl MetadataStore for DynamoDBServiceImpl {
                 )
                 .await?
             }
-            PublishedCheckpointRole::Target => None,
         };
 
         Ok(
@@ -1370,6 +1543,7 @@ impl MetadataStore for DynamoDBServiceImpl {
 mod tests {
     use super::*;
     use crate::data_contract::{ExtensionFile, FileSetPayload, IcebergMetadata, LicenseType};
+    use crate::metadata_store::{MetadataStore, PublishedCheckpointSelector};
     use crate::schema_massager::PowdrrSchema;
     use std::collections::HashMap;
 
@@ -1393,6 +1567,87 @@ mod tests {
             access_artifacts: vec![],
             file_stats: vec![],
         }
+    }
+
+    #[tokio::test]
+    async fn metadata_store_committed_and_published_frontiers_diverge_until_advanced() {
+        let mut service_impl = DynamoDBServiceImpl::test(TestProcessingMode::default()).await;
+        let org_info = fake_org_info();
+        let table_name = "dynamodb_frontier_table".to_string();
+        let file_path = "s3://warehouse/table/data-0001.parquet".to_string();
+
+        service_impl
+            .create_table(
+                &org_info,
+                &CreateTable {
+                    name: table_name.clone(),
+                    tags: HashMap::new(),
+                    serving: None,
+                    dynamodb: None,
+                    mongodb: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        service_impl
+            .iceberg_commit(
+                &org_info,
+                &table_name,
+                &IcebergCommit {
+                    metadata: iceberg_metadata(&file_path, "1"),
+                    deletes_table_info: None,
+                    compactions: vec![],
+                },
+            )
+            .await
+            .unwrap();
+
+        let committed_checkpoint = MetadataStore::get_latest_committed_checkpoint(
+            &mut service_impl,
+            &org_info,
+            &table_name,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            MetadataStore::get_published_checkpoint_record(
+                &mut service_impl,
+                &org_info,
+                &PublishedCheckpointSelector::active(table_name.clone(), None),
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        let target_record = MetadataStore::get_published_checkpoint_record(
+            &mut service_impl,
+            &org_info,
+            &PublishedCheckpointSelector::target(table_name.clone(), None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(target_record.checkpoint_id, committed_checkpoint);
+
+        assert!(
+            MetadataStore::advance_published_checkpoints(&mut service_impl)
+                .await
+                .unwrap()
+        );
+
+        let published_record = MetadataStore::get_published_checkpoint_record(
+            &mut service_impl,
+            &org_info,
+            &PublishedCheckpointSelector::active(table_name.clone(), None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(published_record.checkpoint_id, committed_checkpoint);
     }
 
     #[tokio::test]
