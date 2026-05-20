@@ -746,7 +746,7 @@ pub(crate) async fn data_query_batches(
         .sum::<u64>();
     log_required_files("Query", &required_files, parquet_size, speedboat_size);
 
-    data_query_batches_worker(&invocation.sql, &required_files, true).await
+    data_query_batches_worker(&invocation.sql, &required_files, true, None).await
 }
 
 pub(crate) async fn search_query(
@@ -1230,7 +1230,7 @@ pub(crate) async fn compaction_query_batches(
     num: u64,
 ) -> Result<Vec<RecordBatch>, PrivateApiError> {
     let required_files = generate_required_files(invocation, index, num);
-    data_query_batches_worker(&invocation.sql, &required_files, true).await
+    data_query_batches_worker(&invocation.sql, &required_files, true, None).await
 }
 
 pub(crate) async fn extension_query(
@@ -1290,7 +1290,7 @@ pub(crate) async fn prefetch_query(
                 message: error.message,
             })?;
     } else {
-        data_query_batches_worker(&SqlQuery::dummy(), &required_files, false).await?;
+        data_query_batches_worker(&SqlQuery::dummy(), &required_files, false, None).await?;
     }
     data_access::flush_serving_bulk_cache()
         .await
