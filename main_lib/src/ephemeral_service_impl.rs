@@ -1217,7 +1217,15 @@ impl MetadataStore for EphemeralServiceImpl {
                 )
                 .await?
             }
-            PublishedCheckpointRole::Target => None,
+            PublishedCheckpointRole::Target => {
+                EphemeralServiceImpl::get_latest_committed_checkpoint(
+                    self,
+                    org_info,
+                    &selector.table_name,
+                    selector.extension.clone(),
+                )
+                .await?
+            }
         };
 
         Ok(
@@ -1373,16 +1381,15 @@ mod tests {
             .unwrap(),
             None
         );
-        assert_eq!(
-            MetadataStore::get_published_checkpoint_record(
-                &mut service_impl,
-                &org_info,
-                &PublishedCheckpointSelector::target(table_name.clone(), None),
-            )
-            .await
-            .unwrap(),
-            None
-        );
+        let target_record = MetadataStore::get_published_checkpoint_record(
+            &mut service_impl,
+            &org_info,
+            &PublishedCheckpointSelector::target(table_name.clone(), None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(target_record.checkpoint_id, committed_checkpoint);
 
         assert!(
             MetadataStore::advance_published_checkpoints(&mut service_impl)

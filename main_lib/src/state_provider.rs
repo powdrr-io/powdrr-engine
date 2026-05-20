@@ -5,14 +5,12 @@ use crate::data_contract::{
 };
 use crate::distributed_cache::set_redis_address;
 use crate::dynamodb_state_provider::DynamoDbStateProvider;
-use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::ephemeral_state_provider::EphemeralStateProvider;
 use crate::leaderless_state_provider::LeaderlessStateProvider;
 use crate::peers::{PeerClient, PeerProvider};
 use crate::test_api::{
-    CacheMode, CompactionMode, IndexingMode, PeerModeType, StateMode, StorageMode,
-    TestProcessingMode,
+    CacheMode, CompactionMode, PeerModeType, StateMode, StorageMode, TestProcessingMode,
 };
 use crate::{
     data_access, distributed_cache, peers::CheckpointDescriptor, pipeline::PipelineDefinition,
@@ -180,7 +178,6 @@ struct StateProviderActor {
     state_provider: StateProvider,
     peer_provider: PeerProvider,
     receiver: mpsc::Receiver<StateProviderActorMessage>,
-    indexing_mode: IndexingMode,
     #[allow(dead_code)]
     compaction_mode: CompactionMode,
 }
@@ -199,58 +196,7 @@ impl StateProviderActor {
             )),
             peer_provider: PeerProvider::new(PeerModeType::SelfOnly),
             receiver,
-            indexing_mode: IndexingMode::Disabled,
             compaction_mode: CompactionMode::Disabled,
-        }
-    }
-
-    async fn create_index(&mut self, table_name: &String) -> () {
-        match self.indexing_mode {
-            IndexingMode::Sync => {
-                let work_items = match self
-                    .state_provider
-                    .get_extension_work_items(&"es".to_owned())
-                    .await
-                {
-                    Ok(work_items) => work_items,
-                    Err(e) => {
-                        tracing::error!("Failed to get extension work items: {}", e);
-                        return;
-                    }
-                };
-                for work_item in work_items.iter() {
-                    let metadata = match create_index_inner(
-                        &work_item.iceberg_files.as_file_tuples(),
-                        &work_item.speedboat_files.as_file_tuples(),
-                    )
-                    .await
-                    {
-                        Ok(metadata) => metadata,
-                        Err(e) => {
-                            tracing::error!("Failed to create index: {}", e);
-                            continue;
-                        }
-                    };
-                    match self
-                        .state_provider
-                        .extension_commit(
-                            &table_name,
-                            &ExtensionCommit {
-                                id: work_item.id.clone(),
-                                extension: "es".to_owned(),
-                                files: metadata,
-                            },
-                        )
-                        .await
-                    {
-                        Ok(_) => (),
-                        Err(e) => {
-                            tracing::error!("Failed to commit extension: {}", e);
-                        }
-                    }
-                }
-            }
-            _ => (),
         }
     }
 
@@ -405,7 +351,6 @@ impl StateProviderActor {
                     respond_to,
                     iceberg_commit(&table_name, &iceberg_commit)
                 );
-                self.create_index(&table_name).await;
             }
             StateProviderActorMessage::SpeedboatCommit {
                 respond_to,
@@ -1487,7 +1432,7 @@ mod tests {
                 .get_published_target_servable_checkpoint(&table_name)
                 .await
                 .unwrap(),
-            Some(target_checkpoint)
+            Some(second_checkpoint.clone())
         );
         assert_eq!(
             STATE_PROVIDER
