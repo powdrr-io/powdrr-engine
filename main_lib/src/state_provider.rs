@@ -133,6 +133,11 @@ enum StateProviderActorMessage {
         table_name: String,
         extensions: Option<String>,
     },
+    GetPublishedActiveCheckpoint {
+        respond_to: oneshot::Sender<Result<Option<String>, ServiceApiError>>,
+        table_name: String,
+        extensions: Option<String>,
+    },
     GetLatestTargetCheckpoint {
         respond_to: oneshot::Sender<Result<Option<String>, ServiceApiError>>,
         table_name: String,
@@ -447,6 +452,17 @@ impl StateProviderActor {
                     get_latest_committed_checkpoint(&table_name, extensions)
                 );
             }
+            StateProviderActorMessage::GetPublishedActiveCheckpoint {
+                table_name,
+                extensions,
+                respond_to,
+            } => {
+                handle_message_impl!(
+                    self,
+                    respond_to,
+                    get_published_active_checkpoint(&table_name, extensions)
+                );
+            }
             StateProviderActorMessage::GetLatestTargetCheckpoint {
                 table_name,
                 extensions,
@@ -693,6 +709,17 @@ impl StateProvider {
         state_provider_func_impl!(
             self,
             get_latest_committed_checkpoint(table_name, extensions)
+        )
+    }
+
+    pub async fn get_published_active_checkpoint(
+        &mut self,
+        table_name: &String,
+        extensions: Option<String>,
+    ) -> Result<Option<String>, ServiceApiError> {
+        state_provider_func_impl!(
+            self,
+            get_published_active_checkpoint(table_name, extensions)
         )
     }
 
@@ -979,7 +1006,7 @@ impl StateProviderHandle {
         send_message!(self, CleanupCommit, cleanup_commit = cleanup_commit.clone())
     }
 
-    pub async fn get_published_active_checkpoint(
+    pub async fn get_latest_committed_checkpoint(
         &self,
         table_name: &String,
         extension: Option<String>,
@@ -987,6 +1014,19 @@ impl StateProviderHandle {
         send_message!(
             self,
             GetLatestCommittedCheckpoint,
+            table_name = table_name.clone(),
+            extensions = extension.clone()
+        )
+    }
+
+    pub async fn get_published_active_checkpoint(
+        &self,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> Result<Option<String>, ServiceApiError> {
+        send_message!(
+            self,
+            GetPublishedActiveCheckpoint,
             table_name = table_name.clone(),
             extensions = extension.clone()
         )
@@ -1248,16 +1288,30 @@ mod tests {
             .unwrap();
 
         let first_checkpoint = STATE_PROVIDER
-            .get_published_active_checkpoint(&table_name, None)
+            .get_latest_committed_checkpoint(&table_name, None)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(
             STATE_PROVIDER
-                .get_published_active_checkpoint(&table_name, Some("es".to_string()))
+                .get_latest_committed_checkpoint(&table_name, Some("es".to_string()))
                 .await
                 .unwrap(),
             None
+        );
+        assert_eq!(
+            STATE_PROVIDER
+                .get_published_active_servable_checkpoint(&table_name)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            STATE_PROVIDER
+                .advance_published_checkpoints()
+                .await
+                .unwrap(),
+            true
         );
         assert_eq!(
             STATE_PROVIDER
@@ -1277,14 +1331,35 @@ mod tests {
 
         assert_eq!(
             STATE_PROVIDER
-                .get_published_active_checkpoint(&table_name, Some("es".to_string()))
+                .get_latest_committed_checkpoint(&table_name, Some("es".to_string()))
                 .await
                 .unwrap(),
             Some(first_checkpoint.clone())
         );
         assert_eq!(
             STATE_PROVIDER
+                .get_published_active_checkpoint(&table_name, Some("es".to_string()))
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            STATE_PROVIDER
                 .get_published_active_servable_checkpoint(&table_name)
+                .await
+                .unwrap(),
+            Some(first_checkpoint.clone())
+        );
+        assert_eq!(
+            STATE_PROVIDER
+                .advance_published_checkpoints()
+                .await
+                .unwrap(),
+            true
+        );
+        assert_eq!(
+            STATE_PROVIDER
+                .get_published_active_checkpoint(&table_name, Some("es".to_string()))
                 .await
                 .unwrap(),
             Some(first_checkpoint.clone())
@@ -1296,17 +1371,45 @@ mod tests {
             .unwrap();
 
         let second_checkpoint = STATE_PROVIDER
-            .get_published_active_checkpoint(&table_name, None)
+            .get_latest_committed_checkpoint(&table_name, None)
             .await
             .unwrap()
             .unwrap();
         assert_ne!(second_checkpoint, first_checkpoint);
         assert_eq!(
             STATE_PROVIDER
-                .get_published_active_checkpoint(&table_name, Some("es".to_string()))
+                .get_latest_committed_checkpoint(&table_name, Some("es".to_string()))
                 .await
                 .unwrap(),
             Some(first_checkpoint.clone())
+        );
+        assert_eq!(
+            STATE_PROVIDER
+                .get_published_active_checkpoint(&table_name, None)
+                .await
+                .unwrap(),
+            Some(first_checkpoint.clone())
+        );
+        assert_eq!(
+            STATE_PROVIDER
+                .get_published_active_servable_checkpoint(&table_name)
+                .await
+                .unwrap(),
+            Some(first_checkpoint.clone())
+        );
+        assert_eq!(
+            STATE_PROVIDER
+                .advance_published_checkpoints()
+                .await
+                .unwrap(),
+            true
+        );
+        assert_eq!(
+            STATE_PROVIDER
+                .get_published_active_checkpoint(&table_name, None)
+                .await
+                .unwrap(),
+            Some(second_checkpoint.clone())
         );
         assert_eq!(
             STATE_PROVIDER
@@ -1326,10 +1429,31 @@ mod tests {
 
         assert_eq!(
             STATE_PROVIDER
-                .get_published_active_checkpoint(&table_name, Some("es".to_string()))
+                .get_latest_committed_checkpoint(&table_name, Some("es".to_string()))
                 .await
                 .unwrap(),
             Some(second_checkpoint.clone())
+        );
+        assert_eq!(
+            STATE_PROVIDER
+                .get_published_active_checkpoint(&table_name, Some("es".to_string()))
+                .await
+                .unwrap(),
+            Some(first_checkpoint.clone())
+        );
+        assert_eq!(
+            STATE_PROVIDER
+                .get_published_target_servable_checkpoint(&table_name)
+                .await
+                .unwrap(),
+            Some(first_checkpoint.clone())
+        );
+        assert_eq!(
+            STATE_PROVIDER
+                .advance_published_checkpoints()
+                .await
+                .unwrap(),
+            true
         );
         assert_eq!(
             STATE_PROVIDER

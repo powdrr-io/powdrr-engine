@@ -314,6 +314,16 @@ impl DynamoDbStateProvider {
             .await
     }
 
+    pub async fn get_published_active_checkpoint(
+        &mut self,
+        table_name: &String,
+        extensions: Option<String>,
+    ) -> Result<Option<String>, ServiceApiError> {
+        self.service_impl
+            .get_latest_committed_checkpoint(&self.fake_org_info, table_name, extensions)
+            .await
+    }
+
     pub async fn get_checkpoint(
         &mut self,
         snapshot: &CheckpointDescriptor,

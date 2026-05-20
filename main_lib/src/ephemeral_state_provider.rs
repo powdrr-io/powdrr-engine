@@ -286,6 +286,16 @@ impl EphemeralStateProvider {
             .await
     }
 
+    pub async fn get_published_active_checkpoint(
+        &mut self,
+        table_name: &String,
+        extensions: Option<String>,
+    ) -> Result<Option<String>, ServiceApiError> {
+        self.service_impl
+            .get_published_active_checkpoint(&self.fake_org_info, table_name, extensions)
+            .await
+    }
+
     pub async fn get_checkpoint(
         &mut self,
         snapshot: &CheckpointDescriptor,
@@ -296,8 +306,7 @@ impl EphemeralStateProvider {
     }
 
     pub(crate) async fn update_all_checkpoints(&mut self) -> Result<bool, ServiceApiError> {
-        // Do nothing. This happens on commit.
-        Ok(false)
+        self.service_impl.update_all_checkpoints().await
     }
 
     pub async fn get_extension_work_items(

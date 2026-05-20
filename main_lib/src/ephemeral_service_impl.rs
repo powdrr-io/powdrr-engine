@@ -33,6 +33,8 @@ pub struct EphemeralServiceImpl {
     pipelines: HashMap<String, PipelineDefinition>,
     lifetime_policies: HashMap<String, ILMPolicyDefinition>,
     latest_committed_checkpoint_id: HashMap<Option<String>, CommittedCheckpoints>,
+    published_checkpoint_id: HashMap<Option<String>, CommittedCheckpoints>,
+    checkpoint_publication_requests: HashMap<String, CheckpointUpdateRequest>,
     compaction_work_items: HashMap<String, CompactionWorkItemTracker>,
     not_compacted_checkpoint_ids: HashMap<String, Vec<String>>,
     extension_work_items: HashMap<String, HashMap<String, ExtensionWorkItem>>,
@@ -54,6 +56,8 @@ impl EphemeralServiceImpl {
             pipelines: HashMap::new(),
             lifetime_policies: HashMap::new(),
             latest_committed_checkpoint_id: HashMap::new(),
+            published_checkpoint_id: HashMap::new(),
+            checkpoint_publication_requests: HashMap::new(),
             compaction_work_items: HashMap::new(),
             not_compacted_checkpoint_ids: HashMap::new(),
             compactions: HashMap::new(),
@@ -73,6 +77,13 @@ impl EphemeralServiceImpl {
         self.checkpoints_needing_extension_work
             .get(&format!("{}_{}", table_name, extension_name))
             .cloned()
+    }
+
+    fn canonical_table_name(&self, table_name: &String) -> String {
+        self.table_aliases
+            .get(table_name)
+            .unwrap_or(table_name)
+            .clone()
     }
 
     fn recent_file_extension_metadata(
@@ -171,6 +182,67 @@ impl EphemeralServiceImpl {
             .insert(table_name.clone(), checkpoint_id.clone());
     }
 
+    fn get_frontier_checkpoint_sync(
+        frontier: &HashMap<Option<String>, CommittedCheckpoints>,
+        table_name: &String,
+        extensions: Option<String>,
+    ) -> Option<String> {
+        frontier
+            .get(&extensions)
+            .and_then(|c| c.get(table_name).cloned())
+    }
+
+    fn set_frontier_checkpoint(
+        frontier: &mut HashMap<Option<String>, CommittedCheckpoints>,
+        table_name: &String,
+        extensions: Option<String>,
+        checkpoint_id: &String,
+    ) {
+        if !frontier.contains_key(&extensions) {
+            frontier.insert(extensions.clone(), HashMap::new());
+        }
+        frontier
+            .get_mut(&extensions)
+            .unwrap()
+            .insert(table_name.clone(), checkpoint_id.clone());
+    }
+
+    fn get_published_checkpoint_sync(
+        &self,
+        table_name: &String,
+        extensions: Option<String>,
+    ) -> Option<String> {
+        let real_table_name = self.canonical_table_name(table_name);
+        Self::get_frontier_checkpoint_sync(
+            &self.published_checkpoint_id,
+            &real_table_name,
+            extensions,
+        )
+    }
+
+    fn set_published_checkpoint(
+        &mut self,
+        table_name: &String,
+        extensions: Option<String>,
+        checkpoint_id: &String,
+    ) {
+        let real_table_name = self.canonical_table_name(table_name);
+        Self::set_frontier_checkpoint(
+            &mut self.published_checkpoint_id,
+            &real_table_name,
+            extensions,
+            checkpoint_id,
+        );
+    }
+
+    fn enqueue_checkpoint_publication(&mut self, table_name: &String) {
+        let real_table_name = self.canonical_table_name(table_name);
+        self.checkpoint_publication_requests.insert(
+            real_table_name.clone(),
+            CheckpointUpdateRequest::new("fake_org_id".to_string(), real_table_name),
+        );
+    }
+
     pub async fn add_checkpoint(
         &mut self,
         _org_info: &OrgInfo,
@@ -198,11 +270,17 @@ impl EphemeralServiceImpl {
             &metadata.table_name,
             &metadata.checkpoint_id,
         );
+        self.set_published_checkpoint(&metadata.table_name, None, &metadata.checkpoint_id);
         if metadata.extension_metadata.len() > 0 {
             for extension in metadata.extension_metadata.keys() {
                 self.set_latest_committed_checkpoint_id(
                     Some(extension.clone()),
                     &metadata.table_name,
+                    &metadata.checkpoint_id,
+                );
+                self.set_published_checkpoint(
+                    &metadata.table_name,
+                    Some(extension.clone()),
                     &metadata.checkpoint_id,
                 );
             }
@@ -321,14 +399,16 @@ impl EphemeralServiceImpl {
     }
 
     fn get_latest_committed_checkpoint_sync(
-        &mut self,
+        &self,
         table_name: &String,
         extensions: Option<String>,
     ) -> Option<String> {
-        let real_table_name = self.table_aliases.get(table_name).unwrap_or(table_name);
-        self.latest_committed_checkpoint_id
-            .get(&extensions)
-            .map_or(None, |c| c.get(real_table_name).cloned())
+        let real_table_name = self.canonical_table_name(table_name);
+        Self::get_frontier_checkpoint_sync(
+            &self.latest_committed_checkpoint_id,
+            &real_table_name,
+            extensions,
+        )
     }
 
     fn set_latest_committed_checkpoint(
@@ -337,18 +417,13 @@ impl EphemeralServiceImpl {
         extensions: Option<String>,
         checkpoint_id: &String,
     ) {
-        let real_table_name = self.table_aliases.get(table_name).unwrap_or(table_name);
-        if !self
-            .latest_committed_checkpoint_id
-            .contains_key(&extensions)
-        {
-            self.latest_committed_checkpoint_id
-                .insert(extensions.clone(), HashMap::new());
-        }
-        self.latest_committed_checkpoint_id
-            .get_mut(&extensions)
-            .unwrap()
-            .insert(real_table_name.clone(), checkpoint_id.clone());
+        let real_table_name = self.canonical_table_name(table_name);
+        Self::set_frontier_checkpoint(
+            &mut self.latest_committed_checkpoint_id,
+            &real_table_name,
+            extensions,
+            checkpoint_id,
+        );
     }
 
     async fn speedboat_commit_type_commit(
@@ -775,7 +850,7 @@ impl EphemeralServiceImpl {
 
     pub async fn speedboat_commit(
         &mut self,
-        _org_info: &OrgInfo,
+        org_info: &OrgInfo,
         commit: &SpeedboatCommit,
     ) -> Result<bool, ServiceApiError> {
         assert!(
@@ -793,12 +868,22 @@ impl EphemeralServiceImpl {
                 panic!("Unknown Speedboat commit type")
             }
         }
+        if let Some(table_info) = commit.type_files.first() {
+            MetadataStore::queue_checkpoint_publication(
+                self,
+                &CheckpointUpdateRequest::new(
+                    org_info.org_id.clone(),
+                    table_info.table_name.clone(),
+                ),
+            )
+            .await?;
+        }
         Ok(true)
     }
 
     pub async fn iceberg_commit(
         &mut self,
-        _org_info: &OrgInfo,
+        org_info: &OrgInfo,
         table_name: &String,
         iceberg_commit: &IcebergCommit,
     ) -> Result<bool, ServiceApiError> {
@@ -865,12 +950,18 @@ impl EphemeralServiceImpl {
             self.cleanup_work_items.push(cleanup_work_item);
         }
 
+        MetadataStore::queue_checkpoint_publication(
+            self,
+            &CheckpointUpdateRequest::new(org_info.org_id.clone(), table_name.clone()),
+        )
+        .await?;
+
         Ok(true)
     }
 
     pub async fn extension_commit(
         &mut self,
-        _org_info: &OrgInfo,
+        org_info: &OrgInfo,
         table_name: &String,
         commit: &ExtensionCommit,
     ) -> Result<bool, ServiceApiError> {
@@ -904,6 +995,11 @@ impl EphemeralServiceImpl {
                 self.set_latest_committed_checkpoint(table_name, Some("es".to_string()), max_id);
             }
         };
+        MetadataStore::queue_checkpoint_publication(
+            self,
+            &CheckpointUpdateRequest::new(org_info.org_id.clone(), table_name.clone()),
+        )
+        .await?;
         Ok(true)
     }
 
@@ -937,6 +1033,15 @@ impl EphemeralServiceImpl {
         extensions: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
         Ok(self.get_latest_committed_checkpoint_sync(table_name, extensions))
+    }
+
+    pub async fn get_published_active_checkpoint(
+        &mut self,
+        _org_info: &OrgInfo,
+        table_name: &String,
+        extensions: Option<String>,
+    ) -> Result<Option<String>, ServiceApiError> {
+        Ok(self.get_published_checkpoint_sync(table_name, extensions))
     }
 
     pub async fn get_checkpoint(
@@ -1001,7 +1106,38 @@ impl EphemeralServiceImpl {
     }
 
     pub async fn update_all_checkpoints(&mut self) -> Result<bool, ServiceApiError> {
-        Ok(false)
+        let table_names: Vec<String> = self
+            .checkpoint_publication_requests
+            .keys()
+            .cloned()
+            .collect();
+        let mut changed = false;
+        for table_name in &table_names {
+            let available_extensions: Vec<Option<String>> = self
+                .latest_committed_checkpoint_id
+                .iter()
+                .filter_map(|(extension, checkpoints)| {
+                    if checkpoints.contains_key(table_name) {
+                        Some(extension.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for extension in available_extensions {
+                let committed =
+                    self.get_latest_committed_checkpoint_sync(table_name, extension.clone());
+                let published = self.get_published_checkpoint_sync(table_name, extension.clone());
+                if let Some(committed_checkpoint) = committed {
+                    if published.as_ref() != Some(&committed_checkpoint) {
+                        self.set_published_checkpoint(table_name, extension, &committed_checkpoint);
+                        changed = true;
+                    }
+                }
+            }
+            self.checkpoint_publication_requests.remove(table_name);
+        }
+        Ok(changed)
     }
 
     pub async fn create_org(&mut self, _settings: &OrgSettings) -> Result<(), ServiceApiError> {
@@ -1050,8 +1186,9 @@ impl EphemeralServiceImpl {
 impl MetadataStore for EphemeralServiceImpl {
     async fn queue_checkpoint_publication(
         &mut self,
-        _request: &CheckpointUpdateRequest,
+        request: &CheckpointUpdateRequest,
     ) -> Result<(), ServiceApiError> {
+        self.enqueue_checkpoint_publication(&request.table_name);
         Ok(())
     }
 
@@ -1060,7 +1197,7 @@ impl MetadataStore for EphemeralServiceImpl {
         org_info: &OrgInfo,
         selector: &PublishedCheckpointSelector,
     ) -> Result<Option<PublishedCheckpointRecord>, ServiceApiError> {
-        Ok(EphemeralServiceImpl::get_latest_committed_checkpoint(
+        Ok(EphemeralServiceImpl::get_published_active_checkpoint(
             self,
             org_info,
             &selector.table_name,

@@ -493,6 +493,15 @@ impl LeaderlessStateProvider {
         .await
     }
 
+    pub(crate) async fn get_published_active_checkpoint(
+        &mut self,
+        table_name: &String,
+        extensions: Option<String>,
+    ) -> Result<Option<String>, ServiceApiError> {
+        self.get_latest_committed_checkpoint(table_name, extensions)
+            .await
+    }
+
     pub(crate) async fn get_checkpoint(
         &mut self,
         checkpoint: &CheckpointDescriptor,
