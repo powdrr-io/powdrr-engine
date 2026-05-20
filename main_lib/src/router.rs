@@ -18,6 +18,7 @@ use crate::peers::{
 use crate::private_api;
 use crate::private_api::{compaction_query, extension_query, prefetch_query, search_query};
 use crate::test_api::test_v1_add_checkpoint;
+use crate::test_api::test_v1_advance_checkpoints;
 use crate::test_api::test_v1_create_index;
 use crate::test_api::test_v1_process_work;
 use crate::test_api::test_v1_set_testing_mode;
@@ -348,6 +349,7 @@ pub fn router(include_test_apis: bool) -> Router {
                 route.scope("/v1", |route| {
                     route.post("/_create_index").to(test_v1_create_index);
                     route.post("/_add_checkpoint").to(test_v1_add_checkpoint);
+                    route.put("/_advance_checkpoints").to(test_v1_advance_checkpoints);
                     route.put("/_testing_mode").to(test_v1_set_testing_mode);
                     route
                         .put("/_testing_and_processing_mode")
@@ -786,6 +788,20 @@ pub(crate) mod tests {
             .unwrap();
 
         assert_eq!(process_work_response.status(), 200);
+    }
+
+    fn advance_pending_checkpoints(test_server: &TestServer) {
+        let checkpoint_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_advance_checkpoints",
+                "",
+                mime::TEXT_PLAIN,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(checkpoint_response.status(), 200);
     }
 
     fn search_json(test_server: &TestServer, index: &str, body: &str) -> Value {
@@ -4476,7 +4492,7 @@ pub(crate) mod tests {
         let test_server = &*TEST_SERVER;
         let index = unique_test_index_name("logs_replace");
 
-        set_sync_testing_and_processing_mode(test_server);
+        set_testing_and_processing_mode(test_server);
 
         let body_create_index = r#"{
             "settings" : {
@@ -4524,7 +4540,7 @@ pub(crate) mod tests {
 
         assert_eq!(first_index_response.status(), 201);
 
-        process_pending_work(test_server);
+        advance_pending_checkpoints(test_server);
 
         let second_index_response = test_server
             .client()
@@ -4542,7 +4558,7 @@ pub(crate) mod tests {
         assert_eq!(second_index_json["_id"], json!("my_id"));
         assert_eq!(second_index_json["_version"], json!(2));
 
-        process_pending_work(test_server);
+        advance_pending_checkpoints(test_server);
 
         let get_response = test_server
             .client()
@@ -4674,7 +4690,7 @@ pub(crate) mod tests {
         let test_server = &*TEST_SERVER;
         let index = unique_test_index_name("logs_update");
 
-        set_sync_testing_and_processing_mode(test_server);
+        set_testing_and_processing_mode(test_server);
 
         let body_create_index = r#"{
             "settings" : {
@@ -4723,17 +4739,7 @@ pub(crate) mod tests {
 
         assert_eq!(create_response.status(), 201);
 
-        let process_work_response = test_server
-            .client()
-            .put(
-                "http://localhost/_test/v1/_process_work",
-                "",
-                mime::TEXT_PLAIN,
-            )
-            .perform()
-            .unwrap();
-
-        assert_eq!(process_work_response.status(), 200);
+        advance_pending_checkpoints(test_server);
 
         let update_response = test_server
             .client()
@@ -4750,17 +4756,7 @@ pub(crate) mod tests {
             serde_json::from_str(&update_response.read_utf8_body().unwrap()).unwrap();
         assert_eq!(update_json["_version"], json!(2));
 
-        let second_process_work_response = test_server
-            .client()
-            .put(
-                "http://localhost/_test/v1/_process_work",
-                "",
-                mime::TEXT_PLAIN,
-            )
-            .perform()
-            .unwrap();
-
-        assert_eq!(second_process_work_response.status(), 200);
+        advance_pending_checkpoints(test_server);
 
         let get_response = test_server
             .client()
@@ -4858,7 +4854,7 @@ pub(crate) mod tests {
         let test_server = &*TEST_SERVER;
         let index = unique_test_index_name("logs_bulk_update");
 
-        set_sync_testing_and_processing_mode(test_server);
+        set_testing_and_processing_mode(test_server);
 
         let body_create_index = r#"{
             "settings" : {
@@ -4899,17 +4895,7 @@ pub(crate) mod tests {
 
         assert_eq!(create_response.status(), 201);
 
-        let first_process_work_response = test_server
-            .client()
-            .put(
-                "http://localhost/_test/v1/_process_work",
-                "",
-                mime::TEXT_PLAIN,
-            )
-            .perform()
-            .unwrap();
-
-        assert_eq!(first_process_work_response.status(), 200);
+        advance_pending_checkpoints(test_server);
 
         let bulk_body = make_update_bulk_body(
             index.clone(),
@@ -4934,17 +4920,7 @@ pub(crate) mod tests {
 
         assert_eq!(bulk_response.status(), 200);
 
-        let second_process_work_response = test_server
-            .client()
-            .put(
-                "http://localhost/_test/v1/_process_work",
-                "",
-                mime::TEXT_PLAIN,
-            )
-            .perform()
-            .unwrap();
-
-        assert_eq!(second_process_work_response.status(), 200);
+        advance_pending_checkpoints(test_server);
 
         let get_response = test_server
             .client()
