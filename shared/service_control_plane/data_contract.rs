@@ -688,6 +688,23 @@ pub struct ServingTableConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ServingAggregateMeasure {
+    pub function: String,
+    #[serde(default)]
+    pub field: Option<String>,
+    #[serde(default)]
+    pub alias: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ServingAggregateSpec {
+    #[serde(default)]
+    pub group_by: Vec<String>,
+    #[serde(default)]
+    pub measures: Vec<ServingAggregateMeasure>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ServingPattern {
     pub name: String,
     #[serde(default)]
@@ -702,6 +719,8 @@ pub struct ServingPattern {
     pub max_limit: Option<u64>,
     #[serde(default)]
     pub projection: Option<Vec<String>>,
+    #[serde(default)]
+    pub aggregate: Option<ServingAggregateSpec>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

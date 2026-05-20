@@ -158,6 +158,7 @@ pub fn from_mongodb_find(
     Ok(ServingRequestPlan {
         select: parse_mongodb_projection(command.projection.as_ref())?,
         filters: parse_mongodb_filter_document(&command.filter)?,
+        aggregate: None,
         order_by: parse_mongodb_sort(command.sort.as_ref())?,
         limit: parse_mongodb_limit(command.limit)?,
         allow_slow_path: false,
@@ -475,6 +476,7 @@ mod tests {
                     lte: None,
                 },
             ],
+            aggregate: None,
             order_by: vec![ServingSort {
                 field: "price".to_string(),
                 descending: true,
@@ -515,6 +517,7 @@ mod tests {
                 lt: None,
                 lte: None,
             }],
+            aggregate: None,
             order_by: vec![ServingSort {
                 field: "title".to_string(),
                 descending: false,
@@ -588,6 +591,7 @@ mod tests {
                         lte: None,
                     },
                 ],
+                aggregate: None,
                 order_by: vec![ServingSort {
                     field: "price".to_string(),
                     descending: true,
