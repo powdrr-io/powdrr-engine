@@ -1,4 +1,4 @@
-use crate::compaction::{compact_logs, CompactionCommand};
+use crate::compaction::{CompactionCommand, compact_logs};
 use crate::dynamodb_protocol;
 use crate::elastic_search_endpoints::AliasPathExtractor;
 use crate::elastic_search_endpoints::NameAliasPathExtractor;
@@ -24,21 +24,21 @@ use crate::test_api::test_v1_set_testing_mode;
 use crate::test_api::test_v1_set_testing_processing_mode;
 use crate::elastic_search_common::MIME_ARROW_STREAM;
 use crate::{elastic_search_endpoints, elastic_search_lifetime_policy, lakehouse_serving};
-use futures::future;
 use futures::TryFutureExt;
+use futures::future;
 use futures_util::future::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
 use gotham::hyper::StatusCode;
-use gotham::hyper::{body, Body};
+use gotham::hyper::{Body, body};
 use gotham::middleware::Middleware;
 use gotham::mime;
 use gotham::pipeline::new_pipeline;
 use gotham::pipeline::single_pipeline;
 use gotham::prelude::NewMiddleware;
 use gotham::prelude::StaticResponseExtender;
-use gotham::router::builder::*;
 use gotham::router::Router;
+use gotham::router::builder::*;
 use gotham::state::FromState;
 use gotham::state::State;
 use gotham::state::StateData;
@@ -740,7 +740,7 @@ pub(crate) mod tests {
     use gotham::plain::test::AsyncTestServer;
     use gotham::test::{TestResponse, TestServer};
     use idgenerator::IdInstance;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -1436,15 +1436,21 @@ pub(crate) mod tests {
             json!(format!("{}.$cmd.listCollections", database))
         );
         let first_batch = response_obj["cursor"]["firstBatch"].as_array().unwrap();
-        assert!(first_batch
-            .iter()
-            .any(|entry| entry["name"] == json!("alpha")));
-        assert!(!first_batch
-            .iter()
-            .any(|entry| entry["name"] == json!("beta_disabled")));
-        assert!(!first_batch
-            .iter()
-            .any(|entry| entry["name"] == json!("other")));
+        assert!(
+            first_batch
+                .iter()
+                .any(|entry| entry["name"] == json!("alpha"))
+        );
+        assert!(
+            !first_batch
+                .iter()
+                .any(|entry| entry["name"] == json!("beta_disabled"))
+        );
+        assert!(
+            !first_batch
+                .iter()
+                .any(|entry| entry["name"] == json!("other"))
+        );
 
         let name_only_response = perform_mongo_command(
             test_server,
@@ -1496,9 +1502,11 @@ pub(crate) mod tests {
         let response_obj: Value =
             serde_json::from_str(&response.read_utf8_body().unwrap()).unwrap();
         let databases = response_obj["databases"].as_array().unwrap();
-        assert!(databases
-            .iter()
-            .any(|entry| entry["name"] == json!(database)));
+        assert!(
+            databases
+                .iter()
+                .any(|entry| entry["name"] == json!(database))
+        );
     }
 
     #[test]
@@ -1905,10 +1913,12 @@ pub(crate) mod tests {
         let response_obj: Value =
             serde_json::from_str(&response.read_utf8_body().unwrap()).unwrap();
         assert_eq!(response_obj["codeName"], json!("BadValue"));
-        assert!(response_obj["errmsg"]
-            .as_str()
-            .unwrap()
-            .contains("already exposed by table mongo_duplicate_config_first"));
+        assert!(
+            response_obj["errmsg"]
+                .as_str()
+                .unwrap()
+                .contains("already exposed by table mongo_duplicate_config_first")
+        );
     }
 
     #[test]
@@ -2045,10 +2055,12 @@ pub(crate) mod tests {
         assert_eq!(response_obj["ok"], json!(0.0));
         assert_eq!(response_obj["code"], json!(2));
         assert_eq!(response_obj["codeName"], json!("BadValue"));
-        assert!(response_obj["errmsg"]
-            .as_str()
-            .unwrap()
-            .contains("is exposed as Mongo collection logs_mismatch"));
+        assert!(
+            response_obj["errmsg"]
+                .as_str()
+                .unwrap()
+                .contains("is exposed as Mongo collection logs_mismatch")
+        );
     }
 
     #[test]
@@ -2486,9 +2498,11 @@ pub(crate) mod tests {
             get_named_aliases_json["logs_archive"]["aliases"]["logs_alias"],
             json!({})
         );
-        assert!(get_named_aliases_json["logs"]["aliases"]
-            .get("logs_secondary")
-            .is_none());
+        assert!(
+            get_named_aliases_json["logs"]["aliases"]
+                .get("logs_secondary")
+                .is_none()
+        );
 
         let get_index_named_alias_response = test_server
             .client()
@@ -3129,10 +3143,10 @@ pub(crate) mod tests {
                 .unwrap(),
         )
         .unwrap();
-        let histogram_buckets = multi_index_date_histogram_json["aggregations"]["per_day"]
-            ["buckets"]
-            .as_array()
-            .unwrap();
+        let histogram_buckets =
+            multi_index_date_histogram_json["aggregations"]["per_day"]["buckets"]
+                .as_array()
+                .unwrap();
         assert_eq!(histogram_buckets.len(), 5);
         assert_eq!(
             histogram_buckets[0]["key_as_string"],
@@ -3214,10 +3228,10 @@ pub(crate) mod tests {
         assert_eq!(bounded_histogram_response.status(), 200);
         let bounded_histogram_json: Value =
             serde_json::from_str(&bounded_histogram_response.read_utf8_body().unwrap()).unwrap();
-        let bounded_histogram_buckets = bounded_histogram_json["aggregations"]["per_day"]
-            ["buckets"]
-            .as_array()
-            .unwrap();
+        let bounded_histogram_buckets =
+            bounded_histogram_json["aggregations"]["per_day"]["buckets"]
+                .as_array()
+                .unwrap();
         assert_eq!(bounded_histogram_buckets.len(), 7);
         assert_eq!(
             bounded_histogram_buckets[0]["key_as_string"],

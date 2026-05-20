@@ -10,30 +10,30 @@ use gotham::mime;
 use http::StatusCode;
 use iceberg::arrow::arrow_schema_to_schema;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
     DefaultLocationGenerator, FileNameGenerator,
 };
-use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use idgenerator::IdInstance;
 use parquet_55::file::properties::WriterProperties;
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{error::Error, fmt};
 
-use crate::data_access::{execute_sql, IcebergLibMetadata};
+use crate::data_access::{IcebergLibMetadata, execute_sql};
 use crate::data_contract::{
     CompactionCommit, CompactionWorkItem, FileSetPayload, IcebergCommit, IcebergMetadata,
     SpeedboatCommitTableInfo,
 };
 use crate::elastic_search_common::{
-    execute_command, Command, CommandContext, CommandError, ElasticSearchResponse,
-    ResultGeneratorFuture,
+    Command, CommandContext, CommandError, ElasticSearchResponse, ResultGeneratorFuture,
+    execute_command,
 };
-use crate::elastic_search_ingest::{write_to_file, WriteBuffer};
+use crate::elastic_search_ingest::{WriteBuffer, write_to_file};
 use crate::peers::{PrivateCompactionInvocation, PrivateInvocation};
 use crate::schema_massager::{PowdrrSchema, SqlBuilder};
 use crate::search_runtime::df_to_serde_value;

@@ -670,11 +670,24 @@ impl DynamoDBServiceImpl {
         else {
             return Ok(false);
         };
-        if membership_view.target_checkpoint_id != *target_checkpoint_id
-            || membership_view.required_node_ids.is_empty()
-        {
+        if membership_view.target_checkpoint_id != *target_checkpoint_id {
             return Ok(false);
         }
+
+        let required_node_ids = if membership_view.required_node_ids.is_empty() {
+            let live_node_ids: Vec<String> = self
+                .live_serving_node_leases(org_id)
+                .await?
+                .into_iter()
+                .map(|lease| lease.node_id)
+                .collect();
+            if live_node_ids.is_empty() {
+                return Ok(false);
+            }
+            live_node_ids
+        } else {
+            membership_view.required_node_ids.clone()
+        };
 
         let activation_prefix = Self::activation_key_prefix(table_name, extension);
         let activations = self
@@ -697,18 +710,14 @@ impl DynamoDBServiceImpl {
             }
         }
 
-        Ok(membership_view
-            .required_node_ids
-            .into_iter()
-            .all(|node_id| {
-                matching_acks
-                    .get(&node_id)
-                    .map(|ack| {
-                        ack.checkpoint_id == *target_checkpoint_id
-                            && ack.epoch == membership_view.epoch
-                    })
-                    .unwrap_or(false)
-            }))
+        Ok(required_node_ids.into_iter().all(|node_id| {
+            matching_acks
+                .get(&node_id)
+                .map(|ack| {
+                    ack.checkpoint_id == *target_checkpoint_id && ack.epoch == membership_view.epoch
+                })
+                .unwrap_or(false)
+        }))
     }
 
     async fn promote_active_checkpoint_if_ready(
@@ -741,6 +750,46 @@ impl DynamoDBServiceImpl {
 
         self.set_active_checkpoint_id(org_id, table_name, extension, &target_checkpoint_id)
             .await
+    }
+
+    async fn ensure_cutover_membership_for_current_target(
+        &mut self,
+        org_id: &String,
+        table_name: &String,
+        extension: &Option<String>,
+    ) -> Result<bool, ServiceApiError> {
+        let Some(target_checkpoint_id) = self
+            .get_target_checkpoint_id(org_id, table_name, extension)
+            .await?
+        else {
+            return Ok(false);
+        };
+
+        if self
+            .get_active_checkpoint_id(org_id, table_name, extension)
+            .await?
+            == Some(target_checkpoint_id.clone())
+        {
+            return Ok(false);
+        }
+
+        if self
+            .get_cutover_membership_view(org_id, table_name, extension)
+            .await?
+            .map(|view| view.target_checkpoint_id == target_checkpoint_id)
+            .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+
+        self.capture_cutover_membership_for_target(
+            org_id,
+            table_name,
+            extension,
+            &target_checkpoint_id,
+        )
+        .await?;
+        Ok(true)
     }
 
     async fn checkpoint_publication_still_pending(
@@ -1191,6 +1240,25 @@ impl DynamoDBServiceImpl {
         extensions: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
         let checkpoint_id = self
+            .get_target_checkpoint_id(&org_info.org_id, table_name, &extensions)
+            .await?;
+        if let Some(checkpoint_id) = checkpoint_id.as_ref() {
+            tracing::info!(
+                "Latest committed checkpoint for {}: {}",
+                table_name,
+                checkpoint_id
+            );
+        }
+        Ok(checkpoint_id)
+    }
+
+    pub async fn get_published_active_checkpoint(
+        &mut self,
+        org_info: &OrgInfo,
+        table_name: &String,
+        extensions: Option<String>,
+    ) -> Result<Option<String>, ServiceApiError> {
+        let checkpoint_id = self
             .get_active_checkpoint_id(&org_info.org_id, table_name, &extensions)
             .await?;
         if let Some(checkpoint_id) = checkpoint_id.as_ref() {
@@ -1464,11 +1532,23 @@ impl DynamoDBServiceImpl {
                     .await?;
             work_done = work_done
                 | self
+                    .ensure_cutover_membership_for_current_target(&org_id, &table_name, &None)
+                    .await?;
+            work_done = work_done
+                | self
                     .promote_active_checkpoint_if_ready(&org_id, &table_name, &None)
                     .await?;
             work_done = work_done
                 | self
                     .update_extension_checkpoint(&org_id, &table_name)
+                    .await?;
+            work_done = work_done
+                | self
+                    .ensure_cutover_membership_for_current_target(
+                        &org_id,
+                        &table_name,
+                        &Some("es".to_string()),
+                    )
                     .await?;
             work_done = work_done
                 | self
@@ -1839,6 +1919,16 @@ impl MetadataStore for DynamoDBServiceImpl {
         Ok(())
     }
 
+    async fn get_latest_committed_checkpoint(
+        &mut self,
+        org_info: &OrgInfo,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> Result<Option<String>, ServiceApiError> {
+        DynamoDBServiceImpl::get_latest_committed_checkpoint(self, org_info, table_name, extension)
+            .await
+    }
+
     async fn get_published_checkpoint_record(
         &mut self,
         org_info: &OrgInfo,
@@ -1883,11 +1973,19 @@ impl MetadataStore for DynamoDBServiceImpl {
             .get_target_checkpoint_id(&org_info.org_id, table_name, &extension)
             .await?
             .or_else(|| active_checkpoint_id.clone());
+        let membership_view = self
+            .get_cutover_membership_view(&org_info.org_id, table_name, &extension)
+            .await?;
         Ok(CheckpointCutoverState {
             selector: PublishedCheckpointSelector::target(table_name.clone(), extension.clone()),
-            epoch: self
-                .get_cutover_epoch(&org_info.org_id, table_name, &extension)
-                .await?,
+            epoch: membership_view
+                .as_ref()
+                .filter(|view| Some(view.target_checkpoint_id.clone()) == target_checkpoint_id)
+                .map(|view| view.epoch)
+                .unwrap_or(
+                    self.get_cutover_epoch(&org_info.org_id, table_name, &extension)
+                        .await?,
+                ),
             active_checkpoint_id,
             target_checkpoint_id,
         })
@@ -2026,5 +2124,134 @@ impl MetadataStore for DynamoDBServiceImpl {
 
     async fn advance_published_checkpoints(&mut self) -> Result<bool, ServiceApiError> {
         DynamoDBServiceImpl::update_all_checkpoints(self).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DynamoDBServiceImpl;
+    use crate::data_contract::{
+        CreateTable, FileSetPayload, IcebergCommit, IcebergMetadata, LicenseType, OrgInfo,
+    };
+    use crate::metadata_store::MetadataStore;
+    use crate::schema_massager::PowdrrSchema;
+    use crate::test_api::TestProcessingMode;
+    use std::collections::HashMap;
+
+    fn org_info() -> OrgInfo {
+        OrgInfo {
+            org_id: "fake_org_id".to_string(),
+            license_type: LicenseType::Free,
+        }
+    }
+
+    fn iceberg_metadata(file_path: &str, snapshot_id: &str) -> IcebergMetadata {
+        let schema = PowdrrSchema::minimal();
+        IcebergMetadata {
+            table_schema: schema.clone(),
+            snapshot_id: Some(snapshot_id.to_string()),
+            files: FileSetPayload::single(file_path.to_string(), 128, schema),
+            partition_spec: vec![],
+            sort_order: vec![],
+            column_names: vec![],
+            column_stats: vec![],
+            access_artifacts: vec![],
+            file_stats: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_target_and_active_frontiers_diverge_until_activation() {
+        let mut state = DynamoDBServiceImpl::test(TestProcessingMode::default()).await;
+        let org_info = org_info();
+        let table_name = "dynamodb-frontier-table".to_string();
+
+        state
+            .create_table(
+                &org_info,
+                &CreateTable {
+                    name: table_name.clone(),
+                    tags: HashMap::new(),
+                    serving: None,
+                    dynamodb: None,
+                    mongodb: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        state
+            .iceberg_commit(
+                &org_info,
+                &table_name,
+                &IcebergCommit {
+                    metadata: iceberg_metadata("s3://warehouse/table/data-0001.parquet", "1"),
+                    deletes_table_info: None,
+                    compactions: vec![],
+                },
+            )
+            .await
+            .unwrap();
+
+        let committed_checkpoint = MetadataStore::get_latest_committed_checkpoint(
+            &mut state,
+            &org_info,
+            &table_name,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            MetadataStore::get_latest_target_checkpoint(&mut state, &org_info, &table_name, None)
+                .await
+                .unwrap(),
+            Some(committed_checkpoint.clone())
+        );
+        assert_eq!(
+            MetadataStore::get_published_active_checkpoint(
+                &mut state,
+                &org_info,
+                &table_name,
+                None,
+            )
+            .await
+            .unwrap(),
+            None
+        );
+
+        assert!(
+            MetadataStore::advance_published_checkpoints(&mut state)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            MetadataStore::get_latest_target_checkpoint(&mut state, &org_info, &table_name, None)
+                .await
+                .unwrap(),
+            Some(committed_checkpoint.clone())
+        );
+        assert_eq!(
+            MetadataStore::get_published_active_checkpoint(
+                &mut state,
+                &org_info,
+                &table_name,
+                None,
+            )
+            .await
+            .unwrap(),
+            None
+        );
+
+        let cutover_state =
+            MetadataStore::get_checkpoint_cutover_state(&mut state, &org_info, &table_name, None)
+                .await
+                .unwrap();
+        assert_eq!(
+            cutover_state.target_checkpoint_id,
+            Some(committed_checkpoint)
+        );
+        assert_eq!(cutover_state.active_checkpoint_id, None);
     }
 }

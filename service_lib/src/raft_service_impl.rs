@@ -536,9 +536,26 @@ impl RaftServiceImpl {
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
-        raft_read_state!(self, |state| {
-            state.get_latest_committed_checkpoint(org_info, table_name, extension)
-        })
+        raft_read_state!(
+            self,
+            |state| MetadataStore::get_latest_committed_checkpoint(
+                &mut state, org_info, table_name, extension
+            )
+        )
+    }
+
+    pub async fn get_published_active_checkpoint(
+        &self,
+        org_info: &OrgInfo,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> Result<Option<String>, ServiceApiError> {
+        raft_read_state!(
+            self,
+            |state| MetadataStore::get_published_active_checkpoint(
+                &mut state, org_info, table_name, extension
+            )
+        )
     }
 
     pub async fn get_checkpoint(
@@ -656,6 +673,20 @@ impl MetadataStore for RaftServiceImpl {
         raft_write_state!(self, |state| {
             MetadataStore::queue_checkpoint_publication(&mut state, request)
         })
+    }
+
+    async fn get_latest_committed_checkpoint(
+        &mut self,
+        org_info: &OrgInfo,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> Result<Option<String>, ServiceApiError> {
+        raft_read_state!(
+            self,
+            |state| MetadataStore::get_latest_committed_checkpoint(
+                &mut state, org_info, table_name, extension
+            )
+        )
     }
 
     async fn get_published_checkpoint_record(
@@ -890,7 +921,9 @@ mod tests {
         IcebergMetadata, LicenseType, OrgInfo, SpeedboatCommit, SpeedboatCommitTableInfo,
     };
     use crate::ephemeral_service_impl::EphemeralServiceImpl;
-    use crate::metadata_store::{CutoverEpoch, ServingNodeActivationAck, ServingNodeLease};
+    use crate::metadata_store::{
+        CutoverEpoch, MetadataStore, ServingNodeActivationAck, ServingNodeLease,
+    };
     use crate::schema_massager::PowdrrSchema;
     use crate::test_api::{
         CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode, StorageMode,
@@ -1074,8 +1107,7 @@ mod tests {
     ) -> Option<String> {
         let snapshot = node.read_snapshot_state().await.unwrap();
         let mut state = EphemeralServiceImpl::from_snapshot(node.mode.clone(), snapshot);
-        state
-            .get_latest_committed_checkpoint(&org_info(), table_name, None)
+        MetadataStore::get_published_active_checkpoint(&mut state, &org_info(), table_name, None)
             .await
             .unwrap()
     }
@@ -1097,14 +1129,19 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            raft.get_latest_committed_checkpoint(&org_info, &table_name, None)
-                .await
-                .unwrap(),
-            None
-        );
+        let committed_base_checkpoint = raft
+            .get_latest_committed_checkpoint(&org_info, &table_name, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             raft.get_latest_target_checkpoint(&org_info, &table_name, None)
+                .await
+                .unwrap(),
+            Some(committed_base_checkpoint.clone())
+        );
+        assert_eq!(
+            raft.get_published_active_checkpoint(&org_info, &table_name, None)
                 .await
                 .unwrap(),
             None
@@ -1131,6 +1168,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             raft.get_latest_committed_checkpoint(&org_info, &table_name, None)
+                .await
+                .unwrap(),
+            Some(target_base_checkpoint.clone())
+        );
+        assert_eq!(
+            raft.get_published_active_checkpoint(&org_info, &table_name, None)
                 .await
                 .unwrap(),
             None
@@ -1162,6 +1205,12 @@ mod tests {
             Some(target_base_checkpoint.clone())
         );
         assert_eq!(
+            raft.get_published_active_checkpoint(&org_info, &table_name, None)
+                .await
+                .unwrap(),
+            Some(target_base_checkpoint.clone())
+        );
+        assert_eq!(
             raft.get_latest_committed_checkpoint(&org_info, &table_name, Some("es".to_string()))
                 .await
                 .unwrap(),
@@ -1180,8 +1229,19 @@ mod tests {
         .await
         .unwrap();
 
+        let committed_extension_checkpoint = raft
+            .get_latest_committed_checkpoint(&org_info, &table_name, Some("es".to_string()))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            raft.get_latest_committed_checkpoint(&org_info, &table_name, Some("es".to_string()))
+            raft.get_latest_target_checkpoint(&org_info, &table_name, Some("es".to_string()))
+                .await
+                .unwrap(),
+            Some(committed_extension_checkpoint.clone())
+        );
+        assert_eq!(
+            raft.get_published_active_checkpoint(&org_info, &table_name, Some("es".to_string()))
                 .await
                 .unwrap(),
             None
@@ -1195,6 +1255,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             raft.get_latest_committed_checkpoint(&org_info, &table_name, Some("es".to_string()))
+                .await
+                .unwrap(),
+            Some(target_extension_checkpoint.clone())
+        );
+        assert_eq!(
+            raft.get_published_active_checkpoint(&org_info, &table_name, Some("es".to_string()))
                 .await
                 .unwrap(),
             None
@@ -1225,7 +1291,7 @@ mod tests {
         assert_eq!(recorded_activations.len(), 1);
         let promoted_extension = raft.update_all_checkpoints().await.unwrap();
         let active_extension_checkpoint = raft
-            .get_latest_committed_checkpoint(&org_info, &table_name, Some("es".to_string()))
+            .get_published_active_checkpoint(&org_info, &table_name, Some("es".to_string()))
             .await
             .unwrap();
         assert!(
@@ -1290,7 +1356,7 @@ mod tests {
 
         assert!(!raft.update_all_checkpoints().await.unwrap());
         assert_eq!(
-            raft.get_latest_committed_checkpoint(&org_info, &table_name, None)
+            raft.get_published_active_checkpoint(&org_info, &table_name, None)
                 .await
                 .unwrap(),
             None
@@ -1311,7 +1377,7 @@ mod tests {
 
         assert!(raft.update_all_checkpoints().await.unwrap());
         assert_eq!(
-            raft.get_latest_committed_checkpoint(&org_info, &table_name, None)
+            raft.get_published_active_checkpoint(&org_info, &table_name, None)
                 .await
                 .unwrap(),
             Some(target_checkpoint)
@@ -1367,7 +1433,7 @@ mod tests {
 
         assert!(raft.update_all_checkpoints().await.unwrap());
         assert_eq!(
-            raft.get_latest_committed_checkpoint(&org_info, &table_name, None)
+            raft.get_published_active_checkpoint(&org_info, &table_name, None)
                 .await
                 .unwrap(),
             Some(target_checkpoint)
@@ -1420,7 +1486,7 @@ mod tests {
 
         assert!(raft.update_all_checkpoints().await.unwrap());
         assert_eq!(
-            raft.get_latest_committed_checkpoint(&org_info, &table_name, None)
+            raft.get_published_active_checkpoint(&org_info, &table_name, None)
                 .await
                 .unwrap(),
             Some(target_checkpoint)
@@ -1484,7 +1550,7 @@ mod tests {
             .unwrap();
         assert!(reconfigured_cutover_state.epoch > original_cutover_state.epoch);
         assert_eq!(
-            raft.get_latest_committed_checkpoint(&org_info, &table_name, None)
+            raft.get_published_active_checkpoint(&org_info, &table_name, None)
                 .await
                 .unwrap(),
             None
@@ -1505,7 +1571,7 @@ mod tests {
 
         assert!(raft.update_all_checkpoints().await.unwrap());
         assert_eq!(
-            raft.get_latest_committed_checkpoint(&org_info, &table_name, None)
+            raft.get_published_active_checkpoint(&org_info, &table_name, None)
                 .await
                 .unwrap(),
             Some(target_checkpoint)

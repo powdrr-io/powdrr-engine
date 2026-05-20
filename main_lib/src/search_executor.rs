@@ -1,15 +1,14 @@
 use crate::elastic_search_commands::{SqlCommand, UpdateByQueryCommand};
 use crate::elastic_search_common::{
-    execute_command, Command, CommandContext, ElasticSearchResponse, ParseError,
-    ResultGeneratorFuture,
+    Command, CommandContext, ElasticSearchResponse, ParseError, ResultGeneratorFuture,
+    execute_command,
 };
 use crate::elastic_search_datetime_parser;
 use crate::elastic_search_endpoints::QueryStringSearch;
 use crate::elastic_search_responses::{
-    compare_query_result_hits_desc, AggregationResult, AverageAggregationResult,
-    CardinalityAggregationResult, FilterAggregationResult, HistogramAggregationBucket,
-    HistogramAggregationResult, QueryFailure, QueryResults, TermAggregationBucket,
-    TermAggregationResult,
+    AggregationResult, AverageAggregationResult, CardinalityAggregationResult,
+    FilterAggregationResult, HistogramAggregationBucket, HistogramAggregationResult, QueryFailure,
+    QueryResults, TermAggregationBucket, TermAggregationResult, compare_query_result_hits_desc,
 };
 use crate::peers::{
     CheckpointDescriptor, PrivateExactConstraintGroup, PrivateInvocation,
@@ -126,7 +125,6 @@ pub(crate) struct SearchCommand {
     exact_sql: Option<crate::schema_massager::SqlQuery>,
     exact_constraints: Vec<PrivateExactConstraintGroup>,
     range_constraints: Vec<PrivateSearchRangeConstraint>,
-    exact_doc_id_field_name: Option<String>,
     backend: SearchBackend,
 }
 
@@ -208,7 +206,6 @@ impl SearchCommand {
             exact_sql: self.exact_sql.clone(),
             exact_constraints: self.exact_constraints.clone(),
             range_constraints: self.range_constraints.clone(),
-            exact_doc_id_field_name: self.exact_doc_id_field_name.clone(),
             required_extensions,
             checkpoints,
             table: legacy_command.table.clone(),
@@ -672,8 +669,6 @@ pub(crate) fn search_plan_to_command_with_options(
         typed_aggregation_specs,
         typed_sort_specs: typed_sort_specs.unwrap_or_default(),
         exact_sql,
-        exact_doc_id_field_name: (!exact_constraints.is_empty())
-            .then(|| doc_id_field_name.unwrap_or("_id_seq_no").to_string()),
         exact_constraints,
         range_constraints,
         backend: SearchBackend::LegacySql(backend),

@@ -7,7 +7,7 @@
 ################################################################################
 # Create a stage for building the application.
 
-ARG RUST_VERSION=1.89.0
+ARG RUST_VERSION=1.92.0
 FROM rust:${RUST_VERSION}-slim-bullseye AS base
 
 RUN cargo install cargo-chef
@@ -40,7 +40,6 @@ ENV TARGET_ENV=$TARGET
 CMD [ "sh", "-c", "./$TARGET_ENV" ]
 
 EXPOSE ${PORT}
-
 
 
 

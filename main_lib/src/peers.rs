@@ -68,7 +68,6 @@ pub struct PrivateSearchInvocation {
     pub exact_sql: Option<SqlQuery>,
     pub exact_constraints: Vec<PrivateExactConstraintGroup>,
     pub range_constraints: Vec<PrivateSearchRangeConstraint>,
-    pub exact_doc_id_field_name: Option<String>,
     pub required_extensions: Vec<String>,
     pub checkpoints: Vec<CheckpointDescriptor>,
     pub table: String,
