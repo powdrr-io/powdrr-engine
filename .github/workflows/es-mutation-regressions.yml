@@ -14,16 +14,6 @@ jobs:
   regressions:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    services:
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
@@ -37,5 +27,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Start ES mutation test stack
+        run: docker compose -f tests/es_compat/docker-compose.yml up -d redis minio createbuckets rest localstack
+
       - name: Run ES mutation regression tests
+        env:
+          POWDRR_WAIT_FOR_STACK: "1"
         run: bash scripts/run_es_mutation_regression_local.sh
+
+      - name: Stop ES mutation test stack
+        if: always()
+        run: docker compose -f tests/es_compat/docker-compose.yml down -v
