@@ -1,0 +1,16 @@
+[package]
+name = "powdrr-query-core"
+description = "Powdrr.io shared query core"
+keywords = ["arrow", "query", "sql"]
+publish = false
+readme = "../README.md"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+arrow-json = "58.0.0"
+chrono = "0.4.41"
+datafusion = "53.1.0"
+powdrr-control-plane = { path = "../control_plane", features = ["arrow-schema"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"

@@ -1,4 +1,1 @@
-include!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../shared/service_control_plane/service_api_error.rs"
-));
+pub use powdrr_control_plane::service_api_error::ServiceApiError;

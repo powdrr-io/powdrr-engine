@@ -85,18 +85,27 @@ serving plan and run against one shared snapshot-aware execution path.
 
 ### Main Runtime Pieces
 
-- `engine/` and `engine_lib/`
-  The main query and serving server. This is where the HTTP frontends,
-  planner/executor, and read path live.
+- `query_lib/`
+  The shared query/runtime crate. This is the single source of truth for the
+  serving planner, serving executor, Elasticsearch compatibility layer,
+  DynamoDB adapter, Mongo bridge, Iceberg access, clustered fanout helpers,
+  and the local CLI implementation.
+
+- `control_plane/`
+  Shared control-plane types and utilities used across the runtime and service
+  layers.
+
+- `engine/`
+  The main query and serving server. It now depends directly on the shared
+  query/runtime crate.
 
 - `service/` and `service_lib/`
   The control-plane service for table metadata, checkpoints, org setup,
   aliases, templates, and related state transitions.
 
 - `main_lib/`
-  Shared core logic, including the current serving planner, serving executor,
-  Elasticsearch compatibility layer, DynamoDB adapter, Mongo HTTP bridge,
-  Iceberg access, and test harnesses.
+  The compatibility facade crate used by existing tests and callers that still
+  import `powdrr_lib`. Its implementation surface now lives in `query_lib/`.
 
 - `cli/`
   A local CLI for building and querying a local Parquet cache through Powdrr's

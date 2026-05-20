@@ -1,0 +1,3010 @@
+use crate::data_access;
+use crate::data_contract::{
+    AliasInfo, CreateIndexBody, CreateIndexResult, CreateIndexTemplateBody, CreateTable,
+    SpeedboatCommit, SpeedboatCommitTableInfo, SpeedboatSegmentFile, TableDescription,
+};
+use crate::elastic_search_commands::LookupById;
+use crate::elastic_search_common::{
+    CommandContext, ElasticSearchResponse, MIME_ES_JSON, load_command_raw_result,
+};
+use crate::elastic_search_parser::UpdateBody;
+use crate::elastic_search_responses::{
+    BulkResult, ErrorDetails, OperationResult, Shards, SingleDocCreateFailedResult,
+};
+use crate::elastic_search_storage_schema::{
+    FullRecord, RecordDelete, RecordInput, SpeedboatCommitBuilder,
+};
+use crate::schema_massager::PowdrrSchema;
+use crate::search_runtime::{SerdeValueResult, df_to_serde_value};
+use crate::state_provider::{STATE_PROVIDER, ServiceApiError};
+use crate::util::{describe_table_log_error_then_none, log_err, log_service_err};
+use arrow_ipc::writer::StreamWriter;
+use arrow_json::LineDelimitedWriter;
+use datafusion::arrow::ipc::writer::FileWriter;
+use futures::FutureExt;
+use http::StatusCode;
+use http::header::LOCATION;
+use idgenerator::*;
+use mime;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::error::Error;
+use std::fmt::Display;
+use std::future::Future;
+use std::io::{Cursor, SeekFrom, Write};
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+use std::{collections::HashMap, fs, fs::File};
+use tokio::io::AsyncSeekExt;
+use tokio::sync::oneshot::error::RecvError;
+use tokio::sync::{mpsc, oneshot};
+use uuid_b64::UuidB64;
+
+#[derive(Debug)]
+pub struct IngestError {
+    pub message: String,
+}
+
+impl Display for IngestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _ = f.write_str(&self.message);
+        Ok(())
+    }
+}
+
+impl Error for IngestError {}
+
+impl IngestError {
+    fn from_service_api_error(e: ServiceApiError) -> Self {
+        log_service_err(e.clone());
+        IngestError {
+            message: format!("{}", e),
+        }
+    }
+}
+
+fn default_as_false() -> bool {
+    false
+}
+
+#[derive(Clone)]
+pub(crate) struct WriteBuffer {
+    lines: Vec<Value>,
+    schema: Option<PowdrrSchema>,
+}
+
+pub(crate) const JSON_MODE: bool = true;
+
+impl WriteBuffer {
+    pub fn empty() -> Self {
+        WriteBuffer {
+            lines: vec![],
+            schema: None,
+        }
+    }
+
+    pub fn insert_and_update(schema: PowdrrSchema, lines: Vec<Value>) -> Self {
+        WriteBuffer {
+            lines,
+            schema: Some(schema),
+        }
+    }
+
+    pub fn delete(lines: Vec<Value>) -> Self {
+        WriteBuffer {
+            lines,
+            schema: Some(PowdrrSchema::deletes()),
+        }
+    }
+
+    pub(crate) fn write_to_file(&self, file_name: &String) -> Result<u64, IngestError> {
+        if JSON_MODE {
+            self.write_to_json_file(&format!("{}.json", file_name))
+        } else {
+            self.write_to_arrow_file(&format!("{}.arrow", file_name))
+        }
+    }
+
+    fn write_to_json_file(&self, file_name: &String) -> Result<u64, IngestError> {
+        assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
+        ensure_local_parent_dir(file_name)?;
+        let mut file_write = File::create(file_name).expect("Cannot create file");
+        for line in self.lines.iter() {
+            match writeln!(&mut file_write, "{}", line) {
+                Err(e) => {
+                    return Err(IngestError {
+                        message: format!("{}", e).to_string(),
+                    });
+                }
+                _ => (),
+            }
+        }
+        Ok(self
+            .lines
+            .iter()
+            .map(|l| l.to_string().len())
+            .sum::<usize>() as u64)
+    }
+
+    fn write_to_arrow_file(&self, file_name: &String) -> Result<u64, IngestError> {
+        assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
+        assert!(self.schema.is_some(), "Cannot write buffer without schema");
+        ensure_local_parent_dir(file_name)?;
+        let arrow_schema = self.schema.as_ref().unwrap().to_arrow_schema();
+        let fields = arrow_schema.fields.as_ref();
+        let record_batch = serde_arrow::to_record_batch(fields, &self.lines).unwrap();
+        let file = File::create(file_name).unwrap();
+        let mut writer = FileWriter::try_new_buffered(file, &record_batch.schema()).unwrap();
+        writer.write(&record_batch).unwrap();
+        writer.finish().unwrap();
+        let len = File::open(file_name)
+            .unwrap()
+            .metadata()
+            .as_ref()
+            .map(|m| m.len())
+            .unwrap();
+        Ok(len)
+    }
+
+    #[allow(dead_code)]
+    async fn write_to_arrow_s3(&self, s3_path: &String) -> Result<u64, IngestError> {
+        assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
+        assert!(self.schema.is_some(), "Cannot write buffer without schema");
+        let full_s3_path = format!("{}.arrow", s3_path);
+        let arrow_schema = self.schema.as_ref().unwrap().to_arrow_schema();
+        let fields = arrow_schema.fields.as_ref();
+        let record_batch = serde_arrow::to_record_batch(fields, &self.lines).unwrap();
+        let mut buffer = Cursor::new(Vec::new());
+        let mut writer = StreamWriter::try_new(&mut buffer, &record_batch.schema()).unwrap();
+        writer.write(&record_batch).map_err(|e| IngestError {
+            message: format!("{}", e).to_string(),
+        })?;
+        writer.finish().map_err(|e| IngestError {
+            message: format!("{}", e).to_string(),
+        })?;
+        let _ = buffer
+            .seek(SeekFrom::Start(0))
+            .await
+            .map_err(|e| IngestError {
+                message: format!("{}", e).to_string(),
+            })?;
+        data_access::put_s3_file(&full_s3_path, buffer.get_ref())
+            .await
+            .map_err(|e| IngestError {
+                message: format!("{}", e).to_string(),
+            })?;
+        let len = buffer.get_ref().len() as u64;
+        Ok(len)
+    }
+
+    async fn write_to_json_s3(&self, s3_path: &String) -> Result<u64, IngestError> {
+        assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
+        assert!(self.schema.is_some(), "Cannot write buffer without schema");
+        let full_s3_path = format!("{}.json", s3_path);
+        let arrow_schema = self.schema.as_ref().unwrap().to_arrow_schema();
+        let fields = arrow_schema.fields.as_ref();
+        let record_batch = serde_arrow::to_record_batch(fields, &self.lines).unwrap();
+        let mut buf = Vec::new();
+        let mut writer = LineDelimitedWriter::new(&mut buf);
+        writer.write_batches(&[&record_batch]).unwrap();
+        writer.finish().unwrap();
+        data_access::put_s3_file(&full_s3_path, &buf)
+            .await
+            .map_err(|e| IngestError {
+                message: format!("{}", e).to_string(),
+            })?;
+        let len = buf.len() as u64;
+        Ok(len)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_byte_vec(&self) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        for line in self.lines.iter() {
+            buffer.extend(line.to_string().as_bytes());
+            buffer.push(b'\n');
+        }
+        buffer
+    }
+
+    fn stable_segment_id(&self, index: &String, label: &String) -> Result<String, IngestError> {
+        let mut hasher = Sha256::new();
+        hasher.update(index.as_bytes());
+        hasher.update([0]);
+        hasher.update(label.as_bytes());
+        hasher.update([0]);
+        if let Some(schema) = &self.schema {
+            let schema_bytes = serde_json::to_vec(schema).map_err(|e| IngestError {
+                message: format!("Failed to serialize speedboat schema for segment id: {e}"),
+            })?;
+            hasher.update(schema_bytes);
+        }
+        hasher.update([0xff]);
+        for line in &self.lines {
+            let line_bytes = serde_json::to_vec(line).map_err(|e| IngestError {
+                message: format!("Failed to serialize speedboat line for segment id: {e}"),
+            })?;
+            hasher.update((line_bytes.len() as u64).to_le_bytes());
+            hasher.update(line_bytes);
+        }
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    pub(crate) fn schema(&self) -> Option<PowdrrSchema> {
+        self.schema.clone()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn num_records(&self) -> usize {
+        self.lines.len()
+    }
+}
+
+fn ensure_local_parent_dir(file_name: &str) -> Result<(), IngestError> {
+    if let Some(parent) = Path::new(file_name).parent() {
+        fs::create_dir_all(parent).map_err(|e| IngestError {
+            message: format!("Failed to create local speedboat directory: {e}"),
+        })?;
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct IndexOrCreateBody {
+    #[serde(rename(deserialize = "_index"))]
+    index: Option<String>,
+    #[serde(rename(deserialize = "_id"))]
+    id: Option<String>,
+    #[serde(default = "default_as_false")]
+    #[allow(dead_code)]
+    list_executed_pipelines: bool,
+    #[serde(default = "default_as_false")]
+    #[allow(dead_code)]
+    require_alias: bool,
+    #[allow(dead_code)]
+    dynamic_templates: Option<HashMap<String, String>>,
+}
+
+#[derive(Deserialize)]
+struct UpdateOrDeleteBody {
+    #[serde(rename(deserialize = "_index"))]
+    #[allow(dead_code)]
+    index: Option<String>,
+    #[serde(rename(deserialize = "_id"))]
+    #[allow(dead_code)]
+    id: Option<String>,
+    #[serde(default = "default_as_false")]
+    #[allow(dead_code)]
+    require_alias: bool,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct Create {
+    create: IndexOrCreateBody,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct Index {
+    index: IndexOrCreateBody,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct Delete {
+    delete: UpdateOrDeleteBody,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct Update {
+    update: UpdateOrDeleteBody,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+#[allow(dead_code)]
+enum IngestCommand {
+    Create(Create),
+    Index(Index),
+    Delete(Delete),
+    Update(Update),
+}
+
+pub async fn create_index(table: &String, body: &String) -> Result<CreateIndexResult, IngestError> {
+    let parsed_body = if body.len() == 0 {
+        CreateIndexBody {
+            aliases: None,
+            mappings: None,
+            settings: None,
+        }
+    } else {
+        match CreateIndexBody::parse(body) {
+            Ok(pb) => pb,
+            Err(_e) => {
+                return log_err(IngestError {
+                    message: "body parsing error".to_string(),
+                });
+            }
+        }
+        // TODO: fill in defaults
+    };
+
+    let serialized_body = match serde_json::to_string(&parsed_body) {
+        Ok(s) => s,
+        Err(_) => panic!("What happen?"),
+    };
+
+    STATE_PROVIDER
+        .create_table(&CreateTable {
+            name: table.clone(),
+            tags: HashMap::from([("_es_original".to_string(), serialized_body)]),
+            serving: None,
+            dynamodb: None,
+            mongodb: None,
+        })
+        .await
+        .map_err(|e| IngestError::from_service_api_error(e))?;
+
+    if parsed_body.aliases.is_some() {
+        for (name, _) in parsed_body.aliases.unwrap() {
+            STATE_PROVIDER
+                .add_alias(table, &name)
+                .await
+                .map_err(|e| IngestError::from_service_api_error(e))?;
+        }
+    }
+
+    Ok(CreateIndexResult {
+        index: table.clone(),
+        shards_acknowledged: true,
+        acknowledged: true,
+    })
+}
+
+async fn update_index_alias_metadata<F>(table_name: &String, update: F) -> Result<(), IngestError>
+where
+    F: FnOnce(&mut HashMap<String, AliasInfo>),
+{
+    let table_description = STATE_PROVIDER
+        .describe_table(table_name)
+        .await
+        .map_err(IngestError::from_service_api_error)?
+        .ok_or_else(|| IngestError {
+            message: format!("index does not exist: {}", table_name),
+        })?;
+
+    let mut create_index_body = table_description
+        .tags
+        .get("_es_original")
+        .and_then(|value| CreateIndexBody::parse(value).ok())
+        .unwrap_or(CreateIndexBody {
+            aliases: None,
+            mappings: None,
+            settings: None,
+        });
+
+    let mut aliases = create_index_body.aliases.clone().unwrap_or_default();
+    update(&mut aliases);
+    create_index_body.aliases = if aliases.is_empty() {
+        None
+    } else {
+        Some(aliases)
+    };
+
+    let mut tags = table_description.tags.clone();
+    tags.insert(
+        "_es_original".to_string(),
+        serde_json::to_string(&create_index_body).unwrap(),
+    );
+
+    STATE_PROVIDER
+        .upsert_table_metadata(&CreateTable {
+            name: table_description.name,
+            tags,
+            serving: table_description.serving,
+            dynamodb: table_description.dynamodb,
+            mongodb: table_description.mongodb,
+        })
+        .await
+        .map_err(IngestError::from_service_api_error)?;
+
+    Ok(())
+}
+
+pub async fn create_index_template(
+    table: &String,
+    body: &String,
+) -> Result<CreateIndexResult, IngestError> {
+    let parsed_body: CreateIndexTemplateBody = match serde_json::from_str(body) {
+        Ok(pb) => pb,
+        Err(_e) => {
+            return log_err(IngestError {
+                message: "body parsing error".to_string(),
+            });
+        }
+    };
+
+    STATE_PROVIDER
+        .create_table_template(&table, &parsed_body)
+        .await
+        .map_err(|e| IngestError::from_service_api_error(e))?;
+
+    Ok(CreateIndexResult {
+        index: table.clone(),
+        shards_acknowledged: true,
+        acknowledged: true,
+    })
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Aliases {
+    actions: Vec<AliasAction>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+enum AliasAction {
+    Add(AliasAdd),
+    Remove(AliasRemove),
+    RemoveIndex(AliasRemoveIndex),
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AliasAdd {
+    add: AliasAddBody,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AliasAddBody {
+    // TODO: there are many more fields
+    index: String,
+    alias: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AliasRemove {
+    remove: AliasRemoveBody,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AliasRemoveBody {
+    // TODO: there are many more fields
+    index: String,
+    alias: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AliasRemoveIndex {
+    remove_index: AliasRemoveIndexBody,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AliasRemoveIndexBody {
+    index: String,
+}
+
+pub async fn update_aliases(body: &String) -> Result<(), IngestError> {
+    let parsed_body: Aliases = match serde_json::from_str(body) {
+        Ok(pb) => pb,
+        Err(_e) => {
+            return log_err(IngestError {
+                message: "body parsing error".to_string(),
+            });
+        }
+    };
+
+    // TODO: the actions should probably be pushed up in bulk
+    for action in parsed_body.actions {
+        match action {
+            AliasAction::Add(a) => {
+                STATE_PROVIDER
+                    .add_alias(&a.add.index, &a.add.alias)
+                    .await
+                    .map_err(|e| IngestError::from_service_api_error(e))?;
+                update_index_alias_metadata(&a.add.index, |aliases| {
+                    aliases.insert(a.add.alias.clone(), AliasInfo { is_hidden: false });
+                })
+                .await?;
+            }
+            AliasAction::Remove(r) => {
+                STATE_PROVIDER
+                    .remove_alias(&r.remove.index, &r.remove.alias)
+                    .await
+                    .map_err(|e| IngestError::from_service_api_error(e))?;
+                update_index_alias_metadata(&r.remove.index, |aliases| {
+                    aliases.remove(&r.remove.alias);
+                })
+                .await?;
+            }
+            AliasAction::RemoveIndex(_) => {
+                panic!("TODO: What does this mean?")
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn ingest_create(
+    create: &Create,
+    doc: &Value,
+    version: u64,
+    status: Option<u32>,
+    buffer: &mut SpeedboatCommitBuilder,
+) -> () {
+    let id = match &create.create.id {
+        Some(id) => id.clone(),
+        None => UuidB64::new().to_string(),
+    };
+    let doc_with_id = RecordInput::new(id.clone(), version, &doc, status);
+    buffer.insert(&doc_with_id);
+}
+
+pub(crate) struct IngestResult {
+    tables: HashMap<String, SpeedboatCommitBuilder>,
+    operations: Vec<OperationResult>,
+}
+
+impl IngestResult {
+    fn new() -> Self {
+        IngestResult {
+            tables: HashMap::new(),
+            operations: vec![],
+        }
+    }
+
+    fn get(&mut self, table: &String) -> &mut SpeedboatCommitBuilder {
+        match self.tables.get_mut(table) {
+            Some(_) => (),
+            None => {
+                self.tables
+                    .insert(table.clone(), SpeedboatCommitBuilder::new(table));
+            }
+        }
+        self.tables.get_mut(table).unwrap()
+    }
+}
+
+#[derive(Serialize)]
+#[allow(dead_code)]
+struct CreateSingleSuccessResult {}
+
+#[derive(Serialize)]
+#[allow(dead_code)]
+struct CreateSingleErrorResult {}
+
+pub async fn create_single(
+    index: &String,
+    doc_id: &String,
+    payload: &String,
+) -> Result<ElasticSearchResponse, IngestError> {
+    create_single_worker(index, doc_id, payload).await
+}
+
+pub async fn index_single(
+    index: &String,
+    doc_id: Option<&String>,
+    payload: &String,
+) -> Result<ElasticSearchResponse, IngestError> {
+    index_single_worker(index, doc_id.cloned(), payload).await
+}
+
+pub async fn upsert_single(
+    index: &String,
+    doc_id: &String,
+    payload: &String,
+) -> Result<ElasticSearchResponse, IngestError> {
+    update_single_worker(index, doc_id, payload).await
+}
+
+const USE_SPEEDBOAT_S3: bool = true;
+
+#[derive(Serialize)]
+struct SpeedboatOrphanMarker {
+    orphan_id: String,
+    table_name: String,
+    metadata_commit_error: String,
+    created_at_ms: i64,
+    speedboat_commit: SpeedboatCommit,
+}
+
+fn speedboat_orphan_marker_path(table: &String, orphan_id: &String) -> String {
+    if USE_SPEEDBOAT_S3 {
+        format!(
+            "{}/orphans/{}/{}.json",
+            data_access::s3_ingest_base_path(),
+            table,
+            orphan_id
+        )
+    } else {
+        format!("tests/data/ingest/orphans/{table}/{orphan_id}.json")
+    }
+}
+
+fn next_speedboat_segment(
+    buffer: &WriteBuffer,
+    index: &String,
+    label: &String,
+) -> Result<SpeedboatSegmentFile, IngestError> {
+    let segment_id = buffer.stable_segment_id(index, label)?;
+    let file_path = if USE_SPEEDBOAT_S3 {
+        format!(
+            "{}/{}/{}/{}",
+            data_access::s3_ingest_base_path(),
+            index,
+            label,
+            segment_id
+        )
+    } else {
+        format!("tests/data/ingest/{}/{}/{}", index, label, segment_id)
+    };
+    Ok(SpeedboatSegmentFile {
+        segment_id,
+        file_path,
+        size: 0,
+    })
+}
+
+async fn write_speedboat_orphan_marker(
+    table: &String,
+    speedboat_commit: &SpeedboatCommit,
+    error: &str,
+) -> Result<(), IngestError> {
+    let orphan_id = IdInstance::next_id().to_string();
+    let marker = SpeedboatOrphanMarker {
+        orphan_id: orphan_id.clone(),
+        table_name: table.clone(),
+        metadata_commit_error: error.to_string(),
+        created_at_ms: chrono::Utc::now().timestamp_millis(),
+        speedboat_commit: speedboat_commit.clone(),
+    };
+    let marker_bytes = serde_json::to_vec(&marker).map_err(|e| IngestError {
+        message: format!("Failed to serialize speedboat orphan marker: {e}"),
+    })?;
+
+    if USE_SPEEDBOAT_S3 {
+        let marker_path = speedboat_orphan_marker_path(table, &orphan_id);
+        data_access::put_s3_file(&marker_path, &marker_bytes)
+            .await
+            .map_err(|e| IngestError {
+                message: format!("Failed to write speedboat orphan marker: {e}"),
+            })?;
+    } else {
+        let marker_dir = format!("tests/data/ingest/orphans/{}", table);
+        fs::create_dir_all(&marker_dir).map_err(|e| IngestError {
+            message: format!("Failed to create speedboat orphan marker directory: {e}"),
+        })?;
+        let marker_path = speedboat_orphan_marker_path(table, &orphan_id);
+        fs::write(&marker_path, marker_bytes).map_err(|e| IngestError {
+            message: format!("Failed to write speedboat orphan marker: {e}"),
+        })?;
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn write_to_file(
+    buffer: &WriteBuffer,
+    index: &String,
+    label: &String,
+) -> Result<SpeedboatSegmentFile, IngestError> {
+    let mut segment = next_speedboat_segment(buffer, index, label)?;
+    if USE_SPEEDBOAT_S3 {
+        let size = buffer.write_to_json_s3(&segment.file_path).await?;
+        segment.size = size;
+        Ok(segment)
+    } else {
+        let write_to_file_result = buffer.write_to_file(&segment.file_path);
+        //tracing::info!("Ingest: op {} on table {} wrote {} records", label, index, buffer.num_records());
+
+        let size = match write_to_file_result {
+            Ok(size) => size,
+            Err(_) => {
+                return Err(IngestError {
+                    message: "File error".to_string(),
+                });
+            }
+        };
+        segment.size = size;
+        Ok(segment)
+    }
+}
+
+pub(crate) async fn commit_speedboat(
+    table: &String,
+    inserts_and_updates: &WriteBuffer,
+    deletes: &WriteBuffer,
+    compaction: Option<String>,
+    commit_type: &String,
+) -> Result<(), IngestError> {
+    let mut table_infos = vec![];
+    if inserts_and_updates.lines.len() != 0 {
+        let insert_update_segment = write_to_file(inserts_and_updates, table, commit_type).await?;
+        table_infos.push(SpeedboatCommitTableInfo::from_segments(
+            commit_type.clone(),
+            table.clone(),
+            vec![insert_update_segment],
+            inserts_and_updates.schema.clone(),
+        ));
+    }
+    if deletes.lines.len() != 0 {
+        let delete_segment = write_to_file(deletes, table, &"delete".to_string()).await?;
+        table_infos.push(SpeedboatCommitTableInfo::from_segments(
+            "delete".to_string(),
+            table.clone(),
+            vec![delete_segment],
+            deletes.schema.clone(),
+        ));
+    }
+    let speedboat_commit = SpeedboatCommit {
+        type_files: table_infos,
+        compaction: compaction.clone(),
+    };
+    match STATE_PROVIDER.speedboat_commit(&speedboat_commit).await {
+        Ok(_) => (),
+        Err(error) => {
+            if let Err(marker_error) =
+                write_speedboat_orphan_marker(table, &speedboat_commit, &error.to_string()).await
+            {
+                tracing::error!(
+                    "Failed to persist speedboat orphan marker after metadata commit failure: {}",
+                    marker_error
+                );
+            }
+            return Err(IngestError {
+                message: format!(
+                    "Uploaded speedboat segments but failed to commit metadata: {}",
+                    error
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+async fn get_existing_docs(
+    index: &String,
+    doc_ids: &Vec<String>,
+) -> Result<SerdeValueResult, IngestError> {
+    let docs = match load_command_raw_result(
+        CommandContext {},
+        Arc::new(LookupById::new(&index, &doc_ids)),
+    )
+    .await
+    {
+        Ok(lcrr) => match lcrr {
+            Some(raw_table) => {
+                let df = match data_access::execute_sql(&format!("SELECT * from {raw_table}")).await
+                {
+                    Ok(df) => df,
+                    Err(_) => panic!("weird"),
+                };
+
+                let serde_result = df_to_serde_value(&df).await.map_err(|e| IngestError {
+                    message: e.message.clone(),
+                })?;
+                data_access::drop(&raw_table).await;
+                SerdeValueResult {
+                    values: dedupe_lookup_docs(doc_ids, serde_result.values),
+                    schema: serde_result.schema,
+                }
+            }
+            None => SerdeValueResult {
+                values: vec![],
+                schema: None,
+            },
+        },
+        Err(_) => panic!("weird"),
+    };
+    Ok(docs)
+}
+
+fn lookup_record_is_newer(candidate: &Value, current: &Value) -> bool {
+    let candidate_seq_no = candidate
+        .get("_seq_no")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let current_seq_no = current
+        .get("_seq_no")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    if candidate_seq_no != current_seq_no {
+        return candidate_seq_no > current_seq_no;
+    }
+
+    let candidate_version = candidate
+        .get("_version")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let current_version = current
+        .get("_version")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    candidate_version > current_version
+}
+
+fn dedupe_lookup_docs(doc_ids: &[String], values: Vec<Value>) -> Vec<Value> {
+    let mut by_id: HashMap<String, Value> = HashMap::new();
+    let mut passthrough = vec![];
+
+    for value in values {
+        let Some(doc_id) = value.get("_id").and_then(Value::as_str) else {
+            passthrough.push(value);
+            continue;
+        };
+
+        match by_id.get_mut(doc_id) {
+            Some(existing) => {
+                if lookup_record_is_newer(&value, existing) {
+                    *existing = value;
+                }
+            }
+            None => {
+                by_id.insert(doc_id.to_string(), value);
+            }
+        }
+    }
+
+    let mut deduped = vec![];
+    for doc_id in doc_ids {
+        if let Some(value) = by_id.remove(doc_id) {
+            deduped.push(value);
+        }
+    }
+    deduped.extend(by_id.into_values());
+    deduped.extend(passthrough);
+    deduped
+}
+
+fn insert_record(
+    buffer: &mut SpeedboatCommitBuilder,
+    doc_id: String,
+    version: u64,
+    doc: &Value,
+    status: Option<u32>,
+) {
+    buffer.insert(&RecordInput::new(doc_id, version, doc, status));
+}
+
+fn primary_operation<'a>(
+    operations: &'a [OperationResult],
+) -> Result<&'a OperationResult, IngestError> {
+    operations
+        .iter()
+        .find(|operation| operation.result != "delete")
+        .or_else(|| operations.first())
+        .ok_or_else(|| IngestError {
+            message: "Mutation commit returned no operations".to_string(),
+        })
+}
+
+fn replace_record(
+    buffer: &mut SpeedboatCommitBuilder,
+    existing_doc: &FullRecord,
+    doc: &Value,
+    status: Option<u32>,
+) {
+    let mut updated_doc = RecordInput::new(
+        existing_doc.record_input.id().clone(),
+        existing_doc.record_input.version() + 1,
+        doc,
+        status,
+    );
+    updated_doc.ensure_source();
+    buffer.update(&updated_doc);
+    buffer.delete(&RecordDelete::new(
+        existing_doc.record_input.id(),
+        existing_doc.seq_no,
+        existing_doc.record_input.version(),
+    ));
+}
+
+enum UpdateOutcome {
+    Created,
+    Updated,
+}
+
+fn apply_update_request(
+    buffer: &mut SpeedboatCommitBuilder,
+    doc_id: &String,
+    existing_doc: Option<FullRecord>,
+    update_request: &UpdateBody,
+    created_status: Option<u32>,
+    updated_status: Option<u32>,
+) -> Result<UpdateOutcome, IngestError> {
+    if update_request.script.is_some() || update_request.scripted_upsert == Some(true) {
+        return Err(IngestError {
+            message: "Scripted document updates are not implemented".to_string(),
+        });
+    }
+
+    if let Some(mut existing_doc) = existing_doc {
+        let Some(doc_patch) = update_request.doc.as_ref() else {
+            return Err(IngestError {
+                message: "Document update without a doc payload is not implemented".to_string(),
+            });
+        };
+        existing_doc.record_input.ensure_source();
+        let merged_doc = merge_source(existing_doc.record_input.source().unwrap(), doc_patch);
+        replace_record(buffer, &existing_doc, &merged_doc, updated_status);
+        return Ok(UpdateOutcome::Updated);
+    }
+
+    if update_request.doc_as_upsert.unwrap_or(false) {
+        let Some(doc) = update_request.doc.as_ref() else {
+            return Err(IngestError {
+                message: "doc_as_upsert requires a doc payload".to_string(),
+            });
+        };
+        insert_record(buffer, doc_id.clone(), 1, doc, created_status);
+        return Ok(UpdateOutcome::Created);
+    }
+
+    if let Some(upsert_doc) = update_request.upsert.as_ref() {
+        insert_record(buffer, doc_id.clone(), 1, upsert_doc, created_status);
+        return Ok(UpdateOutcome::Created);
+    }
+
+    Err(IngestError {
+        message: "Document update requires an existing document or an upsert payload".to_string(),
+    })
+}
+
+async fn create_single_worker(
+    index: &String,
+    doc_id: &String,
+    payload: &String,
+) -> Result<ElasticSearchResponse, IngestError> {
+    let table_description: TableDescription = match describe_table_log_error_then_none(&index).await
+    {
+        Some(t) => t,
+        None => {
+            return Err(IngestError {
+                message: "Index does not exist".to_string(),
+            });
+        }
+    };
+    let doc: Result<Value, serde_json::Error> = serde_json::from_str(payload);
+    match doc {
+        Ok(valid_doc) => {
+            let docs =
+                get_existing_docs(&table_description.name, &vec![doc_id.to_string()]).await?;
+
+            if docs.values.len() != 0 {
+                // TODO: get version from existing doc
+                let response = SingleDocCreateFailedResult {
+                    error: ErrorDetails::single_cause(
+                        &"version_conflict_engine_exception".to_string(),
+                        &format!(
+                            "[{}]: version conflict, document already exists (current version [{}])",
+                            doc_id, 1
+                        ),
+                        Some("what is an index uuid?".to_string()),
+                        Some("1".to_string()),
+                        Some(index.to_string()),
+                    ),
+                    status: 409,
+                };
+                return Ok(ElasticSearchResponse {
+                    status: StatusCode::CONFLICT,
+                    mime: mime::APPLICATION_JSON,
+                    body: serde_json::to_string(&response).unwrap(),
+                    headers: vec![],
+                });
+            };
+
+            let mut buffer = SpeedboatCommitBuilder::new(index);
+            insert_record(&mut buffer, doc_id.clone(), 1, &valid_doc, None);
+
+            let commit_result = buffer.commit().await?;
+            assert_eq!(commit_result.operations.len(), 1);
+            let headers = vec![(
+                LOCATION,
+                format!(
+                    "/{}/_doc/{}",
+                    table_description.name,
+                    url_escape::encode_userinfo(doc_id)
+                ),
+            )];
+            Ok(ElasticSearchResponse {
+                status: StatusCode::CREATED,
+                mime: MIME_ES_JSON.clone(),
+                body: serde_json::to_string(&commit_result.operations[0]).unwrap(),
+                headers: headers,
+            })
+        }
+        Err(e) => {
+            let error = format!("{}", e);
+            println!("{}", error);
+            Ok(ElasticSearchResponse {
+                status: StatusCode::BAD_REQUEST,
+                mime: mime::APPLICATION_JSON,
+                body: "Bad request".to_string(),
+                headers: vec![],
+            })
+        }
+    }
+}
+
+async fn index_single_worker(
+    index: &String,
+    doc_id: Option<String>,
+    payload: &String,
+) -> Result<ElasticSearchResponse, IngestError> {
+    let table_description: TableDescription = match describe_table_log_error_then_none(&index).await
+    {
+        Some(t) => t,
+        None => {
+            return Err(IngestError {
+                message: "Index does not exist".to_string(),
+            });
+        }
+    };
+    let doc: Result<Value, serde_json::Error> = serde_json::from_str(payload);
+    match doc {
+        Ok(valid_doc) => {
+            let resolved_doc_id = doc_id.clone().unwrap_or_else(|| UuidB64::new().to_string());
+            let mut buffer = SpeedboatCommitBuilder::new(index);
+            let status = if doc_id.is_some() {
+                let docs =
+                    get_existing_docs(&table_description.name, &vec![resolved_doc_id.clone()])
+                        .await?;
+                if docs.values.is_empty() {
+                    insert_record(&mut buffer, resolved_doc_id.clone(), 1, &valid_doc, None);
+                    StatusCode::CREATED
+                } else {
+                    assert_eq!(docs.values.len(), 1);
+                    let existing_doc = FullRecord::from_record(&docs.values[0]);
+                    replace_record(&mut buffer, &existing_doc, &valid_doc, None);
+                    StatusCode::OK
+                }
+            } else {
+                insert_record(&mut buffer, resolved_doc_id.clone(), 1, &valid_doc, None);
+                StatusCode::CREATED
+            };
+
+            let result = buffer.commit().await?;
+            let primary_operation = primary_operation(&result.operations)?;
+            let headers = vec![(
+                LOCATION,
+                format!(
+                    "/{}/_doc/{}",
+                    table_description.name,
+                    url_escape::encode_userinfo(&resolved_doc_id)
+                ),
+            )];
+            Ok(ElasticSearchResponse {
+                status,
+                mime: MIME_ES_JSON.clone(),
+                body: serde_json::to_string(primary_operation).unwrap(),
+                headers,
+            })
+        }
+        Err(_) => Ok(ElasticSearchResponse {
+            status: StatusCode::BAD_REQUEST,
+            mime: mime::APPLICATION_JSON,
+            body: "Bad request".to_string(),
+            headers: vec![],
+        }),
+    }
+}
+
+fn merge_source(existing_doc: &Value, update_doc: &Value) -> Value {
+    assert!(existing_doc.is_object());
+    assert!(update_doc.is_object());
+
+    let mut new_doc = existing_doc.clone();
+    let new_doc_map = new_doc.as_object_mut().unwrap();
+    for (key, value) in update_doc.as_object().unwrap().iter() {
+        match new_doc_map.get(key) {
+            Some(new_doc_value) => {
+                if new_doc_value.is_object() && value.is_object() {
+                    new_doc_map.insert(key.clone(), merge_source(new_doc_value, value));
+                } else {
+                    new_doc_map.insert(key.clone(), value.clone());
+                }
+            }
+            None => {
+                new_doc_map.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    new_doc
+}
+
+async fn update_single_worker(
+    index: &String,
+    doc_id: &String,
+    payload: &String,
+) -> Result<ElasticSearchResponse, IngestError> {
+    let table_description: TableDescription = match STATE_PROVIDER.describe_table(&index).await {
+        Ok(t) => match t {
+            Some(t) => t,
+            None => {
+                return Err(IngestError {
+                    message: "Index does not exist".to_string(),
+                });
+            }
+        },
+        Err(e) => {
+            log_service_err(e);
+            return Err(IngestError {
+                message: "Index does not exist".to_string(),
+            });
+        }
+    };
+
+    let update_request: UpdateBody = match serde_json::from_str(payload) {
+        Ok(body) => body,
+        Err(_) => {
+            return Ok(ElasticSearchResponse {
+                status: StatusCode::BAD_REQUEST,
+                mime: mime::APPLICATION_JSON,
+                body: "Bad request".to_string(),
+                headers: vec![],
+            });
+        }
+    };
+
+    let docs = get_existing_docs(&table_description.name, &vec![doc_id.to_string()]).await?;
+
+    let mut buffer = SpeedboatCommitBuilder::new(&table_description.name);
+    let existing_doc = if docs.values.is_empty() {
+        None
+    } else {
+        assert_eq!(docs.values.len(), 1);
+        Some(FullRecord::from_record(&docs.values[0]))
+    };
+    let update_outcome = apply_update_request(
+        &mut buffer,
+        doc_id,
+        existing_doc,
+        &update_request,
+        None,
+        None,
+    )?;
+
+    let result = buffer.commit().await?;
+    let primary_operation = primary_operation(&result.operations)?;
+    let headers = vec![(
+        LOCATION,
+        format!(
+            "/{}/_doc/{}",
+            table_description.name,
+            url_escape::encode_userinfo(doc_id)
+        ),
+    )];
+    Ok(ElasticSearchResponse {
+        status: match update_outcome {
+            UpdateOutcome::Created => StatusCode::CREATED,
+            UpdateOutcome::Updated => StatusCode::OK,
+        },
+        mime: MIME_ES_JSON.clone(),
+        body: serde_json::to_string(primary_operation).unwrap(),
+        headers: headers,
+    })
+}
+
+pub async fn delete(index: &String, doc_id: &String) -> Result<ElasticSearchResponse, IngestError> {
+    let table_description: TableDescription = match describe_table_log_error_then_none(&index).await
+    {
+        Some(t) => t,
+        None => {
+            return Err(IngestError {
+                message: "Index does not exist".to_string(),
+            });
+        }
+    };
+
+    let docs = get_existing_docs(&table_description.name, &vec![doc_id.clone()]).await?;
+    if docs.values.len() == 0 {
+        let result = OperationResult {
+            _index: index.clone(),
+            _id: doc_id.clone(),
+            _version: 1,
+            result: "not_found".to_string(),
+            _shards: Shards {
+                total: 1,
+                successful: 1,
+                failed: 0,
+            },
+            _seq_no: 0,
+            _primary_term: 1,
+            status: None,
+            get: None,
+        };
+        return Ok(ElasticSearchResponse {
+            status: StatusCode::NOT_FOUND,
+            mime: mime::APPLICATION_JSON,
+            body: serde_json::to_string(&result).unwrap(),
+            headers: vec![],
+        });
+    }
+    let mut buffer = SpeedboatCommitBuilder::new(&table_description.name);
+    let target_seq_no = docs.values[0].get("_seq_no").unwrap().as_u64().unwrap();
+    let target_version = docs.values[0].get("_version").unwrap().as_u64().unwrap();
+    buffer.delete(&RecordDelete::new(doc_id, target_seq_no, target_version));
+    let result = buffer.commit().await?;
+    assert_eq!(result.operations.len(), 1);
+    Ok(ElasticSearchResponse {
+        status: StatusCode::OK,
+        mime: mime::APPLICATION_JSON,
+        body: serde_json::to_string(&result.operations[0]).unwrap(),
+        headers: vec![],
+    })
+}
+
+pub(crate) async fn ingest(
+    provided_index: Option<&String>,
+    payload: &String,
+) -> Result<IngestResult, IngestError> {
+    let payload_split = payload.lines();
+    let mut ingest_result = IngestResult::new();
+    let mut iterator = payload_split.into_iter().peekable();
+    while iterator.peek() != None {
+        let command_str = iterator.next().unwrap();
+        if command_str.len() == 0 {
+            continue;
+        }
+
+        let deser_command: Result<IngestCommand, serde_json::Error> =
+            serde_json::from_str(command_str);
+        match deser_command {
+            // TODO: we could bulkify the fetching of the docs to be updated
+            Ok(command) => match command {
+                IngestCommand::Create(c) => {
+                    let index = match &c.create.index {
+                        Some(i) => {
+                            match provided_index {
+                                Some(pi) => {
+                                    if i != pi {
+                                        return Err(IngestError {
+                                            message: "Can not provide a index in create here"
+                                                .to_string(),
+                                        });
+                                    }
+                                }
+                                None => (),
+                            }
+                            i
+                        }
+                        None => match provided_index {
+                            Some(pi) => pi,
+                            None => {
+                                return Err(IngestError {
+                                    message: "Must provide index name".to_string(),
+                                });
+                            }
+                        },
+                    };
+                    let table_description = match describe_table_log_error_then_none(&index).await {
+                        Some(t) => t,
+                        None => {
+                            return Err(IngestError {
+                                message: "Index does not exist".to_string(),
+                            });
+                        }
+                    };
+                    let doc_str = match iterator.next() {
+                        Some(ds) => ds.trim(),
+                        None => {
+                            return Err(IngestError {
+                                message: "Bulk create is missing a source document line"
+                                    .to_string(),
+                            });
+                        }
+                    };
+                    let doc: Result<Value, serde_json::Error> = serde_json::from_str(doc_str);
+                    match doc {
+                        Ok(valid_doc) => {
+                            ingest_create(
+                                &c,
+                                &valid_doc,
+                                1,
+                                Some(201),
+                                ingest_result.get(&table_description.name),
+                            );
+                        }
+                        Err(e) => {
+                            return Err(IngestError {
+                                message: format!("Serde error doc: {}", e),
+                            });
+                        }
+                    }
+                }
+                IngestCommand::Index(i) => {
+                    let index = match &i.index.index {
+                        Some(i) => {
+                            match provided_index {
+                                Some(pi) => {
+                                    if i != pi {
+                                        return Err(IngestError {
+                                            message: "Can not provide a index in create here"
+                                                .to_string(),
+                                        });
+                                    }
+                                }
+                                None => (),
+                            }
+                            i
+                        }
+                        None => match provided_index {
+                            Some(pi) => pi,
+                            None => {
+                                return Err(IngestError {
+                                    message: "Must provide index name".to_string(),
+                                });
+                            }
+                        },
+                    };
+                    let table_description = match describe_table_log_error_then_none(&index).await {
+                        Some(t) => t,
+                        None => {
+                            return Err(IngestError {
+                                message: "Index does not exist".to_string(),
+                            });
+                        }
+                    };
+                    let doc_str = match iterator.next() {
+                        Some(ds) => ds.trim(),
+                        None => {
+                            return Err(IngestError {
+                                message: "Bulk index is missing a source document line".to_string(),
+                            });
+                        }
+                    };
+                    let doc: Result<Value, serde_json::Error> = serde_json::from_str(doc_str);
+                    match doc {
+                        Ok(valid_doc) => {
+                            let resolved_doc_id = i
+                                .index
+                                .id
+                                .clone()
+                                .unwrap_or_else(|| UuidB64::new().to_string());
+                            let docs = get_existing_docs(
+                                &table_description.name,
+                                &vec![resolved_doc_id.clone()],
+                            )
+                            .await?;
+                            let buffer = ingest_result.get(&table_description.name);
+                            if docs.values.is_empty() {
+                                insert_record(buffer, resolved_doc_id, 1, &valid_doc, Some(201));
+                            } else {
+                                assert_eq!(docs.values.len(), 1);
+                                let existing_doc = FullRecord::from_record(&docs.values[0]);
+                                replace_record(buffer, &existing_doc, &valid_doc, Some(200));
+                            }
+                        }
+                        Err(e) => {
+                            return Err(IngestError {
+                                message: format!("Serde error doc: {}", e),
+                            });
+                        }
+                    }
+                }
+                IngestCommand::Update(u) => {
+                    let index = match &u.update.index {
+                        Some(i) => {
+                            match provided_index {
+                                Some(pi) => {
+                                    if i != pi {
+                                        return Err(IngestError {
+                                            message: "Can not provide a index in create here"
+                                                .to_string(),
+                                        });
+                                    }
+                                }
+                                None => (),
+                            }
+                            i
+                        }
+                        None => match provided_index {
+                            Some(pi) => pi,
+                            None => {
+                                return Err(IngestError {
+                                    message: "Must provide index name".to_string(),
+                                });
+                            }
+                        },
+                    };
+                    let table_description = match describe_table_log_error_then_none(&index).await {
+                        Some(t) => t,
+                        None => {
+                            return Err(IngestError {
+                                message: "Index does not exist".to_string(),
+                            });
+                        }
+                    };
+                    let doc_id = match u.update.id.as_ref() {
+                        Some(id) => id.clone(),
+                        None => {
+                            return Err(IngestError {
+                                message: "Bulk update requires an _id".to_string(),
+                            });
+                        }
+                    };
+                    let existing_docs =
+                        get_existing_docs(&table_description.name, &vec![doc_id.clone()]).await?;
+                    let doc_str = match iterator.next() {
+                        Some(ds) => ds.trim(),
+                        None => {
+                            return Err(IngestError {
+                                message: "Bulk update is missing an update body line".to_string(),
+                            });
+                        }
+                    };
+                    let doc: Result<UpdateBody, serde_json::Error> = serde_json::from_str(doc_str);
+                    match doc {
+                        Ok(update_request) => {
+                            let existing_doc = if existing_docs.values.is_empty() {
+                                None
+                            } else {
+                                assert_eq!(existing_docs.values.len(), 1);
+                                Some(FullRecord::from_record(&existing_docs.values[0]))
+                            };
+                            let _ = apply_update_request(
+                                ingest_result.get(index),
+                                &doc_id,
+                                existing_doc,
+                                &update_request,
+                                Some(201),
+                                Some(200),
+                            )?;
+                        }
+                        Err(e) => {
+                            return Err(IngestError {
+                                message: format!("Serde error doc: {}", e),
+                            });
+                        }
+                    }
+                }
+                IngestCommand::Delete(d) => {
+                    let index = match &d.delete.index {
+                        Some(i) => {
+                            match provided_index {
+                                Some(pi) => {
+                                    if i != pi {
+                                        return Err(IngestError {
+                                            message: "Can not provide a index in create here"
+                                                .to_string(),
+                                        });
+                                    }
+                                }
+                                None => (),
+                            }
+                            i
+                        }
+                        None => match provided_index {
+                            Some(pi) => pi,
+                            None => {
+                                return Err(IngestError {
+                                    message: "Must provide index name".to_string(),
+                                });
+                            }
+                        },
+                    };
+                    let table_description = match describe_table_log_error_then_none(&index).await {
+                        Some(t) => t,
+                        None => {
+                            return Err(IngestError {
+                                message: "Index does not exist".to_string(),
+                            });
+                        }
+                    };
+                    let doc_id = match d.delete.id.as_ref() {
+                        Some(id) => id.clone(),
+                        None => {
+                            return Err(IngestError {
+                                message: "Bulk delete requires an _id".to_string(),
+                            });
+                        }
+                    };
+                    let existing_docs =
+                        get_existing_docs(&table_description.name, &vec![doc_id]).await?;
+                    if let Some(existing_doc) = existing_docs.values.first() {
+                        let existing_doc = FullRecord::from_record(existing_doc);
+                        ingest_result.get(index).delete(&RecordDelete::new(
+                            existing_doc.record_input.id(),
+                            existing_doc.seq_no,
+                            existing_doc.record_input.version(),
+                        ));
+                    }
+                }
+            },
+            Err(e) => {
+                return Err(IngestError {
+                    message: format!("Serde error command: {}", e),
+                });
+            }
+        }
+    }
+
+    Ok(ingest_result)
+}
+
+struct IngestRequest {
+    response: Vec<OperationResult>,
+    respond_to: Option<oneshot::Sender<Result<BulkResult, IngestError>>>,
+}
+
+struct IngestActor {
+    tables: HashMap<String, SpeedboatCommitBuilder>,
+    requests: Vec<IngestRequest>,
+    receiver: mpsc::Receiver<IngestActorMessage>,
+}
+
+enum IngestActorMessage {
+    IngestSingleTable {
+        table: String,
+        payload: String,
+        respond_to: oneshot::Sender<Result<BulkResult, IngestError>>,
+    },
+    Ingest {
+        payload: String,
+        respond_to: oneshot::Sender<Result<BulkResult, IngestError>>,
+    },
+    Commit {
+        respond_to: oneshot::Sender<()>,
+    },
+}
+
+impl IngestActor {
+    fn new(receiver: mpsc::Receiver<IngestActorMessage>) -> Self {
+        IngestActor {
+            tables: HashMap::new(),
+            requests: vec![],
+            receiver: receiver,
+        }
+    }
+
+    fn merge_table_buffers(&mut self, tables: &HashMap<String, SpeedboatCommitBuilder>) -> () {
+        for (table, buffer_builder) in tables {
+            match self.tables.get_mut(table) {
+                Some(buffer) => buffer.extend(buffer_builder),
+                None => {
+                    self.tables.insert(table.clone(), buffer_builder.clone());
+                }
+            }
+        }
+    }
+
+    async fn do_ingest(
+        &mut self,
+        table: Option<&String>,
+        payload: &String,
+        respond_to: oneshot::Sender<Result<BulkResult, IngestError>>,
+    ) -> () {
+        let buffer_items = ingest(table, &payload).await;
+        match buffer_items {
+            Ok(bi) => {
+                let request = IngestRequest {
+                    response: bi.operations,
+                    respond_to: Some(respond_to),
+                };
+                self.requests.push(request);
+                self.merge_table_buffers(&bi.tables);
+            }
+            Err(e) => {
+                let _ = respond_to.send(Err(e));
+            }
+        };
+    }
+
+    async fn handle_message(&mut self, msg: IngestActorMessage) -> () {
+        match msg {
+            IngestActorMessage::IngestSingleTable {
+                table,
+                payload,
+                respond_to,
+            } => self.do_ingest(Some(&table), &payload, respond_to).await,
+            IngestActorMessage::Ingest {
+                payload,
+                respond_to,
+            } => self.do_ingest(None, &payload, respond_to).await,
+            IngestActorMessage::Commit { respond_to } => {
+                let _ = self.commit().await;
+                let _ = respond_to.send(());
+            }
+        }
+    }
+
+    async fn commit(&mut self) -> Result<(), IngestError> {
+        if self.requests.len() == 0 {
+            return Ok(());
+        }
+
+        for (_, buffer_builder) in self.tables.iter_mut() {
+            buffer_builder.commit().await?;
+        }
+
+        for request in self.requests.iter_mut() {
+            // TODO: track and report time correctly
+            let _ = request
+                .respond_to
+                .take()
+                .unwrap()
+                .send(Ok(BulkResult::success(0, request.response.clone())));
+        }
+
+        self.requests.clear();
+        self.tables.clear();
+
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct IngestHandle {
+    sender: mpsc::Sender<IngestActorMessage>,
+}
+
+async fn run_ingest_message_pump(mut actor: IngestActor) {
+    while let Some(msg) = actor.receiver.recv().await {
+        actor.handle_message(msg).await;
+    }
+}
+
+impl IngestHandle {
+    pub fn new() -> Self {
+        let (sender, receiver) = mpsc::channel(8);
+        let actor: IngestActor = IngestActor::new(receiver);
+        tokio::spawn(run_ingest_message_pump(actor));
+        Self { sender }
+    }
+
+    pub async fn send(&self, payload: &String) -> Result<BulkResult, IngestError> {
+        let (send, recv) = oneshot::channel();
+        let msg = IngestActorMessage::Ingest {
+            payload: payload.clone(),
+            respond_to: send,
+        };
+
+        let _ = self.sender.send(msg).await;
+        match recv.await {
+            Ok(r) => r,
+            Err(_) => panic!("RecvError"),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub async fn send_single_table(
+        &self,
+        table: &String,
+        payload: &String,
+    ) -> Result<BulkResult, IngestError> {
+        let (send, recv) = oneshot::channel();
+        let msg = IngestActorMessage::IngestSingleTable {
+            table: table.clone(),
+            payload: payload.clone(),
+            respond_to: send,
+        };
+
+        let _ = self.sender.send(msg).await;
+        match recv.await {
+            Ok(r) => r,
+            Err(_) => panic!("RecvError"),
+        }
+    }
+
+    pub async fn commit(&self) -> Result<(), RecvError> {
+        let (send, recv) = oneshot::channel();
+        let msg = IngestActorMessage::Commit { respond_to: send };
+
+        let _ = self.sender.send(msg).await;
+        recv.await
+    }
+}
+
+fn commit_messages() -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = INGEST_HANDLE.commit().await;
+        }
+    }
+    .boxed()
+}
+
+fn create_ingest() -> IngestHandle {
+    let handle = IngestHandle::new();
+    tokio::spawn(commit_messages());
+    handle
+}
+
+pub static INGEST_HANDLE: std::sync::LazyLock<IngestHandle> =
+    std::sync::LazyLock::new(|| create_ingest());
+
+#[cfg(test)]
+mod tests {
+    use crate::data_contract::{CreateIndexTemplateBody, PropertyInfo};
+    use crate::elastic_search_ingest::{
+        IngestCommand, WriteBuffer, next_speedboat_segment, speedboat_orphan_marker_path,
+    };
+    use serde_json::json;
+    use std::{collections::HashMap, fs};
+
+    use super::CreateIndexBody;
+
+    #[test]
+    fn test_create_deser() {
+        let empty_deser: IngestCommand = serde_json::from_str("{\"create\": {} }").unwrap();
+        match empty_deser {
+            IngestCommand::Create(c) => {
+                assert_eq!(c.create.index, None);
+                assert_eq!(c.create.id, None);
+            }
+            _ => panic!("This should be a create"),
+        }
+
+        let index_deser: IngestCommand =
+            serde_json::from_str("{\"create\": { \"_index\": \"test\" } }").unwrap();
+        match index_deser {
+            IngestCommand::Create(c) => {
+                assert_eq!(c.create.id, None);
+                match c.create.index {
+                    Some(cci) => assert_eq!(cci, "test".to_string()),
+                    _ => panic!("Should be index == test"),
+                }
+            }
+            _ => panic!("This should be a create"),
+        }
+    }
+
+    #[test]
+    fn test_index_deser() {
+        let empty_deser: IngestCommand = serde_json::from_str("{\"index\": {} }").unwrap();
+        match empty_deser {
+            IngestCommand::Index(i) => {
+                assert_eq!(i.index.index, None);
+                assert_eq!(i.index.id, None);
+            }
+            _ => panic!("This should be a create"),
+        }
+    }
+
+    #[test]
+    fn test_next_speedboat_segment_uses_segment_id_in_path() {
+        let buffer = WriteBuffer::delete(vec![json!({
+            "_id": "doc-1",
+            "_id_seq_no": "doc-1:1",
+            "_version": 1
+        })]);
+        let segment =
+            next_speedboat_segment(&buffer, &"logs".to_string(), &"commit".to_string()).unwrap();
+
+        assert!(segment.file_path.contains("/logs/commit/"));
+        assert!(segment.file_path.ends_with(&segment.segment_id));
+        assert_eq!(segment.size, 0);
+    }
+
+    #[test]
+    fn test_next_speedboat_segment_is_deterministic_for_same_buffer() {
+        let buffer = WriteBuffer::delete(vec![json!({
+            "_id": "doc-1",
+            "_id_seq_no": "doc-1:1",
+            "_version": 1
+        })]);
+
+        let first =
+            next_speedboat_segment(&buffer, &"logs".to_string(), &"commit".to_string()).unwrap();
+        let second =
+            next_speedboat_segment(&buffer, &"logs".to_string(), &"commit".to_string()).unwrap();
+
+        assert_eq!(first.segment_id, second.segment_id);
+        assert_eq!(first.file_path, second.file_path);
+    }
+
+    #[test]
+    fn test_write_to_file_creates_nested_parent_directories() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "powdrr-speedboat-write-buffer-{}",
+            idgenerator::IdInstance::next_id()
+        ));
+        let nested_path = temp_dir.join("table/commit/segment");
+        let nested_path_str = nested_path.display().to_string();
+        let buffer = WriteBuffer::delete(vec![json!({
+            "_id": "doc-1",
+            "_id_seq_no": "doc-1:1",
+            "_version": 1
+        })]);
+
+        let size = buffer.write_to_file(&nested_path_str).unwrap();
+
+        assert!(size > 0);
+        assert!(nested_path.with_extension("json").exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_speedboat_orphan_marker_path_uses_orphan_prefix() {
+        let marker_path =
+            speedboat_orphan_marker_path(&"logs".to_string(), &"orphan-1".to_string());
+
+        assert_eq!(
+            marker_path,
+            "s3://warehouse/default/ingest/orphans/logs/orphan-1.json"
+        );
+    }
+
+    #[test]
+    fn test_create_index_deser() {
+        let mini_test_val = r#"{        "migrationVersion": {
+          "dynamic": "true",
+          "properties": {
+            "task": {
+              "type": "text",
+              "fields": {
+                "keyword": {
+                  "type": "keyword",
+                  "ignore_above": 256
+                }
+              }
+            }
+          }
+    }}"#;
+
+        let _mini_deser: HashMap<String, PropertyInfo> = match serde_json::from_str(mini_test_val) {
+            Ok(d) => d,
+            Err(e) => {
+                let error = format!("{}", e);
+                println!("{}", error);
+                panic!("nope");
+            }
+        };
+
+        let test_val = r#"{
+  ".kibana_task_manager_8.7.1_001": {
+    "aliases": {
+      ".kibana_task_manager": {
+        "is_hidden": true
+      },
+      ".kibana_task_manager_8.7.1": {
+        "is_hidden": true
+      }
+    },
+    "mappings": {
+      "dynamic": "strict",
+      "_meta": {
+        "migrationMappingPropertyHashes": {
+          "migrationVersion": "4a1746014a75ade3a714e1db5763276f",
+          "originId": "2f4316de49999235636386fe51dc06c1",
+          "task": "b3d0a471610ff17077e60653f422491d",
+          "updated_at": "00da57df13e94e9d98437d13ace4bfe0",
+          "references": "7997cf5a56cc02bdc9c93361bde732b0",
+          "namespace": "2f4316de49999235636386fe51dc06c1",
+          "created_at": "00da57df13e94e9d98437d13ace4bfe0",
+          "coreMigrationVersion": "2f4316de49999235636386fe51dc06c1",
+          "type": "2f4316de49999235636386fe51dc06c1",
+          "namespaces": "2f4316de49999235636386fe51dc06c1"
+        }
+      },
+      "properties": {
+        "coreMigrationVersion": {
+          "type": "keyword"
+        },
+        "created_at": {
+          "type": "date"
+        },
+        "migrationVersion": {
+          "dynamic": "true",
+          "properties": {
+            "task": {
+              "type": "text",
+              "fields": {
+                "keyword": {
+                  "type": "keyword",
+                  "ignore_above": 256
+                }
+              }
+            }
+          }
+        },
+        "namespace": {
+          "type": "keyword"
+        },
+        "namespaces": {
+          "type": "keyword"
+        },
+        "originId": {
+          "type": "keyword"
+        },
+        "references": {
+          "type": "nested",
+          "properties": {
+            "id": {
+              "type": "keyword"
+            },
+            "name": {
+              "type": "keyword"
+            },
+            "type": {
+              "type": "keyword"
+            }
+          }
+        },
+        "task": {
+          "properties": {
+            "attempts": {
+              "type": "integer"
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "ownerId": {
+              "type": "keyword"
+            },
+            "params": {
+              "type": "text"
+            },
+            "retryAt": {
+              "type": "date"
+            },
+            "runAt": {
+              "type": "date"
+            },
+            "schedule": {
+              "properties": {
+                "interval": {
+                  "type": "keyword"
+                }
+              }
+            },
+            "scheduledAt": {
+              "type": "date"
+            },
+            "scope": {
+              "type": "keyword"
+            },
+            "startedAt": {
+              "type": "date"
+            },
+            "state": {
+              "type": "text"
+            },
+            "status": {
+              "type": "keyword"
+            },
+            "taskType": {
+              "type": "keyword"
+            },
+            "traceparent": {
+              "type": "text"
+            },
+            "user": {
+              "type": "keyword"
+            }
+          }
+        },
+        "type": {
+          "type": "keyword"
+        },
+        "updated_at": {
+          "type": "date"
+        }
+      }
+    }
+  }
+}"#;
+        let deser: HashMap<String, CreateIndexBody> = match serde_json::from_str(test_val) {
+            Ok(d) => d,
+            Err(e) => {
+                let error = format!("{}", e);
+                println!("{}", error);
+                panic!("nope");
+            }
+        };
+        let index = deser.get(".kibana_task_manager_8.7.1_001").unwrap().clone();
+        assert_eq!(index.aliases.map_or_else(|| 0, |x| x.len()), 2);
+
+        /*
+                let file_content = match read_to_string("main_lib/tests/data/example_create_index.json") {
+                    Ok(f) => f,
+                    Err(_) => panic!("Missing test file")
+                };
+                let deser_file: CreateIndexBody =  match serde_json::from_str(file_content.as_str()) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let error = format!("{}", e);
+                        println!("{}", error);
+                        let _ = fs::write("main_lib/output.txt", error);
+                        panic!("nope");
+                    }
+                };
+        */
+
+        let test_val = include_str!("../tests/data/component_template_2.json");
+
+        let _deser: CreateIndexTemplateBody = match serde_json::from_str(test_val) {
+            Ok(d) => d,
+            Err(e) => {
+                let error = format!("{}", e);
+                println!("{}", error);
+                let _ = fs::write("../output.txt", error);
+                panic!("nope");
+            }
+        };
+
+        let test_val = r#"{
+  "template": {
+    "settings": {},
+    "mappings": {
+      "dynamic": "strict",
+      "properties": {
+        "monitor": {
+          "properties": {
+            "id": {
+              "type": "keyword"
+            },
+            "name": {
+              "type": "keyword"
+            },
+            "type": {
+              "type": "keyword"
+            }
+          }
+        },
+        "url": {
+          "properties": {
+            "full": {
+              "type": "keyword"
+            }
+          }
+        },
+        "observer": {
+          "properties": {
+            "geo": {
+              "properties": {
+                "name": {
+                  "type": "keyword"
+                }
+              }
+            }
+          }
+        },
+        "error": {
+          "properties": {
+            "message": {
+              "type": "text"
+            }
+          }
+        },
+        "agent": {
+          "properties": {
+            "name": {
+              "type": "keyword"
+            }
+          }
+        },
+        "tls": {
+          "properties": {
+            "server": {
+              "properties": {
+                "x509": {
+                  "properties": {
+                    "issuer": {
+                      "properties": {
+                        "common_name": {
+                          "type": "keyword"
+                        }
+                      }
+                    },
+                    "subject": {
+                      "properties": {
+                        "common_name": {
+                          "type": "keyword"
+                        }
+                      }
+                    },
+                    "not_after": {
+                      "type": "date"
+                    },
+                    "not_before": {
+                      "type": "date"
+                    }
+                  }
+                },
+                "hash": {
+                  "properties": {
+                    "sha256": {
+                      "type": "keyword"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "anomaly": {
+          "properties": {
+            "start": {
+              "type": "date"
+            },
+            "bucket_span": {
+              "properties": {
+                "minutes": {
+                  "type": "keyword"
+                }
+              }
+            }
+          }
+        },
+        "kibana": {
+          "properties": {
+            "alert": {
+              "properties": {
+                "evaluation": {
+                  "properties": {
+                    "threshold": {
+                      "type": "scaled_float",
+                      "scaling_factor": 100
+                    },
+                    "value": {
+                      "type": "scaled_float",
+                      "scaling_factor": 100
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}"#;
+
+        let _deser: CreateIndexTemplateBody = match serde_json::from_str(test_val) {
+            Ok(d) => d,
+            Err(e) => {
+                let error = format!("{}", e);
+                println!("{}", error);
+                let _ = fs::write("../output.txt", error);
+                panic!("nope");
+            }
+        };
+
+        let test_val = r#"{
+  "template": {
+    "settings": {},
+    "mappings": {
+      "dynamic": false,
+      "properties": {
+        "@timestamp": {
+          "type": "date"
+        },
+        "event": {
+          "properties": {
+            "action": {
+              "type": "keyword"
+            },
+            "kind": {
+              "type": "keyword"
+            }
+          }
+        },
+        "tags": {
+          "type": "keyword"
+        },
+        "kibana": {
+          "properties": {
+            "alert": {
+              "properties": {
+                "rule": {
+                  "properties": {
+                    "parameters": {
+                      "type": "flattened",
+                      "ignore_above": 4096
+                    },
+                    "rule_type_id": {
+                      "type": "keyword"
+                    },
+                    "consumer": {
+                      "type": "keyword"
+                    },
+                    "producer": {
+                      "type": "keyword"
+                    },
+                    "author": {
+                      "type": "keyword"
+                    },
+                    "category": {
+                      "type": "keyword"
+                    },
+                    "uuid": {
+                      "type": "keyword"
+                    },
+                    "created_at": {
+                      "type": "date"
+                    },
+                    "created_by": {
+                      "type": "keyword"
+                    },
+                    "description": {
+                      "type": "keyword"
+                    },
+                    "enabled": {
+                      "type": "keyword"
+                    },
+                    "execution": {
+                      "properties": {
+                        "uuid": {
+                          "type": "keyword"
+                        }
+                      }
+                    },
+                    "from": {
+                      "type": "keyword"
+                    },
+                    "interval": {
+                      "type": "keyword"
+                    },
+                    "license": {
+                      "type": "keyword"
+                    },
+                    "name": {
+                      "type": "keyword"
+                    },
+                    "note": {
+                      "type": "keyword"
+                    },
+                    "references": {
+                      "type": "keyword"
+                    },
+                    "rule_id": {
+                      "type": "keyword"
+                    },
+                    "rule_name_override": {
+                      "type": "keyword"
+                    },
+                    "tags": {
+                      "type": "keyword"
+                    },
+                    "to": {
+                      "type": "keyword"
+                    },
+                    "type": {
+                      "type": "keyword"
+                    },
+                    "updated_at": {
+                      "type": "date"
+                    },
+                    "updated_by": {
+                      "type": "keyword"
+                    },
+                    "version": {
+                      "type": "keyword"
+                    },
+                    "building_block_type": {
+                      "type": "keyword"
+                    },
+                    "exceptions_list": {
+                      "type": "object"
+                    },
+                    "false_positives": {
+                      "type": "keyword"
+                    },
+                    "immutable": {
+                      "type": "keyword"
+                    },
+                    "max_signals": {
+                      "type": "long"
+                    },
+                    "threat": {
+                      "properties": {
+                        "framework": {
+                          "type": "keyword"
+                        },
+                        "tactic": {
+                          "properties": {
+                            "id": {
+                              "type": "keyword"
+                            },
+                            "name": {
+                              "type": "keyword"
+                            },
+                            "reference": {
+                              "type": "keyword"
+                            }
+                          }
+                        },
+                        "technique": {
+                          "properties": {
+                            "id": {
+                              "type": "keyword"
+                            },
+                            "name": {
+                              "type": "keyword"
+                            },
+                            "reference": {
+                              "type": "keyword"
+                            },
+                            "subtechnique": {
+                              "properties": {
+                                "id": {
+                                  "type": "keyword"
+                                },
+                                "name": {
+                                  "type": "keyword"
+                                },
+                                "reference": {
+                                  "type": "keyword"
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "timeline_id": {
+                      "type": "keyword"
+                    },
+                    "timeline_title": {
+                      "type": "keyword"
+                    },
+                    "timestamp_override": {
+                      "type": "keyword"
+                    }
+                  }
+                },
+                "uuid": {
+                  "type": "keyword"
+                },
+                "instance": {
+                  "properties": {
+                    "id": {
+                      "type": "keyword"
+                    }
+                  }
+                },
+                "start": {
+                  "type": "date"
+                },
+                "time_range": {
+                  "type": "date_range",
+                  "format": "epoch_millis||strict_date_optional_time"
+                },
+                "end": {
+                  "type": "date"
+                },
+                "duration": {
+                  "properties": {
+                    "us": {
+                      "type": "long"
+                    }
+                  }
+                },
+                "severity": {
+                  "type": "keyword"
+                },
+                "status": {
+                  "type": "keyword"
+                },
+                "flapping": {
+                  "type": "boolean"
+                },
+                "risk_score": {
+                  "type": "float"
+                },
+                "workflow_status": {
+                  "type": "keyword"
+                },
+                "workflow_user": {
+                  "type": "keyword"
+                },
+                "workflow_reason": {
+                  "type": "keyword"
+                },
+                "system_status": {
+                  "type": "keyword"
+                },
+                "action_group": {
+                  "type": "keyword"
+                },
+                "reason": {
+                  "type": "keyword"
+                },
+                "case_ids": {
+                  "type": "keyword"
+                },
+                "suppression": {
+                  "properties": {
+                    "terms": {
+                      "properties": {
+                        "field": {
+                          "type": "keyword"
+                        },
+                        "value": {
+                          "type": "keyword"
+                        }
+                      }
+                    },
+                    "start": {
+                      "type": "date"
+                    },
+                    "end": {
+                      "type": "date"
+                    },
+                    "docs_count": {
+                      "type": "long"
+                    }
+                  }
+                },
+                "last_detected": {
+                  "type": "date"
+                },
+                "ancestors": {
+                  "type": "object",
+                  "properties": {
+                    "depth": {
+                      "type": "long"
+                    },
+                    "id": {
+                      "type": "keyword"
+                    },
+                    "index": {
+                      "type": "keyword"
+                    },
+                    "rule": {
+                      "type": "keyword"
+                    },
+                    "type": {
+                      "type": "keyword"
+                    }
+                  }
+                },
+                "building_block_type": {
+                  "type": "keyword"
+                },
+                "depth": {
+                  "type": "long"
+                },
+                "group": {
+                  "properties": {
+                    "id": {
+                      "type": "keyword"
+                    },
+                    "index": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "original_event": {
+                  "properties": {
+                    "action": {
+                      "type": "keyword"
+                    },
+                    "agent_id_status": {
+                      "type": "keyword"
+                    },
+                    "category": {
+                      "type": "keyword"
+                    },
+                    "code": {
+                      "type": "keyword"
+                    },
+                    "created": {
+                      "type": "date"
+                    },
+                    "dataset": {
+                      "type": "keyword"
+                    },
+                    "duration": {
+                      "type": "keyword"
+                    },
+                    "end": {
+                      "type": "date"
+                    },
+                    "hash": {
+                      "type": "keyword"
+                    },
+                    "id": {
+                      "type": "keyword"
+                    },
+                    "ingested": {
+                      "type": "date"
+                    },
+                    "kind": {
+                      "type": "keyword"
+                    },
+                    "module": {
+                      "type": "keyword"
+                    },
+                    "original": {
+                      "type": "keyword"
+                    },
+                    "outcome": {
+                      "type": "keyword"
+                    },
+                    "provider": {
+                      "type": "keyword"
+                    },
+                    "reason": {
+                      "type": "keyword"
+                    },
+                    "reference": {
+                      "type": "keyword"
+                    },
+                    "risk_score": {
+                      "type": "float"
+                    },
+                    "risk_score_norm": {
+                      "type": "float"
+                    },
+                    "sequence": {
+                      "type": "long"
+                    },
+                    "severity": {
+                      "type": "long"
+                    },
+                    "start": {
+                      "type": "date"
+                    },
+                    "timezone": {
+                      "type": "keyword"
+                    },
+                    "type": {
+                      "type": "keyword"
+                    },
+                    "url": {
+                      "type": "keyword"
+                    }
+                  }
+                },
+                "original_time": {
+                  "type": "date"
+                },
+                "threshold_result": {
+                  "properties": {
+                    "cardinality": {
+                      "type": "object",
+                      "properties": {
+                        "field": {
+                          "type": "keyword"
+                        },
+                        "value": {
+                          "type": "long"
+                        }
+                      }
+                    },
+                    "count": {
+                      "type": "long"
+                    },
+                    "from": {
+                      "type": "date"
+                    },
+                    "terms": {
+                      "type": "object",
+                      "properties": {
+                        "field": {
+                          "type": "keyword"
+                        },
+                        "value": {
+                          "type": "keyword"
+                        }
+                      }
+                    }
+                  }
+                },
+                "new_terms": {
+                  "type": "keyword"
+                }
+              }
+            },
+            "space_ids": {
+              "type": "keyword"
+            },
+            "version": {
+              "type": "version"
+            }
+          }
+        },
+        "ecs": {
+          "properties": {
+            "version": {
+              "type": "keyword"
+            }
+          }
+        },
+        "signal": {
+          "properties": {
+            "ancestors": {
+              "properties": {
+                "depth": {
+                  "type": "alias",
+                  "path": "kibana.alert.ancestors.depth"
+                },
+                "id": {
+                  "type": "alias",
+                  "path": "kibana.alert.ancestors.id"
+                },
+                "index": {
+                  "type": "alias",
+                  "path": "kibana.alert.ancestors.index"
+                },
+                "type": {
+                  "type": "alias",
+                  "path": "kibana.alert.ancestors.type"
+                }
+              }
+            },
+            "depth": {
+              "type": "alias",
+              "path": "kibana.alert.depth"
+            },
+            "group": {
+              "properties": {
+                "id": {
+                  "type": "alias",
+                  "path": "kibana.alert.group.id"
+                },
+                "index": {
+                  "type": "alias",
+                  "path": "kibana.alert.group.index"
+                }
+              }
+            },
+            "original_event": {
+              "properties": {
+                "action": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.action"
+                },
+                "category": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.category"
+                },
+                "code": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.code"
+                },
+                "created": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.created"
+                },
+                "dataset": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.dataset"
+                },
+                "duration": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.duration"
+                },
+                "end": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.end"
+                },
+                "hash": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.hash"
+                },
+                "id": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.id"
+                },
+                "kind": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.kind"
+                },
+                "module": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.module"
+                },
+                "outcome": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.outcome"
+                },
+                "provider": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.provider"
+                },
+                "reason": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.reason"
+                },
+                "risk_score": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.risk_score"
+                },
+                "risk_score_norm": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.risk_score_norm"
+                },
+                "sequence": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.sequence"
+                },
+                "severity": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.severity"
+                },
+                "start": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.start"
+                },
+                "timezone": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.timezone"
+                },
+                "type": {
+                  "type": "alias",
+                  "path": "kibana.alert.original_event.type"
+                }
+              }
+            },
+            "original_time": {
+              "type": "alias",
+              "path": "kibana.alert.original_time"
+            },
+            "reason": {
+              "type": "alias",
+              "path": "kibana.alert.reason"
+            },
+            "rule": {
+              "properties": {
+                "author": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.author"
+                },
+                "building_block_type": {
+                  "type": "alias",
+                  "path": "kibana.alert.building_block_type"
+                },
+                "created_at": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.created_at"
+                },
+                "created_by": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.created_by"
+                },
+                "description": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.description"
+                },
+                "enabled": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.enabled"
+                },
+                "false_positives": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.false_positives"
+                },
+                "from": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.from"
+                },
+                "id": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.uuid"
+                },
+                "immutable": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.immutable"
+                },
+                "interval": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.interval"
+                },
+                "license": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.license"
+                },
+                "max_signals": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.max_signals"
+                },
+                "name": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.name"
+                },
+                "note": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.note"
+                },
+                "references": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.references"
+                },
+                "risk_score": {
+                  "type": "alias",
+                  "path": "kibana.alert.risk_score"
+                },
+                "rule_id": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.rule_id"
+                },
+                "rule_name_override": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.rule_name_override"
+                },
+                "severity": {
+                  "type": "alias",
+                  "path": "kibana.alert.severity"
+                },
+                "tags": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.tags"
+                },
+                "threat": {
+                  "properties": {
+                    "framework": {
+                      "type": "alias",
+                      "path": "kibana.alert.rule.threat.framework"
+                    },
+                    "tactic": {
+                      "properties": {
+                        "id": {
+                          "type": "alias",
+                          "path": "kibana.alert.rule.threat.tactic.id"
+                        },
+                        "name": {
+                          "type": "alias",
+                          "path": "kibana.alert.rule.threat.tactic.name"
+                        },
+                        "reference": {
+                          "type": "alias",
+                          "path": "kibana.alert.rule.threat.tactic.reference"
+                        }
+                      }
+                    },
+                    "technique": {
+                      "properties": {
+                        "id": {
+                          "type": "alias",
+                          "path": "kibana.alert.rule.threat.technique.id"
+                        },
+                        "name": {
+                          "type": "alias",
+                          "path": "kibana.alert.rule.threat.technique.name"
+                        },
+                        "reference": {
+                          "type": "alias",
+                          "path": "kibana.alert.rule.threat.technique.reference"
+                        },
+                        "subtechnique": {
+                          "properties": {
+                            "id": {
+                              "type": "alias",
+                              "path": "kibana.alert.rule.threat.technique.subtechnique.id"
+                            },
+                            "name": {
+                              "type": "alias",
+                              "path": "kibana.alert.rule.threat.technique.subtechnique.name"
+                            },
+                            "reference": {
+                              "type": "alias",
+                              "path": "kibana.alert.rule.threat.technique.subtechnique.reference"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "timeline_id": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.timeline_id"
+                },
+                "timeline_title": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.timeline_title"
+                },
+                "timestamp_override": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.timestamp_override"
+                },
+                "to": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.to"
+                },
+                "type": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.type"
+                },
+                "updated_at": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.updated_at"
+                },
+                "updated_by": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.updated_by"
+                },
+                "version": {
+                  "type": "alias",
+                  "path": "kibana.alert.rule.version"
+                }
+              }
+            },
+            "status": {
+              "type": "alias",
+              "path": "kibana.alert.workflow_status"
+            },
+            "threshold_result": {
+              "properties": {
+                "from": {
+                  "type": "alias",
+                  "path": "kibana.alert.threshold_result.from"
+                },
+                "terms": {
+                  "properties": {
+                    "field": {
+                      "type": "alias",
+                      "path": "kibana.alert.threshold_result.terms.field"
+                    },
+                    "value": {
+                      "type": "alias",
+                      "path": "kibana.alert.threshold_result.terms.value"
+                    }
+                  }
+                },
+                "cardinality": {
+                  "properties": {
+                    "field": {
+                      "type": "alias",
+                      "path": "kibana.alert.threshold_result.cardinality.field"
+                    },
+                    "value": {
+                      "type": "alias",
+                      "path": "kibana.alert.threshold_result.cardinality.value"
+                    }
+                  }
+                },
+                "count": {
+                  "type": "alias",
+                  "path": "kibana.alert.threshold_result.count"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+        let _deser: CreateIndexTemplateBody = match serde_json::from_str(test_val) {
+            Ok(d) => d,
+            Err(e) => {
+                let error = format!("{}", e);
+                let error_str = error.as_str();
+                println!("{}", error_str);
+                let _ = fs::write(
+                    "/Users/gregory/code/powdrr-engine/main_lib/output.txt",
+                    error,
+                );
+                panic!("nope");
+            }
+        };
+
+        let test_val = include_str!("../tests/data/component_template_1.json");
+
+        let _deser: CreateIndexTemplateBody = match serde_json::from_str(test_val) {
+            Ok(d) => d,
+            Err(e) => {
+                let error = format!("{}", e);
+                println!("{}", error);
+                let _ = fs::write("../output.txt", error);
+                panic!("nope");
+            }
+        };
+    }
+
+    #[test]
+    fn test_create_index_template() {
+        let test_val = r#"{"version":1,"index_patterns":[".apm-source-map"],"template":{"settings":{"index":{"number_of_shards":1,"auto_expand_replicas":"0-2","hidden":true}},"mappings":{"dynamic":"strict","properties":{"fleet_id":{"type":"keyword"},"created":{"type":"date"},"content":{"type":"binary"},"content_sha256":{"type":"keyword"},"file.path":{"type":"keyword"},"main_lib.name":{"type":"keyword"},"main_lib.version":{"type":"keyword"}}}}}"#;
+
+        let _deser: CreateIndexTemplateBody = match serde_json::from_str(test_val) {
+            Ok(d) => d,
+            Err(e) => {
+                let error = format!("{}", e);
+                println!("{}", error);
+                panic!("nope");
+            }
+        };
+    }
+}

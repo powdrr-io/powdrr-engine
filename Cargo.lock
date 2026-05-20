@@ -5448,7 +5448,8 @@ dependencies = [
  "idgenerator",
  "mime",
  "mongodb",
- "powdrr_lib",
+ "powdrr-query-lib",
+ "powdrr-query-server",
  "rand 0.9.1",
  "reqwest",
  "serde",
@@ -5461,60 +5462,24 @@ name = "powdrr-cli"
 version = "0.0.1"
 dependencies = [
  "clap",
- "powdrr_lib",
+ "powdrr-query-lib",
  "serde_json",
  "tokio",
 ]
 
 [[package]]
-name = "powdrr-engine-lib"
+name = "powdrr-control-plane"
 version = "0.0.1"
 dependencies = [
- "arrow-array 55.1.0",
- "arrow-flight",
- "arrow-ipc 55.1.0",
- "arrow-ipc 58.3.0",
  "arrow-json",
- "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-dynamodb",
- "bson",
  "chrono",
  "datafusion",
- "futures",
- "futures-util",
- "gotham",
- "http 0.2.12",
  "iceberg",
- "iceberg-catalog-rest",
  "idgenerator",
- "lazy_static",
- "liquid-cache-datafusion-local",
- "lru-mem",
  "minijinja",
- "modyne",
- "modyne-derive",
- "object_store",
- "parquet 55.1.0",
- "paste",
- "prost",
- "redis",
  "reqwest",
- "rustls-pemfile 2.2.0",
- "rustls-pki-types",
  "serde",
- "serde_arrow",
- "serde_dynamo",
  "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "ttl_cache",
- "url",
- "url-escape",
- "uuid-b64",
 ]
 
 [[package]]
@@ -5523,7 +5488,8 @@ version = "0.0.1"
 dependencies = [
  "gotham",
  "idgenerator",
- "powdrr-engine-lib",
+ "powdrr-query-lib",
+ "powdrr-query-server",
  "rustls 0.23.28",
  "rustls-pemfile 2.2.0",
  "rustls-pki-types",
@@ -5550,30 +5516,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "powdrr-service-lib"
+name = "powdrr-query-core"
 version = "0.0.1"
 dependencies = [
- "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-dynamodb",
+ "arrow-json",
  "chrono",
- "idgenerator",
- "minijinja",
- "modyne",
- "modyne-derive",
- "openraft",
- "openraft-memstore",
- "paste",
- "reqwest",
+ "datafusion",
+ "powdrr-control-plane",
  "serde",
  "serde_json",
- "tokio",
- "tracing",
 ]
 
 [[package]]
-name = "powdrr_lib"
+name = "powdrr-query-lib"
 version = "0.0.1"
 dependencies = [
  "arrow-array 55.1.0",
@@ -5602,6 +5557,7 @@ dependencies = [
  "liquid-cache-datafusion",
  "liquid-cache-datafusion-local",
  "lru-mem",
+ "mime",
  "minijinja",
  "modyne",
  "modyne-derive",
@@ -5609,6 +5565,8 @@ dependencies = [
  "object_store",
  "parquet 55.1.0",
  "paste",
+ "powdrr-control-plane",
+ "powdrr-query-core",
  "prost",
  "redis",
  "reqwest",
@@ -5627,6 +5585,72 @@ dependencies = [
  "url",
  "url-escape",
  "uuid-b64",
+]
+
+[[package]]
+name = "powdrr-query-server"
+version = "0.0.1"
+dependencies = [
+ "bson",
+ "chrono",
+ "datafusion",
+ "futures",
+ "futures-util",
+ "gotham",
+ "hmac",
+ "http 0.2.12",
+ "idgenerator",
+ "mime",
+ "powdrr-control-plane",
+ "powdrr-query-lib",
+ "serde",
+ "serde_arrow",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid-b64",
+]
+
+[[package]]
+name = "powdrr-service-lib"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-dynamodb",
+ "chrono",
+ "idgenerator",
+ "minijinja",
+ "modyne",
+ "modyne-derive",
+ "openraft",
+ "openraft-memstore",
+ "paste",
+ "powdrr-control-plane",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "powdrr_lib"
+version = "0.0.1"
+dependencies = [
+ "datafusion",
+ "futures-util",
+ "idgenerator",
+ "mongodb",
+ "object_store",
+ "powdrr-query-lib",
+ "powdrr-query-server",
+ "reqwest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
