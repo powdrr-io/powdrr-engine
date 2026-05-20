@@ -8,7 +8,9 @@ on:
 
 jobs:
   compatibility:
-    runs-on: ubuntu-latest
+    # Requires the Ubicloud Managed Runners GitHub App to be installed
+    # for this repository.
+    runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 45
     env:
       CARGO_INCREMENTAL: "0"
