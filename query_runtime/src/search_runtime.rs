@@ -6,16 +6,16 @@ use crate::elastic_search_responses::{
     RangeAggregationResult, TermAggregationBucket, TermAggregationResult,
 };
 use crate::schema_massager::{
-    PowdrrDataType, PowdrrField, PowdrrSchema, SqlQuery, to_powdrr_schema,
+    to_powdrr_schema, PowdrrDataType, PowdrrField, PowdrrSchema, SqlQuery,
 };
-use arrow_json::WriterBuilder;
 use arrow_json::writer::LineDelimited;
+use arrow_json::WriterBuilder;
 use datafusion::{
     arrow::{
         array::{
             Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int32Array,
             Int64Array, LargeListArray, LargeStringArray, ListArray, RecordBatch, StringArray,
-            StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+            StringViewArray, StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
             TimestampNanosecondArray, TimestampSecondArray, UInt32Array, UInt64Array,
         },
         datatypes::{DataType, TimeUnit},
@@ -205,6 +205,14 @@ pub(crate) fn array_value_to_json(
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .expect("string array")
+                .value(row_index)
+                .to_string(),
+        )),
+        DataType::Utf8View => Ok(Value::String(
+            array
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .expect("string view array")
                 .value(row_index)
                 .to_string(),
         )),
