@@ -1163,7 +1163,7 @@ fn load_api_manifest() -> ApiCoverageManifest {
 }
 
 fn router_handler_inventory() -> BTreeSet<String> {
-    let source = include_str!("../src/router.rs");
+    let source = include_str!("../../query_server/src/router.rs");
     let mut handlers = BTreeSet::new();
     handlers.extend(extract_router_handlers(
         source,

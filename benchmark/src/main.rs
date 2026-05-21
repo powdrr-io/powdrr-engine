@@ -12,21 +12,21 @@ use gotham::mime;
 use gotham::plain::test::AsyncTestServer;
 use mongodb::bson::{self, Document};
 use mongodb::{Client as MongoClient, Collection, IndexModel};
-use powdrr_lib::data_contract::{
+use powdrr_query_lib::data_contract::{
     FileSetPayload, IcebergMetadata, ServingPattern, TableMetadataCheckpoint,
 };
-use powdrr_lib::lakehouse_serving::ServingQueryResponse;
-use powdrr_lib::router::router;
-use powdrr_lib::schema_massager::{PowdrrDataType, PowdrrSchema};
-use powdrr_lib::serving_dataset::{ParquetDocumentSet, read_parquet_documents};
-use powdrr_lib::serving_plan::{
+use powdrr_query_lib::lakehouse_serving::ServingQueryResponse;
+use powdrr_query_lib::schema_massager::{PowdrrDataType, PowdrrSchema};
+use powdrr_query_lib::serving_dataset::{ParquetDocumentSet, read_parquet_documents};
+use powdrr_query_lib::serving_plan::{
     ServingPredicate, ServingQueryClassification, ServingRequestPlan, ServingSort,
 };
-use powdrr_lib::serving_protocol::{to_elasticsearch_search, to_mongodb_find};
-use powdrr_lib::test_api::{
+use powdrr_query_lib::serving_protocol::{to_elasticsearch_search, to_mongodb_find};
+use powdrr_query_lib::test_api::{
     CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode, StorageMode,
     TestProcessingMode,
 };
+use powdrr_query_server::router::router;
 use reqwest::{Client as HttpClient, Method as HttpMethod};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -1514,7 +1514,7 @@ mod tests {
         infer_sort_field,
     };
     use crate::ServingPredicate;
-    use powdrr_lib::serving_plan::{ServingRequestPlan, ServingSort};
+    use powdrr_query_lib::serving_plan::{ServingRequestPlan, ServingSort};
     use serde_json::{Value, json};
     use std::collections::HashSet;
 

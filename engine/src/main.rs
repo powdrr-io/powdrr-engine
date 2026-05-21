@@ -44,7 +44,7 @@ async fn run_server(mode: &OperatingMode) -> () {
     println!("Listening for requests at http://{}", addr);
     gotham::init_server(
         addr,
-        powdrr_engine_lib::router::router(mode.testing_enabled),
+        powdrr_query_server::router::router(mode.testing_enabled),
     )
     .await
     .unwrap();
@@ -54,7 +54,7 @@ async fn run_mongodb_wire_server(port: u32) -> () {
     let addr = format!("0.0.0.0:{}", port);
     let listener = TcpListener::bind(&addr).await.unwrap();
     println!("Listening for MongoDB wire requests at {}", addr);
-    powdrr_engine_lib::mongodb_wire_protocol::serve_mongodb_wire(listener)
+    powdrr_query_server::mongodb_wire_protocol::serve_mongodb_wire(listener)
         .await
         .unwrap();
 }
@@ -66,7 +66,7 @@ async fn run_ssl_server() -> () {
     println!("Listening for requests at https://{}", addr);
     gotham::start_with_tls(
         addr,
-        powdrr_engine_lib::router::router(true),
+        powdrr_query_server::router::router(true),
         build_config().unwrap(),
     )
     .unwrap();

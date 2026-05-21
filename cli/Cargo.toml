@@ -10,6 +10,6 @@ edition.workspace = true
 
 [dependencies]
 clap = { version = "4.5.38", features = ["derive"] }
-powdrr_lib = { path = "../main_lib" }
+powdrr-query-lib = { path = "../query_lib" }
 serde_json = "1.0.140"
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }

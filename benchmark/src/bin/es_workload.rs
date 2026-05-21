@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use gotham::mime;
 use gotham::test::TestServer;
-use powdrr_lib::router::router;
+use powdrr_query_server::router::router;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 
