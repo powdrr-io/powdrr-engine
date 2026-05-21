@@ -386,6 +386,10 @@ Powdrr would not exist in its current form without that work upstream.
   The storage-role contract for the mutable frontier, the canonical Iceberg
   snapshot, and the row-to-column promotion boundary.
 
+- `docs/object-store-readonly-state-provider-design.md`
+  The concrete design for serving from object-store-published metadata without
+  a DynamoDB-backed runtime state provider.
+
 - `docs/lakehouse-serving-roadmap.md`
   The repo-specific roadmap from the current hybrid stack toward a shared
   serving engine over lakehouse storage.
