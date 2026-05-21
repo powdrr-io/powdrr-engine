@@ -2811,6 +2811,7 @@ async fn emit_powdrr_visibility_diagnostics(
                 if let Some(metadata) = checkpoint.iceberg_metadata.as_ref() {
                     if let Some(file_path) = metadata.files.file_paths.first() {
                         emit_checkpoint_file_diagnostics(
+                            base_url,
                             table_name,
                             sort_key_name,
                             last_missing_key,
@@ -2837,6 +2838,7 @@ async fn emit_powdrr_visibility_diagnostics(
 }
 
 async fn emit_checkpoint_file_diagnostics(
+    base_url: &str,
     table_name: &str,
     sort_key_name: &str,
     last_missing_key: Option<&Value>,
@@ -2889,12 +2891,18 @@ async fn emit_checkpoint_file_diagnostics(
     }
 
     if let Some(missing_key) = last_missing_key {
+        let raw_key = missing_key
+            .as_object()
+            .expect("missing key should be a JSON object")
+            .iter()
+            .map(|(field, value)| (field.clone(), json_to_dynamodb_wire_attr(value)))
+            .collect::<serde_json::Map<_, _>>();
         let raw_get_item = raw_dynamodb_request(
             base_url,
             "GetItem",
             &json!({
                 "TableName": table_name,
-                "Key": serde_dynamo::aws_sdk_dynamodb_1::to_item(missing_key.clone()).unwrap(),
+                "Key": Value::Object(raw_key),
             }),
         )
         .await;
@@ -2938,6 +2946,32 @@ async fn emit_checkpoint_file_diagnostics(
                 );
             }
         }
+    }
+}
+
+fn json_to_dynamodb_wire_attr(value: &Value) -> Value {
+    match value {
+        Value::Null => json!({ "NULL": true }),
+        Value::Bool(boolean) => json!({ "BOOL": boolean }),
+        Value::Number(number) => json!({ "N": number.to_string() }),
+        Value::String(string) => json!({ "S": string }),
+        Value::Array(values) => Value::Object(serde_json::Map::from_iter([(
+            "L".to_string(),
+            Value::Array(
+                values
+                    .iter()
+                    .map(json_to_dynamodb_wire_attr)
+                    .collect::<Vec<_>>(),
+            ),
+        )])),
+        Value::Object(map) => Value::Object(serde_json::Map::from_iter([(
+            "M".to_string(),
+            Value::Object(
+                map.iter()
+                    .map(|(field, value)| (field.clone(), json_to_dynamodb_wire_attr(value)))
+                    .collect::<serde_json::Map<_, _>>(),
+            ),
+        )])),
     }
 }
 
