@@ -327,6 +327,7 @@ impl EphemeralServiceImpl {
                     id: IdInstance::next_id().to_string(),
                     extension_type: extension.clone(),
                     table_name: table_name.clone(),
+                    checkpoint_id: Some(checkpoint_id.clone()),
                     table_schema: schema.clone(),
                     speedboat_files: speedboat_files.clone(),
                     iceberg_files: iceberg_files.clone(),
@@ -334,6 +335,7 @@ impl EphemeralServiceImpl {
             );
         } else {
             let table_work_item = es_work_items.get_mut(table_name).unwrap();
+            table_work_item.checkpoint_id = Some(checkpoint_id.clone());
             table_work_item.table_schema = schema.clone();
             table_work_item.speedboat_files =
                 table_work_item.speedboat_files.merge(speedboat_files);

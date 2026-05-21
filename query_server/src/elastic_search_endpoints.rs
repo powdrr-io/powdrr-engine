@@ -1,42 +1,43 @@
-use std::{collections::HashMap, env, pin::Pin, sync::Arc};
+use std::{
+    collections::HashMap,
+    env,
+    pin::Pin,
+    sync::{Arc, LazyLock, Mutex},
+};
 
-use datafusion::arrow::datatypes::{DataType, Field};
 use futures::FutureExt;
 use gotham::helpers::http::response::create_empty_response;
 use gotham::{
     handler::HandlerFuture,
     helpers::http::response::create_response,
-    hyper::{Body, body},
+    hyper::{body, Body},
     mime,
     state::{FromState, State},
 };
 use http::StatusCode;
-use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 use crate::elastic_search_cluster_info;
 use crate::elastic_search_http_types::{
     QueryStringAliases, QueryStringClusterHealth, QueryStringClusterSettings, QueryStringFieldCaps,
     QueryStringSearchExtractor,
 };
-use powdrr_query_lib::data_access;
 use powdrr_query_lib::data_contract::{AliasInfo, CreateIndexBody, PropertyInfo, TableDescription};
 use powdrr_query_lib::elastic_search_api_types::QueryStringSearch;
-use powdrr_query_lib::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
 use powdrr_query_runtime::elastic_search_common::{
-    CommandContext, ElasticSearchResponse, MIME_ES_JSON, execute_command,
+    execute_command, CommandContext, ElasticSearchResponse, MIME_ES_JSON,
 };
 use powdrr_query_runtime::elastic_search_ingest;
 use powdrr_query_runtime::elastic_search_parser;
 use powdrr_query_runtime::elastic_search_pipeline;
 use powdrr_query_runtime::elastic_search_responses::{
-    ErrorDetails, QueryResultHit, QueryResultShards, QueryResults, SingleDocCreateFailedResult,
+    ErrorDetails, QueryResultShards, QueryResults, SingleDocCreateFailedResult,
 };
+use powdrr_query_runtime::lakehouse_serving::execute_checkpoint_exact_id_lookup_rows;
 use powdrr_query_runtime::peers::CheckpointDescriptor;
 use powdrr_query_runtime::search_executor;
-use powdrr_query_runtime::search_runtime::df_to_serde_value;
-use powdrr_query_runtime::state_provider::{STATE_PROVIDER, ServiceApiError};
+use powdrr_query_runtime::state_provider::{ServiceApiError, STATE_PROVIDER};
 use powdrr_query_runtime::util::{log_service_err, log_service_err_response};
 
 pub use crate::elastic_search_http_types::{
@@ -128,6 +129,17 @@ impl License {
 
 static SERVER_INFO: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| serde_json::to_string_pretty(&ServerInfo::new()).unwrap());
+
+#[derive(Clone)]
+struct CachedDocumentLookupCheckpoint {
+    table_name: String,
+    checkpoint_id: String,
+    checkpoint: Arc<powdrr_query_lib::data_contract::TableMetadataCheckpoint>,
+}
+
+static DOCUMENT_LOOKUP_CHECKPOINT_CACHE: LazyLock<
+    Mutex<HashMap<String, CachedDocumentLookupCheckpoint>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub fn es_root(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_root");
@@ -739,17 +751,149 @@ async fn execute_search_response_for_target_expr(
 }
 
 async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, String> {
+    let Some((table_name, checkpoint)) = load_document_lookup_checkpoint(index_name).await? else {
+        return Ok(missing_document_value(index_name, doc_id));
+    };
+
+    if let Some(rows) =
+        execute_checkpoint_exact_id_lookup_rows(&checkpoint, &[doc_id.to_string()]).await?
+    {
+        if let Some(value) = rows.first() {
+            return Ok(found_document_value(&table_name, value));
+        }
+        return Ok(missing_document_value(&table_name, doc_id));
+    }
+    Ok(missing_document_value(&table_name, doc_id))
+}
+
+fn missing_document_value(index_name: &str, doc_id: &str) -> Value {
+    json!({
+        "_index": index_name,
+        "_id": doc_id,
+        "found": false,
+    })
+}
+
+fn found_document_value(index_name: &str, row: &Value) -> Value {
+    let row_map = row.as_object().cloned().unwrap_or_default();
+    let mut result = Map::new();
+    result.insert("_index".to_string(), Value::String(index_name.to_string()));
+    result.insert(
+        "_id".to_string(),
+        row_map.get("_id").cloned().unwrap_or(Value::Null),
+    );
+    result.insert(
+        "_version".to_string(),
+        row_map.get("_version").cloned().unwrap_or(Value::from(0)),
+    );
+    result.insert(
+        "_seq_no".to_string(),
+        row_map.get("_seq_no").cloned().unwrap_or(Value::from(0)),
+    );
+    result.insert("_primary_term".to_string(), Value::from(1));
+    result.insert("found".to_string(), Value::Bool(true));
+    result.insert("_source".to_string(), document_source_value(&row_map));
+    Value::Object(result)
+}
+
+fn document_source_value(row_map: &Map<String, Value>) -> Value {
+    if let Some(source) = row_map.get("_source") {
+        return match source {
+            Value::String(text) => {
+                serde_json::from_str(text).unwrap_or(Value::String(text.clone()))
+            }
+            other => other.clone(),
+        };
+    }
+
+    let mut source = Map::new();
+    for (field, value) in row_map.iter() {
+        if matches!(
+            field.as_str(),
+            "_id"
+                | "_id_seq_no"
+                | "_version"
+                | "_seq_no"
+                | "_source"
+                | "score"
+                | "term_cnt"
+                | "word_cnt"
+        ) {
+            continue;
+        }
+        source.insert(field.clone(), value.clone());
+    }
+    Value::Object(source)
+}
+
+async fn load_document_lookup_checkpoint(
+    index_name: &str,
+) -> Result<
+    Option<(
+        String,
+        Arc<powdrr_query_lib::data_contract::TableMetadataCheckpoint>,
+    )>,
+    String,
+> {
+    let cached_by_index_name = {
+        DOCUMENT_LOOKUP_CHECKPOINT_CACHE
+            .lock()
+            .unwrap()
+            .get(index_name)
+            .cloned()
+    };
+    if let Some(cached) = cached_by_index_name {
+        if cached.table_name == index_name {
+            let checkpoint_id = STATE_PROVIDER
+                .get_published_active_servable_checkpoint(&cached.table_name)
+                .await
+                .map_err(|e| e.message)?;
+            match checkpoint_id {
+                Some(checkpoint_id) if checkpoint_id == cached.checkpoint_id => {
+                    return Ok(Some((cached.table_name, cached.checkpoint)));
+                }
+                Some(checkpoint_id) => {
+                    let checkpoint = STATE_PROVIDER
+                        .get_checkpoint(CheckpointDescriptor::new(
+                            cached.table_name.clone(),
+                            checkpoint_id.clone(),
+                        ))
+                        .await
+                        .map_err(|e| e.message)?;
+                    if let Some(checkpoint) = checkpoint {
+                        let checkpoint = Arc::new(checkpoint);
+                        DOCUMENT_LOOKUP_CHECKPOINT_CACHE.lock().unwrap().insert(
+                            index_name.to_string(),
+                            CachedDocumentLookupCheckpoint {
+                                table_name: cached.table_name.clone(),
+                                checkpoint_id,
+                                checkpoint: checkpoint.clone(),
+                            },
+                        );
+                        return Ok(Some((cached.table_name, checkpoint)));
+                    }
+                    DOCUMENT_LOOKUP_CHECKPOINT_CACHE
+                        .lock()
+                        .unwrap()
+                        .remove(index_name);
+                    return Ok(None);
+                }
+                None => {
+                    DOCUMENT_LOOKUP_CHECKPOINT_CACHE
+                        .lock()
+                        .unwrap()
+                        .remove(index_name);
+                }
+            }
+        }
+    }
+
     let table_desc = STATE_PROVIDER
         .describe_table(&index_name.to_string())
         .await
         .map_err(|e| e.message)?;
-
     let Some(table_desc) = table_desc else {
-        return Ok(json!({
-            "_index": index_name,
-            "_id": doc_id,
-            "found": false,
-        }));
+        return Ok(None);
     };
 
     let checkpoint_id = STATE_PROVIDER
@@ -757,205 +901,61 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
         .await
         .map_err(|e| e.message)?;
     let Some(checkpoint_id) = checkpoint_id else {
-        return Ok(json!({
-            "_index": table_desc.name,
-            "_id": doc_id,
-            "found": false,
-        }));
+        return Ok(None);
     };
+
+    if let Some(cached) = DOCUMENT_LOOKUP_CHECKPOINT_CACHE
+        .lock()
+        .unwrap()
+        .get(index_name)
+        .cloned()
+    {
+        if cached.table_name == table_desc.name && cached.checkpoint_id == checkpoint_id {
+            return Ok(Some((cached.table_name, cached.checkpoint)));
+        }
+    }
 
     let checkpoint = STATE_PROVIDER
         .get_checkpoint(CheckpointDescriptor::new(
             table_desc.name.clone(),
-            checkpoint_id,
+            checkpoint_id.clone(),
         ))
         .await
         .map_err(|e| e.message)?;
     let Some(checkpoint) = checkpoint else {
-        return Ok(json!({
-            "_index": table_desc.name,
-            "_id": doc_id,
-            "found": false,
-        }));
+        return Ok(None);
     };
-
-    let checkpoint_schema = checkpoint.schema.clone();
-    let mut local_tables: Vec<(String, PowdrrSchema)> = Vec::new();
-    let mut delete_local_tables = Vec::new();
-
-    if let Some(iceberg_metadata) = checkpoint.iceberg_metadata {
-        for file_descriptor in iceberg_metadata.files.as_file_tuples() {
-            let local_name = format!("mget_iceberg_{}", IdInstance::next_id());
-            data_access::load_file_as_table(
-                &local_name,
-                &file_descriptor.file_path,
-                true,
-                Some(file_descriptor.schema.to_arrow_schema()),
-            )
-            .await
-            .map_err(|e| e.message().to_string())?;
-            local_tables.push((local_name, file_descriptor.schema));
-        }
-    }
-
-    if let Some(speedboat_metadata) = checkpoint.speedboat_metadata {
-        for file_descriptor in speedboat_metadata.files.as_file_tuples() {
-            let local_name = format!("mget_speedboat_{}", IdInstance::next_id());
-            data_access::load_file_as_table(
-                &local_name,
-                &file_descriptor.file_path,
-                false,
-                Some(file_descriptor.schema.to_arrow_schema()),
-            )
-            .await
-            .map_err(|e| e.message().to_string())?;
-            local_tables.push((local_name, file_descriptor.schema));
-        }
-    }
-
-    if let Some(deletes_metadata) = checkpoint.deletes_metadata {
-        let delete_schema = PowdrrSchema::from(&vec![PowdrrField {
-            name: "_id_seq_no".to_string(),
-            data_type: PowdrrDataType::String,
-        }]);
-
-        for delete_file_path in deletes_metadata.files {
-            let local_name = format!("mget_delete_{}", IdInstance::next_id());
-            data_access::load_file_as_table(
-                &local_name,
-                &delete_file_path,
-                false,
-                Some(delete_schema.to_arrow_schema()),
-            )
-            .await
-            .map_err(|e| e.message().to_string())?;
-            delete_local_tables.push(local_name);
-        }
-    }
-
-    if local_tables.is_empty() {
-        return Ok(json!({
-            "_index": table_desc.name,
-            "_id": doc_id,
-            "found": false,
-        }));
-    }
-
-    let escaped_doc_id = doc_id.replace('\'', "''");
-    let union_sql = local_tables
-        .iter()
-        .map(|(table_name, file_schema)| {
-            build_document_lookup_select(table_name, &checkpoint_schema, file_schema)
-        })
-        .collect::<Vec<_>>()
-        .join(" UNION ALL ");
-    let deletes_table_name = create_document_lookup_deletes_table(&delete_local_tables).await?;
-    let lookup_sql = format!(
-        "SELECT docs.* FROM ({union_sql}) AS docs \
-         LEFT JOIN {deletes_table_name} dt ON dt._id_seq_no = docs._id_seq_no \
-         WHERE docs._id = '{escaped_doc_id}' AND dt._id_seq_no IS NULL \
-         ORDER BY docs._seq_no DESC, docs._version DESC LIMIT 1"
+    let checkpoint = Arc::new(checkpoint);
+    DOCUMENT_LOOKUP_CHECKPOINT_CACHE.lock().unwrap().insert(
+        index_name.to_string(),
+        CachedDocumentLookupCheckpoint {
+            table_name: table_desc.name.clone(),
+            checkpoint_id,
+            checkpoint: checkpoint.clone(),
+        },
     );
-    let lookup_df = data_access::execute_sql(&lookup_sql)
-        .await
-        .map_err(|e| e.message().to_string())?;
-    let serde_result = df_to_serde_value(&lookup_df)
-        .await
-        .map_err(|e| e.message.clone())?;
+    Ok(Some((table_desc.name, checkpoint)))
+}
 
-    for (table_name, _) in &local_tables {
-        data_access::drop(table_name).await;
-    }
-    for table_name in &delete_local_tables {
-        data_access::drop(table_name).await;
-    }
-    data_access::drop(&deletes_table_name).await;
-
-    let Some(value) = serde_result.values.first() else {
-        return Ok(json!({
-            "_index": table_desc.name,
-            "_id": doc_id,
-            "found": false,
-        }));
+async fn lookup_document_values(
+    index_name: &str,
+    doc_ids: &[String],
+) -> Result<HashMap<String, Value>, String> {
+    let Some((table_name, checkpoint)) = load_document_lookup_checkpoint(index_name).await? else {
+        return Ok(HashMap::new());
     };
 
-    serde_json::to_value(QueryResultHit::from_record(
-        &Some(table_desc.name.clone()),
-        value,
-        Some(true),
-    ))
-    .map_err(|e| e.to_string())
-}
-
-fn build_document_lookup_select(
-    table_name: &str,
-    checkpoint_schema: &PowdrrSchema,
-    file_schema: &PowdrrSchema,
-) -> String {
-    let checkpoint_arrow_schema = checkpoint_schema.to_arrow_schema();
-    let file_arrow_schema = file_schema.to_arrow_schema();
-    let select_fields = checkpoint_arrow_schema
-        .fields
-        .iter()
-        .map(|field| lookup_select_field_sql(field.as_ref(), &file_arrow_schema))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("SELECT {select_fields} FROM {table_name}")
-}
-
-fn lookup_select_field_sql(
-    field: &Field,
-    file_arrow_schema: &datafusion::arrow::datatypes::Schema,
-) -> String {
-    let escaped_name = escape_lookup_identifier(field.name());
-    if file_arrow_schema.field_with_name(field.name()).is_ok() {
-        format!("\"{escaped_name}\"")
-    } else {
-        format!(
-            "CAST(NULL AS {}) AS \"{escaped_name}\"",
-            lookup_sql_type(field.data_type())
-        )
+    let mut results = HashMap::new();
+    if let Some(rows) = execute_checkpoint_exact_id_lookup_rows(&checkpoint, doc_ids).await? {
+        for row in rows {
+            let hit = found_document_value(&table_name, &row);
+            if let Some(doc_id) = hit.get("_id").and_then(|value| value.as_str()) {
+                results.insert(doc_id.to_string(), hit);
+            }
+        }
     }
-}
 
-fn escape_lookup_identifier(identifier: &str) -> String {
-    identifier.replace('"', "\"\"")
-}
-
-fn lookup_sql_type(data_type: &DataType) -> &'static str {
-    match data_type {
-        DataType::Boolean => "BOOLEAN",
-        DataType::Float16 | DataType::Float32 | DataType::Float64 => "DOUBLE",
-        DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::UInt8
-        | DataType::UInt16
-        | DataType::UInt32
-        | DataType::UInt64 => "BIGINT",
-        DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 => "STRING",
-        _ => "STRING",
-    }
-}
-
-async fn create_document_lookup_deletes_table(local_names: &[String]) -> Result<String, String> {
-    let table_name = format!("mget_all_deletes_{}", IdInstance::next_id());
-    let ddl_stmt = if local_names.is_empty() {
-        "select null as _id_seq_no".to_string()
-    } else {
-        let union_selects = local_names
-            .iter()
-            .map(|table_name| format!("select * from {table_name}"))
-            .collect::<Vec<_>>()
-            .join(" union all ");
-        format!("select * from ({union_selects})")
-    };
-
-    data_access::create_table(&table_name, &ddl_stmt)
-        .await
-        .map_err(|e| e.message().to_string())?;
-    Ok(table_name)
+    Ok(results)
 }
 
 fn parse_msearch_lines(body_content: &str) -> Result<Vec<(String, String)>, ()> {
@@ -1832,38 +1832,28 @@ pub fn es_get_with_id(state: State) -> Pin<Box<HandlerFuture>> {
                 return Ok((state, res));
             }
         };
-        let table_desc = match STATE_PROVIDER.describe_table(&index_name).await {
-            Ok(td) => td,
-            Err(e) => return Ok(log_service_err_response(e, state)),
-        };
-        match table_desc {
-            Some(_) => match lookup_document_value(&index_name, &doc_id).await {
-                Ok(doc) => {
-                    let found = doc
-                        .get("found")
-                        .and_then(|value| value.as_bool())
-                        .unwrap_or(true);
-                    let status = if found {
-                        StatusCode::OK
-                    } else {
-                        StatusCode::NOT_FOUND
-                    };
-                    let res = create_response(
-                        &state,
-                        status,
-                        MIME_ES_JSON.clone(),
-                        serde_json::to_string(&doc).unwrap(),
-                    );
-                    Ok((state, res))
-                }
-                Err(message) => {
-                    let res =
-                        invalid_request_response(&state, StatusCode::SERVICE_UNAVAILABLE, &message);
-                    Ok((state, res))
-                }
-            },
-            None => {
-                let res = create_empty_response(&state, StatusCode::NOT_FOUND);
+        match lookup_document_value(&index_name, &doc_id).await {
+            Ok(doc) => {
+                let found = doc
+                    .get("found")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true);
+                let status = if found {
+                    StatusCode::OK
+                } else {
+                    StatusCode::NOT_FOUND
+                };
+                let res = create_response(
+                    &state,
+                    status,
+                    MIME_ES_JSON.clone(),
+                    serde_json::to_string(&doc).unwrap(),
+                );
+                Ok((state, res))
+            }
+            Err(message) => {
+                let res =
+                    invalid_request_response(&state, StatusCode::SERVICE_UNAVAILABLE, &message);
                 Ok((state, res))
             }
         }
@@ -2700,46 +2690,61 @@ pub fn es_mget(mut state: State) -> Pin<Box<HandlerFuture>> {
             }
         };
 
-        let mut docs = Vec::new();
-        if let Some(request_docs) = request.docs {
-            for request_doc in request_docs {
-                let Some(index_name) = request_doc.index.as_deref() else {
-                    let res =
-                        invalid_request_response(&state, StatusCode::BAD_REQUEST, "Bad request");
-                    return Ok((state, res));
-                };
-                let resolved_target = match resolve_document_target_name(index_name).await {
-                    Ok(Some(target)) => target,
-                    Ok(None) => {
-                        docs.push(json!({
-                            "_index": index_name,
-                            "_id": request_doc.id,
-                            "found": false,
-                        }));
-                        continue;
-                    }
-                    Err((status, message)) => {
-                        let res = invalid_request_response(&state, status, &message);
-                        return Ok((state, res));
-                    }
-                };
-
-                match lookup_document_value(&resolved_target, &request_doc.id).await {
-                    Ok(doc) => docs.push(doc),
-                    Err(message) => {
-                        let res = invalid_request_response(
-                            &state,
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            &message,
-                        );
-                        return Ok((state, res));
-                    }
-                }
-            }
-        } else {
+        let Some(request_docs) = request.docs else {
             let res = invalid_request_response(&state, StatusCode::BAD_REQUEST, "Bad request");
             return Ok((state, res));
+        };
+
+        let mut resolved_docs = Vec::with_capacity(request_docs.len());
+        let mut ids_by_target: HashMap<String, Vec<String>> = HashMap::new();
+        for request_doc in request_docs {
+            let Some(index_name) = request_doc.index.as_deref() else {
+                let res = invalid_request_response(&state, StatusCode::BAD_REQUEST, "Bad request");
+                return Ok((state, res));
+            };
+            let resolved_target = match resolve_document_target_name(index_name).await {
+                Ok(Some(target)) => Some(target),
+                Ok(None) => None,
+                Err((status, message)) => {
+                    let res = invalid_request_response(&state, status, &message);
+                    return Ok((state, res));
+                }
+            };
+            if let Some(target) = resolved_target.as_ref() {
+                ids_by_target
+                    .entry(target.clone())
+                    .or_default()
+                    .push(request_doc.id.clone());
+            }
+            resolved_docs.push((index_name.to_string(), request_doc.id, resolved_target));
         }
+
+        let mut found_docs_by_target: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        for (target, ids) in ids_by_target.iter() {
+            let docs = match lookup_document_values(target, ids).await {
+                Ok(docs) => docs,
+                Err(message) => {
+                    let res =
+                        invalid_request_response(&state, StatusCode::SERVICE_UNAVAILABLE, &message);
+                    return Ok((state, res));
+                }
+            };
+            found_docs_by_target.insert(target.clone(), docs);
+        }
+
+        let docs = resolved_docs
+            .into_iter()
+            .map(
+                |(index_name, doc_id, resolved_target)| match resolved_target {
+                    Some(target) => found_docs_by_target
+                        .get(&target)
+                        .and_then(|docs| docs.get(&doc_id))
+                        .cloned()
+                        .unwrap_or_else(|| missing_document_value(&index_name, &doc_id)),
+                    None => missing_document_value(&index_name, &doc_id),
+                },
+            )
+            .collect::<Vec<_>>();
 
         let res = create_response(
             &state,
@@ -2789,6 +2794,34 @@ pub fn es_mget_table(mut state: State) -> Pin<Box<HandlerFuture>> {
             }
         };
 
+        if let Some(ids) = request.ids {
+            let found_docs = match lookup_document_values(&target, &ids).await {
+                Ok(docs) => docs,
+                Err(message) => {
+                    let res =
+                        invalid_request_response(&state, StatusCode::SERVICE_UNAVAILABLE, &message);
+                    return Ok((state, res));
+                }
+            };
+            let docs = ids
+                .into_iter()
+                .map(|doc_id| {
+                    found_docs
+                        .get(&doc_id)
+                        .cloned()
+                        .unwrap_or_else(|| missing_document_value(&target, &doc_id))
+                })
+                .collect::<Vec<_>>();
+
+            let res = create_response(
+                &state,
+                StatusCode::OK,
+                MIME_ES_JSON.clone(),
+                serde_json::to_string(&MultiGetResponse { docs }).unwrap(),
+            );
+            return Ok((state, res));
+        }
+
         let docs_to_lookup = if let Some(request_docs) = request.docs {
             request_docs
                 .into_iter()
@@ -2797,45 +2830,58 @@ pub fn es_mget_table(mut state: State) -> Pin<Box<HandlerFuture>> {
                     id: request_doc.id,
                 })
                 .collect::<Vec<_>>()
-        } else if let Some(ids) = request.ids {
-            ids.into_iter()
-                .map(|id| MultiGetDocRequest {
-                    index: Some(target.clone()),
-                    id,
-                })
-                .collect::<Vec<_>>()
         } else {
             let res = invalid_request_response(&state, StatusCode::BAD_REQUEST, "Bad request");
             return Ok((state, res));
         };
 
-        let mut docs = Vec::with_capacity(docs_to_lookup.len());
+        let mut resolved_docs = Vec::with_capacity(docs_to_lookup.len());
+        let mut ids_by_target: HashMap<String, Vec<String>> = HashMap::new();
         for request_doc in docs_to_lookup {
             let index_name = request_doc.index.unwrap_or_else(|| target.clone());
             let resolved_target = match resolve_document_target_name(&index_name).await {
-                Ok(Some(target)) => target,
-                Ok(None) => {
-                    docs.push(json!({
-                        "_index": index_name,
-                        "_id": request_doc.id,
-                        "found": false,
-                    }));
-                    continue;
-                }
+                Ok(Some(target)) => Some(target),
+                Ok(None) => None,
                 Err((status, message)) => {
                     let res = invalid_request_response(&state, status, &message);
                     return Ok((state, res));
                 }
             };
-            match lookup_document_value(&resolved_target, &request_doc.id).await {
-                Ok(doc) => docs.push(doc),
+            if let Some(target) = resolved_target.as_ref() {
+                ids_by_target
+                    .entry(target.clone())
+                    .or_default()
+                    .push(request_doc.id.clone());
+            }
+            resolved_docs.push((index_name, request_doc.id, resolved_target));
+        }
+
+        let mut found_docs_by_target: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        for (target, ids) in ids_by_target.iter() {
+            let docs = match lookup_document_values(target, ids).await {
+                Ok(docs) => docs,
                 Err(message) => {
                     let res =
                         invalid_request_response(&state, StatusCode::SERVICE_UNAVAILABLE, &message);
                     return Ok((state, res));
                 }
-            }
+            };
+            found_docs_by_target.insert(target.clone(), docs);
         }
+
+        let docs = resolved_docs
+            .into_iter()
+            .map(
+                |(index_name, doc_id, resolved_target)| match resolved_target {
+                    Some(target) => found_docs_by_target
+                        .get(&target)
+                        .and_then(|docs| docs.get(&doc_id))
+                        .cloned()
+                        .unwrap_or_else(|| missing_document_value(&index_name, &doc_id)),
+                    None => missing_document_value(&index_name, &doc_id),
+                },
+            )
+            .collect::<Vec<_>>();
 
         let res = create_response(
             &state,
