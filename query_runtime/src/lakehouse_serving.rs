@@ -1935,6 +1935,7 @@ async fn execute_file_group_warmup(
         sql: QuerySqlTemplate::Built(sql_template.replace("{table}", "{target_table}")),
         files: query_files,
         delete_files: delete_files.to_vec(),
+        use_deletes_table: !delete_files.is_empty(),
         extension_suffixes: None,
         use_cpu_threadpool: true,
     })
@@ -1986,6 +1987,7 @@ async fn execute_query_input_group_plan(
         sql: QuerySqlTemplate::Built(sql_template.replace("{table}", "{target_table}")),
         files: query_files,
         delete_files: delete_files.to_vec(),
+        use_deletes_table: !delete_files.is_empty(),
         extension_suffixes: None,
         use_cpu_threadpool: true,
     })

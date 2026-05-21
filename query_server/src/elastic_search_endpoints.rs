@@ -2852,12 +2852,8 @@ pub fn es_mget_table(mut state: State) -> Pin<Box<HandlerFuture>> {
 pub fn es_index_pit(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_index_pit");
     async {
-        let _path_extractor = NamePathExtractor::borrow_from(&state);
-        // TODO: really generate this. just needs to be an encoded checkpoint id for this table
-        let response_data = HashMap::from([(
-            "id",
-            json!("t8jsAwEeLmtpYmFuYV90YXNrX21hbmFnZXJfOC43LjFfMDAxFkNScFZFdlZZUzNHTTBZdzVmOVY1VHcAFk0yQkNZM0s0UldDQUlvZTBaTkRqNXcAAAAAAAAAAAEWUkxXRUxKbWhUWkt3LXRTWHdhb3loQQABFkNScFZFdlZZUzNHTTBZdzVmOVY1VHcAAA=="),
-        )]);
+        let path_extractor = NamePathExtractor::borrow_from(&state);
+        let response_data = HashMap::from([("id", json!(path_extractor.name.clone()))]);
         let res = create_response(
             &state,
             StatusCode::OK,
