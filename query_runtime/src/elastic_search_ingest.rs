@@ -59,6 +59,23 @@ impl IngestError {
     }
 }
 
+fn create_table_request(
+    name: String,
+    tags: HashMap<String, String>,
+    serving: Option<crate::data_contract::ServingTableConfig>,
+    dynamodb: Option<crate::data_contract::DynamoDbTableConfig>,
+    mongodb: Option<crate::data_contract::MongoDbTableConfig>,
+) -> CreateTable {
+    serde_json::from_value(serde_json::json!({
+        "name": name,
+        "tags": tags,
+        "serving": serving,
+        "dynamodb": dynamodb,
+        "mongodb": mongodb,
+    }))
+    .expect("table metadata request should deserialize")
+}
+
 fn default_as_false() -> bool {
     false
 }
@@ -158,13 +175,13 @@ pub async fn create_index(table: &String, body: &String) -> Result<CreateIndexRe
     };
 
     STATE_PROVIDER
-        .create_table(&CreateTable {
-            name: table.clone(),
-            tags: HashMap::from([("_es_original".to_string(), serialized_body)]),
-            serving: None,
-            dynamodb: None,
-            mongodb: None,
-        })
+        .create_table(&create_table_request(
+            table.clone(),
+            HashMap::from([("_es_original".to_string(), serialized_body)]),
+            None,
+            None,
+            None,
+        ))
         .await
         .map_err(|e| IngestError::from_service_api_error(e))?;
 
@@ -221,13 +238,13 @@ where
     );
 
     STATE_PROVIDER
-        .upsert_table_metadata(&CreateTable {
-            name: table_description.name,
+        .upsert_table_metadata(&create_table_request(
+            table_description.name,
             tags,
-            serving: table_description.serving,
-            dynamodb: table_description.dynamodb,
-            mongodb: table_description.mongodb,
-        })
+            table_description.serving,
+            table_description.dynamodb,
+            table_description.mongodb,
+        ))
         .await
         .map_err(IngestError::from_service_api_error)?;
 

@@ -26,8 +26,9 @@ use crate::elastic_search_common::record_batches_to_ipc_stream_bytes;
 use crate::elastic_search_index::create_index_inner;
 use crate::elastic_search_responses::QueryResultHit;
 use crate::lakehouse_serving::{
-    build_serving_cache_manager_plan, default_serving_cache_manager_request,
-    execute_serving_cache_manager_plan, ServingCacheManagerPlan,
+    ServingCacheManagerPlan, build_serving_cache_manager_plan,
+    default_serving_cache_manager_request, execute_serving_cache_manager_plan,
+    warm_checkpoint_point_lookup_caches,
 };
 use crate::peers::PrivatePrefetchInvocation;
 use crate::peers::{
@@ -40,10 +41,10 @@ use crate::peers::{
 };
 use crate::prefetch::warm_iceberg_checkpoints;
 use crate::query_execution::{
-    execute_query_plan_batches, QueryExecutionPlan, QueryExtensionFileSpec, QueryInputFile,
-    QuerySqlTemplate, QueryStorageKind,
+    QueryExecutionPlan, QueryExtensionFileSpec, QueryInputFile, QuerySqlTemplate, QueryStorageKind,
+    execute_query_plan_batches,
 };
-use crate::query_path::{file_may_match_predicates, QueryPredicate};
+use crate::query_path::{QueryPredicate, file_may_match_predicates};
 use crate::runtime_bindings;
 use crate::schema_massager::{PowdrrSchema, SqlQuery};
 use crate::search_executor::typed_sort_projection_name;
@@ -466,41 +467,6 @@ fn exact_pruning_extension_file<'a>(
     extension_files
         .iter()
         .find(|extension| extension.suffix == "exact_pruning")
-}
-
-#[cfg(test)]
-fn exact_pruning_summary_from_rows(rows: Vec<serde_json::Value>) -> ExactPruningSummary {
-    let mut summary = ExactPruningSummary::new();
-    for row in rows {
-        let Some(value_map) = row.as_object() else {
-            continue;
-        };
-        let Some(field_name) = value_map
-            .get("field_name")
-            .and_then(|value| value.as_str())
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        let complete = value_map
-            .get("complete")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        let entry = summary.entry(field_name).or_default();
-        if entry.values.is_empty() && !entry.complete {
-            entry.complete = complete;
-        } else {
-            entry.complete &= complete;
-        }
-        if let Some(field_value) = value_map
-            .get("field_value")
-            .and_then(|value| value.as_str())
-            .map(str::to_string)
-        {
-            entry.values.insert(field_value);
-        }
-    }
-    summary
 }
 
 fn exact_pruning_summary_from_batches(batches: &[RecordBatch]) -> ExactPruningSummary {
@@ -1413,9 +1379,11 @@ mod tests {
         let error =
             get_extension_files(&vec!["es".to_string()], &checkpoint, &file_path).unwrap_err();
 
-        assert!(error
-            .message
-            .contains("missing published metadata for required extension es"));
+        assert!(
+            error
+                .message
+                .contains("missing published metadata for required extension es")
+        );
     }
 
     #[test]
@@ -1637,6 +1605,15 @@ pub async fn prefetch_query(
     } else {
         data_query_batches_worker(&SqlQuery::dummy(), &required_files, false, None).await?;
     }
+    let point_lookup_warmup = if invocation.required_extensions.is_empty() {
+        Some(
+            warm_checkpoint_point_lookup_caches(&table_metadata)
+                .await
+                .map_err(|message| PrivateApiError { message })?,
+        )
+    } else {
+        None
+    };
     data_access::flush_serving_bulk_cache()
         .await
         .map_err(|message| PrivateApiError { message })?;
@@ -1684,6 +1661,22 @@ pub async fn prefetch_query(
                     .map(|file| file.size)
                     .sum()
             }),
+        point_lookup_rows_warmed: point_lookup_warmup
+            .as_ref()
+            .map(|stats| stats.rows)
+            .unwrap_or_default(),
+        point_lookup_estimated_bytes: point_lookup_warmup
+            .as_ref()
+            .map(|stats| stats.estimated_bytes)
+            .unwrap_or_default(),
+        point_lookup_shards: point_lookup_warmup
+            .as_ref()
+            .map(|stats| stats.shard_count)
+            .unwrap_or_default(),
+        point_lookup_exact_id_entries: point_lookup_warmup
+            .as_ref()
+            .map(|stats| stats.exact_id_entries)
+            .unwrap_or_default(),
     });
     Ok(())
 }

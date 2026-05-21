@@ -868,6 +868,14 @@ pub struct ServingBulkCacheWarmupStats {
     pub files_selected: usize,
     #[serde(default)]
     pub estimated_bytes: u64,
+    #[serde(default)]
+    pub point_lookup_rows_warmed: usize,
+    #[serde(default)]
+    pub point_lookup_estimated_bytes: u64,
+    #[serde(default)]
+    pub point_lookup_shards: usize,
+    #[serde(default)]
+    pub point_lookup_exact_id_entries: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3345,6 +3353,10 @@ mod tests {
             files_considered: 8,
             files_selected: 2,
             estimated_bytes: 300,
+            point_lookup_rows_warmed: 42,
+            point_lookup_estimated_bytes: 2048,
+            point_lookup_shards: 32,
+            point_lookup_exact_id_entries: 7,
         });
 
         let stats = serving_bulk_cache_stats();
@@ -3360,6 +3372,10 @@ mod tests {
                 files_considered: 8,
                 files_selected: 2,
                 estimated_bytes: 300,
+                point_lookup_rows_warmed: 42,
+                point_lookup_estimated_bytes: 2048,
+                point_lookup_shards: 32,
+                point_lookup_exact_id_entries: 7,
             })
         );
 

@@ -32,6 +32,40 @@ fn from_modyne(e: modyne::Error) -> ServiceApiError {
     ServiceApiError::new(e.to_string())
 }
 
+fn create_table_request(
+    name: String,
+    tags: HashMap<String, String>,
+    serving: Option<crate::data_contract::ServingTableConfig>,
+    dynamodb: Option<crate::data_contract::DynamoDbTableConfig>,
+    mongodb: Option<crate::data_contract::MongoDbTableConfig>,
+) -> CreateTable {
+    serde_json::from_value(serde_json::json!({
+        "name": name,
+        "tags": tags,
+        "serving": serving,
+        "dynamodb": dynamodb,
+        "mongodb": mongodb,
+    }))
+    .expect("table metadata request should deserialize")
+}
+
+fn table_description_from_parts(
+    name: String,
+    tags: HashMap<String, String>,
+    serving: Option<crate::data_contract::ServingTableConfig>,
+    dynamodb: Option<crate::data_contract::DynamoDbTableConfig>,
+    mongodb: Option<crate::data_contract::MongoDbTableConfig>,
+) -> TableDescription {
+    serde_json::from_value(serde_json::json!({
+        "name": name,
+        "tags": tags,
+        "serving": serving,
+        "dynamodb": dynamodb,
+        "mongodb": mongodb,
+    }))
+    .expect("table description should deserialize")
+}
+
 #[allow(dead_code)]
 pub struct DynamoDBServiceImpl {
     mode: TestProcessingMode,
@@ -325,13 +359,13 @@ impl DynamoDBServiceImpl {
     ) -> Result<(), ServiceApiError> {
         self.create_table(
             org_info,
-            &CreateTable {
-                name: metadata.table_name.clone(),
-                tags: Default::default(),
-                serving: None,
-                dynamodb: None,
-                mongodb: None,
-            },
+            &create_table_request(
+                metadata.table_name.clone(),
+                Default::default(),
+                None,
+                None,
+                None,
+            ),
         )
         .await?;
         if metadata.speedboat_metadata.is_some() {
@@ -447,12 +481,14 @@ impl DynamoDBServiceImpl {
             .describe_powdrr_table(&org_info.org_id.to_string(), name)
             .await
             .map(|x| {
-                x.map(|x| TableDescription {
-                    name: name.clone(),
-                    tags: x.tags.clone(),
-                    serving: x.serving.clone(),
-                    dynamodb: x.dynamodb.clone(),
-                    mongodb: x.mongodb.clone(),
+                x.map(|x| {
+                    table_description_from_parts(
+                        name.clone(),
+                        x.tags.clone(),
+                        x.serving.clone(),
+                        x.dynamodb.clone(),
+                        x.mongodb.clone(),
+                    )
                 })
             })
             .map_err(from_modyne)?;
@@ -472,12 +508,14 @@ impl DynamoDBServiceImpl {
                         .describe_powdrr_table(&org_info.org_id.to_string(), &table_name)
                         .await
                         .map(|x| {
-                            x.map(|x| TableDescription {
-                                name: table_name.clone(),
-                                tags: x.tags.clone(),
-                                serving: x.serving.clone(),
-                                dynamodb: x.dynamodb.clone(),
-                                mongodb: x.mongodb.clone(),
+                            x.map(|x| {
+                                table_description_from_parts(
+                                    table_name.clone(),
+                                    x.tags.clone(),
+                                    x.serving.clone(),
+                                    x.dynamodb.clone(),
+                                    x.mongodb.clone(),
+                                )
                             })
                         })
                         .map_err(from_modyne),
@@ -1579,13 +1617,7 @@ mod tests {
         service_impl
             .create_table(
                 &org_info,
-                &CreateTable {
-                    name: table_name.clone(),
-                    tags: HashMap::new(),
-                    serving: None,
-                    dynamodb: None,
-                    mongodb: None,
-                },
+                &create_table_request(table_name.clone(), HashMap::new(), None, None, None),
             )
             .await
             .unwrap();
@@ -1660,13 +1692,7 @@ mod tests {
         service_impl
             .create_table(
                 &org_info,
-                &CreateTable {
-                    name: table_name.clone(),
-                    tags: HashMap::new(),
-                    serving: None,
-                    dynamodb: None,
-                    mongodb: None,
-                },
+                &create_table_request(table_name.clone(), HashMap::new(), None, None, None),
             )
             .await
             .unwrap();

@@ -94,13 +94,14 @@ pub fn put_serving_config(mut state: State) -> Pin<Box<HandlerFuture>> {
             }
         };
 
-        let request = CreateTable {
-            name: path.clone(),
-            tags,
-            serving: Some(body.clone()),
-            dynamodb,
-            mongodb,
-        };
+        let request = serde_json::from_value::<CreateTable>(serde_json::json!({
+            "name": path.clone(),
+            "tags": tags,
+            "serving": body.clone(),
+            "dynamodb": dynamodb,
+            "mongodb": mongodb,
+        }))
+        .expect("serving config table metadata should deserialize");
 
         match STATE_PROVIDER.upsert_table_metadata(&request).await {
             Ok(_) => {

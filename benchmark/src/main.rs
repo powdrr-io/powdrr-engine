@@ -115,6 +115,7 @@ struct LatencySummary {
     min_ms: f64,
     p50_ms: f64,
     p95_ms: f64,
+    p99_ms: f64,
     max_ms: f64,
 }
 
@@ -205,8 +206,8 @@ async fn main() -> Result<()> {
 
     println!();
     println!(
-        "{:<20} {:<10} {:>8} {:>8} {:>8} {:>8} {:>8}",
-        "case", "backend", "avg", "p50", "p95", "min", "max"
+        "{:<20} {:<10} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "case", "backend", "avg", "p50", "p95", "p99", "min", "max"
     );
 
     for case in cases.iter() {
@@ -537,6 +538,39 @@ fn build_benchmark_cases(
                 benchmark_plan(workload, vec![eq_filter.clone()], true, requested_limit),
             );
 
+            if workload.sort_field != *eq_field {
+                if let Some(exact_lookup_value) =
+                    infer_exact_lookup_value(rows, eq_field, eq_value, &workload.sort_field)
+                {
+                    push_benchmark_case(
+                        &mut cases,
+                        rows,
+                        1,
+                        "eq_exact_point_lookup",
+                        ServingRequestPlan {
+                            select: Some(workload.projection.clone()),
+                            filters: vec![
+                                eq_filter.clone(),
+                                ServingPredicate {
+                                    field: workload.sort_field.clone(),
+                                    eq: Some(exact_lookup_value),
+                                    in_values: None,
+                                    gt: None,
+                                    gte: None,
+                                    lt: None,
+                                    lte: None,
+                                },
+                            ],
+                            aggregate: None,
+                            order_by: vec![],
+                            limit: Some(1),
+                            allow_slow_path: true,
+                            explain: false,
+                        },
+                    );
+                }
+            }
+
             if let (Some(range_field), Some(range_lower_bound)) = (
                 workload.range_field.as_ref(),
                 workload.range_lower_bound.as_ref(),
@@ -845,6 +879,19 @@ fn infer_comparable_limit(
     }
 
     (comparable_limit > 0).then_some(comparable_limit)
+}
+
+fn infer_exact_lookup_value(
+    rows: &[Value],
+    eq_field: &str,
+    eq_value: &Value,
+    exact_field: &str,
+) -> Option<Value> {
+    rows.iter()
+        .find(|row| {
+            json_values_equal(row.get(eq_field), Some(eq_value)) && row.get(exact_field).is_some()
+        })
+        .and_then(|row| row.get(exact_field).cloned())
 }
 
 fn safe_ordered_limit_for_field(
@@ -1402,18 +1449,20 @@ fn summarize_latencies(durations: &[Duration]) -> LatencySummary {
         min_ms: *millis.first().unwrap(),
         p50_ms: percentile(0.50),
         p95_ms: percentile(0.95),
+        p99_ms: percentile(0.99),
         max_ms: *millis.last().unwrap(),
     }
 }
 
 fn print_summary(case_name: &str, backend_name: &str, summary: &LatencySummary) {
     println!(
-        "{:<20} {:<10} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1}",
+        "{:<20} {:<10} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1}",
         case_name,
         backend_name,
         summary.avg_ms,
         summary.p50_ms,
         summary.p95_ms,
+        summary.p99_ms,
         summary.min_ms,
         summary.max_ms,
     );
@@ -1596,6 +1645,7 @@ mod tests {
         let names = case_names(&build_benchmark_cases(&workload, &rows, 3));
 
         assert!(names.contains("top_n_desc"));
+        assert!(names.contains("eq_exact_point_lookup"));
         assert!(names.contains("eq_top_n_desc"));
         assert!(names.contains("in_top_n_desc"));
         assert!(names.contains("range_top_n_desc"));
