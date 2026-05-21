@@ -1,0 +1,23 @@
+[package]
+name = "powdrr-control-plane"
+description = "Powdrr.io shared control-plane types and logic"
+publish = false
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+arrow-schema = ["dep:arrow-json", "dep:datafusion"]
+iceberg-schema = ["arrow-schema", "dep:iceberg"]
+http-client = ["dep:reqwest"]
+
+[dependencies]
+arrow-json = { version = "58.0.0", optional = true }
+chrono = "0.4.41"
+datafusion = { version = "53.1.0", optional = true }
+iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "145afdf4b553e0f1b79d27b6cbf9b3af04f87e4e", optional = true }
+idgenerator = "2.0.0"
+minijinja = "2.10.2"
+reqwest = { version = "0.12.14", default-features = false, features = ["json", "rustls-tls"], optional = true }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"

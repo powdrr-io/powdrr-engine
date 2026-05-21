@@ -1,6 +1,17 @@
 [workspace]
 resolver = "2"
-members = ["benchmark", "cli", "engine", "engine_lib", "main_lib", "service", "service_lib"]
+members = [
+    "benchmark",
+    "cli",
+    "control_plane",
+    "engine",
+    "main_lib",
+    "query_core",
+    "query_lib",
+    "query_server",
+    "service",
+    "service_lib",
+]
 default-members = ["cli", "engine", "service"]
 
 

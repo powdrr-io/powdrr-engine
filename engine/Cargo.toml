@@ -11,7 +11,8 @@ edition.workspace = true
 [dependencies]
 gotham = { version = "0.7.4", features = ["rustls"] }
 idgenerator = "2.0.0"
-powdrr-engine-lib = { path = "../engine_lib" }
+powdrr-query-lib = { path = "../query_lib" }
+powdrr-query-server = { path = "../query_server" }
 rustls-pemfile = "2.2.0"
 rustls-pki-types = "1.12.0"
 tracing-subscriber = "0.3.19"

@@ -16,7 +16,8 @@ gotham = { version = "0.7.4", features = ["rustls"] }
 idgenerator = "2.0.0"
 mime = "0.3.17"
 mongodb = "3.3.0"
-powdrr_lib = { path = "../main_lib" }
+powdrr-query-lib = { path = "../query_lib" }
+powdrr-query-server = { path = "../query_server" }
 rand = "0.9.1"
 reqwest = { version = "0.12.22", features = ["blocking"] }
 tokio = "1.45.1"
