@@ -472,23 +472,32 @@ fn exact_pruning_extension_file<'a>(
 fn exact_pruning_summary_from_rows(rows: Vec<serde_json::Value>) -> ExactPruningSummary {
     let mut summary = ExactPruningSummary::new();
     for row in rows {
-        let Some(field_name) = row.get("field_name").and_then(|value| value.as_str()) else {
+        let Some(value_map) = row.as_object() else {
             continue;
         };
-        let complete = row
+        let Some(field_name) = value_map
+            .get("field_name")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let complete = value_map
             .get("complete")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
-        let entry = summary
-            .entry(field_name.to_string())
-            .or_insert_with(ExactPruningFieldSummary::default);
+        let entry = summary.entry(field_name).or_default();
         if entry.values.is_empty() && !entry.complete {
             entry.complete = complete;
         } else {
             entry.complete &= complete;
         }
-        if let Some(field_value) = row.get("field_value").and_then(|value| value.as_str()) {
-            entry.values.insert(field_value.to_string());
+        if let Some(field_value) = value_map
+            .get("field_value")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+        {
+            entry.values.insert(field_value);
         }
     }
     summary
@@ -833,11 +842,9 @@ pub async fn search_query(
         .is_some_and(|_| required_files_have_extension_suffix(&required_files, "exact_index"));
 
     let extension_suffixes = if use_exact_sql {
-        Some(vec!["exact_index".to_string()])
-    } else if invocation.calculate_score {
-        Some(vec!["search_index".to_string()])
+        Some(invocation.exact_extension_suffixes.clone())
     } else {
-        Some(vec![])
+        Some(invocation.base_extension_suffixes.clone())
     };
 
     let parquet_size = required_files
@@ -1481,22 +1488,21 @@ mod tests {
 
     #[test]
     fn exact_pruning_summary_may_match_only_prunes_complete_misses() {
-        let summary = exact_pruning_summary_from_rows(vec![
-            serde_json::json!({
-                "field_name": "service",
-                "field_value": "auth",
-                "complete": true
-            }),
-            serde_json::json!({
-                "field_name": "service",
-                "field_value": "api",
-                "complete": true
-            }),
-            serde_json::json!({
-                "field_name": "env",
-                "field_value": null,
-                "complete": false
-            }),
+        let summary = HashMap::from([
+            (
+                "service".to_string(),
+                ExactPruningFieldSummary {
+                    complete: true,
+                    values: BTreeSet::from(["auth".to_string(), "api".to_string()]),
+                },
+            ),
+            (
+                "env".to_string(),
+                ExactPruningFieldSummary {
+                    complete: false,
+                    values: BTreeSet::new(),
+                },
+            ),
         ]);
 
         assert!(exact_pruning_summary_may_match(
@@ -1520,6 +1526,35 @@ mod tests {
                 values: vec!["prod".to_string()],
             }]
         ));
+    }
+
+    #[test]
+    fn sort_scalar_to_json_preserves_integer_number_types() {
+        assert_eq!(sort_scalar_to_json(&SortScalar::Int(7)), Value::from(7_i64));
+        assert_eq!(
+            sort_scalar_to_json(&SortScalar::UInt(9)),
+            Value::from(9_u64)
+        );
+        assert_eq!(
+            sort_scalar_to_json(&SortScalar::Float(1.5)),
+            Value::from(1.5_f64)
+        );
+    }
+
+    #[test]
+    fn compare_sort_values_handles_mixed_integer_types() {
+        assert_eq!(
+            compare_sort_values(&SortScalar::Int(7), &SortScalar::UInt(8)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_sort_values(&SortScalar::UInt(8), &SortScalar::Int(7)),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_sort_values(&SortScalar::Int(-1), &SortScalar::UInt(0)),
+            std::cmp::Ordering::Less
+        );
     }
 }
 

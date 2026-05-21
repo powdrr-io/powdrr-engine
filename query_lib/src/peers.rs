@@ -6,14 +6,11 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt::Debug;
+use std::fmt::Formatter;
 use std::sync::Arc;
 use std::{error::Error, fmt::Display};
 
-use gotham::plain::test::AsyncTestServer;
-use mime;
-use std::fmt::Formatter;
-
-use crate::compaction::{CompactionCommand, CompactionResponse, compact_logs};
+use crate::compaction::{compact_logs, CompactionCommand, CompactionResponse};
 use crate::data_contract::{ExtensionFileMetadata, FileSetPayload};
 use crate::elastic_search_common::result_to_record_batch;
 use crate::elastic_search_responses::QueryResultHit;
@@ -23,6 +20,8 @@ use crate::private_api::{
 use crate::schema_massager::{PowdrrSchema, SqlQuery};
 use crate::state_common::FileFilter;
 use crate::test_api::{CompactionMode, PeerModeType};
+use gotham::plain::test::AsyncTestServer;
+use mime;
 pub use powdrr_control_plane::checkpoint_descriptor::CheckpointDescriptor;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -67,6 +66,8 @@ pub struct PrivateSearchInvocation {
     pub exact_constraints: Vec<PrivateExactConstraintGroup>,
     pub range_constraints: Vec<PrivateSearchRangeConstraint>,
     pub required_extensions: Vec<String>,
+    pub base_extension_suffixes: Vec<String>,
+    pub exact_extension_suffixes: Vec<String>,
     pub checkpoints: Vec<CheckpointDescriptor>,
     pub table: String,
     pub size: usize,

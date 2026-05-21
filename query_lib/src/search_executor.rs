@@ -238,6 +238,10 @@ impl SearchCommand {
             exact_constraints: self.exact_constraints.clone(),
             range_constraints: self.range_constraints.clone(),
             required_extensions,
+            base_extension_suffixes: self
+                .read_plan
+                .base_extension_suffixes(legacy_command.calculate_score),
+            exact_extension_suffixes: self.read_plan.exact_extension_suffixes(),
             checkpoints,
             table: legacy_command.table.clone(),
             size,
@@ -2026,6 +2030,10 @@ fn append_projection_fields_for_agg_only_query(
     plan: &search_plan::SearchPlan,
     doc_id_field_name: &str,
 ) {
+    if search_plan_returns_hits(plan) {
+        return;
+    }
+
     push_projection_field(
         builder,
         "__powdrr_row_id",
