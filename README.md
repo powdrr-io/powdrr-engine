@@ -9,6 +9,28 @@ to serve bounded, declared application query patterns directly from lakehouse
 snapshots without forcing users to load the same data into a second full
 search, document, or key-value system.
 
+## Why Powdrr
+
+A common problem in ML and data-heavy products is that the most useful
+production data is generated offline in the warehouse or lake: feature tables,
+scored entities, recommendations, fraud signals, eligibility outputs, or other
+results that come from historical joins and heavyweight batch computation.
+
+The painful part is usually not generating that data. The painful part is
+serving it. Teams end up building a second "online" loading system just to copy
+the latest output into a search cluster, key-value store, or custom cache layer
+without serving mixed snapshots or destroying p99 latency every time a new
+batch lands.
+
+Powdrr is meant to remove that whole category of work. You point it at an
+Iceberg table, Powdrr tracks the serveable snapshot, keeps bounded
+snapshot-aware acceleration state, and exposes low-latency read APIs without
+requiring a second full data store. When a new snapshot lands, the system is
+built to publish a coherent version and warm what it needs before shifting
+traffic.
+
+For the longer product explanation, see `docs/why-powdrr.md`.
+
 ## Goal
 
 Powdrr is moving toward a serving database with this contract:
@@ -351,6 +373,10 @@ ecosystems. The exact machine-readable dependency graph lives in the workspace
 Powdrr would not exist in its current form without that work upstream.
 
 ## Where To Read Next
+
+- `docs/why-powdrr.md`
+  The product-level explanation of the offline-to-online serving problem and
+  why an Iceberg-first, coherent-snapshot serving layer matters.
 
 - `docs/zero-copy-lakehouse-serving-requirements.md`
   The most direct statement of the product contract and what "zero-copy"
