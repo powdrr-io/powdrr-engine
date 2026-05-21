@@ -110,12 +110,13 @@ pub async fn execute_query_plan_batches(
     }
 
     let files = filter_query_input_extensions(files, extension_suffixes.as_ref());
-    let delete_local_tables = if use_deletes_table {
-        load_delete_local_tables(&delete_files).await?
+    let (delete_local_tables, deletes_table_name) = if use_deletes_table {
+        let delete_local_tables = load_delete_local_tables(&delete_files).await?;
+        let deletes_table_name = create_deletes_union_table(&delete_local_tables).await?;
+        (delete_local_tables, deletes_table_name)
     } else {
-        vec![]
+        (vec![], String::new())
     };
-    let deletes_table_name = create_deletes_union_table(&delete_local_tables).await?;
     let grouped_files = group_query_input_files_by_schema(files);
 
     // Iceberg and speedboat share one execution entry point here; the only
@@ -151,10 +152,12 @@ pub async fn execute_query_plan_batches(
 
     let grouped_results = try_join_all(grouped_calls).await;
 
-    for local_table in delete_local_tables.iter() {
-        data_access::drop(local_table).await;
+    if use_deletes_table {
+        for local_table in delete_local_tables.iter() {
+            data_access::drop(local_table).await;
+        }
+        data_access::drop(&deletes_table_name).await;
     }
-    data_access::drop(&deletes_table_name).await;
 
     grouped_results.map(|results| results.into_iter().flatten().collect())
 }

@@ -20,7 +20,7 @@ use crate::peers::{
 };
 use crate::read_plan::{ReadPlan, ReadPredicate, ReadSort};
 use crate::runtime_bindings;
-use crate::schema_massager::{FieldExpression, SqlBuilder, SqlExpression};
+use crate::schema_massager::{FieldExpression, SqlBuilder, SqlExpression, SqlQuery};
 use crate::search_plan;
 use crate::search_runtime::{
     AggProcessor, Aggregation, AverageAggProcessor, CardinalityAggProcessor,
@@ -132,9 +132,13 @@ pub struct SearchCommand {
     execution_strategy: SearchExecutionStrategy,
     typed_aggregation_specs: Option<Vec<PrivateSearchAggregationSpec>>,
     typed_sort_specs: Vec<PrivateSearchSortSpec>,
+    sql_without_deletes: Option<crate::schema_massager::SqlQuery>,
     source_projection_sql: Option<crate::schema_massager::SqlQuery>,
+    source_projection_sql_without_deletes: Option<crate::schema_massager::SqlQuery>,
     source_projection_exact_sql: Option<crate::schema_massager::SqlQuery>,
     exact_sql: Option<crate::schema_massager::SqlQuery>,
+    exact_sql_without_deletes: Option<crate::schema_massager::SqlQuery>,
+    source_projection_exact_sql_without_deletes: Option<crate::schema_massager::SqlQuery>,
     exact_constraints: Vec<PrivateExactConstraintGroup>,
     range_constraints: Vec<PrivateSearchRangeConstraint>,
     backend: SearchBackend,
@@ -200,12 +204,8 @@ impl SearchCommand {
     async fn private_search_invocation(&self) -> Option<PrivateSearchInvocation> {
         let legacy_command = self.legacy_sql_command()?;
         let checkpoints = self.current_target_snapshots(legacy_command).await;
+        let size = self.execution_plan.merge.from as usize + self.execution_plan.merge.size;
         let use_source_projection = self.can_use_source_projection(&checkpoints).await;
-        let size = if self.read_plan.search_after.is_some() {
-            usize::MAX
-        } else {
-            self.execution_plan.merge.from as usize + self.execution_plan.merge.size
-        };
         let mut required_extensions = legacy_command.required_extensions();
         if self.exact_sql.is_some()
             && !required_extensions
@@ -223,6 +223,14 @@ impl SearchCommand {
             legacy_command.sql.clone()
         };
 
+        let sql_without_deletes = if use_source_projection {
+            self.source_projection_sql_without_deletes
+                .clone()
+                .or_else(|| self.sql_without_deletes.clone())
+        } else {
+            self.sql_without_deletes.clone()
+        };
+
         let exact_sql = if use_source_projection {
             self.source_projection_exact_sql
                 .clone()
@@ -231,9 +239,19 @@ impl SearchCommand {
             self.exact_sql.clone()
         };
 
+        let exact_sql_without_deletes = if use_source_projection {
+            self.source_projection_exact_sql_without_deletes
+                .clone()
+                .or_else(|| self.exact_sql_without_deletes.clone())
+        } else {
+            self.exact_sql_without_deletes.clone()
+        };
+
         Some(PrivateSearchInvocation {
             sql,
+            sql_without_deletes,
             exact_sql,
+            exact_sql_without_deletes,
             exact_constraints: self.exact_constraints.clone(),
             range_constraints: self.range_constraints.clone(),
             required_extensions,
@@ -247,6 +265,7 @@ impl SearchCommand {
             calculate_score: legacy_command.calculate_score,
             aggregations: self.typed_aggregation_specs.clone().unwrap_or_default(),
             sorts: self.typed_sort_specs.clone(),
+            search_after: self.read_plan.search_after.clone(),
         })
     }
 
@@ -341,13 +360,6 @@ fn legacy_sql_fanout_reason(command: &SearchCommand) -> String {
 
     if backend.query_params.sort.is_some() {
         return "Query-string sort currently uses the legacy SQL fanout path.".to_string();
-    }
-
-    if matches!(
-        &command.search_plan.target,
-        search_plan::SearchTarget::Pit(_)
-    ) {
-        return "Point-in-time queries currently use the legacy SQL fanout path.".to_string();
     }
 
     "Query is supported, but it falls back to the legacy SQL fanout path.".to_string()
@@ -492,15 +504,19 @@ pub async fn execute_multi_target_search_commands(
         .to_response();
     }
 
-    let command_results = match try_join_all(
-        commands
-            .iter()
-            .cloned()
-            .map(execute_typed_search_source_results),
-    )
-    .await
-    {
-        Ok(results) => results,
+    let command_results = match execute_combined_typed_search_source_results(&commands).await {
+        Ok(Some(combined_result)) => vec![combined_result],
+        Ok(None) => match try_join_all(
+            commands
+                .iter()
+                .cloned()
+                .map(execute_typed_search_source_results),
+        )
+        .await
+        {
+            Ok(results) => results,
+            Err(response) => return response,
+        },
         Err(response) => return response,
     };
 
@@ -520,6 +536,88 @@ async fn execute_typed_search_source_results(
         }
     };
 
+    execute_private_search_invocation(invocation).await
+}
+
+async fn execute_combined_typed_search_source_results(
+    commands: &[Arc<SearchCommand>],
+) -> Result<Option<TypedSearchSourceResults>, ElasticSearchResponse> {
+    if commands.len() <= 1
+        || commands
+            .iter()
+            .any(|command| command.execution_plan.merge.size != 0)
+    {
+        return Ok(None);
+    }
+
+    let mut invocations = Vec::with_capacity(commands.len());
+    for command in commands {
+        let Some(invocation) = command.private_search_invocation().await else {
+            return Ok(None);
+        };
+        if !invocations.is_empty()
+            && !can_combine_private_search_invocations(&invocations[0], &invocation)
+        {
+            return Ok(None);
+        }
+        invocations.push(invocation);
+    }
+
+    let Some(mut combined) = invocations.first().cloned() else {
+        return Ok(Some(TypedSearchSourceResults {
+            peer_results: vec![],
+            num_shards: 1,
+        }));
+    };
+    combined.checkpoints.clear();
+    for invocation in invocations {
+        combined.checkpoints.extend(invocation.checkpoints);
+    }
+
+    execute_private_search_invocation(combined).await.map(Some)
+}
+
+fn can_combine_private_search_invocations(
+    left: &PrivateSearchInvocation,
+    right: &PrivateSearchInvocation,
+) -> bool {
+    same_sql_query(&left.sql, &right.sql)
+        && same_optional_sql_query(
+            left.sql_without_deletes.as_ref(),
+            right.sql_without_deletes.as_ref(),
+        )
+        && same_optional_sql_query(left.exact_sql.as_ref(), right.exact_sql.as_ref())
+        && same_optional_sql_query(
+            left.exact_sql_without_deletes.as_ref(),
+            right.exact_sql_without_deletes.as_ref(),
+        )
+        && left.exact_constraints == right.exact_constraints
+        && left.range_constraints == right.range_constraints
+        && left.required_extensions == right.required_extensions
+        && left.base_extension_suffixes == right.base_extension_suffixes
+        && left.exact_extension_suffixes == right.exact_extension_suffixes
+        && left.size == right.size
+        && left.calculate_score == right.calculate_score
+        && left.aggregations == right.aggregations
+        && left.sorts == right.sorts
+        && left.search_after == right.search_after
+}
+
+fn same_sql_query(left: &SqlQuery, right: &SqlQuery) -> bool {
+    serde_json::to_string(left).ok() == serde_json::to_string(right).ok()
+}
+
+fn same_optional_sql_query(left: Option<&SqlQuery>, right: Option<&SqlQuery>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => same_sql_query(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+async fn execute_private_search_invocation(
+    invocation: PrivateSearchInvocation,
+) -> Result<TypedSearchSourceResults, ElasticSearchResponse> {
     if invocation.checkpoints.is_empty() {
         return Ok(TypedSearchSourceResults {
             peer_results: vec![],
@@ -702,6 +800,11 @@ pub(crate) fn search_plan_to_command_with_options(
 ) -> Result<SearchCommand, ParseError> {
     let backend =
         compile_legacy_sql_command(&plan, query, doc_id_field_name, include_deletes_join)?;
+    let sql_without_deletes = if include_deletes_join {
+        Some(compile_legacy_sql_command(&plan, query, doc_id_field_name, false)?.sql)
+    } else {
+        None
+    };
     let source_projection_sql = compile_source_projection_sql_command(
         &plan,
         query,
@@ -709,16 +812,33 @@ pub(crate) fn search_plan_to_command_with_options(
         include_deletes_join,
     )
     .map(|command| command.map(|command| command.sql))?;
+    let source_projection_sql_without_deletes = if include_deletes_join {
+        compile_source_projection_sql_command(&plan, query, doc_id_field_name, false)
+            .map(|command| command.map(|command| command.sql))?
+    } else {
+        None
+    };
     let read_plan = read_plan_from_search_plan(&plan);
     let exact_constraints = compile_exact_constraint_groups(&read_plan)?;
     let range_constraints = compile_range_constraints(&read_plan);
-    let exact_sql = compile_exact_sql_query(&plan, query, doc_id_field_name, include_deletes_join)?;
+    let exact_sql =
+        compile_exact_sql_query(&plan, query, doc_id_field_name, include_deletes_join)?;
+    let exact_sql_without_deletes = if include_deletes_join {
+        compile_exact_sql_query(&plan, query, doc_id_field_name, false)?
+    } else {
+        None
+    };
     let source_projection_exact_sql = compile_source_projection_exact_sql_query(
         &plan,
         query,
         doc_id_field_name,
         include_deletes_join,
     )?;
+    let source_projection_exact_sql_without_deletes = if include_deletes_join {
+        compile_source_projection_exact_sql_query(&plan, query, doc_id_field_name, false)?
+    } else {
+        None
+    };
     let execution_plan =
         create_execution_plan(&read_plan, &plan.target, &backend, exact_sql.is_some());
     let typed_aggregation_specs = private_search_aggregation_specs(&plan.aggregations);
@@ -746,9 +866,13 @@ pub(crate) fn search_plan_to_command_with_options(
         execution_strategy,
         typed_aggregation_specs,
         typed_sort_specs: typed_sort_specs.unwrap_or_default(),
+        sql_without_deletes,
         source_projection_sql,
+        source_projection_sql_without_deletes,
         source_projection_exact_sql,
         exact_sql,
+        exact_sql_without_deletes,
+        source_projection_exact_sql_without_deletes,
         exact_constraints,
         range_constraints,
         backend: SearchBackend::LegacySql(backend),
@@ -823,8 +947,7 @@ fn choose_execution_strategy(
     }
 
     match target {
-        search_plan::SearchTarget::Pit(_) => SearchExecutionStrategy::LegacySqlFanout,
-        search_plan::SearchTarget::Table(_) => {
+        search_plan::SearchTarget::Pit(_) | search_plan::SearchTarget::Table(_) => {
             if !plan.order_by.is_empty() {
                 SearchExecutionStrategy::TypedNodeMerge(SearchResultOrder::ExplicitSort)
             } else if backend.calculate_score {
@@ -1745,7 +1868,7 @@ fn compile_exact_sql_query_with_projection(
 
     let table_name = match &plan.target {
         search_plan::SearchTarget::Table(table_name) => table_name,
-        search_plan::SearchTarget::Pit(_) => return Ok(None),
+        search_plan::SearchTarget::Pit(pit) => &pit.id,
     };
 
     Ok(Some(
@@ -2208,6 +2331,7 @@ mod tests {
     use crate::elastic_search_common::ParseError;
     use crate::elastic_search_parser;
     use crate::peers::PrivateSearchSortSpec;
+    use crate::search_plan::{PitTarget, SearchPlan, SearchTarget, SortPlan};
 
     fn parse_search_command(body: &str) -> SearchCommand {
         parse_search_command_with_query(body, QueryStringSearch::new())
@@ -2564,6 +2688,36 @@ mod tests {
                 descending: true,
             }]
         );
+    }
+
+    #[test]
+    fn test_pit_target_with_supported_sort_uses_typed_node_merge_path() {
+        let command = super::search_plan_to_command_with_options(
+            SearchPlan {
+                target: SearchTarget::Pit(PitTarget {
+                    id: "logs".to_string(),
+                    keep_alive: "1m".to_string(),
+                }),
+                from: 0,
+                size: Some(10),
+                search_after: Some(vec![serde_json::Value::from(2)]),
+                seq_no_primary_term: None,
+                query: None,
+                aggregations: vec![],
+                sort: vec![SortPlan::Field {
+                    field: "index_col".to_string(),
+                    order: Some("asc".to_string()),
+                    unmapped_type: None,
+                    script: None,
+                }],
+            },
+            &QueryStringSearch::new(),
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert!(command.supports_typed_node_merge());
     }
 
     #[test]
