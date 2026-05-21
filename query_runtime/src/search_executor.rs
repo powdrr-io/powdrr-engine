@@ -2,14 +2,15 @@ use crate::elastic_search_api_types::QueryStringSearch;
 use crate::elastic_search_commands::SqlCommand;
 use crate::elastic_search_commands::UpdateByQueryCommand;
 use crate::elastic_search_common::{
-    Command, CommandContext, ElasticSearchResponse, ParseError, ResultGeneratorFuture,
-    execute_command,
+    execute_command, Command, CommandContext, ElasticSearchResponse, ParseError,
+    ResultGeneratorFuture,
 };
 use crate::elastic_search_datetime_parser;
 use crate::elastic_search_responses::{
-    AggregationResult, AverageAggregationResult, CardinalityAggregationResult,
-    FilterAggregationResult, HistogramAggregationBucket, HistogramAggregationResult, QueryFailure,
-    QueryResults, TermAggregationBucket, TermAggregationResult, compare_query_result_hits_desc,
+    compare_query_result_hits_desc, AggregationResult, AverageAggregationResult,
+    CardinalityAggregationResult, FilterAggregationResult, HistogramAggregationBucket,
+    HistogramAggregationResult, QueryFailure, QueryResults, TermAggregationBucket,
+    TermAggregationResult,
 };
 use crate::peers::{
     CheckpointDescriptor, PrivateExactConstraintGroup, PrivateInvocation,
@@ -211,6 +212,10 @@ impl SearchCommand {
             exact_constraints: self.exact_constraints.clone(),
             range_constraints: self.range_constraints.clone(),
             required_extensions,
+            base_extension_suffixes: self
+                .read_plan
+                .base_extension_suffixes(legacy_command.calculate_score),
+            exact_extension_suffixes: self.read_plan.exact_extension_suffixes(),
             checkpoints,
             table: legacy_command.table.clone(),
             size,
@@ -1439,8 +1444,9 @@ fn compile_legacy_sql_command(
     doc_id_field_name: Option<&str>,
     include_deletes_join: bool,
 ) -> Result<SqlCommand, ParseError> {
+    let returns_hits = search_plan_returns_hits(plan);
     let mut builder = SqlBuilder::for_query_with_options(
-        true,
+        returns_hits,
         doc_id_field_name.unwrap_or("_id_seq_no"),
         include_deletes_join,
     );
@@ -1455,6 +1461,11 @@ fn compile_legacy_sql_command(
         apply_query_plan(&mut builder, query_plan)?;
     }
 
+    append_projection_fields_for_agg_only_query(
+        &mut builder,
+        plan,
+        doc_id_field_name.unwrap_or("_id_seq_no"),
+    );
     append_sort_projection_fields(&mut builder, &plan.sort);
 
     let table_name = match &plan.target {
@@ -1530,10 +1541,11 @@ fn compile_exact_sql_query(
         return Ok(None);
     }
 
+    let returns_hits = search_plan_returns_hits(plan);
     let doc_id_field_name = doc_id_field_name.unwrap_or("_id_seq_no");
     let normalized_doc_id_field_name = doc_id_field_name.replace(".", "_");
     let mut builder =
-        SqlBuilder::for_query_with_options(true, doc_id_field_name, include_deletes_join);
+        SqlBuilder::for_query_with_options(returns_hits, doc_id_field_name, include_deletes_join);
 
     for (index, group) in groups.iter().enumerate() {
         let alias = format!("ei{index}");
@@ -1584,6 +1596,7 @@ fn compile_exact_sql_query(
         }
     }
 
+    append_projection_fields_for_agg_only_query(&mut builder, plan, doc_id_field_name);
     append_sort_projection_fields(&mut builder, &plan.sort);
 
     let table_name = match &plan.target {
@@ -1819,6 +1832,116 @@ fn append_sort_projection_fields(builder: &mut SqlBuilder, sorts: &[search_plan:
             expression: SqlExpression::FieldRef("t".to_string(), field.clone()),
         });
     }
+}
+
+fn search_plan_returns_hits(plan: &search_plan::SearchPlan) -> bool {
+    plan.size.unwrap_or(10) > 0
+}
+
+fn append_projection_fields_for_agg_only_query(
+    builder: &mut SqlBuilder,
+    plan: &search_plan::SearchPlan,
+    doc_id_field_name: &str,
+) {
+    if search_plan_returns_hits(plan) {
+        return;
+    }
+
+    push_projection_field(
+        builder,
+        "__powdrr_row_id",
+        SqlExpression::FieldRef("t".to_string(), doc_id_field_name.replace('.', "_")),
+    );
+    append_aggregation_projection_fields(builder, &plan.aggregations);
+}
+
+fn append_aggregation_projection_fields(
+    builder: &mut SqlBuilder,
+    aggregations: &[search_plan::AggregationPlan],
+) {
+    for aggregation in aggregations {
+        append_aggregation_plan_projection_fields(builder, &aggregation.spec);
+    }
+}
+
+fn append_aggregation_plan_projection_fields(
+    builder: &mut SqlBuilder,
+    aggregation: &search_plan::AggregationPlanSpec,
+) {
+    match aggregation {
+        search_plan::AggregationPlanSpec::Terms(plan) => {
+            push_source_field_projection(builder, &plan.field);
+            append_aggregation_projection_fields(builder, &plan.sub_aggregations);
+        }
+        search_plan::AggregationPlanSpec::Missing(plan) => {
+            push_source_field_projection(builder, &plan.field);
+            append_aggregation_projection_fields(builder, &plan.sub_aggregations);
+        }
+        search_plan::AggregationPlanSpec::Filter(plan) => {
+            append_aggregation_filter_projection_fields(builder, &plan.filter);
+            append_aggregation_projection_fields(builder, &plan.sub_aggregations);
+        }
+        search_plan::AggregationPlanSpec::DateHistogram(plan) => {
+            push_source_field_projection(builder, &plan.field);
+            append_aggregation_projection_fields(builder, &plan.sub_aggregations);
+        }
+        search_plan::AggregationPlanSpec::Cardinality(plan) => {
+            push_source_field_projection(builder, &plan.field);
+            append_aggregation_projection_fields(builder, &plan.sub_aggregations);
+        }
+        search_plan::AggregationPlanSpec::Range(plan) => {
+            append_range_bounds_projection_fields(builder, &plan.range);
+            append_aggregation_projection_fields(builder, &plan.sub_aggregations);
+        }
+        search_plan::AggregationPlanSpec::Average(plan) => {
+            push_source_field_projection(builder, &plan.field);
+            append_aggregation_projection_fields(builder, &plan.sub_aggregations);
+        }
+    }
+}
+
+fn append_aggregation_filter_projection_fields(
+    builder: &mut SqlBuilder,
+    filter: &search_plan::AggregationFilterPlan,
+) {
+    match filter {
+        search_plan::AggregationFilterPlan::Term { field, .. } => {
+            push_source_field_projection(builder, field);
+        }
+        search_plan::AggregationFilterPlan::Range(bounds) => {
+            append_range_bounds_projection_fields(builder, bounds);
+        }
+    }
+}
+
+fn append_range_bounds_projection_fields(
+    builder: &mut SqlBuilder,
+    range: &search_plan::AggregationRangeBoundsPlan,
+) {
+    match range {
+        search_plan::AggregationRangeBoundsPlan::Raw { field, .. }
+        | search_plan::AggregationRangeBoundsPlan::Structured { field, .. } => {
+            push_source_field_projection(builder, field);
+        }
+    }
+}
+
+fn push_source_field_projection(builder: &mut SqlBuilder, field: &str) {
+    push_projection_field(
+        builder,
+        field,
+        SqlExpression::FieldRef("t".to_string(), field.to_string()),
+    );
+}
+
+fn push_projection_field(builder: &mut SqlBuilder, name: &str, expression: SqlExpression) {
+    if builder.all_fields || builder.fields.iter().any(|field| field.name == name) {
+        return;
+    }
+    builder.fields.push(FieldExpression {
+        name: name.to_string(),
+        expression,
+    });
 }
 
 fn create_execution_plan(
