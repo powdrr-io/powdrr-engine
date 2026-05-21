@@ -848,10 +848,19 @@ pub(crate) async fn data_query_batches(
         .sum::<u64>();
     log_required_files("Query", &required_files, parquet_size, speedboat_size);
 
+    let use_deletes_table = !required_files.delete_files.is_empty();
+    let sql_without_deletes;
+    let sql = if use_deletes_table {
+        &invocation.sql
+    } else {
+        sql_without_deletes = invocation.sql.without_deletes();
+        &sql_without_deletes
+    };
+
     data_query_batches_worker(
-        &invocation.sql,
+        sql,
         &required_files,
-        !required_files.delete_files.is_empty(),
+        use_deletes_table,
         true,
         None,
     )
@@ -941,24 +950,32 @@ pub async fn search_query(
     log_required_files("Search", &required_files, parquet_size, speedboat_size);
 
     let use_deletes_table = !required_files.delete_files.is_empty();
+    let derived_sql_without_deletes;
+    let derived_exact_sql_without_deletes;
     let sql = if use_exact_sql {
         if use_deletes_table {
             invocation.exact_sql.as_ref().unwrap_or(&invocation.sql)
+        } else if let Some(sql) = invocation
+            .exact_sql_without_deletes
+            .as_ref()
+            .or(invocation.sql_without_deletes.as_ref())
+        {
+            sql
         } else {
-            invocation
-                .exact_sql_without_deletes
+            derived_exact_sql_without_deletes = invocation
+                .exact_sql
                 .as_ref()
-                .or(invocation.sql_without_deletes.as_ref())
-                .or(invocation.exact_sql.as_ref())
                 .unwrap_or(&invocation.sql)
+                .without_deletes();
+            &derived_exact_sql_without_deletes
         }
     } else if use_deletes_table {
         &invocation.sql
+    } else if let Some(sql) = invocation.sql_without_deletes.as_ref() {
+        sql
     } else {
-        invocation
-            .sql_without_deletes
-            .as_ref()
-            .unwrap_or(&invocation.sql)
+        derived_sql_without_deletes = invocation.sql.without_deletes();
+        &derived_sql_without_deletes
     };
 
     let batches = data_query_batches_worker(

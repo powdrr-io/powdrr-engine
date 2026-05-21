@@ -110,7 +110,6 @@ pub async fn execute_query_plan_batches(
     }
 
     let files = filter_query_input_extensions(files, extension_suffixes.as_ref());
-    let use_deletes_table = use_deletes_table && !delete_files.is_empty();
     let (delete_local_tables, deletes_table_name) = if use_deletes_table {
         let delete_local_tables = load_delete_local_tables(&delete_files).await?;
         let deletes_table_name = create_deletes_union_table(&delete_local_tables).await?;
