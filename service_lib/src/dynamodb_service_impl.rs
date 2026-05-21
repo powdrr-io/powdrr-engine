@@ -23,8 +23,8 @@ use crate::state_provider::ServiceApiError;
 use crate::test_api::{StateMode, TestProcessingMode};
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_dynamodb::Client;
-use modyne::TestTableExt;
 use modyne::model::TransactWrite;
+use modyne::TestTableExt;
 use std::collections::{HashMap, HashSet};
 
 const LEASE_LENGTH_MS: i64 = 60 * 1000; // 1 minute
@@ -38,6 +38,8 @@ pub struct DynamoDBServiceImpl {
     mode: TestProcessingMode,
     pub(crate) connector: DynamoDbConnector,
 
+    tables_with_pending_compaction: HashSet<String>,
+    not_compacted_checkpoint_ids: HashMap<String, Vec<String>>,
     compactions_cache: PowdrrNamedCompactionCommitCache,
     checkpoints_cache: PowdrrNamedTableMetadataCheckpointCache,
     speedboat_cache: PowdrrNamedSpeedboatCommitCache,
@@ -93,6 +95,8 @@ impl DynamoDBServiceImpl {
         DynamoDBServiceImpl {
             mode,
             connector: DynamoDbConnector::new(client),
+            tables_with_pending_compaction: HashSet::new(),
+            not_compacted_checkpoint_ids: HashMap::new(),
             compactions_cache: PowdrrNamedCompactionCommitCache::new(),
             checkpoints_cache: PowdrrNamedTableMetadataCheckpointCache::new(),
             speedboat_cache: PowdrrNamedSpeedboatCommitCache::new(),
@@ -906,7 +910,8 @@ impl DynamoDBServiceImpl {
         org_info: &OrgInfo,
         create_table: &CreateTable,
     ) -> Result<bool, ServiceApiError> {
-        self.connector
+        let created = self
+            .connector
             .create_table_helper(
                 &org_info.org_id.to_string(),
                 &create_table.name,
@@ -919,7 +924,14 @@ impl DynamoDBServiceImpl {
                 },
             )
             .await
-            .map_err(from_modyne)
+            .map_err(from_modyne)?;
+        if created {
+            self.not_compacted_checkpoint_ids
+                .entry(create_table.name.clone())
+                .or_default();
+        }
+
+        Ok(created)
     }
 
     pub async fn describe_table(
@@ -1168,6 +1180,9 @@ impl DynamoDBServiceImpl {
             .await
             .map_err(from_modyne)?;
         if retval {
+            if !iceberg_commit.compactions.is_empty() {
+                self.tables_with_pending_compaction.remove(table_name);
+            }
             MetadataStore::queue_checkpoint_publication(
                 self,
                 &CheckpointUpdateRequest::new(org_info.org_id.clone(), table_name.clone()),
@@ -1645,35 +1660,9 @@ impl DynamoDBServiceImpl {
 
         assert!(changed);
 
-        let mut compaction_latest = None;
-        let mut compaction_work_item = None;
-        if new_checkpoint.speedboat_metadata.is_some() {
-            let speedboat_files = &new_checkpoint.speedboat_metadata.as_ref().unwrap().files;
-            let num_files_threshold = self.mode.compaction_mode.threshold();
-            let compact = speedboat_files.file_paths.len() as u64 >= num_files_threshold
-                || speedboat_files.sizes.iter().sum::<u64>() > 30 * 1024 * 1024;
-            tracing::info!(
-                "Compaction threshold: {} files, {} bytes, compact: {}",
-                num_files_threshold,
-                speedboat_files.sizes.iter().sum::<u64>(),
-                compact
-            );
-            if compact {
-                let latest_compaction = self
-                    .connector
-                    .describe_latest(org_id, &Self::latest_compaction_work_item_key(table_name))
-                    .await
-                    .map_err(from_modyne)?
-                    .unwrap();
-                if latest_compaction.entity_id == Self::NO_WORK_ITEM.to_owned() {
-                    compaction_latest = Some(latest_compaction);
-                    compaction_work_item = Some(CompactionWorkItem::from_checkpoint(
-                        &new_checkpoint,
-                        &vec![],
-                    ));
-                }
-            }
-        }
+        let (compaction_latest, compaction_work_item) = self
+            .maybe_create_compaction_work_item(org_id, &new_checkpoint)
+            .await?;
 
         match self
             .connector
@@ -1713,6 +1702,79 @@ impl DynamoDBServiceImpl {
         }
 
         Ok(true)
+    }
+
+    async fn maybe_create_compaction_work_item(
+        &mut self,
+        org_id: &String,
+        checkpoint: &TableMetadataCheckpoint,
+    ) -> Result<(Option<EntityVersionInfo>, Option<CompactionWorkItem>), ServiceApiError> {
+        self.not_compacted_checkpoint_ids
+            .entry(checkpoint.table_name.clone())
+            .or_default();
+
+        if self
+            .tables_with_pending_compaction
+            .contains(&checkpoint.table_name)
+        {
+            self.not_compacted_checkpoint_ids
+                .get_mut(&checkpoint.table_name)
+                .unwrap()
+                .push(checkpoint.checkpoint_id.clone());
+            return Ok((None, None));
+        }
+
+        if checkpoint.speedboat_metadata.is_none() {
+            return Ok((None, None));
+        }
+
+        let speedboat_files = &checkpoint.speedboat_metadata.as_ref().unwrap().files;
+        let num_files_threshold = self.mode.compaction_mode.threshold();
+        let compact = speedboat_files.file_paths.len() as u64 >= num_files_threshold
+            || speedboat_files.sizes.iter().sum::<u64>() > 30 * 1024 * 1024;
+        tracing::info!(
+            "Compaction threshold: {} files, {} bytes, compact: {}",
+            num_files_threshold,
+            speedboat_files.sizes.iter().sum::<u64>(),
+            compact
+        );
+        if !compact {
+            return Ok((None, None));
+        }
+
+        let latest_compaction = self
+            .connector
+            .describe_latest(
+                org_id,
+                &Self::latest_compaction_work_item_key(&checkpoint.table_name),
+            )
+            .await
+            .map_err(from_modyne)?
+            .unwrap();
+        if latest_compaction.entity_id != Self::NO_WORK_ITEM.to_owned() {
+            self.tables_with_pending_compaction
+                .insert(checkpoint.table_name.clone());
+            self.not_compacted_checkpoint_ids
+                .get_mut(&checkpoint.table_name)
+                .unwrap()
+                .push(checkpoint.checkpoint_id.clone());
+            return Ok((None, None));
+        }
+
+        self.tables_with_pending_compaction
+            .insert(checkpoint.table_name.clone());
+        let work_item = CompactionWorkItem::from_checkpoint(
+            checkpoint,
+            self.not_compacted_checkpoint_ids
+                .get(&checkpoint.table_name)
+                .unwrap(),
+        );
+        self.not_compacted_checkpoint_ids
+            .get_mut(&checkpoint.table_name)
+            .unwrap()
+            .clear();
+
+        Ok((Some(latest_compaction), Some(work_item)))
     }
 
     async fn update_extension_checkpoint(
@@ -2136,10 +2198,11 @@ mod tests {
     use super::DynamoDBServiceImpl;
     use crate::data_contract::{
         CreateTable, FileSetPayload, IcebergCommit, IcebergMetadata, LicenseType, OrgInfo,
+        SpeedboatCommit, SpeedboatCommitTableInfo,
     };
     use crate::metadata_store::MetadataStore;
     use crate::schema_massager::PowdrrSchema;
-    use crate::test_api::TestProcessingMode;
+    use crate::test_api::{CompactionMode, TestProcessingMode};
     use std::collections::HashMap;
 
     fn org_info() -> OrgInfo {
@@ -2161,6 +2224,20 @@ mod tests {
             column_stats: vec![],
             access_artifacts: vec![],
             file_stats: vec![],
+        }
+    }
+
+    fn speedboat_commit(table_name: &str, file_path: &str) -> SpeedboatCommit {
+        SpeedboatCommit {
+            type_files: vec![SpeedboatCommitTableInfo {
+                commit_type: "commit".to_string(),
+                table_name: table_name.to_string(),
+                segments: vec![],
+                files: vec![file_path.to_string()],
+                sizes: vec![64],
+                schema: Some(PowdrrSchema::minimal()),
+            }],
+            compaction: None,
         }
     }
 
@@ -2226,11 +2303,9 @@ mod tests {
             None
         );
 
-        assert!(
-            MetadataStore::advance_published_checkpoints(&mut state)
-                .await
-                .unwrap()
-        );
+        assert!(MetadataStore::advance_published_checkpoints(&mut state)
+            .await
+            .unwrap());
         assert_eq!(
             MetadataStore::get_latest_target_checkpoint(&mut state, &org_info, &table_name, None)
                 .await
@@ -2258,5 +2333,111 @@ mod tests {
             Some(committed_checkpoint)
         );
         assert_eq!(cutover_state.active_checkpoint_id, None);
+    }
+
+    #[tokio::test]
+    async fn tracks_intermediate_checkpoints_while_compaction_is_pending() {
+        let mut mode = TestProcessingMode::default();
+        mode.compaction_mode = CompactionMode::Async(Some(1));
+        let mut state = DynamoDBServiceImpl::test(mode).await;
+        let org_info = org_info();
+        let table_name = "dynamodb-compaction-tracking-table".to_string();
+
+        state
+            .create_table(
+                &org_info,
+                &CreateTable {
+                    name: table_name.clone(),
+                    tags: HashMap::new(),
+                    serving: None,
+                    dynamodb: None,
+                    mongodb: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        state
+            .speedboat_commit(
+                &org_info,
+                &speedboat_commit(&table_name, "s3://warehouse/table/speedboat-0001.arrow"),
+            )
+            .await
+            .unwrap();
+        assert!(state.update_all_checkpoints().await.unwrap());
+
+        let first_work_items = state.get_compaction_work_items(&org_info).await.unwrap();
+        assert_eq!(first_work_items.len(), 1);
+        assert!(state.tables_with_pending_compaction.contains(&table_name));
+        assert!(state
+            .not_compacted_checkpoint_ids
+            .get(&table_name)
+            .unwrap()
+            .is_empty());
+
+        state
+            .speedboat_commit(
+                &org_info,
+                &speedboat_commit(&table_name, "s3://warehouse/table/speedboat-0002.arrow"),
+            )
+            .await
+            .unwrap();
+        assert!(state.update_all_checkpoints().await.unwrap());
+        let second_checkpoint =
+            MetadataStore::get_latest_target_checkpoint(&mut state, &org_info, &table_name, None)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(state
+            .get_compaction_work_items(&org_info)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            state.not_compacted_checkpoint_ids.get(&table_name).unwrap(),
+            &vec![second_checkpoint.clone()]
+        );
+
+        state
+            .speedboat_commit(
+                &org_info,
+                &speedboat_commit(&table_name, "s3://warehouse/table/speedboat-0003.arrow"),
+            )
+            .await
+            .unwrap();
+        assert!(state.update_all_checkpoints().await.unwrap());
+        let third_checkpoint =
+            MetadataStore::get_latest_target_checkpoint(&mut state, &org_info, &table_name, None)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            state.not_compacted_checkpoint_ids.get(&table_name).unwrap(),
+            &vec![second_checkpoint.clone(), third_checkpoint.clone()]
+        );
+
+        // Simulate the compaction commit finishing; connector-level tests cover the actual delete path.
+        state.tables_with_pending_compaction.remove(&table_name);
+
+        state
+            .speedboat_commit(
+                &org_info,
+                &speedboat_commit(&table_name, "s3://warehouse/table/speedboat-0004.arrow"),
+            )
+            .await
+            .unwrap();
+        assert!(state.update_all_checkpoints().await.unwrap());
+
+        let second_work_items = state.get_compaction_work_items(&org_info).await.unwrap();
+        assert_eq!(second_work_items.len(), 1);
+        assert_eq!(
+            second_work_items[0].1.checkpoints_to_delete,
+            vec![second_checkpoint, third_checkpoint]
+        );
+        assert!(state
+            .not_compacted_checkpoint_ids
+            .get(&table_name)
+            .unwrap()
+            .is_empty());
     }
 }
