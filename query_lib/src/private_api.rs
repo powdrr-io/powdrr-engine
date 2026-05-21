@@ -944,7 +944,9 @@ struct QueryResultHitRef {
 #[derive(Clone)]
 enum SortScalar {
     Null,
-    Number(f64),
+    Int(i64),
+    UInt(u64),
+    Float(f64),
     String(String),
     Bool(bool),
 }
@@ -1053,14 +1055,14 @@ fn batch_sort_values_for_row(
             .map(|sort| {
                 if sort.field == "_score" {
                     batch_numeric_field(batch, row_index, "score")
-                        .map(SortScalar::Number)
+                        .map(SortScalar::Float)
                         .or_else(|| {
                             if calculate_score {
                                 batch_numeric_field(batch, row_index, "term_cnt").and_then(
                                     |term_cnt| {
                                         batch_numeric_field(batch, row_index, "word_cnt").map(
                                             |word_cnt| {
-                                                SortScalar::Number(bm25_fallback_score(
+                                                SortScalar::Float(bm25_fallback_score(
                                                     term_cnt, word_cnt,
                                                 ))
                                             },
@@ -1181,9 +1183,39 @@ fn compare_sort_values(left: &SortScalar, right: &SortScalar) -> std::cmp::Order
         (SortScalar::Null, SortScalar::Null) => std::cmp::Ordering::Equal,
         (SortScalar::Null, _) => std::cmp::Ordering::Greater,
         (_, SortScalar::Null) => std::cmp::Ordering::Less,
-        (SortScalar::Number(left_number), SortScalar::Number(right_number)) => left_number
-            .partial_cmp(right_number)
-            .unwrap_or(std::cmp::Ordering::Equal),
+        (SortScalar::Int(left_number), SortScalar::Int(right_number)) => {
+            left_number.cmp(right_number)
+        }
+        (SortScalar::UInt(left_number), SortScalar::UInt(right_number)) => {
+            left_number.cmp(right_number)
+        }
+        (SortScalar::Int(left_number), SortScalar::UInt(right_number)) => {
+            if *left_number < 0 {
+                std::cmp::Ordering::Less
+            } else {
+                (*left_number as u64).cmp(right_number)
+            }
+        }
+        (SortScalar::UInt(left_number), SortScalar::Int(right_number)) => {
+            if *right_number < 0 {
+                std::cmp::Ordering::Greater
+            } else {
+                left_number.cmp(&(*right_number as u64))
+            }
+        }
+        (left_number, right_number)
+            if matches!(
+                (left_number, right_number),
+                (
+                    SortScalar::Int(_) | SortScalar::UInt(_) | SortScalar::Float(_),
+                    SortScalar::Int(_) | SortScalar::UInt(_) | SortScalar::Float(_)
+                )
+            ) =>
+        {
+            sort_scalar_numeric_as_f64(left_number)
+                .partial_cmp(&sort_scalar_numeric_as_f64(right_number))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }
         (SortScalar::String(left_string), SortScalar::String(right_string)) => {
             left_string.cmp(right_string)
         }
@@ -1196,13 +1228,46 @@ fn sort_scalar_from_array(array: &dyn Array, row_index: usize) -> Option<SortSca
     if array.is_null(row_index) {
         return Some(SortScalar::Null);
     }
-    if let Some(number) = numeric_array_value(array, row_index) {
-        return Some(SortScalar::Number(number));
-    }
     if let Some(timestamp) = timestamp_array_value(array, row_index) {
-        return Some(SortScalar::Number(timestamp as f64));
+        return Some(SortScalar::Int(timestamp));
     }
     match array.data_type() {
+        DataType::Int64 => Some(SortScalar::Int(
+            array
+                .as_any()
+                .downcast_ref::<Int64Array>()?
+                .value(row_index),
+        )),
+        DataType::Int32 => Some(SortScalar::Int(
+            array
+                .as_any()
+                .downcast_ref::<Int32Array>()?
+                .value(row_index) as i64,
+        )),
+        DataType::UInt64 => Some(SortScalar::UInt(
+            array
+                .as_any()
+                .downcast_ref::<UInt64Array>()?
+                .value(row_index),
+        )),
+        DataType::UInt32 => Some(SortScalar::UInt(
+            array
+                .as_any()
+                .downcast_ref::<UInt32Array>()?
+                .value(row_index) as u64,
+        )),
+        DataType::Float64 => Some(SortScalar::Float(
+            array
+                .as_any()
+                .downcast_ref::<Float64Array>()?
+                .value(row_index),
+        )),
+        DataType::Float32 => Some(SortScalar::Float(
+            array
+                .as_any()
+                .downcast_ref::<Float32Array>()?
+                .value(row_index) as f64,
+        )),
         DataType::Boolean => Some(SortScalar::Bool(
             array
                 .as_any()
@@ -1212,17 +1277,18 @@ fn sort_scalar_from_array(array: &dyn Array, row_index: usize) -> Option<SortSca
         DataType::Utf8 | DataType::LargeUtf8 => {
             string_key_array_value(array, row_index).map(SortScalar::String)
         }
-        DataType::Date32 => Some(SortScalar::Number(
+        DataType::Date32 => Some(SortScalar::Int(
             array
                 .as_any()
                 .downcast_ref::<Date32Array>()?
-                .value(row_index) as f64,
+                .value(row_index) as i64
+                * 86_400_000,
         )),
-        DataType::Date64 => Some(SortScalar::Number(
+        DataType::Date64 => Some(SortScalar::Int(
             array
                 .as_any()
                 .downcast_ref::<Date64Array>()?
-                .value(row_index) as f64,
+                .value(row_index),
         )),
         _ => None,
     }
@@ -1231,9 +1297,22 @@ fn sort_scalar_from_array(array: &dyn Array, row_index: usize) -> Option<SortSca
 fn sort_scalar_to_json(value: &SortScalar) -> Value {
     match value {
         SortScalar::Null => Value::Null,
-        SortScalar::Number(number) => Value::from(*number),
+        SortScalar::Int(number) => Value::from(*number),
+        SortScalar::UInt(number) => Value::from(*number),
+        SortScalar::Float(number) => Value::from(*number),
         SortScalar::String(string) => Value::String(string.clone()),
         SortScalar::Bool(boolean) => Value::Bool(*boolean),
+    }
+}
+
+fn sort_scalar_numeric_as_f64(value: &SortScalar) -> f64 {
+    match value {
+        SortScalar::Int(number) => *number as f64,
+        SortScalar::UInt(number) => *number as f64,
+        SortScalar::Float(number) => *number,
+        SortScalar::Null | SortScalar::String(_) | SortScalar::Bool(_) => {
+            unreachable!("numeric helper called for non-numeric sort scalar")
+        }
     }
 }
 
@@ -1412,6 +1491,35 @@ mod tests {
                 values: vec!["prod".to_string()],
             }]
         ));
+    }
+
+    #[test]
+    fn sort_scalar_to_json_preserves_integer_number_types() {
+        assert_eq!(sort_scalar_to_json(&SortScalar::Int(7)), Value::from(7_i64));
+        assert_eq!(
+            sort_scalar_to_json(&SortScalar::UInt(9)),
+            Value::from(9_u64)
+        );
+        assert_eq!(
+            sort_scalar_to_json(&SortScalar::Float(1.5)),
+            Value::from(1.5_f64)
+        );
+    }
+
+    #[test]
+    fn compare_sort_values_handles_mixed_integer_types() {
+        assert_eq!(
+            compare_sort_values(&SortScalar::Int(7), &SortScalar::UInt(8)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_sort_values(&SortScalar::UInt(8), &SortScalar::Int(7)),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_sort_values(&SortScalar::Int(-1), &SortScalar::UInt(0)),
+            std::cmp::Ordering::Less
+        );
     }
 }
 
