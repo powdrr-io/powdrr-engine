@@ -28,6 +28,7 @@ use powdrr_query_lib::data_contract::{
     DynamoDbGlobalSecondaryIndexConfig, DynamoDbLocalSecondaryIndexConfig, DynamoDbTableConfig,
     FileSetPayload, IcebergMetadata, LicenseType, OrgCreds, OrgSettings, TableMetadataCheckpoint,
 };
+use powdrr_query_runtime::peers::CheckpointDescriptor;
 use powdrr_query_runtime::serving_dataset::read_parquet_documents;
 use powdrr_query_runtime::state_provider::STATE_PROVIDER;
 use powdrr_query_runtime::test_api::{
@@ -2591,18 +2592,19 @@ async fn wait_for_powdrr_rows(
     rows: &[&EventRow],
 ) {
     let started = Instant::now();
+    let mut last_missing_key = None;
     for attempt in 0..240 {
         let mut all_present = true;
         for row in rows {
-            let key = serde_dynamo::aws_sdk_dynamodb_1::to_item(json!({
+            let key_payload = json!({
                 "tenant": row.tenant,
                 sort_key_name: match sort_key_name {
                     "ts" => Value::from(row.ts),
                     "event_id" => Value::from(row.event_id.clone()),
                     other => panic!("unsupported sort key {}", other),
                 },
-            }))
-            .unwrap();
+            });
+            let key = serde_dynamo::aws_sdk_dynamodb_1::to_item(key_payload.clone()).unwrap();
             let output = client
                 .get_item()
                 .table_name(table_name)
@@ -2612,6 +2614,7 @@ async fn wait_for_powdrr_rows(
                 .unwrap();
             if output.item().is_none() {
                 all_present = false;
+                last_missing_key = Some(key_payload);
                 break;
             }
         }
@@ -2625,15 +2628,192 @@ async fn wait_for_powdrr_rows(
                 sort_key_name,
                 started.elapsed()
             );
+            emit_powdrr_visibility_diagnostics(
+                client,
+                table_name,
+                sort_key_name,
+                started.elapsed(),
+                last_missing_key.as_ref(),
+            )
+            .await;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    panic!(
-        "Powdrr table {} did not become readable for sort key {} after {:?}",
+    emit_powdrr_visibility_diagnostics(
+        client,
         table_name,
         sort_key_name,
-        started.elapsed()
+        started.elapsed(),
+        last_missing_key.as_ref(),
+    )
+    .await;
+    panic!(
+        "Powdrr table {} did not become readable for sort key {} after {:?}; last missing key {:?}",
+        table_name,
+        sort_key_name,
+        started.elapsed(),
+        last_missing_key
     );
+}
+
+async fn emit_powdrr_visibility_diagnostics(
+    client: &DynamoClient,
+    table_name: &str,
+    sort_key_name: &str,
+    elapsed: Duration,
+    last_missing_key: Option<&Value>,
+) {
+    let table_name_string = table_name.to_string();
+    eprintln!(
+        "dynamo fixture debug: table={} sort_key={} elapsed={:?} last_missing_key={:?}",
+        table_name, sort_key_name, elapsed, last_missing_key
+    );
+
+    match client.describe_table().table_name(table_name).send().await {
+        Ok(output) => {
+            let summary = output.table().map(|table| {
+                format!(
+                    "status={:?} keys={:?} gsis={} lsis={}",
+                    table.table_status(),
+                    table
+                        .key_schema()
+                        .iter()
+                        .map(|key| format!("{}:{:?}", key.attribute_name(), key.key_type()))
+                        .collect::<Vec<_>>(),
+                    table.global_secondary_indexes().len(),
+                    table.local_secondary_indexes().len(),
+                )
+            });
+            eprintln!(
+                "dynamo fixture debug: sdk describe table = {}",
+                summary.unwrap_or_else(|| "missing table description".to_string())
+            );
+        }
+        Err(error) => {
+            eprintln!("dynamo fixture debug: sdk describe table error = {}", error);
+        }
+    }
+
+    match STATE_PROVIDER.describe_table(&table_name_string).await {
+        Ok(Some(description)) => {
+            eprintln!(
+                "dynamo fixture debug: provider describe table = dynamodb={:?} serving_present={} mongodb_present={}",
+                description.dynamodb,
+                description.serving.is_some(),
+                description.mongodb.is_some(),
+            );
+        }
+        Ok(None) => {
+            eprintln!("dynamo fixture debug: provider describe table = missing");
+        }
+        Err(error) => {
+            eprintln!(
+                "dynamo fixture debug: provider describe table error = {}",
+                error
+            );
+        }
+    }
+
+    let committed = match STATE_PROVIDER
+        .get_latest_committed_checkpoint(&table_name_string, None)
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!(
+                "dynamo fixture debug: committed checkpoint lookup error = {}",
+                error
+            );
+            None
+        }
+    };
+    let active = match STATE_PROVIDER
+        .get_published_active_checkpoint(&table_name_string, None)
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!(
+                "dynamo fixture debug: active checkpoint lookup error = {}",
+                error
+            );
+            None
+        }
+    };
+    let target = match STATE_PROVIDER
+        .get_published_target_checkpoint(&table_name_string, None)
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!(
+                "dynamo fixture debug: target checkpoint lookup error = {}",
+                error
+            );
+            None
+        }
+    };
+    let servable = match STATE_PROVIDER
+        .get_published_active_servable_checkpoint(&table_name_string)
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!(
+                "dynamo fixture debug: servable checkpoint lookup error = {}",
+                error
+            );
+            None
+        }
+    };
+    eprintln!(
+        "dynamo fixture debug: frontiers committed={:?} active={:?} target={:?} servable={:?}",
+        committed, active, target, servable
+    );
+
+    if let Some(checkpoint_id) = servable {
+        match STATE_PROVIDER
+            .get_checkpoint(CheckpointDescriptor::new(
+                table_name_string.clone(),
+                checkpoint_id.clone(),
+            ))
+            .await
+        {
+            Ok(Some(checkpoint)) => {
+                let iceberg_summary = checkpoint.iceberg_metadata.as_ref().map(|metadata| {
+                    (
+                        metadata.snapshot_id.clone(),
+                        metadata.files.file_paths.clone(),
+                        metadata.table_schema.fields().len(),
+                    )
+                });
+                eprintln!(
+                    "dynamo fixture debug: servable checkpoint {} iceberg={:?} schema_fields={} deletes={} extensions={}",
+                    checkpoint_id,
+                    iceberg_summary,
+                    checkpoint.schema.fields().len(),
+                    checkpoint
+                        .deletes_metadata
+                        .as_ref()
+                        .map(|metadata| metadata.files.len())
+                        .unwrap_or(0),
+                    checkpoint.extension_metadata.len(),
+                );
+            }
+            Ok(None) => {
+                eprintln!(
+                    "dynamo fixture debug: servable checkpoint {} metadata missing",
+                    checkpoint_id
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "dynamo fixture debug: servable checkpoint {} lookup error = {}",
+                    checkpoint_id, error
+                );
+            }
+        }
+    }
 }
 
 async fn create_localstack_table(
