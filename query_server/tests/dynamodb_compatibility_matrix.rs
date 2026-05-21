@@ -424,6 +424,7 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
     .await;
     eprintln!("dynamo fixture: waiting for Powdrr primary rows");
     wait_for_powdrr_rows(
+        base_url,
         &powdrr_client,
         &primary_table_name,
         "ts",
@@ -432,6 +433,7 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
     .await;
     eprintln!("dynamo fixture: waiting for Powdrr begins_with rows");
     wait_for_powdrr_rows(
+        base_url,
         &powdrr_client,
         &begins_with_table_name,
         "event_id",
@@ -440,6 +442,7 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
     .await;
     eprintln!("dynamo fixture: waiting for Powdrr write rows");
     wait_for_powdrr_rows(
+        base_url,
         &powdrr_client,
         &write_table_name,
         "ts",
@@ -2588,6 +2591,7 @@ fn powdrr_http_client() -> HttpClient {
 }
 
 async fn wait_for_powdrr_rows(
+    base_url: &str,
     client: &DynamoClient,
     table_name: &str,
     sort_key_name: &str,
@@ -2631,6 +2635,7 @@ async fn wait_for_powdrr_rows(
                 started.elapsed()
             );
             emit_powdrr_visibility_diagnostics(
+                base_url,
                 client,
                 table_name,
                 sort_key_name,
@@ -2642,6 +2647,7 @@ async fn wait_for_powdrr_rows(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     emit_powdrr_visibility_diagnostics(
+        base_url,
         client,
         table_name,
         sort_key_name,
@@ -2659,6 +2665,7 @@ async fn wait_for_powdrr_rows(
 }
 
 async fn emit_powdrr_visibility_diagnostics(
+    base_url: &str,
     client: &DynamoClient,
     table_name: &str,
     sort_key_name: &str,
@@ -2882,6 +2889,20 @@ async fn emit_checkpoint_file_diagnostics(
     }
 
     if let Some(missing_key) = last_missing_key {
+        let raw_get_item = raw_dynamodb_request(
+            base_url,
+            "GetItem",
+            &json!({
+                "TableName": table_name,
+                "Key": serde_dynamo::aws_sdk_dynamodb_1::to_item(missing_key.clone()).unwrap(),
+            }),
+        )
+        .await;
+        eprintln!(
+            "dynamo fixture debug: raw GetItem status={} body={}",
+            raw_get_item.status, raw_get_item.body
+        );
+
         let filters = serving_filters_for_key(sort_key_name, missing_key);
         match execute_serving_query(
             table_name,
