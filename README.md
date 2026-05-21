@@ -390,6 +390,10 @@ Powdrr would not exist in its current form without that work upstream.
   The concrete design for serving from object-store-published metadata without
   a DynamoDB-backed runtime state provider.
 
+- `docs/redis-dependency-removal-plan.md`
+  The plan for removing Redis from the mutation path and moving the remaining
+  shared state behind a service-owned coordination boundary.
+
 - `docs/lakehouse-serving-roadmap.md`
   The repo-specific roadmap from the current hybrid stack toward a shared
   serving engine over lakehouse storage.
