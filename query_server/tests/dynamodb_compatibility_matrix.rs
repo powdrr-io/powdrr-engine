@@ -28,6 +28,8 @@ use powdrr_query_lib::data_contract::{
     DynamoDbGlobalSecondaryIndexConfig, DynamoDbLocalSecondaryIndexConfig, DynamoDbTableConfig,
     FileSetPayload, IcebergMetadata, LicenseType, OrgCreds, OrgSettings, TableMetadataCheckpoint,
 };
+use powdrr_query_lib::serving_plan::{ServingPredicate, ServingRequestPlan};
+use powdrr_query_runtime::lakehouse_serving::execute_serving_query;
 use powdrr_query_runtime::peers::CheckpointDescriptor;
 use powdrr_query_runtime::serving_dataset::read_parquet_documents;
 use powdrr_query_runtime::state_provider::STATE_PROVIDER;
@@ -2799,6 +2801,17 @@ async fn emit_powdrr_visibility_diagnostics(
                         .unwrap_or(0),
                     checkpoint.extension_metadata.len(),
                 );
+                if let Some(metadata) = checkpoint.iceberg_metadata.as_ref() {
+                    if let Some(file_path) = metadata.files.file_paths.first() {
+                        emit_checkpoint_file_diagnostics(
+                            table_name,
+                            sort_key_name,
+                            last_missing_key,
+                            file_path,
+                        )
+                        .await;
+                    }
+                }
             }
             Ok(None) => {
                 eprintln!(
@@ -2814,6 +2827,137 @@ async fn emit_powdrr_visibility_diagnostics(
             }
         }
     }
+}
+
+async fn emit_checkpoint_file_diagnostics(
+    table_name: &str,
+    sort_key_name: &str,
+    last_missing_key: Option<&Value>,
+    file_path: &str,
+) {
+    let local_path = file_path.strip_prefix("file://").unwrap_or(file_path);
+    match fs::metadata(local_path) {
+        Ok(metadata) => {
+            eprintln!(
+                "dynamo fixture debug: checkpoint file {} exists=true len={}",
+                file_path,
+                metadata.len()
+            );
+        }
+        Err(error) => {
+            eprintln!(
+                "dynamo fixture debug: checkpoint file {} exists=false error={}",
+                file_path, error
+            );
+            return;
+        }
+    }
+
+    match read_parquet_documents(local_path, None).await {
+        Ok(dataset) => {
+            let matching_rows = dataset
+                .rows
+                .iter()
+                .filter(|row| row_matches_key(row, sort_key_name, last_missing_key))
+                .cloned()
+                .collect::<Vec<_>>();
+            eprintln!(
+                "dynamo fixture debug: direct parquet rows={} schema_fields={:?} matching_rows={:?}",
+                dataset.rows.len(),
+                dataset
+                    .schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.name.clone())
+                    .collect::<Vec<_>>(),
+                matching_rows
+            );
+        }
+        Err(error) => {
+            eprintln!(
+                "dynamo fixture debug: direct parquet read failed for {}: {}",
+                file_path, error
+            );
+        }
+    }
+
+    if let Some(missing_key) = last_missing_key {
+        let filters = serving_filters_for_key(sort_key_name, missing_key);
+        match execute_serving_query(
+            table_name,
+            ServingRequestPlan {
+                select: Some(vec![
+                    "tenant".to_string(),
+                    sort_key_name.to_string(),
+                    "event_id".to_string(),
+                    "count".to_string(),
+                    "region".to_string(),
+                    "active".to_string(),
+                ]),
+                filters,
+                aggregate: None,
+                order_by: vec![],
+                limit: Some(3),
+                allow_slow_path: true,
+                explain: false,
+            },
+        )
+        .await
+        {
+            Ok(response) => {
+                eprintln!(
+                    "dynamo fixture debug: serving query classification={:?} reason={:?} rows={:?} sql={:?}",
+                    response.classification, response.reason, response.rows, response.sql
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "dynamo fixture debug: serving query failed for key {:?}: {}",
+                    missing_key, error.message
+                );
+            }
+        }
+    }
+}
+
+fn row_matches_key(row: &Value, sort_key_name: &str, last_missing_key: Option<&Value>) -> bool {
+    let Some(missing_key) = last_missing_key else {
+        return false;
+    };
+    let Some(row_obj) = row.as_object() else {
+        return false;
+    };
+    let Some(key_obj) = missing_key.as_object() else {
+        return false;
+    };
+    row_obj.get("tenant") == key_obj.get("tenant")
+        && row_obj.get(sort_key_name) == key_obj.get(sort_key_name)
+}
+
+fn serving_filters_for_key(sort_key_name: &str, missing_key: &Value) -> Vec<ServingPredicate> {
+    let key_obj = missing_key
+        .as_object()
+        .expect("missing key should be a JSON object");
+    vec![
+        ServingPredicate {
+            field: "tenant".to_string(),
+            eq: key_obj.get("tenant").cloned(),
+            in_values: None,
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
+        },
+        ServingPredicate {
+            field: sort_key_name.to_string(),
+            eq: key_obj.get(sort_key_name).cloned(),
+            in_values: None,
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
+        },
+    ]
 }
 
 async fn create_localstack_table(
