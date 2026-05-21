@@ -844,17 +844,18 @@ pub(crate) async fn create_index_inner(
 #[cfg(test)]
 mod tests {
     use crate::elastic_search_index::create_index_parquet;
-    use gotham::test::Server;
+    use gotham::test::{Server as GothamServer, TestServer};
+    use powdrr_query_server::router::router;
     use std::env;
 
     #[test]
     fn test_simple_create_index_parquet() {
-        let test_server = &*crate::router::tests::TEST_SERVER;
+        let test_server = TestServer::with_timeout(router(true), 1000).unwrap();
 
         test_server.run_future(async {
             match create_index_parquet(
                 &format!(
-                    "file://{}/tests/data/flights.parquet",
+                    "file://{}/testdata/flights.parquet",
                     env::current_dir().unwrap().to_str().unwrap()
                 ),
                 &"index_col".to_string(),
@@ -872,7 +873,7 @@ mod tests {
             let test_server = &*crate::router::tests::TEST_SERVER;
 
             test_server.run_future(async {
-                match create_index_jsonl(&format!("file://{}/tests/data/logs.json", env::current_dir().unwrap().to_str().unwrap()), &"index_col".to_string()).await {
+                match create_index_jsonl(&format!("file://{}/testdata/logs.json", env::current_dir().unwrap().to_str().unwrap()), &"index_col".to_string()).await {
                     Err(_) => panic!("failed"),
                     Ok(_) => ()
                 }

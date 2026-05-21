@@ -12,9 +12,9 @@ It has two jobs:
 
 The backing test artifacts are:
 
-- fixture corpus: `main_lib/tests/data/es_compat_cases.json`
-- route coverage manifest: `main_lib/tests/data/es_api_coverage_manifest.json`
-- local and differential harness: `main_lib/tests/es_compatibility_matrix.rs`
+- fixture corpus: `testdata/es_compat_cases.json`
+- route coverage manifest: `testdata/es_api_coverage_manifest.json`
+- local and differential harness: `query_server/tests/es_compatibility_matrix.rs`
 
 ## How To Read This Matrix
 
@@ -34,7 +34,7 @@ The backing test artifacts are:
 
 The manifest file turns this into an enforceable surface contract:
 
-- every routed `es_*` handler in `main_lib/src/router.rs` must appear in the
+- every routed `es_*` handler in `query_server/src/router.rs` must appear in the
   manifest
 - every manifest entry must reference at least one fixture id
 - differential handlers may only reference `differential_enabled: true` cases
@@ -144,7 +144,7 @@ If you already have the dependencies running and only want to point the harness
 at Elasticsearch directly, set:
 
 ```bash
-POWDRR_ES_COMPAT_URL=http://localhost:9200 cargo test -p powdrr_lib --test es_compatibility_matrix -- --nocapture
+POWDRR_ES_COMPAT_URL=http://localhost:9200 cargo test -p powdrr-query-server --features integration-tests --test es_compatibility_matrix -- --nocapture
 ```
 
 Without `POWDRR_ES_COMPAT_URL`, only the local fixture run executes.

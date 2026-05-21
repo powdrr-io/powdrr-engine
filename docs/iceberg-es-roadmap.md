@@ -33,12 +33,12 @@ engine.
 
 The hot path is:
 
-- HTTP handling in `main_lib/src/elastic_search_endpoints.rs`
-- ES-like DSL parsing in `main_lib/src/elastic_search_parser.rs`
-- SQL assembly in `main_lib/src/schema_massager.rs`
-- file loading and query execution in `main_lib/src/private_api.rs`
+- HTTP handling in `query_server/src/elastic_search_endpoints.rs`
+- ES-like DSL parsing in `query_runtime/src/elastic_search_parser.rs`
+- SQL assembly in `query_core/src/schema_massager.rs`
+- file loading and query execution in `query_runtime/src/private_api.rs`
 - sidecar `_search_index.parquet` generation in
-  `main_lib/src/elastic_search_index.rs`
+  `query_runtime/src/elastic_search_index.rs`
 
 The important current assumptions are:
 
@@ -53,7 +53,7 @@ The important current assumptions are:
 
 Useful existing starting points:
 
-- end-to-end router tests in `main_lib/src/router.rs`
+- end-to-end router tests in `query_server/src/router.rs`
 - benchmark harness in `benchmark/src/main.rs`
 
 ## Why Stay Iceberg

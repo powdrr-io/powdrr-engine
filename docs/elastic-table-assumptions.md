@@ -11,7 +11,7 @@ These checks now run in both places that build Elastic sidecars:
 
 - `powdrr-cli elastic validate`
 - local cache builds through `powdrr-cli elastic build`
-- server-side Elastic sidecar generation in `main_lib/src/elastic_search_index.rs`
+- server-side Elastic sidecar generation in `query_runtime/src/elastic_search_index.rs`
 
 The current validated assumptions are:
 

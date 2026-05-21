@@ -23,14 +23,16 @@ use crate::elastic_search_http_types::NamePathExtractor;
 use powdrr_query_lib::data_contract::{
     CreateTable, MongoDbTableConfig, TableDescription, TableMetadataCheckpoint,
 };
-use powdrr_query_lib::lakehouse_serving::{
-    ServingQueryError, ServingQueryResponse, execute_serving_query,
-};
-use powdrr_query_lib::peers::CheckpointDescriptor;
 use powdrr_query_lib::schema_massager::{PowdrrDataType, PowdrrSchema};
 use powdrr_query_lib::serving_plan::ServingQueryClassification;
-use powdrr_query_lib::serving_protocol::{MongoFindCommand, MongoProtocolError, from_mongodb_find};
-use powdrr_query_lib::state_provider::{STATE_PROVIDER, ServiceApiError};
+use powdrr_query_runtime::lakehouse_serving::{
+    ServingQueryError, ServingQueryResponse, execute_serving_query,
+};
+use powdrr_query_runtime::peers::CheckpointDescriptor;
+use powdrr_query_runtime::serving_protocol::{
+    MongoFindCommand, MongoProtocolError, from_mongodb_find,
+};
+use powdrr_query_runtime::state_provider::{STATE_PROVIDER, ServiceApiError};
 
 const MONGO_BAD_VALUE_CODE: i32 = 2;
 const MONGO_CURSOR_NOT_FOUND_CODE: i32 = 43;

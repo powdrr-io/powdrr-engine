@@ -29,16 +29,16 @@ use powdrr_query_lib::data_contract::{
     DynamoDbTableConfig, FileDescriptor, FileSetPayload, IcebergMetadata, ServingPattern,
     ServingTableConfig, TableDescription, TableMetadataCheckpoint,
 };
-use powdrr_query_lib::lakehouse_serving::{
-    ServingQueryError, ServingQueryResponse, execute_serving_query,
-};
-use powdrr_query_lib::peers::CheckpointDescriptor;
 use powdrr_query_lib::schema_massager::{PowdrrDataType, PowdrrSchema, extract_powdrr_schema};
-use powdrr_query_lib::search_runtime::batches_to_serde_value;
 use powdrr_query_lib::serving_plan::{
     ServingPredicate, ServingQueryClassification, ServingRequestPlan, ServingSort,
 };
-use powdrr_query_lib::state_provider::{STATE_PROVIDER, ServiceApiError};
+use powdrr_query_runtime::lakehouse_serving::{
+    ServingQueryError, ServingQueryResponse, execute_serving_query,
+};
+use powdrr_query_runtime::peers::CheckpointDescriptor;
+use powdrr_query_runtime::search_runtime::batches_to_serde_value;
+use powdrr_query_runtime::state_provider::{STATE_PROVIDER, ServiceApiError};
 
 const DYNAMODB_TARGET_PREFIX: &str = "DynamoDB_20120810.";
 const DYNAMODB_CONFIG_PATTERN_PREFIX: &str = "_dynamodb_";
@@ -5008,9 +5008,9 @@ mod tests {
         TableMetadataCheckpoint,
     };
     use powdrr_query_lib::schema_massager::extract_powdrr_schema;
-    use powdrr_query_lib::serving_dataset::read_parquet_documents;
-    use powdrr_query_lib::state_provider::STATE_PROVIDER;
-    use powdrr_query_lib::test_api::{
+    use powdrr_query_runtime::serving_dataset::read_parquet_documents;
+    use powdrr_query_runtime::state_provider::STATE_PROVIDER;
+    use powdrr_query_runtime::test_api::{
         CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode, StorageMode,
         TestProcessingMode,
     };
@@ -5501,8 +5501,8 @@ mod tests {
             return;
         }
         let test_server = TestServer::with_timeout(crate::router::router(true), 1000).unwrap();
-        let dataset_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/flights.parquet");
+        let dataset_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../testdata/flights.parquet");
         let dataset_path_string = dataset_path.display().to_string();
         let file_path = format!("file://{}", dataset_path.display());
         let file_size = fs::metadata(&dataset_path).unwrap().len();

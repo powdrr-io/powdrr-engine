@@ -33,10 +33,11 @@ use crate::elastic_search_common::{
     Command, CommandContext, CommandError, ElasticSearchResponse, ResultGeneratorFuture,
     execute_command,
 };
-use crate::elastic_search_ingest::{WriteBuffer, write_to_file};
+use crate::elastic_search_ingest::write_to_file;
 use crate::peers::{PrivateCompactionInvocation, PrivateInvocation};
 use crate::schema_massager::{PowdrrSchema, SqlBuilder};
 use crate::search_runtime::df_to_serde_value;
+use crate::speedboat_buffer::WriteBuffer;
 use crate::state_provider::ServiceApiError;
 use crate::{data_access, state_provider::STATE_PROVIDER};
 
@@ -435,9 +436,10 @@ pub async fn perform_compaction(
     for (table_name, work_item) in work_items.iter() {
         let compaction_id = work_item.id.clone();
 
-        // NOTE: the api commit must happen before the iceberg commit. The main_lib is designed to understand that
-        // a compaction commit might get committed to it but fail afterwards. If we commit to Iceberg and fail to
-        // record that in the main_lib then that leads to correctness errors that aren't really possible to fix.
+        // NOTE: the API-layer commit must happen before the Iceberg commit. The runtime is designed to
+        // tolerate a compaction commit being recorded before the follow-up Iceberg write finishes. If we
+        // commit to Iceberg first and then fail to record that in metadata, we create correctness errors
+        // that are not realistically recoverable.
         let parquet_file_name = PowdrrFileNameGenerator::create_file_name();
         match STATE_PROVIDER
             .compaction_commit(
@@ -501,7 +503,7 @@ mod tests {
     use datafusion::arrow::array::RecordBatch;
     use datafusion::arrow::error::ArrowError;
     use datafusion::parquet::data_type::AsBytes;
-    use gotham::test::Server;
+    use gotham::test::{Server as GothamServer, TestServer};
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use std::io::BufReader;
     use std::sync::Arc;
@@ -509,14 +511,14 @@ mod tests {
     use super::{CompactionCommand, PowdrrFileNameGenerator};
     use crate::data_access;
     use crate::elastic_search_storage_schema::{FullRecord, RecordInput, SpeedboatCommitBuilder};
-    use crate::router::tests::TEST_SERVER;
     use iceberg::io::{
         FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY,
     };
+    use powdrr_query_server::router::router;
 
     #[test]
     fn test_iceberg_catalog_list_all_tables() {
-        let test_server = &*TEST_SERVER;
+        let test_server = TestServer::with_timeout(router(true), 1000).unwrap();
 
         test_server.run_future(test_iceberg_catalog_list_all_tables_worker());
     }
@@ -560,7 +562,7 @@ mod tests {
 
     #[test]
     fn test_iceberg_compact_simple() {
-        let test_server = &*TEST_SERVER;
+        let test_server = TestServer::with_timeout(router(true), 1000).unwrap();
 
         test_server.run_future(test_iceberg_compact_simple_worker());
     }
@@ -570,7 +572,7 @@ mod tests {
             .await
             .unwrap();
 
-        let file_content = include_str!("../tests/data/logs.json");
+        let file_content = include_str!("../../testdata/logs.json");
         let mut values = vec![];
         for split_str in file_content.split("\n") {
             if split_str.len() == 0 {
@@ -643,7 +645,7 @@ mod tests {
 
     #[test]
     fn test_iceberg_compact_okta() {
-        let test_server = &*TEST_SERVER;
+        let test_server = TestServer::with_timeout(router(true), 1000).unwrap();
 
         test_server.run_future(test_iceberg_compact_okta_worker());
     }
@@ -653,10 +655,10 @@ mod tests {
             .await
             .unwrap();
 
-        let okta_1 = include_str!("../tests/data/okta_system_log_1.json").replace("\n", "");
-        let okta_2 = include_str!("../tests/data/okta_system_log_2.json").replace("\n", "");
-        let okta_3 = include_str!("../tests/data/okta_system_log_3.json").replace("\n", "");
-        let okta_4 = include_str!("../tests/data/okta_system_log_4.json").replace("\n", "");
+        let okta_1 = include_str!("../../testdata/okta_system_log_1.json").replace("\n", "");
+        let okta_2 = include_str!("../../testdata/okta_system_log_2.json").replace("\n", "");
+        let okta_3 = include_str!("../../testdata/okta_system_log_3.json").replace("\n", "");
+        let okta_4 = include_str!("../../testdata/okta_system_log_4.json").replace("\n", "");
         let values = vec![
             serde_json::from_str::<serde_json::Value>(&okta_1).unwrap(),
             serde_json::from_str::<serde_json::Value>(&okta_2).unwrap(),
@@ -758,7 +760,7 @@ mod tests {
 
     #[test]
     fn test_s3_file_io() {
-        let test_server = &*TEST_SERVER;
+        let test_server = TestServer::with_timeout(router(true), 1000).unwrap();
 
         test_server.run_future(test_s3_file_io_worker());
     }

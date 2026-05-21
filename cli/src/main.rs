@@ -1,5 +1,5 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use powdrr_query_lib::local_cli::{
+use powdrr_query_runtime::local_cli::{
     LocalParquetBuildRequest, LocalParquetQueryRequest, LocalParquetValidateRequest,
     LocalQueryAnalysisRequest, LocalQueryLanguage, analyze_local_query, build_local_parquet_cache,
     query_local_parquet_cache, validate_local_parquet_source,

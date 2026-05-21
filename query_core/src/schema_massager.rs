@@ -757,7 +757,7 @@ impl SqlQuery {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn build_debug(&self) -> String {
+    pub fn build_debug(&self) -> String {
         let fields = self
             .fields
             .iter()

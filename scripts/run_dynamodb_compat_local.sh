@@ -67,4 +67,4 @@ wait_for_http "http://localhost:8181" "Iceberg REST catalog"
 wait_for_http "http://localhost:4566/_localstack/health" "LocalStack"
 
 cd "$ROOT_DIR"
-scripts/cargo-worktree.sh test -p powdrr_lib --features integration-tests --test dynamodb_compatibility_matrix -- --nocapture --test-threads=1
+scripts/cargo-worktree.sh test -p powdrr-query-server --test dynamodb_compatibility_matrix -- --nocapture --test-threads=1

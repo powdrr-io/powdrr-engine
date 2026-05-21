@@ -106,9 +106,10 @@ serving plan and run against one shared snapshot-aware execution path.
   The control-plane service for table metadata, checkpoints, org setup,
   aliases, templates, and related state transitions.
 
-- `main_lib/`
-  The compatibility facade crate used by existing tests and callers that still
-  import `powdrr_lib`. Its implementation surface now lives in `query_lib/`.
+- `query_runtime/`
+  The runtime/orchestration crate. This owns ingest, compaction, state
+  providers, peer/runtime fanout, local CLI execution, and the snapshot-aware
+  serving runtime.
 
 - `cli/`
   A local CLI for building and querying a local Parquet cache through Powdrr's
@@ -293,7 +294,7 @@ Targeted checks during development:
 ```bash
 scripts/cargo-worktree.sh check -p powdrr-io-engine
 scripts/cargo-worktree.sh check -p powdrr-io-service
-scripts/cargo-worktree.sh check -p powdrr_lib
+scripts/cargo-worktree.sh check -p powdrr-query-runtime
 ```
 
 General test guidance:

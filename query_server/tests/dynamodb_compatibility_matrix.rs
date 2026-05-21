@@ -24,16 +24,16 @@ use datafusion::parquet::arrow::ArrowWriter;
 use futures_util::future;
 use gotham::bind_server;
 use hmac::{Hmac, Mac};
-use powdrr_lib::data_contract::{
+use powdrr_query_lib::data_contract::{
     DynamoDbGlobalSecondaryIndexConfig, DynamoDbLocalSecondaryIndexConfig, DynamoDbTableConfig,
     FileSetPayload, IcebergMetadata, LicenseType, OrgCreds, OrgSettings, TableMetadataCheckpoint,
 };
-use powdrr_lib::router::router;
-use powdrr_lib::serving_dataset::read_parquet_documents;
-use powdrr_lib::state_provider::STATE_PROVIDER;
-use powdrr_lib::test_api::{
+use powdrr_query_runtime::serving_dataset::read_parquet_documents;
+use powdrr_query_runtime::state_provider::STATE_PROVIDER;
+use powdrr_query_runtime::test_api::{
     CacheMode, CompactionMode, IndexingMode, StateMode, TestProcessingMode,
 };
+use powdrr_query_server::router::router;
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -43,7 +43,7 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use url::Url;
 
-const CASES_JSON: &str = include_str!("data/dynamodb_compat_cases.json");
+const CASES_JSON: &str = include_str!("../../testdata/dynamodb_compat_cases.json");
 
 static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -373,6 +373,7 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
     .await;
     eprintln!("dynamo fixture: adding hidden Powdrr checkpoint");
     add_powdrr_checkpoint(base_url, &hidden_table_name, &parquet_path).await;
+    advance_powdrr_checkpoints(base_url).await;
 
     let powdrr_client = dynamodb_client(base_url).await;
     let localstack_client = dynamodb_client("http://127.0.0.1:4566").await;
@@ -2395,6 +2396,28 @@ async fn add_powdrr_checkpoint(base_url: &str, table_name: &str, parquet_path: &
     );
 }
 
+async fn advance_powdrr_checkpoints(base_url: &str) {
+    let client = powdrr_http_client();
+    let url = format!("{}/_test/v1/_advance_checkpoints", base_url);
+    let mut last_error = String::new();
+
+    for _ in 0..20 {
+        match client.put(&url).send().await {
+            Ok(response) => match response.error_for_status() {
+                Ok(_) => return,
+                Err(error) => last_error = error.to_string(),
+            },
+            Err(error) => last_error = error.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    panic!(
+        "PUT /_test/v1/_advance_checkpoints failed after retries: {}",
+        last_error
+    );
+}
+
 async fn put_powdrr_dynamodb_config(
     base_url: &str,
     table_name: &str,
@@ -2449,6 +2472,7 @@ async fn configure_powdrr_table(
 ) {
     add_powdrr_checkpoint(base_url, table_name, parquet_path).await;
     put_powdrr_dynamodb_config(base_url, table_name, config).await;
+    advance_powdrr_checkpoints(base_url).await;
 }
 
 async fn configure_powdrr_testing_mode(base_url: &str) {

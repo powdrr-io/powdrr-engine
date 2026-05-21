@@ -16,7 +16,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       # Keep both steps on the same target dir so rust-cache and the
-      # differential script reuse the initial powdrr_lib test build.
+      # differential script reuse the initial query-server compatibility test build.
       CARGO_TARGET_DIR: target
 
     steps:
@@ -35,7 +35,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Validate Compatibility Fixture File
-        run: scripts/cargo-worktree.sh test -p powdrr_lib --features integration-tests --test es_compatibility_matrix compatibility_matrix_case_file_parses_and_ids_are_unique -- --nocapture
+        run: scripts/cargo-worktree.sh test -p powdrr-query-server --features integration-tests --test es_compatibility_matrix compatibility_matrix_case_file_parses_and_ids_are_unique -- --nocapture
 
       - name: Run Differential Compatibility Matrix
         run: POWDRR_SKIP_FIXTURE_VALIDATION=1 bash scripts/run_es_compat_local.sh

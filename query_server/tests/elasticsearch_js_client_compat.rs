@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use futures_util::future;
 use gotham::bind_server;
-use powdrr_lib::router::router;
+use powdrr_query_server::router::router;
 use reqwest::Client as HttpClient;
 use serde_json::json;
 use tokio::net::TcpListener;
