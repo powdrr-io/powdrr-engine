@@ -59,6 +59,15 @@ async fn run_mongodb_wire_server(port: u32) -> () {
         .unwrap();
 }
 
+async fn run_redis_wire_server(port: u32) -> () {
+    let addr = format!("0.0.0.0:{}", port);
+    let listener = TcpListener::bind(&addr).await.unwrap();
+    println!("Listening for Redis wire requests at {}", addr);
+    powdrr_query_server::redis_wire_protocol::serve_redis_wire(listener)
+        .await
+        .unwrap();
+}
+
 #[allow(dead_code)]
 async fn run_ssl_server() -> () {
     tracing_subscriber::fmt().init();
@@ -98,6 +107,12 @@ async fn main() -> () {
     if let Some(mongo_port) = mode.mongo_port {
         tokio::runtime::Handle::current().spawn(async move {
             run_mongodb_wire_server(mongo_port).await;
+        });
+    }
+
+    if let Some(redis_port) = mode.redis_port {
+        tokio::runtime::Handle::current().spawn(async move {
+            run_redis_wire_server(redis_port).await;
         });
     }
 

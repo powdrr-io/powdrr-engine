@@ -81,9 +81,14 @@ pub fn put_serving_config(mut state: State) -> Pin<Box<HandlerFuture>> {
             }
         };
 
-        let (tags, dynamodb, mongodb) = match STATE_PROVIDER.describe_table(&path).await {
-            Ok(Some(description)) => (description.tags, description.dynamodb, description.mongodb),
-            Ok(None) => (HashMap::new(), None, None),
+        let (tags, dynamodb, mongodb, redis) = match STATE_PROVIDER.describe_table(&path).await {
+            Ok(Some(description)) => (
+                description.tags,
+                description.dynamodb,
+                description.mongodb,
+                description.redis,
+            ),
+            Ok(None) => (HashMap::new(), None, None, None),
             Err(error) => {
                 let response = json_response(
                     &state,
@@ -100,6 +105,7 @@ pub fn put_serving_config(mut state: State) -> Pin<Box<HandlerFuture>> {
             "serving": body.clone(),
             "dynamodb": dynamodb,
             "mongodb": mongodb,
+            "redis": redis,
         }))
         .expect("serving config table metadata should deserialize");
 

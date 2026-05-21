@@ -9,6 +9,7 @@ use crate::elastic_search_http_types::QueryStringClusterSettings;
 use crate::elastic_search_http_types::QueryStringFieldCaps;
 use crate::elastic_search_http_types::QueryStringSearchExtractor;
 use crate::mongodb_protocol;
+use crate::redis_protocol;
 use crate::test_api_endpoints::test_v1_add_checkpoint;
 use crate::test_api_endpoints::test_v1_advance_checkpoints;
 use crate::test_api_endpoints::test_v1_create_index;
@@ -491,6 +492,10 @@ pub fn router(include_test_apis: bool) -> Router {
             .with_path_extractor::<NamePathExtractor>()
             .to(mongodb_protocol::get_mongodb_config);
         route
+            .get("/:name/_redis/config")
+            .with_path_extractor::<NamePathExtractor>()
+            .to(redis_protocol::get_redis_config);
+        route
             .put("/:name/_serve/config")
             .with_path_extractor::<NamePathExtractor>()
             .to(lakehouse_serving_endpoints::put_serving_config);
@@ -502,6 +507,10 @@ pub fn router(include_test_apis: bool) -> Router {
             .put("/:name/_mongo/config")
             .with_path_extractor::<NamePathExtractor>()
             .to(mongodb_protocol::put_mongodb_config);
+        route
+            .put("/:name/_redis/config")
+            .with_path_extractor::<NamePathExtractor>()
+            .to(redis_protocol::put_redis_config);
         route
             .post("/_mongo/:database/_command")
             .with_path_extractor::<mongodb_protocol::MongoDatabasePathExtractor>()
@@ -2231,6 +2240,7 @@ pub(crate) mod tests {
                 "serving": null,
                 "dynamodb": null,
                 "mongodb": null,
+                "redis": null,
             }))
             .expect("test table metadata should deserialize"),
         ))
@@ -2265,6 +2275,7 @@ pub(crate) mod tests {
                     "serving": null,
                     "dynamodb": null,
                     "mongodb": null,
+                    "redis": null,
                 }))
                 .expect("test alias metadata should deserialize"),
             ),
@@ -2299,6 +2310,7 @@ pub(crate) mod tests {
                     "serving": null,
                     "dynamodb": null,
                     "mongodb": null,
+                    "redis": null,
                 }))
                 .expect("test extra metadata should deserialize"),
             ),

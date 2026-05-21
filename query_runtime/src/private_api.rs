@@ -9,6 +9,7 @@ use datafusion::arrow::{
     datatypes::{DataType, TimeUnit},
 };
 use datafusion::error::DataFusionError;
+use futures::future::try_join_all;
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -44,7 +45,9 @@ use crate::query_execution::{
     QueryExecutionPlan, QueryExtensionFileSpec, QueryInputFile, QuerySqlTemplate, QueryStorageKind,
     execute_query_plan_batches,
 };
-use crate::query_path::{QueryPredicate, file_may_match_predicates};
+use crate::query_path::{
+    QueryPredicate, file_may_match_predicates, row_group_may_match_predicates,
+};
 use crate::runtime_bindings;
 use crate::schema_massager::{PowdrrSchema, SqlQuery};
 use crate::search_executor::typed_sort_projection_name;
@@ -154,38 +157,55 @@ async fn determine_required_files(
     index: u64,
     num: u64,
 ) -> Result<RequiredFiles, PrivateApiError> {
-    if required_extensions.len() > 1 || checkpoints.len() != 1 {
+    if required_extensions.len() > 1 || checkpoints.is_empty() {
         return Err(PrivateApiError {
             message: "Only read for one table at a time please.".to_string(),
         });
     }
 
-    let table_metadata = load_checkpoint_table_metadata(checkpoints).await?;
-    required_files_from_table_metadata(required_extensions, &table_metadata, index, num)
+    let table_metadatas = load_checkpoint_table_metadatas(checkpoints).await?;
+    required_files_from_table_metadatas(required_extensions, &table_metadatas, index, num)
+}
+
+async fn load_checkpoint_table_metadatas(
+    checkpoints: &Vec<CheckpointDescriptor>,
+) -> Result<Vec<TableMetadataCheckpoint>, PrivateApiError> {
+    if checkpoints.is_empty() {
+        return Err(PrivateApiError {
+            message: "Only read for one table at a time please.".to_string(),
+        });
+    }
+
+    let mut metadatas = Vec::with_capacity(checkpoints.len());
+    for target_checkpoint in checkpoints {
+        match runtime_bindings::get_checkpoint(target_checkpoint.clone()).await {
+            Ok(tmc) => match tmc {
+                Some(tmc) => metadatas.push(tmc),
+                None => panic!(
+                    "The table metadata was not found for a known checkpoint: {}",
+                    target_checkpoint
+                ),
+            },
+            Err(_e) => {
+                return log_err(PrivateApiError {
+                    message: "Error calling get checkpoint".to_string(),
+                });
+            }
+        }
+    }
+    Ok(metadatas)
 }
 
 async fn load_checkpoint_table_metadata(
     checkpoints: &Vec<CheckpointDescriptor>,
 ) -> Result<TableMetadataCheckpoint, PrivateApiError> {
-    if checkpoints.len() != 1 {
+    let mut metadatas = load_checkpoint_table_metadatas(checkpoints).await?;
+    if metadatas.len() != 1 {
         return Err(PrivateApiError {
             message: "Only read for one table at a time please.".to_string(),
         });
     }
-
-    let target_checkpoint = &checkpoints[0];
-    match runtime_bindings::get_checkpoint(target_checkpoint.clone()).await {
-        Ok(tmc) => match tmc {
-            Some(tmc) => Ok(tmc),
-            None => panic!(
-                "The table metadata was not found for a known checkpoint: {}",
-                target_checkpoint
-            ),
-        },
-        Err(_e) => log_err(PrivateApiError {
-            message: "Error calling get checkpoint".to_string(),
-        }),
-    }
+    Ok(metadatas.remove(0))
 }
 
 fn required_files_from_table_metadata(
@@ -221,6 +241,54 @@ fn required_files_from_table_metadata(
             .as_ref()
             .map_or_else(Vec::new, |d| d.files.clone()),
     })
+}
+
+fn required_files_from_table_metadatas(
+    required_extensions: &Vec<String>,
+    table_metadatas: &[TableMetadataCheckpoint],
+    index: u64,
+    num: u64,
+) -> Result<RequiredFiles, PrivateApiError> {
+    let Some(first_table_metadata) = table_metadatas.first() else {
+        return Err(PrivateApiError {
+            message: "Only read for one table at a time please.".to_string(),
+        });
+    };
+
+    let mut merged = RequiredFiles {
+        table_schema: first_table_metadata.schema.clone(),
+        iceberg_files: vec![],
+        all_iceberg_files_count: 0,
+        iceberg_file_extensions: vec![],
+        speedboat_files: vec![],
+        all_speedboat_files_count: 0,
+        speedboat_file_extensions: vec![],
+        delete_files: vec![],
+    };
+
+    for table_metadata in table_metadatas {
+        if table_metadata.schema != merged.table_schema {
+            return Err(PrivateApiError {
+                message: "Multi-target search currently requires identical schemas".to_string(),
+            });
+        }
+
+        let next =
+            required_files_from_table_metadata(required_extensions, table_metadata, index, num)?;
+        merged.iceberg_files.extend(next.iceberg_files);
+        merged.all_iceberg_files_count += next.all_iceberg_files_count;
+        merged
+            .iceberg_file_extensions
+            .extend(next.iceberg_file_extensions);
+        merged.speedboat_files.extend(next.speedboat_files);
+        merged.all_speedboat_files_count += next.all_speedboat_files_count;
+        merged
+            .speedboat_file_extensions
+            .extend(next.speedboat_file_extensions);
+        merged.delete_files.extend(next.delete_files);
+    }
+
+    Ok(merged)
 }
 
 async fn narrow_prefetch_files_for_serving_warmup(
@@ -599,11 +667,17 @@ async fn file_may_match_search(
     range_constraints: &[PrivateSearchRangeConstraint],
     parquet: bool,
 ) -> Result<bool, PrivateApiError> {
+    let predicates = search_query_predicates(exact_constraints, range_constraints);
     if let Some(file_stats) = iceberg_file_stats {
-        if !file_may_match_predicates(
-            file_stats,
-            &search_query_predicates(exact_constraints, range_constraints),
-        ) {
+        if !file_may_match_predicates(file_stats, &predicates) {
+            return Ok(false);
+        }
+        if !file_stats.row_groups.is_empty()
+            && !file_stats
+                .row_groups
+                .iter()
+                .any(|row_group| row_group_may_match_predicates(row_group, &predicates))
+        {
             return Ok(false);
         }
     }
@@ -643,53 +717,53 @@ async fn prune_required_files_for_search(
         })
         .unwrap_or_default();
 
-    let mut retained_iceberg_files = vec![];
-    let mut retained_iceberg_extensions = vec![];
-    for (file, extensions) in required_files
-        .iceberg_files
-        .iter()
-        .cloned()
-        .zip(required_files.iceberg_file_extensions.iter().cloned())
-    {
-        if file_may_match_search(
-            &file,
-            &extensions,
-            iceberg_file_stats.get(&file.file_path),
-            exact_constraints,
-            range_constraints,
-            true,
-        )
-        .await?
-        {
-            retained_iceberg_files.push(file);
-            retained_iceberg_extensions.push(extensions);
-        }
-    }
+    let retained_iceberg_pairs = try_join_all(
+        required_files
+            .iceberg_files
+            .iter()
+            .cloned()
+            .zip(required_files.iceberg_file_extensions.iter().cloned())
+            .map(|(file, extensions)| async {
+                let keep = file_may_match_search(
+                    &file,
+                    &extensions,
+                    iceberg_file_stats.get(&file.file_path),
+                    exact_constraints,
+                    range_constraints,
+                    true,
+                )
+                .await?;
+                Ok::<_, PrivateApiError>(keep.then_some((file, extensions)))
+            }),
+    )
+    .await?;
+    let (retained_iceberg_files, retained_iceberg_extensions): (Vec<_>, Vec<_>) =
+        retained_iceberg_pairs.into_iter().flatten().unzip();
     required_files.iceberg_files = retained_iceberg_files;
     required_files.iceberg_file_extensions = retained_iceberg_extensions;
 
-    let mut retained_speedboat_files = vec![];
-    let mut retained_speedboat_extensions = vec![];
-    for (file, extensions) in required_files
-        .speedboat_files
-        .iter()
-        .cloned()
-        .zip(required_files.speedboat_file_extensions.iter().cloned())
-    {
-        if file_may_match_search(
-            &file,
-            &extensions,
-            None,
-            exact_constraints,
-            range_constraints,
-            false,
-        )
-        .await?
-        {
-            retained_speedboat_files.push(file);
-            retained_speedboat_extensions.push(extensions);
-        }
-    }
+    let retained_speedboat_pairs = try_join_all(
+        required_files
+            .speedboat_files
+            .iter()
+            .cloned()
+            .zip(required_files.speedboat_file_extensions.iter().cloned())
+            .map(|(file, extensions)| async {
+                let keep = file_may_match_search(
+                    &file,
+                    &extensions,
+                    None,
+                    exact_constraints,
+                    range_constraints,
+                    false,
+                )
+                .await?;
+                Ok::<_, PrivateApiError>(keep.then_some((file, extensions)))
+            }),
+    )
+    .await?;
+    let (retained_speedboat_files, retained_speedboat_extensions): (Vec<_>, Vec<_>) =
+        retained_speedboat_pairs.into_iter().flatten().unzip();
     required_files.speedboat_files = retained_speedboat_files;
     required_files.speedboat_file_extensions = retained_speedboat_extensions;
 
@@ -740,7 +814,16 @@ pub(crate) async fn data_query_batches(
         .sum::<u64>();
     log_required_files("Query", &required_files, parquet_size, speedboat_size);
 
-    data_query_batches_worker(&invocation.sql, &required_files, true, None).await
+    let use_deletes_table = !required_files.delete_files.is_empty();
+    let sql_without_deletes;
+    let sql = if use_deletes_table {
+        &invocation.sql
+    } else {
+        sql_without_deletes = invocation.sql.without_deletes();
+        &sql_without_deletes
+    };
+
+    data_query_batches_worker(sql, &required_files, use_deletes_table, true, None).await
 }
 
 pub async fn search_query(
@@ -825,14 +908,43 @@ pub async fn search_query(
         .sum::<u64>();
     log_required_files("Search", &required_files, parquet_size, speedboat_size);
 
+    let use_deletes_table = !required_files.delete_files.is_empty();
+    let derived_sql_without_deletes;
+    let derived_exact_sql_without_deletes;
     let sql = if use_exact_sql {
-        invocation.exact_sql.as_ref().unwrap_or(&invocation.sql)
-    } else {
+        if use_deletes_table {
+            invocation.exact_sql.as_ref().unwrap_or(&invocation.sql)
+        } else if let Some(sql) = invocation
+            .exact_sql_without_deletes
+            .as_ref()
+            .or(invocation.sql_without_deletes.as_ref())
+        {
+            sql
+        } else {
+            derived_exact_sql_without_deletes = invocation
+                .exact_sql
+                .as_ref()
+                .unwrap_or(&invocation.sql)
+                .without_deletes();
+            &derived_exact_sql_without_deletes
+        }
+    } else if use_deletes_table {
         &invocation.sql
+    } else if let Some(sql) = invocation.sql_without_deletes.as_ref() {
+        sql
+    } else {
+        derived_sql_without_deletes = invocation.sql.without_deletes();
+        &derived_sql_without_deletes
     };
 
-    let batches =
-        data_query_batches_worker(sql, &required_files, true, extension_suffixes.as_ref()).await?;
+    let batches = data_query_batches_worker(
+        sql,
+        &required_files,
+        use_deletes_table,
+        true,
+        extension_suffixes.as_ref(),
+    )
+    .await?;
     let total_hits = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
     if invocation.size == 0 && invocation.aggregations.is_empty() {
         return Ok(PrivateSearchResult {
@@ -843,32 +955,13 @@ pub async fn search_query(
     }
 
     if invocation.aggregations.is_empty() {
-        let mut hit_refs = query_result_hit_refs_from_batches(
+        let hit_refs = collect_query_result_hit_refs(
             &batches,
+            invocation.size,
             invocation.calculate_score,
             &invocation.sorts,
+            invocation.search_after.as_deref(),
         );
-
-        if !invocation.sorts.is_empty() {
-            if invocation.size < hit_refs.len() {
-                hit_refs.select_nth_unstable_by(invocation.size, |left, right| {
-                    compare_query_result_hit_refs_by_sort(left, right, &invocation.sorts)
-                });
-                hit_refs.truncate(invocation.size);
-            }
-            hit_refs.sort_by(|left, right| {
-                compare_query_result_hit_refs_by_sort(left, right, &invocation.sorts)
-            });
-        } else if invocation.calculate_score {
-            if invocation.size < hit_refs.len() {
-                hit_refs
-                    .select_nth_unstable_by(invocation.size, compare_query_result_hit_refs_desc);
-                hit_refs.truncate(invocation.size);
-            }
-            hit_refs.sort_by(compare_query_result_hit_refs_desc);
-        }
-
-        hit_refs.truncate(invocation.size);
         let hits =
             query_result_hits_from_refs(&batches, &hit_refs, &Some(invocation.table.clone()))?;
         return Ok(PrivateSearchResult {
@@ -888,28 +981,13 @@ pub async fn search_query(
         });
     }
 
-    let mut hit_refs =
-        query_result_hit_refs_from_batches(&batches, invocation.calculate_score, &invocation.sorts);
-
-    if !invocation.sorts.is_empty() {
-        if invocation.size < hit_refs.len() {
-            hit_refs.select_nth_unstable_by(invocation.size, |left, right| {
-                compare_query_result_hit_refs_by_sort(left, right, &invocation.sorts)
-            });
-            hit_refs.truncate(invocation.size);
-        }
-        hit_refs.sort_by(|left, right| {
-            compare_query_result_hit_refs_by_sort(left, right, &invocation.sorts)
-        });
-    } else if invocation.calculate_score {
-        if invocation.size < hit_refs.len() {
-            hit_refs.select_nth_unstable_by(invocation.size, compare_query_result_hit_refs_desc);
-            hit_refs.truncate(invocation.size);
-        }
-        hit_refs.sort_by(compare_query_result_hit_refs_desc);
-    }
-
-    hit_refs.truncate(invocation.size);
+    let hit_refs = collect_query_result_hit_refs(
+        &batches,
+        invocation.size,
+        invocation.calculate_score,
+        &invocation.sorts,
+        invocation.search_after.as_deref(),
+    );
     let hits = query_result_hits_from_refs(&batches, &hit_refs, &Some(invocation.table.clone()))?;
 
     Ok(PrivateSearchResult {
@@ -952,25 +1030,69 @@ enum SortScalar {
     Bool(bool),
 }
 
-fn query_result_hit_refs_from_batches(
+fn collect_query_result_hit_refs(
     batches: &[RecordBatch],
+    size: usize,
     calculate_score: bool,
     sorts: &[PrivateSearchSortSpec],
+    search_after: Option<&[Value]>,
 ) -> Vec<QueryResultHitRef> {
-    let capacity = batches.iter().map(|batch| batch.num_rows()).sum();
-    let mut hits = Vec::with_capacity(capacity);
+    let total_rows = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
+    let mut hits =
+        Vec::with_capacity(total_rows.min(hit_ref_buffer_limit(size, calculate_score, sorts)));
+    let ranked = !sorts.is_empty() || calculate_score;
+    let buffer_limit = hit_ref_buffer_limit(size, calculate_score, sorts);
+
     for (batch_index, batch) in batches.iter().enumerate() {
         for row_index in 0..batch.num_rows() {
-            hits.push(query_result_hit_ref_from_batch_row(
+            let hit = query_result_hit_ref_from_batch_row(
                 batch_index,
                 batch,
                 row_index,
                 calculate_score,
                 sorts,
-            ));
+            );
+
+            if let Some(search_after) = search_after {
+                if compare_hit_ref_to_search_after(&hit, search_after, sorts)
+                    != std::cmp::Ordering::Greater
+                {
+                    continue;
+                }
+            }
+
+            if !ranked && hits.len() >= size {
+                continue;
+            }
+
+            hits.push(hit);
+
+            if ranked && hits.len() > buffer_limit {
+                trim_query_result_hit_refs(&mut hits, size, calculate_score, sorts);
+            }
         }
     }
+
+    finalize_query_result_hit_refs(&mut hits, size, calculate_score, sorts);
     hits
+}
+
+fn hit_ref_buffer_limit(
+    size: usize,
+    calculate_score: bool,
+    sorts: &[PrivateSearchSortSpec],
+) -> usize {
+    if size == usize::MAX {
+        return usize::MAX;
+    }
+    if size == 0 {
+        return 0;
+    }
+    if sorts.is_empty() && !calculate_score {
+        size
+    } else {
+        size.saturating_mul(4).max(size)
+    }
 }
 
 fn query_result_hit_ref_from_batch_row(
@@ -1163,6 +1285,76 @@ fn compare_query_result_hit_refs_by_sort(
         .then_with(|| left.id.cmp(&right.id))
 }
 
+fn compare_hit_ref_to_search_after(
+    hit: &QueryResultHitRef,
+    search_after: &[Value],
+    sorts: &[PrivateSearchSortSpec],
+) -> std::cmp::Ordering {
+    let hit_values = hit.sort.as_deref().unwrap_or(&[]);
+    for (index, sort) in sorts.iter().enumerate() {
+        let hit_value = hit_values.get(index).unwrap_or(&SortScalar::Null);
+        let search_after_value = search_after
+            .get(index)
+            .map(sort_scalar_from_json_value)
+            .unwrap_or(SortScalar::Null);
+        let ordering = compare_sort_values(hit_value, &search_after_value);
+        let ordering = if sort.descending {
+            ordering.reverse()
+        } else {
+            ordering
+        };
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+
+    std::cmp::Ordering::Equal
+}
+
+fn trim_query_result_hit_refs(
+    hit_refs: &mut Vec<QueryResultHitRef>,
+    size: usize,
+    calculate_score: bool,
+    sorts: &[PrivateSearchSortSpec],
+) {
+    if size == 0 {
+        hit_refs.clear();
+        return;
+    }
+    if hit_refs.len() <= size {
+        return;
+    }
+
+    if !sorts.is_empty() {
+        hit_refs.select_nth_unstable_by(size, |left, right| {
+            compare_query_result_hit_refs_by_sort(left, right, sorts)
+        });
+    } else if calculate_score {
+        hit_refs.select_nth_unstable_by(size, compare_query_result_hit_refs_desc);
+    } else {
+        hit_refs.truncate(size);
+        return;
+    }
+    hit_refs.truncate(size);
+}
+
+fn finalize_query_result_hit_refs(
+    hit_refs: &mut Vec<QueryResultHitRef>,
+    size: usize,
+    calculate_score: bool,
+    sorts: &[PrivateSearchSortSpec],
+) {
+    trim_query_result_hit_refs(hit_refs, size, calculate_score, sorts);
+
+    if !sorts.is_empty() {
+        hit_refs.sort_by(|left, right| compare_query_result_hit_refs_by_sort(left, right, sorts));
+    } else if calculate_score {
+        hit_refs.sort_by(compare_query_result_hit_refs_desc);
+    }
+
+    hit_refs.truncate(size);
+}
+
 fn compare_query_result_hit_refs_desc(
     left: &QueryResultHitRef,
     right: &QueryResultHitRef,
@@ -1303,6 +1495,24 @@ fn sort_scalar_to_json(value: &SortScalar) -> Value {
         SortScalar::Float(number) => Value::from(*number),
         SortScalar::String(string) => Value::String(string.clone()),
         SortScalar::Bool(boolean) => Value::Bool(*boolean),
+    }
+}
+
+fn sort_scalar_from_json_value(value: &Value) -> SortScalar {
+    match value {
+        Value::Null => SortScalar::Null,
+        Value::Bool(boolean) => SortScalar::Bool(*boolean),
+        Value::String(string) => SortScalar::String(string.clone()),
+        Value::Number(number) => {
+            if let Some(int) = number.as_i64() {
+                SortScalar::Int(int)
+            } else if let Some(uint) = number.as_u64() {
+                SortScalar::UInt(uint)
+            } else {
+                SortScalar::Float(number.as_f64().unwrap_or_default())
+            }
+        }
+        _ => SortScalar::String(value.to_string()),
     }
 }
 
@@ -1524,6 +1734,75 @@ mod tests {
             std::cmp::Ordering::Less
         );
     }
+
+    #[test]
+    fn iceberg_file_may_match_search_uses_row_group_stats_for_stronger_pruning() {
+        let file = FileDescriptor {
+            file_path: "s3://warehouse/table/data.parquet".to_string(),
+            size: 128,
+            schema: PowdrrSchema::minimal(),
+        };
+        let file_stats = IcebergFileStats {
+            file_path: file.file_path.clone(),
+            record_count: Some(10),
+            columns: vec![IcebergColumnStats {
+                field_id: 1,
+                field_name: "@timestamp".to_string(),
+                null_count: Some(0),
+                lower_bound: Some(serde_json::Value::from(100_i64)),
+                upper_bound: Some(serde_json::Value::from(300_i64)),
+            }],
+            partition_values: vec![],
+            row_groups: vec![
+                crate::data_contract::IcebergRowGroupStats {
+                    row_group_index: 0,
+                    record_count: Some(5),
+                    compressed_bytes: 64,
+                    page_index_present: true,
+                    bloom_filter_present: false,
+                    columns: vec![IcebergColumnStats {
+                        field_id: 1,
+                        field_name: "@timestamp".to_string(),
+                        null_count: Some(0),
+                        lower_bound: Some(serde_json::Value::from(100_i64)),
+                        upper_bound: Some(serde_json::Value::from(150_i64)),
+                    }],
+                },
+                crate::data_contract::IcebergRowGroupStats {
+                    row_group_index: 1,
+                    record_count: Some(5),
+                    compressed_bytes: 64,
+                    page_index_present: true,
+                    bloom_filter_present: false,
+                    columns: vec![IcebergColumnStats {
+                        field_id: 1,
+                        field_name: "@timestamp".to_string(),
+                        null_count: Some(0),
+                        lower_bound: Some(serde_json::Value::from(220_i64)),
+                        upper_bound: Some(serde_json::Value::from(260_i64)),
+                    }],
+                },
+            ],
+        };
+
+        let keep = futures::executor::block_on(file_may_match_search(
+            &file,
+            &vec![],
+            Some(&file_stats),
+            &[],
+            &[PrivateSearchRangeConstraint {
+                field: "@timestamp".to_string(),
+                gt: None,
+                gte: Some(serde_json::Value::from(170_i64)),
+                lt: None,
+                lte: Some(serde_json::Value::from(200_i64)),
+            }],
+            true,
+        ))
+        .unwrap();
+
+        assert!(!keep);
+    }
 }
 
 pub async fn compaction_query(
@@ -1543,7 +1822,14 @@ pub(crate) async fn compaction_query_batches(
     num: u64,
 ) -> Result<Vec<RecordBatch>, PrivateApiError> {
     let required_files = generate_required_files(invocation, index, num);
-    data_query_batches_worker(&invocation.sql, &required_files, true, None).await
+    data_query_batches_worker(
+        &invocation.sql,
+        &required_files,
+        !required_files.delete_files.is_empty(),
+        true,
+        None,
+    )
+    .await
 }
 
 pub async fn extension_query(
@@ -1603,7 +1889,14 @@ pub async fn prefetch_query(
                 message: error.message,
             })?;
     } else {
-        data_query_batches_worker(&SqlQuery::dummy(), &required_files, false, None).await?;
+        data_query_batches_worker(
+            &SqlQuery::dummy(),
+            &required_files,
+            !required_files.delete_files.is_empty(),
+            false,
+            None,
+        )
+        .await?;
     }
     let point_lookup_warmup = if invocation.required_extensions.is_empty() {
         Some(
@@ -2330,6 +2623,7 @@ fn string_key_array_value(array: &dyn Array, row_index: usize) -> Option<String>
 async fn data_query_batches_worker(
     sql: &SqlQuery,
     required_files: &RequiredFiles,
+    use_deletes_table: bool,
     use_cpu_threadpool: bool,
     extension_suffixes: Option<&Vec<String>>,
 ) -> Result<Vec<RecordBatch>, PrivateApiError> {
@@ -2373,7 +2667,7 @@ async fn data_query_batches_worker(
         },
         files: iceberg_query_files.chain(speedboat_query_files).collect(),
         delete_files: required_files.delete_files.clone(),
-        use_deletes_table: !required_files.delete_files.is_empty(),
+        use_deletes_table,
         extension_suffixes: extension_suffixes.cloned(),
         use_cpu_threadpool,
     };

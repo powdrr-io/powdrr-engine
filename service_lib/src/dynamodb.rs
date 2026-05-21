@@ -15,7 +15,7 @@ use modyne::{
     Aggregate, Entity, EntityExt, Error, Item, ProjectionExt, QueryInput, QueryInputExt, Table,
     expr, keys, model::TransactWrite, projections, read_projection,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub struct DynamoDbConnector {
     table_name: std::sync::Arc<str>,
@@ -577,6 +577,8 @@ pub struct TableBody {
     pub dynamodb: Option<crate::data_contract::DynamoDbTableConfig>,
     #[serde(default)]
     pub mongodb: Option<crate::data_contract::MongoDbTableConfig>,
+    #[serde(default)]
+    pub redis: Option<crate::data_contract::RedisTableConfig>,
 }
 
 impl TableBody {
@@ -587,6 +589,7 @@ impl TableBody {
             serving: None,
             dynamodb: None,
             mongodb: None,
+            redis: None,
         }
     }
 }
@@ -647,6 +650,38 @@ powdrr_tracker!(extension_commit_checkpointed);
 powdrr_tracker!(checkpoint_waiting_for_extension);
 
 impl DynamoDbConnector {
+    fn delete_checkpoint_core(
+        transaction: TransactWrite,
+        org_id: &String,
+        checkpoint_full_name: &String,
+    ) -> TransactWrite {
+        let checkpoint_type = "checkpoint".to_string();
+        transaction
+            .operation(PowdrrEntity::delete(PowdrrEntityInput {
+                type_name: &checkpoint_type,
+                org_id,
+                entity_id: checkpoint_full_name.clone(),
+            }))
+            .operation(PowdrrNamedTableMetadataCheckpoint::delete(OrgIdNameInput {
+                org_id,
+                name: checkpoint_full_name,
+            }))
+    }
+
+    fn delete_checkpoint_waiting_for_extension_core(
+        transaction: TransactWrite,
+        org_id: &String,
+        table_name: &String,
+        checkpoint_full_name: &String,
+    ) -> TransactWrite {
+        transaction.operation(PowdrrTracker::delete(OrgIdEntityNameInput {
+            entity_name: &"checkpoint_waiting_for_extension".to_string(),
+            org_id,
+            parent_entity: table_name,
+            name: checkpoint_full_name,
+        }))
+    }
+
     fn latest_checkpoint_key(table_name: &String, extension: &Option<String>) -> String {
         match extension {
             Some(x) => format!("checkpoint#{}#{}", table_name, x),
@@ -1127,11 +1162,11 @@ impl DynamoDbConnector {
             let checkpoint_obj = PowdrrNamedTableMetadataCheckpoint {
                 name: cloned_checkpoint_to_replace.get_descriptor().full_name(),
                 org_id: org_id.clone(),
-                entity: new_checkpoint.clone(),
+                entity: cloned_checkpoint_to_replace.clone(),
             };
             transaction = transaction.operation(checkpoint_obj.create());
 
-            if !new_checkpoint.fully_covered_for_extension(&"es".to_string()) {
+            if !cloned_checkpoint_to_replace.fully_covered_for_extension(&"es".to_string()) {
                 transaction = Self::create_checkpoint_waiting_for_extension_core(
                     transaction,
                     org_id,
@@ -1142,7 +1177,25 @@ impl DynamoDbConnector {
             }
 
             // Step 5b
-            // TODO: delete the listed checkpoints
+            let checkpoints_to_delete: HashSet<String> =
+                std::iter::once(compaction_commit.checkpoint_id_to_replace.clone())
+                    .chain(compaction_commit.checkpoints_to_delete.iter().cloned())
+                    .collect();
+            for checkpoint_id in checkpoints_to_delete {
+                let checkpoint_full_name = CheckpointDescriptor::new(
+                    cloned_checkpoint_to_replace.table_name.clone(),
+                    checkpoint_id,
+                )
+                .full_name();
+                transaction =
+                    Self::delete_checkpoint_core(transaction, org_id, &checkpoint_full_name);
+                transaction = Self::delete_checkpoint_waiting_for_extension_core(
+                    transaction,
+                    org_id,
+                    &cloned_checkpoint_to_replace.table_name,
+                    &checkpoint_full_name,
+                );
+            }
 
             // Step 5c
             let key =
@@ -1219,7 +1272,7 @@ impl DynamoDbConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_contract::SpeedboatCommitTableInfo;
+    use crate::data_contract::{IcebergMetadata, SpeedboatCommitTableInfo, SpeedboatMetadata};
     use crate::peers::CheckpointDescriptor;
     use crate::schema_massager::PowdrrSchema;
     use aws_config::{BehaviorVersion, Region};
@@ -1598,6 +1651,218 @@ mod tests {
         assert_eq!(
             CheckpointDescriptor::from_full_name(&new_latest.entity_id).checkpoint_id,
             new_checkpoint.checkpoint_id
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_iceberg_replaces_and_deletes_compacted_checkpoints() {
+        let mut connector = create_connector().await;
+        let org_id = "fake_org".to_string();
+        let table_name = "fake_table".to_string();
+
+        connector
+            .create_table_helper(&org_id, &table_name, &TableBody::new())
+            .await
+            .unwrap();
+
+        let latest_checkpoint_key = DynamoDbConnector::latest_checkpoint_key(&table_name, &None);
+        let latest_checkpoint_info = connector
+            .describe_latest(&org_id, &latest_checkpoint_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut checkpoint_cache = PowdrrNamedTableMetadataCheckpointCache::new();
+        let base_checkpoint = connector
+            .describe_checkpoint(
+                &mut checkpoint_cache,
+                &org_id,
+                &latest_checkpoint_info.entity_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let checkpoint_to_replace = TableMetadataCheckpoint {
+            table_name: table_name.clone(),
+            original_checkpoint_id: None,
+            checkpoint_id: "checkpoint-to-replace".to_string(),
+            iceberg_metadata: None,
+            speedboat_metadata: Some(SpeedboatMetadata {
+                files: FileSetPayload::single(
+                    "s3://warehouse/fake_table/speedboat-0001.arrow".to_string(),
+                    32,
+                    PowdrrSchema::minimal(),
+                ),
+            }),
+            deletes_metadata: None,
+            extension_metadata: base_checkpoint.extension_metadata.clone(),
+            schema: PowdrrSchema::minimal(),
+        };
+        assert!(
+            connector
+                .commit_checkpoint(
+                    &latest_checkpoint_info,
+                    &vec![],
+                    &checkpoint_to_replace,
+                    &None,
+                    &None,
+                )
+                .await
+                .unwrap()
+        );
+
+        let checkpoint_to_delete = TableMetadataCheckpoint {
+            table_name: table_name.clone(),
+            original_checkpoint_id: None,
+            checkpoint_id: "checkpoint-to-delete".to_string(),
+            iceberg_metadata: None,
+            speedboat_metadata: Some(SpeedboatMetadata {
+                files: FileSetPayload::single(
+                    "s3://warehouse/fake_table/speedboat-0002.arrow".to_string(),
+                    16,
+                    PowdrrSchema::minimal(),
+                ),
+            }),
+            deletes_metadata: None,
+            extension_metadata: Default::default(),
+            schema: PowdrrSchema::minimal(),
+        };
+        connector
+            .create_checkpoint(
+                &mut checkpoint_cache,
+                &org_id,
+                &checkpoint_to_delete.get_descriptor().full_name(),
+                &checkpoint_to_delete,
+            )
+            .await
+            .unwrap();
+        connector
+            .create_checkpoint_waiting_for_extension(
+                &org_id,
+                &table_name,
+                &checkpoint_to_delete.get_descriptor().full_name(),
+            )
+            .await
+            .unwrap();
+
+        let compaction = CompactionCommit {
+            removed_speedboat_files: vec![
+                "s3://warehouse/fake_table/speedboat-0001.arrow".to_string(),
+            ],
+            removed_delete_files: vec![],
+            parquet_file_name: "compact-0001.parquet".to_string(),
+            compaction_id: "compaction-1".to_string(),
+            checkpoint_id_to_replace: checkpoint_to_replace.checkpoint_id.clone(),
+            checkpoints_to_delete: vec![checkpoint_to_delete.checkpoint_id.clone()],
+        };
+        let mut compaction_cache = PowdrrNamedCompactionCommitCache::new();
+        connector
+            .create_compaction(
+                &mut compaction_cache,
+                &org_id,
+                &compaction.compaction_id,
+                &compaction,
+            )
+            .await
+            .unwrap();
+        connector
+            .create_compaction_work_item_lease(
+                &org_id,
+                &compaction.compaction_id,
+                &DynamoDbConnector::latest_compaction_work_item_key(&table_name),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            connector
+                .commit_iceberg(
+                    &org_id,
+                    &table_name,
+                    &IcebergCommit {
+                        metadata: IcebergMetadata {
+                            table_schema: PowdrrSchema::minimal(),
+                            snapshot_id: Some("snap-1".to_string()),
+                            files: FileSetPayload::single(
+                                "s3://warehouse/fake_table/compact-0001.parquet".to_string(),
+                                64,
+                                PowdrrSchema::minimal(),
+                            ),
+                            partition_spec: vec![],
+                            sort_order: vec![],
+                            column_names: vec![],
+                            column_stats: vec![],
+                            access_artifacts: vec![],
+                            file_stats: vec![],
+                        },
+                        deletes_table_info: None,
+                        compactions: vec![compaction.compaction_id.clone()],
+                    },
+                )
+                .await
+                .unwrap()
+        );
+
+        let mut post_commit_checkpoint_cache = PowdrrNamedTableMetadataCheckpointCache::new();
+        let checkpoint_to_replace_name = checkpoint_to_replace.get_descriptor().full_name();
+        assert!(
+            connector
+                .describe_checkpoint(
+                    &mut post_commit_checkpoint_cache,
+                    &org_id,
+                    &checkpoint_to_replace_name,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let checkpoint_to_delete_name = checkpoint_to_delete.get_descriptor().full_name();
+        assert!(
+            connector
+                .describe_checkpoint(
+                    &mut post_commit_checkpoint_cache,
+                    &org_id,
+                    &checkpoint_to_delete_name,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let waiting_checkpoints = connector
+            .oldest_available_checkpoint_waiting_for_extension(&org_id, &table_name, None, None)
+            .await
+            .unwrap();
+        assert!(
+            !waiting_checkpoints
+                .iter()
+                .any(|tracker| tracker.name == checkpoint_to_replace_name)
+        );
+        assert!(
+            !waiting_checkpoints
+                .iter()
+                .any(|tracker| tracker.name == checkpoint_to_delete_name)
+        );
+
+        let replacement_prefix = format!("{}:{}:", table_name, checkpoint_to_replace.checkpoint_id);
+        let replacement_name = waiting_checkpoints
+            .iter()
+            .find(|tracker| tracker.name.starts_with(&replacement_prefix))
+            .map(|tracker| tracker.name.clone())
+            .expect("replacement checkpoint should exist");
+        let replacement_checkpoint = connector
+            .describe_checkpoint(
+                &mut post_commit_checkpoint_cache,
+                &org_id,
+                &replacement_name,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            replacement_checkpoint.original_checkpoint_id,
+            Some(checkpoint_to_replace.checkpoint_id.clone())
         );
     }
 }

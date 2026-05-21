@@ -683,6 +683,8 @@ pub struct CreateTable {
     pub dynamodb: Option<DynamoDbTableConfig>,
     #[serde(default)]
     pub mongodb: Option<MongoDbTableConfig>,
+    #[serde(default)]
+    pub redis: Option<RedisTableConfig>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -695,6 +697,8 @@ pub struct TableDescription {
     pub dynamodb: Option<DynamoDbTableConfig>,
     #[serde(default)]
     pub mongodb: Option<MongoDbTableConfig>,
+    #[serde(default)]
+    pub redis: Option<RedisTableConfig>,
 }
 
 impl TableDescription {
@@ -705,6 +709,7 @@ impl TableDescription {
             serving: create_table.serving.clone(),
             dynamodb: create_table.dynamodb.clone(),
             mongodb: create_table.mongodb.clone(),
+            redis: create_table.redis.clone(),
         }
     }
 }
@@ -787,6 +792,15 @@ pub struct MongoDbTableConfig {
     pub database: String,
     pub collection: String,
     pub id: MongoDbIdConfig,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RedisTableConfig {
+    pub enabled: bool,
+    #[serde(default)]
+    pub database: u32,
+    pub key_field: String,
+    pub value_field: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

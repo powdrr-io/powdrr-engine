@@ -62,7 +62,9 @@ pub struct PrivateSqlInvocationExternal {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PrivateSearchInvocation {
     pub sql: SqlQuery,
+    pub sql_without_deletes: Option<SqlQuery>,
     pub exact_sql: Option<SqlQuery>,
+    pub exact_sql_without_deletes: Option<SqlQuery>,
     pub exact_constraints: Vec<PrivateExactConstraintGroup>,
     pub range_constraints: Vec<PrivateSearchRangeConstraint>,
     pub required_extensions: Vec<String>,
@@ -74,6 +76,7 @@ pub struct PrivateSearchInvocation {
     pub calculate_score: bool,
     pub aggregations: Vec<PrivateSearchAggregationSpec>,
     pub sorts: Vec<PrivateSearchSortSpec>,
+    pub search_after: Option<Vec<Value>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -111,7 +114,7 @@ pub struct PrivateSearchRangeConstraint {
     pub lte: Option<Value>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub enum PrivateSearchAggregationSpec {
     Terms {
         name: String,
@@ -158,7 +161,7 @@ pub struct PrivateSearchDateHistogramExtendedBoundsSpec {
     pub max: Value,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum PrivateSearchAggregationFilterSpec {
     Term { field: String, value: String },
 }

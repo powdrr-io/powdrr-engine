@@ -65,6 +65,7 @@ fn create_table_request(
     serving: Option<crate::data_contract::ServingTableConfig>,
     dynamodb: Option<crate::data_contract::DynamoDbTableConfig>,
     mongodb: Option<crate::data_contract::MongoDbTableConfig>,
+    redis: Option<crate::data_contract::RedisTableConfig>,
 ) -> CreateTable {
     serde_json::from_value(serde_json::json!({
         "name": name,
@@ -72,6 +73,7 @@ fn create_table_request(
         "serving": serving,
         "dynamodb": dynamodb,
         "mongodb": mongodb,
+        "redis": redis,
     }))
     .expect("table metadata request should deserialize")
 }
@@ -181,6 +183,7 @@ pub async fn create_index(table: &String, body: &String) -> Result<CreateIndexRe
             None,
             None,
             None,
+            None,
         ))
         .await
         .map_err(|e| IngestError::from_service_api_error(e))?;
@@ -244,6 +247,7 @@ where
             table_description.serving,
             table_description.dynamodb,
             table_description.mongodb,
+            table_description.redis,
         ))
         .await
         .map_err(IngestError::from_service_api_error)?;

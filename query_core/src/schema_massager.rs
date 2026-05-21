@@ -37,6 +37,31 @@ unsafe impl Send for SqlExpression {}
 unsafe impl Sync for SqlExpression {}
 
 impl SqlExpression {
+    fn is_delete_filter(&self) -> bool {
+        matches!(
+            self,
+            SqlExpression::IsNull(value)
+                if matches!(
+                    value.as_ref(),
+                    SqlExpression::FieldRef(table, field)
+                        if table == "dt" && field == "_id_seq_no"
+                )
+        )
+    }
+
+    fn without_delete_filter(&self) -> Option<Self> {
+        match self {
+            expression if expression.is_delete_filter() => None,
+            SqlExpression::And(exprs) => SqlExpression::and(
+                exprs
+                    .iter()
+                    .filter_map(|expr| expr.without_delete_filter())
+                    .collect(),
+            ),
+            _ => Some(self.clone()),
+        }
+    }
+
     fn lookup_field(schema: &HashMap<String, PowdrrField>, path: &String) -> Option<PowdrrField> {
         let split_path: Vec<&str> = path.split(".").collect();
         Self::lookup_field_worker(schema, &split_path, 0)
@@ -624,6 +649,25 @@ impl SqlBuilder {
 }
 
 impl SqlQuery {
+    pub fn without_deletes(&self) -> Self {
+        const DELETE_JOIN: &str =
+            "LEFT JOIN {deletes_table} dt ON dt._id_seq_no = t.\"_id_seq_no\"";
+
+        SqlQuery {
+            dummy: self.dummy,
+            all_fields: self.all_fields,
+            fields: self.fields.clone(),
+            joins: self.joins.replace(DELETE_JOIN, " ").trim().to_string(),
+            filters: self
+                .filters
+                .as_ref()
+                .and_then(|filter| filter.without_delete_filter()),
+            limit: self.limit,
+            order_by: self.order_by.clone(),
+            group_by: self.group_by.clone(),
+        }
+    }
+
     pub fn dummy() -> Self {
         SqlQuery {
             dummy: false,

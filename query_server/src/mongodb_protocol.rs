@@ -233,6 +233,9 @@ pub fn put_mongodb_config(mut state: State) -> Pin<Box<HandlerFuture>> {
             let dynamodb = existing
                 .as_ref()
                 .and_then(|description| description.dynamodb.clone());
+            let redis = existing
+                .as_ref()
+                .and_then(|description| description.redis.clone());
 
             let schema = load_table_schema(&path).await?;
             validate_mongodb_config(&schema, &body)?;
@@ -244,6 +247,7 @@ pub fn put_mongodb_config(mut state: State) -> Pin<Box<HandlerFuture>> {
                 "serving": serving,
                 "dynamodb": dynamodb,
                 "mongodb": body.clone(),
+                "redis": redis,
             }))
             .expect("mongodb config table metadata should deserialize");
 

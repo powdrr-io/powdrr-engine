@@ -30,6 +30,7 @@ fn create_table_request(
     serving: Option<crate::data_contract::ServingTableConfig>,
     dynamodb: Option<crate::data_contract::DynamoDbTableConfig>,
     mongodb: Option<crate::data_contract::MongoDbTableConfig>,
+    redis: Option<crate::data_contract::RedisTableConfig>,
 ) -> CreateTable {
     serde_json::from_value(serde_json::json!({
         "name": name,
@@ -37,6 +38,7 @@ fn create_table_request(
         "serving": serving,
         "dynamodb": dynamodb,
         "mongodb": mongodb,
+        "redis": redis,
     }))
     .expect("table metadata request should deserialize")
 }
@@ -47,6 +49,7 @@ fn table_description_from_parts(
     serving: Option<crate::data_contract::ServingTableConfig>,
     dynamodb: Option<crate::data_contract::DynamoDbTableConfig>,
     mongodb: Option<crate::data_contract::MongoDbTableConfig>,
+    redis: Option<crate::data_contract::RedisTableConfig>,
 ) -> TableDescription {
     serde_json::from_value(serde_json::json!({
         "name": name,
@@ -54,6 +57,7 @@ fn table_description_from_parts(
         "serving": serving,
         "dynamodb": dynamodb,
         "mongodb": mongodb,
+        "redis": redis,
     }))
     .expect("table description should deserialize")
 }
@@ -290,6 +294,7 @@ impl EphemeralServiceImpl {
                 table_description_from_parts(
                     metadata.table_name.clone(),
                     Default::default(),
+                    None,
                     None,
                     None,
                     None,
@@ -1374,7 +1379,7 @@ mod tests {
         service_impl
             .create_table(
                 &org_info,
-                &create_table_request(table_name.clone(), HashMap::new(), None, None, None),
+                &create_table_request(table_name.clone(), HashMap::new(), None, None, None, None),
             )
             .await
             .unwrap();
