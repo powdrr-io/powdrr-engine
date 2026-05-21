@@ -468,6 +468,41 @@ fn exact_pruning_extension_file<'a>(
         .find(|extension| extension.suffix == "exact_pruning")
 }
 
+#[cfg(test)]
+fn exact_pruning_summary_from_rows(rows: Vec<serde_json::Value>) -> ExactPruningSummary {
+    let mut summary = ExactPruningSummary::new();
+    for row in rows {
+        let Some(value_map) = row.as_object() else {
+            continue;
+        };
+        let Some(field_name) = value_map
+            .get("field_name")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let complete = value_map
+            .get("complete")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let entry = summary.entry(field_name).or_default();
+        if entry.values.is_empty() && !entry.complete {
+            entry.complete = complete;
+        } else {
+            entry.complete &= complete;
+        }
+        if let Some(field_value) = value_map
+            .get("field_value")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+        {
+            entry.values.insert(field_value);
+        }
+    }
+    summary
+}
+
 fn exact_pruning_summary_from_batches(batches: &[RecordBatch]) -> ExactPruningSummary {
     let mut summary = ExactPruningSummary::new();
     for batch in batches {
