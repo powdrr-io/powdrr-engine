@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use gotham::mime;
 use gotham::test::TestServer;
 use powdrr_query_server::router::router;
@@ -13,7 +13,7 @@ const CASES_JSON: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../testdata/es_compat_cases.json"
 ));
-const DEFAULT_CASE_IDS: &str = "logs_wildcard_query_string_returns_expected_hits,logs_wildcard_search_after_returns_expected_hits,logs_wildcard_date_histogram_with_bounds_returns_expected_buckets,logs_wildcard_terms_order_and_missing_return_expected_buckets,logs_wildcard_terms_subaggregation_returns_expected_buckets";
+const DEFAULT_CASE_IDS: &str = "get_existing_doc_returns_source,table_mget_returns_found_and_missing_docs,logs_wildcard_query_string_returns_expected_hits,logs_wildcard_search_after_returns_expected_hits,logs_wildcard_date_histogram_with_bounds_returns_expected_buckets,logs_wildcard_terms_order_and_missing_return_expected_buckets,logs_wildcard_terms_subaggregation_returns_expected_buckets";
 
 #[derive(Debug, Deserialize)]
 struct CaseFile {

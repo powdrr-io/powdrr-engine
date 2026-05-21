@@ -1,8 +1,17 @@
 use crate::data_access::load_file_as_table;
-use crate::data_contract::{ExtensionFileMetadata, ExtensionWorkItem, FileDescriptor};
+use crate::data_contract::{
+    ExtensionFileMetadata, ExtensionWorkItem, FileDescriptor, TableMetadataCheckpoint,
+    checkpoint_extension_metadata_key,
+};
 use crate::elastic_search_common::call_peers;
 use crate::elastic_table_validation::{ElasticTableValidationError, validate_elastic_table_files};
-use crate::peers::{PrivateExtensionInvocation, PrivateInvocation, PrivateInvocationResult};
+use crate::peers::{
+    CheckpointDescriptor, PrivateExtensionInvocation, PrivateInvocation, PrivateInvocationResult,
+};
+use crate::query_execution::{
+    QueryExecutionPlan, QueryInputFile, QuerySqlTemplate, QueryStorageKind,
+    execute_query_plan_batches,
+};
 use crate::runtime_bindings;
 use crate::schema_massager::PowdrrSchema;
 use crate::search_runtime::batches_to_serde_value;
@@ -12,12 +21,16 @@ use crate::{
     data_contract::{ExtensionCommit, ExtensionFile},
     util::add_file_suffix,
 };
+use datafusion::arrow::array::RecordBatch;
 use datafusion::error::DataFusionError;
 use datafusion::{arrow::datatypes::DataType, dataframe::DataFrameWriteOptions};
+use idgenerator::IdInstance;
 use std::error::Error;
 use std::fmt::Display;
 
 const EXACT_PRUNING_VALUE_LIMIT: usize = 64;
+const SNAPSHOT_EXACT_LOOKUP_SUFFIX: &str = "snapshot_exact_lookup";
+const SNAPSHOT_LOOKUP_SUFFIX: &str = "snapshot_lookup";
 
 #[derive(Debug)]
 pub struct IndexError {
@@ -623,6 +636,170 @@ pub(crate) async fn create_exact_pruning_index_parquet(
     }
 }
 
+fn checkpoint_query_inputs(files: Vec<FileDescriptor>) -> Vec<QueryInputFile> {
+    files.into_iter()
+        .map(|file| QueryInputFile {
+            file,
+            storage: QueryStorageKind::Iceberg,
+            extensions: vec![],
+        })
+        .collect()
+}
+
+fn snapshot_lookup_full_scan_sql(include_delete_filter: bool) -> String {
+    if include_delete_filter {
+        "SELECT t.* FROM {target_table} t LEFT JOIN {deletes_table} dt ON dt._id_seq_no = t.\"_id_seq_no\" WHERE dt._id_seq_no IS NULL".to_string()
+    } else {
+        "SELECT * FROM {target_table}".to_string()
+    }
+}
+
+async fn write_snapshot_lookup_parquet(
+    batches: &Vec<RecordBatch>,
+    target_file_path: &String,
+) -> Result<bool, IndexError> {
+    let row_count: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    if row_count == 0 {
+        return Ok(false);
+    }
+
+    let local_name = format!("snapshot_lookup_{}", IdInstance::next_id());
+    data_access::load_memtable_with_name(&local_name, batches)
+        .await
+        .map_err(IndexError::from)?;
+    let dataframe = execute_sql(&format!("SELECT * FROM {local_name}"))
+        .await
+        .map_err(IndexError::from)?;
+    let write_result = dataframe
+        .write_parquet(
+            target_file_path,
+            DataFrameWriteOptions::new().with_single_file_output(true),
+            None,
+        )
+        .await
+        .map_err(IndexError::from);
+    data_access::drop(&local_name).await;
+    write_result.map(|_| true)
+}
+
+async fn create_snapshot_lookup_artifact(
+    checkpoint: &TableMetadataCheckpoint,
+) -> Result<Option<String>, IndexError> {
+    let Some(iceberg_metadata) = checkpoint.iceberg_metadata.as_ref() else {
+        return Ok(None);
+    };
+    let files = iceberg_metadata.files.as_file_tuples();
+    if files.is_empty() {
+        return Ok(None);
+    }
+
+    let delete_files = checkpoint
+        .deletes_metadata
+        .as_ref()
+        .map(|metadata| metadata.files.clone())
+        .unwrap_or_default();
+    let target_file_path = add_file_suffix(
+        &files[0].file_path,
+        &format!("{SNAPSHOT_LOOKUP_SUFFIX}_{}", checkpoint.checkpoint_id),
+        Some(&".parquet".to_string()),
+    );
+    if file_exists(&target_file_path).await {
+        return Ok(Some(target_file_path));
+    }
+
+    let batches = execute_query_plan_batches(QueryExecutionPlan {
+        sql: QuerySqlTemplate::Built(snapshot_lookup_full_scan_sql(!delete_files.is_empty())),
+        files: checkpoint_query_inputs(files),
+        delete_files: delete_files.clone(),
+        use_deletes_table: !delete_files.is_empty(),
+        extension_suffixes: None,
+        use_cpu_threadpool: true,
+    })
+    .await
+    .map_err(IndexError::from)?;
+
+    if write_snapshot_lookup_parquet(&batches, &target_file_path).await? {
+        Ok(Some(target_file_path))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn create_snapshot_exact_lookup_artifact(
+    checkpoint: &TableMetadataCheckpoint,
+) -> Result<Option<String>, IndexError> {
+    let Some(iceberg_metadata) = checkpoint.iceberg_metadata.as_ref() else {
+        return Ok(None);
+    };
+    let schema_map = checkpoint.schema.to_map();
+    for required in ["_id", "_id_seq_no", "_seq_no", "_version", "_source"] {
+        if !schema_map.contains_key(required) {
+            return Ok(None);
+        }
+    }
+
+    let files = iceberg_metadata.files.as_file_tuples();
+    if files.is_empty() {
+        return Ok(None);
+    }
+
+    let delete_files = checkpoint
+        .deletes_metadata
+        .as_ref()
+        .map(|metadata| metadata.files.clone())
+        .unwrap_or_default();
+    let target_file_path = add_file_suffix(
+        &files[0].file_path,
+        &format!("{SNAPSHOT_EXACT_LOOKUP_SUFFIX}_{}", checkpoint.checkpoint_id),
+        Some(&".parquet".to_string()),
+    );
+    if file_exists(&target_file_path).await {
+        return Ok(Some(target_file_path));
+    }
+
+    let sql = if delete_files.is_empty() {
+        "SELECT t.\"_id\", t.\"_id_seq_no\", t.\"_seq_no\", t.\"_version\", t.\"_source\" FROM {target_table} t WHERE t.\"_id\" IS NOT NULL".to_string()
+    } else {
+        "SELECT t.\"_id\", t.\"_id_seq_no\", t.\"_seq_no\", t.\"_version\", t.\"_source\" FROM {target_table} t LEFT JOIN {deletes_table} dt ON dt._id_seq_no = t.\"_id_seq_no\" WHERE dt._id_seq_no IS NULL AND t.\"_id\" IS NOT NULL".to_string()
+    };
+
+    let batches = execute_query_plan_batches(QueryExecutionPlan {
+        sql: QuerySqlTemplate::Built(sql),
+        files: checkpoint_query_inputs(files),
+        delete_files: delete_files.clone(),
+        use_deletes_table: !delete_files.is_empty(),
+        extension_suffixes: None,
+        use_cpu_threadpool: true,
+    })
+    .await
+    .map_err(IndexError::from)?;
+
+    if write_snapshot_lookup_parquet(&batches, &target_file_path).await? {
+        Ok(Some(target_file_path))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn lookup_work_item_checkpoint(
+    work_item: &ExtensionWorkItem,
+) -> Result<Option<TableMetadataCheckpoint>, IndexError> {
+    let Some(checkpoint_id) = work_item.checkpoint_id.as_ref() else {
+        return Ok(None);
+    };
+    runtime_bindings::get_checkpoint(CheckpointDescriptor::new(
+        work_item.table_name.clone(),
+        checkpoint_id.clone(),
+    ))
+    .await
+    .map_err(|error| {
+        IndexError::new(format!(
+            "Unable to load checkpoint {} for {}: {}",
+            checkpoint_id, work_item.table_name, error
+        ))
+    })
+}
+
 pub(crate) async fn create_index(work_item: &ExtensionWorkItem) -> Result<(), IndexError> {
     let invocation = PrivateInvocation::Extension(PrivateExtensionInvocation {
         extension_name: work_item.extension_type.clone(),
@@ -655,6 +832,26 @@ pub(crate) async fn create_index(work_item: &ExtensionWorkItem) -> Result<(), In
     let mut final_result = ExtensionFileMetadata::new();
     for result in results {
         final_result.extend(result);
+    }
+    if let Some(checkpoint) = lookup_work_item_checkpoint(work_item).await? {
+        let checkpoint_extension_key = checkpoint_extension_metadata_key(&checkpoint.checkpoint_id);
+        let checkpoint_entry = final_result
+            .entry(checkpoint_extension_key)
+            .or_insert_with(Vec::new);
+        if let Some(snapshot_exact_lookup_path) =
+            create_snapshot_exact_lookup_artifact(&checkpoint).await?
+        {
+            checkpoint_entry.push(ExtensionFile {
+                suffix: SNAPSHOT_EXACT_LOOKUP_SUFFIX.to_string(),
+                location: snapshot_exact_lookup_path,
+            });
+        }
+        if let Some(snapshot_lookup_path) = create_snapshot_lookup_artifact(&checkpoint).await? {
+            checkpoint_entry.push(ExtensionFile {
+                suffix: SNAPSHOT_LOOKUP_SUFFIX.to_string(),
+                location: snapshot_lookup_path,
+            });
+        }
     }
 
     match runtime_bindings::extension_commit(

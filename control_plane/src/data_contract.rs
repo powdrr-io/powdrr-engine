@@ -237,6 +237,16 @@ pub struct ExtensionFile {
 
 pub type ExtensionFileMetadata = HashMap<String, Vec<ExtensionFile>>;
 
+pub const CHECKPOINT_EXTENSION_METADATA_PREFIX: &str = "__checkpoint__:";
+
+pub fn checkpoint_extension_metadata_key(checkpoint_id: &str) -> String {
+    format!("{CHECKPOINT_EXTENSION_METADATA_PREFIX}{checkpoint_id}")
+}
+
+pub fn is_checkpoint_extension_metadata_key(key: &str) -> bool {
+    key.starts_with(CHECKPOINT_EXTENSION_METADATA_PREFIX)
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ExtensionCommit {
     pub id: String,
@@ -303,6 +313,7 @@ impl TableMetadataCheckpoint {
     ) -> (Self, bool) {
         let mut new_table_metadata_checkpoint = self.clone();
         new_table_metadata_checkpoint.checkpoint_id = IdInstance::next_id().to_string();
+        new_table_metadata_checkpoint.retain_current_extension_metadata();
 
         let mut changed = false;
         for speedboat_commit in speedboat_commits {
@@ -523,8 +534,11 @@ impl TableMetadataCheckpoint {
 
     pub fn retain_current_extension_metadata(&mut self) {
         let current_file_paths = self.current_file_paths();
+        let checkpoint_key = checkpoint_extension_metadata_key(&self.checkpoint_id);
         for metadata in self.extension_metadata.values_mut() {
-            metadata.retain(|file_path, _| current_file_paths.contains(file_path));
+            metadata.retain(|file_path, _| {
+                current_file_paths.contains(file_path) || file_path == &checkpoint_key
+            });
         }
     }
 
@@ -621,6 +635,20 @@ impl TableMetadataCheckpoint {
             }
             None => {}
         };
+
+        let checkpoint_key = checkpoint_extension_metadata_key(&self.checkpoint_id);
+        if extension_commit.files.contains_key(&checkpoint_key)
+            && !existing_extension_metadata_map.contains_key(&checkpoint_key)
+        {
+            self.extension_metadata
+                .get_mut(&extension_commit.extension)
+                .unwrap()
+                .insert(
+                    checkpoint_key.clone(),
+                    extension_commit.files[&checkpoint_key].clone(),
+                );
+            changed = true;
+        }
 
         changed
     }
@@ -923,6 +951,8 @@ pub struct ExtensionWorkItem {
     pub id: String,
     pub extension_type: String,
     pub table_name: String,
+    #[serde(default)]
+    pub checkpoint_id: Option<String>,
     pub table_schema: PowdrrSchema,
     pub speedboat_files: FileSetPayload,
     pub iceberg_files: FileSetPayload,

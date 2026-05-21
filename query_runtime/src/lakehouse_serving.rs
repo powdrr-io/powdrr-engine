@@ -1,39 +1,44 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
+use datafusion::arrow::array::Array;
+use datafusion::arrow::record_batch::RecordBatch;
 use futures::stream::{self, StreamExt};
 use http::StatusCode;
 use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::data_access::{self, execute_sql_async};
 use crate::data_contract::{
-    ExtensionFile, FileDescriptor, IcebergAccessArtifact, IcebergFileStats, IcebergPartitionField,
-    IcebergRowGroupStats, IcebergSortField, ServingAggregateMeasure, ServingAggregateSpec,
-    ServingPattern, ServingTableConfig, TableDescription, TableMetadataCheckpoint,
+    checkpoint_extension_metadata_key, ExtensionFile, FileDescriptor, IcebergAccessArtifact,
+    IcebergFileStats, IcebergPartitionField, IcebergRowGroupStats, IcebergSortField,
+    ServingAggregateMeasure, ServingAggregateSpec, ServingPattern, ServingTableConfig,
+    TableDescription, TableMetadataCheckpoint,
 };
 use crate::peers::CheckpointDescriptor;
 use crate::prefetch::warm_iceberg_checkpoints;
 use crate::query_execution::{
-    QueryExecutionPlan, QueryInputFile, QuerySqlTemplate, QueryStorageKind,
-    execute_query_plan_batches, group_query_input_files_by_schema,
+    execute_query_plan_batches, group_query_input_files_by_schema, QueryExecutionPlan,
+    QueryInputFile, QuerySqlTemplate, QueryStorageKind,
 };
 use crate::query_path::{
-    QueryPredicate, column_is_all_null, compare_scalar_values, file_may_match_predicates,
-    group_files_by_schema, row_group_may_match_predicates,
+    column_is_all_null, compare_scalar_values, file_may_match_predicates, group_files_by_schema,
+    row_group_may_match_predicates, QueryPredicate,
 };
-use crate::read_plan::ReadPlan;
+use crate::read_plan::{ReadPlan, ReadPredicate};
 use crate::schema_massager::{PowdrrDataType, PowdrrSchema};
-use crate::search_runtime::batches_to_serde_value;
+use crate::search_runtime::{array_value_to_json, batches_to_serde_value};
 use crate::serving_plan::{ServingPredicate, ServingQueryClassification, ServingRequestPlan};
 use crate::state_provider::STATE_PROVIDER;
 
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 const MAX_IN_VALUES: usize = 32;
+const MAX_EXACT_LOOKUP_DOC_IDS: usize = 256;
+const MAX_SNAPSHOT_LOOKUP_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_WARMUP_FILE_GROUPS_PER_PATTERN: usize = 2;
 const MAX_WARMUP_FILES: usize = 8;
 const ACCESS_ARTIFACT_KIND_BLOOM_FILTER: &str = "bloom-filter";
@@ -44,7 +49,12 @@ const ACCESS_ARTIFACT_KIND_PAGE_INDEX: &str = "page-index";
 const ACCESS_ARTIFACT_KIND_PARTITION_SPEC: &str = "partition-spec";
 const ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS: &str = "row-group-stats";
 const ACCESS_ARTIFACT_KIND_SECONDARY_PATTERN: &str = "secondary-pattern";
+const ACCESS_ARTIFACT_KIND_SNAPSHOT_EXACT_LOOKUP: &str = "snapshot-exact-lookup";
+const ACCESS_ARTIFACT_KIND_SNAPSHOT_KEY_LOOKUP: &str = "snapshot-key-lookup";
+const ACCESS_ARTIFACT_KIND_SNAPSHOT_KEY_RANGE_LOOKUP: &str = "snapshot-key-range-lookup";
 const ACCESS_ARTIFACT_KIND_SORT_ORDER: &str = "sort-order";
+const SNAPSHOT_EXACT_LOOKUP_EXTENSION_SUFFIX: &str = "snapshot_exact_lookup";
+const SNAPSHOT_LOOKUP_EXTENSION_SUFFIX: &str = "snapshot_lookup";
 const DEFAULT_FAST_PATH_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_FAST_PATH_MAX_FILES: usize = 32;
 const DEFAULT_FAST_PATH_MAX_ROW_GROUPS: usize = 128;
@@ -55,6 +65,11 @@ const DEFAULT_SLOW_PATH_MAX_ROW_GROUPS: usize = 512;
 const DEFAULT_SLOW_PATH_MAX_DELETE_FILES: usize = 64;
 
 static EXACT_PRUNING_SUMMARY_CACHE: LazyLock<Mutex<HashMap<String, ExactPruningSummary>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static SNAPSHOT_EXACT_LOOKUP_CACHE: LazyLock<
+    Mutex<HashMap<String, Arc<HashMap<String, SnapshotExactLookupEntry>>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static SNAPSHOT_LOOKUP_CACHE: LazyLock<Mutex<HashMap<String, Arc<SnapshotLookupCache>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -277,6 +292,64 @@ struct ServingExecutionResult {
     files_selected: usize,
     estimated_bytes: u64,
     artifacts_used: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExactLookupPredicate {
+    field: String,
+    values: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct RangeLookupPredicate {
+    field: String,
+    gt: Option<Value>,
+    gte: Option<Value>,
+    lt: Option<Value>,
+    lte: Option<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum SnapshotLookupPlan {
+    Exact {
+        predicates: Vec<ExactLookupPredicate>,
+    },
+    KeyRange {
+        eq_field: String,
+        eq_value: String,
+        order_field: String,
+        descending: bool,
+        range: Option<RangeLookupPredicate>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct SnapshotRowRef {
+    batch_index: usize,
+    row_index: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SnapshotOrderedIndexKey {
+    eq_field: String,
+    order_field: String,
+}
+
+#[derive(Debug, Default)]
+struct SnapshotLookupCache {
+    batches: Vec<RecordBatch>,
+    exact_indexes: Mutex<HashMap<String, Arc<HashMap<String, Vec<SnapshotRowRef>>>>>,
+    ordered_indexes:
+        Mutex<HashMap<SnapshotOrderedIndexKey, Arc<HashMap<String, Vec<SnapshotRowRef>>>>>,
+}
+
+#[derive(Clone, Debug)]
+struct SnapshotExactLookupEntry {
+    id: String,
+    id_seq_no: Option<String>,
+    seq_no: i64,
+    version: i64,
+    source: Value,
 }
 
 #[derive(Clone, Debug)]
@@ -699,6 +772,15 @@ pub async fn execute_serving_query(
     }
 
     let mut execution = execute_plan(
+        &checkpoint_cache_key(&context.checkpoint),
+        snapshot_exact_lookup_artifact_location(
+            &context.checkpoint.checkpoint_id,
+            &context.extension_files,
+        ),
+        snapshot_lookup_artifact_location(
+            &context.checkpoint.checkpoint_id,
+            &context.extension_files,
+        ),
         &plan.selected_files,
         &context.speedboat_files,
         &context.delete_files,
@@ -973,6 +1055,9 @@ fn plan_request(
 }
 
 async fn execute_plan(
+    checkpoint_key: &str,
+    snapshot_exact_lookup_artifact: Option<String>,
+    snapshot_lookup_artifact: Option<String>,
     files: &[FileDescriptor],
     speedboat_files: &[FileDescriptor],
     delete_files: &[String],
@@ -985,6 +1070,34 @@ async fn execute_plan(
 ) -> Result<ServingExecutionResult, ServingQueryError> {
     if limit == 0 {
         return Ok(ServingExecutionResult::default());
+    }
+    if let Some(result) = maybe_execute_snapshot_lookup(
+        checkpoint_key,
+        snapshot_exact_lookup_artifact.as_deref(),
+        snapshot_lookup_artifact.as_deref(),
+        files,
+        speedboat_files,
+        delete_files,
+        request,
+        limit,
+    )
+    .await
+    .map_err(|message| ServingQueryError::new(StatusCode::UNPROCESSABLE_ENTITY, &message))?
+    {
+        return Ok(result);
+    }
+    if let Some(result) = maybe_execute_exact_lookup(
+        files,
+        speedboat_files,
+        delete_files,
+        extension_files,
+        request,
+        limit,
+    )
+    .await
+    .map_err(|message| ServingQueryError::new(StatusCode::UNPROCESSABLE_ENTITY, &message))?
+    {
+        return Ok(result);
     }
     let (files, mut execution_artifacts_used) =
         prune_execution_files_with_exact_artifact(files, extension_files, request).await?;
@@ -1042,6 +1155,1090 @@ async fn execute_plan(
         estimated_bytes: execution_estimated_bytes,
         artifacts_used: execution_artifacts_used,
     })
+}
+
+pub async fn execute_checkpoint_exact_lookup_rows(
+    checkpoint: &TableMetadataCheckpoint,
+    request: &ReadPlan,
+) -> Result<Option<Vec<Value>>, String> {
+    let files = checkpoint
+        .iceberg_metadata
+        .as_ref()
+        .map(|metadata| metadata.files.as_file_tuples())
+        .unwrap_or_default();
+    let speedboat_files = checkpoint
+        .speedboat_metadata
+        .as_ref()
+        .map(|metadata| metadata.files.as_file_tuples())
+        .unwrap_or_default();
+    let delete_files = checkpoint
+        .deletes_metadata
+        .as_ref()
+        .map(|metadata| metadata.files.clone())
+        .unwrap_or_default();
+    let extension_files = flatten_extension_files(checkpoint);
+    let checkpoint_key = checkpoint_cache_key(&checkpoint.get_descriptor());
+    let limit = request.normalized_limit(DEFAULT_LIMIT, MAX_LIMIT);
+    if let Some(result) = maybe_execute_snapshot_lookup(
+        &checkpoint_key,
+        snapshot_exact_lookup_artifact_location(&checkpoint.checkpoint_id, &extension_files)
+            .as_deref(),
+        snapshot_lookup_artifact_location(&checkpoint.checkpoint_id, &extension_files).as_deref(),
+        &files,
+        &speedboat_files,
+        &delete_files,
+        request,
+        limit,
+    )
+    .await?
+    {
+        return Ok(Some(result.rows));
+    }
+    if let Some(result) = maybe_execute_exact_lookup(
+        &files,
+        &speedboat_files,
+        &delete_files,
+        &extension_files,
+        request,
+        limit,
+    )
+    .await?
+    {
+        return Ok(Some(result.rows));
+    }
+
+    let sql = build_sql("{target_table}", request, limit, !delete_files.is_empty())
+        .map_err(|error| error.message)?;
+    let rows = if request.aggregate.is_some() {
+        execute_aggregate_plan(&files, &speedboat_files, &delete_files, request, limit)
+            .await
+            .map_err(|error| error.message)?
+    } else {
+        execute_parallel_plan(
+            &files,
+            &speedboat_files,
+            &delete_files,
+            request,
+            &sql,
+            limit,
+        )
+        .await
+        .map_err(|error| error.message)?
+    };
+    Ok(Some(rows))
+}
+
+pub async fn execute_checkpoint_exact_id_lookup_rows(
+    checkpoint: &TableMetadataCheckpoint,
+    doc_ids: &[String],
+) -> Result<Option<Vec<Value>>, String> {
+    if doc_ids.is_empty() {
+        return Ok(Some(vec![]));
+    }
+
+    let request = ReadPlan {
+        select: None,
+        filters: vec![ReadPredicate {
+            field: "_id".to_string(),
+            eq: None,
+            in_values: Some(doc_ids.iter().cloned().map(Value::String).collect()),
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
+        }],
+        aggregate: None,
+        order_by: vec![],
+        limit: Some(doc_ids.len()),
+        offset: 0,
+        search_after: None,
+        allow_slow_path: true,
+        explain: false,
+    };
+    execute_checkpoint_exact_lookup_rows(checkpoint, &request).await
+}
+
+fn checkpoint_cache_key(checkpoint: &CheckpointDescriptor) -> String {
+    format!("{}:{}", checkpoint.table_name, checkpoint.checkpoint_id)
+}
+
+fn snapshot_lookup_artifact_location(
+    checkpoint_id: &str,
+    extension_files: &HashMap<String, Vec<ExtensionFile>>,
+) -> Option<String> {
+    let checkpoint_key = checkpoint_extension_metadata_key(checkpoint_id);
+    extension_files
+        .get(&checkpoint_key)
+        .and_then(|extension_files| {
+            extension_files
+                .iter()
+                .find(|extension| extension.suffix == SNAPSHOT_LOOKUP_EXTENSION_SUFFIX)
+        })
+        .map(|extension| extension.location.clone())
+}
+
+fn snapshot_exact_lookup_artifact_location(
+    checkpoint_id: &str,
+    extension_files: &HashMap<String, Vec<ExtensionFile>>,
+) -> Option<String> {
+    let checkpoint_key = checkpoint_extension_metadata_key(checkpoint_id);
+    extension_files
+        .get(&checkpoint_key)
+        .and_then(|extension_files| {
+            extension_files
+                .iter()
+                .find(|extension| extension.suffix == SNAPSHOT_EXACT_LOOKUP_EXTENSION_SUFFIX)
+        })
+        .map(|extension| extension.location.clone())
+}
+
+async fn maybe_execute_snapshot_lookup(
+    checkpoint_key: &str,
+    snapshot_exact_lookup_artifact: Option<&str>,
+    snapshot_lookup_artifact: Option<&str>,
+    files: &[FileDescriptor],
+    speedboat_files: &[FileDescriptor],
+    delete_files: &[String],
+    request: &ReadPlan,
+    limit: usize,
+) -> Result<Option<ServingExecutionResult>, String> {
+    if files.is_empty() || !speedboat_files.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(rows) = maybe_execute_snapshot_exact_lookup_artifact(
+        checkpoint_key,
+        snapshot_exact_lookup_artifact,
+        request,
+        limit,
+    )
+    .await?
+    {
+        return Ok(Some(ServingExecutionResult {
+            rows,
+            files_selected: 0,
+            estimated_bytes: 0,
+            artifacts_used: vec![ACCESS_ARTIFACT_KIND_SNAPSHOT_EXACT_LOOKUP.to_string()],
+        }));
+    }
+
+    let Some(plan) = snapshot_lookup_plan(request) else {
+        return Ok(None);
+    };
+
+    let total_bytes = files.iter().map(|file| file.size).sum::<u64>();
+    if snapshot_lookup_artifact.is_none() && total_bytes > MAX_SNAPSHOT_LOOKUP_CACHE_BYTES {
+        return Ok(None);
+    }
+
+    let cache = get_or_build_snapshot_lookup_cache(
+        checkpoint_key,
+        snapshot_lookup_artifact,
+        files,
+        delete_files,
+    )
+    .await?;
+    let (rows, artifact_used) = match plan {
+        SnapshotLookupPlan::Exact { predicates } => (
+            execute_snapshot_exact_lookup(&cache, &predicates, limit)?,
+            ACCESS_ARTIFACT_KIND_SNAPSHOT_KEY_LOOKUP.to_string(),
+        ),
+        SnapshotLookupPlan::KeyRange {
+            eq_field,
+            eq_value,
+            order_field,
+            descending,
+            range,
+        } => (
+            execute_snapshot_key_range_lookup(
+                &cache,
+                &eq_field,
+                &eq_value,
+                &order_field,
+                descending,
+                range.as_ref(),
+                limit,
+            )?,
+            ACCESS_ARTIFACT_KIND_SNAPSHOT_KEY_RANGE_LOOKUP.to_string(),
+        ),
+    };
+    let rows = project_rows_for_select(rows, request);
+
+    Ok(Some(ServingExecutionResult {
+        rows,
+        files_selected: 0,
+        estimated_bytes: 0,
+        artifacts_used: vec![artifact_used],
+    }))
+}
+
+fn exact_id_lookup_values(request: &ReadPlan) -> Option<Vec<String>> {
+    let predicates = exact_lookup_predicates(request)?;
+    if predicates.len() != 1 || predicates[0].field != "_id" {
+        return None;
+    }
+    Some(predicates[0].values.clone())
+}
+
+async fn maybe_execute_snapshot_exact_lookup_artifact(
+    checkpoint_key: &str,
+    snapshot_exact_lookup_artifact: Option<&str>,
+    request: &ReadPlan,
+    limit: usize,
+) -> Result<Option<Vec<Value>>, String> {
+    let Some(snapshot_exact_lookup_artifact) = snapshot_exact_lookup_artifact else {
+        return Ok(None);
+    };
+    let Some(doc_ids) = exact_id_lookup_values(request) else {
+        return Ok(None);
+    };
+    if doc_ids.is_empty() {
+        return Ok(Some(vec![]));
+    }
+    let cache =
+        get_or_build_snapshot_exact_lookup_cache(checkpoint_key, snapshot_exact_lookup_artifact)
+            .await?;
+    let mut rows = Vec::with_capacity(limit.min(doc_ids.len()));
+    for doc_id in doc_ids {
+        if let Some(entry) = cache.get(&doc_id) {
+            rows.push(project_row_for_select(
+                snapshot_exact_lookup_entry_to_value(entry),
+                request,
+            ));
+        }
+        if rows.len() >= limit {
+            break;
+        }
+    }
+    Ok(Some(rows))
+}
+
+async fn get_or_build_snapshot_exact_lookup_cache(
+    checkpoint_key: &str,
+    snapshot_exact_lookup_artifact: &str,
+) -> Result<Arc<HashMap<String, SnapshotExactLookupEntry>>, String> {
+    if let Some(cache) = SNAPSHOT_EXACT_LOOKUP_CACHE
+        .lock()
+        .unwrap()
+        .get(checkpoint_key)
+        .cloned()
+    {
+        return Ok(cache);
+    }
+
+    let built = Arc::new(build_snapshot_exact_lookup_cache(snapshot_exact_lookup_artifact).await?);
+    let mut caches = SNAPSHOT_EXACT_LOOKUP_CACHE.lock().unwrap();
+    Ok(caches
+        .entry(checkpoint_key.to_string())
+        .or_insert_with(|| built.clone())
+        .clone())
+}
+
+async fn build_snapshot_exact_lookup_cache(
+    snapshot_exact_lookup_artifact: &str,
+) -> Result<HashMap<String, SnapshotExactLookupEntry>, String> {
+    let batches = load_snapshot_lookup_artifact_batches(snapshot_exact_lookup_artifact).await?;
+    let mut best_by_id = HashMap::new();
+    for batch in batches.iter() {
+        for row_index in 0..batch.num_rows() {
+            let Some(candidate) = snapshot_exact_lookup_entry_from_batch(batch, row_index)? else {
+                continue;
+            };
+            if let Some(existing) = best_by_id.get(&candidate.id) {
+                if !exact_lookup_entry_is_better(&candidate, existing) {
+                    continue;
+                }
+            }
+            best_by_id.insert(candidate.id.clone(), candidate);
+        }
+    }
+    Ok(best_by_id)
+}
+
+fn snapshot_exact_lookup_entry_from_batch(
+    batch: &RecordBatch,
+    row_index: usize,
+) -> Result<Option<SnapshotExactLookupEntry>, String> {
+    let field_index = |field_name: &str| {
+        batch
+            .schema()
+            .index_of(field_name)
+            .map_err(|error| error.to_string())
+    };
+
+    let id_index = match field_index("_id") {
+        Ok(index) => index,
+        Err(_) => return Ok(None),
+    };
+    let id_array = batch.column(id_index);
+    if id_array.is_null(row_index) {
+        return Ok(None);
+    }
+    let id_value =
+        array_value_to_json(id_array.as_ref(), row_index).map_err(|error| error.message.clone())?;
+    let Some(id) = normalize_exact_lookup_value(&id_value) else {
+        return Ok(None);
+    };
+
+    let id_seq_no = match field_index("_id_seq_no") {
+        Ok(index) => {
+            let array = batch.column(index);
+            if array.is_null(row_index) {
+                None
+            } else {
+                let value = array_value_to_json(array.as_ref(), row_index)
+                    .map_err(|error| error.message.clone())?;
+                normalize_exact_lookup_value(&value)
+            }
+        }
+        Err(_) => None,
+    };
+
+    let seq_no = read_batch_i64_field(batch, "_seq_no", row_index)?;
+    let version = read_batch_i64_field(batch, "_version", row_index)?;
+    let source = read_snapshot_exact_lookup_source(batch, row_index)?;
+
+    Ok(Some(SnapshotExactLookupEntry {
+        id,
+        id_seq_no,
+        seq_no,
+        version,
+        source,
+    }))
+}
+
+fn read_batch_i64_field(
+    batch: &RecordBatch,
+    field_name: &str,
+    row_index: usize,
+) -> Result<i64, String> {
+    let field_index = batch
+        .schema()
+        .index_of(field_name)
+        .map_err(|error| error.to_string())?;
+    let array = batch.column(field_index);
+    if array.is_null(row_index) {
+        return Ok(0);
+    }
+    let value =
+        array_value_to_json(array.as_ref(), row_index).map_err(|error| error.message.clone())?;
+    Ok(value
+        .as_i64()
+        .or_else(|| value.as_u64().map(|value| value as i64))
+        .unwrap_or_default())
+}
+
+fn read_snapshot_exact_lookup_source(
+    batch: &RecordBatch,
+    row_index: usize,
+) -> Result<Value, String> {
+    let field_index = batch
+        .schema()
+        .index_of("_source")
+        .map_err(|error| error.to_string())?;
+    let array = batch.column(field_index);
+    if array.is_null(row_index) {
+        return Ok(Value::Null);
+    }
+    let value =
+        array_value_to_json(array.as_ref(), row_index).map_err(|error| error.message.clone())?;
+    Ok(match value {
+        Value::String(text) => serde_json::from_str(&text).unwrap_or(Value::String(text)),
+        other => other,
+    })
+}
+
+fn exact_lookup_entry_is_better(
+    candidate: &SnapshotExactLookupEntry,
+    existing: &SnapshotExactLookupEntry,
+) -> bool {
+    if candidate.seq_no != existing.seq_no {
+        return candidate.seq_no > existing.seq_no;
+    }
+    candidate.version > existing.version
+}
+
+fn snapshot_exact_lookup_entry_to_value(entry: &SnapshotExactLookupEntry) -> Value {
+    let mut row = Map::new();
+    row.insert("_id".to_string(), Value::String(entry.id.clone()));
+    if let Some(id_seq_no) = entry.id_seq_no.as_ref() {
+        row.insert("_id_seq_no".to_string(), Value::String(id_seq_no.clone()));
+    } else {
+        row.insert("_id_seq_no".to_string(), Value::Null);
+    }
+    row.insert("_seq_no".to_string(), Value::from(entry.seq_no));
+    row.insert("_version".to_string(), Value::from(entry.version));
+    row.insert("_source".to_string(), entry.source.clone());
+    Value::Object(row)
+}
+
+fn project_rows_for_select(rows: Vec<Value>, request: &ReadPlan) -> Vec<Value> {
+    if request.select.is_none() {
+        return rows;
+    }
+    rows.into_iter()
+        .map(|row| project_row_for_select(row, request))
+        .collect()
+}
+
+fn project_row_for_select(row: Value, request: &ReadPlan) -> Value {
+    let Some(select_fields) = normalized_select(request.select.clone()) else {
+        return row;
+    };
+    let Some(row_map) = row.as_object() else {
+        return row;
+    };
+    let source_map = row_map.get("_source").and_then(Value::as_object);
+    let mut projected = Map::with_capacity(select_fields.len());
+    for field in select_fields {
+        if let Some(value) = row_map.get(&field) {
+            projected.insert(field, value.clone());
+        } else if let Some(value) = source_map.and_then(|source| source.get(&field)) {
+            projected.insert(field, value.clone());
+        }
+    }
+    Value::Object(projected)
+}
+
+fn snapshot_lookup_plan(request: &ReadPlan) -> Option<SnapshotLookupPlan> {
+    if let Some(predicates) = exact_lookup_predicates(request) {
+        return Some(SnapshotLookupPlan::Exact { predicates });
+    }
+
+    if request.aggregate.is_some()
+        || request.offset > 0
+        || request.search_after.is_some()
+        || request.filters.is_empty()
+        || request.order_by.len() > 1
+    {
+        return None;
+    }
+
+    let mut eq_field: Option<String> = None;
+    let mut eq_value: Option<String> = None;
+    let mut range: Option<RangeLookupPredicate> = None;
+
+    for filter in request.filters.iter() {
+        let has_eq = filter.eq.is_some() || filter.in_values.is_some();
+        let has_range = filter.gt.is_some()
+            || filter.gte.is_some()
+            || filter.lt.is_some()
+            || filter.lte.is_some();
+        match (has_eq, has_range) {
+            (true, false) => {
+                if eq_field.is_some() {
+                    return None;
+                }
+                let value = if let Some(value) = filter.eq.as_ref() {
+                    normalize_exact_lookup_value(value)?
+                } else if let Some(values) = filter.in_values.as_ref() {
+                    if values.len() != 1 {
+                        return None;
+                    }
+                    normalize_exact_lookup_value(values.first()?)?
+                } else {
+                    return None;
+                };
+                eq_field = Some(filter.field.clone());
+                eq_value = Some(value);
+            }
+            (false, true) => {
+                if range.is_some() {
+                    return None;
+                }
+                range = Some(RangeLookupPredicate {
+                    field: filter.field.clone(),
+                    gt: filter.gt.clone(),
+                    gte: filter.gte.clone(),
+                    lt: filter.lt.clone(),
+                    lte: filter.lte.clone(),
+                });
+            }
+            _ => return None,
+        }
+    }
+
+    let eq_field = eq_field?;
+    let eq_value = eq_value?;
+    let order_field = if let Some(sort) = request.order_by.first() {
+        if let Some(range_filter) = range.as_ref() {
+            if range_filter.field != sort.field {
+                return None;
+            }
+        } else if sort.field == eq_field {
+            return None;
+        }
+        sort.field.clone()
+    } else {
+        range.as_ref()?.field.clone()
+    };
+
+    Some(SnapshotLookupPlan::KeyRange {
+        eq_field,
+        eq_value,
+        order_field,
+        descending: request
+            .order_by
+            .first()
+            .map(|sort| sort.descending)
+            .unwrap_or(false),
+        range,
+    })
+}
+
+async fn get_or_build_snapshot_lookup_cache(
+    checkpoint_key: &str,
+    snapshot_lookup_artifact: Option<&str>,
+    files: &[FileDescriptor],
+    delete_files: &[String],
+) -> Result<Arc<SnapshotLookupCache>, String> {
+    if let Some(cache) = SNAPSHOT_LOOKUP_CACHE
+        .lock()
+        .unwrap()
+        .get(checkpoint_key)
+        .cloned()
+    {
+        return Ok(cache);
+    }
+
+    let built =
+        Arc::new(build_snapshot_lookup_cache(snapshot_lookup_artifact, files, delete_files).await?);
+    let mut caches = SNAPSHOT_LOOKUP_CACHE.lock().unwrap();
+    Ok(caches
+        .entry(checkpoint_key.to_string())
+        .or_insert_with(|| built.clone())
+        .clone())
+}
+
+async fn build_snapshot_lookup_cache(
+    snapshot_lookup_artifact: Option<&str>,
+    files: &[FileDescriptor],
+    delete_files: &[String],
+) -> Result<SnapshotLookupCache, String> {
+    let batches = if let Some(snapshot_lookup_artifact) = snapshot_lookup_artifact {
+        load_snapshot_lookup_artifact_batches(snapshot_lookup_artifact).await?
+    } else {
+        let sql = snapshot_lookup_full_scan_sql(!delete_files.is_empty());
+        execute_query_plan_batches(QueryExecutionPlan {
+            sql: QuerySqlTemplate::Built(sql),
+            files: iceberg_query_inputs(files.to_vec()),
+            delete_files: delete_files.to_vec(),
+            use_deletes_table: !delete_files.is_empty(),
+            extension_suffixes: None,
+            use_cpu_threadpool: true,
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    };
+    Ok(SnapshotLookupCache {
+        batches,
+        exact_indexes: Mutex::new(HashMap::new()),
+        ordered_indexes: Mutex::new(HashMap::new()),
+    })
+}
+
+async fn load_snapshot_lookup_artifact_batches(
+    snapshot_lookup_artifact: &str,
+) -> Result<Vec<RecordBatch>, String> {
+    let local_name = format!("serving_snapshot_lookup_{}", IdInstance::next_id());
+    let snapshot_lookup_artifact = snapshot_lookup_artifact.to_string();
+    data_access::reserve(&local_name, 1, vec![]).await;
+    let result = async {
+        data_access::load_file_as_table(&local_name, &snapshot_lookup_artifact, true, None)
+            .await
+            .map_err(|error| error.to_string())?;
+        execute_sql_async(&format!("SELECT * FROM {local_name}"))
+            .await
+            .map_err(|error| error.to_string())
+    }
+    .await;
+    data_access::release(&local_name).await;
+    result
+}
+
+fn snapshot_lookup_full_scan_sql(include_delete_filter: bool) -> String {
+    if include_delete_filter {
+        "SELECT t.* FROM {target_table} t LEFT JOIN {deletes_table} dt ON dt._id_seq_no = t.\"_id_seq_no\" WHERE dt._id_seq_no IS NULL".to_string()
+    } else {
+        "SELECT * FROM {target_table}".to_string()
+    }
+}
+
+fn execute_snapshot_exact_lookup(
+    cache: &SnapshotLookupCache,
+    predicates: &[ExactLookupPredicate],
+    limit: usize,
+) -> Result<Vec<Value>, String> {
+    let mut matching_rows: Option<HashSet<SnapshotRowRef>> = None;
+    for predicate in predicates.iter() {
+        let index = exact_field_lookup_index(cache, &predicate.field)?;
+        let mut predicate_rows = HashSet::new();
+        for value in predicate.values.iter() {
+            if let Some(row_refs) = index.get(value) {
+                predicate_rows.extend(row_refs.iter().copied());
+            }
+        }
+        matching_rows = Some(match matching_rows {
+            Some(existing) => existing
+                .intersection(&predicate_rows)
+                .copied()
+                .collect::<HashSet<_>>(),
+            None => predicate_rows,
+        });
+        if matching_rows.as_ref().is_some_and(|rows| rows.is_empty()) {
+            return Ok(vec![]);
+        }
+    }
+
+    let mut row_refs = matching_rows
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<Vec<_>>();
+    row_refs.sort();
+    row_refs
+        .into_iter()
+        .take(limit)
+        .map(|row_ref| snapshot_row_to_value(cache, row_ref))
+        .collect()
+}
+
+fn execute_snapshot_key_range_lookup(
+    cache: &SnapshotLookupCache,
+    eq_field: &str,
+    eq_value: &str,
+    order_field: &str,
+    descending: bool,
+    range: Option<&RangeLookupPredicate>,
+    limit: usize,
+) -> Result<Vec<Value>, String> {
+    let ordered_index = ordered_partition_lookup_index(cache, eq_field, order_field)?;
+    let Some(partition_rows) = ordered_index.get(eq_value) else {
+        return Ok(vec![]);
+    };
+
+    let mut rows = Vec::with_capacity(limit.min(partition_rows.len()));
+    let row_iter: Box<dyn Iterator<Item = &SnapshotRowRef>> = if descending {
+        Box::new(partition_rows.iter().rev())
+    } else {
+        Box::new(partition_rows.iter())
+    };
+    for row_ref in row_iter {
+        if let Some(range_filter) = range {
+            if !snapshot_row_matches_range(cache, *row_ref, range_filter)? {
+                continue;
+            }
+        }
+        rows.push(snapshot_row_to_value(cache, *row_ref)?);
+        if rows.len() >= limit {
+            break;
+        }
+    }
+    Ok(rows)
+}
+
+fn exact_field_lookup_index(
+    cache: &SnapshotLookupCache,
+    field: &str,
+) -> Result<Arc<HashMap<String, Vec<SnapshotRowRef>>>, String> {
+    if let Some(index) = cache.exact_indexes.lock().unwrap().get(field).cloned() {
+        return Ok(index);
+    }
+
+    let mut index: HashMap<String, Vec<SnapshotRowRef>> = HashMap::new();
+    for (batch_index, batch) in cache.batches.iter().enumerate() {
+        let Ok(column_index) = batch.schema().index_of(field) else {
+            continue;
+        };
+        let column = batch.column(column_index);
+        for row_index in 0..batch.num_rows() {
+            if column.is_null(row_index) {
+                continue;
+            }
+            let value = array_value_to_json(column.as_ref(), row_index)
+                .map_err(|error| error.message.clone())?;
+            let Some(normalized) = normalize_exact_lookup_value(&value) else {
+                continue;
+            };
+            index.entry(normalized).or_default().push(SnapshotRowRef {
+                batch_index,
+                row_index,
+            });
+        }
+    }
+
+    let index = Arc::new(index);
+    let mut indexes = cache.exact_indexes.lock().unwrap();
+    Ok(indexes
+        .entry(field.to_string())
+        .or_insert_with(|| index.clone())
+        .clone())
+}
+
+fn ordered_partition_lookup_index(
+    cache: &SnapshotLookupCache,
+    eq_field: &str,
+    order_field: &str,
+) -> Result<Arc<HashMap<String, Vec<SnapshotRowRef>>>, String> {
+    let key = SnapshotOrderedIndexKey {
+        eq_field: eq_field.to_string(),
+        order_field: order_field.to_string(),
+    };
+    if let Some(index) = cache.ordered_indexes.lock().unwrap().get(&key).cloned() {
+        return Ok(index);
+    }
+
+    let exact_index = exact_field_lookup_index(cache, eq_field)?;
+    let mut ordered_index = HashMap::new();
+    for (eq_value, row_refs) in exact_index.iter() {
+        let mut ordered_refs = row_refs.clone();
+        ordered_refs.sort_by(|left, right| {
+            compare_row_values(
+                snapshot_row_field_value(cache, *left, order_field)
+                    .ok()
+                    .flatten()
+                    .as_ref(),
+                snapshot_row_field_value(cache, *right, order_field)
+                    .ok()
+                    .flatten()
+                    .as_ref(),
+                false,
+            )
+        });
+        ordered_index.insert(eq_value.clone(), ordered_refs);
+    }
+
+    let ordered_index = Arc::new(ordered_index);
+    let mut indexes = cache.ordered_indexes.lock().unwrap();
+    Ok(indexes
+        .entry(key)
+        .or_insert_with(|| ordered_index.clone())
+        .clone())
+}
+
+fn snapshot_row_matches_range(
+    cache: &SnapshotLookupCache,
+    row_ref: SnapshotRowRef,
+    range: &RangeLookupPredicate,
+) -> Result<bool, String> {
+    let Some(value) = snapshot_row_field_value(cache, row_ref, &range.field)? else {
+        return Ok(false);
+    };
+    if value.is_null() {
+        return Ok(false);
+    }
+    if let Some(bound) = range.gt.as_ref() {
+        if compare_values(&value, bound) != Ordering::Greater {
+            return Ok(false);
+        }
+    }
+    if let Some(bound) = range.gte.as_ref() {
+        if compare_values(&value, bound) == Ordering::Less {
+            return Ok(false);
+        }
+    }
+    if let Some(bound) = range.lt.as_ref() {
+        if compare_values(&value, bound) != Ordering::Less {
+            return Ok(false);
+        }
+    }
+    if let Some(bound) = range.lte.as_ref() {
+        if compare_values(&value, bound) == Ordering::Greater {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn snapshot_row_field_value(
+    cache: &SnapshotLookupCache,
+    row_ref: SnapshotRowRef,
+    field: &str,
+) -> Result<Option<Value>, String> {
+    let Some(batch) = cache.batches.get(row_ref.batch_index) else {
+        return Ok(None);
+    };
+    let Ok(column_index) = batch.schema().index_of(field) else {
+        return Ok(None);
+    };
+    let column = batch.column(column_index);
+    let value = array_value_to_json(column.as_ref(), row_ref.row_index)
+        .map_err(|error| error.message.clone())?;
+    Ok(Some(value))
+}
+
+fn snapshot_row_to_value(
+    cache: &SnapshotLookupCache,
+    row_ref: SnapshotRowRef,
+) -> Result<Value, String> {
+    let Some(batch) = cache.batches.get(row_ref.batch_index) else {
+        return Err("Snapshot lookup cache row batch is missing".to_string());
+    };
+    let mut object = serde_json::Map::with_capacity(batch.num_columns());
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        object.insert(
+            field.name().clone(),
+            array_value_to_json(column.as_ref(), row_ref.row_index)
+                .map_err(|error| error.message.clone())?,
+        );
+    }
+    Ok(Value::Object(object))
+}
+
+async fn maybe_execute_exact_lookup(
+    files: &[FileDescriptor],
+    speedboat_files: &[FileDescriptor],
+    delete_files: &[String],
+    extension_files: &HashMap<String, Vec<ExtensionFile>>,
+    request: &ReadPlan,
+    limit: usize,
+) -> Result<Option<ServingExecutionResult>, String> {
+    let Some(predicates) = exact_lookup_predicates(request) else {
+        return Ok(None);
+    };
+    if !files.iter().chain(speedboat_files.iter()).all(|file| {
+        extension_files
+            .get(&file.file_path)
+            .is_some_and(|extensions| exact_index_extension_file(extensions).is_some())
+    }) {
+        return Ok(None);
+    }
+
+    let mut rows = vec![];
+    let mut files_selected = 0usize;
+    let mut estimated_bytes = 0u64;
+
+    for (file, storage) in files
+        .iter()
+        .cloned()
+        .map(|file| (file, QueryStorageKind::Iceberg))
+        .chain(
+            speedboat_files
+                .iter()
+                .cloned()
+                .map(|file| (file, QueryStorageKind::Speedboat)),
+        )
+    {
+        let Some(extensions) = extension_files.get(&file.file_path) else {
+            return Ok(None);
+        };
+        let Some(exact_index) = exact_index_extension_file(extensions) else {
+            return Ok(None);
+        };
+        let doc_ids = load_exact_lookup_doc_ids(&exact_index.location, &predicates).await?;
+        if doc_ids.len() > MAX_EXACT_LOOKUP_DOC_IDS {
+            return Ok(None);
+        }
+        if doc_ids.is_empty() {
+            continue;
+        }
+
+        let new_rows =
+            execute_exact_lookup_file(&file, storage, delete_files, request, limit, &doc_ids)
+                .await?;
+        files_selected += 1;
+        estimated_bytes += file.size;
+        merge_rows(&mut rows, new_rows, request, limit);
+    }
+
+    Ok(Some(ServingExecutionResult {
+        rows,
+        files_selected,
+        estimated_bytes,
+        artifacts_used: vec![ACCESS_ARTIFACT_KIND_EXACT_INDEX.to_string()],
+    }))
+}
+
+async fn execute_exact_lookup_file(
+    file: &FileDescriptor,
+    storage: QueryStorageKind,
+    delete_files: &[String],
+    request: &ReadPlan,
+    limit: usize,
+    doc_ids: &[String],
+) -> Result<Vec<Value>, String> {
+    let mut lookup_request = request.clone();
+    lookup_request.filters.push(ReadPredicate {
+        field: "_id_seq_no".to_string(),
+        eq: None,
+        in_values: Some(
+            doc_ids
+                .iter()
+                .cloned()
+                .map(Value::String)
+                .collect::<Vec<_>>(),
+        ),
+        gt: None,
+        gte: None,
+        lt: None,
+        lte: None,
+    });
+    let sql = build_sql(
+        "{target_table}",
+        &lookup_request,
+        limit,
+        !delete_files.is_empty(),
+    )
+    .map_err(|error| error.message)?;
+    let batches = execute_query_plan_batches(QueryExecutionPlan {
+        sql: QuerySqlTemplate::Built(sql),
+        files: vec![QueryInputFile {
+            file: file.clone(),
+            storage,
+            extensions: vec![],
+        }],
+        delete_files: delete_files.to_vec(),
+        use_deletes_table: !delete_files.is_empty(),
+        extension_suffixes: None,
+        use_cpu_threadpool: true,
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    let serde_result = batches_to_serde_value(&batches)
+        .await
+        .map_err(|error| error.message)?;
+    Ok(serde_result.values)
+}
+
+fn exact_lookup_predicates(request: &ReadPlan) -> Option<Vec<ExactLookupPredicate>> {
+    if request.aggregate.is_some()
+        || !request.order_by.is_empty()
+        || request.offset > 0
+        || request.search_after.is_some()
+    {
+        return None;
+    }
+
+    let mut predicates = vec![];
+    for filter in request.filters.iter() {
+        if filter.gt.is_some()
+            || filter.gte.is_some()
+            || filter.lt.is_some()
+            || filter.lte.is_some()
+        {
+            return None;
+        }
+
+        let values = if let Some(value) = filter.eq.as_ref() {
+            vec![normalize_exact_lookup_value(value)?]
+        } else if let Some(values) = filter.in_values.as_ref() {
+            if values.is_empty() || values.len() > MAX_IN_VALUES {
+                return None;
+            }
+            let mut normalized = values
+                .iter()
+                .map(normalize_exact_lookup_value)
+                .collect::<Option<Vec<_>>>()?;
+            normalized.sort();
+            normalized.dedup();
+            normalized
+        } else {
+            return None;
+        };
+
+        if values.is_empty() {
+            return None;
+        }
+
+        predicates.push(ExactLookupPredicate {
+            field: filter.field.clone(),
+            values,
+        });
+    }
+
+    if predicates.is_empty() {
+        None
+    } else {
+        Some(predicates)
+    }
+}
+
+fn normalize_exact_lookup_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(boolean) => Some(boolean.to_string()),
+        _ => None,
+    }
+}
+
+fn exact_index_extension_file(extension_files: &[ExtensionFile]) -> Option<&ExtensionFile> {
+    extension_files
+        .iter()
+        .find(|extension| extension.suffix == "exact_index")
+}
+
+async fn load_exact_lookup_doc_ids(
+    extension_file_path: &str,
+    predicates: &[ExactLookupPredicate],
+) -> Result<Vec<String>, String> {
+    let local_name = format!("serving_exact_lookup_{}", IdInstance::next_id());
+    let extension_file_path = extension_file_path.to_string();
+    data_access::reserve(&local_name, 1, vec![]).await;
+    let result = async {
+        data_access::load_file_as_table(&local_name, &extension_file_path, true, None)
+            .await
+            .map_err(|error| error.to_string())?;
+        let predicate_sql = predicates
+            .iter()
+            .map(|predicate| {
+                let escaped_field = sql_escape_text(&predicate.field);
+                let values_sql = predicate
+                    .values
+                    .iter()
+                    .map(|value| {
+                        format!(
+                            "(field_name = '{}' AND field_value = '{}')",
+                            escaped_field,
+                            sql_escape_text(value)
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                format!("({})", values_sql.join(" OR "))
+            })
+            .collect::<Vec<_>>();
+        let sql = format!(
+            "SELECT doc_id FROM {local_name} WHERE {} GROUP BY doc_id HAVING COUNT(*) = {} LIMIT {}",
+            predicate_sql.join(" OR "),
+            predicates.len(),
+            MAX_EXACT_LOOKUP_DOC_IDS + 1,
+        );
+        let batches = execute_sql_async(&sql)
+            .await
+            .map_err(|error| error.to_string())?;
+        extract_string_column_values(&batches, "doc_id")
+    }
+    .await;
+    data_access::release(&local_name).await;
+    result
+}
+
+fn extract_string_column_values(
+    batches: &[RecordBatch],
+    field_name: &str,
+) -> Result<Vec<String>, String> {
+    let mut values = vec![];
+    for batch in batches {
+        let field_index = batch
+            .schema()
+            .index_of(field_name)
+            .map_err(|error| error.to_string())?;
+        let array = batch.column(field_index);
+        for row_index in 0..array.len() {
+            if array.is_null(row_index) {
+                continue;
+            }
+            let value = array_value_to_json(array.as_ref(), row_index)
+                .map_err(|error| error.message.clone())?;
+            let normalized = normalize_exact_lookup_value(&value)
+                .ok_or_else(|| format!("Field {field_name} could not be normalized"))?;
+            values.push(normalized);
+        }
+    }
+    Ok(values)
+}
+
+fn sql_escape_text(text: &str) -> String {
+    text.replace('\'', "''")
 }
 
 async fn execute_parallel_plan(
@@ -1935,6 +3132,7 @@ async fn execute_file_group_warmup(
         sql: QuerySqlTemplate::Built(sql_template.replace("{table}", "{target_table}")),
         files: query_files,
         delete_files: delete_files.to_vec(),
+        use_deletes_table: !delete_files.is_empty(),
         extension_suffixes: None,
         use_cpu_threadpool: true,
     })
@@ -1986,6 +3184,7 @@ async fn execute_query_input_group_plan(
         sql: QuerySqlTemplate::Built(sql_template.replace("{table}", "{target_table}")),
         files: query_files,
         delete_files: delete_files.to_vec(),
+        use_deletes_table: !delete_files.is_empty(),
         extension_suffixes: None,
         use_cpu_threadpool: true,
     })
@@ -3389,7 +4588,7 @@ fn build_sql(
     let select = match normalized_select(request.select.clone()) {
         Some(select_fields) => select_fields
             .iter()
-            .map(|field| format!("\"{}\"", escape_identifier(field)))
+            .map(|field| format!("t.\"{}\"", escape_identifier(field)))
             .collect::<Vec<_>>()
             .join(", "),
         None => {
@@ -3416,7 +4615,7 @@ fn build_sql(
     }
     if let Some(sort) = request.order_by.first() {
         sql.push_str(&format!(
-            " ORDER BY \"{}\" {}",
+            " ORDER BY t.\"{}\" {}",
             escape_identifier(&sort.field),
             if sort.descending { "DESC" } else { "ASC" }
         ));
@@ -3442,7 +4641,7 @@ fn build_aggregate_sql(
     let mut select_parts = aggregate
         .group_by
         .iter()
-        .map(|field| format!("\"{}\"", escape_identifier(field)))
+        .map(|field| format!("t.\"{}\"", escape_identifier(field)))
         .collect::<Vec<_>>();
     for plan in measure_plans.iter() {
         match (plan.function, partial) {
@@ -3455,49 +4654,49 @@ fn build_aggregate_sql(
                 escape_identifier(&plan.partial_value_alias)
             )),
             (AggregateFunction::Sum, false) => select_parts.push(format!(
-                "SUM(\"{}\") AS \"{}\"",
+                "SUM(t.\"{}\") AS \"{}\"",
                 escape_identifier(plan.field.as_ref().unwrap()),
                 escape_identifier(&plan.alias)
             )),
             (AggregateFunction::Sum, true) => select_parts.push(format!(
-                "SUM(\"{}\") AS \"{}\"",
+                "SUM(t.\"{}\") AS \"{}\"",
                 escape_identifier(plan.field.as_ref().unwrap()),
                 escape_identifier(&plan.partial_value_alias)
             )),
             (AggregateFunction::Avg, false) => select_parts.push(format!(
-                "AVG(\"{}\") AS \"{}\"",
+                "AVG(t.\"{}\") AS \"{}\"",
                 escape_identifier(plan.field.as_ref().unwrap()),
                 escape_identifier(&plan.alias)
             )),
             (AggregateFunction::Avg, true) => {
                 select_parts.push(format!(
-                    "SUM(\"{}\") AS \"{}\"",
+                    "SUM(t.\"{}\") AS \"{}\"",
                     escape_identifier(plan.field.as_ref().unwrap()),
                     escape_identifier(&plan.partial_value_alias)
                 ));
                 select_parts.push(format!(
-                    "COUNT(\"{}\") AS \"{}\"",
+                    "COUNT(t.\"{}\") AS \"{}\"",
                     escape_identifier(plan.field.as_ref().unwrap()),
                     escape_identifier(plan.partial_count_alias.as_ref().unwrap())
                 ));
             }
             (AggregateFunction::Min, false) => select_parts.push(format!(
-                "MIN(\"{}\") AS \"{}\"",
+                "MIN(t.\"{}\") AS \"{}\"",
                 escape_identifier(plan.field.as_ref().unwrap()),
                 escape_identifier(&plan.alias)
             )),
             (AggregateFunction::Min, true) => select_parts.push(format!(
-                "MIN(\"{}\") AS \"{}\"",
+                "MIN(t.\"{}\") AS \"{}\"",
                 escape_identifier(plan.field.as_ref().unwrap()),
                 escape_identifier(&plan.partial_value_alias)
             )),
             (AggregateFunction::Max, false) => select_parts.push(format!(
-                "MAX(\"{}\") AS \"{}\"",
+                "MAX(t.\"{}\") AS \"{}\"",
                 escape_identifier(plan.field.as_ref().unwrap()),
                 escape_identifier(&plan.alias)
             )),
             (AggregateFunction::Max, true) => select_parts.push(format!(
-                "MAX(\"{}\") AS \"{}\"",
+                "MAX(t.\"{}\") AS \"{}\"",
                 escape_identifier(plan.field.as_ref().unwrap()),
                 escape_identifier(&plan.partial_value_alias)
             )),
@@ -3523,7 +4722,7 @@ fn build_aggregate_sql(
             aggregate
                 .group_by
                 .iter()
-                .map(|field| format!("\"{}\"", escape_identifier(field)))
+                .map(|field| format!("t.\"{}\"", escape_identifier(field)))
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
@@ -3577,7 +4776,7 @@ fn aggregate_measure_plans(
 }
 
 fn sql_for_filter(filter: &crate::read_plan::ReadPredicate) -> Result<String, ServingQueryError> {
-    let field = format!("\"{}\"", escape_identifier(&filter.field));
+    let field = format!("t.\"{}\"", escape_identifier(&filter.field));
     if let Some(value) = filter.eq.as_ref() {
         return Ok(format!("{} = {}", field, sql_literal(value)?));
     }
@@ -3686,14 +4885,15 @@ impl ServingQueryError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCESS_ARTIFACT_KIND_EXACT_PRUNING, ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS,
-        DEFAULT_FAST_PATH_MAX_DELETE_FILES, DEFAULT_SLOW_PATH_MAX_BYTES, ExactPruningFieldSummary,
-        ServingExecutionContext, aggregate_measure_plans, append_secondary_pattern_artifacts,
-        build_serving_layout_advice, build_serving_warmup_plan, build_sql, exact_artifact_fields,
+        aggregate_measure_plans, append_secondary_pattern_artifacts, build_serving_layout_advice,
+        build_serving_warmup_plan, build_sql, exact_artifact_fields,
         exact_pruning_summary_may_match_request, file_group_table_name, finalize_aggregate_rows,
         group_files_by_schema, merge_partial_aggregate_rows, ordered_file_groups_for_top_k,
         plan_request, prune_candidate_files, remaining_groups_cannot_beat_kth_row,
         request_matches_pattern, secondary_pattern_artifact_name, select_serving_warmup_files,
+        ExactPruningFieldSummary, ServingExecutionContext, ACCESS_ARTIFACT_KIND_EXACT_PRUNING,
+        ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS, DEFAULT_FAST_PATH_MAX_DELETE_FILES,
+        DEFAULT_SLOW_PATH_MAX_BYTES,
     };
     use crate::data_access::{
         prime_parquet_row_group_stats_cache_for_test, reset_serving_metadata_caches_for_test,
@@ -4413,11 +5613,10 @@ mod tests {
         let plan = plan_request(&context, &read_request).unwrap();
 
         assert_eq!(plan.classification, ServingQueryClassification::Rejected);
-        assert!(
-            plan.reason
-                .as_ref()
-                .is_some_and(|reason| reason.contains("exceeds serving budget"))
-        );
+        assert!(plan
+            .reason
+            .as_ref()
+            .is_some_and(|reason| reason.contains("exceeds serving budget")));
     }
 
     #[test]
@@ -4448,11 +5647,10 @@ mod tests {
         let plan = plan_request(&context, &read_request).unwrap();
 
         assert_eq!(plan.classification, ServingQueryClassification::Rejected);
-        assert!(
-            plan.reason
-                .as_ref()
-                .is_some_and(|reason| reason.contains("aggregate serving pattern"))
-        );
+        assert!(plan
+            .reason
+            .as_ref()
+            .is_some_and(|reason| reason.contains("aggregate serving pattern")));
     }
 
     #[test]
@@ -4575,11 +5773,9 @@ mod tests {
             }],
         );
 
-        assert!(
-            access_artifacts.iter().any(|artifact| {
-                artifact.name == secondary_pattern_artifact_name("tenant_recent")
-            })
-        );
+        assert!(access_artifacts
+            .iter()
+            .any(|artifact| { artifact.name == secondary_pattern_artifact_name("tenant_recent") }));
     }
 
     #[test]
@@ -4633,11 +5829,10 @@ mod tests {
         let plan = plan_request(&context, &read_request).unwrap();
 
         assert_eq!(plan.classification, ServingQueryClassification::SlowPath);
-        assert!(
-            plan.reason
-                .as_ref()
-                .is_some_and(|reason| reason.contains("delete files"))
-        );
+        assert!(plan
+            .reason
+            .as_ref()
+            .is_some_and(|reason| reason.contains("delete files")));
     }
 
     #[test]
@@ -4704,12 +5899,10 @@ mod tests {
 
         assert_eq!(advice.patterns.len(), 1);
         assert!(!advice.issues.is_empty());
-        assert!(
-            advice.patterns[0]
-                .recommendation
-                .as_ref()
-                .is_some_and(|recommendation| recommendation.contains("Cluster or partition"))
-        );
+        assert!(advice.patterns[0]
+            .recommendation
+            .as_ref()
+            .is_some_and(|recommendation| recommendation.contains("Cluster or partition")));
     }
 
     #[test]
