@@ -10,26 +10,26 @@ use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct QueryExtensionFileSpec {
+pub struct QueryExtensionFileSpec {
     pub suffix: String,
     pub file_path: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum QueryStorageKind {
+pub enum QueryStorageKind {
     Iceberg,
     Speedboat,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct QueryInputFile {
+pub struct QueryInputFile {
     pub file: FileDescriptor,
     pub storage: QueryStorageKind,
     pub extensions: Vec<QueryExtensionFileSpec>,
 }
 
 #[derive(Clone)]
-pub(crate) enum QuerySqlTemplate {
+pub enum QuerySqlTemplate {
     Built(String),
     Structured {
         sql: SqlQuery,
@@ -38,7 +38,7 @@ pub(crate) enum QuerySqlTemplate {
 }
 
 #[derive(Clone)]
-pub(crate) struct QueryExecutionPlan {
+pub struct QueryExecutionPlan {
     // This is the protocol-neutral mixed-source read plan consumed by both
     // lakehouse serving and Elasticsearch/private reads.
     pub sql: QuerySqlTemplate,
@@ -48,9 +48,7 @@ pub(crate) struct QueryExecutionPlan {
     pub use_cpu_threadpool: bool,
 }
 
-pub(crate) fn group_query_input_files_by_schema(
-    files: Vec<QueryInputFile>,
-) -> Vec<Vec<QueryInputFile>> {
+pub fn group_query_input_files_by_schema(files: Vec<QueryInputFile>) -> Vec<Vec<QueryInputFile>> {
     let mut groups: Vec<Vec<QueryInputFile>> = vec![];
 
     for file in files {
@@ -94,7 +92,7 @@ impl QuerySqlTemplate {
     }
 }
 
-pub(crate) async fn execute_query_plan_batches(
+pub async fn execute_query_plan_batches(
     plan: QueryExecutionPlan,
 ) -> Result<Vec<RecordBatch>, DataFusionError> {
     let QueryExecutionPlan {
@@ -174,7 +172,7 @@ fn filter_query_input_extensions(
 }
 
 #[allow(dead_code)]
-pub(crate) async fn execute_query_file_group_batches(
+pub async fn execute_query_file_group_batches(
     files: Vec<QueryInputFile>,
     sql_template: &str,
     delete_files: &[String],

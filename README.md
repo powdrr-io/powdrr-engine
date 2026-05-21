@@ -46,6 +46,9 @@ The practical promise is: keep the base table in the lakehouse, then add only
 the minimal extra state needed to turn selective read workloads into a
 database-like serving surface.
 
+For the current storage-role model of `speedboat` vs `Iceberg`, see
+`docs/speedboat-vs-iceberg-architecture.md`.
+
 ## High-Level Architecture
 
 At a high level, Powdrr looks like this:
@@ -103,9 +106,10 @@ serving plan and run against one shared snapshot-aware execution path.
   The control-plane service for table metadata, checkpoints, org setup,
   aliases, templates, and related state transitions.
 
-- `main_lib/`
-  The compatibility facade crate used by existing tests and callers that still
-  import `powdrr_lib`. Its implementation surface now lives in `query_lib/`.
+- `query_runtime/`
+  The runtime/orchestration crate. This owns ingest, compaction, state
+  providers, peer/runtime fanout, local CLI execution, and the snapshot-aware
+  serving runtime.
 
 - `cli/`
   A local CLI for building and querying a local Parquet cache through Powdrr's
@@ -290,7 +294,7 @@ Targeted checks during development:
 ```bash
 scripts/cargo-worktree.sh check -p powdrr-io-engine
 scripts/cargo-worktree.sh check -p powdrr-io-service
-scripts/cargo-worktree.sh check -p powdrr_lib
+scripts/cargo-worktree.sh check -p powdrr-query-runtime
 ```
 
 General test guidance:
@@ -324,11 +328,37 @@ bash scripts/run_dynamodb_sdk_compat_local.sh
 - live Powdrr-vs-Elasticsearch differential checks
 - an official JavaScript `@elastic/elasticsearch` smoke suite against the read-only subset
 
+## Acknowledgements
+
+Powdrr is built on top of a large set of open-source projects and protocol
+ecosystems. The exact machine-readable dependency graph lives in the workspace
+`Cargo.toml` files and `Cargo.lock`, but the major foundations include:
+
+- Rust and the broader Tokio async ecosystem
+- Apache Arrow, Apache Parquet, and Apache DataFusion
+- Apache Iceberg and the `iceberg-rust` implementation
+- Gotham for the HTTP server surface
+- Serde and Reqwest for protocol and client plumbing
+- Redis for coordination and local runtime behavior
+- the AWS Rust SDK and `object_store` for DynamoDB and object-storage access
+- `kube` and `k8s-openapi` for Kubernetes-aware runtime behavior
+- OpenRaft for the service-side replicated metadata direction
+- Liquid Cache for the current Linux-only DataFusion cache integration
+- MinIO and LocalStack for local object-store and cloud-service emulation
+- Elasticsearch, MongoDB, and DynamoDB as the client ecosystems Powdrr targets
+  in compatibility layers, tests, and benchmarks
+
+Powdrr would not exist in its current form without that work upstream.
+
 ## Where To Read Next
 
 - `docs/zero-copy-lakehouse-serving-requirements.md`
   The most direct statement of the product contract and what "zero-copy"
   should mean honestly.
+
+- `docs/speedboat-vs-iceberg-architecture.md`
+  The storage-role contract for the mutable frontier, the canonical Iceberg
+  snapshot, and the row-to-column promotion boundary.
 
 - `docs/lakehouse-serving-roadmap.md`
   The repo-specific roadmap from the current hybrid stack toward a shared

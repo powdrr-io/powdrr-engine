@@ -12,16 +12,16 @@ use futures_util::future;
 use gotham::bind_server;
 use mongodb::Client as MongoClient;
 use mongodb::bson::{Document, doc};
-use powdrr_lib::data_contract::{
+use powdrr_query_lib::data_contract::{
     FileSetPayload, IcebergFileStats, IcebergMetadata, TableMetadataCheckpoint,
 };
-use powdrr_lib::mongodb_wire_protocol::serve_mongodb_wire;
-use powdrr_lib::router::router;
-use powdrr_lib::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
-use powdrr_lib::test_api::{
+use powdrr_query_lib::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
+use powdrr_query_runtime::test_api::{
     CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode, StorageMode,
     TestProcessingMode,
 };
+use powdrr_query_server::mongodb_wire_protocol::serve_mongodb_wire;
+use powdrr_query_server::router::router;
 use reqwest::Client as HttpClient;
 use tempfile::TempDir;
 use tokio::net::TcpListener;

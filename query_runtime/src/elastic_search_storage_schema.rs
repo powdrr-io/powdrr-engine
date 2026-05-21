@@ -1,8 +1,9 @@
 use crate::distributed_cache;
 use crate::elastic_search_common::create_denormalized_value;
-use crate::elastic_search_ingest::{IngestError, WriteBuffer, commit_speedboat};
+use crate::elastic_search_ingest::{IngestError, commit_speedboat};
 use crate::elastic_search_responses::{OperationResult, QueryResultHit, Shards};
 use crate::schema_massager::{PowdrrSchema, extract_powdrr_schema_option};
+use crate::speedboat_buffer::WriteBuffer;
 use serde_json::Value;
 
 #[derive(Clone)]

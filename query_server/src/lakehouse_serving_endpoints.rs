@@ -14,13 +14,13 @@ use serde_json::Value;
 use crate::elastic_search_http_types::NamePathExtractor;
 
 use powdrr_query_lib::data_contract::{CreateTable, ServingTableConfig};
-use powdrr_query_lib::lakehouse_serving::{
+use powdrr_query_lib::serving_plan::ServingQueryClassification;
+use powdrr_query_lib::serving_plan::ServingRequestPlan;
+use powdrr_query_runtime::lakehouse_serving::{
     ServingCacheManagerRequestBody, ServingConfigResponse, execute_serving_cache_manager_request,
     execute_serving_layout_advice, execute_serving_query,
 };
-use powdrr_query_lib::serving_plan::ServingQueryClassification;
-use powdrr_query_lib::serving_plan::ServingRequestPlan;
-use powdrr_query_lib::state_provider::STATE_PROVIDER;
+use powdrr_query_runtime::state_provider::STATE_PROVIDER;
 
 pub fn get_serving_config(state: State) -> Pin<Box<HandlerFuture>> {
     async move {

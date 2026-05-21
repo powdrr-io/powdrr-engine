@@ -24,30 +24,30 @@ Those are related, but they are not the same amount of work.
 The repo already has the right logical seams for a read-only Mongo frontend:
 
 - protocol-neutral request planning in
-  [main_lib/src/serving_plan.rs](../main_lib/src/serving_plan.rs)
+  [query_core/src/serving_plan.rs](../query_core/src/serving_plan.rs)
 - a shared serving executor in
-  [main_lib/src/lakehouse_serving.rs](../main_lib/src/lakehouse_serving.rs)
+  [query_runtime/src/lakehouse_serving.rs](../query_runtime/src/lakehouse_serving.rs)
 - an outbound Mongo renderer used by the benchmark in
-  [main_lib/src/serving_protocol.rs](../main_lib/src/serving_protocol.rs)
+  [query_runtime/src/serving_protocol.rs](../query_runtime/src/serving_protocol.rs)
 - a concrete example of a protocol frontend translating into
   `ServingRequestPlan` in
-  [main_lib/src/dynamodb_protocol.rs](../main_lib/src/dynamodb_protocol.rs)
+  [query_server/src/dynamodb_protocol.rs](../query_server/src/dynamodb_protocol.rs)
 
 This branch also adds the inverse Mongo read-path adapter:
 
 - `from_mongodb_find(...)` in
-  [main_lib/src/serving_protocol.rs](../main_lib/src/serving_protocol.rs)
+  [query_runtime/src/serving_protocol.rs](../query_runtime/src/serving_protocol.rs)
 - a temporary HTTP bridge at
-  [main_lib/src/mongodb_protocol.rs](../main_lib/src/mongodb_protocol.rs)
+  [query_server/src/mongodb_protocol.rs](../query_server/src/mongodb_protocol.rs)
   exposed as:
   - `POST /:table/_mongo/find`
   - `POST /_mongo/:database/_command`
 - table metadata for Mongo exposure and `_id` mapping via
   `MongoDbTableConfig` in
-  [main_lib/src/data_contract.rs](../main_lib/src/data_contract.rs)
+  [control_plane/src/data_contract.rs](../control_plane/src/data_contract.rs)
 - HTTP config endpoints at `GET` / `PUT /:table/_mongo/config`
 - an experimental Mongo wire listener at
-  [main_lib/src/mongodb_wire_protocol.rs](../main_lib/src/mongodb_wire_protocol.rs)
+  [query_server/src/mongodb_wire_protocol.rs](../query_server/src/mongodb_wire_protocol.rs)
   with runtime wiring in
   [engine/src/main.rs](../engine/src/main.rs) behind `MONGO_PORT`
 
@@ -121,7 +121,7 @@ Status:
 
 - **partially implemented**
 - `OP_MSG` request/response framing now exists in
-  [main_lib/src/mongodb_wire_protocol.rs](../main_lib/src/mongodb_wire_protocol.rs)
+  [query_server/src/mongodb_wire_protocol.rs](../query_server/src/mongodb_wire_protocol.rs)
 - the listener can be started by setting `MONGO_PORT`
 - current transport is intentionally narrow:
   - `OP_MSG` only
@@ -275,7 +275,7 @@ Target:
 Status:
 
 - now partially done in
-  [main_lib/src/serving_protocol.rs](../main_lib/src/serving_protocol.rs)
+  [query_runtime/src/serving_protocol.rs](../query_runtime/src/serving_protocol.rs)
 
 Next work inside this phase:
 
@@ -389,7 +389,7 @@ This should initially be read-only and single-node.
 Status:
 
 - now partially implemented in
-  [main_lib/src/mongodb_wire_protocol.rs](../main_lib/src/mongodb_wire_protocol.rs)
+  [query_server/src/mongodb_wire_protocol.rs](../query_server/src/mongodb_wire_protocol.rs)
 - the remaining gaps are compression, richer command coverage, and a
   BSON-native execution path instead of the current BSON -> JSON bridge
 

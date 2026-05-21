@@ -14,11 +14,10 @@ use crate::elastic_search_responses::{
 use crate::elastic_search_storage_schema::{
     FullRecord, RecordDelete, RecordInput, SpeedboatCommitBuilder,
 };
-use crate::schema_massager::PowdrrSchema;
 use crate::search_runtime::{SerdeValueResult, df_to_serde_value};
+use crate::speedboat_buffer::{SpeedboatBufferError, WriteBuffer};
 use crate::state_provider::{STATE_PROVIDER, ServiceApiError};
 use crate::util::{describe_table_log_error_then_none, log_err, log_service_err};
-use datafusion::arrow::ipc::writer::FileWriter;
 use futures::FutureExt;
 use http::StatusCode;
 use http::header::LOCATION;
@@ -26,16 +25,13 @@ use idgenerator::*;
 use mime;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt::Display;
 use std::future::Future;
-use std::io::Write;
-use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{collections::HashMap, fs, fs::File};
+use std::{collections::HashMap, fs};
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::{mpsc, oneshot};
 use uuid_b64::UuidB64;
@@ -67,159 +63,12 @@ fn default_as_false() -> bool {
     false
 }
 
-#[derive(Clone)]
-pub(crate) struct WriteBuffer {
-    lines: Vec<Value>,
-    schema: Option<PowdrrSchema>,
-}
-
-pub(crate) const JSON_MODE: bool = false;
-
-impl WriteBuffer {
-    pub fn empty() -> Self {
-        WriteBuffer {
-            lines: vec![],
-            schema: None,
+impl From<SpeedboatBufferError> for IngestError {
+    fn from(value: SpeedboatBufferError) -> Self {
+        IngestError {
+            message: value.message,
         }
     }
-
-    pub fn insert_and_update(schema: PowdrrSchema, lines: Vec<Value>) -> Self {
-        WriteBuffer {
-            lines,
-            schema: Some(schema),
-        }
-    }
-
-    pub fn delete(lines: Vec<Value>) -> Self {
-        WriteBuffer {
-            lines,
-            schema: Some(PowdrrSchema::deletes()),
-        }
-    }
-
-    pub(crate) fn write_to_file(&self, file_name: &String) -> Result<u64, IngestError> {
-        if JSON_MODE {
-            self.write_to_json_file(&format!("{}.json", file_name))
-        } else {
-            self.write_to_arrow_file(&format!("{}.arrow", file_name))
-        }
-    }
-
-    fn write_to_json_file(&self, file_name: &String) -> Result<u64, IngestError> {
-        assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
-        ensure_local_parent_dir(file_name)?;
-        let mut file_write = File::create(file_name).expect("Cannot create file");
-        for line in self.lines.iter() {
-            match writeln!(&mut file_write, "{}", line) {
-                Err(e) => {
-                    return Err(IngestError {
-                        message: format!("{}", e).to_string(),
-                    });
-                }
-                _ => (),
-            }
-        }
-        Ok(self
-            .lines
-            .iter()
-            .map(|l| l.to_string().len())
-            .sum::<usize>() as u64)
-    }
-
-    fn write_to_arrow_file(&self, file_name: &String) -> Result<u64, IngestError> {
-        assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
-        assert!(self.schema.is_some(), "Cannot write buffer without schema");
-        ensure_local_parent_dir(file_name)?;
-        let bytes = self.arrow_file_bytes()?;
-        let mut file = File::create(file_name).unwrap();
-        file.write_all(&bytes).unwrap();
-        Ok(bytes.len() as u64)
-    }
-
-    #[allow(dead_code)]
-    async fn write_to_arrow_s3(&self, s3_path: &String) -> Result<u64, IngestError> {
-        assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
-        assert!(self.schema.is_some(), "Cannot write buffer without schema");
-        let full_s3_path = format!("{}.arrow", s3_path);
-        let bytes = self.arrow_file_bytes()?;
-        data_access::put_s3_file(&full_s3_path, &bytes)
-            .await
-            .map_err(|e| IngestError {
-                message: format!("{}", e).to_string(),
-            })?;
-        Ok(bytes.len() as u64)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn as_byte_vec(&self) -> Vec<u8> {
-        let mut buffer = Vec::new();
-        for line in self.lines.iter() {
-            buffer.extend(line.to_string().as_bytes());
-            buffer.push(b'\n');
-        }
-        buffer
-    }
-
-    fn arrow_file_bytes(&self) -> Result<Vec<u8>, IngestError> {
-        assert!(self.lines.len() > 0, "Cannot write empty buffer to file");
-        assert!(self.schema.is_some(), "Cannot write buffer without schema");
-        let arrow_schema = self.schema.as_ref().unwrap().to_arrow_schema();
-        let fields = arrow_schema.fields.as_ref();
-        let record_batch = serde_arrow::to_record_batch(fields, &self.lines).unwrap();
-        let mut bytes = Vec::new();
-        let mut writer =
-            FileWriter::try_new(&mut bytes, &record_batch.schema()).map_err(|e| IngestError {
-                message: format!("{}", e),
-            })?;
-        writer.write(&record_batch).map_err(|e| IngestError {
-            message: format!("{}", e),
-        })?;
-        writer.finish().map_err(|e| IngestError {
-            message: format!("{}", e),
-        })?;
-        Ok(bytes)
-    }
-
-    fn stable_segment_id(&self, index: &String, label: &String) -> Result<String, IngestError> {
-        let mut hasher = Sha256::new();
-        hasher.update(index.as_bytes());
-        hasher.update([0]);
-        hasher.update(label.as_bytes());
-        hasher.update([0]);
-        if let Some(schema) = &self.schema {
-            let schema_bytes = serde_json::to_vec(schema).map_err(|e| IngestError {
-                message: format!("Failed to serialize speedboat schema for segment id: {e}"),
-            })?;
-            hasher.update(schema_bytes);
-        }
-        hasher.update([0xff]);
-        for line in &self.lines {
-            let line_bytes = serde_json::to_vec(line).map_err(|e| IngestError {
-                message: format!("Failed to serialize speedboat line for segment id: {e}"),
-            })?;
-            hasher.update((line_bytes.len() as u64).to_le_bytes());
-            hasher.update(line_bytes);
-        }
-        Ok(format!("{:x}", hasher.finalize()))
-    }
-
-    pub(crate) fn schema(&self) -> Option<PowdrrSchema> {
-        self.schema.clone()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn num_records(&self) -> usize {
-        self.lines.len()
-    }
-}
-
-fn ensure_local_parent_dir(file_name: &str) -> Result<(), IngestError> {
-    if let Some(parent) = Path::new(file_name).parent() {
-        fs::create_dir_all(parent).map_err(|e| IngestError {
-            message: format!("Failed to create local speedboat directory: {e}"),
-        })?;
-    }
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -590,7 +439,7 @@ fn speedboat_orphan_marker_path(table: &String, orphan_id: &String) -> String {
             orphan_id
         )
     } else {
-        format!("tests/data/ingest/orphans/{table}/{orphan_id}.json")
+        format!("testdata/ingest/orphans/{table}/{orphan_id}.json")
     }
 }
 
@@ -609,7 +458,7 @@ fn next_speedboat_segment(
             segment_id
         )
     } else {
-        format!("tests/data/ingest/{}/{}/{}", index, label, segment_id)
+        format!("testdata/ingest/{}/{}/{}", index, label, segment_id)
     };
     Ok(SpeedboatSegmentFile {
         segment_id,
@@ -643,7 +492,7 @@ async fn write_speedboat_orphan_marker(
                 message: format!("Failed to write speedboat orphan marker: {e}"),
             })?;
     } else {
-        let marker_dir = format!("tests/data/ingest/orphans/{}", table);
+        let marker_dir = format!("testdata/ingest/orphans/{}", table);
         fs::create_dir_all(&marker_dir).map_err(|e| IngestError {
             message: format!("Failed to create speedboat orphan marker directory: {e}"),
         })?;
@@ -668,15 +517,10 @@ pub(crate) async fn write_to_file(
         Ok(segment)
     } else {
         let write_to_file_result = buffer.write_to_file(&segment.file_path);
-        //tracing::info!("Ingest: op {} on table {} wrote {} records", label, index, buffer.num_records());
 
         let size = match write_to_file_result {
             Ok(size) => size,
-            Err(_) => {
-                return Err(IngestError {
-                    message: "File error".to_string(),
-                });
-            }
+            Err(error) => return Err(error.into()),
         };
         segment.size = size;
         Ok(segment)
@@ -691,22 +535,22 @@ pub(crate) async fn commit_speedboat(
     commit_type: &String,
 ) -> Result<(), IngestError> {
     let mut table_infos = vec![];
-    if inserts_and_updates.lines.len() != 0 {
+    if inserts_and_updates.num_records() != 0 {
         let insert_update_segment = write_to_file(inserts_and_updates, table, commit_type).await?;
         table_infos.push(SpeedboatCommitTableInfo::from_segments(
             commit_type.clone(),
             table.clone(),
             vec![insert_update_segment],
-            inserts_and_updates.schema.clone(),
+            inserts_and_updates.schema(),
         ));
     }
-    if deletes.lines.len() != 0 {
+    if deletes.num_records() != 0 {
         let delete_segment = write_to_file(deletes, table, &"delete".to_string()).await?;
         table_infos.push(SpeedboatCommitTableInfo::from_segments(
             "delete".to_string(),
             table.clone(),
             vec![delete_segment],
-            deletes.schema.clone(),
+            deletes.schema(),
         ));
     }
     let speedboat_commit = SpeedboatCommit {
@@ -1987,7 +1831,7 @@ mod tests {
         assert_eq!(index.aliases.map_or_else(|| 0, |x| x.len()), 2);
 
         /*
-                let file_content = match read_to_string("main_lib/tests/data/example_create_index.json") {
+                let file_content = match read_to_string("testdata/example_create_index.json") {
                     Ok(f) => f,
                     Err(_) => panic!("Missing test file")
                 };
@@ -1996,13 +1840,13 @@ mod tests {
                     Err(e) => {
                         let error = format!("{}", e);
                         println!("{}", error);
-                        let _ = fs::write("main_lib/output.txt", error);
+                        let _ = fs::write("output.txt", error);
                         panic!("nope");
                     }
                 };
         */
 
-        let test_val = include_str!("../tests/data/component_template_2.json");
+        let test_val = include_str!("../../testdata/component_template_2.json");
 
         let _deser: CreateIndexTemplateBody = match serde_json::from_str(test_val) {
             Ok(d) => d,
@@ -2958,15 +2802,12 @@ mod tests {
                 let error = format!("{}", e);
                 let error_str = error.as_str();
                 println!("{}", error_str);
-                let _ = fs::write(
-                    "/Users/gregory/code/powdrr-engine/main_lib/output.txt",
-                    error,
-                );
+                let _ = fs::write("output.txt", error);
                 panic!("nope");
             }
         };
 
-        let test_val = include_str!("../tests/data/component_template_1.json");
+        let test_val = include_str!("../../testdata/component_template_1.json");
 
         let _deser: CreateIndexTemplateBody = match serde_json::from_str(test_val) {
             Ok(d) => d,

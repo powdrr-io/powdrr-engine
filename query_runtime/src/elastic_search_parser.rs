@@ -1840,7 +1840,7 @@ mod tests {
 
     #[test]
     fn test_parse_update_by_query() {
-        let test_val = include_str!("../tests/data/search_query_1.json");
+        let test_val = include_str!("../../testdata/search_query_1.json");
 
         let _parse_result: SearchBody = match serde_json::from_str(test_val) {
             Ok(pr) => pr,
@@ -1851,7 +1851,7 @@ mod tests {
             }
         };
 
-        let test_val = include_str!("../tests/data/update_by_query_1.json");
+        let test_val = include_str!("../../testdata/update_by_query_1.json");
 
         let _parse_result: UpdateByQueryBody = match serde_json::from_str(test_val) {
             Ok(pr) => pr,

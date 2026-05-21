@@ -15,14 +15,14 @@ use mongodb::{Client as MongoClient, Collection, IndexModel};
 use powdrr_query_lib::data_contract::{
     FileSetPayload, IcebergMetadata, ServingPattern, TableMetadataCheckpoint,
 };
-use powdrr_query_lib::lakehouse_serving::ServingQueryResponse;
 use powdrr_query_lib::schema_massager::{PowdrrDataType, PowdrrSchema};
-use powdrr_query_lib::serving_dataset::{ParquetDocumentSet, read_parquet_documents};
 use powdrr_query_lib::serving_plan::{
     ServingPredicate, ServingQueryClassification, ServingRequestPlan, ServingSort,
 };
-use powdrr_query_lib::serving_protocol::{to_elasticsearch_search, to_mongodb_find};
-use powdrr_query_lib::test_api::{
+use powdrr_query_runtime::lakehouse_serving::ServingQueryResponse;
+use powdrr_query_runtime::serving_dataset::{ParquetDocumentSet, read_parquet_documents};
+use powdrr_query_runtime::serving_protocol::{to_elasticsearch_search, to_mongodb_find};
+use powdrr_query_runtime::test_api::{
     CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode, StorageMode,
     TestProcessingMode,
 };
@@ -34,7 +34,7 @@ use serde_json::{Map, Value, json};
 const DEFAULT_LIMIT: usize = 25;
 const DEFAULT_ITERATIONS: usize = 20;
 const DEFAULT_WARMUP: usize = 5;
-const DEFAULT_DATASET: &str = "main_lib/tests/data/flights.parquet";
+const DEFAULT_DATASET: &str = "testdata/flights.parquet";
 const BENCH_BASE_URL: &str = "http://localhost";
 
 #[derive(Clone, Debug)]

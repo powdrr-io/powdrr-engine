@@ -9,9 +9,9 @@ It builds on:
 - [`docs/lakehouse-serving-roadmap.md`](./lakehouse-serving-roadmap.md)
 - [`docs/zero-copy-lakehouse-serving-requirements.md`](./zero-copy-lakehouse-serving-requirements.md)
 - the current serving MVP in
-  [main_lib/src/lakehouse_serving.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/main_lib/src/lakehouse_serving.rs:1)
+  [query_runtime/src/lakehouse_serving.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/query_runtime/src/lakehouse_serving.rs:1)
 - the current protocol adapters in
-  [main_lib/src/serving_protocol.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/main_lib/src/serving_protocol.rs:1)
+  [query_runtime/src/serving_protocol.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/query_runtime/src/serving_protocol.rs:1)
 
 ## Goal
 
@@ -37,13 +37,13 @@ still missing.
 What already exists:
 
 - a protocol-neutral request shape in
-  [main_lib/src/serving_plan.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/main_lib/src/serving_plan.rs:1)
+  [query_core/src/serving_plan.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/query_core/src/serving_plan.rs:1)
 - outbound protocol renderers for Elasticsearch and MongoDB in
-  [main_lib/src/serving_protocol.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/main_lib/src/serving_protocol.rs:1)
+  [query_runtime/src/serving_protocol.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/query_runtime/src/serving_protocol.rs:1)
 - a read-only serving endpoint in
-  [main_lib/src/lakehouse_serving.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/main_lib/src/lakehouse_serving.rs:178)
+  [query_runtime/src/lakehouse_serving.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/query_runtime/src/lakehouse_serving.rs:178)
 - placeholder checkpoint metadata for file stats in
-  [main_lib/src/data_contract.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/main_lib/src/data_contract.rs:56)
+  [control_plane/src/data_contract.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/control_plane/src/data_contract.rs:56)
 
 What does not exist yet:
 
@@ -56,7 +56,7 @@ What does not exist yet:
 
 The current MVP still treats "fast path" as "allowed query shape" rather than
 "query shape plus optimized read set." In
-[main_lib/src/lakehouse_serving.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/main_lib/src/lakehouse_serving.rs:383),
+[query_runtime/src/lakehouse_serving.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/query_runtime/src/lakehouse_serving.rs:383),
 matching a `ServingPattern` still selects all files and sums all file sizes.
 
 ## Design Principles
@@ -117,7 +117,7 @@ Suggested new types:
 - `ServingFrontendConstraints`
 
 This should live near the current
-[main_lib/src/serving_plan.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/main_lib/src/serving_plan.rs:1).
+[query_core/src/serving_plan.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/query_core/src/serving_plan.rs:1).
 
 The current `ServingRequestPlan` can remain the MVP wire shape for `POST
 /{table}/_serve`, but it should become one frontend into the same logical
@@ -126,9 +126,9 @@ planner rather than the planner's final input format.
 ### 2. Typed Optimization Metadata
 
 Replace the loose `column_stats: Vec<(String, String)>` placeholder in
-[main_lib/src/data_contract.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/main_lib/src/data_contract.rs:63)
+[control_plane/src/data_contract.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/control_plane/src/data_contract.rs:63)
 and
-[main_lib/src/data_access.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/main_lib/src/data_access.rs:207)
+[query_lib/src/data_access.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/query_lib/src/data_access.rs:207)
 with typed metadata.
 
 Suggested structure:
@@ -237,7 +237,7 @@ Suggested plan enums:
   - `RenderAggregates`
 
 The optimizer should own the currently missing behavior in
-[main_lib/src/lakehouse_serving.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/main_lib/src/lakehouse_serving.rs:383),
+[query_runtime/src/lakehouse_serving.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/query_runtime/src/lakehouse_serving.rs:383),
 where file selection is still all-or-nothing.
 
 ### 4. Shared Execution
@@ -374,16 +374,16 @@ For example:
 ### Near-Term Module Boundaries
 
 1. Expand
-   [main_lib/src/serving_plan.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/main_lib/src/serving_plan.rs:1)
+   [query_core/src/serving_plan.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/query_core/src/serving_plan.rs:1)
    from an MVP request struct into the canonical logical planning layer.
 
 2. Keep
-   [main_lib/src/serving_protocol.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/main_lib/src/serving_protocol.rs:1)
+   [query_runtime/src/serving_protocol.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/query_runtime/src/serving_protocol.rs:1)
    as protocol adapter code only.
    Add Dynamo request/response translations there or in a sibling frontend module.
 
 3. Split
-   [main_lib/src/lakehouse_serving.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/main_lib/src/lakehouse_serving.rs:1)
+   [query_runtime/src/lakehouse_serving.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/query_runtime/src/lakehouse_serving.rs:1)
    into:
    - request admission
    - logical planning
@@ -392,11 +392,11 @@ For example:
    - explain/result rendering
 
 4. Replace the checkpoint metadata placeholder in
-   [main_lib/src/data_contract.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/main_lib/src/data_contract.rs:56)
+   [control_plane/src/data_contract.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/control_plane/src/data_contract.rs:56)
    with typed optimization metadata.
 
 5. Teach
-   [main_lib/src/data_access.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/main_lib/src/data_access.rs:1179)
+   [query_lib/src/data_access.rs](/Users/gregory/code/powdrr-engine/.worktrees/codex-cross-protocol-optimization-plan/query_lib/src/data_access.rs:1179)
    to materialize file and row-group stats into those typed structures.
 
 6. Extend benchmarks in
@@ -410,11 +410,11 @@ For example:
 
 ### Suggested New Modules
 
-- `main_lib/src/serving_optimizer.rs`
-- `main_lib/src/serving_metadata.rs`
-- `main_lib/src/serving_physical_plan.rs`
-- `main_lib/src/serving_frontends.rs` or protocol-specific siblings
-- `main_lib/src/serving_explain.rs`
+- `query_runtime/src/serving_optimizer.rs`
+- `query_runtime/src/serving_metadata.rs`
+- `query_runtime/src/serving_physical_plan.rs`
+- `query_server/src/serving_frontends.rs` or protocol-specific siblings
+- `query_runtime/src/serving_explain.rs`
 
 ## Rollout Phases
 

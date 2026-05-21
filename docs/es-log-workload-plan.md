@@ -194,7 +194,7 @@ Add a workload-specific compatibility section and fixture corpus for:
 
 Deliverables:
 
-- new workload fixtures in `main_lib/tests/data/es_compat_cases.json`
+- new workload fixtures in `testdata/es_compat_cases.json`
 - matrix doc updates in `docs/es-compatibility-matrix.md`
 - route or feature manifest expansion if new handlers are involved
 
@@ -331,12 +331,12 @@ Validate:
 
 ### 2. Differential Fixture Tests
 
-Expand `main_lib/tests/es_compatibility_matrix.rs` so every supported workload
+Expand `query_server/tests/es_compatibility_matrix.rs` so every supported workload
 shape is compared against real Elasticsearch.
 
 ### 3. Official Client Tests
 
-Extend `main_lib/tests/elasticsearch_js_client_compat.rs` and
+Extend `query_server/tests/elasticsearch_js_client_compat.rs` and
 `tests/es_js_client/smoke.mjs` into workload-level checks.
 
 ### 4. Benchmark Harness

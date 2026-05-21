@@ -14,11 +14,11 @@ It has two jobs:
 The backing artifacts are:
 
 - operation coverage corpus:
-  `main_lib/tests/data/dynamodb_compat_cases.json`
+  `testdata/dynamodb_compat_cases.json`
 - compatibility harness:
-  `main_lib/tests/dynamodb_compatibility_matrix.rs`
+  `query_server/tests/dynamodb_compatibility_matrix.rs`
 - complementary SDK compatibility suite:
-  `main_lib/tests/dynamodb_sdk_compat.rs`
+  `query_server/tests/dynamodb_sdk_compat.rs`
 
 ## Contract
 

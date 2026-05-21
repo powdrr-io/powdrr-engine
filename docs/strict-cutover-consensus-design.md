@@ -57,7 +57,7 @@ This lets the codebase speak in strict-cutover terms without requiring the Raft 
 
 - Read paths now explicitly use `get_active_servable_checkpoint(...)`
 - Target/preparation paths can use `get_target_servable_checkpoint(...)`
-- The metadata boundary in `main_lib/src/metadata_store.rs` and `service_lib/src/metadata_store.rs`
+- The metadata boundary in `query_runtime/src/metadata_store.rs` and `service_lib/src/metadata_store.rs`
   now defines the strict-cutover records needed by a future consensus backend
 
 ## Remaining Work

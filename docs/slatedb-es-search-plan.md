@@ -42,15 +42,15 @@ Out of scope for the first cut:
 The current codebase is not an abstract ES API layer over pluggable storage. It
 is a specific execution model built around:
 
-- HTTP handlers in `main_lib/src/elastic_search_endpoints.rs`
+- HTTP handlers in `query_server/src/elastic_search_endpoints.rs`
 - A parser that turns ES-like DSL into SQL/DataFusion-oriented plans in
-  `main_lib/src/elastic_search_parser.rs`
+  `query_runtime/src/elastic_search_parser.rs`
 - Object-store files for primary data via the speedboat and iceberg paths in
-  `main_lib/src/elastic_search_ingest.rs` and `main_lib/src/private_api.rs`
+  `query_runtime/src/elastic_search_ingest.rs` and `query_runtime/src/private_api.rs`
 - A sidecar parquet full-text index generated in
-  `main_lib/src/elastic_search_index.rs`
-- Query fan-out by file subset across peers in `main_lib/src/data_contract.rs`
-  and `main_lib/src/private_api.rs`
+  `query_runtime/src/elastic_search_index.rs`
+- Query fan-out by file subset across peers in `control_plane/src/data_contract.rs`
+  and `query_runtime/src/private_api.rs`
 
 ### Important Current Assumptions
 
@@ -67,20 +67,20 @@ is a specific execution model built around:
 ### Code Paths That Matter
 
 - Search entrypoints:
-  `main_lib/src/elastic_search_endpoints.rs`
+  `query_server/src/elastic_search_endpoints.rs`
 - Search parsing:
-  `main_lib/src/elastic_search_parser.rs`
+  `query_runtime/src/elastic_search_parser.rs`
 - Query SQL assembly:
-  `main_lib/src/schema_massager.rs`
+  `query_core/src/schema_massager.rs`
 - Shard-local execution today:
-  `main_lib/src/private_api.rs`
+  `query_runtime/src/private_api.rs`
 - Index sidecar generation:
-  `main_lib/src/elastic_search_index.rs`
+  `query_runtime/src/elastic_search_index.rs`
 - Ingest and seq/version handling:
-  `main_lib/src/elastic_search_ingest.rs`,
-  `main_lib/src/elastic_search_storage_schema.rs`
+  `query_runtime/src/elastic_search_ingest.rs`,
+  `query_runtime/src/elastic_search_storage_schema.rs`
 - Peer/file distribution:
-  `main_lib/src/data_contract.rs`
+  `control_plane/src/data_contract.rs`
 
 ## Why The Current Parquet Shortcut Does Not Map To SlateDB
 
@@ -709,21 +709,21 @@ single-shard key layout matters more.
 
 ### Keep With Moderate Changes
 
-- `main_lib/src/router.rs`
-- `main_lib/src/elastic_search_endpoints.rs`
-- alias/template parts of `main_lib/src/elastic_search_ingest.rs`
-- parts of `main_lib/src/state_provider.rs`
+- `query_server/src/router.rs`
+- `query_server/src/elastic_search_endpoints.rs`
+- alias/template parts of `query_runtime/src/elastic_search_ingest.rs`
+- parts of `query_runtime/src/state_provider.rs`
 
 ### Replace Or Heavily Rewrite
 
-- `main_lib/src/elastic_search_parser.rs`
-- `main_lib/src/schema_massager.rs`
-- `main_lib/src/private_api.rs`
-- `main_lib/src/elastic_search_index.rs`
-- `main_lib/src/elastic_search_storage_schema.rs`
-- the search-critical parts of `main_lib/src/elastic_search_ingest.rs`
-- `main_lib/src/elastic_search_commands.rs`
-- search-related pieces of `main_lib/src/data_access.rs`
+- `query_runtime/src/elastic_search_parser.rs`
+- `query_core/src/schema_massager.rs`
+- `query_runtime/src/private_api.rs`
+- `query_runtime/src/elastic_search_index.rs`
+- `query_runtime/src/elastic_search_storage_schema.rs`
+- the search-critical parts of `query_runtime/src/elastic_search_ingest.rs`
+- `query_runtime/src/elastic_search_commands.rs`
+- search-related pieces of `query_lib/src/data_access.rs`
 
 ### Retire From The Search Hot Path
 
@@ -828,10 +828,10 @@ Work:
 These are the next changes worth making in code.
 
 1. Add `docs/slatedb-es-search-plan.md` and keep it current.
-2. Add `main_lib/src/search_plan.rs` with query enums and request-independent
+2. Add `query_core/src/search_plan.rs` with query enums and request-independent
    plan types.
 3. Refactor `elastic_search_parser.rs` to emit `SearchPlan`.
-4. Add `main_lib/src/slatedb_search/` with:
+4. Add `query_runtime/src/slatedb_search/` with:
    - `keys.rs`
    - `analyzer.rs`
    - `shard_writer.rs`

@@ -11,10 +11,10 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::Value;
 
-use powdrr_lib::router::router;
+use powdrr_query_server::router::router;
 
-const CASES_JSON: &str = include_str!("data/es_compat_cases.json");
-const API_MANIFEST_JSON: &str = include_str!("data/es_api_coverage_manifest.json");
+const CASES_JSON: &str = include_str!("../../testdata/es_compat_cases.json");
+const API_MANIFEST_JSON: &str = include_str!("../../testdata/es_api_coverage_manifest.json");
 static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Debug, Deserialize)]

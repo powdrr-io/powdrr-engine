@@ -65,7 +65,7 @@ POWDRR_SERVE_BENCH_RELEASE=0 bash scripts/run_serving_bench_local.sh
 ### Environment
 
 - `POWDRR_SERVE_BENCH_DATASET`
-  Default: `main_lib/tests/data/flights.parquet`
+  Default: `testdata/flights.parquet`
 - `POWDRR_SERVE_BENCH_LIMIT`
   Default: `25`
   Note: the benchmark may reduce the effective per-case limit to avoid
@@ -99,7 +99,7 @@ lakehouse data using protocols clients already know.
 
 The compatibility workload benchmark is separate from the serving benchmark. It
 replays selected differential `logs-*` fixture cases from
-`main_lib/tests/data/es_compat_cases.json` against:
+`testdata/es_compat_cases.json` against:
 
 - an in-process Powdrr HTTP server
 - a real Elasticsearch node
