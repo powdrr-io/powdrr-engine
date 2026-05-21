@@ -962,7 +962,7 @@ async fn handle_get_item(payload: Value) -> Result<Value, DynamoDbError> {
         request.projection_expression.as_ref(),
         request.expression_attribute_names.as_ref(),
     )?;
-    let response = execute_fast_path_query(
+    let response = execute_lookup_query(
         &request.table_name,
         ServingRequestPlan {
             select: projection,
@@ -970,7 +970,7 @@ async fn handle_get_item(payload: Value) -> Result<Value, DynamoDbError> {
             aggregate: None,
             order_by: vec![],
             limit: Some(1),
-            allow_slow_path: false,
+            allow_slow_path: true,
             explain: false,
         },
     )
@@ -1235,7 +1235,7 @@ async fn handle_batch_get_item(payload: Value) -> Result<Value, DynamoDbError> {
         let mut items = vec![];
         for key in keys_and_attributes.keys.iter() {
             let parsed_key = parse_key_map(key, &key_schema)?;
-            let response = execute_fast_path_query(
+            let response = execute_lookup_query(
                 table_name,
                 ServingRequestPlan {
                     select: projection.clone(),
@@ -1243,7 +1243,7 @@ async fn handle_batch_get_item(payload: Value) -> Result<Value, DynamoDbError> {
                     aggregate: None,
                     order_by: vec![],
                     limit: Some(1),
-                    allow_slow_path: false,
+                    allow_slow_path: true,
                     explain: false,
                 },
             )
@@ -1550,6 +1550,15 @@ async fn execute_fast_path_query(
         )));
     }
     Ok(response)
+}
+
+async fn execute_lookup_query(
+    table_name: &str,
+    request: ServingRequestPlan,
+) -> Result<ServingQueryResponse, DynamoDbError> {
+    execute_serving_query(table_name, request)
+        .await
+        .map_err(convert_serving_error)
 }
 
 fn convert_serving_error(error: ServingQueryError) -> DynamoDbError {
