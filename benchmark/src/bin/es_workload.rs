@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use gotham::mime;
 use gotham::test::TestServer;
 use powdrr_query_server::router::router;
@@ -187,6 +187,7 @@ struct LatencySummary {
     min_ms: f64,
     p50_ms: f64,
     p95_ms: f64,
+    p99_ms: f64,
     max_ms: f64,
 }
 
@@ -217,8 +218,8 @@ fn main() -> Result<()> {
         config.warmup, config.iterations
     );
     println!(
-        "{:<52} {:<10} {:>8} {:>8} {:>8} {:>8} {:>8}",
-        "case", "backend", "avg", "p50", "p95", "min", "max"
+        "{:<52} {:<10} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "case", "backend", "avg", "p50", "p95", "p99", "min", "max"
     );
 
     for case in selected_cases.iter() {
@@ -403,18 +404,20 @@ fn summarize_samples(samples: Vec<Duration>) -> Result<LatencySummary> {
         min_ms: millis[0],
         p50_ms: millis[len / 2],
         p95_ms: millis[((len - 1) * 95) / 100],
+        p99_ms: millis[((len - 1) * 99) / 100],
         max_ms: *millis.last().unwrap(),
     })
 }
 
 fn print_summary(case: &CompatibilityCase, backend: &str, summary: &LatencySummary) {
     println!(
-        "{:<52} {:<10} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2}",
+        "{:<52} {:<10} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2}",
         case.id,
         backend,
         summary.avg_ms,
         summary.p50_ms,
         summary.p95_ms,
+        summary.p99_ms,
         summary.min_ms,
         summary.max_ms
     );

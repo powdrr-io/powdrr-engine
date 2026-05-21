@@ -2233,78 +2233,87 @@ pub(crate) mod tests {
           }
         }"#;
 
-        futures::executor::block_on(STATE_PROVIDER.upsert_table_metadata(&CreateTable {
-            name: "logs".to_string(),
-            tags: HashMap::from([("_es_original".to_string(), original_index_body.to_string())]),
-            serving: None,
-            dynamodb: None,
-            mongodb: None,
-            redis: None,
-        }))
+        futures::executor::block_on(STATE_PROVIDER.upsert_table_metadata(
+            &serde_json::from_value::<CreateTable>(json!({
+                "name": "logs",
+                "tags": HashMap::from([("_es_original".to_string(), original_index_body.to_string())]),
+                "serving": null,
+                "dynamodb": null,
+                "mongodb": null,
+                "redis": null,
+            }))
+            .expect("test table metadata should deserialize"),
+        ))
         .unwrap();
         futures::executor::block_on(
-            STATE_PROVIDER.upsert_table_metadata(&CreateTable {
-                name: "logs_archive".to_string(),
-                tags: HashMap::from([(
-                    "_es_original".to_string(),
-                    json!({
-                        "aliases": {
-                            "logs_alias": {},
-                            "archive_alias": {}
-                        },
-                        "mappings": {
-                            "properties": {
-                                "index_col": {
-                                    "type": "keyword"
+            STATE_PROVIDER.upsert_table_metadata(
+                &serde_json::from_value::<CreateTable>(json!({
+                    "name": "logs_archive",
+                    "tags": HashMap::from([(
+                        "_es_original".to_string(),
+                        json!({
+                            "aliases": {
+                                "logs_alias": {},
+                                "archive_alias": {}
+                            },
+                            "mappings": {
+                                "properties": {
+                                    "index_col": {
+                                        "type": "keyword"
+                                    }
+                                }
+                            },
+                            "settings": {
+                                "index": {
+                                    "number_of_shards": 1,
+                                    "number_of_replicas": 0
                                 }
                             }
-                        },
-                        "settings": {
-                            "index": {
-                                "number_of_shards": 1,
-                                "number_of_replicas": 0
-                            }
-                        }
-                    })
-                    .to_string(),
-                )]),
-                serving: None,
-                dynamodb: None,
-                mongodb: None,
-                redis: None,
-            }),
+                        })
+                        .to_string(),
+                    )]),
+                    "serving": null,
+                    "dynamodb": null,
+                    "mongodb": null,
+                    "redis": null,
+                }))
+                .expect("test alias metadata should deserialize"),
+            ),
         )
         .unwrap();
         futures::executor::block_on(
-            STATE_PROVIDER.upsert_table_metadata(&CreateTable {
-                name: "events_extra".to_string(),
-                tags: HashMap::from([(
-                    "_es_original".to_string(),
-                    json!({
-                        "mappings": {
-                            "properties": {
-                                "message": {
-                                    "type": "text"
-                                },
-                                "index_col": {
-                                    "type": "long"
+            STATE_PROVIDER.upsert_table_metadata(
+                &serde_json::from_value::<CreateTable>(json!({
+                    "name": "events_extra",
+                    "tags": HashMap::from([(
+                        "_es_original".to_string(),
+                        json!({
+                            "mappings": {
+                                "properties": {
+                                    "message": {
+                                        "type": "text"
+                                    },
+                                    "index_col": {
+                                        "type": "long"
+                                    }
+                                }
+                            },
+                            "settings": {
+                                "index": {
+                                    "number_of_shards": 1,
+                                    "number_of_replicas": 0
                                 }
                             }
-                        },
-                        "settings": {
-                            "index": {
-                                "number_of_shards": 1,
-                                "number_of_replicas": 0
-                            }
-                        }
-                    })
-                    .to_string(),
-                )]),
-                serving: None,
-                dynamodb: None,
-                mongodb: None,
-                redis: None,
-            }),
+                        })
+                        .to_string(),
+                    )]),
+                    "serving": null,
+                    "dynamodb": null,
+                    "mongodb": null,
+                    "redis": null,
+                }))
+                .expect("test extra metadata should deserialize"),
+            ),
         )
         .unwrap();
 
