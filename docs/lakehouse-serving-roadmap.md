@@ -75,6 +75,9 @@ That is not the target architecture. The requirements call for an Iceberg-first
 serving engine with explicit, snapshot-aware acceleration artifacts rather than
 paired files and implicit sidecar conventions.
 
+For the storage-role terminology behind that transition, see
+[`docs/speedboat-vs-iceberg-architecture.md`](./speedboat-vs-iceberg-architecture.md).
+
 ## Product Direction
 
 The engine should evolve from:
