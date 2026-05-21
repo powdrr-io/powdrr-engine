@@ -44,6 +44,7 @@ pub struct QueryExecutionPlan {
     pub sql: QuerySqlTemplate,
     pub files: Vec<QueryInputFile>,
     pub delete_files: Vec<String>,
+    pub use_deletes_table: bool,
     pub extension_suffixes: Option<Vec<String>>,
     pub use_cpu_threadpool: bool,
 }
@@ -99,6 +100,7 @@ pub async fn execute_query_plan_batches(
         sql,
         files,
         delete_files,
+        use_deletes_table,
         extension_suffixes,
         use_cpu_threadpool,
     } = plan;
@@ -108,8 +110,16 @@ pub async fn execute_query_plan_batches(
     }
 
     let files = filter_query_input_extensions(files, extension_suffixes.as_ref());
-    let delete_local_tables = load_delete_local_tables(&delete_files).await?;
-    let deletes_table_name = create_deletes_union_table(&delete_local_tables).await?;
+    let delete_local_tables = if use_deletes_table {
+        load_delete_local_tables(&delete_files).await?
+    } else {
+        vec![]
+    };
+    let deletes_table_name = if use_deletes_table {
+        create_deletes_union_table(&delete_local_tables).await?
+    } else {
+        "deletes_table_unused".to_string()
+    };
     let grouped_files = group_query_input_files_by_schema(files);
 
     // Iceberg and speedboat share one execution entry point here; the only
@@ -148,7 +158,9 @@ pub async fn execute_query_plan_batches(
     for local_table in delete_local_tables.iter() {
         data_access::drop(local_table).await;
     }
-    data_access::drop(&deletes_table_name).await;
+    if use_deletes_table {
+        data_access::drop(&deletes_table_name).await;
+    }
 
     grouped_results.map(|results| results.into_iter().flatten().collect())
 }
