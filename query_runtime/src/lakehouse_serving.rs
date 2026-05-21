@@ -13,10 +13,10 @@ use serde_json::{Map, Value};
 
 use crate::data_access::{self, execute_sql_async};
 use crate::data_contract::{
-    checkpoint_extension_metadata_key,
-    ExtensionFile, FileDescriptor, IcebergAccessArtifact, IcebergFileStats, IcebergPartitionField,
-    IcebergRowGroupStats, IcebergSortField, ServingAggregateMeasure, ServingAggregateSpec,
-    ServingPattern, ServingTableConfig, TableDescription, TableMetadataCheckpoint,
+    checkpoint_extension_metadata_key, ExtensionFile, FileDescriptor, IcebergAccessArtifact,
+    IcebergFileStats, IcebergPartitionField, IcebergRowGroupStats, IcebergSortField,
+    ServingAggregateMeasure, ServingAggregateSpec, ServingPattern, ServingTableConfig,
+    TableDescription, TableMetadataCheckpoint,
 };
 use crate::peers::CheckpointDescriptor;
 use crate::prefetch::warm_iceberg_checkpoints;
@@ -1178,6 +1178,7 @@ pub async fn execute_checkpoint_exact_lookup_rows(
         .unwrap_or_default();
     let extension_files = flatten_extension_files(checkpoint);
     let checkpoint_key = checkpoint_cache_key(&checkpoint.get_descriptor());
+    let limit = request.normalized_limit(DEFAULT_LIMIT, MAX_LIMIT);
     if let Some(result) = maybe_execute_snapshot_lookup(
         &checkpoint_key,
         snapshot_exact_lookup_artifact_location(&checkpoint.checkpoint_id, &extension_files)
@@ -1187,22 +1188,44 @@ pub async fn execute_checkpoint_exact_lookup_rows(
         &speedboat_files,
         &delete_files,
         request,
-        request.normalized_limit(DEFAULT_LIMIT, MAX_LIMIT),
+        limit,
     )
     .await?
     {
         return Ok(Some(result.rows));
     }
-    Ok(maybe_execute_exact_lookup(
+    if let Some(result) = maybe_execute_exact_lookup(
         &files,
         &speedboat_files,
         &delete_files,
         &extension_files,
         request,
-        request.normalized_limit(DEFAULT_LIMIT, MAX_LIMIT),
+        limit,
     )
     .await?
-    .map(|result| result.rows))
+    {
+        return Ok(Some(result.rows));
+    }
+
+    let sql = build_sql("{target_table}", request, limit, !delete_files.is_empty())
+        .map_err(|error| error.message)?;
+    let rows = if request.aggregate.is_some() {
+        execute_aggregate_plan(&files, &speedboat_files, &delete_files, request, limit)
+            .await
+            .map_err(|error| error.message)?
+    } else {
+        execute_parallel_plan(
+            &files,
+            &speedboat_files,
+            &delete_files,
+            request,
+            &sql,
+            limit,
+        )
+        .await
+        .map_err(|error| error.message)?
+    };
+    Ok(Some(rows))
 }
 
 pub async fn execute_checkpoint_exact_id_lookup_rows(
@@ -1211,23 +1234,6 @@ pub async fn execute_checkpoint_exact_id_lookup_rows(
 ) -> Result<Option<Vec<Value>>, String> {
     if doc_ids.is_empty() {
         return Ok(Some(vec![]));
-    }
-
-    let extension_files = flatten_extension_files(checkpoint);
-    let checkpoint_key = checkpoint_cache_key(&checkpoint.get_descriptor());
-    if let Some(snapshot_exact_lookup_artifact) =
-        snapshot_exact_lookup_artifact_location(&checkpoint.checkpoint_id, &extension_files)
-    {
-        let cache =
-            get_or_build_snapshot_exact_lookup_cache(&checkpoint_key, &snapshot_exact_lookup_artifact)
-                .await?;
-        let mut rows = Vec::with_capacity(doc_ids.len());
-        for doc_id in doc_ids {
-            if let Some(entry) = cache.get(doc_id) {
-                rows.push(snapshot_exact_lookup_entry_to_value(entry));
-            }
-        }
-        return Ok(Some(rows));
     }
 
     let request = ReadPlan {
@@ -1356,6 +1362,7 @@ async fn maybe_execute_snapshot_lookup(
             ACCESS_ARTIFACT_KIND_SNAPSHOT_KEY_RANGE_LOOKUP.to_string(),
         ),
     };
+    let rows = project_rows_for_select(rows, request);
 
     Ok(Some(ServingExecutionResult {
         rows,
@@ -1394,7 +1401,10 @@ async fn maybe_execute_snapshot_exact_lookup_artifact(
     let mut rows = Vec::with_capacity(limit.min(doc_ids.len()));
     for doc_id in doc_ids {
         if let Some(entry) = cache.get(&doc_id) {
-            rows.push(snapshot_exact_lookup_entry_to_value(entry));
+            rows.push(project_row_for_select(
+                snapshot_exact_lookup_entry_to_value(entry),
+                request,
+            ));
         }
         if rows.len() >= limit {
             break;
@@ -1416,9 +1426,7 @@ async fn get_or_build_snapshot_exact_lookup_cache(
         return Ok(cache);
     }
 
-    let built = Arc::new(
-        build_snapshot_exact_lookup_cache(snapshot_exact_lookup_artifact).await?,
-    );
+    let built = Arc::new(build_snapshot_exact_lookup_cache(snapshot_exact_lookup_artifact).await?);
     let mut caches = SNAPSHOT_EXACT_LOOKUP_CACHE.lock().unwrap();
     Ok(caches
         .entry(checkpoint_key.to_string())
@@ -1451,7 +1459,12 @@ fn snapshot_exact_lookup_entry_from_batch(
     batch: &RecordBatch,
     row_index: usize,
 ) -> Result<Option<SnapshotExactLookupEntry>, String> {
-    let field_index = |field_name: &str| batch.schema().index_of(field_name).map_err(|error| error.to_string());
+    let field_index = |field_name: &str| {
+        batch
+            .schema()
+            .index_of(field_name)
+            .map_err(|error| error.to_string())
+    };
 
     let id_index = match field_index("_id") {
         Ok(index) => index,
@@ -1494,7 +1507,11 @@ fn snapshot_exact_lookup_entry_from_batch(
     }))
 }
 
-fn read_batch_i64_field(batch: &RecordBatch, field_name: &str, row_index: usize) -> Result<i64, String> {
+fn read_batch_i64_field(
+    batch: &RecordBatch,
+    field_name: &str,
+    row_index: usize,
+) -> Result<i64, String> {
     let field_index = batch
         .schema()
         .index_of(field_name)
@@ -1511,7 +1528,10 @@ fn read_batch_i64_field(batch: &RecordBatch, field_name: &str, row_index: usize)
         .unwrap_or_default())
 }
 
-fn read_snapshot_exact_lookup_source(batch: &RecordBatch, row_index: usize) -> Result<Value, String> {
+fn read_snapshot_exact_lookup_source(
+    batch: &RecordBatch,
+    row_index: usize,
+) -> Result<Value, String> {
     let field_index = batch
         .schema()
         .index_of("_source")
@@ -1550,6 +1570,34 @@ fn snapshot_exact_lookup_entry_to_value(entry: &SnapshotExactLookupEntry) -> Val
     row.insert("_version".to_string(), Value::from(entry.version));
     row.insert("_source".to_string(), entry.source.clone());
     Value::Object(row)
+}
+
+fn project_rows_for_select(rows: Vec<Value>, request: &ReadPlan) -> Vec<Value> {
+    if request.select.is_none() {
+        return rows;
+    }
+    rows.into_iter()
+        .map(|row| project_row_for_select(row, request))
+        .collect()
+}
+
+fn project_row_for_select(row: Value, request: &ReadPlan) -> Value {
+    let Some(select_fields) = normalized_select(request.select.clone()) else {
+        return row;
+    };
+    let Some(row_map) = row.as_object() else {
+        return row;
+    };
+    let source_map = row_map.get("_source").and_then(Value::as_object);
+    let mut projected = Map::with_capacity(select_fields.len());
+    for field in select_fields {
+        if let Some(value) = row_map.get(&field) {
+            projected.insert(field, value.clone());
+        } else if let Some(value) = source_map.and_then(|source| source.get(&field)) {
+            projected.insert(field, value.clone());
+        }
+    }
+    Value::Object(projected)
 }
 
 fn snapshot_lookup_plan(request: &ReadPlan) -> Option<SnapshotLookupPlan> {
@@ -1653,9 +1701,8 @@ async fn get_or_build_snapshot_lookup_cache(
         return Ok(cache);
     }
 
-    let built = Arc::new(
-        build_snapshot_lookup_cache(snapshot_lookup_artifact, files, delete_files).await?,
-    );
+    let built =
+        Arc::new(build_snapshot_lookup_cache(snapshot_lookup_artifact, files, delete_files).await?);
     let mut caches = SNAPSHOT_LOOKUP_CACHE.lock().unwrap();
     Ok(caches
         .entry(checkpoint_key.to_string())
@@ -4541,7 +4588,7 @@ fn build_sql(
     let select = match normalized_select(request.select.clone()) {
         Some(select_fields) => select_fields
             .iter()
-            .map(|field| format!("\"{}\"", escape_identifier(field)))
+            .map(|field| format!("t.\"{}\"", escape_identifier(field)))
             .collect::<Vec<_>>()
             .join(", "),
         None => {
@@ -4568,7 +4615,7 @@ fn build_sql(
     }
     if let Some(sort) = request.order_by.first() {
         sql.push_str(&format!(
-            " ORDER BY \"{}\" {}",
+            " ORDER BY t.\"{}\" {}",
             escape_identifier(&sort.field),
             if sort.descending { "DESC" } else { "ASC" }
         ));
@@ -4594,7 +4641,7 @@ fn build_aggregate_sql(
     let mut select_parts = aggregate
         .group_by
         .iter()
-        .map(|field| format!("\"{}\"", escape_identifier(field)))
+        .map(|field| format!("t.\"{}\"", escape_identifier(field)))
         .collect::<Vec<_>>();
     for plan in measure_plans.iter() {
         match (plan.function, partial) {
@@ -4607,49 +4654,49 @@ fn build_aggregate_sql(
                 escape_identifier(&plan.partial_value_alias)
             )),
             (AggregateFunction::Sum, false) => select_parts.push(format!(
-                "SUM(\"{}\") AS \"{}\"",
+                "SUM(t.\"{}\") AS \"{}\"",
                 escape_identifier(plan.field.as_ref().unwrap()),
                 escape_identifier(&plan.alias)
             )),
             (AggregateFunction::Sum, true) => select_parts.push(format!(
-                "SUM(\"{}\") AS \"{}\"",
+                "SUM(t.\"{}\") AS \"{}\"",
                 escape_identifier(plan.field.as_ref().unwrap()),
                 escape_identifier(&plan.partial_value_alias)
             )),
             (AggregateFunction::Avg, false) => select_parts.push(format!(
-                "AVG(\"{}\") AS \"{}\"",
+                "AVG(t.\"{}\") AS \"{}\"",
                 escape_identifier(plan.field.as_ref().unwrap()),
                 escape_identifier(&plan.alias)
             )),
             (AggregateFunction::Avg, true) => {
                 select_parts.push(format!(
-                    "SUM(\"{}\") AS \"{}\"",
+                    "SUM(t.\"{}\") AS \"{}\"",
                     escape_identifier(plan.field.as_ref().unwrap()),
                     escape_identifier(&plan.partial_value_alias)
                 ));
                 select_parts.push(format!(
-                    "COUNT(\"{}\") AS \"{}\"",
+                    "COUNT(t.\"{}\") AS \"{}\"",
                     escape_identifier(plan.field.as_ref().unwrap()),
                     escape_identifier(plan.partial_count_alias.as_ref().unwrap())
                 ));
             }
             (AggregateFunction::Min, false) => select_parts.push(format!(
-                "MIN(\"{}\") AS \"{}\"",
+                "MIN(t.\"{}\") AS \"{}\"",
                 escape_identifier(plan.field.as_ref().unwrap()),
                 escape_identifier(&plan.alias)
             )),
             (AggregateFunction::Min, true) => select_parts.push(format!(
-                "MIN(\"{}\") AS \"{}\"",
+                "MIN(t.\"{}\") AS \"{}\"",
                 escape_identifier(plan.field.as_ref().unwrap()),
                 escape_identifier(&plan.partial_value_alias)
             )),
             (AggregateFunction::Max, false) => select_parts.push(format!(
-                "MAX(\"{}\") AS \"{}\"",
+                "MAX(t.\"{}\") AS \"{}\"",
                 escape_identifier(plan.field.as_ref().unwrap()),
                 escape_identifier(&plan.alias)
             )),
             (AggregateFunction::Max, true) => select_parts.push(format!(
-                "MAX(\"{}\") AS \"{}\"",
+                "MAX(t.\"{}\") AS \"{}\"",
                 escape_identifier(plan.field.as_ref().unwrap()),
                 escape_identifier(&plan.partial_value_alias)
             )),
@@ -4675,7 +4722,7 @@ fn build_aggregate_sql(
             aggregate
                 .group_by
                 .iter()
-                .map(|field| format!("\"{}\"", escape_identifier(field)))
+                .map(|field| format!("t.\"{}\"", escape_identifier(field)))
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
@@ -4729,7 +4776,7 @@ fn aggregate_measure_plans(
 }
 
 fn sql_for_filter(filter: &crate::read_plan::ReadPredicate) -> Result<String, ServingQueryError> {
-    let field = format!("\"{}\"", escape_identifier(&filter.field));
+    let field = format!("t.\"{}\"", escape_identifier(&filter.field));
     if let Some(value) = filter.eq.as_ref() {
         return Ok(format!("{} = {}", field, sql_literal(value)?));
     }

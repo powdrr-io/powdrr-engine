@@ -792,14 +792,38 @@ fn found_document_value(index_name: &str, row: &Value) -> Value {
     );
     result.insert("_primary_term".to_string(), Value::from(1));
     result.insert("found".to_string(), Value::Bool(true));
-    result.insert(
-        "_source".to_string(),
-        row_map
-            .get("_source")
-            .cloned()
-            .unwrap_or_else(|| Value::Object(Map::new())),
-    );
+    result.insert("_source".to_string(), document_source_value(&row_map));
     Value::Object(result)
+}
+
+fn document_source_value(row_map: &Map<String, Value>) -> Value {
+    if let Some(source) = row_map.get("_source") {
+        return match source {
+            Value::String(text) => {
+                serde_json::from_str(text).unwrap_or(Value::String(text.clone()))
+            }
+            other => other.clone(),
+        };
+    }
+
+    let mut source = Map::new();
+    for (field, value) in row_map.iter() {
+        if matches!(
+            field.as_str(),
+            "_id"
+                | "_id_seq_no"
+                | "_version"
+                | "_seq_no"
+                | "_source"
+                | "score"
+                | "term_cnt"
+                | "word_cnt"
+        ) {
+            continue;
+        }
+        source.insert(field.clone(), value.clone());
+    }
+    Value::Object(source)
 }
 
 async fn load_document_lookup_checkpoint(
@@ -2700,11 +2724,8 @@ pub fn es_mget(mut state: State) -> Pin<Box<HandlerFuture>> {
             let docs = match lookup_document_values(target, ids).await {
                 Ok(docs) => docs,
                 Err(message) => {
-                    let res = invalid_request_response(
-                        &state,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &message,
-                    );
+                    let res =
+                        invalid_request_response(&state, StatusCode::SERVICE_UNAVAILABLE, &message);
                     return Ok((state, res));
                 }
             };
@@ -2713,14 +2734,16 @@ pub fn es_mget(mut state: State) -> Pin<Box<HandlerFuture>> {
 
         let docs = resolved_docs
             .into_iter()
-            .map(|(index_name, doc_id, resolved_target)| match resolved_target {
-                Some(target) => found_docs_by_target
-                    .get(&target)
-                    .and_then(|docs| docs.get(&doc_id))
-                    .cloned()
-                    .unwrap_or_else(|| missing_document_value(&index_name, &doc_id)),
-                None => missing_document_value(&index_name, &doc_id),
-            })
+            .map(
+                |(index_name, doc_id, resolved_target)| match resolved_target {
+                    Some(target) => found_docs_by_target
+                        .get(&target)
+                        .and_then(|docs| docs.get(&doc_id))
+                        .cloned()
+                        .unwrap_or_else(|| missing_document_value(&index_name, &doc_id)),
+                    None => missing_document_value(&index_name, &doc_id),
+                },
+            )
             .collect::<Vec<_>>();
 
         let res = create_response(
@@ -2848,14 +2871,16 @@ pub fn es_mget_table(mut state: State) -> Pin<Box<HandlerFuture>> {
 
         let docs = resolved_docs
             .into_iter()
-            .map(|(index_name, doc_id, resolved_target)| match resolved_target {
-                Some(target) => found_docs_by_target
-                    .get(&target)
-                    .and_then(|docs| docs.get(&doc_id))
-                    .cloned()
-                    .unwrap_or_else(|| missing_document_value(&index_name, &doc_id)),
-                None => missing_document_value(&index_name, &doc_id),
-            })
+            .map(
+                |(index_name, doc_id, resolved_target)| match resolved_target {
+                    Some(target) => found_docs_by_target
+                        .get(&target)
+                        .and_then(|docs| docs.get(&doc_id))
+                        .cloned()
+                        .unwrap_or_else(|| missing_document_value(&index_name, &doc_id)),
+                    None => missing_document_value(&index_name, &doc_id),
+                },
+            )
             .collect::<Vec<_>>();
 
         let res = create_response(
