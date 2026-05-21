@@ -576,6 +576,8 @@ pub struct TableBody {
     pub dynamodb: Option<crate::data_contract::DynamoDbTableConfig>,
     #[serde(default)]
     pub mongodb: Option<crate::data_contract::MongoDbTableConfig>,
+    #[serde(default)]
+    pub redis: Option<crate::data_contract::RedisTableConfig>,
 }
 
 impl TableBody {
@@ -586,6 +588,7 @@ impl TableBody {
             serving: None,
             dynamodb: None,
             mongodb: None,
+            redis: None,
         }
     }
 }

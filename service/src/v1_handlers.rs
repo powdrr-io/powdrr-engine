@@ -541,6 +541,8 @@ mod tests {
             tags: Default::default(),
             serving: None,
             dynamodb: None,
+            mongodb: None,
+            redis: None,
         };
 
         let client = test_server.client();

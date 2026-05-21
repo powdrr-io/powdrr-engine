@@ -17,6 +17,7 @@ pub(crate) struct OperatingMode {
     pub(crate) testing_enabled: bool,
     pub(crate) port: u32,
     pub(crate) mongo_port: Option<u32>,
+    pub(crate) redis_port: Option<u32>,
     pub(crate) state_mode: Option<TestProcessingMode>,
 }
 
@@ -32,6 +33,9 @@ pub(crate) fn get_operating_mode(_command_line_args: &Vec<String>) -> OperatingM
     let mongo_port = std::env::var("MONGO_PORT")
         .ok()
         .map(|port| port.parse::<u32>().unwrap());
+    let redis_port = std::env::var("REDIS_FRONTEND_PORT")
+        .ok()
+        .map(|port| port.parse::<u32>().unwrap());
 
     match mode.as_str() {
         "default" => OperatingMode {
@@ -39,6 +43,7 @@ pub(crate) fn get_operating_mode(_command_line_args: &Vec<String>) -> OperatingM
             testing_enabled: true,
             port,
             mongo_port,
+            redis_port,
             state_mode: None,
         },
         "docker" => OperatingMode {
@@ -46,6 +51,7 @@ pub(crate) fn get_operating_mode(_command_line_args: &Vec<String>) -> OperatingM
             testing_enabled: true,
             port,
             mongo_port,
+            redis_port,
             state_mode: None,
         },
         "leaderless" => OperatingMode {
@@ -53,6 +59,7 @@ pub(crate) fn get_operating_mode(_command_line_args: &Vec<String>) -> OperatingM
             testing_enabled: false,
             port,
             mongo_port,
+            redis_port,
             state_mode: Some(TestProcessingMode {
                 state_mode: StateMode::Leaderless {
                     server_address: std::env::var("SERVICE_BASE_URL")

@@ -258,6 +258,7 @@ impl EphemeralServiceImpl {
                     serving: None,
                     dynamodb: None,
                     mongodb: None,
+                    redis: None,
                 },
             );
         }
@@ -1343,6 +1344,7 @@ mod tests {
                     serving: None,
                     dynamodb: None,
                     mongodb: None,
+                    redis: None,
                 },
             )
             .await
