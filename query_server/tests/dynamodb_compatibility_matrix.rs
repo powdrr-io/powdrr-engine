@@ -373,6 +373,7 @@ async fn build_differential_fixture(base_url: &str) -> DifferentialFixture {
     .await;
     eprintln!("dynamo fixture: adding hidden Powdrr checkpoint");
     add_powdrr_checkpoint(base_url, &hidden_table_name, &parquet_path).await;
+    advance_powdrr_checkpoints(base_url).await;
 
     let powdrr_client = dynamodb_client(base_url).await;
     let localstack_client = dynamodb_client("http://127.0.0.1:4566").await;
@@ -2395,6 +2396,28 @@ async fn add_powdrr_checkpoint(base_url: &str, table_name: &str, parquet_path: &
     );
 }
 
+async fn advance_powdrr_checkpoints(base_url: &str) {
+    let client = powdrr_http_client();
+    let url = format!("{}/_test/v1/_advance_checkpoints", base_url);
+    let mut last_error = String::new();
+
+    for _ in 0..20 {
+        match client.put(&url).send().await {
+            Ok(response) => match response.error_for_status() {
+                Ok(_) => return,
+                Err(error) => last_error = error.to_string(),
+            },
+            Err(error) => last_error = error.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    panic!(
+        "PUT /_test/v1/_advance_checkpoints failed after retries: {}",
+        last_error
+    );
+}
+
 async fn put_powdrr_dynamodb_config(
     base_url: &str,
     table_name: &str,
@@ -2449,6 +2472,7 @@ async fn configure_powdrr_table(
 ) {
     add_powdrr_checkpoint(base_url, table_name, parquet_path).await;
     put_powdrr_dynamodb_config(base_url, table_name, config).await;
+    advance_powdrr_checkpoints(base_url).await;
 }
 
 async fn configure_powdrr_testing_mode(base_url: &str) {
