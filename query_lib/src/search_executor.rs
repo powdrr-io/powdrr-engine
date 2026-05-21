@@ -2,14 +2,15 @@ use crate::elastic_search_api_types::QueryStringSearch;
 use crate::elastic_search_commands::SqlCommand;
 use crate::elastic_search_commands::UpdateByQueryCommand;
 use crate::elastic_search_common::{
-    Command, CommandContext, ElasticSearchResponse, ParseError, ResultGeneratorFuture,
-    execute_command,
+    execute_command, Command, CommandContext, ElasticSearchResponse, ParseError,
+    ResultGeneratorFuture,
 };
 use crate::elastic_search_datetime_parser;
 use crate::elastic_search_responses::{
-    AggregationResult, AverageAggregationResult, CardinalityAggregationResult,
-    FilterAggregationResult, HistogramAggregationBucket, HistogramAggregationResult, QueryFailure,
-    QueryResults, TermAggregationBucket, TermAggregationResult, compare_query_result_hits_desc,
+    compare_query_result_hits_desc, AggregationResult, AverageAggregationResult,
+    CardinalityAggregationResult, FilterAggregationResult, HistogramAggregationBucket,
+    HistogramAggregationResult, QueryFailure, QueryResults, TermAggregationBucket,
+    TermAggregationResult,
 };
 use crate::peers::{
     CheckpointDescriptor, PrivateExactConstraintGroup, PrivateInvocation,
@@ -116,6 +117,12 @@ pub(crate) struct SearchPerformanceAssessment {
     pub reason: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchSqlProjection {
+    FullRow,
+    SourceProjection,
+}
+
 pub struct SearchCommand {
     #[allow(dead_code)]
     pub search_plan: search_plan::SearchPlan,
@@ -126,6 +133,8 @@ pub struct SearchCommand {
     execution_strategy: SearchExecutionStrategy,
     typed_aggregation_specs: Option<Vec<PrivateSearchAggregationSpec>>,
     typed_sort_specs: Vec<PrivateSearchSortSpec>,
+    source_projection_sql: Option<crate::schema_massager::SqlQuery>,
+    source_projection_exact_sql: Option<crate::schema_massager::SqlQuery>,
     exact_sql: Option<crate::schema_massager::SqlQuery>,
     exact_constraints: Vec<PrivateExactConstraintGroup>,
     range_constraints: Vec<PrivateSearchRangeConstraint>,
@@ -192,6 +201,7 @@ impl SearchCommand {
     async fn private_search_invocation(&self) -> Option<PrivateSearchInvocation> {
         let legacy_command = self.legacy_sql_command()?;
         let checkpoints = self.current_target_snapshots(legacy_command).await;
+        let use_source_projection = self.can_use_source_projection(&checkpoints).await;
         let size = if self.read_plan.search_after.is_some() {
             usize::MAX
         } else {
@@ -205,9 +215,26 @@ impl SearchCommand {
         {
             required_extensions.push("es".to_string());
         }
+
+        let sql = if use_source_projection {
+            self.source_projection_sql
+                .clone()
+                .unwrap_or_else(|| legacy_command.sql.clone())
+        } else {
+            legacy_command.sql.clone()
+        };
+
+        let exact_sql = if use_source_projection {
+            self.source_projection_exact_sql
+                .clone()
+                .or_else(|| self.exact_sql.clone())
+        } else {
+            self.exact_sql.clone()
+        };
+
         Some(PrivateSearchInvocation {
-            sql: legacy_command.sql.clone(),
-            exact_sql: self.exact_sql.clone(),
+            sql,
+            exact_sql,
             exact_constraints: self.exact_constraints.clone(),
             range_constraints: self.range_constraints.clone(),
             required_extensions,
@@ -241,6 +268,29 @@ impl SearchCommand {
                     e
                 );
                 vec![]
+            }
+        }
+    }
+
+    async fn can_use_source_projection(&self, checkpoints: &[CheckpointDescriptor]) -> bool {
+        if !search_plan_returns_hits(&self.search_plan) || self.source_projection_sql.is_none() {
+            return false;
+        }
+
+        let Some(target_checkpoint) = checkpoints.first() else {
+            return false;
+        };
+
+        match runtime_bindings::get_checkpoint(target_checkpoint.clone()).await {
+            Ok(Some(table_metadata)) => table_schema_has_source_field(&table_metadata.schema),
+            Ok(None) => false,
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to inspect checkpoint schema for source projection on {}: {}",
+                    target_checkpoint,
+                    error
+                );
+                false
             }
         }
     }
@@ -649,10 +699,23 @@ pub(crate) fn search_plan_to_command_with_options(
 ) -> Result<SearchCommand, ParseError> {
     let backend =
         compile_legacy_sql_command(&plan, query, doc_id_field_name, include_deletes_join)?;
+    let source_projection_sql = compile_source_projection_sql_command(
+        &plan,
+        query,
+        doc_id_field_name,
+        include_deletes_join,
+    )
+    .map(|command| command.map(|command| command.sql))?;
     let read_plan = read_plan_from_search_plan(&plan);
     let exact_constraints = compile_exact_constraint_groups(&read_plan)?;
     let range_constraints = compile_range_constraints(&read_plan);
     let exact_sql = compile_exact_sql_query(&plan, query, doc_id_field_name, include_deletes_join)?;
+    let source_projection_exact_sql = compile_source_projection_exact_sql_query(
+        &plan,
+        query,
+        doc_id_field_name,
+        include_deletes_join,
+    )?;
     let execution_plan =
         create_execution_plan(&read_plan, &plan.target, &backend, exact_sql.is_some());
     let typed_aggregation_specs = private_search_aggregation_specs(&plan.aggregations);
@@ -680,6 +743,8 @@ pub(crate) fn search_plan_to_command_with_options(
         execution_strategy,
         typed_aggregation_specs,
         typed_sort_specs: typed_sort_specs.unwrap_or_default(),
+        source_projection_sql,
+        source_projection_exact_sql,
         exact_sql,
         exact_constraints,
         range_constraints,
@@ -1427,6 +1492,10 @@ fn histogram_bound_to_timestamp_millis(value: &Value) -> Option<i64> {
         .map(|datetime| datetime.with_timezone(&Utc).timestamp_millis())
 }
 
+fn table_schema_has_source_field(schema: &crate::schema_massager::PowdrrSchema) -> bool {
+    schema.fields.iter().any(|field| field.name == "_source")
+}
+
 fn timestamp_millis_to_key_as_string(timestamp_ms: i64) -> String {
     DateTime::<Utc>::from_timestamp_millis(timestamp_ms)
         .unwrap()
@@ -1439,9 +1508,50 @@ fn compile_legacy_sql_command(
     doc_id_field_name: Option<&str>,
     include_deletes_join: bool,
 ) -> Result<SqlCommand, ParseError> {
+    compile_sql_command(
+        plan,
+        query,
+        doc_id_field_name,
+        include_deletes_join,
+        SearchSqlProjection::FullRow,
+    )
+}
+
+fn compile_source_projection_sql_command(
+    plan: &search_plan::SearchPlan,
+    query: &QueryStringSearch,
+    doc_id_field_name: Option<&str>,
+    include_deletes_join: bool,
+) -> Result<Option<SqlCommand>, ParseError> {
+    if !search_plan_returns_hits(plan) {
+        return Ok(None);
+    }
+
+    compile_sql_command(
+        plan,
+        query,
+        doc_id_field_name,
+        include_deletes_join,
+        SearchSqlProjection::SourceProjection,
+    )
+    .map(Some)
+}
+
+fn compile_sql_command(
+    plan: &search_plan::SearchPlan,
+    query: &QueryStringSearch,
+    doc_id_field_name: Option<&str>,
+    include_deletes_join: bool,
+    projection: SearchSqlProjection,
+) -> Result<SqlCommand, ParseError> {
+    let doc_id_field_name = doc_id_field_name.unwrap_or("_id_seq_no");
+    let returns_hits = search_plan_returns_hits(plan);
     let mut builder = SqlBuilder::for_query_with_options(
-        true,
-        doc_id_field_name.unwrap_or("_id_seq_no"),
+        match projection {
+            SearchSqlProjection::FullRow => returns_hits,
+            SearchSqlProjection::SourceProjection => false,
+        },
+        doc_id_field_name,
         include_deletes_join,
     );
 
@@ -1455,6 +1565,7 @@ fn compile_legacy_sql_command(
         apply_query_plan(&mut builder, query_plan)?;
     }
 
+    append_projection_fields_for_query(&mut builder, plan, doc_id_field_name, projection);
     append_sort_projection_fields(&mut builder, &plan.sort);
 
     let table_name = match &plan.target {
@@ -1520,6 +1631,41 @@ fn compile_exact_sql_query(
     doc_id_field_name: Option<&str>,
     include_deletes_join: bool,
 ) -> Result<Option<crate::schema_massager::SqlQuery>, ParseError> {
+    compile_exact_sql_query_with_projection(
+        plan,
+        query,
+        doc_id_field_name,
+        include_deletes_join,
+        SearchSqlProjection::FullRow,
+    )
+}
+
+fn compile_source_projection_exact_sql_query(
+    plan: &search_plan::SearchPlan,
+    query: &QueryStringSearch,
+    doc_id_field_name: Option<&str>,
+    include_deletes_join: bool,
+) -> Result<Option<crate::schema_massager::SqlQuery>, ParseError> {
+    if !search_plan_returns_hits(plan) {
+        return Ok(None);
+    }
+
+    compile_exact_sql_query_with_projection(
+        plan,
+        query,
+        doc_id_field_name,
+        include_deletes_join,
+        SearchSqlProjection::SourceProjection,
+    )
+}
+
+fn compile_exact_sql_query_with_projection(
+    plan: &search_plan::SearchPlan,
+    query: &QueryStringSearch,
+    doc_id_field_name: Option<&str>,
+    include_deletes_join: bool,
+    projection: SearchSqlProjection,
+) -> Result<Option<crate::schema_massager::SqlQuery>, ParseError> {
     let Some(query_plan) = &plan.query else {
         return Ok(None);
     };
@@ -1531,9 +1677,16 @@ fn compile_exact_sql_query(
     }
 
     let doc_id_field_name = doc_id_field_name.unwrap_or("_id_seq_no");
+    let returns_hits = search_plan_returns_hits(plan);
     let normalized_doc_id_field_name = doc_id_field_name.replace(".", "_");
-    let mut builder =
-        SqlBuilder::for_query_with_options(true, doc_id_field_name, include_deletes_join);
+    let mut builder = SqlBuilder::for_query_with_options(
+        match projection {
+            SearchSqlProjection::FullRow => returns_hits,
+            SearchSqlProjection::SourceProjection => false,
+        },
+        doc_id_field_name,
+        include_deletes_join,
+    );
 
     for (index, group) in groups.iter().enumerate() {
         let alias = format!("ei{index}");
@@ -1584,6 +1737,7 @@ fn compile_exact_sql_query(
         }
     }
 
+    append_projection_fields_for_query(&mut builder, plan, doc_id_field_name, projection);
     append_sort_projection_fields(&mut builder, &plan.sort);
 
     let table_name = match &plan.target {
@@ -1819,6 +1973,154 @@ fn append_sort_projection_fields(builder: &mut SqlBuilder, sorts: &[search_plan:
             expression: SqlExpression::FieldRef("t".to_string(), field.clone()),
         });
     }
+}
+
+fn search_plan_returns_hits(plan: &search_plan::SearchPlan) -> bool {
+    plan.size.unwrap_or(10) > 0
+}
+
+fn append_projection_fields_for_query(
+    builder: &mut SqlBuilder,
+    plan: &search_plan::SearchPlan,
+    doc_id_field_name: &str,
+    projection: SearchSqlProjection,
+) {
+    if search_plan_returns_hits(plan) {
+        if matches!(projection, SearchSqlProjection::SourceProjection) {
+            append_projection_fields_for_source_hit_query(builder, plan);
+        }
+    } else {
+        append_projection_fields_for_agg_only_query(builder, plan, doc_id_field_name);
+    }
+}
+
+fn append_projection_fields_for_source_hit_query(
+    builder: &mut SqlBuilder,
+    plan: &search_plan::SearchPlan,
+) {
+    push_projection_field(
+        builder,
+        "_id",
+        SqlExpression::FieldRef("t".to_string(), "_id".to_string()),
+    );
+    push_projection_field(
+        builder,
+        "_version",
+        SqlExpression::FieldRef("t".to_string(), "_version".to_string()),
+    );
+    push_projection_field(
+        builder,
+        "_seq_no",
+        SqlExpression::FieldRef("t".to_string(), "_seq_no".to_string()),
+    );
+    push_projection_field(
+        builder,
+        "_source",
+        SqlExpression::FieldRef("t".to_string(), "_source".to_string()),
+    );
+    append_aggregation_projection_fields(builder, &plan.aggregations);
+}
+
+fn append_projection_fields_for_agg_only_query(
+    builder: &mut SqlBuilder,
+    plan: &search_plan::SearchPlan,
+    doc_id_field_name: &str,
+) {
+    push_projection_field(
+        builder,
+        "__powdrr_row_id",
+        SqlExpression::FieldRef("t".to_string(), doc_id_field_name.replace('.', "_")),
+    );
+    append_aggregation_projection_fields(builder, &plan.aggregations);
+}
+
+fn append_aggregation_projection_fields(
+    builder: &mut SqlBuilder,
+    aggregations: &[search_plan::AggregationPlan],
+) {
+    for aggregation in aggregations {
+        append_aggregation_plan_projection_fields(builder, &aggregation.spec);
+    }
+}
+
+fn append_aggregation_plan_projection_fields(
+    builder: &mut SqlBuilder,
+    aggregation: &search_plan::AggregationPlanSpec,
+) {
+    match aggregation {
+        search_plan::AggregationPlanSpec::Terms(plan) => {
+            push_source_field_projection(builder, &plan.field);
+            append_aggregation_projection_fields(builder, &plan.sub_aggregations);
+        }
+        search_plan::AggregationPlanSpec::Missing(plan) => {
+            push_source_field_projection(builder, &plan.field);
+            append_aggregation_projection_fields(builder, &plan.sub_aggregations);
+        }
+        search_plan::AggregationPlanSpec::Filter(plan) => {
+            append_aggregation_filter_projection_fields(builder, &plan.filter);
+            append_aggregation_projection_fields(builder, &plan.sub_aggregations);
+        }
+        search_plan::AggregationPlanSpec::DateHistogram(plan) => {
+            push_source_field_projection(builder, &plan.field);
+            append_aggregation_projection_fields(builder, &plan.sub_aggregations);
+        }
+        search_plan::AggregationPlanSpec::Cardinality(plan) => {
+            push_source_field_projection(builder, &plan.field);
+            append_aggregation_projection_fields(builder, &plan.sub_aggregations);
+        }
+        search_plan::AggregationPlanSpec::Range(plan) => {
+            append_range_bounds_projection_fields(builder, &plan.range);
+            append_aggregation_projection_fields(builder, &plan.sub_aggregations);
+        }
+        search_plan::AggregationPlanSpec::Average(plan) => {
+            push_source_field_projection(builder, &plan.field);
+            append_aggregation_projection_fields(builder, &plan.sub_aggregations);
+        }
+    }
+}
+
+fn append_aggregation_filter_projection_fields(
+    builder: &mut SqlBuilder,
+    filter: &search_plan::AggregationFilterPlan,
+) {
+    match filter {
+        search_plan::AggregationFilterPlan::Term { field, .. } => {
+            push_source_field_projection(builder, field);
+        }
+        search_plan::AggregationFilterPlan::Range(bounds) => {
+            append_range_bounds_projection_fields(builder, bounds);
+        }
+    }
+}
+
+fn append_range_bounds_projection_fields(
+    builder: &mut SqlBuilder,
+    range: &search_plan::AggregationRangeBoundsPlan,
+) {
+    match range {
+        search_plan::AggregationRangeBoundsPlan::Raw { field, .. }
+        | search_plan::AggregationRangeBoundsPlan::Structured { field, .. } => {
+            push_source_field_projection(builder, field);
+        }
+    }
+}
+
+fn push_source_field_projection(builder: &mut SqlBuilder, field: &str) {
+    push_projection_field(
+        builder,
+        field,
+        SqlExpression::FieldRef("t".to_string(), field.to_string()),
+    );
+}
+
+fn push_projection_field(builder: &mut SqlBuilder, name: &str, expression: SqlExpression) {
+    if builder.all_fields || builder.fields.iter().any(|field| field.name == name) {
+        return;
+    }
+    builder.fields.push(FieldExpression {
+        name: name.to_string(),
+        expression,
+    });
 }
 
 fn create_execution_plan(

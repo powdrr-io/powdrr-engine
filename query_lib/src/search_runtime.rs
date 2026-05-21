@@ -6,13 +6,24 @@ use crate::elastic_search_responses::{
     RangeAggregationResult, TermAggregationBucket, TermAggregationResult,
 };
 use crate::schema_massager::{
-    PowdrrDataType, PowdrrField, PowdrrSchema, SqlQuery, to_powdrr_schema,
+    to_powdrr_schema, PowdrrDataType, PowdrrField, PowdrrSchema, SqlQuery,
 };
-use arrow_json::WriterBuilder;
 use arrow_json::writer::LineDelimited;
-use datafusion::{arrow::array::RecordBatch, prelude::DataFrame};
+use arrow_json::WriterBuilder;
+use datafusion::{
+    arrow::{
+        array::{
+            Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int32Array,
+            Int64Array, LargeListArray, LargeStringArray, ListArray, RecordBatch, StringArray,
+            StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+            TimestampNanosecondArray, TimestampSecondArray, UInt32Array, UInt64Array,
+        },
+        datatypes::{DataType, TimeUnit},
+    },
+    prelude::DataFrame,
+};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Number, Value};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -115,6 +126,20 @@ pub async fn batches_to_serde_value(
         _ => Some(to_powdrr_schema(&record_batches.get(0).unwrap().schema())),
     };
 
+    let parsed_json = match record_batches_to_values(record_batches) {
+        Ok(values) => values,
+        Err(_) => batches_to_serde_value_via_arrow_json(record_batches)?,
+    };
+
+    Ok(SerdeValueResult {
+        values: parsed_json,
+        schema,
+    })
+}
+
+fn batches_to_serde_value_via_arrow_json(
+    record_batches: &Vec<RecordBatch>,
+) -> Result<Vec<Value>, CommandError> {
     let record_batch_references: Vec<&RecordBatch> = record_batches.iter().collect();
 
     let buf = Vec::new();
@@ -127,15 +152,203 @@ pub async fn batches_to_serde_value(
 
     let buf = writer.into_inner();
     let reader = String::from_utf8(buf).unwrap();
-    let parsed_json: Vec<Value> = reader
+    Ok(reader
         .lines()
         .map(|x| serde_json::from_str(x).unwrap())
-        .collect();
+        .collect())
+}
 
-    Ok(SerdeValueResult {
-        values: parsed_json,
-        schema,
-    })
+pub(crate) fn record_batches_to_values(
+    record_batches: &[RecordBatch],
+) -> Result<Vec<Value>, CommandError> {
+    let mut values = Vec::new();
+    for batch in record_batches {
+        values.extend(record_batch_to_values(batch)?);
+    }
+    Ok(values)
+}
+
+pub(crate) fn record_batch_to_values(batch: &RecordBatch) -> Result<Vec<Value>, CommandError> {
+    let schema = batch.schema();
+    let mut values = Vec::with_capacity(batch.num_rows());
+    for row_index in 0..batch.num_rows() {
+        let mut value_map = Map::with_capacity(batch.num_columns());
+        for (field, column) in schema.fields().iter().zip(batch.columns()) {
+            value_map.insert(
+                field.name().clone(),
+                array_value_to_json(column.as_ref(), row_index)?,
+            );
+        }
+        values.push(Value::Object(value_map));
+    }
+    Ok(values)
+}
+
+pub(crate) fn array_value_to_json(
+    array: &dyn Array,
+    row_index: usize,
+) -> Result<Value, CommandError> {
+    if array.is_null(row_index) {
+        return Ok(Value::Null);
+    }
+
+    match array.data_type() {
+        DataType::Boolean => Ok(Value::Bool(
+            array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("boolean array")
+                .value(row_index),
+        )),
+        DataType::Utf8 => Ok(Value::String(
+            array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("string array")
+                .value(row_index)
+                .to_string(),
+        )),
+        DataType::LargeUtf8 => Ok(Value::String(
+            array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("large string array")
+                .value(row_index)
+                .to_string(),
+        )),
+        DataType::Int32 => Ok(Value::from(
+            array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("int32 array")
+                .value(row_index),
+        )),
+        DataType::Int64 => Ok(Value::from(
+            array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64 array")
+                .value(row_index),
+        )),
+        DataType::UInt32 => Ok(Value::from(
+            array
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .expect("uint32 array")
+                .value(row_index),
+        )),
+        DataType::UInt64 => Ok(Value::from(
+            array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("uint64 array")
+                .value(row_index),
+        )),
+        DataType::Float32 => Ok(json_number_value(
+            array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("float32 array")
+                .value(row_index) as f64,
+        )),
+        DataType::Float64 => Ok(json_number_value(
+            array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("float64 array")
+                .value(row_index),
+        )),
+        DataType::Timestamp(TimeUnit::Second, _) => Ok(Value::from(
+            array
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .expect("timestamp second array")
+                .value(row_index),
+        )),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => Ok(Value::from(
+            array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .expect("timestamp millisecond array")
+                .value(row_index),
+        )),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => Ok(Value::from(
+            array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .expect("timestamp microsecond array")
+                .value(row_index),
+        )),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => Ok(Value::from(
+            array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .expect("timestamp nanosecond array")
+                .value(row_index),
+        )),
+        DataType::Date32 => Ok(Value::from(
+            array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .expect("date32 array")
+                .value(row_index),
+        )),
+        DataType::Date64 => Ok(Value::from(
+            array
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .expect("date64 array")
+                .value(row_index),
+        )),
+        DataType::Struct(fields) => {
+            let struct_array = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("struct array");
+            let mut value_map = Map::with_capacity(fields.len());
+            for (field, column) in fields.iter().zip(struct_array.columns()) {
+                value_map.insert(
+                    field.name().clone(),
+                    array_value_to_json(column.as_ref(), row_index)?,
+                );
+            }
+            Ok(Value::Object(value_map))
+        }
+        DataType::List(_) => {
+            let list_array = array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("list array");
+            list_array_to_json(list_array.value(row_index).as_ref())
+        }
+        DataType::LargeList(_) => {
+            let list_array = array
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .expect("large list array");
+            list_array_to_json(list_array.value(row_index).as_ref())
+        }
+        unsupported => Err(CommandError {
+            message: format!(
+                "Direct batch JSON conversion does not support Arrow type {:?}",
+                unsupported
+            ),
+        }),
+    }
+}
+
+fn list_array_to_json(array: &dyn Array) -> Result<Value, CommandError> {
+    let mut values = Vec::with_capacity(array.len());
+    for row_index in 0..array.len() {
+        values.push(array_value_to_json(array, row_index)?);
+    }
+    Ok(Value::Array(values))
+}
+
+fn json_number_value(value: f64) -> Value {
+    Number::from_f64(value)
+        .map(Value::Number)
+        .unwrap_or(Value::Null)
 }
 
 #[derive(Clone)]
