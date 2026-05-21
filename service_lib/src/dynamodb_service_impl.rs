@@ -845,6 +845,7 @@ impl DynamoDBServiceImpl {
                 serving: None,
                 dynamodb: None,
                 mongodb: None,
+                redis: None,
             },
         )
         .await?;
@@ -914,6 +915,7 @@ impl DynamoDBServiceImpl {
                     serving: create_table.serving.clone(),
                     dynamodb: create_table.dynamodb.clone(),
                     mongodb: create_table.mongodb.clone(),
+                    redis: create_table.redis.clone(),
                 },
             )
             .await
@@ -936,6 +938,7 @@ impl DynamoDBServiceImpl {
                     serving: x.serving.clone(),
                     dynamodb: x.dynamodb.clone(),
                     mongodb: x.mongodb.clone(),
+                    redis: x.redis.clone(),
                 })
             })
             .map_err(from_modyne)?;
@@ -961,6 +964,7 @@ impl DynamoDBServiceImpl {
                                 serving: x.serving.clone(),
                                 dynamodb: x.dynamodb.clone(),
                                 mongodb: x.mongodb.clone(),
+                                redis: x.redis.clone(),
                             })
                         })
                         .map_err(from_modyne),
@@ -2175,6 +2179,7 @@ mod tests {
                     serving: None,
                     dynamodb: None,
                     mongodb: None,
+                    redis: None,
                 },
             )
             .await

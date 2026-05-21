@@ -5630,6 +5630,7 @@ dependencies = [
  "powdrr-control-plane",
  "powdrr-query-lib",
  "powdrr-query-runtime",
+ "redis",
  "reqwest",
  "serde",
  "serde_arrow",

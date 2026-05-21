@@ -38,6 +38,7 @@ aws-config = "1.8.3"
 aws-credential-types = "1.2.4"
 aws-sdk-dynamodb = "1.86.0"
 mongodb = "3.3.0"
+redis = "0.30.0"
 reqwest = { version = "0.12.14", default-features = false, features = ["json", "blocking", "rustls-tls"] }
 serde_dynamo = { version = "4.2.14", features = ["aws-sdk-dynamodb+1"] }
 tempfile = "3.23.0"
@@ -65,4 +66,9 @@ required-features = ["integration-tests"]
 [[test]]
 name = "mongodb_wire_compat"
 path = "tests/mongodb_wire_compat.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "redis_wire_compat"
+path = "tests/redis_wire_compat.rs"
 required-features = ["integration-tests"]

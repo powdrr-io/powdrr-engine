@@ -6,5 +6,7 @@ pub mod elastic_search_lifetime_policy;
 pub mod lakehouse_serving_endpoints;
 pub mod mongodb_protocol;
 pub mod mongodb_wire_protocol;
+pub mod redis_protocol;
+pub mod redis_wire_protocol;
 pub mod router;
 mod test_api_endpoints;

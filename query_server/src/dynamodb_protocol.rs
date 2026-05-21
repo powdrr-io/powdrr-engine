@@ -695,12 +695,16 @@ pub fn put_dynamodb_config(mut state: State) -> Pin<Box<HandlerFuture>> {
             let existing_mongodb = existing
                 .as_ref()
                 .and_then(|description| description.mongodb.clone());
+            let existing_redis = existing
+                .as_ref()
+                .and_then(|description| description.redis.clone());
             let request = CreateTable {
                 name: path.clone(),
                 tags,
                 serving: Some(merge_dynamodb_serving_patterns(existing_serving, &body)),
                 dynamodb: Some(body.clone()),
                 mongodb: existing_mongodb,
+                redis: existing_redis,
             };
 
             STATE_PROVIDER

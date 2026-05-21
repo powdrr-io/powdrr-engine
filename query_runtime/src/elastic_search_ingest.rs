@@ -164,6 +164,7 @@ pub async fn create_index(table: &String, body: &String) -> Result<CreateIndexRe
             serving: None,
             dynamodb: None,
             mongodb: None,
+            redis: None,
         })
         .await
         .map_err(|e| IngestError::from_service_api_error(e))?;
@@ -227,6 +228,7 @@ where
             serving: table_description.serving,
             dynamodb: table_description.dynamodb,
             mongodb: table_description.mongodb,
+            redis: table_description.redis,
         })
         .await
         .map_err(IngestError::from_service_api_error)?;
