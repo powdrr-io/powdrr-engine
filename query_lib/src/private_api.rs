@@ -1,6 +1,15 @@
 use chrono::{DateTime, SecondsFormat, Utc};
-use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::{
+    array::{
+        Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int32Array,
+        Int64Array, LargeStringArray, RecordBatch, StringArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt32Array,
+        UInt64Array,
+    },
+    datatypes::{DataType, TimeUnit},
+};
 use datafusion::error::DataFusionError;
+use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     error::Error,
@@ -15,10 +24,10 @@ use crate::data_contract::{
 };
 use crate::elastic_search_common::record_batches_to_ipc_stream_bytes;
 use crate::elastic_search_index::create_index_inner;
-use crate::elastic_search_responses::{QueryResultHit, compare_query_result_hits_desc};
+use crate::elastic_search_responses::QueryResultHit;
 use crate::lakehouse_serving::{
-    ServingCacheManagerPlan, build_serving_cache_manager_plan,
-    default_serving_cache_manager_request, execute_serving_cache_manager_plan,
+    build_serving_cache_manager_plan, default_serving_cache_manager_request,
+    execute_serving_cache_manager_plan, ServingCacheManagerPlan,
 };
 use crate::peers::PrivatePrefetchInvocation;
 use crate::peers::{
@@ -31,14 +40,14 @@ use crate::peers::{
 };
 use crate::prefetch::warm_iceberg_checkpoints;
 use crate::query_execution::{
-    QueryExecutionPlan, QueryExtensionFileSpec, QueryInputFile, QuerySqlTemplate, QueryStorageKind,
-    execute_query_plan_batches,
+    execute_query_plan_batches, QueryExecutionPlan, QueryExtensionFileSpec, QueryInputFile,
+    QuerySqlTemplate, QueryStorageKind,
 };
-use crate::query_path::{QueryPredicate, file_may_match_predicates};
+use crate::query_path::{file_may_match_predicates, QueryPredicate};
 use crate::runtime_bindings;
 use crate::schema_massager::{PowdrrSchema, SqlQuery};
 use crate::search_executor::typed_sort_projection_name;
-use crate::search_runtime::batches_to_serde_value;
+use crate::search_runtime::array_value_to_json;
 use crate::util::log_err;
 
 static EXACT_PRUNING_SUMMARY_CACHE: LazyLock<Mutex<HashMap<String, ExactPruningSummary>>> =
@@ -459,26 +468,23 @@ fn exact_pruning_extension_file<'a>(
         .find(|extension| extension.suffix == "exact_pruning")
 }
 
-fn exact_pruning_summary_from_rows(rows: Vec<serde_json::Value>) -> ExactPruningSummary {
+fn exact_pruning_summary_from_batches(batches: &[RecordBatch]) -> ExactPruningSummary {
     let mut summary = ExactPruningSummary::new();
-    for row in rows {
-        let Some(field_name) = row.get("field_name").and_then(|value| value.as_str()) else {
-            continue;
-        };
-        let complete = row
-            .get("complete")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        let entry = summary
-            .entry(field_name.to_string())
-            .or_insert_with(ExactPruningFieldSummary::default);
-        if entry.values.is_empty() && !entry.complete {
-            entry.complete = complete;
-        } else {
-            entry.complete &= complete;
-        }
-        if let Some(field_value) = row.get("field_value").and_then(|value| value.as_str()) {
-            entry.values.insert(field_value.to_string());
+    for batch in batches {
+        for row_index in 0..batch.num_rows() {
+            let Some(field_name) = batch_string_field(batch, row_index, "field_name") else {
+                continue;
+            };
+            let complete = batch_bool_field(batch, row_index, "complete").unwrap_or(false);
+            let entry = summary.entry(field_name).or_default();
+            if entry.values.is_empty() && !entry.complete {
+                entry.complete = complete;
+            } else {
+                entry.complete &= complete;
+            }
+            if let Some(field_value) = batch_string_field(batch, row_index, "field_value") {
+                entry.values.insert(field_value);
+            }
         }
     }
     summary
@@ -517,18 +523,9 @@ async fn load_exact_pruning_summary(
             return log_err(PrivateApiError::from(error));
         }
     };
-    let serde_result = match batches_to_serde_value(&batches).await {
-        Ok(result) => result,
-        Err(error) => {
-            data_access::release(&pruning_local_name).await;
-            return Err(PrivateApiError {
-                message: error.message,
-            });
-        }
-    };
     data_access::release(&pruning_local_name).await;
 
-    let summary = exact_pruning_summary_from_rows(serde_result.values);
+    let summary = exact_pruning_summary_from_batches(&batches);
     EXACT_PRUNING_SUMMARY_CACHE
         .lock()
         .unwrap()
@@ -810,11 +807,9 @@ pub async fn search_query(
         .is_some_and(|_| required_files_have_extension_suffix(&required_files, "exact_index"));
 
     let extension_suffixes = if use_exact_sql {
-        Some(vec!["exact_index".to_string()])
-    } else if invocation.calculate_score {
-        Some(vec!["search_index".to_string()])
+        Some(invocation.exact_extension_suffixes.clone())
     } else {
-        Some(vec![])
+        Some(invocation.base_extension_suffixes.clone())
     };
 
     let parquet_size = required_files
@@ -837,14 +832,53 @@ pub async fn search_query(
 
     let batches =
         data_query_batches_worker(sql, &required_files, true, extension_suffixes.as_ref()).await?;
-    let serde_result = match batches_to_serde_value(&batches).await {
-        Ok(result) => result,
-        Err(e) => return Err(PrivateApiError { message: e.message }),
-    };
+    let total_hits = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
+    if invocation.size == 0 && invocation.aggregations.is_empty() {
+        return Ok(PrivateSearchResult {
+            hits: vec![],
+            total_hits,
+            aggregations: vec![],
+        });
+    }
 
-    let total_hits = serde_result.values.len();
+    if invocation.aggregations.is_empty() {
+        let mut hit_refs = query_result_hit_refs_from_batches(
+            &batches,
+            invocation.calculate_score,
+            &invocation.sorts,
+        );
+
+        if !invocation.sorts.is_empty() {
+            if invocation.size < hit_refs.len() {
+                hit_refs.select_nth_unstable_by(invocation.size, |left, right| {
+                    compare_query_result_hit_refs_by_sort(left, right, &invocation.sorts)
+                });
+                hit_refs.truncate(invocation.size);
+            }
+            hit_refs.sort_by(|left, right| {
+                compare_query_result_hit_refs_by_sort(left, right, &invocation.sorts)
+            });
+        } else if invocation.calculate_score {
+            if invocation.size < hit_refs.len() {
+                hit_refs
+                    .select_nth_unstable_by(invocation.size, compare_query_result_hit_refs_desc);
+                hit_refs.truncate(invocation.size);
+            }
+            hit_refs.sort_by(compare_query_result_hit_refs_desc);
+        }
+
+        hit_refs.truncate(invocation.size);
+        let hits =
+            query_result_hits_from_refs(&batches, &hit_refs, &Some(invocation.table.clone()))?;
+        return Ok(PrivateSearchResult {
+            hits,
+            total_hits,
+            aggregations: vec![],
+        });
+    }
+
     let aggregations =
-        compute_search_aggregation_partials(&serde_result.values, &invocation.aggregations);
+        compute_search_aggregation_partials_from_batches(&batches, &invocation.aggregations);
     if invocation.size == 0 {
         return Ok(PrivateSearchResult {
             hits: vec![],
@@ -853,30 +887,29 @@ pub async fn search_query(
         });
     }
 
-    let mut hits = serde_result
-        .values
-        .iter()
-        .map(|value| {
-            let score =
-                search_sort_values_for_row(value, invocation.calculate_score, &invocation.sorts);
-            QueryResultHit::from_record_with_sort(
-                &Some(invocation.table.clone()),
-                value,
-                None,
-                score,
-            )
-        })
-        .collect::<Vec<QueryResultHit>>();
+    let mut hit_refs =
+        query_result_hit_refs_from_batches(&batches, invocation.calculate_score, &invocation.sorts);
 
     if !invocation.sorts.is_empty() {
-        hits.sort_by(|left, right| {
-            compare_query_result_hits_by_sort(left, right, &invocation.sorts)
+        if invocation.size < hit_refs.len() {
+            hit_refs.select_nth_unstable_by(invocation.size, |left, right| {
+                compare_query_result_hit_refs_by_sort(left, right, &invocation.sorts)
+            });
+            hit_refs.truncate(invocation.size);
+        }
+        hit_refs.sort_by(|left, right| {
+            compare_query_result_hit_refs_by_sort(left, right, &invocation.sorts)
         });
     } else if invocation.calculate_score {
-        hits.sort_by(compare_query_result_hits_desc);
+        if invocation.size < hit_refs.len() {
+            hit_refs.select_nth_unstable_by(invocation.size, compare_query_result_hit_refs_desc);
+            hit_refs.truncate(invocation.size);
+        }
+        hit_refs.sort_by(compare_query_result_hit_refs_desc);
     }
 
-    hits.truncate(invocation.size);
+    hit_refs.truncate(invocation.size);
+    let hits = query_result_hits_from_refs(&batches, &hit_refs, &Some(invocation.table.clone()))?;
 
     Ok(PrivateSearchResult {
         hits,
@@ -897,91 +930,221 @@ fn required_files_have_extension_suffix(required_files: &RequiredFiles, suffix: 
         })
 }
 
-fn search_sort_values_for_row(
-    row: &serde_json::Value,
+#[derive(Clone)]
+struct QueryResultHitRef {
+    batch_index: usize,
+    row_index: usize,
+    id: Option<String>,
+    version: u64,
+    seq_no: u64,
+    score: Option<f64>,
+    sort: Option<Vec<SortScalar>>,
+}
+
+#[derive(Clone)]
+enum SortScalar {
+    Null,
+    Int(i64),
+    UInt(u64),
+    Float(f64),
+    String(String),
+    Bool(bool),
+}
+
+fn query_result_hit_refs_from_batches(
+    batches: &[RecordBatch],
     calculate_score: bool,
     sorts: &[PrivateSearchSortSpec],
-) -> Option<Vec<serde_json::Value>> {
+) -> Vec<QueryResultHitRef> {
+    let capacity = batches.iter().map(|batch| batch.num_rows()).sum();
+    let mut hits = Vec::with_capacity(capacity);
+    for (batch_index, batch) in batches.iter().enumerate() {
+        for row_index in 0..batch.num_rows() {
+            hits.push(query_result_hit_ref_from_batch_row(
+                batch_index,
+                batch,
+                row_index,
+                calculate_score,
+                sorts,
+            ));
+        }
+    }
+    hits
+}
+
+fn query_result_hit_ref_from_batch_row(
+    batch_index: usize,
+    batch: &RecordBatch,
+    row_index: usize,
+    calculate_score: bool,
+    sorts: &[PrivateSearchSortSpec],
+) -> QueryResultHitRef {
+    let id = batch_string_field(batch, row_index, "_id");
+    let version = batch_u64_field(batch, row_index, "_version").unwrap_or_default();
+    let seq_no = batch_u64_field(batch, row_index, "_seq_no").unwrap_or_default();
+    let score = batch_numeric_field(batch, row_index, "score").or_else(|| {
+        if calculate_score {
+            batch_numeric_field(batch, row_index, "term_cnt").and_then(|term_cnt| {
+                batch_numeric_field(batch, row_index, "word_cnt")
+                    .map(|word_cnt| bm25_fallback_score(term_cnt, word_cnt))
+            })
+        } else {
+            None
+        }
+    });
+    let sort = batch_sort_values_for_row(batch, row_index, calculate_score, sorts);
+    QueryResultHitRef {
+        batch_index,
+        row_index,
+        id,
+        version,
+        seq_no,
+        score,
+        sort,
+    }
+}
+
+fn query_result_hits_from_refs(
+    batches: &[RecordBatch],
+    hit_refs: &[QueryResultHitRef],
+    index: &Option<String>,
+) -> Result<Vec<QueryResultHit>, PrivateApiError> {
+    hit_refs
+        .iter()
+        .map(|hit_ref| query_result_hit_from_ref(batches, hit_ref, index))
+        .collect()
+}
+
+fn query_result_hit_from_ref(
+    batches: &[RecordBatch],
+    hit_ref: &QueryResultHitRef,
+    index: &Option<String>,
+) -> Result<QueryResultHit, PrivateApiError> {
+    let batch = &batches[hit_ref.batch_index];
+    let source = batch_source_value(batch, hit_ref.row_index)?;
+    let has_id = hit_ref.id.is_some();
+    Ok(QueryResultHit {
+        _index: index.clone(),
+        _id: hit_ref.id.clone(),
+        _version: hit_ref.version,
+        _seq_no: hit_ref.seq_no,
+        _score: hit_ref.score,
+        _primary_term: has_id.then_some(1),
+        found: None,
+        sort: hit_ref
+            .sort
+            .as_ref()
+            .map(|values| values.iter().map(sort_scalar_to_json).collect()),
+        _source: source,
+    })
+}
+
+fn batch_sort_values_for_row(
+    batch: &RecordBatch,
+    row_index: usize,
+    calculate_score: bool,
+    sorts: &[PrivateSearchSortSpec],
+) -> Option<Vec<SortScalar>> {
     if sorts.is_empty() {
         return None;
     }
 
-    let value_map = row.as_object().unwrap();
     Some(
         sorts
             .iter()
             .map(|sort| {
                 if sort.field == "_score" {
-                    value_map
-                        .get("score")
-                        .and_then(|value| value.as_f64())
+                    batch_numeric_field(batch, row_index, "score")
+                        .map(SortScalar::Float)
                         .or_else(|| {
                             if calculate_score {
-                                value_map.get("term_cnt").and_then(|term_cnt| {
-                                    value_map.get("word_cnt").map(|word_cnt| {
-                                        bm25_fallback_score_from_values(term_cnt, word_cnt)
-                                    })
-                                })
+                                batch_numeric_field(batch, row_index, "term_cnt").and_then(
+                                    |term_cnt| {
+                                        batch_numeric_field(batch, row_index, "word_cnt").map(
+                                            |word_cnt| {
+                                                SortScalar::Float(bm25_fallback_score(
+                                                    term_cnt, word_cnt,
+                                                ))
+                                            },
+                                        )
+                                    },
+                                )
                             } else {
                                 None
                             }
                         })
-                        .map(serde_json::Value::from)
-                        .unwrap_or(serde_json::Value::Null)
+                        .unwrap_or(SortScalar::Null)
                 } else {
-                    sort_value_for_field(row, &sort.field)
+                    batch_sort_scalar_field(
+                        batch,
+                        row_index,
+                        &typed_sort_projection_name(&sort.field),
+                    )
+                    .or_else(|| batch_sort_scalar_field(batch, row_index, &sort.field))
+                    .unwrap_or(SortScalar::Null)
                 }
             })
             .collect(),
     )
 }
 
-fn sort_value_for_field(row: &serde_json::Value, field: &str) -> serde_json::Value {
-    let value_map = row.as_object().unwrap();
-    let projection_name = typed_sort_projection_name(field);
-    if let Some(value) = value_map.get(&projection_name) {
-        return value.clone();
-    }
-    if let Some(value) = value_map.get(field) {
-        return value.clone();
+fn batch_source_value(batch: &RecordBatch, row_index: usize) -> Result<Value, PrivateApiError> {
+    if let Some(source) = batch_json_field(batch, row_index, "_source") {
+        return match source {
+            Value::String(source) => {
+                serde_json::from_str(&source).map_err(|error| PrivateApiError {
+                    message: format!("Could not parse _source payload: {}", error),
+                })
+            }
+            other => Ok(other),
+        };
     }
 
-    value_map
-        .get("_source")
-        .and_then(|source| sort_value_from_source(source, field))
-        .unwrap_or(serde_json::Value::Null)
-}
-
-fn sort_value_from_source(source: &serde_json::Value, field: &str) -> Option<serde_json::Value> {
-    let parsed_source = match source {
-        serde_json::Value::String(source) => {
-            serde_json::from_str::<serde_json::Value>(source).ok()?
+    let schema = batch.schema();
+    let mut source_map = serde_json::Map::new();
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        if field.name().starts_with("__powdrr_sort_")
+            || matches!(
+                field.name().as_str(),
+                "_id" | "_version" | "_seq_no" | "_source" | "score" | "term_cnt" | "word_cnt"
+            )
+        {
+            continue;
         }
-        other => other.clone(),
-    };
-
-    if let Some(value) = parsed_source.get(field) {
-        return Some(value.clone());
+        source_map.insert(
+            field.name().clone(),
+            array_value_to_json(column.as_ref(), row_index).map_err(|error| PrivateApiError {
+                message: error.message,
+            })?,
+        );
     }
-
-    let mut current = &parsed_source;
-    for segment in field.split('.') {
-        current = current.get(segment)?;
-    }
-
-    Some(current.clone())
+    Ok(Value::Object(source_map))
 }
 
-fn compare_query_result_hits_by_sort(
-    left: &QueryResultHit,
-    right: &QueryResultHit,
+fn batch_json_field(batch: &RecordBatch, row_index: usize, field: &str) -> Option<Value> {
+    let field_index = batch.schema().index_of(field).ok()?;
+    array_value_to_json(batch.column(field_index).as_ref(), row_index).ok()
+}
+
+fn batch_sort_scalar_field(
+    batch: &RecordBatch,
+    row_index: usize,
+    field: &str,
+) -> Option<SortScalar> {
+    let field_index = batch.schema().index_of(field).ok()?;
+    sort_scalar_from_array(batch.column(field_index).as_ref(), row_index)
+}
+
+fn compare_query_result_hit_refs_by_sort(
+    left: &QueryResultHitRef,
+    right: &QueryResultHitRef,
     sorts: &[PrivateSearchSortSpec],
 ) -> std::cmp::Ordering {
     let left_values = left.sort.as_deref().unwrap_or(&[]);
     let right_values = right.sort.as_deref().unwrap_or(&[]);
     for (index, sort) in sorts.iter().enumerate() {
-        let left_value = left_values.get(index).unwrap_or(&serde_json::Value::Null);
-        let right_value = right_values.get(index).unwrap_or(&serde_json::Value::Null);
+        let left_value = left_values.get(index).unwrap_or(&SortScalar::Null);
+        let right_value = right_values.get(index).unwrap_or(&SortScalar::Null);
         let ordering = compare_sort_values(left_value, right_value);
         let ordering = if sort.descending {
             ordering.reverse()
@@ -994,39 +1157,166 @@ fn compare_query_result_hits_by_sort(
     }
 
     right
-        ._seq_no
-        .cmp(&left._seq_no)
-        .then_with(|| left._id.cmp(&right._id))
+        .seq_no
+        .cmp(&left.seq_no)
+        .then_with(|| left.id.cmp(&right.id))
 }
 
-fn compare_sort_values(left: &serde_json::Value, right: &serde_json::Value) -> std::cmp::Ordering {
+fn compare_query_result_hit_refs_desc(
+    left: &QueryResultHitRef,
+    right: &QueryResultHitRef,
+) -> std::cmp::Ordering {
+    match (left.score, right.score) {
+        (Some(left_score), Some(right_score)) => right_score
+            .partial_cmp(&left_score)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+    .then_with(|| right.seq_no.cmp(&left.seq_no))
+    .then_with(|| left.id.cmp(&right.id))
+}
+
+fn compare_sort_values(left: &SortScalar, right: &SortScalar) -> std::cmp::Ordering {
     match (left, right) {
-        (serde_json::Value::Null, serde_json::Value::Null) => std::cmp::Ordering::Equal,
-        (serde_json::Value::Null, _) => std::cmp::Ordering::Greater,
-        (_, serde_json::Value::Null) => std::cmp::Ordering::Less,
-        _ => {
-            if let (Some(left_number), Some(right_number)) = (left.as_f64(), right.as_f64()) {
-                return left_number
-                    .partial_cmp(&right_number)
-                    .unwrap_or(std::cmp::Ordering::Equal);
+        (SortScalar::Null, SortScalar::Null) => std::cmp::Ordering::Equal,
+        (SortScalar::Null, _) => std::cmp::Ordering::Greater,
+        (_, SortScalar::Null) => std::cmp::Ordering::Less,
+        (SortScalar::Int(left_number), SortScalar::Int(right_number)) => {
+            left_number.cmp(right_number)
+        }
+        (SortScalar::UInt(left_number), SortScalar::UInt(right_number)) => {
+            left_number.cmp(right_number)
+        }
+        (SortScalar::Int(left_number), SortScalar::UInt(right_number)) => {
+            if *left_number < 0 {
+                std::cmp::Ordering::Less
+            } else {
+                (*left_number as u64).cmp(right_number)
             }
-            if let (Some(left_string), Some(right_string)) = (left.as_str(), right.as_str()) {
-                return left_string.cmp(right_string);
+        }
+        (SortScalar::UInt(left_number), SortScalar::Int(right_number)) => {
+            if *right_number < 0 {
+                std::cmp::Ordering::Greater
+            } else {
+                left_number.cmp(&(*right_number as u64))
             }
-            if let (Some(left_bool), Some(right_bool)) = (left.as_bool(), right.as_bool()) {
-                return left_bool.cmp(&right_bool);
-            }
-            left.to_string().cmp(&right.to_string())
+        }
+        (left_number, right_number)
+            if matches!(
+                (left_number, right_number),
+                (
+                    SortScalar::Int(_) | SortScalar::UInt(_) | SortScalar::Float(_),
+                    SortScalar::Int(_) | SortScalar::UInt(_) | SortScalar::Float(_)
+                )
+            ) =>
+        {
+            sort_scalar_numeric_as_f64(left_number)
+                .partial_cmp(&sort_scalar_numeric_as_f64(right_number))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (SortScalar::String(left_string), SortScalar::String(right_string)) => {
+            left_string.cmp(right_string)
+        }
+        (SortScalar::Bool(left_bool), SortScalar::Bool(right_bool)) => left_bool.cmp(right_bool),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+fn sort_scalar_from_array(array: &dyn Array, row_index: usize) -> Option<SortScalar> {
+    if array.is_null(row_index) {
+        return Some(SortScalar::Null);
+    }
+    if let Some(timestamp) = timestamp_array_value(array, row_index) {
+        return Some(SortScalar::Int(timestamp));
+    }
+    match array.data_type() {
+        DataType::Int64 => Some(SortScalar::Int(
+            array
+                .as_any()
+                .downcast_ref::<Int64Array>()?
+                .value(row_index),
+        )),
+        DataType::Int32 => Some(SortScalar::Int(
+            array
+                .as_any()
+                .downcast_ref::<Int32Array>()?
+                .value(row_index) as i64,
+        )),
+        DataType::UInt64 => Some(SortScalar::UInt(
+            array
+                .as_any()
+                .downcast_ref::<UInt64Array>()?
+                .value(row_index),
+        )),
+        DataType::UInt32 => Some(SortScalar::UInt(
+            array
+                .as_any()
+                .downcast_ref::<UInt32Array>()?
+                .value(row_index) as u64,
+        )),
+        DataType::Float64 => Some(SortScalar::Float(
+            array
+                .as_any()
+                .downcast_ref::<Float64Array>()?
+                .value(row_index),
+        )),
+        DataType::Float32 => Some(SortScalar::Float(
+            array
+                .as_any()
+                .downcast_ref::<Float32Array>()?
+                .value(row_index) as f64,
+        )),
+        DataType::Boolean => Some(SortScalar::Bool(
+            array
+                .as_any()
+                .downcast_ref::<BooleanArray>()?
+                .value(row_index),
+        )),
+        DataType::Utf8 | DataType::LargeUtf8 => {
+            string_key_array_value(array, row_index).map(SortScalar::String)
+        }
+        DataType::Date32 => Some(SortScalar::Int(
+            array
+                .as_any()
+                .downcast_ref::<Date32Array>()?
+                .value(row_index) as i64
+                * 86_400_000,
+        )),
+        DataType::Date64 => Some(SortScalar::Int(
+            array
+                .as_any()
+                .downcast_ref::<Date64Array>()?
+                .value(row_index),
+        )),
+        _ => None,
+    }
+}
+
+fn sort_scalar_to_json(value: &SortScalar) -> Value {
+    match value {
+        SortScalar::Null => Value::Null,
+        SortScalar::Int(number) => Value::from(*number),
+        SortScalar::UInt(number) => Value::from(*number),
+        SortScalar::Float(number) => Value::from(*number),
+        SortScalar::String(string) => Value::String(string.clone()),
+        SortScalar::Bool(boolean) => Value::Bool(*boolean),
+    }
+}
+
+fn sort_scalar_numeric_as_f64(value: &SortScalar) -> f64 {
+    match value {
+        SortScalar::Int(number) => *number as f64,
+        SortScalar::UInt(number) => *number as f64,
+        SortScalar::Float(number) => *number,
+        SortScalar::Null | SortScalar::String(_) | SortScalar::Bool(_) => {
+            unreachable!("numeric helper called for non-numeric sort scalar")
         }
     }
 }
 
-fn bm25_fallback_score_from_values(
-    term_cnt: &serde_json::Value,
-    word_cnt: &serde_json::Value,
-) -> f64 {
-    let term_cnt = term_cnt.as_f64().unwrap_or(0.0);
-    let word_cnt = word_cnt.as_f64().unwrap_or(0.0);
+fn bm25_fallback_score(term_cnt: f64, word_cnt: f64) -> f64 {
     let constant_k = 1.2;
     let constant_b = 0.75;
     let avgdl = 5.6;
@@ -1088,11 +1378,9 @@ mod tests {
         let error =
             get_extension_files(&vec!["es".to_string()], &checkpoint, &file_path).unwrap_err();
 
-        assert!(
-            error
-                .message
-                .contains("missing published metadata for required extension es")
-        );
+        assert!(error
+            .message
+            .contains("missing published metadata for required extension es"));
     }
 
     #[test]
@@ -1165,22 +1453,21 @@ mod tests {
 
     #[test]
     fn exact_pruning_summary_may_match_only_prunes_complete_misses() {
-        let summary = exact_pruning_summary_from_rows(vec![
-            serde_json::json!({
-                "field_name": "service",
-                "field_value": "auth",
-                "complete": true
-            }),
-            serde_json::json!({
-                "field_name": "service",
-                "field_value": "api",
-                "complete": true
-            }),
-            serde_json::json!({
-                "field_name": "env",
-                "field_value": null,
-                "complete": false
-            }),
+        let summary = HashMap::from([
+            (
+                "service".to_string(),
+                ExactPruningFieldSummary {
+                    complete: true,
+                    values: BTreeSet::from(["auth".to_string(), "api".to_string()]),
+                },
+            ),
+            (
+                "env".to_string(),
+                ExactPruningFieldSummary {
+                    complete: false,
+                    values: BTreeSet::new(),
+                },
+            ),
         ]);
 
         assert!(exact_pruning_summary_may_match(
@@ -1204,6 +1491,35 @@ mod tests {
                 values: vec!["prod".to_string()],
             }]
         ));
+    }
+
+    #[test]
+    fn sort_scalar_to_json_preserves_integer_number_types() {
+        assert_eq!(sort_scalar_to_json(&SortScalar::Int(7)), Value::from(7_i64));
+        assert_eq!(
+            sort_scalar_to_json(&SortScalar::UInt(9)),
+            Value::from(9_u64)
+        );
+        assert_eq!(
+            sort_scalar_to_json(&SortScalar::Float(1.5)),
+            Value::from(1.5_f64)
+        );
+    }
+
+    #[test]
+    fn compare_sort_values_handles_mixed_integer_types() {
+        assert_eq!(
+            compare_sort_values(&SortScalar::Int(7), &SortScalar::UInt(8)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_sort_values(&SortScalar::UInt(8), &SortScalar::Int(7)),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_sort_values(&SortScalar::Int(-1), &SortScalar::UInt(0)),
+            std::cmp::Ordering::Less
+        );
     }
 }
 
@@ -1355,18 +1671,48 @@ fn log_required_files(
     );
 }
 
+#[derive(Clone, Copy)]
+struct BatchRowRef {
+    batch_index: usize,
+    row_index: usize,
+}
+
+fn compute_search_aggregation_partials_from_batches(
+    batches: &[RecordBatch],
+    specs: &[PrivateSearchAggregationSpec],
+) -> Vec<PrivateSearchAggregationPartial> {
+    let rows = all_batch_rows(batches);
+    compute_search_aggregation_partials(batches, &rows, specs)
+}
+
+fn all_batch_rows(batches: &[RecordBatch]) -> Vec<BatchRowRef> {
+    let capacity = batches.iter().map(|batch| batch.num_rows()).sum();
+    let mut rows = Vec::with_capacity(capacity);
+    for (batch_index, batch) in batches.iter().enumerate() {
+        for row_index in 0..batch.num_rows() {
+            rows.push(BatchRowRef {
+                batch_index,
+                row_index,
+            });
+        }
+    }
+    rows
+}
+
 fn compute_search_aggregation_partials(
-    rows: &[serde_json::Value],
+    batches: &[RecordBatch],
+    rows: &[BatchRowRef],
     specs: &[PrivateSearchAggregationSpec],
 ) -> Vec<PrivateSearchAggregationPartial> {
     specs
         .iter()
-        .map(|spec| compute_search_aggregation_partial(rows, spec))
+        .map(|spec| compute_search_aggregation_partial(batches, rows, spec))
         .collect()
 }
 
 fn compute_search_aggregation_partial(
-    rows: &[serde_json::Value],
+    batches: &[RecordBatch],
+    rows: &[BatchRowRef],
     spec: &PrivateSearchAggregationSpec,
 ) -> PrivateSearchAggregationPartial {
     match spec {
@@ -1374,7 +1720,11 @@ fn compute_search_aggregation_partial(
             let mut sum = 0.0;
             let mut count = 0_u64;
             for row in rows.iter() {
-                if let Some(value) = extract_numeric_field(row, field) {
+                if let Some(value) = extract_numeric_field_from_batch_row(
+                    &batches[row.batch_index],
+                    row.row_index,
+                    field,
+                ) {
                     sum += value;
                     count += 1;
                 }
@@ -1388,7 +1738,9 @@ fn compute_search_aggregation_partial(
         PrivateSearchAggregationSpec::Cardinality { name, field } => {
             let values = rows
                 .iter()
-                .filter_map(|row| extract_term_key(row, field))
+                .filter_map(|row| {
+                    extract_term_key_from_batch_row(&batches[row.batch_index], row.row_index, field)
+                })
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
@@ -1412,11 +1764,46 @@ fn compute_search_aggregation_partial(
                 };
             };
 
-            let mut buckets = BTreeMap::<i64, Vec<serde_json::Value>>::new();
+            if sub_aggregations.is_empty() {
+                let mut bucket_counts = BTreeMap::<i64, u64>::new();
+                for row in rows.iter() {
+                    if let Some(timestamp_ms) = extract_timestamp_millis_from_batch_row(
+                        &batches[row.batch_index],
+                        row.row_index,
+                        field,
+                    ) {
+                        let bucket_key = timestamp_ms - timestamp_ms.rem_euclid(interval_ms);
+                        *bucket_counts.entry(bucket_key).or_default() += 1;
+                    }
+                }
+
+                let buckets = bucket_counts
+                    .into_iter()
+                    .map(
+                        |(bucket_key, doc_count)| PrivateSearchHistogramBucketPartial {
+                            key: bucket_key,
+                            key_as_string: timestamp_millis_to_key_as_string(bucket_key),
+                            doc_count,
+                            sub_aggregations: vec![],
+                        },
+                    )
+                    .collect::<Vec<_>>();
+
+                return PrivateSearchAggregationPartial::DateHistogram {
+                    name: name.clone(),
+                    buckets,
+                };
+            }
+
+            let mut buckets = BTreeMap::<i64, Vec<BatchRowRef>>::new();
             for row in rows.iter() {
-                if let Some(timestamp_ms) = extract_timestamp_millis(row, field) {
+                if let Some(timestamp_ms) = extract_timestamp_millis_from_batch_row(
+                    &batches[row.batch_index],
+                    row.row_index,
+                    field,
+                ) {
                     let bucket_key = timestamp_ms - timestamp_ms.rem_euclid(interval_ms);
-                    buckets.entry(bucket_key).or_default().push(row.clone());
+                    buckets.entry(bucket_key).or_default().push(*row);
                 }
             }
 
@@ -1428,6 +1815,7 @@ fn compute_search_aggregation_partial(
                         key_as_string: timestamp_millis_to_key_as_string(bucket_key),
                         doc_count: bucket_rows.len() as u64,
                         sub_aggregations: compute_search_aggregation_partials(
+                            batches,
                             &bucket_rows,
                             sub_aggregations,
                         ),
@@ -1448,12 +1836,45 @@ fn compute_search_aggregation_partial(
             missing,
             sub_aggregations,
         } => {
-            let mut buckets = std::collections::HashMap::<String, Vec<serde_json::Value>>::new();
-            for row in rows.iter() {
-                if let Some(key) = extract_term_key(row, field)
+            if sub_aggregations.is_empty() {
+                let mut bucket_counts = std::collections::HashMap::<String, u64>::new();
+                for row in rows.iter() {
+                    if let Some(key) = extract_term_key_from_batch_row(
+                        &batches[row.batch_index],
+                        row.row_index,
+                        field,
+                    )
                     .or_else(|| missing.as_ref().and_then(render_missing_term_key))
+                    {
+                        *bucket_counts.entry(key).or_default() += 1;
+                    }
+                }
+
+                let mut bucket_partials = bucket_counts
+                    .into_iter()
+                    .map(|(key, doc_count)| PrivateSearchTermsBucketPartial {
+                        doc_count,
+                        sub_aggregations: vec![],
+                        key,
+                    })
+                    .collect::<Vec<_>>();
+                bucket_partials.sort_by(|left, right| {
+                    compare_terms_bucket_partials(left, right, order.as_ref())
+                });
+
+                return PrivateSearchAggregationPartial::Terms {
+                    name: name.clone(),
+                    buckets: bucket_partials,
+                };
+            }
+
+            let mut buckets = std::collections::HashMap::<String, Vec<BatchRowRef>>::new();
+            for row in rows.iter() {
+                if let Some(key) =
+                    extract_term_key_from_batch_row(&batches[row.batch_index], row.row_index, field)
+                        .or_else(|| missing.as_ref().and_then(render_missing_term_key))
                 {
-                    buckets.entry(key).or_default().push(row.clone());
+                    buckets.entry(key).or_default().push(*row);
                 }
             }
 
@@ -1462,6 +1883,7 @@ fn compute_search_aggregation_partial(
                 .map(|(key, bucket_rows)| PrivateSearchTermsBucketPartial {
                     doc_count: bucket_rows.len() as u64,
                     sub_aggregations: compute_search_aggregation_partials(
+                        batches,
                         &bucket_rows,
                         sub_aggregations,
                     ),
@@ -1481,13 +1903,38 @@ fn compute_search_aggregation_partial(
             filter,
             sub_aggregations,
         } => {
+            if sub_aggregations.is_empty() {
+                let doc_count = rows
+                    .iter()
+                    .filter(|row| {
+                        row_matches_aggregation_filter_batch_row(
+                            &batches[row.batch_index],
+                            row.row_index,
+                            filter,
+                        )
+                    })
+                    .count() as u64;
+
+                return PrivateSearchAggregationPartial::Filter {
+                    name: name.clone(),
+                    doc_count,
+                    sub_aggregations: vec![],
+                };
+            }
+
             let filtered_rows = rows
                 .iter()
-                .filter(|row| row_matches_aggregation_filter(row, filter))
-                .cloned()
+                .copied()
+                .filter(|row| {
+                    row_matches_aggregation_filter_batch_row(
+                        &batches[row.batch_index],
+                        row.row_index,
+                        filter,
+                    )
+                })
                 .collect::<Vec<_>>();
             let sub_aggregations =
-                compute_search_aggregation_partials(&filtered_rows, sub_aggregations);
+                compute_search_aggregation_partials(batches, &filtered_rows, sub_aggregations);
             PrivateSearchAggregationPartial::Filter {
                 name: name.clone(),
                 doc_count: filtered_rows.len() as u64,
@@ -1497,39 +1944,36 @@ fn compute_search_aggregation_partial(
     }
 }
 
-fn row_matches_aggregation_filter(
-    row: &serde_json::Value,
+fn row_matches_aggregation_filter_batch_row(
+    batch: &RecordBatch,
+    row_index: usize,
     filter: &PrivateSearchAggregationFilterSpec,
 ) -> bool {
     match filter {
-        PrivateSearchAggregationFilterSpec::Term { field, value } => row
-            .get(field)
-            .and_then(|field_value| field_value.as_str())
-            .map(|field_value| field_value == value)
-            .unwrap_or(false),
+        PrivateSearchAggregationFilterSpec::Term { field, value } => {
+            extract_term_key_from_batch_row(batch, row_index, field)
+                .map(|field_value| field_value == *value)
+                .unwrap_or(false)
+        }
     }
 }
 
-fn extract_numeric_field(row: &serde_json::Value, field: &str) -> Option<f64> {
-    let value = row.get(field)?;
-    value
-        .as_f64()
-        .or_else(|| value.as_i64().map(|numeric| numeric as f64))
-        .or_else(|| value.as_u64().map(|numeric| numeric as f64))
+fn extract_numeric_field_from_batch_row(
+    batch: &RecordBatch,
+    row_index: usize,
+    field: &str,
+) -> Option<f64> {
+    let field_index = batch.schema().index_of(field).ok()?;
+    numeric_array_value(batch.column(field_index).as_ref(), row_index)
 }
 
-fn extract_timestamp_millis(row: &serde_json::Value, field: &str) -> Option<i64> {
-    let value = row.get(field)?;
-    if let Some(timestamp_ms) = value.as_i64() {
-        return Some(timestamp_ms);
-    }
-    if let Some(timestamp_ms) = value.as_u64() {
-        return i64::try_from(timestamp_ms).ok();
-    }
-    let timestamp = value.as_str()?;
-    DateTime::parse_from_rfc3339(timestamp)
-        .ok()
-        .map(|datetime| datetime.with_timezone(&Utc).timestamp_millis())
+fn extract_timestamp_millis_from_batch_row(
+    batch: &RecordBatch,
+    row_index: usize,
+    field: &str,
+) -> Option<i64> {
+    let field_index = batch.schema().index_of(field).ok()?;
+    timestamp_array_value(batch.column(field_index).as_ref(), row_index)
 }
 
 fn parse_fixed_interval_millis(interval: &str) -> Option<i64> {
@@ -1584,15 +2028,275 @@ fn timestamp_millis_to_key_as_string(timestamp_ms: i64) -> String {
         .to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-fn extract_term_key(row: &serde_json::Value, field: &str) -> Option<String> {
-    let value = row.get(field)?;
-    value
-        .as_str()
-        .map(|text| text.to_string())
-        .or_else(|| value.as_i64().map(|numeric| numeric.to_string()))
-        .or_else(|| value.as_u64().map(|numeric| numeric.to_string()))
-        .or_else(|| value.as_f64().map(|numeric| numeric.to_string()))
-        .or_else(|| value.as_bool().map(|boolean| boolean.to_string()))
+fn extract_term_key_from_batch_row(
+    batch: &RecordBatch,
+    row_index: usize,
+    field: &str,
+) -> Option<String> {
+    let field_index = batch.schema().index_of(field).ok()?;
+    string_key_array_value(batch.column(field_index).as_ref(), row_index)
+}
+
+fn batch_string_field(batch: &RecordBatch, row_index: usize, field: &str) -> Option<String> {
+    let field_index = batch.schema().index_of(field).ok()?;
+    string_key_array_value(batch.column(field_index).as_ref(), row_index)
+}
+
+fn batch_bool_field(batch: &RecordBatch, row_index: usize, field: &str) -> Option<bool> {
+    let field_index = batch.schema().index_of(field).ok()?;
+    let array = batch.column(field_index).as_ref();
+    if array.is_null(row_index) {
+        return None;
+    }
+    match array.data_type() {
+        DataType::Boolean => Some(
+            array
+                .as_any()
+                .downcast_ref::<BooleanArray>()?
+                .value(row_index),
+        ),
+        _ => None,
+    }
+}
+
+fn batch_u64_field(batch: &RecordBatch, row_index: usize, field: &str) -> Option<u64> {
+    let field_index = batch.schema().index_of(field).ok()?;
+    u64_array_value(batch.column(field_index).as_ref(), row_index)
+}
+
+fn batch_numeric_field(batch: &RecordBatch, row_index: usize, field: &str) -> Option<f64> {
+    let field_index = batch.schema().index_of(field).ok()?;
+    numeric_array_value(batch.column(field_index).as_ref(), row_index)
+}
+
+fn numeric_array_value(array: &dyn Array, row_index: usize) -> Option<f64> {
+    if array.is_null(row_index) {
+        return None;
+    }
+    match array.data_type() {
+        DataType::Float64 => Some(
+            array
+                .as_any()
+                .downcast_ref::<Float64Array>()?
+                .value(row_index),
+        ),
+        DataType::Float32 => Some(
+            array
+                .as_any()
+                .downcast_ref::<Float32Array>()?
+                .value(row_index) as f64,
+        ),
+        DataType::Int64 => Some(
+            array
+                .as_any()
+                .downcast_ref::<Int64Array>()?
+                .value(row_index) as f64,
+        ),
+        DataType::Int32 => Some(
+            array
+                .as_any()
+                .downcast_ref::<Int32Array>()?
+                .value(row_index) as f64,
+        ),
+        DataType::UInt64 => Some(
+            array
+                .as_any()
+                .downcast_ref::<UInt64Array>()?
+                .value(row_index) as f64,
+        ),
+        DataType::UInt32 => Some(
+            array
+                .as_any()
+                .downcast_ref::<UInt32Array>()?
+                .value(row_index) as f64,
+        ),
+        _ => None,
+    }
+}
+
+fn u64_array_value(array: &dyn Array, row_index: usize) -> Option<u64> {
+    if array.is_null(row_index) {
+        return None;
+    }
+    match array.data_type() {
+        DataType::UInt64 => Some(
+            array
+                .as_any()
+                .downcast_ref::<UInt64Array>()?
+                .value(row_index),
+        ),
+        DataType::UInt32 => Some(
+            array
+                .as_any()
+                .downcast_ref::<UInt32Array>()?
+                .value(row_index) as u64,
+        ),
+        DataType::Int64 => u64::try_from(
+            array
+                .as_any()
+                .downcast_ref::<Int64Array>()?
+                .value(row_index),
+        )
+        .ok(),
+        DataType::Int32 => u64::try_from(
+            array
+                .as_any()
+                .downcast_ref::<Int32Array>()?
+                .value(row_index),
+        )
+        .ok(),
+        _ => None,
+    }
+}
+
+fn timestamp_array_value(array: &dyn Array, row_index: usize) -> Option<i64> {
+    if array.is_null(row_index) {
+        return None;
+    }
+    match array.data_type() {
+        DataType::Timestamp(TimeUnit::Second, _) => Some(
+            array
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()?
+                .value(row_index)
+                * 1_000,
+        ),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => Some(
+            array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()?
+                .value(row_index),
+        ),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => Some(
+            array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()?
+                .value(row_index)
+                / 1_000,
+        ),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => Some(
+            array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()?
+                .value(row_index)
+                / 1_000_000,
+        ),
+        DataType::Date64 => Some(
+            array
+                .as_any()
+                .downcast_ref::<Date64Array>()?
+                .value(row_index),
+        ),
+        DataType::Date32 => Some(
+            array
+                .as_any()
+                .downcast_ref::<Date32Array>()?
+                .value(row_index) as i64
+                * 86_400_000,
+        ),
+        DataType::Int64 => Some(
+            array
+                .as_any()
+                .downcast_ref::<Int64Array>()?
+                .value(row_index),
+        ),
+        DataType::UInt64 => i64::try_from(
+            array
+                .as_any()
+                .downcast_ref::<UInt64Array>()?
+                .value(row_index),
+        )
+        .ok(),
+        DataType::Utf8 => DateTime::parse_from_rfc3339(
+            array
+                .as_any()
+                .downcast_ref::<StringArray>()?
+                .value(row_index),
+        )
+        .ok()
+        .map(|datetime| datetime.with_timezone(&Utc).timestamp_millis()),
+        DataType::LargeUtf8 => DateTime::parse_from_rfc3339(
+            array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()?
+                .value(row_index),
+        )
+        .ok()
+        .map(|datetime| datetime.with_timezone(&Utc).timestamp_millis()),
+        _ => None,
+    }
+}
+
+fn string_key_array_value(array: &dyn Array, row_index: usize) -> Option<String> {
+    if array.is_null(row_index) {
+        return None;
+    }
+    match array.data_type() {
+        DataType::Utf8 => Some(
+            array
+                .as_any()
+                .downcast_ref::<StringArray>()?
+                .value(row_index)
+                .to_string(),
+        ),
+        DataType::LargeUtf8 => Some(
+            array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()?
+                .value(row_index)
+                .to_string(),
+        ),
+        DataType::Int64 => Some(
+            array
+                .as_any()
+                .downcast_ref::<Int64Array>()?
+                .value(row_index)
+                .to_string(),
+        ),
+        DataType::Int32 => Some(
+            array
+                .as_any()
+                .downcast_ref::<Int32Array>()?
+                .value(row_index)
+                .to_string(),
+        ),
+        DataType::UInt64 => Some(
+            array
+                .as_any()
+                .downcast_ref::<UInt64Array>()?
+                .value(row_index)
+                .to_string(),
+        ),
+        DataType::UInt32 => Some(
+            array
+                .as_any()
+                .downcast_ref::<UInt32Array>()?
+                .value(row_index)
+                .to_string(),
+        ),
+        DataType::Float64 => Some(
+            array
+                .as_any()
+                .downcast_ref::<Float64Array>()?
+                .value(row_index)
+                .to_string(),
+        ),
+        DataType::Float32 => Some(
+            array
+                .as_any()
+                .downcast_ref::<Float32Array>()?
+                .value(row_index)
+                .to_string(),
+        ),
+        DataType::Boolean => Some(
+            array
+                .as_any()
+                .downcast_ref::<BooleanArray>()?
+                .value(row_index)
+                .to_string(),
+        ),
+        _ => None,
+    }
 }
 
 async fn data_query_batches_worker(
