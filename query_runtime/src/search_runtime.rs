@@ -6,10 +6,10 @@ use crate::elastic_search_responses::{
     RangeAggregationResult, TermAggregationBucket, TermAggregationResult,
 };
 use crate::schema_massager::{
-    to_powdrr_schema, PowdrrDataType, PowdrrField, PowdrrSchema, SqlQuery,
+    PowdrrDataType, PowdrrField, PowdrrSchema, SqlQuery, to_powdrr_schema,
 };
-use arrow_json::writer::LineDelimited;
 use arrow_json::WriterBuilder;
+use arrow_json::writer::LineDelimited;
 use datafusion::{
     arrow::{
         array::{
