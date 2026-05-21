@@ -8,10 +8,10 @@ use gotham::prelude::FromState;
 use gotham::state::State;
 use http::StatusCode;
 pub use powdrr_control_plane::ilm_policy::*;
-use powdrr_query_lib::elastic_search_common::MIME_ES_JSON;
-use powdrr_query_lib::elastic_search_responses::{ErrorDetails, SingleDocCreateFailedResult};
-use powdrr_query_lib::state_provider::STATE_PROVIDER;
-use powdrr_query_lib::util::log_service_err_response;
+use powdrr_query_runtime::elastic_search_common::MIME_ES_JSON;
+use powdrr_query_runtime::elastic_search_responses::{ErrorDetails, SingleDocCreateFailedResult};
+use powdrr_query_runtime::state_provider::STATE_PROVIDER;
+use powdrr_query_runtime::util::log_service_err_response;
 use std::collections::HashMap;
 use std::pin::Pin;
 
@@ -127,10 +127,7 @@ mod tests {
                 let error = format!("{}", e);
                 let error_str = error.as_str();
                 println!("{}", error_str);
-                let _ = fs::write(
-                    "/Users/gregory/code/powdrr-engine/main_lib/output.txt",
-                    error,
-                );
+                let _ = fs::write("output.txt", error);
                 panic!("nope");
             }
         }
@@ -143,10 +140,7 @@ mod tests {
                 let error = format!("{}", e);
                 let error_str = error.as_str();
                 println!("{}", error_str);
-                let _ = fs::write(
-                    "/Users/gregory/code/powdrr-engine/main_lib/output.txt",
-                    error,
-                );
+                let _ = fs::write("output.txt", error);
                 panic!("nope");
             }
         }

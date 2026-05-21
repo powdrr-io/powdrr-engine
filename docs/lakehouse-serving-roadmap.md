@@ -38,19 +38,19 @@ Not the initial goal:
 The repo already has useful primitives:
 
 - Iceberg catalog and object-store integration in
-  [main_lib/src/data_access.rs](/Users/gregory/code/powdrr-engine/main_lib/src/data_access.rs:1)
+  [query_lib/src/data_access.rs](/Users/gregory/code/powdrr-engine/query_lib/src/data_access.rs:1)
 - Iceberg snapshot publication during compaction in
-  [main_lib/src/compaction.rs](/Users/gregory/code/powdrr-engine/main_lib/src/compaction.rs:109)
+  [query_runtime/src/compaction.rs](/Users/gregory/code/powdrr-engine/query_runtime/src/compaction.rs:109)
 - checkpointed table metadata in
-  [main_lib/src/data_contract.rs](/Users/gregory/code/powdrr-engine/main_lib/src/data_contract.rs:125)
+  [control_plane/src/data_contract.rs](/Users/gregory/code/powdrr-engine/control_plane/src/data_contract.rs:125)
 - cluster metadata and checkpoint lookup in
-  [main_lib/src/state_provider.rs](/Users/gregory/code/powdrr-engine/main_lib/src/state_provider.rs:607)
+  [query_runtime/src/state_provider.rs](/Users/gregory/code/powdrr-engine/query_runtime/src/state_provider.rs:607)
 - a new logical planning boundary in
-  [main_lib/src/search_plan.rs](/Users/gregory/code/powdrr-engine/main_lib/src/search_plan.rs:4)
+  [query_core/src/search_plan.rs](/Users/gregory/code/powdrr-engine/query_core/src/search_plan.rs:4)
   and
-  [main_lib/src/search_executor.rs](/Users/gregory/code/powdrr-engine/main_lib/src/search_executor.rs:34)
+  [query_runtime/src/search_executor.rs](/Users/gregory/code/powdrr-engine/query_runtime/src/search_executor.rs:34)
 - node-local merge plumbing through the private RPC path in
-  [main_lib/src/search_executor.rs](/Users/gregory/code/powdrr-engine/main_lib/src/search_executor.rs:194)
+  [query_runtime/src/search_executor.rs](/Users/gregory/code/powdrr-engine/query_runtime/src/search_executor.rs:194)
 
 These pieces are enough to avoid a rewrite from zero.
 
@@ -59,17 +59,17 @@ These pieces are enough to avoid a rewrite from zero.
 The current runtime is still built around a hybrid search stack:
 
 - checkpoints carry both `iceberg_metadata` and `speedboat_metadata` in
-  [main_lib/src/data_contract.rs](/Users/gregory/code/powdrr-engine/main_lib/src/data_contract.rs:125)
+  [control_plane/src/data_contract.rs](/Users/gregory/code/powdrr-engine/control_plane/src/data_contract.rs:125)
 - private execution still selects concrete file lists from a checkpoint in
-  [main_lib/src/private_api.rs](/Users/gregory/code/powdrr-engine/main_lib/src/private_api.rs:120)
+  [query_runtime/src/private_api.rs](/Users/gregory/code/powdrr-engine/query_runtime/src/private_api.rs:120)
 - the read path still fans out over `iceberg_files` and `speedboat_files` in
-  [main_lib/src/private_api.rs](/Users/gregory/code/powdrr-engine/main_lib/src/private_api.rs:422)
+  [query_runtime/src/private_api.rs](/Users/gregory/code/powdrr-engine/query_runtime/src/private_api.rs:422)
 - text search depends on `_search_index.parquet` sidecars in
-  [main_lib/src/private_api.rs](/Users/gregory/code/powdrr-engine/main_lib/src/private_api.rs:196)
+  [query_runtime/src/private_api.rs](/Users/gregory/code/powdrr-engine/query_runtime/src/private_api.rs:196)
   and
-  [main_lib/src/elastic_search_index.rs](/Users/gregory/code/powdrr-engine/main_lib/src/elastic_search_index.rs:162)
+  [query_runtime/src/elastic_search_index.rs](/Users/gregory/code/powdrr-engine/query_runtime/src/elastic_search_index.rs:162)
 - the SQL builder still assumes a join against `{target_table}_search_index` in
-  [main_lib/src/schema_massager.rs](/Users/gregory/code/powdrr-engine/main_lib/src/schema_massager.rs:950)
+  [query_core/src/schema_massager.rs](/Users/gregory/code/powdrr-engine/query_core/src/schema_massager.rs:950)
 
 That is not the target architecture. The requirements call for an Iceberg-first
 serving engine with explicit, snapshot-aware acceleration artifacts rather than
@@ -224,7 +224,7 @@ Text search can remain an optional later serving pattern.
 ### Checkpoint And Metadata Model
 
 `TableMetadataCheckpoint` in
-[main_lib/src/data_contract.rs](/Users/gregory/code/powdrr-engine/main_lib/src/data_contract.rs:125)
+[control_plane/src/data_contract.rs](/Users/gregory/code/powdrr-engine/control_plane/src/data_contract.rs:125)
 should stop representing a hybrid of canonical data stores.
 
 It should evolve toward:
@@ -252,9 +252,9 @@ Add explicit metadata types for:
 - artifact build status
 
 This belongs near
-[main_lib/src/data_contract.rs](/Users/gregory/code/powdrr-engine/main_lib/src/data_contract.rs:1)
+[control_plane/src/data_contract.rs](/Users/gregory/code/powdrr-engine/control_plane/src/data_contract.rs:1)
 and
-[main_lib/src/state_provider.rs](/Users/gregory/code/powdrr-engine/main_lib/src/state_provider.rs:1).
+[query_runtime/src/state_provider.rs](/Users/gregory/code/powdrr-engine/query_runtime/src/state_provider.rs:1).
 
 ### Execution IR
 
@@ -266,7 +266,7 @@ Generalize the current search-centric executor into a serving executor:
 - `private_api.rs` executes serving operators, not just file-backed SQL batches
 
 The existing executor split in
-[main_lib/src/search_executor.rs](/Users/gregory/code/powdrr-engine/main_lib/src/search_executor.rs:34)
+[query_runtime/src/search_executor.rs](/Users/gregory/code/powdrr-engine/query_runtime/src/search_executor.rs:34)
 is the right seam for this.
 
 ## Phased Implementation Plan
@@ -301,9 +301,9 @@ Work:
 
 Likely files:
 
-- [main_lib/src/data_contract.rs](/Users/gregory/code/powdrr-engine/main_lib/src/data_contract.rs:1)
-- [main_lib/src/state_provider.rs](/Users/gregory/code/powdrr-engine/main_lib/src/state_provider.rs:1)
-- [main_lib/src/router.rs](/Users/gregory/code/powdrr-engine/main_lib/src/router.rs:1)
+- [control_plane/src/data_contract.rs](/Users/gregory/code/powdrr-engine/control_plane/src/data_contract.rs:1)
+- [query_runtime/src/state_provider.rs](/Users/gregory/code/powdrr-engine/query_runtime/src/state_provider.rs:1)
+- [query_server/src/router.rs](/Users/gregory/code/powdrr-engine/query_server/src/router.rs:1)
 
 ### Phase 2: Build A Serving Planner
 
@@ -321,10 +321,10 @@ Work:
 
 Likely files:
 
-- [main_lib/src/search_plan.rs](/Users/gregory/code/powdrr-engine/main_lib/src/search_plan.rs:1)
-- [main_lib/src/search_executor.rs](/Users/gregory/code/powdrr-engine/main_lib/src/search_executor.rs:1)
-- [main_lib/src/private_api.rs](/Users/gregory/code/powdrr-engine/main_lib/src/private_api.rs:1)
-- [main_lib/src/data_access.rs](/Users/gregory/code/powdrr-engine/main_lib/src/data_access.rs:1)
+- [query_core/src/search_plan.rs](/Users/gregory/code/powdrr-engine/query_core/src/search_plan.rs:1)
+- [query_runtime/src/search_executor.rs](/Users/gregory/code/powdrr-engine/query_runtime/src/search_executor.rs:1)
+- [query_runtime/src/private_api.rs](/Users/gregory/code/powdrr-engine/query_runtime/src/private_api.rs:1)
+- [query_lib/src/data_access.rs](/Users/gregory/code/powdrr-engine/query_lib/src/data_access.rs:1)
 
 ### Phase 3: Key Lookup And Range Serving
 
@@ -394,27 +394,27 @@ Work:
 
 ### Storage And Snapshot Layer
 
-- [main_lib/src/data_access.rs](/Users/gregory/code/powdrr-engine/main_lib/src/data_access.rs:1)
+- [query_lib/src/data_access.rs](/Users/gregory/code/powdrr-engine/query_lib/src/data_access.rs:1)
   should become the home for manifest caching, snapshot diffing, file-stat
   extraction, and Parquet metadata access.
-- [main_lib/src/compaction.rs](/Users/gregory/code/powdrr-engine/main_lib/src/compaction.rs:109)
+- [query_runtime/src/compaction.rs](/Users/gregory/code/powdrr-engine/query_runtime/src/compaction.rs:109)
   should publish serveable-snapshot inputs and trigger artifact maintenance,
   not just move data from speedboat into Iceberg.
 
 ### Metadata And Control Plane
 
-- [main_lib/src/data_contract.rs](/Users/gregory/code/powdrr-engine/main_lib/src/data_contract.rs:125)
+- [control_plane/src/data_contract.rs](/Users/gregory/code/powdrr-engine/control_plane/src/data_contract.rs:125)
   should define serving patterns, serveable snapshots, and artifact manifests.
-- [main_lib/src/state_provider.rs](/Users/gregory/code/powdrr-engine/main_lib/src/state_provider.rs:607)
+- [query_runtime/src/state_provider.rs](/Users/gregory/code/powdrr-engine/query_runtime/src/state_provider.rs:607)
   should track lifecycle state for those records.
 
 ### Planner And Executor
 
-- [main_lib/src/search_plan.rs](/Users/gregory/code/powdrr-engine/main_lib/src/search_plan.rs:4)
+- [query_core/src/search_plan.rs](/Users/gregory/code/powdrr-engine/query_core/src/search_plan.rs:4)
   should become a general serving IR.
-- [main_lib/src/search_executor.rs](/Users/gregory/code/powdrr-engine/main_lib/src/search_executor.rs:34)
+- [query_runtime/src/search_executor.rs](/Users/gregory/code/powdrr-engine/query_runtime/src/search_executor.rs:34)
   should become the serving planner and merge coordinator.
-- [main_lib/src/private_api.rs](/Users/gregory/code/powdrr-engine/main_lib/src/private_api.rs:422)
+- [query_runtime/src/private_api.rs](/Users/gregory/code/powdrr-engine/query_runtime/src/private_api.rs:422)
   should stop centering execution around DataFusion batches over checkpoint file
   lists.
 

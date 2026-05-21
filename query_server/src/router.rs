@@ -37,15 +37,15 @@ use gotham::state::FromState;
 use gotham::state::State;
 use gotham::state::StateData;
 use http::HeaderMap;
-use powdrr_query_lib::compaction::{CompactionCommand, compact_logs};
-use powdrr_query_lib::elastic_search_common::MIME_ARROW_STREAM;
-use powdrr_query_lib::peers::{
+use powdrr_query_runtime::compaction::{CompactionCommand, compact_logs};
+use powdrr_query_runtime::elastic_search_common::MIME_ARROW_STREAM;
+use powdrr_query_runtime::peers::{
     PrivateCompactionInvocationExternal, PrivateExtensionInvocationExternal,
     PrivatePrefetchInvocationExternal, PrivateSearchInvocationExternal,
     PrivateSqlInvocationExternal,
 };
-use powdrr_query_lib::private_api;
-use powdrr_query_lib::private_api::{
+use powdrr_query_runtime::private_api;
+use powdrr_query_runtime::private_api::{
     compaction_query, extension_query, prefetch_query, search_query,
 };
 use serde::Deserialize;
@@ -735,19 +735,19 @@ pub(crate) mod tests {
         CreateTable, DeletesMetadata, FileSetPayload, IcebergFileStats, IcebergMetadata,
         SpeedboatMetadata, TableMetadataCheckpoint,
     };
-    use powdrr_query_lib::elastic_search_common::result_to_record_batch;
-    use powdrr_query_lib::elastic_search_responses::{QueryResultTotal, QueryResults};
-    use powdrr_query_lib::lakehouse_serving::ServingConfigResponse;
-    use powdrr_query_lib::peers::{
-        CheckpointDescriptor, PrivateSqlInvocation, PrivateSqlInvocationExternal,
-    };
     use powdrr_query_lib::schema_massager::{
         PowdrrDataType, PowdrrField, PowdrrSchema, SqlBuilder, SqlExpression,
         extract_powdrr_schema_str,
     };
     use powdrr_query_lib::serving_plan::ServingQueryClassification;
-    use powdrr_query_lib::state_provider::STATE_PROVIDER;
-    use powdrr_query_lib::test_api::{
+    use powdrr_query_runtime::elastic_search_common::result_to_record_batch;
+    use powdrr_query_runtime::elastic_search_responses::{QueryResultTotal, QueryResults};
+    use powdrr_query_runtime::lakehouse_serving::ServingConfigResponse;
+    use powdrr_query_runtime::peers::{
+        CheckpointDescriptor, PrivateSqlInvocation, PrivateSqlInvocationExternal,
+    };
+    use powdrr_query_runtime::state_provider::STATE_PROVIDER;
+    use powdrr_query_runtime::test_api::{
         CacheMode, CompactionMode, IndexingMode, PeerMode, PeerModeType, PrefetchMode, StateMode,
         StorageMode, TestProcessingMode,
     };
@@ -1091,7 +1091,7 @@ pub(crate) mod tests {
         ]);
 
         let file_path = format!(
-            "file://{}/tests/data/flights.parquet",
+            "file://{}/testdata/flights.parquet",
             env::current_dir().unwrap().to_str().unwrap()
         );
 
@@ -2115,11 +2115,11 @@ pub(crate) mod tests {
             speedboat_metadata: Some(SpeedboatMetadata {
                 files: FileSetPayload::single(
                     format!(
-                        "file://{}/tests/data/logs.json",
+                        "file://{}/testdata/logs.json",
                         env::current_dir().unwrap().to_str().unwrap()
                     ),
-                    include_str!("../../main_lib/tests/data/logs.json").len() as u64,
-                    extract_powdrr_schema_str(include_str!("../../main_lib/tests/data/logs.json")),
+                    include_str!("../../testdata/logs.json").len() as u64,
+                    extract_powdrr_schema_str(include_str!("../../testdata/logs.json")),
                 ),
             }),
             deletes_metadata: None,
@@ -2304,11 +2304,11 @@ pub(crate) mod tests {
             speedboat_metadata: Some(SpeedboatMetadata {
                 files: FileSetPayload::single(
                     format!(
-                        "file://{}/tests/data/logs.json",
+                        "file://{}/testdata/logs.json",
                         env::current_dir().unwrap().to_str().unwrap()
                     ),
-                    include_str!("../../main_lib/tests/data/logs.json").len() as u64,
-                    extract_powdrr_schema_str(include_str!("../../main_lib/tests/data/logs.json")),
+                    include_str!("../../testdata/logs.json").len() as u64,
+                    extract_powdrr_schema_str(include_str!("../../testdata/logs.json")),
                 ),
             }),
             deletes_metadata: None,
@@ -2334,13 +2334,11 @@ pub(crate) mod tests {
             speedboat_metadata: Some(SpeedboatMetadata {
                 files: FileSetPayload::single(
                     format!(
-                        "file://{}/tests/data/events_extra.json",
+                        "file://{}/testdata/events_extra.json",
                         env::current_dir().unwrap().to_str().unwrap()
                     ),
-                    include_str!("../../main_lib/tests/data/events_extra.json").len() as u64,
-                    extract_powdrr_schema_str(include_str!(
-                        "../../main_lib/tests/data/events_extra.json"
-                    )),
+                    include_str!("../../testdata/events_extra.json").len() as u64,
+                    extract_powdrr_schema_str(include_str!("../../testdata/events_extra.json")),
                 ),
             }),
             deletes_metadata: None,
@@ -3397,7 +3395,7 @@ pub(crate) mod tests {
                 snapshot_id: Some("fake_iceberg_snapshot".to_string()),
                 files: FileSetPayload::single(
                     format!(
-                        "file://{}/tests/data/flights.parquet",
+                        "file://{}/testdata/flights.parquet",
                         env::current_dir().unwrap().to_str().unwrap()
                     ),
                     1,
@@ -3503,7 +3501,7 @@ pub(crate) mod tests {
         ]);
 
         let file_path = format!(
-            "file://{}/tests/data/flights.parquet",
+            "file://{}/testdata/flights.parquet",
             env::current_dir().unwrap().to_str().unwrap()
         );
 
@@ -3625,7 +3623,7 @@ pub(crate) mod tests {
         ]);
 
         let data_file_path = format!(
-            "file://{}/tests/data/logs.json",
+            "file://{}/testdata/logs.json",
             env::current_dir().unwrap().to_str().unwrap()
         );
 
@@ -6272,10 +6270,10 @@ pub(crate) mod tests {
         let body = make_create_bulk_body(
             "okta_system_log".to_string(),
             vec![
-                include_str!("../../main_lib/tests/data/okta_system_log_1.json").to_string(),
-                include_str!("../../main_lib/tests/data/okta_system_log_2.json").to_string(),
-                include_str!("../../main_lib/tests/data/okta_system_log_3.json").to_string(),
-                include_str!("../../main_lib/tests/data/okta_system_log_4.json").to_string(),
+                include_str!("../../testdata/okta_system_log_1.json").to_string(),
+                include_str!("../../testdata/okta_system_log_2.json").to_string(),
+                include_str!("../../testdata/okta_system_log_3.json").to_string(),
+                include_str!("../../testdata/okta_system_log_4.json").to_string(),
             ],
         );
 

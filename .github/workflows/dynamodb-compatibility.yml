@@ -26,7 +26,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Validate Compatibility Fixture File
-        run: cargo test -p powdrr_lib --features integration-tests --test dynamodb_compatibility_matrix compatibility_matrix_operations_are_complete_and_unique -- --nocapture
+        run: cargo test -p powdrr-query-server --test dynamodb_compatibility_matrix compatibility_matrix_operations_are_complete_and_unique -- --nocapture
 
       - name: Run DynamoDB Compatibility Matrix
         run: bash scripts/run_dynamodb_compat_local.sh

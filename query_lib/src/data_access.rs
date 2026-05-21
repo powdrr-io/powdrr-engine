@@ -2,8 +2,7 @@ use crate::data_contract::{
     IcebergAccessArtifact, IcebergColumnStats, IcebergFileStats, IcebergPartitionField,
     IcebergPartitionValue, IcebergRowGroupStats, IcebergSortField,
 };
-use crate::elastic_search_ingest::JSON_MODE;
-use crate::util::log_err;
+use crate::speedboat_buffer::JSON_MODE;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::ipc::reader::FileReader as ArrowIpcFileReader;
 use datafusion::common::HashMap;
@@ -64,6 +63,15 @@ use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinSet;
 use url::Url;
+
+fn log_err<SuccessType, ErrorType: std::error::Error>(
+    error: ErrorType,
+) -> Result<SuccessType, ErrorType> {
+    let error_str = format!("{}", error);
+    println!("{}", error_str);
+    tracing::info!("{}", error);
+    Err(error)
+}
 
 const DEFAULT_S3_ENDPOINT_VALUE: &str = "http://localhost:9000";
 const DEFAULT_ICEBERG_ENDPOINT_VALUE: &str = "http://localhost:8181";
@@ -257,7 +265,7 @@ impl IcebergTableMetadataCache {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct MetadataCacheCoverage {
+pub struct MetadataCacheCoverage {
     pub files_cached: usize,
     pub row_groups_cached: usize,
 }
@@ -280,9 +288,7 @@ fn cache_parquet_row_group_stats(file_path: &str, row_groups: &[IcebergRowGroupS
         .insert(file_path, row_groups.to_vec());
 }
 
-pub(crate) fn cached_parquet_row_group_stats_coverage(
-    file_paths: &[String],
-) -> MetadataCacheCoverage {
+pub fn cached_parquet_row_group_stats_coverage(file_paths: &[String]) -> MetadataCacheCoverage {
     let cache = PARQUET_ROW_GROUP_STATS_CACHE.lock().unwrap();
     let mut coverage = MetadataCacheCoverage::default();
     for file_path in file_paths {
@@ -325,7 +331,7 @@ fn cache_iceberg_table_metadata(namespace: &str, name: &str, metadata: &IcebergL
         .insert(&iceberg_table_key(namespace, name), cached);
 }
 
-pub(crate) fn iceberg_table_metadata_cache_contains(
+pub fn iceberg_table_metadata_cache_contains(
     namespace: &str,
     name: &str,
     snapshot_id: i64,
@@ -361,16 +367,14 @@ fn clear_iceberg_table_metadata_cache() {
     ICEBERG_TABLE_METADATA_CACHE.lock().unwrap().clear();
 }
 
-#[cfg(test)]
-pub(crate) fn prime_parquet_row_group_stats_cache_for_test(
+pub fn prime_parquet_row_group_stats_cache_for_test(
     file_path: &str,
     row_groups: &[IcebergRowGroupStats],
 ) {
     cache_parquet_row_group_stats(file_path, row_groups);
 }
 
-#[cfg(test)]
-pub(crate) fn reset_serving_metadata_caches_for_test() {
+pub fn reset_serving_metadata_caches_for_test() {
     clear_parquet_row_group_stats_cache();
     clear_iceberg_table_metadata_cache();
     clear_iceberg_table_row_group_stats_tracker();
@@ -378,7 +382,7 @@ pub(crate) fn reset_serving_metadata_caches_for_test() {
     clear_serving_cache_manager_operation();
 }
 
-pub(crate) fn evict_serving_metadata_for_files(file_paths: &[String]) {
+pub fn evict_serving_metadata_for_files(file_paths: &[String]) {
     for file_path in file_paths {
         remove_file_from_iceberg_table_row_group_stats(file_path);
         invalidate_iceberg_table_metadata_for_file(file_path);
@@ -1034,21 +1038,21 @@ fn clear_serving_cache_manager_operation() {
     LAST_SERVING_CACHE_MANAGER_OPERATION.lock().unwrap().take();
 }
 
-pub(crate) fn record_serving_bulk_cache_warmup(stats: ServingBulkCacheWarmupStats) {
+pub fn record_serving_bulk_cache_warmup(stats: ServingBulkCacheWarmupStats) {
     LAST_SERVING_BULK_CACHE_WARMUP
         .lock()
         .unwrap()
         .replace(stats);
 }
 
-pub(crate) fn record_serving_cache_manager_operation(stats: ServingCacheManagerOperationStats) {
+pub fn record_serving_cache_manager_operation(stats: ServingCacheManagerOperationStats) {
     LAST_SERVING_CACHE_MANAGER_OPERATION
         .lock()
         .unwrap()
         .replace(stats);
 }
 
-pub(crate) fn serving_bulk_cache_stats() -> ServingBulkCacheStats {
+pub fn serving_bulk_cache_stats() -> ServingBulkCacheStats {
     let last_warmup = current_serving_bulk_cache_warmup();
     let last_manager_operation = current_serving_cache_manager_operation();
     #[cfg(target_os = "linux")]
@@ -1072,7 +1076,7 @@ pub(crate) fn serving_bulk_cache_stats() -> ServingBulkCacheStats {
     }
 }
 
-pub(crate) async fn flush_serving_bulk_cache() -> Result<(), String> {
+pub async fn flush_serving_bulk_cache() -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         let Some(runtime) = current_serving_liquid_cache_runtime() else {
@@ -2181,10 +2185,7 @@ impl LRUCacheHandle {
 
 static LRU_CACHE_HANDLE: LazyLock<LRUCacheHandle> = LazyLock::new(|| LRUCacheHandle::new());
 
-pub(crate) async fn set_s3_endpoint(
-    rest_endpoint: &Option<String>,
-    s3_endpoint: &Option<String>,
-) -> () {
+pub async fn set_s3_endpoint(rest_endpoint: &Option<String>, s3_endpoint: &Option<String>) -> () {
     LRU_CACHE_HANDLE
         .set_s3_config(
             &rest_endpoint
@@ -2497,7 +2498,7 @@ fn register_memtable_with_name(
     }
 }
 
-pub(crate) fn path_to_table_name(file_path: &String) -> String {
+pub fn path_to_table_name(file_path: &String) -> String {
     let safe_name = file_path
         .replace("/", "_")
         .replace(".", "_")
@@ -3216,7 +3217,7 @@ async fn commit_iceberg_transaction_worker(
     }
 }
 
-pub(crate) async fn file_exists(path: &String) -> bool {
+pub async fn file_exists(path: &String) -> bool {
     LRU_CACHE_HANDLE.file_exists(path).await
 }
 
@@ -3235,7 +3236,7 @@ pub async fn put_s3_file(
     LRU_CACHE_HANDLE.file_put(file_path, file_contents).await
 }
 
-pub(crate) async fn commit_iceberg_transaction(
+pub async fn commit_iceberg_transaction(
     namespace: &String,
     table_name: &String,
     compaction_id: &String,
@@ -3260,8 +3261,8 @@ mod tests {
         serving_bulk_cache_stats, serving_session_config,
     };
     use crate::data_contract::{IcebergColumnStats, IcebergRowGroupStats};
-    use crate::elastic_search_ingest::WriteBuffer;
     use crate::schema_massager::PowdrrSchema;
+    use crate::speedboat_buffer::WriteBuffer;
     use datafusion::arrow::array::{Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field};
     use datafusion::parquet::arrow::ArrowWriter;

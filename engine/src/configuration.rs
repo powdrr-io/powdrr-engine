@@ -1,6 +1,6 @@
-use powdrr_query_lib::peers::get_docker_peer_ips;
-use powdrr_query_lib::state_provider::STATE_PROVIDER;
-use powdrr_query_lib::test_api::{
+use powdrr_query_runtime::peers::get_docker_peer_ips;
+use powdrr_query_runtime::state_provider::STATE_PROVIDER;
+use powdrr_query_runtime::test_api::{
     CacheMode, CompactionMode, IndexingMode, PeerMode, PeerModeType, PrefetchMode, StateMode,
     StorageMode, TestProcessingMode,
 };

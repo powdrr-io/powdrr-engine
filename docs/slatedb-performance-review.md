@@ -161,16 +161,16 @@ For time-scoped or append-heavy tables, this matters as much as caching.
 Powdrr already has a few pieces in the same direction:
 
 - file-level Iceberg stats are loaded into checkpoints in
-  [main_lib/src/data_access.rs](../main_lib/src/data_access.rs)
+  [query_lib/src/data_access.rs](../query_lib/src/data_access.rs)
 - the shared serving path uses those stats for file pruning and bounded top-k in
-  [main_lib/src/lakehouse_serving.rs](../main_lib/src/lakehouse_serving.rs)
+  [query_runtime/src/lakehouse_serving.rs](../query_runtime/src/lakehouse_serving.rs)
 - the serving optimization docs already call for row-group metadata, page-index
   awareness, shared caches, and protocol-neutral planning in
   [docs/cross-protocol-serving-optimization-plan.md](./cross-protocol-serving-optimization-plan.md)
   and
   [docs/zero-copy-lakehouse-serving-requirements.md](./zero-copy-lakehouse-serving-requirements.md)
 - DataFusion Parquet pruning is enabled in
-  [main_lib/src/data_access.rs](../main_lib/src/data_access.rs)
+  [query_lib/src/data_access.rs](../query_lib/src/data_access.rs)
 
 So the gap is not architectural direction. The gap is that these concerns are
 not yet first-class enough in code or operations.

@@ -1,4 +1,4 @@
-use powdrr_lib::local_cli::{
+use powdrr_query_runtime::local_cli::{
     LocalQueryAnalysisRequest, LocalQueryExecutionPath, LocalQueryLanguage,
     LocalQueryPerformanceClassification, analyze_local_query,
 };

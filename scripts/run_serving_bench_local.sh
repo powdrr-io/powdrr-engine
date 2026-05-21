@@ -105,8 +105,8 @@ ENGINE_PID=$!
 
 wait_for_engine "${POWDRR_URL}/_cluster/health"
 
-"$ROOT_DIR/scripts/cargo-worktree.sh" test -p powdrr_lib --lib serving_protocol::tests -- --nocapture
-"$ROOT_DIR/scripts/cargo-worktree.sh" test -p powdrr_lib --lib lakehouse_serving::tests -- --nocapture
-"$ROOT_DIR/scripts/cargo-worktree.sh" test -p powdrr_lib --lib router::tests::test_serving_config_and_fast_path_query -- --nocapture
+"$ROOT_DIR/scripts/cargo-worktree.sh" test -p powdrr-query-runtime --lib serving_protocol::tests -- --nocapture
+"$ROOT_DIR/scripts/cargo-worktree.sh" test -p powdrr-query-runtime --lib lakehouse_serving::tests -- --nocapture
+"$ROOT_DIR/scripts/cargo-worktree.sh" test -p powdrr-query-server --lib router::tests::test_serving_config_and_fast_path_query -- --nocapture
 POWDRR_SERVE_BENCH_POWDRR_URL="$POWDRR_URL" \
   "$ROOT_DIR/scripts/cargo-worktree.sh" run ${BENCH_RELEASE_FLAG:+$BENCH_RELEASE_FLAG} -p powdrr-benchmark

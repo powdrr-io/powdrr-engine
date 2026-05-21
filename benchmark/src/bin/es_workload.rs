@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 const CASES_JSON: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../main_lib/tests/data/es_compat_cases.json"
+    "/../testdata/es_compat_cases.json"
 ));
 const DEFAULT_CASE_IDS: &str = "logs_wildcard_query_string_returns_expected_hits,logs_wildcard_search_after_returns_expected_hits,logs_wildcard_date_histogram_with_bounds_returns_expected_buckets,logs_wildcard_terms_order_and_missing_return_expected_buckets,logs_wildcard_terms_subaggregation_returns_expected_buckets";
 

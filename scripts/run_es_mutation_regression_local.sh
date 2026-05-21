@@ -59,5 +59,5 @@ tests=(
 
 for test_name in "${tests[@]}"; do
   echo "Running ${test_name}"
-  scripts/cargo-worktree.sh test -p powdrr_lib "$test_name" --lib -- --exact --test-threads=1
+  scripts/cargo-worktree.sh test -p powdrr-query-server "$test_name" --lib -- --exact --test-threads=1
 done

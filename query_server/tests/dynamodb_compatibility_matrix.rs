@@ -24,16 +24,16 @@ use datafusion::parquet::arrow::ArrowWriter;
 use futures_util::future;
 use gotham::bind_server;
 use hmac::{Hmac, Mac};
-use powdrr_lib::data_contract::{
+use powdrr_query_lib::data_contract::{
     DynamoDbGlobalSecondaryIndexConfig, DynamoDbLocalSecondaryIndexConfig, DynamoDbTableConfig,
     FileSetPayload, IcebergMetadata, LicenseType, OrgCreds, OrgSettings, TableMetadataCheckpoint,
 };
-use powdrr_lib::router::router;
-use powdrr_lib::serving_dataset::read_parquet_documents;
-use powdrr_lib::state_provider::STATE_PROVIDER;
-use powdrr_lib::test_api::{
+use powdrr_query_runtime::serving_dataset::read_parquet_documents;
+use powdrr_query_runtime::state_provider::STATE_PROVIDER;
+use powdrr_query_runtime::test_api::{
     CacheMode, CompactionMode, IndexingMode, StateMode, TestProcessingMode,
 };
+use powdrr_query_server::router::router;
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -43,7 +43,7 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use url::Url;
 
-const CASES_JSON: &str = include_str!("data/dynamodb_compat_cases.json");
+const CASES_JSON: &str = include_str!("../../testdata/dynamodb_compat_cases.json");
 
 static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 

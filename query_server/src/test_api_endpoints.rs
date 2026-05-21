@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use powdrr_query_lib::data_access;
 use powdrr_query_lib::data_contract::TableMetadataCheckpoint;
-use powdrr_query_lib::elastic_search_index;
-use powdrr_query_lib::state_provider::STATE_PROVIDER;
-use powdrr_query_lib::test_api::{
+use powdrr_query_runtime::elastic_search_index;
+use powdrr_query_runtime::state_provider::STATE_PROVIDER;
+use powdrr_query_runtime::test_api::{
     TestProcessingMode, do_available_compaction_work, do_available_extension_work, do_next_cleanup,
     spawn_processing_mode_workers,
 };

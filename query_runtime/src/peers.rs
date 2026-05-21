@@ -1080,9 +1080,9 @@ impl PeerClient for SelfPeer {
 mod tests {
     use super::*;
     use crate::data_contract::{FileSetPayload, IcebergMetadata, TableMetadataCheckpoint};
-    use crate::router::router;
     use crate::schema_massager::{PowdrrDataType, PowdrrField, SqlBuilder, SqlExpression};
     use gotham::mime;
+    use powdrr_query_server::router::router;
     use std::collections::HashMap;
     use std::env;
 
@@ -1115,7 +1115,7 @@ mod tests {
             },
         ]);
         let file_path = format!(
-            "file://{}/tests/data/flights.parquet",
+            "file://{}/testdata/flights.parquet",
             env::current_dir().unwrap().to_str().unwrap()
         );
         let checkpoint = TableMetadataCheckpoint {
