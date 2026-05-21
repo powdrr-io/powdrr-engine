@@ -30,12 +30,7 @@ use powdrr_query_lib::data_contract::{
     ServingTableConfig, TableDescription, TableMetadataCheckpoint,
 };
 use powdrr_query_lib::schema_massager::{PowdrrDataType, PowdrrSchema, extract_powdrr_schema};
-use powdrr_query_lib::serving_plan::{
-    ServingPredicate, ServingQueryClassification, ServingRequestPlan, ServingSort,
-};
-use powdrr_query_runtime::lakehouse_serving::{
-    ServingQueryError, ServingQueryResponse, execute_serving_query,
-};
+use powdrr_query_lib::serving_plan::ServingPredicate;
 use powdrr_query_runtime::peers::CheckpointDescriptor;
 use powdrr_query_runtime::search_runtime::batches_to_serde_value;
 use powdrr_query_runtime::state_provider::{STATE_PROVIDER, ServiceApiError};
@@ -551,6 +546,12 @@ struct QueryTarget {
     index_name: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DynamoDbReadOrder {
+    field: String,
+    descending: bool,
+}
+
 #[derive(Clone, Debug)]
 enum FilterNode {
     Predicate(FilterPredicate),
@@ -966,26 +967,25 @@ async fn handle_get_item(payload: Value) -> Result<Value, DynamoDbError> {
         request.projection_expression.as_ref(),
         request.expression_attribute_names.as_ref(),
     )?;
-    let response = execute_fast_path_query(
-        &request.table_name,
-        ServingRequestPlan {
-            select: projection,
-            filters: key_to_predicates(&key_schema, &key),
-            aggregate: None,
-            order_by: vec![],
-            limit: Some(1),
-            allow_slow_path: false,
-            explain: false,
-        },
+    let files = load_table_files(&request.table_name).await?;
+    let execution_projection =
+        projection_with_fields(projection.as_ref(), &key_schema_fields(&key_schema));
+    let item = execute_uncached_read_query(
+        &files,
+        &execution_projection,
+        &key_to_predicates(&key_schema, &key),
+        &read_orders_for_key_schema(&key_schema),
+        1,
     )
-    .await?;
-
-    let item = response
-        .rows
-        .into_iter()
-        .next()
-        .map(|row| json_row_to_dynamodb_item(&row))
-        .transpose()?;
+    .await?
+    .rows
+    .into_iter()
+    .next()
+    .map(|row| {
+        let row = project_row_if_requested(row, projection.as_ref())?;
+        json_row_to_dynamodb_item(&row)
+    })
+    .transpose()?;
 
     Ok(serde_json::to_value(GetItemResponse {
         item,
@@ -1236,23 +1236,25 @@ async fn handle_batch_get_item(payload: Value) -> Result<Value, DynamoDbError> {
             keys_and_attributes.projection_expression.as_ref(),
             keys_and_attributes.expression_attribute_names.as_ref(),
         )?;
+        let files = load_table_files(table_name).await?;
+        let execution_projection =
+            projection_with_fields(projection.as_ref(), &key_schema_fields(&key_schema));
         let mut items = vec![];
         for key in keys_and_attributes.keys.iter() {
             let parsed_key = parse_key_map(key, &key_schema)?;
-            let response = execute_fast_path_query(
-                table_name,
-                ServingRequestPlan {
-                    select: projection.clone(),
-                    filters: key_to_predicates(&key_schema, &parsed_key),
-                    aggregate: None,
-                    order_by: vec![],
-                    limit: Some(1),
-                    allow_slow_path: false,
-                    explain: false,
-                },
+            if let Some(row) = execute_uncached_read_query(
+                &files,
+                &execution_projection,
+                &key_to_predicates(&key_schema, &parsed_key),
+                &read_orders_for_key_schema(&key_schema),
+                1,
             )
-            .await?;
-            if let Some(row) = response.rows.into_iter().next() {
+            .await?
+            .rows
+            .into_iter()
+            .next()
+            {
+                let row = project_row_if_requested(row, projection.as_ref())?;
                 items.push(json_row_to_dynamodb_item(&row)?);
             }
         }
@@ -1343,21 +1345,6 @@ async fn handle_query(payload: Value) -> Result<Value, DynamoDbError> {
         )?;
     }
 
-    let order_by = if sort_is_exact_eq {
-        vec![]
-    } else {
-        query_target
-            .key_schema
-            .sort_key
-            .as_ref()
-            .map(|sort_key| {
-                vec![ServingSort {
-                    field: sort_key.clone(),
-                    descending: !ascending,
-                }]
-            })
-            .unwrap_or_default()
-    };
     let effective_limit = query_fetch_limit(
         page_limit,
         sort_is_exact_eq,
@@ -1370,22 +1357,22 @@ async fn handle_query(payload: Value) -> Result<Value, DynamoDbError> {
         &query_target.key_schema,
         &context.schema,
     );
-
-    let response = execute_fast_path_query(
-        &request.table_name,
-        ServingRequestPlan {
-            select: query_projection,
-            filters: key_filters,
-            aggregate: None,
-            order_by,
-            limit: Some(effective_limit),
-            allow_slow_path: false,
-            explain: false,
-        },
+    let files = load_table_files(&request.table_name).await?;
+    let query_read_orders = read_orders_for_query(
+        &query_target.key_schema,
+        &table_key_schema,
+        ascending,
+        sort_is_exact_eq,
+    );
+    let mut evaluated_rows = execute_uncached_read_query(
+        &files,
+        &query_projection,
+        &key_filters,
+        &query_read_orders,
+        effective_limit,
     )
-    .await?;
-
-    let mut evaluated_rows = response.rows;
+    .await?
+    .rows;
     let last_evaluated_key = if evaluated_rows.len() > page_limit {
         let key = row_to_key(
             &evaluated_rows[page_limit - 1],
@@ -1539,30 +1526,6 @@ fn validate_consistent_read(
         ));
     }
     Ok(())
-}
-
-async fn execute_fast_path_query(
-    table_name: &str,
-    request: ServingRequestPlan,
-) -> Result<ServingQueryResponse, DynamoDbError> {
-    let response = execute_serving_query(table_name, request)
-        .await
-        .map_err(convert_serving_error)?;
-    if response.classification != ServingQueryClassification::FastPath {
-        return Err(DynamoDbError::validation(response.reason.unwrap_or_else(
-            || "Query did not qualify for the serving fast path".to_string(),
-        )));
-    }
-    Ok(response)
-}
-
-fn convert_serving_error(error: ServingQueryError) -> DynamoDbError {
-    let type_name = match error.status {
-        StatusCode::NOT_FOUND => "ResourceNotFoundException",
-        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => "ValidationException",
-        _ => "InternalServerError",
-    };
-    DynamoDbError::new(error.status, type_name, error.message)
 }
 
 async fn load_dynamodb_table_context(
@@ -1748,7 +1711,9 @@ async fn publish_mutated_checkpoint(
                 .map(|field| field.name.clone())
                 .collect(),
             column_stats: vec![],
-            access_artifacts: previous_iceberg_metadata.access_artifacts.clone(),
+            // DynamoDB mutations rewrite the base file set, so any previously-derived serving
+            // artifacts are no longer authoritative for the new checkpoint.
+            access_artifacts: vec![],
             file_stats: vec![],
         }),
         speedboat_metadata: None,
@@ -4253,6 +4218,93 @@ fn ordered_key_fields(
     fields
 }
 
+fn key_schema_fields(key_schema: &DynamoDbKeySchemaConfig) -> Vec<String> {
+    let mut fields = vec![key_schema.partition_key.clone()];
+    if let Some(sort_key) = key_schema.sort_key.as_ref() {
+        fields.push(sort_key.clone());
+    }
+    fields
+}
+
+fn read_orders_for_key_schema(key_schema: &DynamoDbKeySchemaConfig) -> Vec<DynamoDbReadOrder> {
+    key_schema_fields(key_schema)
+        .into_iter()
+        .map(|field| DynamoDbReadOrder {
+            field,
+            descending: false,
+        })
+        .collect()
+}
+
+fn read_orders_for_query(
+    query_key_schema: &DynamoDbKeySchemaConfig,
+    table_key_schema: &DynamoDbKeySchemaConfig,
+    ascending: bool,
+    sort_is_exact_eq: bool,
+) -> Vec<DynamoDbReadOrder> {
+    let mut orders = Vec::new();
+    if !sort_is_exact_eq {
+        if let Some(sort_key) = query_key_schema.sort_key.as_ref() {
+            orders.push(DynamoDbReadOrder {
+                field: sort_key.clone(),
+                descending: !ascending,
+            });
+        }
+    }
+    for field in ordered_key_fields(query_key_schema, table_key_schema) {
+        if !orders.iter().any(|order| order.field == field) {
+            orders.push(DynamoDbReadOrder {
+                field,
+                descending: false,
+            });
+        }
+    }
+    orders
+}
+
+fn projection_with_fields(
+    projection: Option<&Vec<String>>,
+    required_fields: &[String],
+) -> Option<Vec<String>> {
+    let mut projection = projection.cloned()?;
+    for field in required_fields.iter() {
+        append_selected_field(&mut projection, field);
+    }
+    Some(projection)
+}
+
+fn project_row_if_requested(
+    row: Value,
+    projection: Option<&Vec<String>>,
+) -> Result<Value, DynamoDbError> {
+    match projection {
+        Some(projection) => project_row(&row, projection),
+        None => Ok(row),
+    }
+}
+
+async fn execute_uncached_read_query(
+    files: &[FileDescriptor],
+    projection: &Option<Vec<String>>,
+    filters: &[ServingPredicate],
+    order_by: &[DynamoDbReadOrder],
+    limit: usize,
+) -> Result<ScanExecutionResult, DynamoDbError> {
+    let sql_template = build_read_sql("{table}", projection.as_ref(), filters, order_by, limit)?;
+    let mut rows = vec![];
+    for file_group in group_files_by_schema(files).into_iter() {
+        let mut new_rows = execute_scan_file_group(file_group, &sql_template).await?;
+        rows.append(&mut new_rows);
+        rows.sort_by(|left, right| compare_read_rows(left, right, order_by));
+        rows.truncate(limit);
+    }
+    Ok(ScanExecutionResult { rows })
+}
+
+struct ScanExecutionResult {
+    rows: Vec<Value>,
+}
+
 async fn execute_scan_query(
     files: &[FileDescriptor],
     projection: &Option<Vec<String>>,
@@ -4268,10 +4320,11 @@ async fn execute_scan_query(
         limit,
     )?;
     let mut rows = vec![];
+    let read_orders = order_fields_to_read_orders(order_fields);
     for file_group in group_files_by_schema(files).into_iter() {
         let mut new_rows = execute_scan_file_group(file_group, &sql_template).await?;
         rows.append(&mut new_rows);
-        rows.sort_by(|left, right| compare_scan_rows(left, right, order_fields));
+        rows.sort_by(|left, right| compare_read_rows(left, right, &read_orders));
         rows.truncate(limit);
     }
     Ok(rows)
@@ -4306,6 +4359,51 @@ async fn execute_scan_file_group(
     result
 }
 
+fn build_read_sql(
+    table_name: &str,
+    projection: Option<&Vec<String>>,
+    filters: &[ServingPredicate],
+    order_fields: &[DynamoDbReadOrder],
+    limit: usize,
+) -> Result<String, DynamoDbError> {
+    let select = match projection {
+        Some(select_fields) => select_fields
+            .iter()
+            .map(|field| format!("t.\"{}\"", escape_identifier(field)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        None => "*".to_string(),
+    };
+    let where_clauses = filters
+        .iter()
+        .map(sql_clauses_for_filter)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+    let mut sql = format!("SELECT {} FROM {} t", select, table_name);
+    if !where_clauses.is_empty() {
+        sql.push_str(&format!(" WHERE {}", where_clauses.join(" AND ")));
+    }
+    if !order_fields.is_empty() {
+        let order_clause = order_fields
+            .iter()
+            .map(|field| {
+                format!(
+                    "t.\"{}\" {}",
+                    escape_identifier(&field.field),
+                    if field.descending { "DESC" } else { "ASC" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        sql.push_str(&format!(" ORDER BY {}", order_clause));
+    }
+    sql.push_str(&format!(" LIMIT {}", limit));
+    Ok(sql)
+}
+
 fn build_scan_sql(
     table_name: &str,
     projection: Option<&Vec<String>>,
@@ -4316,30 +4414,71 @@ fn build_scan_sql(
     let select = match projection {
         Some(select_fields) => select_fields
             .iter()
-            .map(|field| format!("\"{}\"", escape_identifier(field)))
+            .map(|field| format!("t.\"{}\"", escape_identifier(field)))
             .collect::<Vec<_>>()
             .join(", "),
         None => "*".to_string(),
     };
-    let mut where_clauses = vec![];
-    if let Some(exclusive_start_key) = exclusive_start_key {
-        where_clauses.push(scan_start_key_clause(order_fields, exclusive_start_key)?);
-    }
-
     let mut sql = format!("SELECT {} FROM {} t", select, table_name);
-    if !where_clauses.is_empty() {
-        sql.push_str(&format!(" WHERE {}", where_clauses.join(" AND ")));
+    if let Some(exclusive_start_key) = exclusive_start_key {
+        sql.push_str(&format!(
+            " WHERE {}",
+            scan_start_key_clause(order_fields, exclusive_start_key)?
+        ));
     }
     if !order_fields.is_empty() {
         let order_clause = order_fields
             .iter()
-            .map(|field| format!("\"{}\" ASC", escape_identifier(field)))
+            .map(|field| format!("t.\"{}\" ASC", escape_identifier(field)))
             .collect::<Vec<_>>()
             .join(", ");
         sql.push_str(&format!(" ORDER BY {}", order_clause));
     }
     sql.push_str(&format!(" LIMIT {}", limit));
     Ok(sql)
+}
+
+fn sql_clauses_for_filter(filter: &ServingPredicate) -> Result<Vec<String>, DynamoDbError> {
+    let field = format!("t.\"{}\"", escape_identifier(&filter.field));
+    let mut clauses = Vec::new();
+    if let Some(eq) = filter.eq.as_ref() {
+        clauses.push(format!("{} = {}", field, scan_sql_literal(eq)?));
+    }
+    if let Some(in_values) = filter.in_values.as_ref() {
+        if in_values.is_empty() {
+            clauses.push("FALSE".to_string());
+        } else {
+            let values = in_values
+                .iter()
+                .map(scan_sql_literal)
+                .collect::<Result<Vec<_>, _>>()?;
+            clauses.push(format!("{} IN ({})", field, values.join(", ")));
+        }
+    }
+    if let Some(gt) = filter.gt.as_ref() {
+        clauses.push(format!("{} > {}", field, scan_sql_literal(gt)?));
+    }
+    if let Some(gte) = filter.gte.as_ref() {
+        clauses.push(format!("{} >= {}", field, scan_sql_literal(gte)?));
+    }
+    if let Some(lt) = filter.lt.as_ref() {
+        clauses.push(format!("{} < {}", field, scan_sql_literal(lt)?));
+    }
+    if let Some(lte) = filter.lte.as_ref() {
+        clauses.push(format!("{} <= {}", field, scan_sql_literal(lte)?));
+    }
+    Ok(clauses)
+}
+
+fn order_fields_to_read_orders(order_fields: &[String]) -> Vec<DynamoDbReadOrder> {
+    order_fields
+        .iter()
+        .cloned()
+        .map(|field| DynamoDbReadOrder {
+            field,
+            descending: false,
+        })
+        .collect()
 }
 
 fn scan_start_key_clause(
@@ -4394,16 +4533,20 @@ fn escape_identifier(identifier: &str) -> String {
     identifier.replace('"', "\"\"")
 }
 
-fn compare_scan_rows(left: &Value, right: &Value, order_fields: &[String]) -> Ordering {
+fn compare_read_rows(left: &Value, right: &Value, order_fields: &[DynamoDbReadOrder]) -> Ordering {
     let left_object = left.as_object();
     let right_object = right.as_object();
     for field in order_fields.iter() {
         let ordering = compare_scan_row_field(
-            left_object.and_then(|object| object.get(field)),
-            right_object.and_then(|object| object.get(field)),
+            left_object.and_then(|object| object.get(&field.field)),
+            right_object.and_then(|object| object.get(&field.field)),
         );
         if ordering != Ordering::Equal {
-            return ordering;
+            return if field.descending {
+                ordering.reverse()
+            } else {
+                ordering
+            };
         }
     }
     Ordering::Equal
@@ -4996,9 +5139,10 @@ fn dynamodb_error_response(state: &State, error: DynamoDbError) -> gotham::hyper
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_filter_expression, dynamodb_attr_to_json, json_to_dynamodb_attr,
-        parse_filter_expression, parse_key_condition_expression, primary_key_schema,
-        query_select_fields, sha256_hex, sigv4_signature,
+        apply_filter_expression, dynamodb_attr_to_json, execute_uncached_read_query,
+        json_to_dynamodb_attr, key_to_predicates, parse_filter_expression,
+        parse_key_condition_expression, primary_key_schema, publish_mutated_checkpoint,
+        query_select_fields, read_orders_for_key_schema, sha256_hex, sigv4_signature,
     };
     use chrono::Utc;
     use datafusion::arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
@@ -5008,10 +5152,11 @@ mod tests {
     use gotham::mime;
     use gotham::test::TestServer;
     use powdrr_query_lib::data_contract::{
-        DynamoDbTableConfig, FileSetPayload, IcebergMetadata, LicenseType, OrgCreds, OrgSettings,
-        TableMetadataCheckpoint,
+        DynamoDbTableConfig, ExtensionFile, FileDescriptor, FileSetPayload, IcebergAccessArtifact,
+        IcebergMetadata, LicenseType, OrgCreds, OrgSettings, TableMetadataCheckpoint,
     };
     use powdrr_query_lib::schema_massager::extract_powdrr_schema;
+    use powdrr_query_runtime::peers::CheckpointDescriptor;
     use powdrr_query_runtime::serving_dataset::read_parquet_documents;
     use powdrr_query_runtime::state_provider::STATE_PROVIDER;
     use powdrr_query_runtime::test_api::{
@@ -5240,7 +5385,7 @@ mod tests {
                     .map(|field| field.name.clone())
                     .collect(),
                 column_stats: vec![],
-                access_artifacts: vec![],
+                access_artifacts: vec![dynamodb_exact_pruning_artifact()],
                 file_stats: vec![],
             }),
             speedboat_metadata: None,
@@ -5351,6 +5496,38 @@ mod tests {
         assert_eq!(
             dynamodb_attr_to_json(&get_item_body["Item"]["active"]).unwrap(),
             json!(true)
+        );
+        let active_checkpoint_id = runtime.block_on(async {
+            STATE_PROVIDER
+                .get_published_active_servable_checkpoint(&table_name)
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        let active_checkpoint = runtime.block_on(async {
+            STATE_PROVIDER
+                .get_checkpoint(CheckpointDescriptor::new(
+                    table_name.clone(),
+                    active_checkpoint_id.clone(),
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert!(
+            active_checkpoint
+                .iceberg_metadata
+                .as_ref()
+                .unwrap()
+                .access_artifacts
+                .is_empty(),
+            "mutated checkpoint {} should not inherit serving access artifacts",
+            active_checkpoint_id
+        );
+        assert!(
+            active_checkpoint.extension_metadata.is_empty(),
+            "mutated checkpoint {} should not inherit extension metadata",
+            active_checkpoint_id
         );
 
         let update_response = perform_dynamodb_request(
@@ -5677,6 +5854,166 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_execute_uncached_read_query_exact_lookup_reads_live_rows() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let live_path = temp_dir.path().join("live.parquet");
+        write_smoke_parquet_rows(
+            &live_path,
+            &[
+                ("acme", 10, "evt-live", "us", true, 99),
+                ("acme", 20, "evt-2", "us", false, 2),
+            ],
+        );
+        let dataset_path_string = live_path.display().to_string();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dataset = runtime
+            .block_on(read_parquet_documents(&dataset_path_string, Some(10)))
+            .unwrap();
+        let config = DynamoDbTableConfig {
+            partition_key: "tenant".to_string(),
+            sort_key: Some("ts".to_string()),
+            local_secondary_indexes: vec![],
+            global_secondary_indexes: vec![],
+        };
+        let rows = runtime
+            .block_on(execute_uncached_read_query(
+                &[FileDescriptor {
+                    file_path: format!("file://{}", live_path.display()),
+                    size: fs::metadata(&live_path).unwrap().len(),
+                    schema: dataset.schema.clone(),
+                }],
+                &Some(vec![
+                    "tenant".to_string(),
+                    "ts".to_string(),
+                    "event_id".to_string(),
+                    "count".to_string(),
+                ]),
+                &key_to_predicates(
+                    &primary_key_schema(&config),
+                    &HashMap::from([
+                        ("tenant".to_string(), json!("acme")),
+                        ("ts".to_string(), json!(10)),
+                    ]),
+                ),
+                &read_orders_for_key_schema(&primary_key_schema(&config)),
+                1,
+            ))
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["event_id"], json!("evt-live"));
+        assert_eq!(rows[0]["count"], json!(99));
+    }
+
+    #[test]
+    fn test_publish_mutated_checkpoint_drops_stale_serving_artifacts() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let parquet_path = temp_dir.path().join("events.parquet");
+        write_smoke_parquet(&parquet_path);
+        let dataset_path_string = parquet_path.display().to_string();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dataset = runtime
+            .block_on(read_parquet_documents(&dataset_path_string, Some(10)))
+            .unwrap();
+        let table_name = format!(
+            "dynamo_mutation_cache_guard_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
+        let previous_checkpoint = TableMetadataCheckpoint {
+            table_name: table_name.clone(),
+            original_checkpoint_id: None,
+            checkpoint_id: "checkpoint_0".to_string(),
+            iceberg_metadata: Some(IcebergMetadata {
+                table_schema: dataset.schema.clone(),
+                snapshot_id: Some("snapshot_1".to_string()),
+                files: FileSetPayload::single(
+                    format!("file://{}", parquet_path.display()),
+                    fs::metadata(&parquet_path).unwrap().len(),
+                    dataset.schema.clone(),
+                ),
+                partition_spec: vec![],
+                sort_order: vec![],
+                column_names: dataset
+                    .schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.name.clone())
+                    .collect(),
+                column_stats: vec![],
+                access_artifacts: vec![dynamodb_exact_pruning_artifact()],
+                file_stats: vec![],
+            }),
+            speedboat_metadata: None,
+            deletes_metadata: None,
+            extension_metadata: HashMap::from([(
+                "es".to_string(),
+                HashMap::from([(
+                    "stale".to_string(),
+                    vec![ExtensionFile {
+                        suffix: "snapshot_lookup".to_string(),
+                        location: "file://stale.parquet".to_string(),
+                    }],
+                )]),
+            )]),
+            schema: dataset.schema.clone(),
+        };
+        runtime
+            .block_on(publish_mutated_checkpoint(
+                &previous_checkpoint,
+                vec![json!({
+                    "tenant": "acme",
+                    "ts": 10,
+                    "event_id": "evt-mutated",
+                    "region": "us",
+                    "active": true,
+                    "count": 7
+                })],
+            ))
+            .unwrap();
+        let active_checkpoint_id = runtime.block_on(async {
+            STATE_PROVIDER
+                .get_published_active_servable_checkpoint(&table_name)
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        let active_checkpoint = runtime.block_on(async {
+            STATE_PROVIDER
+                .get_checkpoint(CheckpointDescriptor::new(
+                    table_name.clone(),
+                    active_checkpoint_id.clone(),
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert!(
+            active_checkpoint
+                .iceberg_metadata
+                .as_ref()
+                .unwrap()
+                .access_artifacts
+                .is_empty(),
+            "mutated checkpoint {} should not inherit serving access artifacts",
+            active_checkpoint_id
+        );
+        assert!(
+            active_checkpoint.extension_metadata.is_empty(),
+            "mutated checkpoint {} should not inherit extension metadata",
+            active_checkpoint_id
+        );
+    }
+
     async fn ensure_test_org_registered() {
         if STATE_PROVIDER
             .lookup_secret_access_key(&"test".to_string())
@@ -5702,6 +6039,19 @@ mod tests {
     }
 
     fn write_smoke_parquet(path: &std::path::Path) {
+        write_smoke_parquet_rows(
+            path,
+            &[
+                ("acme", 10, "evt-1", "us", true, 1),
+                ("acme", 20, "evt-2", "us", false, 2),
+            ],
+        );
+    }
+
+    fn write_smoke_parquet_rows(
+        path: &std::path::Path,
+        rows: &[(&str, i64, &str, &str, bool, i64)],
+    ) {
         let schema = std::sync::Arc::new(Schema::new(vec![
             Field::new("tenant", DataType::Utf8, false),
             Field::new("ts", DataType::Int64, false),
@@ -5713,12 +6063,24 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                std::sync::Arc::new(StringArray::from(vec!["acme", "acme"])) as ArrayRef,
-                std::sync::Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
-                std::sync::Arc::new(StringArray::from(vec!["evt-1", "evt-2"])) as ArrayRef,
-                std::sync::Arc::new(StringArray::from(vec!["us", "us"])) as ArrayRef,
-                std::sync::Arc::new(BooleanArray::from(vec![true, false])) as ArrayRef,
-                std::sync::Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+                std::sync::Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                std::sync::Arc::new(Int64Array::from(
+                    rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                std::sync::Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                std::sync::Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.3).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                std::sync::Arc::new(BooleanArray::from(
+                    rows.iter().map(|row| row.4).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                std::sync::Arc::new(Int64Array::from(
+                    rows.iter().map(|row| row.5).collect::<Vec<_>>(),
+                )) as ArrayRef,
             ],
         )
         .unwrap();
@@ -5726,6 +6088,18 @@ mod tests {
         let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
+    }
+
+    fn dynamodb_exact_pruning_artifact() -> IcebergAccessArtifact {
+        IcebergAccessArtifact {
+            name: "exact-pruning".to_string(),
+            kind: "exact-pruning".to_string(),
+            fields: vec!["tenant".to_string(), "ts".to_string()],
+            exact: true,
+            supports_eq: true,
+            supports_range: false,
+            supports_order: false,
+        }
     }
 
     fn perform_dynamodb_request(
