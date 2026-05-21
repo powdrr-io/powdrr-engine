@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::configuration::{
-    get_operating_mode, initialize_state_provider, perform_updates, OperatingMode,
+    OperatingMode, get_operating_mode, initialize_state_provider, perform_updates,
 };
 use gotham::{
     anyhow,

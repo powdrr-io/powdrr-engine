@@ -241,14 +241,15 @@ pub fn put_mongodb_config(mut state: State) -> Pin<Box<HandlerFuture>> {
             validate_mongodb_config(&schema, &body)?;
             validate_mongodb_namespace_uniqueness(&path, &body).await?;
 
-            let request = CreateTable {
-                name: path.clone(),
-                tags,
-                serving,
-                dynamodb,
-                mongodb: Some(body.clone()),
-                redis,
-            };
+            let request = serde_json::from_value::<CreateTable>(serde_json::json!({
+                "name": path.clone(),
+                "tags": tags,
+                "serving": serving,
+                "dynamodb": dynamodb,
+                "mongodb": body.clone(),
+                "redis": redis,
+            }))
+            .expect("mongodb config table metadata should deserialize");
 
             STATE_PROVIDER
                 .upsert_table_metadata(&request)

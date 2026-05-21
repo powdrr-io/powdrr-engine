@@ -34,9 +34,11 @@ use powdrr_query_lib::serving_plan::{
     ServingPredicate, ServingQueryClassification, ServingRequestPlan, ServingSort,
 };
 use powdrr_query_runtime::lakehouse_serving::{
-    ServingQueryError, ServingQueryResponse, execute_serving_query,
+    ServingQueryError, ServingQueryResponse, execute_checkpoint_exact_lookup_batch_rows,
+    execute_checkpoint_point_lookup_rows, execute_serving_query,
 };
 use powdrr_query_runtime::peers::CheckpointDescriptor;
+use powdrr_query_runtime::read_plan::ReadPlan;
 use powdrr_query_runtime::search_runtime::batches_to_serde_value;
 use powdrr_query_runtime::state_provider::{STATE_PROVIDER, ServiceApiError};
 
@@ -698,14 +700,15 @@ pub fn put_dynamodb_config(mut state: State) -> Pin<Box<HandlerFuture>> {
             let existing_redis = existing
                 .as_ref()
                 .and_then(|description| description.redis.clone());
-            let request = CreateTable {
-                name: path.clone(),
-                tags,
-                serving: Some(merge_dynamodb_serving_patterns(existing_serving, &body)),
-                dynamodb: Some(body.clone()),
-                mongodb: existing_mongodb,
-                redis: existing_redis,
-            };
+            let request = serde_json::from_value::<CreateTable>(serde_json::json!({
+                "name": path.clone(),
+                "tags": tags,
+                "serving": merge_dynamodb_serving_patterns(existing_serving, &body),
+                "dynamodb": body.clone(),
+                "mongodb": existing_mongodb,
+                "redis": existing_redis,
+            }))
+            .expect("dynamodb config table metadata should deserialize");
 
             STATE_PROVIDER
                 .upsert_table_metadata(&request)
@@ -966,22 +969,26 @@ async fn handle_get_item(payload: Value) -> Result<Value, DynamoDbError> {
         request.projection_expression.as_ref(),
         request.expression_attribute_names.as_ref(),
     )?;
-    let response = execute_fast_path_query(
-        &request.table_name,
-        ServingRequestPlan {
-            select: projection,
-            filters: key_to_predicates(&key_schema, &key),
-            aggregate: None,
-            order_by: vec![],
-            limit: Some(1),
-            allow_slow_path: false,
-            explain: false,
-        },
-    )
-    .await?;
+    let serving_request = ServingRequestPlan {
+        select: projection,
+        filters: key_to_predicates(&key_schema, &key),
+        aggregate: None,
+        order_by: vec![],
+        limit: Some(1),
+        allow_slow_path: false,
+        explain: false,
+    };
+    let rows = if let Some(rows) =
+        execute_fast_path_point_lookup_rows(&request.table_name, &serving_request).await?
+    {
+        rows
+    } else {
+        execute_fast_path_query(&request.table_name, serving_request)
+            .await?
+            .rows
+    };
 
-    let item = response
-        .rows
+    let item = rows
         .into_iter()
         .next()
         .map(|row| json_row_to_dynamodb_item(&row))
@@ -1236,12 +1243,12 @@ async fn handle_batch_get_item(payload: Value) -> Result<Value, DynamoDbError> {
             keys_and_attributes.projection_expression.as_ref(),
             keys_and_attributes.expression_attribute_names.as_ref(),
         )?;
-        let mut items = vec![];
-        for key in keys_and_attributes.keys.iter() {
-            let parsed_key = parse_key_map(key, &key_schema)?;
-            let response = execute_fast_path_query(
-                table_name,
-                ServingRequestPlan {
+        let serving_requests = keys_and_attributes
+            .keys
+            .iter()
+            .map(|key| {
+                let parsed_key = parse_key_map(key, &key_schema)?;
+                Ok::<ServingRequestPlan, DynamoDbError>(ServingRequestPlan {
                     select: projection.clone(),
                     filters: key_to_predicates(&key_schema, &parsed_key),
                     aggregate: None,
@@ -1249,10 +1256,23 @@ async fn handle_batch_get_item(payload: Value) -> Result<Value, DynamoDbError> {
                     limit: Some(1),
                     allow_slow_path: false,
                     explain: false,
-                },
-            )
-            .await?;
-            if let Some(row) = response.rows.into_iter().next() {
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let row_sets = if let Some(row_sets) =
+            execute_fast_path_point_lookup_batch_rows(table_name, &serving_requests).await?
+        {
+            row_sets
+        } else {
+            let mut fallback_rows = Vec::with_capacity(serving_requests.len());
+            for request in serving_requests {
+                fallback_rows.push(execute_fast_path_query(table_name, request).await?.rows);
+            }
+            fallback_rows
+        };
+        let mut items = vec![];
+        for rows in row_sets {
+            if let Some(row) = rows.into_iter().next() {
                 items.push(json_row_to_dynamodb_item(&row)?);
             }
         }
@@ -1371,21 +1391,24 @@ async fn handle_query(payload: Value) -> Result<Value, DynamoDbError> {
         &context.schema,
     );
 
-    let response = execute_fast_path_query(
-        &request.table_name,
-        ServingRequestPlan {
-            select: query_projection,
-            filters: key_filters,
-            aggregate: None,
-            order_by,
-            limit: Some(effective_limit),
-            allow_slow_path: false,
-            explain: false,
-        },
-    )
-    .await?;
-
-    let mut evaluated_rows = response.rows;
+    let serving_request = ServingRequestPlan {
+        select: query_projection,
+        filters: key_filters,
+        aggregate: None,
+        order_by,
+        limit: Some(effective_limit),
+        allow_slow_path: false,
+        explain: false,
+    };
+    let mut evaluated_rows = if let Some(rows) =
+        execute_fast_path_point_lookup_rows(&request.table_name, &serving_request).await?
+    {
+        rows
+    } else {
+        execute_fast_path_query(&request.table_name, serving_request)
+            .await?
+            .rows
+    };
     let last_evaluated_key = if evaluated_rows.len() > page_limit {
         let key = row_to_key(
             &evaluated_rows[page_limit - 1],
@@ -1554,6 +1577,27 @@ async fn execute_fast_path_query(
         )));
     }
     Ok(response)
+}
+
+async fn execute_fast_path_point_lookup_rows(
+    table_name: &str,
+    request: &ServingRequestPlan,
+) -> Result<Option<Vec<Value>>, DynamoDbError> {
+    let checkpoint = load_active_checkpoint(table_name).await?;
+    execute_checkpoint_point_lookup_rows(&checkpoint, &ReadPlan::from(request))
+        .await
+        .map_err(DynamoDbError::internal)
+}
+
+async fn execute_fast_path_point_lookup_batch_rows(
+    table_name: &str,
+    requests: &[ServingRequestPlan],
+) -> Result<Option<Vec<Vec<Value>>>, DynamoDbError> {
+    let checkpoint = load_active_checkpoint(table_name).await?;
+    let read_plans = requests.iter().map(ReadPlan::from).collect::<Vec<_>>();
+    execute_checkpoint_exact_lookup_batch_rows(&checkpoint, &read_plans)
+        .await
+        .map_err(DynamoDbError::internal)
 }
 
 fn convert_serving_error(error: ServingQueryError) -> DynamoDbError {
@@ -5470,6 +5514,40 @@ mod tests {
         .unwrap();
         assert_eq!(
             dynamodb_attr_to_json(&batch_item_body["Item"]["event_id"]).unwrap(),
+            json!("evt-11")
+        );
+
+        let batch_get_response = perform_dynamodb_request(
+            &test_server,
+            "BatchGetItem",
+            json!({
+                "RequestItems": {
+                    (table_name.clone()): {
+                        "Keys": [
+                            {
+                                "tenant": { "S": "acme" },
+                                "ts": { "N": "11" }
+                            },
+                            {
+                                "tenant": { "S": "acme" },
+                                "ts": { "N": "999" }
+                            }
+                        ]
+                    }
+                }
+            }),
+        );
+        assert_eq!(batch_get_response.status(), 200);
+        let batch_get_body = serde_json::from_str::<serde_json::Value>(
+            &batch_get_response.read_utf8_body().unwrap(),
+        )
+        .unwrap();
+        let batch_items = batch_get_body["Responses"][table_name.as_str()]
+            .as_array()
+            .unwrap();
+        assert_eq!(batch_items.len(), 1);
+        assert_eq!(
+            dynamodb_attr_to_json(&batch_items[0]["event_id"]).unwrap(),
             json!("evt-11")
         );
 

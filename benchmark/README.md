@@ -21,6 +21,7 @@ It is intentionally read-only. The benchmark:
    - `top_n_desc`
    - `eq_top_n`
    - `eq_top_n_desc`
+   - `eq_exact_point_lookup` when a repeated equality field and a scalar sort field can identify a single row
    - `in_top_n`
    - `in_top_n_desc`
    - `range_top_n` when a numeric field exists
@@ -37,6 +38,10 @@ It is intentionally read-only. The benchmark:
    - `in_range_top_n_desc` when `IN` and numeric range filters can be combined
 6. Verifies that Powdrr, Elasticsearch, and MongoDB return the same rows.
 7. Measures latency for each backend.
+
+The benchmark summaries now report `avg`, `p50`, `p95`, and `p99` so the
+point-lookup path can be watched for tail-latency regressions, not just median
+improvements.
 
 ### Local Run
 
