@@ -179,15 +179,74 @@ partial approximations.
 ### Contributor Workflow
 
 This repo expects day-to-day work to happen in linked worktrees, and Cargo
-commands should go through `scripts/cargo-worktree.sh` so worktrees share the
-repo-level build cache.
+commands should go through `scripts/cargo-worktree.sh`. The wrapper keeps final
+build outputs in the current worktree's `target/` directory while sharing a
+repo-level intermediate cache in `.cargo-build/`.
+
+That means a command like:
+
+```bash
+scripts/cargo-worktree.sh check -p powdrr-io-engine
+```
+
+behaves roughly like:
+
+```bash
+export CARGO_TARGET_DIR="$PWD/target"
+export CARGO_BUILD_BUILD_DIR="$REPO_ROOT/.cargo-build"
+cargo check -p powdrr-io-engine
+```
+
+The important effect is:
+
+- `target/` is local to the current worktree
+- `.cargo-build/` is shared across all linked worktrees in this repo
+- final binaries, test executables, and crate-local outputs stay isolated per worktree
+- intermediate dependency build artifacts can still be reused across worktrees
+
+Example layout after running a build from two worktrees:
+
+```text
+powdrr-engine/
+├── .cargo-build/
+│   └── ... shared intermediate Cargo build cache ...
+└── .worktrees/
+    ├── codex-a/
+    │   └── target/
+    │       └── ... final outputs for worktree A ...
+    └── codex-b/
+        └── target/
+            └── ... final outputs for worktree B ...
+```
+
+Example session in one worktree:
 
 ```bash
 git fetch origin
 git worktree add -b my-branch .worktrees/my-branch origin/main
 cd .worktrees/my-branch
-scripts/cargo-worktree.sh check -p powdrr-io-engine
+scripts/cargo-worktree.sh check -p powdrr-query-runtime
+scripts/cargo-worktree.sh test -p powdrr-query-server --lib router::tests::test_serving_config_and_fast_path_query -- --nocapture
 ```
+
+That leaves:
+
+```text
+.worktrees/my-branch/target/              final outputs for this worktree
+.cargo-build/                             shared intermediate cache for the repo
+```
+
+Example session in a second worktree:
+
+```bash
+git worktree add -b my-other-branch .worktrees/my-other-branch origin/main
+cd .worktrees/my-other-branch
+scripts/cargo-worktree.sh check -p powdrr-query-runtime
+```
+
+The second worktree gets its own `target/`, but Cargo can still reuse
+compatible intermediate work from `.cargo-build/` instead of rebuilding every
+dependency from scratch.
 
 Or use the repo helper to create the worktree and run the default build preset
 in one step:

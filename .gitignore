@@ -26,6 +26,7 @@ main_lib/tests/data/flights_search_index.parquet
 .DS_Store
 .history
 .cargo-target/
+.cargo-build/
 .worktrees/
 .gh-cache/
 .cargo-home*/

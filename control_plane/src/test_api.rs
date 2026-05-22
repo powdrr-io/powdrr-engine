@@ -121,7 +121,7 @@ impl TestProcessingMode {
         Self {
             state_mode: StateMode::TestingDynamoDb(None),
             storage_mode: StorageMode::default(),
-            cache_mode: CacheMode::Redis(None),
+            cache_mode: CacheMode::Native,
             api_mode: ApiMode::ReadWrite,
             peer_mode: PeerMode::SelfOnly,
             indexing_mode: IndexingMode::Sync,
@@ -134,7 +134,7 @@ impl TestProcessingMode {
         Self {
             state_mode: StateMode::TestingDynamoDb(address),
             storage_mode: StorageMode::default(),
-            cache_mode: CacheMode::Redis(None),
+            cache_mode: CacheMode::Native,
             api_mode: ApiMode::ReadWrite,
             peer_mode: PeerMode::SelfOnly,
             indexing_mode: IndexingMode::Sync,

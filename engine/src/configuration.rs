@@ -110,7 +110,7 @@ pub(crate) fn get_operating_mode(_command_line_args: &Vec<String>) -> OperatingM
                         .expect("SERVICE_SECRET_KEY must be set for MODE=leaderless"),
                 },
                 storage_mode: StorageMode::default(),
-                cache_mode: CacheMode::Redis(None),
+                cache_mode: CacheMode::Native,
                 api_mode,
                 peer_mode: PeerMode::SelfOnly,
                 indexing_mode: IndexingMode::Sync,

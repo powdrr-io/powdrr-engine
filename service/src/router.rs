@@ -89,6 +89,9 @@ pub fn router(include_test_apis: bool) -> Router {
                     .get("/get_latest_checkpoint")
                     .to(v1_handlers::get_latest_checkpoint);
                 route
+                    .get("/get_published_active_checkpoint")
+                    .to(v1_handlers::get_published_active_checkpoint);
+                route
                     .get("/get_latest_target_checkpoint")
                     .to(v1_handlers::get_latest_target_checkpoint);
                 route
@@ -100,6 +103,15 @@ pub fn router(include_test_apis: bool) -> Router {
                 route
                     .post("/record_serving_node_activation")
                     .to(v1_handlers::record_serving_node_activation);
+                route
+                    .post("/record_artifact_readiness")
+                    .to(v1_handlers::record_artifact_readiness);
+                route
+                    .get("/list_artifact_readiness")
+                    .to(v1_handlers::list_artifact_readiness);
+                route
+                    .get("/get_read_only_coordination_state")
+                    .to(v1_handlers::get_read_only_coordination_state);
                 route.get("/get_checkpoint").to(v1_handlers::get_checkpoint);
                 route
                     .get("/get_extension_work_items/:name")

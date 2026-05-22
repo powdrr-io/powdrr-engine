@@ -2,6 +2,7 @@ use crate::data_contract::{
     CleanupWorkItem, CompactionWorkItem, ExtensionWorkItem, OrgInfo, TableMetadataCheckpoint,
 };
 use crate::peers::CheckpointDescriptor;
+use crate::read_only_coordination::ArtifactReadinessAck;
 use crate::state_provider::ServiceApiError;
 use async_trait::async_trait;
 
@@ -250,6 +251,23 @@ pub trait MetadataStore {
         _table_name: &String,
         _extension: Option<String>,
     ) -> Result<Vec<ServingNodeActivationAck>, ServiceApiError> {
+        Ok(vec![])
+    }
+
+    async fn record_artifact_readiness(
+        &mut self,
+        _org_info: &OrgInfo,
+        _ack: &ArtifactReadinessAck,
+    ) -> Result<(), ServiceApiError> {
+        Ok(())
+    }
+
+    async fn list_artifact_readiness(
+        &mut self,
+        _org_info: &OrgInfo,
+        _table_name: &String,
+        _extension: Option<String>,
+    ) -> Result<Vec<ArtifactReadinessAck>, ServiceApiError> {
         Ok(vec![])
     }
 

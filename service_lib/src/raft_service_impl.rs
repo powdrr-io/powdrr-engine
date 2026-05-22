@@ -13,6 +13,7 @@ use crate::metadata_store::{
 };
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
+use crate::read_only_coordination::ArtifactReadinessAck;
 use crate::state_provider::ServiceApiError;
 use crate::test_api::TestProcessingMode;
 use async_trait::async_trait;
@@ -619,6 +620,27 @@ impl RaftServiceImpl {
         ))
     }
 
+    pub async fn record_artifact_readiness(
+        &self,
+        org_info: &OrgInfo,
+        ack: &ArtifactReadinessAck,
+    ) -> Result<(), ServiceApiError> {
+        raft_write_state!(self, |state| MetadataStore::record_artifact_readiness(
+            &mut state, org_info, ack
+        ))
+    }
+
+    pub async fn list_artifact_readiness(
+        &self,
+        org_info: &OrgInfo,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> Result<Vec<ArtifactReadinessAck>, ServiceApiError> {
+        raft_read_state!(self, |state| MetadataStore::list_artifact_readiness(
+            &mut state, org_info, table_name, extension
+        ))
+    }
+
     pub async fn get_extension_work_items(
         &self,
         org_info: &OrgInfo,
@@ -757,6 +779,27 @@ impl MetadataStore for RaftServiceImpl {
             MetadataStore::list_serving_node_activations(
                 &mut state, org_info, table_name, extension,
             )
+        })
+    }
+
+    async fn record_artifact_readiness(
+        &mut self,
+        org_info: &OrgInfo,
+        ack: &ArtifactReadinessAck,
+    ) -> Result<(), ServiceApiError> {
+        raft_write_state!(self, |state| {
+            MetadataStore::record_artifact_readiness(&mut state, org_info, ack)
+        })
+    }
+
+    async fn list_artifact_readiness(
+        &mut self,
+        org_info: &OrgInfo,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> Result<Vec<ArtifactReadinessAck>, ServiceApiError> {
+        raft_read_state!(self, |state| {
+            MetadataStore::list_artifact_readiness(&mut state, org_info, table_name, extension)
         })
     }
     async fn claim_extension_work_items(
@@ -924,6 +967,7 @@ mod tests {
     use crate::metadata_store::{
         CutoverEpoch, MetadataStore, ServingNodeActivationAck, ServingNodeLease,
     };
+    use crate::read_only_coordination::{ArtifactClass, ArtifactReadinessAck};
     use crate::schema_massager::PowdrrSchema;
     use crate::test_api::{
         ApiMode, CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode,
@@ -1029,6 +1073,42 @@ mod tests {
             node_id: node_id.to_string(),
             membership_epoch: CutoverEpoch::default(),
             observed_at_ms: chrono::Utc::now().timestamp_millis() - (2 * 60 * 1000),
+        }
+    }
+
+    async fn record_readiness(
+        raft: &RaftServiceImpl,
+        table_name: &String,
+        extension: Option<String>,
+        epoch: CutoverEpoch,
+        checkpoint_id: &String,
+    ) {
+        let artifact_classes = match extension.as_deref() {
+            None => vec![
+                ArtifactClass::SnapshotLookupMmap,
+                ArtifactClass::SnapshotExactLookupMmap,
+            ],
+            Some("es") => vec![ArtifactClass::SearchProjection],
+            Some(extension) => vec![ArtifactClass::Custom(extension.to_string())],
+        };
+
+        for artifact_class in artifact_classes {
+            raft.record_artifact_readiness(
+                &org_info(),
+                &ArtifactReadinessAck {
+                    selector: crate::metadata_store::PublishedCheckpointSelector::target(
+                        table_name.clone(),
+                        extension.clone(),
+                    ),
+                    checkpoint_id: checkpoint_id.clone(),
+                    epoch,
+                    artifact_class,
+                    producer_id: "warm-cache".to_string(),
+                    ready_at_ms: chrono::Utc::now().timestamp_millis(),
+                },
+            )
+            .await
+            .unwrap();
         }
     }
 
@@ -1186,6 +1266,14 @@ mod tests {
         raft.heartbeat_serving_node(&org_info, &serving_lease("warm-cache"))
             .await
             .unwrap();
+        record_readiness(
+            &raft,
+            &table_name,
+            None,
+            base_cutover_state.epoch,
+            &target_base_checkpoint,
+        )
+        .await;
         raft.record_serving_node_activation(
             &org_info,
             &ServingNodeActivationAck {
@@ -1273,6 +1361,14 @@ mod tests {
         raft.heartbeat_serving_node(&org_info, &serving_lease("warm-cache"))
             .await
             .unwrap();
+        record_readiness(
+            &raft,
+            &table_name,
+            Some("es".to_string()),
+            extension_cutover_state.epoch,
+            &target_extension_checkpoint,
+        )
+        .await;
         raft.record_serving_node_activation(
             &org_info,
             &ServingNodeActivationAck {
@@ -1334,6 +1430,14 @@ mod tests {
             .get_checkpoint_cutover_state(&org_info, &table_name, None)
             .await
             .unwrap();
+        record_readiness(
+            &raft,
+            &table_name,
+            None,
+            cutover_state.epoch,
+            &target_checkpoint,
+        )
+        .await;
 
         raft.heartbeat_serving_node(&org_info, &serving_lease("node-a"))
             .await
@@ -1419,6 +1523,14 @@ mod tests {
         raft.heartbeat_serving_node(&org_info, &serving_lease("node-b"))
             .await
             .unwrap();
+        record_readiness(
+            &raft,
+            &table_name,
+            None,
+            cutover_state.epoch,
+            &target_checkpoint,
+        )
+        .await;
         raft.record_serving_node_activation(
             &org_info,
             &ServingNodeActivationAck {
@@ -1472,6 +1584,14 @@ mod tests {
         raft.heartbeat_serving_node(&org_info, &serving_lease("node-a"))
             .await
             .unwrap();
+        record_readiness(
+            &raft,
+            &table_name,
+            None,
+            cutover_state.epoch,
+            &target_checkpoint,
+        )
+        .await;
         raft.record_serving_node_activation(
             &org_info,
             &ServingNodeActivationAck {
@@ -1527,6 +1647,14 @@ mod tests {
             .get_checkpoint_cutover_state(&org_info, &table_name, None)
             .await
             .unwrap();
+        record_readiness(
+            &raft,
+            &table_name,
+            None,
+            original_cutover_state.epoch,
+            &target_checkpoint,
+        )
+        .await;
 
         raft.record_serving_node_activation(
             &org_info,
@@ -1717,6 +1845,14 @@ mod tests {
             .get_checkpoint_cutover_state(&org_info, &table_name, None)
             .await
             .unwrap();
+        record_readiness(
+            &raft,
+            &table_name,
+            None,
+            initial_cutover_state.epoch,
+            &initial_target_checkpoint,
+        )
+        .await;
         raft.record_serving_node_activation(
             &org_info,
             &ServingNodeActivationAck {
@@ -1778,6 +1914,14 @@ mod tests {
             .get_checkpoint_cutover_state(&org_info, &table_name, None)
             .await
             .unwrap();
+        record_readiness(
+            &raft,
+            &table_name,
+            None,
+            next_cutover_state.epoch,
+            &next_target_checkpoint,
+        )
+        .await;
         raft.record_serving_node_activation(
             &org_info,
             &ServingNodeActivationAck {
@@ -1898,6 +2042,14 @@ mod tests {
             .heartbeat_serving_node(&org_info, &serving_lease("warm-cache"))
             .await
             .unwrap();
+        record_readiness(
+            &leader,
+            &table_name,
+            None,
+            first_cutover_state.epoch,
+            &first_target_checkpoint,
+        )
+        .await;
         leader
             .record_serving_node_activation(
                 &org_info,
@@ -1970,6 +2122,14 @@ mod tests {
             .heartbeat_serving_node(&org_info, &serving_lease("warm-cache"))
             .await
             .unwrap();
+        record_readiness(
+            &new_leader,
+            &table_name,
+            None,
+            second_cutover_state.epoch,
+            &second_target_checkpoint,
+        )
+        .await;
         new_leader
             .record_serving_node_activation(
                 &org_info,

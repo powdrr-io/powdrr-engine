@@ -1,4 +1,9 @@
-use std::{collections::HashMap, env, pin::Pin, sync::Arc};
+use std::{
+    collections::HashMap,
+    env,
+    pin::Pin,
+    sync::{Arc, LazyLock},
+};
 
 use futures::FutureExt;
 use gotham::helpers::http::response::create_empty_response;
@@ -19,7 +24,7 @@ use crate::elastic_search_http_types::{
     QueryStringSearchExtractor,
 };
 use crate::exact_lookup::{
-    ActiveCheckpointLookupError, execute_active_checkpoint_exact_id_lookup_rows,
+    ActiveCheckpointLookupError, execute_active_checkpoint_projected_exact_id_lookup_rows,
 };
 use powdrr_query_lib::data_contract::{AliasInfo, CreateIndexBody, PropertyInfo, TableDescription};
 use powdrr_query_lib::elastic_search_api_types::QueryStringSearch;
@@ -39,6 +44,15 @@ use powdrr_query_runtime::util::{log_service_err, log_service_err_response};
 pub use crate::elastic_search_http_types::{
     AliasPathExtractor, NameAliasPathExtractor, NameIdPathExtractor, NamePathExtractor,
 };
+
+static DOCUMENT_LOOKUP_SELECT_FIELDS: LazyLock<Vec<String>> = LazyLock::new(|| {
+    vec![
+        "_id".to_string(),
+        "_version".to_string(),
+        "_seq_no".to_string(),
+        "_source".to_string(),
+    ]
+});
 
 #[derive(Serialize)]
 struct ServerVersion {
@@ -752,7 +766,13 @@ async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, 
         return Ok(missing_document_value(index_name, doc_id));
     };
 
-    match execute_active_checkpoint_exact_id_lookup_rows(&table_name, &[doc_id.to_string()]).await {
+    match execute_active_checkpoint_projected_exact_id_lookup_rows(
+        &table_name,
+        &[doc_id.to_string()],
+        &DOCUMENT_LOOKUP_SELECT_FIELDS,
+    )
+    .await
+    {
         Ok(Some(rows)) => {
             if let Some(value) = rows.first() {
                 Ok(found_document_value(&table_name, value))
@@ -839,7 +859,13 @@ async fn lookup_document_values(
     };
 
     let mut results = HashMap::new();
-    match execute_active_checkpoint_exact_id_lookup_rows(&table_name, doc_ids).await {
+    match execute_active_checkpoint_projected_exact_id_lookup_rows(
+        &table_name,
+        doc_ids,
+        &DOCUMENT_LOOKUP_SELECT_FIELDS,
+    )
+    .await
+    {
         Ok(Some(rows)) => {
             for row in rows {
                 let hit = found_document_value(&table_name, &row);
@@ -2932,4 +2958,51 @@ pub fn es_bulk_ingest(mut state: State) -> Pin<Box<HandlerFuture>> {
         }
     }
     .boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn found_document_value_preserves_projected_exact_lookup_fields() {
+        let document = found_document_value(
+            "logs",
+            &json!({
+                "_id": "doc-1",
+                "_version": 3,
+                "_seq_no": 7,
+                "_source": {
+                    "message": "Login successful",
+                    "tenant": "acme"
+                }
+            }),
+        );
+
+        assert_eq!(
+            document,
+            json!({
+                "_index": "logs",
+                "_id": "doc-1",
+                "_version": 3,
+                "_seq_no": 7,
+                "_primary_term": 1,
+                "found": true,
+                "_source": {
+                    "message": "Login successful",
+                    "tenant": "acme"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn document_source_value_parses_projected_source_json_text() {
+        let source = document_source_value(&Map::from_iter([(
+            "_source".to_string(),
+            Value::String("{\"message\":\"Login successful\"}".to_string()),
+        )]));
+
+        assert_eq!(source, json!({ "message": "Login successful" }));
+    }
 }
