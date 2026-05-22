@@ -821,8 +821,7 @@ pub(crate) fn search_plan_to_command_with_options(
     let read_plan = read_plan_from_search_plan(&plan);
     let exact_constraints = compile_exact_constraint_groups(&read_plan)?;
     let range_constraints = compile_range_constraints(&read_plan);
-    let exact_sql =
-        compile_exact_sql_query(&plan, query, doc_id_field_name, include_deletes_join)?;
+    let exact_sql = compile_exact_sql_query(&plan, query, doc_id_field_name, include_deletes_join)?;
     let exact_sql_without_deletes = if include_deletes_join {
         compile_exact_sql_query(&plan, query, doc_id_field_name, false)?
     } else {

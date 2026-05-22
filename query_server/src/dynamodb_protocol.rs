@@ -699,14 +699,15 @@ pub fn put_dynamodb_config(mut state: State) -> Pin<Box<HandlerFuture>> {
             let existing_redis = existing
                 .as_ref()
                 .and_then(|description| description.redis.clone());
-            let request = CreateTable {
-                name: path.clone(),
-                tags,
-                serving: Some(merge_dynamodb_serving_patterns(existing_serving, &body)),
-                dynamodb: Some(body.clone()),
-                mongodb: existing_mongodb,
-                redis: existing_redis,
-            };
+            let request = serde_json::from_value::<CreateTable>(serde_json::json!({
+                "name": path.clone(),
+                "tags": tags,
+                "serving": merge_dynamodb_serving_patterns(existing_serving, &body),
+                "dynamodb": body.clone(),
+                "mongodb": existing_mongodb,
+                "redis": existing_redis,
+            }))
+            .expect("dynamodb config table metadata should deserialize");
 
             STATE_PROVIDER
                 .upsert_table_metadata(&request)
@@ -5647,6 +5648,40 @@ mod tests {
         .unwrap();
         assert_eq!(
             dynamodb_attr_to_json(&batch_item_body["Item"]["event_id"]).unwrap(),
+            json!("evt-11")
+        );
+
+        let batch_get_response = perform_dynamodb_request(
+            &test_server,
+            "BatchGetItem",
+            json!({
+                "RequestItems": {
+                    (table_name.clone()): {
+                        "Keys": [
+                            {
+                                "tenant": { "S": "acme" },
+                                "ts": { "N": "11" }
+                            },
+                            {
+                                "tenant": { "S": "acme" },
+                                "ts": { "N": "999" }
+                            }
+                        ]
+                    }
+                }
+            }),
+        );
+        assert_eq!(batch_get_response.status(), 200);
+        let batch_get_body = serde_json::from_str::<serde_json::Value>(
+            &batch_get_response.read_utf8_body().unwrap(),
+        )
+        .unwrap();
+        let batch_items = batch_get_body["Responses"][table_name.as_str()]
+            .as_array()
+            .unwrap();
+        assert_eq!(batch_items.len(), 1);
+        assert_eq!(
+            dynamodb_attr_to_json(&batch_items[0]["event_id"]).unwrap(),
             json!("evt-11")
         );
 

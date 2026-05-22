@@ -23,8 +23,8 @@ use crate::state_provider::ServiceApiError;
 use crate::test_api::{StateMode, TestProcessingMode};
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_dynamodb::Client;
-use modyne::model::TransactWrite;
 use modyne::TestTableExt;
+use modyne::model::TransactWrite;
 use std::collections::{HashMap, HashSet};
 
 const LEASE_LENGTH_MS: i64 = 60 * 1000; // 1 minute
@@ -2303,9 +2303,11 @@ mod tests {
             None
         );
 
-        assert!(MetadataStore::advance_published_checkpoints(&mut state)
-            .await
-            .unwrap());
+        assert!(
+            MetadataStore::advance_published_checkpoints(&mut state)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             MetadataStore::get_latest_target_checkpoint(&mut state, &org_info, &table_name, None)
                 .await
@@ -2369,11 +2371,13 @@ mod tests {
         let first_work_items = state.get_compaction_work_items(&org_info).await.unwrap();
         assert_eq!(first_work_items.len(), 1);
         assert!(state.tables_with_pending_compaction.contains(&table_name));
-        assert!(state
-            .not_compacted_checkpoint_ids
-            .get(&table_name)
-            .unwrap()
-            .is_empty());
+        assert!(
+            state
+                .not_compacted_checkpoint_ids
+                .get(&table_name)
+                .unwrap()
+                .is_empty()
+        );
 
         state
             .speedboat_commit(
@@ -2388,11 +2392,13 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-        assert!(state
-            .get_compaction_work_items(&org_info)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            state
+                .get_compaction_work_items(&org_info)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             state.not_compacted_checkpoint_ids.get(&table_name).unwrap(),
             &vec![second_checkpoint.clone()]
@@ -2434,10 +2440,12 @@ mod tests {
             second_work_items[0].1.checkpoints_to_delete,
             vec![second_checkpoint, third_checkpoint]
         );
-        assert!(state
-            .not_compacted_checkpoint_ids
-            .get(&table_name)
-            .unwrap()
-            .is_empty());
+        assert!(
+            state
+                .not_compacted_checkpoint_ids
+                .get(&table_name)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

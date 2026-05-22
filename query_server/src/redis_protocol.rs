@@ -3,12 +3,12 @@ use std::pin::Pin;
 use futures_util::future::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{body, Body};
+use gotham::hyper::{Body, body};
 use gotham::mime;
 use gotham::state::{FromState, State};
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::elastic_search_http_types::NamePathExtractor;
 use powdrr_query_lib::data_contract::{
@@ -18,9 +18,9 @@ use powdrr_query_lib::schema_massager::PowdrrSchema;
 use powdrr_query_lib::serving_plan::{
     ServingPredicate, ServingQueryClassification, ServingRequestPlan,
 };
-use powdrr_query_runtime::lakehouse_serving::{execute_serving_query, ServingQueryError};
+use powdrr_query_runtime::lakehouse_serving::{ServingQueryError, execute_serving_query};
 use powdrr_query_runtime::peers::CheckpointDescriptor;
-use powdrr_query_runtime::state_provider::{ServiceApiError, STATE_PROVIDER};
+use powdrr_query_runtime::state_provider::{STATE_PROVIDER, ServiceApiError};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct RedisConfigResponse {

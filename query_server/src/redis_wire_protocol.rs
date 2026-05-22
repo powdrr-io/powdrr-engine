@@ -3,7 +3,7 @@ use std::io;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufStream};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::redis_protocol::{execute_redis_command, RespValue};
+use crate::redis_protocol::{RespValue, execute_redis_command};
 
 pub async fn serve_redis_wire(listener: TcpListener) -> io::Result<()> {
     loop {

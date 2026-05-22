@@ -637,7 +637,8 @@ pub(crate) async fn create_exact_pruning_index_parquet(
 }
 
 fn checkpoint_query_inputs(files: Vec<FileDescriptor>) -> Vec<QueryInputFile> {
-    files.into_iter()
+    files
+        .into_iter()
         .map(|file| QueryInputFile {
             file,
             storage: QueryStorageKind::Iceberg,
@@ -750,7 +751,10 @@ async fn create_snapshot_exact_lookup_artifact(
         .unwrap_or_default();
     let target_file_path = add_file_suffix(
         &files[0].file_path,
-        &format!("{SNAPSHOT_EXACT_LOOKUP_SUFFIX}_{}", checkpoint.checkpoint_id),
+        &format!(
+            "{SNAPSHOT_EXACT_LOOKUP_SUFFIX}_{}",
+            checkpoint.checkpoint_id
+        ),
         Some(&".parquet".to_string()),
     );
     if file_exists(&target_file_path).await {
