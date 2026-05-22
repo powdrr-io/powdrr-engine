@@ -318,6 +318,41 @@ The binding is defined by:
 }
 ```
 
+Those last two fields are schema mappings, not Redis keywords:
+
+- `key_field` names the Powdrr column used as the Redis key
+- `value_field` names the Powdrr column returned as the Redis value
+
+So with the example above:
+
+- `SELECT 0` chooses the bound Powdrr table
+- `GET alice` behaves like an exact lookup on `user_id = 'alice'`
+- the returned Redis value comes from that row's `payload` column
+
+To target multiple values in that same Powdrr table, the client stays on the
+same selected Redis database and sends multiple keys:
+
+```text
+SELECT 0
+MGET alice bob charlie
+EXISTS alice bob charlie
+```
+
+That behaves like repeated exact lookups against the same table:
+
+- `MGET alice bob charlie` returns the `payload` values for rows whose
+  `user_id` values are `alice`, `bob`, and `charlie`
+- `EXISTS alice bob charlie` counts how many of those keys matched rows in the
+  selected table
+
+Operationally, that means the Redis view is a key/value projection over one
+Iceberg-backed table:
+
+- the configured `key_field` should identify at most one row per Redis key
+- if `value_field` is a string, Powdrr returns it as a Redis bulk string
+- if `value_field` is a non-string JSON value, Powdrr JSON-serializes it
+- if `value_field` is `null` or the lookup finds no row, Redis returns a miss
+
 Important limits:
 
 - only one enabled Powdrr table may claim a given Redis database number

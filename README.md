@@ -203,13 +203,17 @@ The compatibility surfaces do not all identify a table the same way:
 - Mongo maps a Powdrr table to one `(database, collection)` pair through
   `/:table/_mongo/config`.
 - Redis maps a Powdrr table to one Redis database number through
-  `/:table/_redis/config`; clients then pick the table with `SELECT <db>`.
+  `/:table/_redis/config`; that config also maps one table column to the Redis
+  key and one table column to the Redis value. Clients then pick the table
+  with `SELECT <db>`.
 
 That Redis mapping is real and enforced:
 
 - one enabled Powdrr table per Redis database number
 - `SELECT` fails if the chosen database is not configured
-- `GET`, `MGET`, and `EXISTS` operate only on the currently selected table
+- `GET`, `MGET`, and `EXISTS` operate only on the currently selected table,
+  using the configured key column for lookup and value column for the returned
+  Redis payload
 
 The detailed targeting rules and examples live in
 `docs/protocol-compatibility-contract.md`.
