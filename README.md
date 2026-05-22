@@ -180,7 +180,7 @@ same maturity level.
 | Native serving API | `PUT /:table/_serve/config`, `POST /:table/_serve` | This is the long-term protocol-neutral serving path. |
 | Elasticsearch-compatible HTTP API | Root `/`, index lifecycle, `_bulk`, `_search`, aliases, templates, selected aggregations | Compatibility is tracked as a subset, not full Elasticsearch parity. See `docs/protocol-compatibility-contract.md` and `docs/es-compatibility-matrix.md`. |
 | DynamoDB-compatible HTTP API | Root `POST /` with `X-Amz-Target: DynamoDB_20120810.*` plus per-table config | Designed for configured tables on top of the shared serving path. See `docs/protocol-compatibility-contract.md` and `docs/dynamodb-compatibility-matrix.md`. |
-| Redis-compatible RESP API | `REDIS_FRONTEND_PORT` plus per-table config | Read-oriented subset with explicit `READONLY` behavior for known write commands in read-only mode. See `docs/protocol-compatibility-contract.md`. |
+| Redis-compatible RESP API | `REDIS_FRONTEND_PORT` plus per-table config | Read-oriented exact-lookup subset. Supports both single-value `GET` / `MGET` lookups and hash-style `HGET` / `HMGET` / `HGETALL` access over one selected table. See `docs/protocol-compatibility-contract.md`. |
 | Mongo-shaped read API | `POST /:table/_mongo/find`, `POST /_mongo/:database/_command` | Read-only subset over HTTP. This is **not** full Mongo wire-protocol compatibility yet. |
 | Control-plane API | `powdrr-io-service` under `/api/v1` | Used for table creation, checkpoint publication, aliases, templates, pipelines, and org management. |
 
@@ -190,6 +190,34 @@ Two important caveats:
   identity.
 - The Mongo work is intentionally an HTTP bridge today. Off-the-shelf MongoDB
   drivers speaking the Mongo wire protocol are a later step.
+
+### How Compatibility APIs Target Tables
+
+The compatibility surfaces do not all identify a table the same way:
+
+- Elasticsearch routes use the `:index` path segment and also honor configured
+  aliases, wildcard expressions, and comma-separated target lists on the
+  routes that support them.
+- DynamoDB uses the AWS `TableName` request member and per-table config at
+  `/:table/_dynamodb/config`.
+- Mongo maps a Powdrr table to one `(database, collection)` pair through
+  `/:table/_mongo/config`.
+- Redis maps a Powdrr table to one Redis database number through
+  `/:table/_redis/config`; that config also maps one table column to the Redis
+  key and optionally one table column to the string-style Redis value. Clients
+  then pick the table with `SELECT <db>`.
+
+That Redis mapping is real and enforced:
+
+- one enabled Powdrr table per Redis database number
+- `SELECT` fails if the chosen database is not configured
+- `GET`, `MGET`, and `EXISTS` operate on the currently selected table using
+  the configured key column and optional single-value column
+- `HGET`, `HMGET`, `HGETALL`, and `HEXISTS` operate on that same selected
+  table as a row-shaped feature projection
+
+The detailed targeting rules and examples live in
+`docs/protocol-compatibility-contract.md`.
 
 ## First-Class Serving Contract
 

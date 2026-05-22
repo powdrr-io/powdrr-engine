@@ -800,7 +800,8 @@ pub struct RedisTableConfig {
     #[serde(default)]
     pub database: u32,
     pub key_field: String,
-    pub value_field: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_field: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
