@@ -45,8 +45,8 @@ correct update semantics:
 
 In the current implementation, this is visible in:
 
-- `query_lib/src/elastic_search_ingest.rs`
-- `query_lib/src/elastic_search_storage_schema.rs`
+- `query_runtime/src/elastic_search_ingest.rs`
+- `query_runtime/src/elastic_search_storage_schema.rs`
 - `control_plane/src/data_contract.rs` via `SpeedboatCommit`
 
 The important point is that `speedboat` is logically row-oriented even when it
@@ -80,7 +80,7 @@ columnar data on object storage:
 
 In the current implementation, this is visible in:
 
-- `query_lib/src/compaction.rs`
+- `query_runtime/src/compaction.rs`
 - `query_lib/src/data_access.rs`
 - `control_plane/src/data_contract.rs` via `IcebergMetadata` and `IcebergCommit`
 
