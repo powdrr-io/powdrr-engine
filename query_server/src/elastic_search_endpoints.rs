@@ -1,9 +1,4 @@
-use std::{
-    collections::HashMap,
-    env,
-    pin::Pin,
-    sync::{Arc, LazyLock, Mutex},
-};
+use std::{collections::HashMap, env, pin::Pin, sync::Arc};
 
 use futures::FutureExt;
 use gotham::helpers::http::response::create_empty_response;
@@ -23,6 +18,9 @@ use crate::elastic_search_http_types::{
     QueryStringAliases, QueryStringClusterHealth, QueryStringClusterSettings, QueryStringFieldCaps,
     QueryStringSearchExtractor,
 };
+use crate::exact_lookup::{
+    ActiveCheckpointLookupError, execute_active_checkpoint_exact_id_lookup_rows,
+};
 use powdrr_query_lib::data_contract::{AliasInfo, CreateIndexBody, PropertyInfo, TableDescription};
 use powdrr_query_lib::elastic_search_api_types::QueryStringSearch;
 use powdrr_query_runtime::elastic_search_common::{
@@ -34,8 +32,6 @@ use powdrr_query_runtime::elastic_search_pipeline;
 use powdrr_query_runtime::elastic_search_responses::{
     ErrorDetails, QueryResultShards, QueryResults, SingleDocCreateFailedResult,
 };
-use powdrr_query_runtime::lakehouse_serving::execute_checkpoint_exact_id_lookup_rows;
-use powdrr_query_runtime::peers::CheckpointDescriptor;
 use powdrr_query_runtime::search_executor;
 use powdrr_query_runtime::state_provider::{STATE_PROVIDER, ServiceApiError};
 use powdrr_query_runtime::util::{log_service_err, log_service_err_response};
@@ -129,17 +125,6 @@ impl License {
 
 static SERVER_INFO: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| serde_json::to_string_pretty(&ServerInfo::new()).unwrap());
-
-#[derive(Clone)]
-struct CachedDocumentLookupCheckpoint {
-    table_name: String,
-    checkpoint_id: String,
-    checkpoint: Arc<powdrr_query_lib::data_contract::TableMetadataCheckpoint>,
-}
-
-static DOCUMENT_LOOKUP_CHECKPOINT_CACHE: LazyLock<
-    Mutex<HashMap<String, CachedDocumentLookupCheckpoint>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub fn es_root(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_root");
@@ -751,19 +736,26 @@ async fn execute_search_response_for_target_expr(
 }
 
 async fn lookup_document_value(index_name: &str, doc_id: &str) -> Result<Value, String> {
-    let Some((table_name, checkpoint)) = load_document_lookup_checkpoint(index_name).await? else {
+    let Some(table_name) = resolve_document_target_name(index_name)
+        .await
+        .map_err(|(_, message)| message)?
+    else {
         return Ok(missing_document_value(index_name, doc_id));
     };
 
-    if let Some(rows) =
-        execute_checkpoint_exact_id_lookup_rows(&checkpoint, &[doc_id.to_string()]).await?
-    {
-        if let Some(value) = rows.first() {
-            return Ok(found_document_value(&table_name, value));
+    match execute_active_checkpoint_exact_id_lookup_rows(&table_name, &[doc_id.to_string()]).await {
+        Ok(Some(rows)) => {
+            if let Some(value) = rows.first() {
+                Ok(found_document_value(&table_name, value))
+            } else {
+                Ok(missing_document_value(&table_name, doc_id))
+            }
         }
-        return Ok(missing_document_value(&table_name, doc_id));
+        Ok(None) | Err(ActiveCheckpointLookupError::NotFound(_)) => {
+            Ok(missing_document_value(&table_name, doc_id))
+        }
+        Err(ActiveCheckpointLookupError::Internal(message)) => Err(message),
     }
-    Ok(missing_document_value(&table_name, doc_id))
 }
 
 fn missing_document_value(index_name: &str, doc_id: &str) -> Value {
@@ -826,133 +818,29 @@ fn document_source_value(row_map: &Map<String, Value>) -> Value {
     Value::Object(source)
 }
 
-async fn load_document_lookup_checkpoint(
-    index_name: &str,
-) -> Result<
-    Option<(
-        String,
-        Arc<powdrr_query_lib::data_contract::TableMetadataCheckpoint>,
-    )>,
-    String,
-> {
-    let cached_by_index_name = {
-        DOCUMENT_LOOKUP_CHECKPOINT_CACHE
-            .lock()
-            .unwrap()
-            .get(index_name)
-            .cloned()
-    };
-    if let Some(cached) = cached_by_index_name {
-        if cached.table_name == index_name {
-            let checkpoint_id = STATE_PROVIDER
-                .get_published_active_servable_checkpoint(&cached.table_name)
-                .await
-                .map_err(|e| e.message)?;
-            match checkpoint_id {
-                Some(checkpoint_id) if checkpoint_id == cached.checkpoint_id => {
-                    return Ok(Some((cached.table_name, cached.checkpoint)));
-                }
-                Some(checkpoint_id) => {
-                    let checkpoint = STATE_PROVIDER
-                        .get_checkpoint(CheckpointDescriptor::new(
-                            cached.table_name.clone(),
-                            checkpoint_id.clone(),
-                        ))
-                        .await
-                        .map_err(|e| e.message)?;
-                    if let Some(checkpoint) = checkpoint {
-                        let checkpoint = Arc::new(checkpoint);
-                        DOCUMENT_LOOKUP_CHECKPOINT_CACHE.lock().unwrap().insert(
-                            index_name.to_string(),
-                            CachedDocumentLookupCheckpoint {
-                                table_name: cached.table_name.clone(),
-                                checkpoint_id,
-                                checkpoint: checkpoint.clone(),
-                            },
-                        );
-                        return Ok(Some((cached.table_name, checkpoint)));
-                    }
-                    DOCUMENT_LOOKUP_CHECKPOINT_CACHE
-                        .lock()
-                        .unwrap()
-                        .remove(index_name);
-                    return Ok(None);
-                }
-                None => {
-                    DOCUMENT_LOOKUP_CHECKPOINT_CACHE
-                        .lock()
-                        .unwrap()
-                        .remove(index_name);
-                }
-            }
-        }
-    }
-
-    let table_desc = STATE_PROVIDER
-        .describe_table(&index_name.to_string())
-        .await
-        .map_err(|e| e.message)?;
-    let Some(table_desc) = table_desc else {
-        return Ok(None);
-    };
-
-    let checkpoint_id = STATE_PROVIDER
-        .get_published_active_servable_checkpoint(&table_desc.name)
-        .await
-        .map_err(|e| e.message)?;
-    let Some(checkpoint_id) = checkpoint_id else {
-        return Ok(None);
-    };
-
-    if let Some(cached) = DOCUMENT_LOOKUP_CHECKPOINT_CACHE
-        .lock()
-        .unwrap()
-        .get(index_name)
-        .cloned()
-    {
-        if cached.table_name == table_desc.name && cached.checkpoint_id == checkpoint_id {
-            return Ok(Some((cached.table_name, cached.checkpoint)));
-        }
-    }
-
-    let checkpoint = STATE_PROVIDER
-        .get_checkpoint(CheckpointDescriptor::new(
-            table_desc.name.clone(),
-            checkpoint_id.clone(),
-        ))
-        .await
-        .map_err(|e| e.message)?;
-    let Some(checkpoint) = checkpoint else {
-        return Ok(None);
-    };
-    let checkpoint = Arc::new(checkpoint);
-    DOCUMENT_LOOKUP_CHECKPOINT_CACHE.lock().unwrap().insert(
-        index_name.to_string(),
-        CachedDocumentLookupCheckpoint {
-            table_name: table_desc.name.clone(),
-            checkpoint_id,
-            checkpoint: checkpoint.clone(),
-        },
-    );
-    Ok(Some((table_desc.name, checkpoint)))
-}
-
 async fn lookup_document_values(
     index_name: &str,
     doc_ids: &[String],
 ) -> Result<HashMap<String, Value>, String> {
-    let Some((table_name, checkpoint)) = load_document_lookup_checkpoint(index_name).await? else {
+    let Some(table_name) = resolve_document_target_name(index_name)
+        .await
+        .map_err(|(_, message)| message)?
+    else {
         return Ok(HashMap::new());
     };
 
     let mut results = HashMap::new();
-    if let Some(rows) = execute_checkpoint_exact_id_lookup_rows(&checkpoint, doc_ids).await? {
-        for row in rows {
-            let hit = found_document_value(&table_name, &row);
-            if let Some(doc_id) = hit.get("_id").and_then(|value| value.as_str()) {
-                results.insert(doc_id.to_string(), hit);
+    match execute_active_checkpoint_exact_id_lookup_rows(&table_name, doc_ids).await {
+        Ok(Some(rows)) => {
+            for row in rows {
+                let hit = found_document_value(&table_name, &row);
+                if let Some(doc_id) = hit.get("_id").and_then(|value| value.as_str()) {
+                    results.insert(doc_id.to_string(), hit);
+                }
             }
         }
+        Ok(None) | Err(ActiveCheckpointLookupError::NotFound(_)) => {}
+        Err(ActiveCheckpointLookupError::Internal(message)) => return Err(message),
     }
 
     Ok(results)

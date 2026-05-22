@@ -648,6 +648,7 @@ async fn load_active_checkpoint(
 ) -> Result<TableMetadataCheckpoint, RedisCommandError> {
     load_shared_active_checkpoint(table_name)
         .await
+        .map(|checkpoint| checkpoint.as_ref().clone())
         .map_err(convert_active_checkpoint_lookup_error)
 }
 

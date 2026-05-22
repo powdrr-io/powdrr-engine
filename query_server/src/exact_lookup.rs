@@ -1,11 +1,27 @@
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock, Mutex},
+};
+
 use serde_json::Value;
 
 use powdrr_query_lib::data_contract::TableMetadataCheckpoint;
 use powdrr_query_lib::serving_plan::ServingRequestPlan;
-use powdrr_query_runtime::lakehouse_serving::execute_checkpoint_exact_lookup_batch_rows;
+use powdrr_query_runtime::lakehouse_serving::{
+    execute_checkpoint_exact_id_lookup_rows, execute_checkpoint_exact_lookup_batch_rows,
+};
 use powdrr_query_runtime::peers::CheckpointDescriptor;
 use powdrr_query_runtime::read_plan::ReadPlan;
 use powdrr_query_runtime::state_provider::{STATE_PROVIDER, ServiceApiError};
+
+#[derive(Clone)]
+struct CachedActiveCheckpoint {
+    checkpoint_id: String,
+    checkpoint: Arc<TableMetadataCheckpoint>,
+}
+
+static ACTIVE_CHECKPOINT_CACHE: LazyLock<Mutex<HashMap<String, CachedActiveCheckpoint>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug)]
 pub(crate) enum ActiveCheckpointLookupError {
@@ -19,14 +35,24 @@ pub(crate) async fn execute_active_checkpoint_exact_lookup_batch_rows(
 ) -> Result<Option<Vec<Vec<Value>>>, ActiveCheckpointLookupError> {
     let checkpoint = load_active_checkpoint(table_name).await?;
     let read_plans = requests.iter().map(ReadPlan::from).collect::<Vec<_>>();
-    execute_checkpoint_exact_lookup_batch_rows(&checkpoint, &read_plans)
+    execute_checkpoint_exact_lookup_batch_rows(checkpoint.as_ref(), &read_plans)
+        .await
+        .map_err(ActiveCheckpointLookupError::Internal)
+}
+
+pub(crate) async fn execute_active_checkpoint_exact_id_lookup_rows(
+    table_name: &str,
+    doc_ids: &[String],
+) -> Result<Option<Vec<Value>>, ActiveCheckpointLookupError> {
+    let checkpoint = load_active_checkpoint(table_name).await?;
+    execute_checkpoint_exact_id_lookup_rows(checkpoint.as_ref(), doc_ids)
         .await
         .map_err(ActiveCheckpointLookupError::Internal)
 }
 
 pub(crate) async fn load_active_checkpoint(
     table_name: &str,
-) -> Result<TableMetadataCheckpoint, ActiveCheckpointLookupError> {
+) -> Result<Arc<TableMetadataCheckpoint>, ActiveCheckpointLookupError> {
     let checkpoint_id = STATE_PROVIDER
         .get_published_active_servable_checkpoint(&table_name.to_string())
         .await
@@ -37,6 +63,18 @@ pub(crate) async fn load_active_checkpoint(
                 table_name
             ))
         })?;
+
+    if let Some(cached) = ACTIVE_CHECKPOINT_CACHE
+        .lock()
+        .unwrap()
+        .get(table_name)
+        .cloned()
+    {
+        if cached.checkpoint_id == checkpoint_id {
+            return Ok(cached.checkpoint);
+        }
+    }
+
     STATE_PROVIDER
         .get_checkpoint(CheckpointDescriptor::new(
             table_name.to_string(),
@@ -49,6 +87,16 @@ pub(crate) async fn load_active_checkpoint(
                 "Checkpoint metadata was not found for table {}",
                 table_name
             ))
+        })
+        .map(Arc::new)
+        .inspect(|checkpoint| {
+            ACTIVE_CHECKPOINT_CACHE.lock().unwrap().insert(
+                table_name.to_string(),
+                CachedActiveCheckpoint {
+                    checkpoint_id: checkpoint.checkpoint_id.clone(),
+                    checkpoint: checkpoint.clone(),
+                },
+            );
         })
 }
 
