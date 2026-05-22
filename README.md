@@ -203,6 +203,25 @@ This is the quickest way to see the protocol-neutral serving layer compared
 against familiar systems with Powdrr measured over a real external HTTP server
 rather than an in-process test harness.
 
+### Recent Exact-Lookup Results
+
+The newest mmap-backed exact lookup path is aimed at Redis-style key/value
+reads and Elasticsearch `_doc` / `_mget` reads over coherent Iceberg
+snapshots.
+
+Recent local release measurements on a warmed fast path showed:
+
+- Redis wire `GET key:1`: Powdrr `0.033 ms avg` vs Redis `0.063 ms avg`
+- Redis wire `MGET 50`: Powdrr `0.489 ms avg` vs Redis `0.493 ms avg`
+- Redis wire `MGET 100`: Powdrr `0.985 ms avg` vs Redis `0.796 ms avg`
+- Elasticsearch `_doc`: Powdrr `17.66 ms avg`
+- Elasticsearch `_mget`: Powdrr `17.27 ms avg`
+
+Those are localhost microbenchmarks, not a universal claim about deployment
+latency, but they show the current shape of the exact-lookup path and where the
+remaining gaps are. For the commands, caveats, and full result tables, see
+`docs/exact-lookup-performance.md`.
+
 ### Run The Servers
 
 Start the control plane:
