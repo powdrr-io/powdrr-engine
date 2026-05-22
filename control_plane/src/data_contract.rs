@@ -1166,7 +1166,7 @@ impl ServiceMode {
             ServiceImplType::TestingDynamoDb(address) => {
                 TestProcessingMode::dynamo_testing(address.clone())
             }
-            _ => TestProcessingMode::default(),
+            _ => TestProcessingMode::ephemeral_default(),
         }
     }
 }

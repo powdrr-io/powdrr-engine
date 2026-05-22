@@ -41,11 +41,35 @@ Powdrr is moving toward a serving database with this contract:
 - explicit fast-path vs slow-path query classification
 - familiar client protocols on top of one shared serving engine
 
+The primary product direction is read-only serving over Iceberg snapshots.
+Compatibility layers and mutation flows still matter, but they are secondary to
+the simpler "serve warehouse-generated data coherently with low latency"
+contract.
+
 Today the repo is in transition from a search-first architecture toward that
 protocol-neutral serving model. The current main branch already contains the
 shared serving path and multiple frontend adapters, but it still carries
 Elasticsearch compatibility layers and some search-oriented artifacts while the
 lakehouse-serving architecture is being generalized.
+
+## Primary Product Modes
+
+Powdrr is converging on three operating modes, with the first two as the
+product center:
+
+| Mode | Product role | Coordination story |
+|---|---|---|
+| Single-node read-only | Primary | Iceberg + object store + local NVMe, no external coordination required for serving |
+| Clustered read-only | Primary | Iceberg + object store for durable truth, service/Raft for live cutover and work coordination |
+| Compatibility / mutation | Secondary | Elasticsearch/DynamoDB/Mongo compatibility plus mutable flows, with more legacy constraints still in flight |
+
+The practical reading is:
+
+- the primary value proposition is coherent, low-latency reads over lakehouse
+  snapshots
+- the protocol adapters are there to expose familiar client surfaces on top of
+  that serving core
+- Elasticsearch compatibility is important, but it is not the product identity
 
 ## What "Zero-Copy Lakehouse Server" Means
 
@@ -161,6 +185,20 @@ Two important caveats:
 - The Mongo work is intentionally an HTTP bridge today. Off-the-shelf MongoDB
   drivers speaking the Mongo wire protocol are a later step.
 
+## First-Class Serving Contract
+
+The first hard serving class Powdrr is optimizing around is exact lookup over
+coherent snapshots:
+
+- point lookup by declared key
+- batched exact lookup
+- bounded key-range lookup
+- exact document lookup on compatibility surfaces
+
+That is not just an incidental optimization. It is the first serving contract
+where the shared engine is expected to act like a real operational database
+surface rather than a generic Parquet query wrapper.
+
 ## Getting Started
 
 ### Prerequisites
@@ -260,14 +298,15 @@ bash scripts/run_serving_bench_local.sh
 That script:
 
 - starts local Elasticsearch and MongoDB containers
-- starts local Redis
+- starts local Redis as part of the current compatibility benchmark stack
 - starts a real `powdrr-io-engine` process on a dedicated local port
 - runs focused serving-path tests
 - benchmarks equivalent Powdrr, Elasticsearch, and Mongo query shapes
 
 This is the quickest way to see the protocol-neutral serving layer compared
 against familiar systems with Powdrr measured over a real external HTTP server
-rather than an in-process test harness.
+rather than an in-process test harness. It is not the minimal read-only product
+deployment shape.
 
 ### Recent Exact-Lookup Results
 
@@ -290,7 +329,16 @@ remaining gaps are. For the commands, caveats, and full result tables, see
 
 ### Run The Servers
 
-Start the control plane:
+For the current single-node read-only development loop, start just the engine:
+
+```bash
+scripts/cargo-worktree.sh run -p powdrr-io-engine
+```
+
+That defaults to self-only operation on `http://localhost:9200`.
+
+For clustered read-only and metadata-coordinated flows, start the control
+plane:
 
 ```bash
 scripts/cargo-worktree.sh run -p powdrr-io-service
@@ -310,6 +358,7 @@ The engine also supports:
 
 - `MODE=default` for self-only operation
 - `MODE=docker` for Docker-based peer discovery
+- `MODE=leaderless` for the service-backed clustered read-only path
 - `PORT=<port>` to change the listening port
 
 Example:
@@ -446,7 +495,8 @@ ecosystems. The exact machine-readable dependency graph lives in the workspace
 - Apache Iceberg and the `iceberg-rust` implementation
 - Gotham for the HTTP server surface
 - Serde and Reqwest for protocol and client plumbing
-- Redis for coordination and local runtime behavior
+- Redis for legacy compatibility and mutation-path behavior that is still being
+  removed from the product center
 - the AWS Rust SDK and `object_store` for DynamoDB and object-storage access
 - `kube` and `k8s-openapi` for Kubernetes-aware runtime behavior
 - OpenRaft for the service-side replicated metadata direction
@@ -474,6 +524,10 @@ Powdrr would not exist in its current form without that work upstream.
 - `docs/object-store-readonly-state-provider-design.md`
   The concrete design for serving from object-store-published metadata without
   a DynamoDB-backed runtime state provider.
+
+- `docs/exact-lookup-performance.md`
+  The current numbers and caveats for the mmap-backed exact lookup fast path,
+  which is the first core serving contract Powdrr is pushing hard on.
 
 - `docs/redis-dependency-removal-plan.md`
   The plan for removing Redis from the mutation path and moving the remaining

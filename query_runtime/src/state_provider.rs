@@ -180,7 +180,7 @@ impl StateProviderActor {
     fn new(receiver: mpsc::Receiver<StateProviderActorMessage>) -> Self {
         StateProviderActor {
             state_provider: StateProvider::Ephemeral(EphemeralStateProvider::new(
-                TestProcessingMode::default(),
+                TestProcessingMode::ephemeral_default(),
             )),
             peer_provider: PeerProvider::new(PeerModeType::SelfOnly),
             receiver,

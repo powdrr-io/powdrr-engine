@@ -107,6 +107,22 @@ pub struct TestProcessingMode {
 
 impl TestProcessingMode {
     pub fn default() -> Self {
+        Self::testing_dynamodb_default()
+    }
+
+    pub fn ephemeral_default() -> Self {
+        Self {
+            state_mode: StateMode::Ephemeral,
+            storage_mode: StorageMode::default(),
+            cache_mode: CacheMode::Native,
+            peer_mode: PeerMode::SelfOnly,
+            indexing_mode: IndexingMode::Sync,
+            compaction_mode: CompactionMode::Async(None),
+            prefetch_mode: PrefetchMode::Disabled,
+        }
+    }
+
+    pub fn testing_dynamodb_default() -> Self {
         Self {
             state_mode: StateMode::TestingDynamoDb(None),
             storage_mode: StorageMode::default(),
