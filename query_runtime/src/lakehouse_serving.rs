@@ -1601,17 +1601,20 @@ pub async fn execute_checkpoint_exact_lookup_batch_rows(
             return Ok(None);
         };
         let rows = match plan {
-            SnapshotLookupPlan::Exact { predicates } => {
-                execute_snapshot_exact_lookup(&cache, &predicates, limit).await?
-            }
+            SnapshotLookupPlan::Exact { predicates } => snapshot_row_refs_to_projected_values(
+                &cache,
+                execute_snapshot_exact_lookup_row_refs(&cache, &predicates, limit).await?,
+                request,
+            )?,
             SnapshotLookupPlan::KeyRange {
                 eq_field,
                 eq_value,
                 order_field,
                 descending,
                 range,
-            } => {
-                execute_snapshot_key_range_lookup(
+            } => snapshot_row_refs_to_projected_values(
+                &cache,
+                execute_snapshot_key_range_lookup_row_refs(
                     &cache,
                     &eq_field,
                     &eq_value,
@@ -1620,10 +1623,11 @@ pub async fn execute_checkpoint_exact_lookup_batch_rows(
                     range.as_ref(),
                     limit,
                 )
-                .await?
-            }
+                .await?,
+                request,
+            )?,
         };
-        results.push(project_rows_for_select(rows, request));
+        results.push(rows);
     }
     Ok(Some(results))
 }
@@ -1872,10 +1876,7 @@ async fn maybe_execute_snapshot_lookup(
             ACCESS_ARTIFACT_KIND_SNAPSHOT_KEY_RANGE_LOOKUP.to_string(),
         ),
     };
-    let rows = row_refs
-        .into_iter()
-        .map(|row_ref| snapshot_row_to_projected_value(&cache, row_ref, request))
-        .collect::<Result<Vec<_>, _>>()?;
+    let rows = snapshot_row_refs_to_projected_values(&cache, row_refs, request)?;
 
     Ok(Some(ServingExecutionResult {
         rows,
@@ -1911,13 +1912,15 @@ async fn maybe_execute_snapshot_exact_lookup_artifact(
     let cache =
         get_or_build_snapshot_exact_lookup_cache(checkpoint_key, snapshot_exact_lookup_artifact)
             .await?;
+    let select_fields = normalized_select(request.select.clone());
     let mut rows = Vec::with_capacity(limit.min(doc_ids.len()));
     for doc_id in doc_ids {
         if let Some(entry) = cache.entries_by_id.get(&doc_id) {
-            rows.push(cache.row_store.projected_row_value(
-                entry.row_ref,
-                normalized_select(request.select.clone()).as_deref(),
-            )?);
+            rows.push(
+                cache
+                    .row_store
+                    .projected_row_value(entry.row_ref, select_fields.as_deref())?,
+            );
         }
         if rows.len() >= limit {
             break;
@@ -2060,34 +2063,6 @@ fn exact_lookup_index_entry_is_better(
         return candidate.seq_no > existing.seq_no;
     }
     candidate.version > existing.version
-}
-
-fn project_rows_for_select(rows: Vec<Value>, request: &ReadPlan) -> Vec<Value> {
-    if request.select.is_none() {
-        return rows;
-    }
-    rows.into_iter()
-        .map(|row| project_row_for_select(row, request))
-        .collect()
-}
-
-fn project_row_for_select(row: Value, request: &ReadPlan) -> Value {
-    let Some(select_fields) = normalized_select(request.select.clone()) else {
-        return row;
-    };
-    let Some(row_map) = row.as_object() else {
-        return row;
-    };
-    let source_map = row_map.get("_source").and_then(Value::as_object);
-    let mut projected = Map::with_capacity(select_fields.len());
-    for field in select_fields {
-        if let Some(value) = row_map.get(&field) {
-            projected.insert(field, value.clone());
-        } else if let Some(value) = source_map.and_then(|source| source.get(&field)) {
-            projected.insert(field, value.clone());
-        }
-    }
-    Value::Object(projected)
 }
 
 fn snapshot_lookup_plan(request: &ReadPlan) -> Option<SnapshotLookupPlan> {
@@ -2904,6 +2879,22 @@ fn snapshot_row_to_projected_value(
     cache
         .row_store
         .projected_row_value(row_ref, select_fields.as_deref())
+}
+
+fn snapshot_row_refs_to_projected_values(
+    cache: &SnapshotLookupCache,
+    row_refs: Vec<SnapshotRowRef>,
+    request: &ReadPlan,
+) -> Result<Vec<Value>, String> {
+    let select_fields = normalized_select(request.select.clone());
+    row_refs
+        .into_iter()
+        .map(|row_ref| {
+            cache
+                .row_store
+                .projected_row_value(row_ref, select_fields.as_deref())
+        })
+        .collect()
 }
 
 async fn maybe_execute_exact_lookup(
@@ -5844,7 +5835,7 @@ mod tests {
         ServingPattern, ServingTableConfig, TableDescription,
     };
     use crate::peers::CheckpointDescriptor;
-    use crate::read_plan::ReadPlan;
+    use crate::read_plan::{ReadPlan, ReadPredicate};
     use crate::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
     use crate::serving_plan::{
         ServingPredicate, ServingQueryClassification, ServingRequestPlan, ServingSort,
@@ -7693,6 +7684,63 @@ mod tests {
                 "_version": 2,
                 "_source": { "tenant": "acme", "score": 20 }
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_exact_lookup_artifact_projects_selected_fields() {
+        let rows = vec![json!({
+            "_id": "doc-1",
+            "_id_seq_no": "doc-1#2",
+            "_seq_no": 2,
+            "_version": 2,
+            "_source": { "tenant": "acme", "score": 20 }
+        })];
+        let batch = snapshot_exact_lookup_record_batch(&rows);
+        let bytes =
+            super::record_batches_to_snapshot_exact_lookup_mmap_bytes(&vec![batch]).unwrap();
+        let local_path = std::env::temp_dir().join(format!(
+            "powdrr-snapshot-exact-lookup-project-{}.bin",
+            idgenerator::IdInstance::next_id()
+        ));
+        std::fs::write(&local_path, &bytes).unwrap();
+
+        let projected = super::maybe_execute_snapshot_exact_lookup_artifact(
+            &format!("checkpoint-{}", idgenerator::IdInstance::next_id()),
+            Some(&super::SnapshotExactLookupArtifact::Mmap(format!(
+                "file://{}",
+                local_path.display()
+            ))),
+            &ReadPlan {
+                select: Some(vec!["_id".to_string(), "_source".to_string()]),
+                filters: vec![ReadPredicate {
+                    field: "_id".to_string(),
+                    eq: None,
+                    in_values: Some(vec![json!("doc-1")]),
+                    gt: None,
+                    gte: None,
+                    lt: None,
+                    lte: None,
+                }],
+                aggregate: None,
+                order_by: vec![],
+                limit: Some(1),
+                offset: 0,
+                search_after: None,
+                allow_slow_path: true,
+                explain: false,
+            },
+            1,
+        )
+        .await
+        .expect("exact lookup artifact should succeed");
+
+        assert_eq!(
+            projected,
+            Some(vec![json!({
+                "_id": "doc-1",
+                "_source": { "tenant": "acme", "score": 20 }
+            })])
         );
     }
 
