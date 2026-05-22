@@ -5,6 +5,10 @@ use crate::data_contract::{
 };
 use crate::elastic_search_common::call_peers;
 use crate::elastic_table_validation::{ElasticTableValidationError, validate_elastic_table_files};
+use crate::lakehouse_serving::{
+    record_batches_to_snapshot_exact_lookup_mmap_bytes,
+    record_batches_to_snapshot_lookup_mmap_bytes,
+};
 use crate::peers::{
     CheckpointDescriptor, PrivateExtensionInvocation, PrivateInvocation, PrivateInvocationResult,
 };
@@ -30,7 +34,9 @@ use std::fmt::Display;
 
 const EXACT_PRUNING_VALUE_LIMIT: usize = 64;
 const SNAPSHOT_EXACT_LOOKUP_SUFFIX: &str = "snapshot_exact_lookup";
+const SNAPSHOT_EXACT_LOOKUP_MMAP_SUFFIX: &str = "snapshot_exact_lookup_mmap";
 const SNAPSHOT_LOOKUP_SUFFIX: &str = "snapshot_lookup";
+const SNAPSHOT_LOOKUP_MMAP_SUFFIX: &str = "snapshot_lookup_mmap";
 
 #[derive(Debug)]
 pub struct IndexError {
@@ -683,6 +689,57 @@ async fn write_snapshot_lookup_parquet(
     write_result.map(|_| true)
 }
 
+async fn write_snapshot_lookup_mmap(
+    batches: &Vec<RecordBatch>,
+    target_file_path: &String,
+) -> Result<bool, IndexError> {
+    let payload = record_batches_to_snapshot_lookup_mmap_bytes(batches).map_err(IndexError::new)?;
+    if payload.is_empty() {
+        return Ok(false);
+    }
+
+    if target_file_path.starts_with("s3://") {
+        data_access::put_s3_file(target_file_path, &payload)
+            .await
+            .map_err(IndexError::from)?;
+    } else {
+        let local_path = target_file_path
+            .strip_prefix("file://")
+            .unwrap_or(target_file_path);
+        if let Some(parent) = std::path::Path::new(local_path).parent() {
+            std::fs::create_dir_all(parent).map_err(|error| IndexError::new(error.to_string()))?;
+        }
+        std::fs::write(local_path, payload).map_err(|error| IndexError::new(error.to_string()))?;
+    }
+    Ok(true)
+}
+
+async fn write_snapshot_exact_lookup_mmap(
+    batches: &Vec<RecordBatch>,
+    target_file_path: &String,
+) -> Result<bool, IndexError> {
+    let payload =
+        record_batches_to_snapshot_exact_lookup_mmap_bytes(batches).map_err(IndexError::new)?;
+    if payload.is_empty() {
+        return Ok(false);
+    }
+
+    if target_file_path.starts_with("s3://") {
+        data_access::put_s3_file(target_file_path, &payload)
+            .await
+            .map_err(IndexError::from)?;
+    } else {
+        let local_path = target_file_path
+            .strip_prefix("file://")
+            .unwrap_or(target_file_path);
+        if let Some(parent) = std::path::Path::new(local_path).parent() {
+            std::fs::create_dir_all(parent).map_err(|error| IndexError::new(error.to_string()))?;
+        }
+        std::fs::write(local_path, payload).map_err(|error| IndexError::new(error.to_string()))?;
+    }
+    Ok(true)
+}
+
 async fn create_snapshot_lookup_artifact(
     checkpoint: &TableMetadataCheckpoint,
 ) -> Result<Option<String>, IndexError> {
@@ -720,6 +777,49 @@ async fn create_snapshot_lookup_artifact(
     .map_err(IndexError::from)?;
 
     if write_snapshot_lookup_parquet(&batches, &target_file_path).await? {
+        Ok(Some(target_file_path))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn create_snapshot_lookup_mmap_artifact(
+    checkpoint: &TableMetadataCheckpoint,
+) -> Result<Option<String>, IndexError> {
+    let Some(iceberg_metadata) = checkpoint.iceberg_metadata.as_ref() else {
+        return Ok(None);
+    };
+    let files = iceberg_metadata.files.as_file_tuples();
+    if files.is_empty() {
+        return Ok(None);
+    }
+
+    let delete_files = checkpoint
+        .deletes_metadata
+        .as_ref()
+        .map(|metadata| metadata.files.clone())
+        .unwrap_or_default();
+    let target_file_path = add_file_suffix(
+        &files[0].file_path,
+        &format!("{SNAPSHOT_LOOKUP_MMAP_SUFFIX}_{}", checkpoint.checkpoint_id),
+        Some(&".bin".to_string()),
+    );
+    if file_exists(&target_file_path).await {
+        return Ok(Some(target_file_path));
+    }
+
+    let batches = execute_query_plan_batches(QueryExecutionPlan {
+        sql: QuerySqlTemplate::Built(snapshot_lookup_full_scan_sql(!delete_files.is_empty())),
+        files: checkpoint_query_inputs(files),
+        delete_files: delete_files.clone(),
+        use_deletes_table: !delete_files.is_empty(),
+        extension_suffixes: None,
+        use_cpu_threadpool: true,
+    })
+    .await
+    .map_err(IndexError::from)?;
+
+    if write_snapshot_exact_lookup_mmap(&batches, &target_file_path).await? {
         Ok(Some(target_file_path))
     } else {
         Ok(None)
@@ -779,6 +879,65 @@ async fn create_snapshot_exact_lookup_artifact(
     .map_err(IndexError::from)?;
 
     if write_snapshot_lookup_parquet(&batches, &target_file_path).await? {
+        Ok(Some(target_file_path))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn create_snapshot_exact_lookup_mmap_artifact(
+    checkpoint: &TableMetadataCheckpoint,
+) -> Result<Option<String>, IndexError> {
+    let Some(iceberg_metadata) = checkpoint.iceberg_metadata.as_ref() else {
+        return Ok(None);
+    };
+    let schema_map = checkpoint.schema.to_map();
+    for required in ["_id", "_id_seq_no", "_seq_no", "_version", "_source"] {
+        if !schema_map.contains_key(required) {
+            return Ok(None);
+        }
+    }
+
+    let files = iceberg_metadata.files.as_file_tuples();
+    if files.is_empty() {
+        return Ok(None);
+    }
+
+    let delete_files = checkpoint
+        .deletes_metadata
+        .as_ref()
+        .map(|metadata| metadata.files.clone())
+        .unwrap_or_default();
+    let target_file_path = add_file_suffix(
+        &files[0].file_path,
+        &format!(
+            "{SNAPSHOT_EXACT_LOOKUP_MMAP_SUFFIX}_{}",
+            checkpoint.checkpoint_id
+        ),
+        Some(&".bin".to_string()),
+    );
+    if file_exists(&target_file_path).await {
+        return Ok(Some(target_file_path));
+    }
+
+    let sql = if delete_files.is_empty() {
+        "SELECT t.\"_id\", t.\"_id_seq_no\", t.\"_seq_no\", t.\"_version\", t.\"_source\" FROM {target_table} t WHERE t.\"_id\" IS NOT NULL".to_string()
+    } else {
+        "SELECT t.\"_id\", t.\"_id_seq_no\", t.\"_seq_no\", t.\"_version\", t.\"_source\" FROM {target_table} t LEFT JOIN {deletes_table} dt ON dt._id_seq_no = t.\"_id_seq_no\" WHERE dt._id_seq_no IS NULL AND t.\"_id\" IS NOT NULL".to_string()
+    };
+
+    let batches = execute_query_plan_batches(QueryExecutionPlan {
+        sql: QuerySqlTemplate::Built(sql),
+        files: checkpoint_query_inputs(files),
+        delete_files: delete_files.clone(),
+        use_deletes_table: !delete_files.is_empty(),
+        extension_suffixes: None,
+        use_cpu_threadpool: true,
+    })
+    .await
+    .map_err(IndexError::from)?;
+
+    if write_snapshot_lookup_mmap(&batches, &target_file_path).await? {
         Ok(Some(target_file_path))
     } else {
         Ok(None)
@@ -850,10 +1009,26 @@ pub(crate) async fn create_index(work_item: &ExtensionWorkItem) -> Result<(), In
                 location: snapshot_exact_lookup_path,
             });
         }
+        if let Some(snapshot_exact_lookup_mmap_path) =
+            create_snapshot_exact_lookup_mmap_artifact(&checkpoint).await?
+        {
+            checkpoint_entry.push(ExtensionFile {
+                suffix: SNAPSHOT_EXACT_LOOKUP_MMAP_SUFFIX.to_string(),
+                location: snapshot_exact_lookup_mmap_path,
+            });
+        }
         if let Some(snapshot_lookup_path) = create_snapshot_lookup_artifact(&checkpoint).await? {
             checkpoint_entry.push(ExtensionFile {
                 suffix: SNAPSHOT_LOOKUP_SUFFIX.to_string(),
                 location: snapshot_lookup_path,
+            });
+        }
+        if let Some(snapshot_lookup_mmap_path) =
+            create_snapshot_lookup_mmap_artifact(&checkpoint).await?
+        {
+            checkpoint_entry.push(ExtensionFile {
+                suffix: SNAPSHOT_LOOKUP_MMAP_SUFFIX.to_string(),
+                location: snapshot_lookup_mmap_path,
             });
         }
     }

@@ -22,6 +22,10 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::elastic_search_http_types::NamePathExtractor;
+use crate::exact_lookup::{
+    ActiveCheckpointLookupError, execute_active_checkpoint_exact_lookup_batch_rows,
+    load_active_checkpoint as load_shared_active_checkpoint,
+};
 use futures_util::future::FutureExt;
 use powdrr_query_lib::data_access::{self, execute_sql_async, load_files_as_table};
 use powdrr_query_lib::data_contract::{
@@ -34,11 +38,9 @@ use powdrr_query_lib::serving_plan::{
     ServingPredicate, ServingQueryClassification, ServingRequestPlan, ServingSort,
 };
 use powdrr_query_runtime::lakehouse_serving::{
-    ServingQueryError, ServingQueryResponse, execute_checkpoint_exact_lookup_batch_rows,
-    execute_checkpoint_point_lookup_rows, execute_serving_query,
+    ServingQueryError, ServingQueryResponse, execute_serving_query,
 };
 use powdrr_query_runtime::peers::CheckpointDescriptor;
-use powdrr_query_runtime::read_plan::ReadPlan;
 use powdrr_query_runtime::search_runtime::batches_to_serde_value;
 use powdrr_query_runtime::state_provider::{STATE_PROVIDER, ServiceApiError};
 
@@ -1583,21 +1585,21 @@ async fn execute_fast_path_point_lookup_rows(
     table_name: &str,
     request: &ServingRequestPlan,
 ) -> Result<Option<Vec<Value>>, DynamoDbError> {
-    let checkpoint = load_active_checkpoint(table_name).await?;
-    execute_checkpoint_point_lookup_rows(&checkpoint, &ReadPlan::from(request))
-        .await
-        .map_err(DynamoDbError::internal)
+    let mut row_sets =
+        execute_fast_path_point_lookup_batch_rows(table_name, std::slice::from_ref(request))
+            .await?;
+    Ok(row_sets
+        .as_mut()
+        .and_then(|rows| (!rows.is_empty()).then(|| rows.remove(0))))
 }
 
 async fn execute_fast_path_point_lookup_batch_rows(
     table_name: &str,
     requests: &[ServingRequestPlan],
 ) -> Result<Option<Vec<Vec<Value>>>, DynamoDbError> {
-    let checkpoint = load_active_checkpoint(table_name).await?;
-    let read_plans = requests.iter().map(ReadPlan::from).collect::<Vec<_>>();
-    execute_checkpoint_exact_lookup_batch_rows(&checkpoint, &read_plans)
+    execute_active_checkpoint_exact_lookup_batch_rows(table_name, requests)
         .await
-        .map_err(DynamoDbError::internal)
+        .map_err(convert_active_checkpoint_lookup_error)
 }
 
 fn convert_serving_error(error: ServingQueryError) -> DynamoDbError {
@@ -1671,29 +1673,9 @@ async fn load_latest_base_checkpoint(
 async fn load_active_checkpoint(
     table_name: &str,
 ) -> Result<TableMetadataCheckpoint, DynamoDbError> {
-    let checkpoint_id = STATE_PROVIDER
-        .get_published_active_servable_checkpoint(&table_name.to_string())
+    load_shared_active_checkpoint(table_name)
         .await
-        .map_err(service_error)?
-        .ok_or_else(|| {
-            DynamoDbError::resource_not_found(format!(
-                "No checkpoint was available for table {}",
-                table_name
-            ))
-        })?;
-    STATE_PROVIDER
-        .get_checkpoint(CheckpointDescriptor::new(
-            table_name.to_string(),
-            checkpoint_id,
-        ))
-        .await
-        .map_err(service_error)?
-        .ok_or_else(|| {
-            DynamoDbError::resource_not_found(format!(
-                "Checkpoint metadata was not found for table {}",
-                table_name
-            ))
-        })
+        .map_err(convert_active_checkpoint_lookup_error)
 }
 
 fn checkpoint_file_descriptors(
@@ -1737,6 +1719,15 @@ fn schema_from_checkpoint(
     Err(DynamoDbError::internal(
         "Checkpoint did not contain a usable schema",
     ))
+}
+
+fn convert_active_checkpoint_lookup_error(error: ActiveCheckpointLookupError) -> DynamoDbError {
+    match error {
+        ActiveCheckpointLookupError::NotFound(message) => {
+            DynamoDbError::resource_not_found(message)
+        }
+        ActiveCheckpointLookupError::Internal(message) => DynamoDbError::internal(message),
+    }
 }
 
 async fn load_mutable_table_rows(
