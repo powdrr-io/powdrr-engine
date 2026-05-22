@@ -182,6 +182,13 @@ cd .worktrees/my-branch
 scripts/cargo-worktree.sh check -p powdrr-io-engine
 ```
 
+Or use the repo helper to create the worktree and run the default build preset
+in one step:
+
+```bash
+bash scripts/create-worktree.sh --fetch my-branch
+```
+
 ### Fastest End-to-End Demo
 
 The easiest way to see the shared serving path in action is the local serving
