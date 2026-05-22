@@ -71,6 +71,13 @@ database-like serving surface.
 For the current storage-role model of `speedboat` vs `Iceberg`, see
 `docs/speedboat-vs-iceberg-architecture.md`.
 
+If you are trying to understand the code rather than the product framing, start
+with:
+
+- `docs/README.md`
+- `docs/architecture.md`
+- `docs/repo-map.md`
+
 ## High-Level Architecture
 
 At a high level, Powdrr looks like this:
@@ -108,38 +115,36 @@ supposed to fork the execution engine. Elasticsearch-style, DynamoDB-style,
 Mongo-style, and native serving requests should all compile into one shared
 serving plan and run against one shared snapshot-aware execution path.
 
-### Main Runtime Pieces
+### Current Workspace Layout
 
-- `query_lib/`
-  The shared query/runtime crate. This is the single source of truth for the
-  serving planner, serving executor, Elasticsearch compatibility layer,
-  DynamoDB adapter, Mongo bridge, Iceberg access, clustered fanout helpers,
-  and the local CLI implementation.
+The repo is now split into explicit layers:
 
 - `control_plane/`
-  Shared control-plane types and utilities used across the runtime and service
-  layers.
+  Shared control-plane contracts used by both the runtime and service layers.
 
-- `engine/`
-  The main query and serving server. It now depends directly on the shared
-  query/runtime crate.
+- `query_core/`
+  Pure query and serving-plan types, schema helpers, and shared query DTOs.
 
-- `service/` and `service_lib/`
-  The control-plane service for table metadata, checkpoints, org setup,
-  aliases, templates, and related state transitions.
+- `query_lib/`
+  Low-level execution and storage helpers such as object-store/parquet access
+  and query execution primitives.
 
 - `query_runtime/`
-  The runtime/orchestration crate. This owns ingest, compaction, state
-  providers, peer/runtime fanout, local CLI execution, and the snapshot-aware
-  serving runtime.
+  The shared runtime/orchestration layer: serving runtime, ingest, compaction,
+  state providers, peer/runtime fanout, and local CLI execution.
 
-- `cli/`
-  A local CLI for building and querying a local Parquet cache through Powdrr's
-  search stack without starting the HTTP service.
+- `query_server/`
+  Protocol adapters and routing for Elasticsearch-compatible, DynamoDB-
+  compatible, Mongo-shaped, Redis-shaped, and native serving entrypoints.
 
-- `benchmark/`
-  An end-to-end serving benchmark that compares equivalent Powdrr,
-  Elasticsearch, and Mongo query shapes.
+- `service_lib/`
+  The control-plane service implementation and metadata backends.
+
+- `engine/`, `service/`, `cli/`, and `benchmark/`
+  The binaries and harnesses that assemble those shared crates.
+
+For the concrete file- and package-level map, see `docs/repo-map.md`. For
+request flows and test ownership, see `docs/architecture.md`.
 
 ## Supported Protocols
 
@@ -247,6 +252,20 @@ in one step:
 ```bash
 bash scripts/create-worktree.sh --fetch my-branch
 ```
+
+### Contributor Docs
+
+Use the docs index in `docs/README.md` to choose the right level of detail.
+
+- current crate and request flow: `docs/architecture.md`
+- package and directory map: `docs/repo-map.md`
+- protocol/API changes: `docs/playbooks/protocol-change.md`
+- serving engine changes: `docs/playbooks/serving-engine-change.md`
+- metadata/state-provider changes:
+  `docs/playbooks/metadata-state-provider-change.md`
+- compatibility harness changes:
+  `docs/playbooks/compatibility-test-change.md`
+- benchmark changes: `docs/playbooks/benchmark-change.md`
 
 ### Fastest End-to-End Demo
 
@@ -458,6 +477,15 @@ ecosystems. The exact machine-readable dependency graph lives in the workspace
 Powdrr would not exist in its current form without that work upstream.
 
 ## Where To Read Next
+
+- `docs/README.md`
+  The docs index. Start here if you are not sure which document is current.
+
+- `docs/architecture.md`
+  The current codebase architecture, request flows, and test ownership.
+
+- `docs/repo-map.md`
+  The directory-to-package map for the current workspace.
 
 - `docs/why-powdrr.md`
   The product-level explanation of the offline-to-online serving problem and
