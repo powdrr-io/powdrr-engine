@@ -28,6 +28,38 @@ Powdrr only claims compatibility for the explicitly documented subset.
 - `readonly` means write APIs hard error even if the same surface is supported
   in normal read-write mode.
 
+## How Compatibility Surfaces Target Tables
+
+Powdrr compatibility surfaces do not all identify a table the same way. The
+selection rules are:
+
+- Elasticsearch-compatible HTTP:
+  `:index` path segments resolve against Powdrr table names and configured
+  Elasticsearch aliases. Root routes such as `/_search` and wildcard or
+  comma-separated index expressions can target more than one table.
+- DynamoDB-compatible HTTP:
+  the DynamoDB `TableName` request member is the Powdrr table name. Each table
+  also needs its own `/:table/_dynamodb/config`.
+- Mongo-shaped HTTP:
+  each Powdrr table can be exposed as one configured `(database, collection)`
+  pair through `/:table/_mongo/config`. Mongo commands then target that
+  database and collection.
+- Redis-compatible RESP:
+  each Powdrr table can be exposed as one configured Redis database number
+  through `/:table/_redis/config`. The Redis client chooses the table with
+  `SELECT <db>`, then issues `GET`, `MGET`, or `EXISTS` inside that selected
+  database.
+
+The Redis case is intentionally one-table-per-database:
+
+- Powdrr rejects duplicate enabled `database` assignments across tables
+- `SELECT` fails if the chosen database is not configured
+- `GET`/`MGET`/`EXISTS` only operate against the currently selected table
+- a single Redis command does not span multiple Powdrr tables
+
+For read traffic, the selected table also needs a published servable
+checkpoint; protocol routing alone is not enough.
+
 `readonly` mode is explicit:
 
 - engine/runtime config: `API_MODE=readonly`
@@ -45,6 +77,23 @@ In `readonly` mode, Powdrr rejects:
 ## Elasticsearch-Compatible HTTP API
 
 Detailed matrix: `docs/es-compatibility-matrix.md`
+
+### How Table Selection Works
+
+- `GET /:index/...` and `POST /:index/...` routes target the Powdrr table named
+  by `:index`
+- the same `:index` slot also accepts configured Elasticsearch aliases
+- comma-separated and wildcard index expressions are accepted on the routes
+  that already take `:index`
+- root routes like `GET /_search` and `POST /_search` operate across all
+  matching tables
+
+Examples:
+
+- `POST /logs/_search` targets the `logs` table
+- `POST /logs_alias/_search` targets the table bound to alias `logs_alias`
+- `POST /logs,events/_search` targets both `logs` and `events`
+- `GET /_resolve/index/logs*` resolves matching table names and aliases
 
 ### Supported Read and Metadata Routes
 
@@ -162,6 +211,27 @@ Not yet verified:
 
 Detailed matrix: `docs/dynamodb-compatibility-matrix.md`
 
+### How Table Selection Works
+
+The DynamoDB-compatible HTTP surface always targets a Powdrr table through the
+AWS `TableName` member in the request body.
+
+Examples:
+
+- `DescribeTable` with `TableName: "events"` targets the Powdrr table `events`
+- `GetItem`, `Query`, and `Scan` use that same `TableName`
+- `BatchGetItem` and `BatchWriteItem` can reference multiple Powdrr tables in
+  their request-items map, because DynamoDB itself is multi-table at that API
+  shape
+
+Per-table DynamoDB compatibility config is managed through:
+
+- `GET /:table/_dynamodb/config`
+- `PUT /:table/_dynamodb/config`
+
+That config attaches the DynamoDB key model to one Powdrr table; it does not
+create a second independent storage copy.
+
 ### Supported Operations
 
 Powdrr currently routes `POST /` with `X-Amz-Target: DynamoDB_20120810.*` and
@@ -226,6 +296,34 @@ Not yet verified:
 
 Powdrr's Redis surface is exposed on `REDIS_FRONTEND_PORT` and is intentionally
 read-oriented.
+
+### How Table Selection Works
+
+Redis does not carry a table name on each `GET`. Powdrr therefore maps one
+Powdrr table to one Redis database number:
+
+- configure table binding with `PUT /:table/_redis/config`
+- client issues `SELECT <db>`
+- Powdrr resolves that database number to the configured table
+- `GET`, `MGET`, and `EXISTS` run against that table's published checkpoint
+
+The binding is defined by:
+
+```json
+{
+  "enabled": true,
+  "database": 0,
+  "key_field": "user_id",
+  "value_field": "payload"
+}
+```
+
+Important limits:
+
+- only one enabled Powdrr table may claim a given Redis database number
+- `SELECT` to an unconfigured database returns an explicit error
+- Redis commands do not target multiple Powdrr tables at once
+- this is currently an exact-lookup surface, not a general Redis data model
 
 ### Supported Commands
 

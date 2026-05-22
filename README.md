@@ -191,6 +191,29 @@ Two important caveats:
 - The Mongo work is intentionally an HTTP bridge today. Off-the-shelf MongoDB
   drivers speaking the Mongo wire protocol are a later step.
 
+### How Compatibility APIs Target Tables
+
+The compatibility surfaces do not all identify a table the same way:
+
+- Elasticsearch routes use the `:index` path segment and also honor configured
+  aliases, wildcard expressions, and comma-separated target lists on the
+  routes that support them.
+- DynamoDB uses the AWS `TableName` request member and per-table config at
+  `/:table/_dynamodb/config`.
+- Mongo maps a Powdrr table to one `(database, collection)` pair through
+  `/:table/_mongo/config`.
+- Redis maps a Powdrr table to one Redis database number through
+  `/:table/_redis/config`; clients then pick the table with `SELECT <db>`.
+
+That Redis mapping is real and enforced:
+
+- one enabled Powdrr table per Redis database number
+- `SELECT` fails if the chosen database is not configured
+- `GET`, `MGET`, and `EXISTS` operate only on the currently selected table
+
+The detailed targeting rules and examples live in
+`docs/protocol-compatibility-contract.md`.
+
 ## First-Class Serving Contract
 
 The first hard serving class Powdrr is optimizing around is exact lookup over
