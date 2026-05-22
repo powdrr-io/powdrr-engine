@@ -227,6 +227,36 @@ Not yet verified:
 Powdrr's Redis surface is exposed on `REDIS_FRONTEND_PORT` and is intentionally
 read-oriented.
 
+One selected Redis database maps to one Powdrr table. The Redis config for that
+table declares:
+
+- `database`: which Redis database number selects the table
+- `key_field`: which Powdrr column identifies the row for a Redis key
+- optional `value_field`: which Powdrr column backs string-style `GET` / `MGET`
+
+That gives Powdrr two Redis-shaped views over the same Iceberg-backed table:
+
+- string-style lookups
+  - `GET key`
+  - `MGET key1 key2 ...`
+  - `EXISTS key1 key2 ...`
+- hash-style row lookups
+  - `HGET key field`
+  - `HMGET key field1 field2 ...`
+  - `HGETALL key`
+  - `HEXISTS key field`
+
+For feature-store style access, the hash path is the important one:
+
+```text
+SELECT 0
+HMGET alice age country plan score_7d score_30d score_90d
+```
+
+That behaves like one exact row lookup on the selected table plus a projection
+of the requested columns from that row, not seven independent table scans or
+seven different table bindings.
+
 ### Supported Commands
 
 - `PING`
@@ -238,6 +268,10 @@ read-oriented.
 - `SELECT`
 - `GET`
 - `MGET`
+- `HGET`
+- `HMGET`
+- `HGETALL`
+- `HEXISTS`
 - `EXISTS`
 - `QUIT`
 

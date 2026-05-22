@@ -234,6 +234,10 @@ pub(crate) async fn execute_redis_command(
         "SELECT" => execute_select(selected_db, rest).await,
         "GET" => execute_get(*selected_db, rest).await,
         "MGET" => execute_mget(*selected_db, rest).await,
+        "HGET" => execute_hget(*selected_db, rest).await,
+        "HMGET" => execute_hmget(*selected_db, rest).await,
+        "HGETALL" => execute_hgetall(*selected_db, rest).await,
+        "HEXISTS" => execute_hexists(*selected_db, rest).await,
         "EXISTS" => execute_exists(*selected_db, rest).await,
         _ => Err(RedisCommandError::unsupported(&command)),
     }
@@ -440,8 +444,9 @@ async fn execute_get(
     };
 
     let binding = load_redis_database_binding(selected_db).await?;
+    let value_field = configured_redis_value_field(&binding)?;
     let keys = vec![key.to_string()];
-    let values = fetch_redis_values(&binding, &keys).await?;
+    let values = fetch_redis_values(&binding, &keys, value_field).await?;
     let value = values.into_iter().next().unwrap_or(None);
     Ok(RedisCommandResult {
         response: value
@@ -462,7 +467,8 @@ async fn execute_mget(
     }
 
     let binding = load_redis_database_binding(selected_db).await?;
-    let values = fetch_redis_values(&binding, args).await?;
+    let value_field = configured_redis_value_field(&binding)?;
+    let values = fetch_redis_values(&binding, args, value_field).await?;
     let values = values
         .into_iter()
         .map(|value| {
@@ -478,6 +484,126 @@ async fn execute_mget(
     })
 }
 
+async fn execute_hget(
+    selected_db: u32,
+    args: &[String],
+) -> Result<RedisCommandResult, RedisCommandError> {
+    let [key, field] = args else {
+        return Err(RedisCommandError::validation(
+            "wrong number of arguments for 'hget' command",
+        ));
+    };
+
+    let binding = load_redis_database_binding(selected_db).await?;
+    let schema = load_table_schema(&binding.table_name).await?;
+    let select = select_known_fields(&schema, &[field.to_string()]);
+    let row = fetch_redis_row(&binding, key, &select).await?;
+    Ok(RedisCommandResult {
+        response: redis_field_bytes(row.as_ref(), field)
+            .map(RespValue::BulkString)
+            .unwrap_or(RespValue::NullBulkString),
+        close_connection: false,
+    })
+}
+
+async fn execute_hmget(
+    selected_db: u32,
+    args: &[String],
+) -> Result<RedisCommandResult, RedisCommandError> {
+    let Some((key, fields)) = args.split_first() else {
+        return Err(RedisCommandError::validation(
+            "wrong number of arguments for 'hmget' command",
+        ));
+    };
+    if fields.is_empty() {
+        return Err(RedisCommandError::validation(
+            "wrong number of arguments for 'hmget' command",
+        ));
+    }
+
+    let binding = load_redis_database_binding(selected_db).await?;
+    let schema = load_table_schema(&binding.table_name).await?;
+    let select = select_known_fields(&schema, fields);
+    let row = fetch_redis_row(&binding, key, &select).await?;
+    let values = fields
+        .iter()
+        .map(|field| {
+            redis_field_bytes(row.as_ref(), field)
+                .map(RespValue::BulkString)
+                .unwrap_or(RespValue::NullBulkString)
+        })
+        .collect();
+
+    Ok(RedisCommandResult {
+        response: RespValue::Array(values),
+        close_connection: false,
+    })
+}
+
+async fn execute_hgetall(
+    selected_db: u32,
+    args: &[String],
+) -> Result<RedisCommandResult, RedisCommandError> {
+    let [key] = args else {
+        return Err(RedisCommandError::validation(
+            "wrong number of arguments for 'hgetall' command",
+        ));
+    };
+
+    let binding = load_redis_database_binding(selected_db).await?;
+    let schema = load_table_schema(&binding.table_name).await?;
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<Vec<_>>();
+    let row = fetch_redis_row(&binding, key, &fields).await?;
+
+    let Some(row) = row.as_ref() else {
+        return Ok(RedisCommandResult {
+            response: RespValue::Array(vec![]),
+            close_connection: false,
+        });
+    };
+
+    let mut response = Vec::with_capacity(fields.len() * 2);
+    for field in fields {
+        response.push(RespValue::BulkString(field.clone().into_bytes()));
+        response.push(
+            redis_field_bytes(Some(row), &field)
+                .map(RespValue::BulkString)
+                .unwrap_or(RespValue::NullBulkString),
+        );
+    }
+
+    Ok(RedisCommandResult {
+        response: RespValue::Array(response),
+        close_connection: false,
+    })
+}
+
+async fn execute_hexists(
+    selected_db: u32,
+    args: &[String],
+) -> Result<RedisCommandResult, RedisCommandError> {
+    let [key, field] = args else {
+        return Err(RedisCommandError::validation(
+            "wrong number of arguments for 'hexists' command",
+        ));
+    };
+
+    let binding = load_redis_database_binding(selected_db).await?;
+    let schema = load_table_schema(&binding.table_name).await?;
+    let select = select_known_fields(&schema, &[field.to_string()]);
+    let row = fetch_redis_row(&binding, key, &select).await?;
+    let exists = redis_field_bytes(row.as_ref(), field).is_some();
+
+    Ok(RedisCommandResult {
+        response: RespValue::Integer(if exists { 1 } else { 0 }),
+        close_connection: false,
+    })
+}
+
 async fn execute_exists(
     selected_db: u32,
     args: &[String],
@@ -489,7 +615,8 @@ async fn execute_exists(
     }
 
     let binding = load_redis_database_binding(selected_db).await?;
-    let count = fetch_redis_values(&binding, args)
+    let value_field = configured_redis_value_field(&binding)?;
+    let count = fetch_redis_values(&binding, args, value_field)
         .await?
         .into_iter()
         .filter(|value| value.is_some())
@@ -501,11 +628,11 @@ async fn execute_exists(
     })
 }
 
-fn redis_lookup_request(binding: &RedisTableBinding, key: &str) -> ServingRequestPlan {
+fn redis_lookup_request(key_field: &str, key: &str, select: Vec<String>) -> ServingRequestPlan {
     ServingRequestPlan {
-        select: Some(vec![binding.config.value_field.clone()]),
+        select: Some(select),
         filters: vec![ServingPredicate {
-            field: binding.config.key_field.clone(),
+            field: key_field.to_string(),
             eq: Some(json!(key)),
             in_values: None,
             gt: None,
@@ -524,29 +651,54 @@ fn redis_lookup_request(binding: &RedisTableBinding, key: &str) -> ServingReques
 async fn fetch_redis_values(
     binding: &RedisTableBinding,
     keys: &[String],
+    value_field: &str,
 ) -> Result<Vec<Option<Vec<u8>>>, RedisCommandError> {
+    let select = vec![value_field.to_string()];
+    let rows = fetch_redis_rows(binding, keys, &select).await?;
+    keys.iter()
+        .zip(rows.into_iter())
+        .map(|rows| {
+            let (key, rows) = rows;
+            redis_row_from_rows(&binding.table_name, key, rows)
+                .map(|row| redis_field_bytes(row.as_ref(), value_field))
+        })
+        .collect()
+}
+
+async fn fetch_redis_row(
+    binding: &RedisTableBinding,
+    key: &str,
+    select: &[String],
+) -> Result<Option<Value>, RedisCommandError> {
+    if select.is_empty() {
+        return Ok(None);
+    }
+    let rows = fetch_redis_rows(binding, &[key.to_string()], select).await?;
+    redis_row_from_rows(
+        &binding.table_name,
+        key,
+        rows.into_iter().next().unwrap_or_default(),
+    )
+}
+
+async fn fetch_redis_rows(
+    binding: &RedisTableBinding,
+    keys: &[String],
+    select: &[String],
+) -> Result<Vec<Vec<Value>>, RedisCommandError> {
     let requests = keys
         .iter()
-        .map(|key| redis_lookup_request(binding, key))
+        .map(|key| redis_lookup_request(&binding.config.key_field, key, select.to_vec()))
         .collect::<Vec<_>>();
 
     if let Some(row_sets) =
         execute_fast_path_point_lookup_batch_rows(&binding.table_name, &requests).await?
     {
-        let mut values = Vec::with_capacity(row_sets.len());
-        for (key, rows) in keys.iter().zip(row_sets.into_iter()) {
-            values.push(redis_value_from_rows(
-                &binding.table_name,
-                &binding.config.value_field,
-                key,
-                rows,
-            )?);
-        }
-        return Ok(values);
+        return Ok(row_sets);
     }
 
     let mut values = Vec::with_capacity(requests.len());
-    for (key, request) in keys.iter().zip(requests.into_iter()) {
+    for request in requests {
         let response = execute_serving_query(&binding.table_name, request)
             .await
             .map_err(convert_serving_error)?;
@@ -557,34 +709,29 @@ async fn fetch_redis_values(
                 }),
             ));
         }
-        values.push(redis_value_from_rows(
-            &binding.table_name,
-            &binding.config.value_field,
-            key,
-            response.rows,
-        )?);
+        values.push(response.rows);
     }
     Ok(values)
 }
 
-fn redis_value_from_rows(
+fn redis_row_from_rows(
     table_name: &str,
-    value_field: &str,
     key: &str,
     rows: Vec<Value>,
-) -> Result<Option<Vec<u8>>, RedisCommandError> {
+) -> Result<Option<Value>, RedisCommandError> {
     if rows.len() > 1 {
         return Err(RedisCommandError::internal(format!(
             "Redis key {} matched multiple rows in table {}",
             key, table_name
         )));
     }
-    let row = match rows.into_iter().next() {
-        Some(row) => row,
-        None => return Ok(None),
-    };
-    let value = row.get(value_field).cloned().unwrap_or(Value::Null);
-    Ok(redis_value_bytes(&value))
+    Ok(rows.into_iter().next())
+}
+
+fn redis_field_bytes(row: Option<&Value>, field: &str) -> Option<Vec<u8>> {
+    let row = row?;
+    let value = row.get(field)?;
+    redis_value_bytes(value)
 }
 
 async fn execute_fast_path_point_lookup_batch_rows(
@@ -608,6 +755,35 @@ fn parse_database(database: &str) -> Result<u32, RedisCommandError> {
     database
         .parse::<u32>()
         .map_err(|_| RedisCommandError::validation("database index must be a non-negative integer"))
+}
+
+fn configured_redis_value_field<'a>(
+    binding: &'a RedisTableBinding,
+) -> Result<&'a str, RedisCommandError> {
+    binding.config.value_field.as_deref().ok_or_else(|| {
+        RedisCommandError::validation(
+            "Redis value_field must be configured to use GET, MGET, or EXISTS; use HGET, HMGET, HGETALL, or HEXISTS for multi-column row access",
+        )
+    })
+}
+
+fn unique_fields(fields: &[String]) -> Vec<String> {
+    let mut unique = Vec::with_capacity(fields.len());
+    for field in fields {
+        if !unique.iter().any(|existing| existing == field) {
+            unique.push(field.clone());
+        }
+    }
+    unique
+}
+
+fn select_known_fields(schema: &PowdrrSchema, fields: &[String]) -> Vec<String> {
+    let schema_map = schema.to_map();
+    let unique = unique_fields(fields);
+    unique
+        .into_iter()
+        .filter(|field| schema_map.contains_key(field))
+        .collect()
 }
 
 async fn list_redis_bindings() -> Result<Vec<RedisTableBinding>, RedisCommandError> {
@@ -735,12 +911,6 @@ fn validate_redis_config(
             "Redis key field must be a non-empty string",
         ));
     }
-    if config.value_field.trim().is_empty() {
-        return Err(RedisCommandError::validation(
-            "Redis value field must be a non-empty string",
-        ));
-    }
-
     let schema_map = schema.to_map();
     if !schema_map.contains_key(&config.key_field) {
         return Err(RedisCommandError::validation(format!(
@@ -748,11 +918,18 @@ fn validate_redis_config(
             config.key_field
         )));
     }
-    if !schema_map.contains_key(&config.value_field) {
-        return Err(RedisCommandError::validation(format!(
-            "Unknown Redis value field {}",
-            config.value_field
-        )));
+    if let Some(value_field) = config.value_field.as_ref() {
+        if value_field.trim().is_empty() {
+            return Err(RedisCommandError::validation(
+                "Redis value field must be a non-empty string when provided",
+            ));
+        }
+        if !schema_map.contains_key(value_field) {
+            return Err(RedisCommandError::validation(format!(
+                "Unknown Redis value field {}",
+                value_field
+            )));
+        }
     }
     Ok(())
 }

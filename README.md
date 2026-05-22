@@ -180,7 +180,7 @@ same maturity level.
 | Native serving API | `PUT /:table/_serve/config`, `POST /:table/_serve` | This is the long-term protocol-neutral serving path. |
 | Elasticsearch-compatible HTTP API | Root `/`, index lifecycle, `_bulk`, `_search`, aliases, templates, selected aggregations | Compatibility is tracked as a subset, not full Elasticsearch parity. See `docs/protocol-compatibility-contract.md` and `docs/es-compatibility-matrix.md`. |
 | DynamoDB-compatible HTTP API | Root `POST /` with `X-Amz-Target: DynamoDB_20120810.*` plus per-table config | Designed for configured tables on top of the shared serving path. See `docs/protocol-compatibility-contract.md` and `docs/dynamodb-compatibility-matrix.md`. |
-| Redis-compatible RESP API | `REDIS_FRONTEND_PORT` plus per-table config | Read-oriented subset with explicit `READONLY` behavior for known write commands in read-only mode. See `docs/protocol-compatibility-contract.md`. |
+| Redis-compatible RESP API | `REDIS_FRONTEND_PORT` plus per-table config | Read-oriented exact-lookup subset. Supports both single-value `GET` / `MGET` lookups and hash-style `HGET` / `HMGET` / `HGETALL` access over one selected table. See `docs/protocol-compatibility-contract.md`. |
 | Mongo-shaped read API | `POST /:table/_mongo/find`, `POST /_mongo/:database/_command` | Read-only subset over HTTP. This is **not** full Mongo wire-protocol compatibility yet. |
 | Control-plane API | `powdrr-io-service` under `/api/v1` | Used for table creation, checkpoint publication, aliases, templates, pipelines, and org management. |
 

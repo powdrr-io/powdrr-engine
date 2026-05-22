@@ -126,6 +126,7 @@ impl TestProcessingMode {
             state_mode: StateMode::Ephemeral,
             storage_mode: StorageMode::default(),
             cache_mode: CacheMode::Native,
+            api_mode: ApiMode::ReadWrite,
             peer_mode: PeerMode::SelfOnly,
             indexing_mode: IndexingMode::Sync,
             compaction_mode: CompactionMode::Async(None),

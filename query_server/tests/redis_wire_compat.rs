@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use datafusion::arrow::array::{ArrayRef, StringArray};
+use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::parquet::arrow::ArrowWriter;
@@ -28,6 +28,12 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static TEST_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+});
 
 struct HttpPowdrrServer {
     base_url: String,
@@ -87,11 +93,7 @@ fn redis_rust_client_can_ping_get_and_mget_over_powdrr_wire() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
+    TEST_RUNTIME.block_on(async {
         run_redis_wire_compat_test().await;
     });
 }
@@ -112,8 +114,8 @@ async fn run_redis_wire_compat_test() {
     configure_redis(&http_server.base_url, &table_name, database).await;
 
     let client = redis::Client::open(redis_server.url.clone()).unwrap();
-    let (ping, alpha, missing, values, exists_count) =
-        tokio::task::spawn_blocking(move || -> (String, Option<String>, Option<String>, Vec<Option<String>>, i64) {
+    let (ping, alpha, missing, values, exists_count, city, features, all_fields, hexists_city, hexists_missing) =
+        tokio::task::spawn_blocking(move || -> (String, Option<String>, Option<String>, Vec<Option<String>>, i64, Option<String>, Vec<Option<String>>, HashMap<String, String>, i64, i64) {
             let mut connection = client.get_connection().unwrap();
             let ping: String = redis::cmd("PING").query(&mut connection).unwrap();
             let alpha: Option<String> = connection.get("alpha").unwrap();
@@ -124,7 +126,42 @@ async fn run_redis_wire_compat_test() {
                 .arg(&["alpha", "missing", "bravo"])
                 .query(&mut connection)
                 .unwrap();
-            (ping, alpha, missing, values, exists_count)
+            let city: Option<String> = redis::cmd("HGET")
+                .arg("alpha")
+                .arg("city")
+                .query(&mut connection)
+                .unwrap();
+            let features: Vec<Option<String>> = redis::cmd("HMGET")
+                .arg("alpha")
+                .arg(&["city", "plan", "score", "missing_feature"])
+                .query(&mut connection)
+                .unwrap();
+            let all_fields: HashMap<String, String> = redis::cmd("HGETALL")
+                .arg("alpha")
+                .query(&mut connection)
+                .unwrap();
+            let hexists_city: i64 = redis::cmd("HEXISTS")
+                .arg("alpha")
+                .arg("city")
+                .query(&mut connection)
+                .unwrap();
+            let hexists_missing: i64 = redis::cmd("HEXISTS")
+                .arg("alpha")
+                .arg("missing_feature")
+                .query(&mut connection)
+                .unwrap();
+            (
+                ping,
+                alpha,
+                missing,
+                values,
+                exists_count,
+                city,
+                features,
+                all_fields,
+                hexists_city,
+                hexists_missing,
+            )
         })
         .await
         .unwrap();
@@ -137,6 +174,23 @@ async fn run_redis_wire_compat_test() {
         vec![Some("first".to_string()), None, Some("second".to_string())]
     );
     assert_eq!(exists_count, 2);
+    assert_eq!(city, Some("honolulu".to_string()));
+    assert_eq!(
+        features,
+        vec![
+            Some("honolulu".to_string()),
+            Some("pro".to_string()),
+            Some("7".to_string()),
+            None,
+        ]
+    );
+    assert_eq!(all_fields.get("key"), Some(&"alpha".to_string()));
+    assert_eq!(all_fields.get("value"), Some(&"first".to_string()));
+    assert_eq!(all_fields.get("city"), Some(&"honolulu".to_string()));
+    assert_eq!(all_fields.get("plan"), Some(&"pro".to_string()));
+    assert_eq!(all_fields.get("score"), Some(&"7".to_string()));
+    assert_eq!(hexists_city, 1);
+    assert_eq!(hexists_missing, 0);
 }
 
 #[test]
@@ -145,11 +199,7 @@ fn redis_rust_client_receives_readonly_on_write_commands() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
+    TEST_RUNTIME.block_on(async {
         let temp_dir = TempDir::new().unwrap();
         let parquet_path = temp_dir.path().join("redis_wire_cache.parquet");
         write_redis_test_parquet(&parquet_path);
@@ -181,6 +231,62 @@ fn redis_rust_client_receives_readonly_on_write_commands() {
             "{error}"
         );
         assert!(error.contains("read-only mode"), "{error}");
+    });
+}
+
+#[test]
+fn redis_hash_commands_work_without_value_field_config() {
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    TEST_RUNTIME.block_on(async {
+        let temp_dir = TempDir::new().unwrap();
+        let parquet_path = temp_dir.path().join("redis_wire_hash_only.parquet");
+        write_redis_test_parquet(&parquet_path);
+
+        let table_name = unique_name("redis_wire_hash_only");
+        let database = 9u32;
+
+        let http_server = HttpPowdrrServer::spawn().await;
+        let redis_server = RedisWireServer::spawn(database).await;
+        configure_testing_mode(&http_server.base_url).await;
+        add_checkpoint(&http_server.base_url, &table_name, &parquet_path).await;
+        configure_serving(&http_server.base_url, &table_name).await;
+        configure_redis_hash_only(&http_server.base_url, &table_name, database).await;
+
+        let client = redis::Client::open(redis_server.url.clone()).unwrap();
+        let (fields, missing) =
+            tokio::task::spawn_blocking(move || -> (Vec<Option<String>>, String) {
+                let mut connection = client.get_connection().unwrap();
+                let fields: Vec<Option<String>> = redis::cmd("HMGET")
+                    .arg("alpha")
+                    .arg(&["city", "plan", "score"])
+                    .query(&mut connection)
+                    .unwrap();
+                let missing = redis::cmd("GET")
+                    .arg("alpha")
+                    .query::<Option<String>>(&mut connection)
+                    .expect_err("GET should fail when value_field is not configured")
+                    .to_string();
+                (fields, missing)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fields,
+            vec![
+                Some("honolulu".to_string()),
+                Some("pro".to_string()),
+                Some("7".to_string()),
+            ]
+        );
+        assert!(missing.contains("value_field"), "{missing}");
+        assert!(
+            missing.contains("HGET") || missing.contains("HMGET"),
+            "{missing}"
+        );
     });
 }
 
@@ -221,6 +327,18 @@ async fn add_checkpoint(base_url: &str, table_name: &str, parquet_path: &Path) {
         PowdrrField {
             name: "value".to_string(),
             data_type: PowdrrDataType::String,
+        },
+        PowdrrField {
+            name: "city".to_string(),
+            data_type: PowdrrDataType::String,
+        },
+        PowdrrField {
+            name: "plan".to_string(),
+            data_type: PowdrrDataType::String,
+        },
+        PowdrrField {
+            name: "score".to_string(),
+            data_type: PowdrrDataType::Integer,
         },
     ]);
     let file_path = format!("file://{}", parquet_path.display());
@@ -303,16 +421,38 @@ async fn configure_redis(base_url: &str, table_name: &str, database: u32) {
         .unwrap();
 }
 
+async fn configure_redis_hash_only(base_url: &str, table_name: &str, database: u32) {
+    HttpClient::new()
+        .put(format!("{}/{}/_redis/config", base_url, table_name))
+        .json(&serde_json::json!({
+            "enabled": true,
+            "database": database,
+            "key_field": "key"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+}
+
 fn write_redis_test_parquet(path: &Path) {
     let schema = Schema::new(vec![
         Field::new("key", DataType::Utf8, false),
         Field::new("value", DataType::Utf8, false),
+        Field::new("city", DataType::Utf8, false),
+        Field::new("plan", DataType::Utf8, false),
+        Field::new("score", DataType::Int64, false),
     ]);
     let batch = RecordBatch::try_new(
         std::sync::Arc::new(schema.clone()),
         vec![
             std::sync::Arc::new(StringArray::from(vec!["alpha", "bravo", "charlie"])) as ArrayRef,
             std::sync::Arc::new(StringArray::from(vec!["first", "second", "third"])) as ArrayRef,
+            std::sync::Arc::new(StringArray::from(vec!["honolulu", "oakland", "seattle"]))
+                as ArrayRef,
+            std::sync::Arc::new(StringArray::from(vec!["pro", "free", "team"])) as ArrayRef,
+            std::sync::Arc::new(Int64Array::from(vec![7, 3, 11])) as ArrayRef,
         ],
     )
     .unwrap();
