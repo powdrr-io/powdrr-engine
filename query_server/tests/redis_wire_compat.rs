@@ -14,9 +14,10 @@ use powdrr_query_lib::data_contract::{
     FileSetPayload, IcebergFileStats, IcebergMetadata, TableMetadataCheckpoint,
 };
 use powdrr_query_lib::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
+use powdrr_query_runtime::state_provider::STATE_PROVIDER;
 use powdrr_query_runtime::test_api::{
-    CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode, StorageMode,
-    TestProcessingMode,
+    ApiMode, CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode,
+    StorageMode, TestProcessingMode,
 };
 use powdrr_query_server::redis_wire_protocol::serve_redis_wire;
 use powdrr_query_server::router::router;
@@ -138,7 +139,56 @@ async fn run_redis_wire_compat_test() {
     assert_eq!(exists_count, 2);
 }
 
+#[test]
+fn redis_rust_client_receives_readonly_on_write_commands() {
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let temp_dir = TempDir::new().unwrap();
+        let parquet_path = temp_dir.path().join("redis_wire_cache.parquet");
+        write_redis_test_parquet(&parquet_path);
+
+        let table_name = unique_name("redis_wire_cache_readonly");
+        let database = 8u32;
+
+        let http_server = HttpPowdrrServer::spawn().await;
+        let redis_server = RedisWireServer::spawn(database).await;
+        configure_testing_mode_with_api_mode(&http_server.base_url, ApiMode::ReadWrite).await;
+        add_checkpoint(&http_server.base_url, &table_name, &parquet_path).await;
+        configure_serving(&http_server.base_url, &table_name).await;
+        configure_redis(&http_server.base_url, &table_name, database).await;
+        STATE_PROVIDER.set_api_mode(ApiMode::ReadOnly).await;
+
+        let client = redis::Client::open(redis_server.url.clone()).unwrap();
+        let error = tokio::task::spawn_blocking(move || -> String {
+            let mut connection = client.get_connection().unwrap();
+            let result: redis::RedisResult<()> = connection.set("alpha", "updated");
+            result
+                .expect_err("SET should fail in read-only mode")
+                .to_string()
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            error.contains("READONLY") || error.contains("ReadOnly"),
+            "{error}"
+        );
+        assert!(error.contains("read-only mode"), "{error}");
+    });
+}
+
 async fn configure_testing_mode(base_url: &str) {
+    configure_testing_mode_with_api_mode(base_url, ApiMode::ReadWrite).await;
+}
+
+async fn configure_testing_mode_with_api_mode(base_url: &str, api_mode: ApiMode) {
     let client = HttpClient::new();
     client
         .put(format!(
@@ -149,6 +199,7 @@ async fn configure_testing_mode(base_url: &str) {
             state_mode: StateMode::Testing,
             storage_mode: StorageMode::default(),
             cache_mode: CacheMode::Redis(None),
+            api_mode,
             peer_mode: PeerMode::SelfOnly,
             indexing_mode: IndexingMode::Disabled,
             compaction_mode: CompactionMode::Disabled,

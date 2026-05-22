@@ -31,6 +31,32 @@ Not the initial goal:
 - full Elasticsearch compatibility as the product identity
 - broad scan support hidden behind low-latency APIs
 
+## Primary Product Modes
+
+The product should be optimized around these modes in order:
+
+1. single-node read-only
+2. clustered read-only
+3. compatibility and mutation flows
+
+That ordering matters.
+
+Single-node read-only is the cleanest product story:
+
+- Iceberg + object store are canonical
+- Powdrr owns bounded acceleration state
+- local NVMe is allowed for warmed serving artifacts
+- no second serving database is required
+
+Clustered read-only adds only live coordination:
+
+- target and active snapshot cutover
+- readiness and activation gating
+- work ownership for artifact build/warmup
+
+Compatibility and mutation features should fit around that serving core rather
+than define it.
+
 ## Current Codebase Assessment
 
 ### What Already Fits
@@ -202,6 +228,8 @@ Queries must bind to one serveable snapshot and never mix old and new state.
 The first supported serving contract should be narrower than the current
 search-heavy surface:
 
+- exact lookup by declared key
+- batch exact lookup by declared key
 - single-table queries only
 - equality predicates on declared keys
 - tenant-scoped equality predicates
@@ -221,6 +249,10 @@ Explicit non-goals for the MVP:
 - full-text search as a required feature
 
 Text search can remain an optional later serving pattern.
+
+Exact lookup is not just one optimization among many. It is the first hard
+product contract for "operationally simple lakehouse serving at low latency,"
+and all protocol adapters should converge on the same exact-lookup core.
 
 ## Required Model Changes
 
@@ -333,7 +365,8 @@ Likely files:
 
 Goal:
 
-- serve the highest-value database-like access patterns
+- serve the highest-value database-like access patterns as a first-class product
+  surface
 
 Work:
 
@@ -341,6 +374,8 @@ Work:
 - add secondary-key index artifacts for declared patterns
 - add row-group/page-aware row materialization
 - add row/object cache for hot keys
+- route Elasticsearch, DynamoDB, Redis, and native exact lookups through one
+  shared path
 
 Success criteria:
 

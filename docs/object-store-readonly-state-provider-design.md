@@ -1,11 +1,15 @@
 # Object-Store Read-Only State Provider Design
 
 This document specifies a read-only Powdrr state provider that loads table
-metadata, checkpoint metadata, and publication pointers directly from the
+metadata, checkpoint metadata, and desired checkpoint targets directly from the
 object store.
 
 The goal is to support serving from lakehouse storage without requiring
 DynamoDB or the remote leaderless service for metadata reads.
+
+This is the cleanest primary product mode for Powdrr: a read-only serving path
+whose durable truth is Iceberg plus object storage rather than an external
+metadata database.
 
 This is intentionally not a full replacement for the mutable control plane.
 
@@ -14,8 +18,9 @@ This is intentionally not a full replacement for the mutable control plane.
 Add a runtime mode that:
 
 - reads table and checkpoint metadata from the object store
-- serves queries from published active checkpoints
-- plans local prefetch from published target checkpoints
+- derives the desired target checkpoint from object-store-visible metadata
+- serves queries only from a local warmed active checkpoint
+- plans local prefetch toward the desired target checkpoint
 - performs no metadata writes
 - requires no DynamoDB-backed state authority
 
@@ -63,7 +68,7 @@ Today:
 
 The current metadata authority is larger than checkpoint lookup:
 
-- published active and target checkpoint pointers
+- durable target pointers plus live cutover state
 - aliases, templates, pipelines, and lifetime policies
 - checkpoint publication queues
 - extension, compaction, and cleanup work items
@@ -89,14 +94,14 @@ The handle-level API in
 [query_runtime/src/state_provider.rs](../query_runtime/src/state_provider.rs)
 distinguishes:
 
-- published active checkpoint
-- published target checkpoint
+- local active checkpoint
+- desired target checkpoint
 - local prefetched target checkpoint
 
 The naming is not perfect, but the behaviors matter:
 
-- active checkpoint: the one queries should use now
-- target checkpoint: the next checkpoint the node should prefetch toward
+- active checkpoint: the warmed checkpoint this process should use now
+- target checkpoint: the desired next checkpoint the node should prefetch toward
 - local target checkpoint: the latest checkpoint this node has already warmed
 
 ### Prefetch Flow
@@ -119,11 +124,8 @@ The read-only provider should reuse the same basic model:
 If this mode is supposed to avoid external state dependencies, it cannot keep
 requiring Redis just to start.
 
-Today `CacheMode::Native` still panics in
-[query_runtime/src/state_provider.rs](../query_runtime/src/state_provider.rs).
-
-The read-only object-store mode therefore depends on adding a supported
-in-process cache path.
+The repo now has a supported `CacheMode::Native` path, so read-only object-store
+mode can depend on an in-process cache backend instead of Redis.
 
 ## Proposed Mode
 
@@ -218,18 +220,12 @@ Semantics:
   "table_templates": {},
   "pipelines": {},
   "lifetime_policies": {},
-  "published": {
+  "targets": {
     "base": {
-      "logs": {
-        "active": "cp-100",
-        "target": "cp-101"
-      }
+      "logs": "cp-101"
     },
     "es": {
-      "logs": {
-        "active": "cp-100",
-        "target": "cp-101"
-      }
+      "logs": "cp-101"
     }
   }
 }
@@ -240,8 +236,8 @@ Rules:
 - `tables` values are serialized
   [`TableDescription`](../control_plane/src/data_contract.rs)
 - `aliases` maps alias name to canonical table name
-- `published.base` holds no-extension publication pointers
-- `published.<extension>` holds extension-scoped publication pointers
+- `targets.base` holds no-extension desired checkpoints
+- `targets.<extension>` holds extension-scoped desired checkpoints
 
 ### Checkpoint Objects
 
@@ -305,8 +301,7 @@ Provider initialization should:
 1. build the object-store client
 2. load `manifest-pointer.json`
 3. load the referenced manifest
-4. seed the local desired prefetch targets from published target or active
-   pointers
+4. seed the local desired prefetch targets from manifest target pointers
 5. fail startup if pointer or manifest loading fails
 
 Initial startup failure should be hard, not soft. A serving process without any
@@ -355,19 +350,14 @@ already derive alias behavior separately from table descriptions.
 
 `get_published_active_checkpoint(table, extension)`:
 
-- read from manifest publication pointers
-- extension lookup order is exact extension only
-- the handle-level fallback to base checkpoints should remain in
-  `StateProviderHandle`, not in the provider implementation
+- read from the process-local warmed active checkpoint state
+- return `None` on startup until warmup completes
+- remain a local runtime fact, not a durable object-store fact
 
 `get_latest_committed_checkpoint(table, extension)`:
 
-- return the published target pointer for that scope
-- if target is absent, return the active pointer
-
-This matches how the runtime currently treats published target vs published
-active in the handle methods in
-[query_runtime/src/state_provider.rs](../query_runtime/src/state_provider.rs).
+- return the manifest target pointer for that scope
+- do not synthesize an active pointer fallback in the provider
 
 `get_checkpoint(descriptor)`:
 
@@ -399,7 +389,7 @@ The provider should use the existing in-memory fetch tracker model from
 
 There are two distinct kinds of target:
 
-- desired target from manifest publication pointers
+- desired target from manifest target pointers
 - local warmed target for this process
 
 Behavior:
@@ -410,13 +400,11 @@ Behavior:
   target
 - `set_target_checkpoints(...)` updates only the local warmed target
 
-Desired target selection rule:
+Serving startup rule:
 
-- use published `target` when present
-- otherwise use published `active`
-
-That ensures the prefetch loop can still warm the currently active checkpoint
-after startup even when no cutover is pending.
+- if no local active checkpoint is warmed yet, the process should serve nothing
+  until it warms the current desired target
+- after warmup, local active advances to the warmed target
 
 The provider must not attempt to write activation acknowledgements. That
 behavior is leaderless-service-specific and belongs to mutable coordination, not

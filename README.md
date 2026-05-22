@@ -41,11 +41,35 @@ Powdrr is moving toward a serving database with this contract:
 - explicit fast-path vs slow-path query classification
 - familiar client protocols on top of one shared serving engine
 
+The primary product direction is read-only serving over Iceberg snapshots.
+Compatibility layers and mutation flows still matter, but they are secondary to
+the simpler "serve warehouse-generated data coherently with low latency"
+contract.
+
 Today the repo is in transition from a search-first architecture toward that
 protocol-neutral serving model. The current main branch already contains the
 shared serving path and multiple frontend adapters, but it still carries
 Elasticsearch compatibility layers and some search-oriented artifacts while the
 lakehouse-serving architecture is being generalized.
+
+## Primary Product Modes
+
+Powdrr is converging on three operating modes, with the first two as the
+product center:
+
+| Mode | Product role | Coordination story |
+|---|---|---|
+| Single-node read-only | Primary | Iceberg + object store + local NVMe, no external coordination required for serving |
+| Clustered read-only | Primary | Iceberg + object store for durable truth, service/Raft for live cutover and work coordination |
+| Compatibility / mutation | Secondary | Elasticsearch/DynamoDB/Mongo compatibility plus mutable flows, with more legacy constraints still in flight |
+
+The practical reading is:
+
+- the primary value proposition is coherent, low-latency reads over lakehouse
+  snapshots
+- the protocol adapters are there to expose familiar client surfaces on top of
+  that serving core
+- Elasticsearch compatibility is important, but it is not the product identity
 
 ## What "Zero-Copy Lakehouse Server" Means
 
@@ -70,6 +94,13 @@ database-like serving surface.
 
 For the current storage-role model of `speedboat` vs `Iceberg`, see
 `docs/speedboat-vs-iceberg-architecture.md`.
+
+If you are trying to understand the code rather than the product framing, start
+with:
+
+- `docs/README.md`
+- `docs/architecture.md`
+- `docs/repo-map.md`
 
 ## High-Level Architecture
 
@@ -108,38 +139,36 @@ supposed to fork the execution engine. Elasticsearch-style, DynamoDB-style,
 Mongo-style, and native serving requests should all compile into one shared
 serving plan and run against one shared snapshot-aware execution path.
 
-### Main Runtime Pieces
+### Current Workspace Layout
 
-- `query_lib/`
-  The shared query/runtime crate. This is the single source of truth for the
-  serving planner, serving executor, Elasticsearch compatibility layer,
-  DynamoDB adapter, Mongo bridge, Iceberg access, clustered fanout helpers,
-  and the local CLI implementation.
+The repo is now split into explicit layers:
 
 - `control_plane/`
-  Shared control-plane types and utilities used across the runtime and service
-  layers.
+  Shared control-plane contracts used by both the runtime and service layers.
 
-- `engine/`
-  The main query and serving server. It now depends directly on the shared
-  query/runtime crate.
+- `query_core/`
+  Pure query and serving-plan types, schema helpers, and shared query DTOs.
 
-- `service/` and `service_lib/`
-  The control-plane service for table metadata, checkpoints, org setup,
-  aliases, templates, and related state transitions.
+- `query_lib/`
+  Low-level execution and storage helpers such as object-store/parquet access
+  and query execution primitives.
 
 - `query_runtime/`
-  The runtime/orchestration crate. This owns ingest, compaction, state
-  providers, peer/runtime fanout, local CLI execution, and the snapshot-aware
-  serving runtime.
+  The shared runtime/orchestration layer: serving runtime, ingest, compaction,
+  state providers, peer/runtime fanout, and local CLI execution.
 
-- `cli/`
-  A local CLI for building and querying a local Parquet cache through Powdrr's
-  search stack without starting the HTTP service.
+- `query_server/`
+  Protocol adapters and routing for Elasticsearch-compatible, DynamoDB-
+  compatible, Mongo-shaped, Redis-shaped, and native serving entrypoints.
 
-- `benchmark/`
-  An end-to-end serving benchmark that compares equivalent Powdrr,
-  Elasticsearch, and Mongo query shapes.
+- `service_lib/`
+  The control-plane service implementation and metadata backends.
+
+- `engine/`, `service/`, `cli/`, and `benchmark/`
+  The binaries and harnesses that assemble those shared crates.
+
+For the concrete file- and package-level map, see `docs/repo-map.md`. For
+request flows and test ownership, see `docs/architecture.md`.
 
 ## Supported Protocols
 
@@ -149,8 +178,9 @@ same maturity level.
 | Surface | Current shape | Notes |
 |---|---|---|
 | Native serving API | `PUT /:table/_serve/config`, `POST /:table/_serve` | This is the long-term protocol-neutral serving path. |
-| Elasticsearch-compatible HTTP API | Root `/`, index lifecycle, `_bulk`, `_search`, aliases, templates, selected aggregations | Compatibility is tracked as a subset, not full Elasticsearch parity. See `docs/es-compatibility-matrix.md`. |
-| DynamoDB-compatible HTTP API | Root `POST /` with `X-Amz-Target: DynamoDB_20120810.*` plus per-table config | Designed for configured tables on top of the shared serving path. |
+| Elasticsearch-compatible HTTP API | Root `/`, index lifecycle, `_bulk`, `_search`, aliases, templates, selected aggregations | Compatibility is tracked as a subset, not full Elasticsearch parity. See `docs/protocol-compatibility-contract.md` and `docs/es-compatibility-matrix.md`. |
+| DynamoDB-compatible HTTP API | Root `POST /` with `X-Amz-Target: DynamoDB_20120810.*` plus per-table config | Designed for configured tables on top of the shared serving path. See `docs/protocol-compatibility-contract.md` and `docs/dynamodb-compatibility-matrix.md`. |
+| Redis-compatible RESP API | `REDIS_FRONTEND_PORT` plus per-table config | Read-oriented subset with explicit `READONLY` behavior for known write commands in read-only mode. See `docs/protocol-compatibility-contract.md`. |
 | Mongo-shaped read API | `POST /:table/_mongo/find`, `POST /_mongo/:database/_command` | Read-only subset over HTTP. This is **not** full Mongo wire-protocol compatibility yet. |
 | Control-plane API | `powdrr-io-service` under `/api/v1` | Used for table creation, checkpoint publication, aliases, templates, pipelines, and org management. |
 
@@ -160,6 +190,26 @@ Two important caveats:
   identity.
 - The Mongo work is intentionally an HTTP bridge today. Off-the-shelf MongoDB
   drivers speaking the Mongo wire protocol are a later step.
+
+## First-Class Serving Contract
+
+The first hard serving class Powdrr is optimizing around is exact lookup over
+coherent snapshots:
+
+- point lookup by declared key
+- batched exact lookup
+- bounded key-range lookup
+- exact document lookup on compatibility surfaces
+
+That is not just an incidental optimization. It is the first serving contract
+where the shared engine is expected to act like a real operational database
+surface rather than a generic Parquet query wrapper.
+
+Compatibility is explicit, not implied. Powdrr only claims the Elasticsearch,
+DynamoDB, and Redis subsets documented in
+`docs/protocol-compatibility-contract.md`, and unsupported or read-disabled
+requests are expected to fail with checked errors rather than succeed as
+partial approximations.
 
 ## Getting Started
 
@@ -248,6 +298,20 @@ in one step:
 bash scripts/create-worktree.sh --fetch my-branch
 ```
 
+### Contributor Docs
+
+Use the docs index in `docs/README.md` to choose the right level of detail.
+
+- current crate and request flow: `docs/architecture.md`
+- package and directory map: `docs/repo-map.md`
+- protocol/API changes: `docs/playbooks/protocol-change.md`
+- serving engine changes: `docs/playbooks/serving-engine-change.md`
+- metadata/state-provider changes:
+  `docs/playbooks/metadata-state-provider-change.md`
+- compatibility harness changes:
+  `docs/playbooks/compatibility-test-change.md`
+- benchmark changes: `docs/playbooks/benchmark-change.md`
+
 ### Fastest End-to-End Demo
 
 The easiest way to see the shared serving path in action is the local serving
@@ -260,14 +324,15 @@ bash scripts/run_serving_bench_local.sh
 That script:
 
 - starts local Elasticsearch and MongoDB containers
-- starts local Redis
+- starts local Redis as part of the current compatibility benchmark stack
 - starts a real `powdrr-io-engine` process on a dedicated local port
 - runs focused serving-path tests
 - benchmarks equivalent Powdrr, Elasticsearch, and Mongo query shapes
 
 This is the quickest way to see the protocol-neutral serving layer compared
 against familiar systems with Powdrr measured over a real external HTTP server
-rather than an in-process test harness.
+rather than an in-process test harness. It is not the minimal read-only product
+deployment shape.
 
 ### Recent Exact-Lookup Results
 
@@ -290,7 +355,16 @@ remaining gaps are. For the commands, caveats, and full result tables, see
 
 ### Run The Servers
 
-Start the control plane:
+For the current single-node read-only development loop, start just the engine:
+
+```bash
+scripts/cargo-worktree.sh run -p powdrr-io-engine
+```
+
+That defaults to self-only operation on `http://localhost:9200`.
+
+For clustered read-only and metadata-coordinated flows, start the control
+plane:
 
 ```bash
 scripts/cargo-worktree.sh run -p powdrr-io-service
@@ -310,6 +384,7 @@ The engine also supports:
 
 - `MODE=default` for self-only operation
 - `MODE=docker` for Docker-based peer discovery
+- `MODE=leaderless` for the service-backed clustered read-only path
 - `PORT=<port>` to change the listening port
 
 Example:
@@ -446,7 +521,8 @@ ecosystems. The exact machine-readable dependency graph lives in the workspace
 - Apache Iceberg and the `iceberg-rust` implementation
 - Gotham for the HTTP server surface
 - Serde and Reqwest for protocol and client plumbing
-- Redis for coordination and local runtime behavior
+- Redis for legacy compatibility and mutation-path behavior that is still being
+  removed from the product center
 - the AWS Rust SDK and `object_store` for DynamoDB and object-storage access
 - `kube` and `k8s-openapi` for Kubernetes-aware runtime behavior
 - OpenRaft for the service-side replicated metadata direction
@@ -458,6 +534,15 @@ ecosystems. The exact machine-readable dependency graph lives in the workspace
 Powdrr would not exist in its current form without that work upstream.
 
 ## Where To Read Next
+
+- `docs/README.md`
+  The docs index. Start here if you are not sure which document is current.
+
+- `docs/architecture.md`
+  The current codebase architecture, request flows, and test ownership.
+
+- `docs/repo-map.md`
+  The directory-to-package map for the current workspace.
 
 - `docs/why-powdrr.md`
   The product-level explanation of the offline-to-online serving problem and
@@ -475,9 +560,17 @@ Powdrr would not exist in its current form without that work upstream.
   The concrete design for serving from object-store-published metadata without
   a DynamoDB-backed runtime state provider.
 
+- `docs/exact-lookup-performance.md`
+  The current numbers and caveats for the mmap-backed exact lookup fast path,
+  which is the first core serving contract Powdrr is pushing hard on.
+
 - `docs/redis-dependency-removal-plan.md`
   The plan for removing Redis from the mutation path and moving the remaining
   shared state behind a service-owned coordination boundary.
+
+- `docs/protocol-compatibility-contract.md`
+  The top-level contract for the supported Elasticsearch, DynamoDB, and Redis
+  surfaces, including read-only mode and verified client coverage.
 
 - `docs/lakehouse-serving-roadmap.md`
   The repo-specific roadmap from the current hybrid stack toward a shared
