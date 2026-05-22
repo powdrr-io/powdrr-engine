@@ -104,6 +104,45 @@ The point is:
 That means you do not need a separate full online copy just to expose the data
 to production systems.
 
+## The Primary Product Modes
+
+Powdrr is converging on two primary operating modes and one secondary one:
+
+- single-node read-only
+- clustered read-only
+- compatibility and mutation flows
+
+The important distinction is that the first two are the product center.
+
+Single-node read-only means:
+
+- Iceberg and object storage are the durable truth
+- Powdrr warms local state and serves one active snapshot
+- no second serving database is required
+
+Clustered read-only means:
+
+- the same storage model
+- cluster coordination only for target/active cutover and work ownership
+- no need for Redis or DynamoDB on the read path
+
+Compatibility and mutation surfaces still matter, but they are not the main
+thing Powdrr is trying to be.
+
+## Exact Lookup Is The First Hard Contract
+
+The first serving class Powdrr needs to be unambiguously good at is exact
+lookup over coherent snapshots:
+
+- key/value lookups
+- batch key lookups
+- exact document lookup
+- bounded key-range reads
+
+That is why the mmap-backed exact-lookup path matters so much. It is not just
+an optimization. It is the first place where the lakehouse-serving story has to
+feel operationally real.
+
 ## Coherent Snapshots Matter More Than People Expect
 
 Serving from lake-managed data is only useful if results are coherent.
@@ -195,7 +234,7 @@ With Powdrr, the goal is much simpler:
 - let Powdrr discover the new snapshot
 - let Powdrr prepare the serving state for that snapshot
 - let Powdrr activate it only when the snapshot is coherent and warm
-- let clients keep using the same serving API
+- let clients keep using the same serving API or compatibility surface
 
 That is the product promise.
 
