@@ -42,9 +42,38 @@ In `readonly` mode, Powdrr rejects:
   `PUT /:table/_dynamodb/config`, `PUT /:table/_mongo/config`, and
   `PUT /:table/_redis/config`
 
+## How Compatibility Surfaces Target Tables
+
+The compatibility APIs do not all target Powdrr tables the same way:
+
+- Elasticsearch uses the `:index` path segment and may also resolve aliases,
+  wildcard expressions, and comma-separated target lists depending on the
+  route.
+- DynamoDB uses the AWS `TableName` request member.
+- Mongo maps a Powdrr table to one configured `(database, collection)` pair.
+- Redis maps a Powdrr table to one configured Redis database number, selected
+  by `SELECT <db>`.
+
+The remainder of this document describes each surface in more detail, including
+the extra config each one needs in order to interpret those identifiers.
+
 ## Elasticsearch-Compatible HTTP API
 
 Detailed matrix: `docs/es-compatibility-matrix.md`
+
+### How Table Selection Works
+
+Powdrr's Elasticsearch-compatible routes target tables through the `:index`
+path segment:
+
+- `GET /events/_search` targets the Powdrr table `events`
+- `GET /logs,metrics/_search` targets multiple Powdrr tables on routes that
+  accept comma-separated index expressions
+- wildcard routes such as `GET /logs-*/_search` are matched against the known
+  Powdrr tables and configured aliases
+
+Configured aliases are part of table selection too. A request may target a
+table directly or resolve through an alias that points at that table.
 
 ### Supported Read and Metadata Routes
 
@@ -161,6 +190,24 @@ Not yet verified:
 ## DynamoDB-Compatible HTTP API
 
 Detailed matrix: `docs/dynamodb-compatibility-matrix.md`
+
+### How Table Selection Works
+
+DynamoDB requests target tables through the AWS `TableName` request member:
+
+- `DescribeTable` with `TableName: "events"` targets the Powdrr table `events`
+- `GetItem`, `Query`, and `Scan` use that same `TableName`
+- `BatchGetItem` and `BatchWriteItem` can reference multiple Powdrr tables in
+  their request-items map, because DynamoDB itself is multi-table at that API
+  shape
+
+Per-table DynamoDB compatibility config is managed through:
+
+- `GET /:table/_dynamodb/config`
+- `PUT /:table/_dynamodb/config`
+
+That config attaches the DynamoDB key model to one Powdrr table; it does not
+create a second independent storage copy.
 
 ### Supported Operations
 
