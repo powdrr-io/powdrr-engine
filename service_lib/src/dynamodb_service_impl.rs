@@ -2354,6 +2354,7 @@ mod tests {
                     serving: None,
                     dynamodb: None,
                     mongodb: None,
+                    redis: None,
                 },
             )
             .await

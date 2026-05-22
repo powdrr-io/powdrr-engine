@@ -22,6 +22,9 @@ use powdrr_service_lib::metadata_store::{
 use powdrr_service_lib::peers::CheckpointDescriptor;
 use powdrr_service_lib::pipeline::PipelineDefinition;
 use powdrr_service_lib::raft_service_impl::{RaftServiceConfig, RaftServiceImpl};
+use powdrr_service_lib::read_only_coordination::{
+    ArtifactReadinessAck, ReadOnlyCheckpointCoordinationState, ReadOnlyCoordinationStore,
+};
 use powdrr_service_lib::state_provider::ServiceApiError;
 use powdrr_service_lib::test_api::TestProcessingMode;
 use std::error::Error;
@@ -205,6 +208,23 @@ enum ServiceImplProviderActorMessage {
         respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
         org_info: OrgInfo,
         ack: ServingNodeActivationAck,
+    },
+    RecordArtifactReadiness {
+        respond_to: oneshot::Sender<Result<(), ServiceImplError>>,
+        org_info: OrgInfo,
+        ack: ArtifactReadinessAck,
+    },
+    ListArtifactReadiness {
+        respond_to: oneshot::Sender<Result<Vec<ArtifactReadinessAck>, ServiceImplError>>,
+        org_info: OrgInfo,
+        table_name: String,
+        extensions: Option<String>,
+    },
+    GetReadOnlyCoordinationState {
+        respond_to: oneshot::Sender<Result<ReadOnlyCheckpointCoordinationState, ServiceImplError>>,
+        org_info: OrgInfo,
+        table_name: String,
+        extensions: Option<String>,
     },
     GetCheckpoint {
         respond_to: oneshot::Sender<Result<Option<TableMetadataCheckpoint>, ServiceImplError>>,
@@ -535,6 +555,37 @@ impl ServiceImplProviderActor {
                     record_serving_node_activation(&org_info, &ack)
                 );
             }
+            ServiceImplProviderActorMessage::RecordArtifactReadiness {
+                org_info,
+                ack,
+                respond_to,
+            } => {
+                handle_message_impl!(self, respond_to, record_artifact_readiness(&org_info, &ack));
+            }
+            ServiceImplProviderActorMessage::ListArtifactReadiness {
+                org_info,
+                table_name,
+                extensions,
+                respond_to,
+            } => {
+                handle_message_impl!(
+                    self,
+                    respond_to,
+                    list_artifact_readiness(&org_info, &table_name, extensions)
+                );
+            }
+            ServiceImplProviderActorMessage::GetReadOnlyCoordinationState {
+                org_info,
+                table_name,
+                extensions,
+                respond_to,
+            } => {
+                handle_message_impl!(
+                    self,
+                    respond_to,
+                    get_read_only_coordination_state(&org_info, &table_name, extensions)
+                );
+            }
             ServiceImplProviderActorMessage::GetCheckpoint {
                 checkpoint,
                 respond_to,
@@ -607,6 +658,16 @@ macro_rules! metadata_store_func_impl {
             ServiceImpl::Ephemeral(eph) => MetadataStore::$func(eph, $($args),*).await.map_err(|e|ServiceImplError::from(e)),
             ServiceImpl::DynamoDb(dynamo) => MetadataStore::$func(dynamo, $($args),*).await.map_err(|e|ServiceImplError::from(e)),
             ServiceImpl::Raft(raft) => MetadataStore::$func(raft, $($args),*).await.map_err(|e|ServiceImplError::from(e)),
+        }
+    };
+}
+
+macro_rules! read_only_coordination_func_impl {
+    ($self:expr, $func:ident($($args:tt),*)) => {
+        match $self {
+            ServiceImpl::Ephemeral(eph) => ReadOnlyCoordinationStore::$func(eph, $($args),*).await.map_err(|e|ServiceImplError::from(e)),
+            ServiceImpl::DynamoDb(dynamo) => ReadOnlyCoordinationStore::$func(dynamo, $($args),*).await.map_err(|e|ServiceImplError::from(e)),
+            ServiceImpl::Raft(raft) => ReadOnlyCoordinationStore::$func(raft, $($args),*).await.map_err(|e|ServiceImplError::from(e)),
         }
     };
 }
@@ -759,7 +820,7 @@ impl ServiceImpl {
         table_name: &String,
         extensions: Option<String>,
     ) -> Result<Option<String>, ServiceImplError> {
-        metadata_store_func_impl!(
+        read_only_coordination_func_impl!(
             self,
             get_published_active_checkpoint(org_info, table_name, extensions)
         )
@@ -771,7 +832,7 @@ impl ServiceImpl {
         table_name: &String,
         extensions: Option<String>,
     ) -> Result<Option<String>, ServiceImplError> {
-        metadata_store_func_impl!(
+        read_only_coordination_func_impl!(
             self,
             get_latest_target_checkpoint(org_info, table_name, extensions)
         )
@@ -783,7 +844,7 @@ impl ServiceImpl {
         table_name: &String,
         extensions: Option<String>,
     ) -> Result<CheckpointCutoverState, ServiceImplError> {
-        metadata_store_func_impl!(
+        read_only_coordination_func_impl!(
             self,
             get_checkpoint_cutover_state(org_info, table_name, extensions)
         )
@@ -794,7 +855,7 @@ impl ServiceImpl {
         org_info: &OrgInfo,
         lease: &ServingNodeLease,
     ) -> Result<(), ServiceImplError> {
-        metadata_store_func_impl!(self, heartbeat_serving_node(org_info, lease))
+        read_only_coordination_func_impl!(self, heartbeat_serving_node(org_info, lease))
     }
 
     pub async fn record_serving_node_activation(
@@ -802,7 +863,39 @@ impl ServiceImpl {
         org_info: &OrgInfo,
         ack: &ServingNodeActivationAck,
     ) -> Result<(), ServiceImplError> {
-        metadata_store_func_impl!(self, record_serving_node_activation(org_info, ack))
+        read_only_coordination_func_impl!(self, record_serving_node_activation(org_info, ack))
+    }
+
+    pub async fn record_artifact_readiness(
+        &mut self,
+        org_info: &OrgInfo,
+        ack: &ArtifactReadinessAck,
+    ) -> Result<(), ServiceImplError> {
+        read_only_coordination_func_impl!(self, record_artifact_readiness(org_info, ack))
+    }
+
+    pub async fn list_artifact_readiness(
+        &mut self,
+        org_info: &OrgInfo,
+        table_name: &String,
+        extensions: Option<String>,
+    ) -> Result<Vec<ArtifactReadinessAck>, ServiceImplError> {
+        read_only_coordination_func_impl!(
+            self,
+            list_artifact_readiness(org_info, table_name, extensions)
+        )
+    }
+
+    pub async fn get_read_only_coordination_state(
+        &mut self,
+        org_info: &OrgInfo,
+        table_name: &String,
+        extensions: Option<String>,
+    ) -> Result<ReadOnlyCheckpointCoordinationState, ServiceImplError> {
+        read_only_coordination_func_impl!(
+            self,
+            get_read_only_coordination_state(org_info, table_name, extensions)
+        )
     }
     pub async fn get_checkpoint(
         &mut self,
@@ -1241,6 +1334,21 @@ impl ServiceImplHandle {
         )
     }
 
+    pub async fn get_published_active_checkpoint(
+        &self,
+        org_info: &OrgInfo,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> Result<Option<String>, ServiceImplError> {
+        send_message!(
+            self,
+            GetPublishedActiveCheckpoint,
+            org_info = org_info.clone(),
+            table_name = table_name.clone(),
+            extensions = extension.clone()
+        )
+    }
+
     pub async fn get_latest_target_checkpoint(
         &self,
         org_info: &OrgInfo,
@@ -1294,6 +1402,49 @@ impl ServiceImplHandle {
             RecordServingNodeActivation,
             org_info = org_info.clone(),
             ack = ack.clone()
+        )
+    }
+
+    pub async fn record_artifact_readiness(
+        &self,
+        org_info: &OrgInfo,
+        ack: &ArtifactReadinessAck,
+    ) -> Result<(), ServiceImplError> {
+        send_message!(
+            self,
+            RecordArtifactReadiness,
+            org_info = org_info.clone(),
+            ack = ack.clone()
+        )
+    }
+
+    pub async fn list_artifact_readiness(
+        &self,
+        org_info: &OrgInfo,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> Result<Vec<ArtifactReadinessAck>, ServiceImplError> {
+        send_message!(
+            self,
+            ListArtifactReadiness,
+            org_info = org_info.clone(),
+            table_name = table_name.clone(),
+            extensions = extension.clone()
+        )
+    }
+
+    pub async fn get_read_only_coordination_state(
+        &self,
+        org_info: &OrgInfo,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> Result<ReadOnlyCheckpointCoordinationState, ServiceImplError> {
+        send_message!(
+            self,
+            GetReadOnlyCoordinationState,
+            org_info = org_info.clone(),
+            table_name = table_name.clone(),
+            extensions = extension.clone()
         )
     }
     pub async fn get_checkpoint(

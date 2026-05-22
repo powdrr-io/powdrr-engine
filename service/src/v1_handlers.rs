@@ -20,6 +20,7 @@ use powdrr_service_lib::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use powdrr_service_lib::metadata_store::{ServingNodeActivationAck, ServingNodeLease};
 use powdrr_service_lib::peers::CheckpointDescriptor;
 use powdrr_service_lib::pipeline::PipelineDefinition;
+use powdrr_service_lib::read_only_coordination::ArtifactReadinessAck;
 use reqwest::Client;
 use serde::Serialize;
 use std::pin::Pin;
@@ -469,6 +470,10 @@ body_handler_org_info! { get_latest_checkpoint(org_info: OrgInfo, input: GetLate
     handle_result_option(SERVICE_IMPL.get_latest_checkpoint(&org_info, &input.table_name, input.extension).await)
 }}
 
+body_handler_org_info! { get_published_active_checkpoint(org_info: OrgInfo, input: GetLatestCheckpoint) -> GenericResponse {
+    handle_result_option(SERVICE_IMPL.get_published_active_checkpoint(&org_info, &input.table_name, input.extension).await)
+}}
+
 body_handler_org_info! { get_latest_target_checkpoint(org_info: OrgInfo, input: GetLatestCheckpoint) -> GenericResponse {
     handle_result_option(SERVICE_IMPL.get_latest_target_checkpoint(&org_info, &input.table_name, input.extension).await)
 }}
@@ -483,6 +488,18 @@ body_handler_org_info! { heartbeat_serving_node(org_info: OrgInfo, input: Servin
 
 body_handler_org_info! { record_serving_node_activation(org_info: OrgInfo, input: ServingNodeActivationAck) -> GenericResponse {
     handle_result(SERVICE_IMPL.record_serving_node_activation(&org_info, &input).await)
+}}
+
+body_handler_org_info! { record_artifact_readiness(org_info: OrgInfo, input: ArtifactReadinessAck) -> GenericResponse {
+    handle_result(SERVICE_IMPL.record_artifact_readiness(&org_info, &input).await)
+}}
+
+body_handler_org_info! { list_artifact_readiness(org_info: OrgInfo, input: GetLatestCheckpoint) -> GenericResponse {
+    handle_result(SERVICE_IMPL.list_artifact_readiness(&org_info, &input.table_name, input.extension).await)
+}}
+
+body_handler_org_info! { get_read_only_coordination_state(org_info: OrgInfo, input: GetLatestCheckpoint) -> GenericResponse {
+    handle_result(SERVICE_IMPL.get_read_only_coordination_state(&org_info, &input.table_name, input.extension).await)
 }}
 
 body_handler_org_info! { get_checkpoint(org_info: OrgInfo, input: CheckpointDescriptor) -> GenericResponse {

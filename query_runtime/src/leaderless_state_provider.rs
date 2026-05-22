@@ -20,6 +20,25 @@ use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ArtifactClass {
+    SnapshotLookupMmap,
+    SnapshotExactLookupMmap,
+    SearchProjection,
+    Custom(String),
+}
+
+#[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
+struct ArtifactReadinessAck {
+    selector: crate::metadata_store::PublishedCheckpointSelector,
+    checkpoint_id: String,
+    epoch: CutoverEpoch,
+    artifact_class: ArtifactClass,
+    producer_id: String,
+    ready_at_ms: i64,
+}
+
 pub struct LeaderlessStateProvider {
     base_address: String,
     client: Client,
@@ -30,6 +49,17 @@ pub struct LeaderlessStateProvider {
 }
 
 impl LeaderlessStateProvider {
+    fn required_artifact_classes(extension: Option<&String>) -> Vec<ArtifactClass> {
+        match extension {
+            None => vec![
+                ArtifactClass::SnapshotLookupMmap,
+                ArtifactClass::SnapshotExactLookupMmap,
+            ],
+            Some(extension) if extension == "es" => vec![ArtifactClass::SearchProjection],
+            Some(extension) => vec![ArtifactClass::Custom(extension.clone())],
+        }
+    }
+
     fn default_serving_node_id() -> String {
         if let Ok(node_id) = std::env::var("POWDRR_SERVING_NODE_ID") {
             return node_id;
@@ -522,8 +552,20 @@ impl LeaderlessStateProvider {
         table_name: &String,
         extensions: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
-        self.get_latest_committed_checkpoint(table_name, extensions)
-            .await
+        let payload = GetLatestCheckpoint {
+            table_name: table_name.to_owned(),
+            extension: extensions,
+        };
+        Self::handle_response_body_option(
+            self.get(format!(
+                "{}/api/v1/get_published_active_checkpoint",
+                self.base_address
+            ))
+            .body(serde_json::to_string(&payload).unwrap())
+            .send()
+            .await,
+        )
+        .await
     }
 
     async fn get_remote_latest_target_checkpoint(
@@ -575,6 +617,22 @@ impl LeaderlessStateProvider {
         Self::handle_response(
             self.post(format!(
                 "{}/api/v1/record_serving_node_activation",
+                self.base_address
+            ))
+            .body(serde_json::to_string(ack).unwrap())
+            .send()
+            .await,
+        )
+        .await
+    }
+
+    async fn record_artifact_readiness(
+        &mut self,
+        ack: &ArtifactReadinessAck,
+    ) -> Result<(), ServiceApiError> {
+        Self::handle_response(
+            self.post(format!(
+                "{}/api/v1/record_artifact_readiness",
                 self.base_address
             ))
             .body(serde_json::to_string(ack).unwrap())
@@ -701,6 +759,18 @@ impl LeaderlessStateProvider {
                 .await?;
             if cutover_state.target_checkpoint_id != Some(descriptor.checkpoint_id.clone()) {
                 continue;
+            }
+
+            for artifact_class in Self::required_artifact_classes(extension.as_ref()) {
+                self.record_artifact_readiness(&ArtifactReadinessAck {
+                    selector: cutover_state.selector.clone(),
+                    checkpoint_id: descriptor.checkpoint_id.clone(),
+                    epoch: cutover_state.epoch,
+                    artifact_class,
+                    producer_id: self.serving_node_id.clone(),
+                    ready_at_ms: Self::current_timestamp_ms(),
+                })
+                .await?;
             }
 
             self.record_serving_node_activation(&ServingNodeActivationAck {

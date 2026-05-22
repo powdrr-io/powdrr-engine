@@ -16,6 +16,9 @@ use crate::metadata_store::{
 };
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
+use crate::read_only_coordination::{
+    ArtifactClass, ArtifactReadinessAck, required_artifact_classes,
+};
 use crate::schema_massager::PowdrrSchema;
 use crate::state_provider::ServiceApiError;
 use crate::test_api::TestProcessingMode;
@@ -38,6 +41,7 @@ type CheckpointCutoverEpochs = HashMap<String, CutoverEpoch>;
 type CutoverMembershipViews = HashMap<String, CutoverMembershipView>;
 type ServingNodeLeases = HashMap<String, ServingNodeLease>;
 type ServingNodeActivations = HashMap<String, HashMap<String, ServingNodeActivationAck>>;
+type ArtifactReadinessAcks = HashMap<String, HashMap<ArtifactClass, ArtifactReadinessAck>>;
 type ExtensionWorkItems = HashMap<String, HashMap<String, ExtensionWorkItemTracker>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +79,7 @@ pub struct EphemeralServiceSnapshot {
     cutover_membership_views: CutoverMembershipViews,
     serving_node_leases: ServingNodeLeases,
     serving_node_activations: ServingNodeActivations,
+    artifact_readiness_acks: ArtifactReadinessAcks,
     compaction_work_items: HashMap<String, CompactionWorkItemTracker>,
     not_compacted_checkpoint_ids: HashMap<String, Vec<String>>,
     extension_work_items: ExtensionWorkItems,
@@ -102,6 +107,7 @@ pub struct EphemeralServiceImpl {
     cutover_membership_views: CutoverMembershipViews,
     serving_node_leases: ServingNodeLeases,
     serving_node_activations: ServingNodeActivations,
+    artifact_readiness_acks: ArtifactReadinessAcks,
     compaction_work_items: HashMap<String, CompactionWorkItemTracker>,
     not_compacted_checkpoint_ids: HashMap<String, Vec<String>>,
     extension_work_items: ExtensionWorkItems,
@@ -136,6 +142,7 @@ impl EphemeralServiceImpl {
             cutover_membership_views: snapshot.cutover_membership_views,
             serving_node_leases: snapshot.serving_node_leases,
             serving_node_activations: snapshot.serving_node_activations,
+            artifact_readiness_acks: snapshot.artifact_readiness_acks,
             compaction_work_items: snapshot.compaction_work_items,
             not_compacted_checkpoint_ids: snapshot.not_compacted_checkpoint_ids,
             extension_work_items: if snapshot.extension_work_items.is_empty() {
@@ -167,6 +174,7 @@ impl EphemeralServiceImpl {
             cutover_membership_views: self.cutover_membership_views.clone(),
             serving_node_leases: self.serving_node_leases.clone(),
             serving_node_activations: self.serving_node_activations.clone(),
+            artifact_readiness_acks: self.artifact_readiness_acks.clone(),
             compaction_work_items: self.compaction_work_items.clone(),
             not_compacted_checkpoint_ids: self.not_compacted_checkpoint_ids.clone(),
             extension_work_items: self.extension_work_items.clone(),
@@ -261,6 +269,11 @@ impl EphemeralServiceImpl {
 
     fn clear_serving_node_activations(&mut self, table_name: &String, extension: &Option<String>) {
         self.serving_node_activations
+            .remove(&Self::selector_group_key(table_name, extension));
+    }
+
+    fn clear_artifact_readiness(&mut self, table_name: &String, extension: &Option<String>) {
+        self.artifact_readiness_acks
             .remove(&Self::selector_group_key(table_name, extension));
     }
 
@@ -437,11 +450,7 @@ impl EphemeralServiceImpl {
         table_name: &String,
         extension: &Option<String>,
     ) -> bool {
-        match self.get_published_checkpoint_sync(
-            PublishedCheckpointRole::Target,
-            table_name,
-            extension,
-        ) {
+        match self.get_latest_materialized_checkpoint_sync(table_name, extension.clone()) {
             Some(target_checkpoint_id) => {
                 self.get_published_checkpoint_sync(
                     PublishedCheckpointRole::Active,
@@ -1564,23 +1573,14 @@ impl EphemeralServiceImpl {
             return false;
         };
 
-        if self.get_published_checkpoint_sync(
-            PublishedCheckpointRole::Target,
-            table_name,
-            &extension,
-        ) == Some(checkpoint_id.clone())
-        {
-            return false;
+        let previous_target = self
+            .get_cutover_membership_view(table_name, &extension)
+            .map(|view| view.target_checkpoint_id.clone());
+        if previous_target != Some(checkpoint_id.clone()) {
+            self.clear_artifact_readiness(table_name, &extension);
         }
-
-        self.set_published_checkpoint(
-            PublishedCheckpointRole::Target,
-            table_name,
-            &extension,
-            &checkpoint_id,
-        );
         self.capture_cutover_membership_for_target(table_name, &extension, &checkpoint_id);
-        true
+        previous_target != Some(checkpoint_id)
     }
 
     fn activation_matches_target(
@@ -1619,16 +1619,37 @@ impl EphemeralServiceImpl {
         })
     }
 
+    fn readiness_matches_target(
+        &self,
+        table_name: &String,
+        extension: &Option<String>,
+        target_checkpoint_id: &String,
+    ) -> bool {
+        let Some(readiness_acks) = self
+            .artifact_readiness_acks
+            .get(&Self::selector_group_key(table_name, extension))
+        else {
+            return false;
+        };
+
+        required_artifact_classes(extension.as_ref())
+            .into_iter()
+            .all(|artifact_class| {
+                readiness_acks
+                    .get(&artifact_class)
+                    .map(|ack| ack.checkpoint_id == *target_checkpoint_id)
+                    .unwrap_or(false)
+            })
+    }
+
     fn promote_active_checkpoint_if_ready(
         &mut self,
         table_name: &String,
         extension: Option<String>,
     ) -> bool {
-        let Some(target_checkpoint_id) = self.get_published_checkpoint_sync(
-            PublishedCheckpointRole::Target,
-            table_name,
-            &extension,
-        ) else {
+        let Some(target_checkpoint_id) =
+            self.get_latest_materialized_checkpoint_sync(table_name, extension.clone())
+        else {
             return false;
         };
 
@@ -1638,6 +1659,10 @@ impl EphemeralServiceImpl {
             &extension,
         ) == Some(target_checkpoint_id.clone())
         {
+            return false;
+        }
+
+        if !self.readiness_matches_target(table_name, &extension, &target_checkpoint_id) {
             return false;
         }
 
@@ -1770,32 +1795,39 @@ impl MetadataStore for EphemeralServiceImpl {
         table_name: &String,
         extension: Option<String>,
     ) -> Result<CheckpointCutoverState, ServiceApiError> {
+        let target_checkpoint_id =
+            self.get_latest_materialized_checkpoint_sync(table_name, extension.clone());
+        if let Some(target_checkpoint_id) = target_checkpoint_id.as_ref() {
+            self.capture_cutover_membership_for_target(
+                table_name,
+                &extension,
+                target_checkpoint_id,
+            );
+            self.backfill_cutover_membership_for_target(
+                table_name,
+                &extension,
+                target_checkpoint_id,
+            );
+        }
         let key = Self::selector_group_key(table_name, &extension);
         Ok(CheckpointCutoverState {
             selector: PublishedCheckpointSelector::target(table_name.clone(), extension.clone()),
             epoch: self
-                .checkpoint_cutover_epochs
-                .get(&key)
-                .copied()
-                .unwrap_or_default(),
+                .get_cutover_membership_view(table_name, &extension)
+                .filter(|view| Some(view.target_checkpoint_id.clone()) == target_checkpoint_id)
+                .map(|view| view.epoch)
+                .unwrap_or_else(|| {
+                    self.checkpoint_cutover_epochs
+                        .get(&key)
+                        .copied()
+                        .unwrap_or_default()
+                }),
             active_checkpoint_id: self.get_published_checkpoint_sync(
                 PublishedCheckpointRole::Active,
                 table_name,
                 &extension,
             ),
-            target_checkpoint_id: self
-                .get_published_checkpoint_sync(
-                    PublishedCheckpointRole::Target,
-                    table_name,
-                    &extension,
-                )
-                .or_else(|| {
-                    self.get_published_checkpoint_sync(
-                        PublishedCheckpointRole::Active,
-                        table_name,
-                        &extension,
-                    )
-                }),
+            target_checkpoint_id,
         })
     }
 
@@ -1831,6 +1863,32 @@ impl MetadataStore for EphemeralServiceImpl {
     ) -> Result<Vec<ServingNodeActivationAck>, ServiceApiError> {
         Ok(self
             .serving_node_activations
+            .get(&Self::selector_group_key(table_name, &extension))
+            .map(|acks| acks.values().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    async fn record_artifact_readiness(
+        &mut self,
+        _org_info: &OrgInfo,
+        ack: &ArtifactReadinessAck,
+    ) -> Result<(), ServiceApiError> {
+        let key = Self::selector_group_key(&ack.selector.table_name, &ack.selector.extension);
+        self.artifact_readiness_acks
+            .entry(key)
+            .or_default()
+            .insert(ack.artifact_class.clone(), ack.clone());
+        Ok(())
+    }
+
+    async fn list_artifact_readiness(
+        &mut self,
+        _org_info: &OrgInfo,
+        table_name: &String,
+        extension: Option<String>,
+    ) -> Result<Vec<ArtifactReadinessAck>, ServiceApiError> {
+        Ok(self
+            .artifact_readiness_acks
             .get(&Self::selector_group_key(table_name, &extension))
             .map(|acks| acks.values().cloned().collect())
             .unwrap_or_default())
@@ -1904,7 +1962,12 @@ mod tests {
         CreateTable, FileSetPayload, IcebergCommit, IcebergMetadata, LicenseType, OrgCreds,
         OrgInfo, OrgSettings,
     };
-    use crate::metadata_store::{MetadataStore, ServingNodeActivationAck, ServingNodeLease};
+    use crate::metadata_store::{
+        CutoverEpoch, MetadataStore, ServingNodeActivationAck, ServingNodeLease,
+    };
+    use crate::read_only_coordination::{
+        ArtifactClass, ArtifactReadinessAck, ReadOnlyCoordinationStore, ReadOnlyTargetPhase,
+    };
     use crate::schema_massager::PowdrrSchema;
     use crate::test_api::TestProcessingMode;
     use std::collections::HashMap;
@@ -1928,6 +1991,37 @@ mod tests {
             column_stats: vec![],
             access_artifacts: vec![],
             file_stats: vec![],
+        }
+    }
+
+    async fn record_default_readiness(
+        state: &mut EphemeralServiceImpl,
+        org_info: &OrgInfo,
+        table_name: &String,
+        epoch: CutoverEpoch,
+        checkpoint_id: &String,
+    ) {
+        for artifact_class in [
+            ArtifactClass::SnapshotLookupMmap,
+            ArtifactClass::SnapshotExactLookupMmap,
+        ] {
+            MetadataStore::record_artifact_readiness(
+                state,
+                org_info,
+                &ArtifactReadinessAck {
+                    selector: crate::metadata_store::PublishedCheckpointSelector::target(
+                        table_name.clone(),
+                        None,
+                    ),
+                    checkpoint_id: checkpoint_id.clone(),
+                    epoch,
+                    artifact_class,
+                    producer_id: "warm-cache".to_string(),
+                    ready_at_ms: chrono::Utc::now().timestamp_millis(),
+                },
+            )
+            .await
+            .unwrap();
         }
     }
 
@@ -2073,6 +2167,32 @@ mod tests {
         .unwrap();
 
         assert!(
+            !MetadataStore::advance_published_checkpoints(&mut state)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            MetadataStore::get_published_active_checkpoint(
+                &mut state,
+                &org_info,
+                &table_name,
+                None,
+            )
+            .await
+            .unwrap(),
+            None
+        );
+
+        record_default_readiness(
+            &mut state,
+            &org_info,
+            &table_name,
+            cutover_state.epoch,
+            &committed_checkpoint,
+        )
+        .await;
+
+        assert!(
             MetadataStore::advance_published_checkpoints(&mut state)
                 .await
                 .unwrap()
@@ -2088,5 +2208,172 @@ mod tests {
             .unwrap(),
             Some(committed_checkpoint)
         );
+    }
+
+    #[tokio::test]
+    async fn read_only_cutover_state_uses_latest_committed_target_and_ephemeral_active() {
+        let mut state = EphemeralServiceImpl::new(TestProcessingMode::default());
+        let org_info = org_info();
+        let table_name = "read-only-cutover-table".to_string();
+
+        state
+            .create_table(
+                &org_info,
+                &CreateTable {
+                    name: table_name.clone(),
+                    tags: HashMap::new(),
+                    serving: None,
+                    dynamodb: None,
+                    mongodb: None,
+                    redis: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        state
+            .iceberg_commit(
+                &org_info,
+                &table_name,
+                &IcebergCommit {
+                    metadata: iceberg_metadata("s3://warehouse/table/data-0001.parquet", "1"),
+                    deletes_table_info: None,
+                    compactions: vec![],
+                },
+            )
+            .await
+            .unwrap();
+
+        let checkpoint_one = MetadataStore::get_latest_committed_checkpoint(
+            &mut state,
+            &org_info,
+            &table_name,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let initial_cutover = ReadOnlyCoordinationStore::get_checkpoint_cutover_state(
+            &mut state,
+            &org_info,
+            &table_name,
+            None,
+        )
+        .await
+        .unwrap();
+        let initial_coordination_state =
+            ReadOnlyCoordinationStore::get_read_only_coordination_state(
+                &mut state,
+                &org_info,
+                &table_name,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            initial_cutover.target_checkpoint_id,
+            Some(checkpoint_one.clone())
+        );
+        assert_eq!(initial_cutover.active_checkpoint_id, None);
+        assert_eq!(
+            initial_coordination_state.phase,
+            ReadOnlyTargetPhase::AwaitingReadiness
+        );
+
+        let observed_at_ms = chrono::Utc::now().timestamp_millis();
+        MetadataStore::heartbeat_serving_node(
+            &mut state,
+            &org_info,
+            &ServingNodeLease {
+                node_id: "warm-cache".to_string(),
+                membership_epoch: initial_cutover.epoch,
+                observed_at_ms,
+            },
+        )
+        .await
+        .unwrap();
+        MetadataStore::record_serving_node_activation(
+            &mut state,
+            &org_info,
+            &ServingNodeActivationAck {
+                selector: initial_cutover.selector,
+                node_id: "warm-cache".to_string(),
+                epoch: initial_cutover.epoch,
+                checkpoint_id: checkpoint_one.clone(),
+                activated_at_ms: observed_at_ms + 1,
+            },
+        )
+        .await
+        .unwrap();
+        let awaiting_readiness = ReadOnlyCoordinationStore::get_read_only_coordination_state(
+            &mut state,
+            &org_info,
+            &table_name,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            awaiting_readiness.phase,
+            ReadOnlyTargetPhase::AwaitingReadiness
+        );
+        record_default_readiness(
+            &mut state,
+            &org_info,
+            &table_name,
+            initial_cutover.epoch,
+            &checkpoint_one,
+        )
+        .await;
+        let awaiting_activation = ReadOnlyCoordinationStore::get_read_only_coordination_state(
+            &mut state,
+            &org_info,
+            &table_name,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            awaiting_activation.phase,
+            ReadOnlyTargetPhase::AwaitingActivation
+        );
+        MetadataStore::advance_published_checkpoints(&mut state)
+            .await
+            .unwrap();
+
+        state
+            .iceberg_commit(
+                &org_info,
+                &table_name,
+                &IcebergCommit {
+                    metadata: iceberg_metadata("s3://warehouse/table/data-0002.parquet", "2"),
+                    deletes_table_info: None,
+                    compactions: vec![],
+                },
+            )
+            .await
+            .unwrap();
+
+        let checkpoint_two = MetadataStore::get_latest_committed_checkpoint(
+            &mut state,
+            &org_info,
+            &table_name,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let next_cutover = ReadOnlyCoordinationStore::get_checkpoint_cutover_state(
+            &mut state,
+            &org_info,
+            &table_name,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(next_cutover.active_checkpoint_id, Some(checkpoint_one));
+        assert_eq!(next_cutover.target_checkpoint_id, Some(checkpoint_two));
     }
 }

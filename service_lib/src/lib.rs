@@ -7,6 +7,7 @@ pub mod metadata_store;
 pub mod peers;
 pub mod pipeline;
 pub mod raft_service_impl;
+pub mod read_only_coordination;
 pub mod schema_massager;
 pub mod state_provider;
 pub mod test_api;
