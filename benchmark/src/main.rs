@@ -23,8 +23,8 @@ use powdrr_query_runtime::lakehouse_serving::ServingQueryResponse;
 use powdrr_query_runtime::serving_dataset::{ParquetDocumentSet, read_parquet_documents};
 use powdrr_query_runtime::serving_protocol::{to_elasticsearch_search, to_mongodb_find};
 use powdrr_query_runtime::test_api::{
-    CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode, StorageMode,
-    TestProcessingMode,
+    ApiMode, CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode,
+    StorageMode, TestProcessingMode,
 };
 use powdrr_query_server::router::router;
 use reqwest::{Client as HttpClient, Method as HttpMethod};
@@ -1030,6 +1030,7 @@ async fn setup_powdrr(
         state_mode: StateMode::Testing,
         storage_mode: StorageMode::default(),
         cache_mode: CacheMode::Redis(None),
+        api_mode: ApiMode::ReadWrite,
         peer_mode: PeerMode::SelfOnly,
         indexing_mode: IndexingMode::Disabled,
         compaction_mode: CompactionMode::Disabled,

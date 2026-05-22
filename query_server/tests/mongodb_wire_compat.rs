@@ -17,8 +17,8 @@ use powdrr_query_lib::data_contract::{
 };
 use powdrr_query_lib::schema_massager::{PowdrrDataType, PowdrrField, PowdrrSchema};
 use powdrr_query_runtime::test_api::{
-    CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode, StorageMode,
-    TestProcessingMode,
+    ApiMode, CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode,
+    StorageMode, TestProcessingMode,
 };
 use powdrr_query_server::mongodb_wire_protocol::serve_mongodb_wire;
 use powdrr_query_server::router::router;
@@ -168,6 +168,7 @@ async fn configure_testing_mode(base_url: &str) {
             state_mode: StateMode::Testing,
             storage_mode: StorageMode::default(),
             cache_mode: CacheMode::Redis(None),
+            api_mode: ApiMode::ReadWrite,
             peer_mode: PeerMode::SelfOnly,
             indexing_mode: IndexingMode::Disabled,
             compaction_mode: CompactionMode::Disabled,

@@ -63,6 +63,26 @@ pub fn es_post_ilm_policy(mut state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_post_ilm_policy");
     // TODO: figure out what to do with ILM policy
     async {
+        if STATE_PROVIDER.is_read_only().await {
+            let response = SingleDocCreateFailedResult {
+                error: ErrorDetails::single_cause(
+                    &"cluster_block_exception".to_string(),
+                    &"The Elasticsearch write API is disabled in Powdrr read-only mode."
+                        .to_string(),
+                    None,
+                    None,
+                    None,
+                ),
+                status: 403,
+            };
+            let res = create_response(
+                &state,
+                StatusCode::FORBIDDEN,
+                mime::APPLICATION_JSON,
+                serde_json::to_string(&response).unwrap(),
+            );
+            return Ok((state, res));
+        }
         let path_extractor = NamePathExtractor::borrow_from(&state);
         let table = path_extractor.name.to_string();
 
@@ -99,6 +119,26 @@ pub fn es_post_monitoring_bulk(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_post_monitoring_bulk");
     // TODO: figure out what this really means
     async {
+        if STATE_PROVIDER.is_read_only().await {
+            let response = SingleDocCreateFailedResult {
+                error: ErrorDetails::single_cause(
+                    &"cluster_block_exception".to_string(),
+                    &"The Elasticsearch write API is disabled in Powdrr read-only mode."
+                        .to_string(),
+                    None,
+                    None,
+                    None,
+                ),
+                status: 403,
+            };
+            let res = create_response(
+                &state,
+                StatusCode::FORBIDDEN,
+                mime::APPLICATION_JSON,
+                serde_json::to_string(&response).unwrap(),
+            );
+            return Ok((state, res));
+        }
         let response_str = r#"{
   "took": 0,
   "ignored": true,

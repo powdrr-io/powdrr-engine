@@ -306,6 +306,15 @@ fn unsupported_api_response(state: &State, reason: &str) -> gotham::hyper::Respo
     )
 }
 
+fn readonly_api_response(state: &State, reason: &str) -> gotham::hyper::Response<Body> {
+    elasticsearch_error_response(
+        state,
+        StatusCode::FORBIDDEN,
+        "cluster_block_exception",
+        reason,
+    )
+}
+
 pub fn es_unsupported_search_scroll(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_unsupported_search_scroll");
     async {
@@ -1600,6 +1609,13 @@ pub fn es_resolve_index(state: State) -> Pin<Box<HandlerFuture>> {
 pub fn es_create_with_id(mut state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_create_with_id");
     async {
+        if STATE_PROVIDER.is_read_only().await {
+            let res = readonly_api_response(
+                &state,
+                "The Elasticsearch write API is disabled in Powdrr read-only mode.",
+            );
+            return Ok((state, res));
+        }
         let path_extractor = NameIdPathExtractor::borrow_from(&state);
         let index_name = path_extractor.name.to_string();
         let doc_id = path_extractor.id.to_string();
@@ -1632,6 +1648,13 @@ pub fn es_create_with_id(mut state: State) -> Pin<Box<HandlerFuture>> {
 pub fn es_index_auto_id(mut state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_index_auto_id");
     async move {
+        if STATE_PROVIDER.is_read_only().await {
+            let res = readonly_api_response(
+                &state,
+                "The Elasticsearch write API is disabled in Powdrr read-only mode.",
+            );
+            return Ok((state, res));
+        }
         let path_extractor = NamePathExtractor::borrow_from(&state);
         let index_name = path_extractor.name.to_string();
         let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
@@ -1663,6 +1686,13 @@ pub fn es_index_auto_id(mut state: State) -> Pin<Box<HandlerFuture>> {
 pub fn es_index_with_id(mut state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_index_with_id");
     async move {
+        if STATE_PROVIDER.is_read_only().await {
+            let res = readonly_api_response(
+                &state,
+                "The Elasticsearch write API is disabled in Powdrr read-only mode.",
+            );
+            return Ok((state, res));
+        }
         let path_extractor = NameIdPathExtractor::borrow_from(&state);
         let index_name = path_extractor.name.to_string();
         let doc_id = path_extractor.id.to_string();
@@ -1695,6 +1725,13 @@ pub fn es_index_with_id(mut state: State) -> Pin<Box<HandlerFuture>> {
 pub fn es_update_with_id(mut state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_update_with_id");
     async {
+        if STATE_PROVIDER.is_read_only().await {
+            let res = readonly_api_response(
+                &state,
+                "The Elasticsearch write API is disabled in Powdrr read-only mode.",
+            );
+            return Ok((state, res));
+        }
         let path_extractor = NameIdPathExtractor::borrow_from(&state);
         let index_name = path_extractor.name.to_string();
         let doc_id = path_extractor.id.to_string();
@@ -1825,6 +1862,13 @@ pub fn es_head_with_id(state: State) -> Pin<Box<HandlerFuture>> {
 pub fn es_delete_with_id(state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_get_with_id");
     async {
+        if STATE_PROVIDER.is_read_only().await {
+            let res = readonly_api_response(
+                &state,
+                "The Elasticsearch write API is disabled in Powdrr read-only mode.",
+            );
+            return Ok((state, res));
+        }
         let path_extractor = NameIdPathExtractor::borrow_from(&state);
         let index_name = path_extractor.name.to_string();
         let doc_id = path_extractor.id.to_string();
@@ -1843,6 +1887,13 @@ pub fn es_delete_with_id(state: State) -> Pin<Box<HandlerFuture>> {
 pub fn es_create_pipeline(mut state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_create_pipeline");
     async {
+        if STATE_PROVIDER.is_read_only().await {
+            let res = readonly_api_response(
+                &state,
+                "The Elasticsearch write API is disabled in Powdrr read-only mode.",
+            );
+            return Ok((state, res));
+        }
         let path_extractor = NamePathExtractor::borrow_from(&state);
         let name = path_extractor.name.to_string();
         let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
@@ -1950,6 +2001,13 @@ pub fn es_simulate_named_pipeline(mut state: State) -> Pin<Box<HandlerFuture>> {
 pub fn es_create_index(mut state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_create_index");
     async {
+        if STATE_PROVIDER.is_read_only().await {
+            let res = readonly_api_response(
+                &state,
+                "The Elasticsearch write API is disabled in Powdrr read-only mode.",
+            );
+            return Ok((state, res));
+        }
         let path_extractor = NamePathExtractor::borrow_from(&state);
         let table = path_extractor.name.to_string();
         let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
@@ -1985,6 +2043,13 @@ pub fn es_create_index(mut state: State) -> Pin<Box<HandlerFuture>> {
 pub fn es_create_index_template(mut state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_create_index_template");
     async {
+        if STATE_PROVIDER.is_read_only().await {
+            let res = readonly_api_response(
+                &state,
+                "The Elasticsearch write API is disabled in Powdrr read-only mode.",
+            );
+            return Ok((state, res));
+        }
         let path_extractor = NamePathExtractor::borrow_from(&state);
         let table = path_extractor.name.to_string();
         let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
@@ -2072,6 +2137,13 @@ pub fn es_get_template(state: State) -> Pin<Box<HandlerFuture>> {
 pub fn es_update_aliases(mut state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_update_aliases");
     async {
+        if STATE_PROVIDER.is_read_only().await {
+            let res = readonly_api_response(
+                &state,
+                "The Elasticsearch write API is disabled in Powdrr read-only mode.",
+            );
+            return Ok((state, res));
+        }
         let _query_string = QueryStringAliases::take_from(&mut state);
         let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
             Ok(vb) => vb,
@@ -2357,6 +2429,13 @@ pub fn es_count_table(mut state: State) -> Pin<Box<HandlerFuture>> {
 pub fn es_update_by_query(mut state: State) -> Pin<Box<HandlerFuture>> {
     tracing::info!("es_update_by_query");
     async {
+        if STATE_PROVIDER.is_read_only().await {
+            let res = readonly_api_response(
+                &state,
+                "The Elasticsearch write API is disabled in Powdrr read-only mode.",
+            );
+            return Ok((state, res));
+        }
         let path_extractor = NamePathExtractor::borrow_from(&state);
         let table = path_extractor.name.to_string();
         let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
@@ -2845,6 +2924,13 @@ pub fn es_delete_pit(state: State) -> Pin<Box<HandlerFuture>> {
 pub fn es_bulk_ingest(mut state: State) -> Pin<Box<HandlerFuture>> {
     //tracing::info!("es_bulk_ingest");
     async move {
+        if STATE_PROVIDER.is_read_only().await {
+            let res = readonly_api_response(
+                &state,
+                "The Elasticsearch write API is disabled in Powdrr read-only mode.",
+            );
+            return Ok((state, res));
+        }
         let valid_body = match body::to_bytes(Body::take_from(&mut state)).await {
             Ok(vb) => vb,
             Err(_) => panic!("Oh no"),
