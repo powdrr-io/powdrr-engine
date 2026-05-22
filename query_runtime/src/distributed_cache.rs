@@ -1,5 +1,7 @@
+use crate::test_api::CacheMode;
 use lazy_static::lazy_static;
 use redis::{Commands, FromRedisValue, ToRedisArgs};
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::{error::Error, fmt::Display};
 
@@ -16,79 +18,134 @@ impl Error for CacheError {}
 
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379/";
 
+#[derive(Debug, Clone)]
+struct NativeTableState {
+    approx_num_records: u64,
+    next_seq_no: u64,
+}
+
+impl NativeTableState {
+    fn new() -> Self {
+        Self {
+            approx_num_records: 0,
+            next_seq_no: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum CacheBackend {
+    Redis {
+        address: String,
+    },
+    Native {
+        tables: HashMap<String, NativeTableState>,
+    },
+}
+
 lazy_static! {
-    static ref REDIS_ADDRESS: Mutex<String> = Mutex::new(DEFAULT_REDIS_URL.to_string());
+    static ref CACHE_BACKEND: Mutex<CacheBackend> = Mutex::new(CacheBackend::Native {
+        tables: HashMap::new()
+    });
 }
 
-pub fn set_redis_address(address: &Option<String>) -> () {
-    tracing::info!(
-        "Setting redis address to {}",
-        address.as_ref().unwrap_or(&DEFAULT_REDIS_URL.to_string())
-    );
-    let mut my_lock = REDIS_ADDRESS.lock().unwrap();
-    *my_lock = address
-        .as_ref()
-        .map_or_else(|| DEFAULT_REDIS_URL.to_string(), |s| s.clone());
+pub fn set_cache_mode(mode: &CacheMode) {
+    let mut backend = CACHE_BACKEND.lock().unwrap();
+    *backend = match mode {
+        CacheMode::Redis(address) => {
+            let address = address
+                .clone()
+                .unwrap_or_else(|| DEFAULT_REDIS_URL.to_string());
+            tracing::info!("Using redis distributed cache at {}", address);
+            CacheBackend::Redis { address }
+        }
+        CacheMode::Native => {
+            tracing::info!("Using native in-memory distributed cache backend");
+            CacheBackend::Native {
+                tables: HashMap::new(),
+            }
+        }
+    };
 }
 
-fn get_connection() -> Result<redis::Connection, CacheError> {
-    let redis_address = REDIS_ADDRESS.lock().unwrap();
-    let client = match redis::Client::open(redis_address.clone()) {
+fn with_redis_address<T>(
+    f: impl FnOnce(&String) -> Result<T, CacheError>,
+) -> Result<T, CacheError> {
+    let address = {
+        let backend = CACHE_BACKEND.lock().unwrap();
+        match &*backend {
+            CacheBackend::Redis { address } => address.clone(),
+            CacheBackend::Native { .. } => {
+                return Err(CacheError {});
+            }
+        }
+    };
+    f(&address)
+}
+
+fn get_connection_from_address(address: &String) -> Result<redis::Connection, CacheError> {
+    let client = match redis::Client::open(address.clone()) {
         Ok(c) => c,
         Err(_) => {
-            tracing::error!("Failed to connect to redis at {}", redis_address);
+            tracing::error!("Failed to connect to redis at {}", address);
             return Err(CacheError {});
         }
     };
     match client.get_connection() {
         Ok(c) => Ok(c),
         Err(_) => {
-            tracing::error!("Failed to connect to redis at {}", redis_address);
+            tracing::error!("Failed to connect to redis at {}", address);
             Err(CacheError {})
         }
     }
 }
 
-fn increment(key: &String, delta: i64) -> Result<i64, CacheError> {
-    let con = &mut get_connection()?;
-
-    match redis::pipe()
-        .atomic()
-        .cmd("INCRBY")
-        .arg(key)
-        .arg(delta)
-        .ignore()
-        .cmd("GET")
-        .arg(key)
-        .query::<Vec<String>>(con)
-    {
-        Ok(v) => Ok(v.get(0).unwrap().parse::<i64>().unwrap()),
-        Err(e) => {
-            let _error = format!("{}", e);
-            panic!("Time for some debug");
+fn increment_redis(key: &String, delta: i64) -> Result<i64, CacheError> {
+    with_redis_address(|address| {
+        let con = &mut get_connection_from_address(address)?;
+        match redis::pipe()
+            .atomic()
+            .cmd("INCRBY")
+            .arg(key)
+            .arg(delta)
+            .ignore()
+            .cmd("GET")
+            .arg(key)
+            .query::<Vec<String>>(con)
+        {
+            Ok(v) => Ok(v.get(0).unwrap().parse::<i64>().unwrap()),
+            Err(error) => {
+                tracing::error!("Redis increment failed for key {}: {}", key, error);
+                Err(CacheError {})
+            }
         }
-    }
+    })
 }
 
-fn get<T: FromRedisValue>(key: &String) -> Result<T, CacheError> {
-    let mut con = get_connection()?;
-
-    match con.get(key) {
-        Ok(v) => Ok(v),
-        Err(_) => panic!("Time for some debug"),
-    }
+fn get_redis<T: FromRedisValue>(key: &String) -> Result<T, CacheError> {
+    with_redis_address(|address| {
+        let mut con = get_connection_from_address(address)?;
+        match con.get(key) {
+            Ok(v) => Ok(v),
+            Err(error) => {
+                tracing::error!("Redis get failed for key {}: {}", key, error);
+                Err(CacheError {})
+            }
+        }
+    })
 }
 
-fn set<T: ToRedisArgs>(key: &String, value: T) -> Result<(), CacheError> {
-    let mut con = get_connection()?;
-
-    match con.set::<&String, T, String>(key, value) {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            let _error = format!("{}", e);
-            panic!("Time for some debug and maybe adding more error path")
+fn set_redis<T: ToRedisArgs>(key: &String, value: T) -> Result<(), CacheError> {
+    with_redis_address(|address| {
+        let mut con = get_connection_from_address(address)?;
+        match con.set::<&String, T, String>(key, value) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                tracing::error!("Redis set failed for key {}: {}", key, error);
+                Err(CacheError {})
+            }
         }
-    }
+    })
 }
 
 fn approx_num_records_key(table: &String) -> String {
@@ -100,12 +157,29 @@ fn table_seq_no_key(table: &String) -> String {
 }
 
 pub(crate) fn get_approx_num_records(table: &String) -> Result<u64, CacheError> {
-    get::<u64>(&approx_num_records_key(table))
+    let backend = CACHE_BACKEND.lock().unwrap().clone();
+    match backend {
+        CacheBackend::Redis { .. } => get_redis::<u64>(&approx_num_records_key(table)),
+        CacheBackend::Native { tables } => Ok(tables
+            .get(table)
+            .map(|state| state.approx_num_records)
+            .unwrap_or_default()),
+    }
 }
 
 pub(crate) fn create_table(table: &String) -> Result<(), CacheError> {
-    set(&approx_num_records_key(table), 0)?;
-    set(&table_seq_no_key(table), 0)
+    let mut backend = CACHE_BACKEND.lock().unwrap();
+    match &mut *backend {
+        CacheBackend::Redis { .. } => {
+            drop(backend);
+            set_redis(&approx_num_records_key(table), 0)?;
+            set_redis(&table_seq_no_key(table), 0)
+        }
+        CacheBackend::Native { tables } => {
+            tables.insert(table.clone(), NativeTableState::new());
+            Ok(())
+        }
+    }
 }
 
 pub(crate) fn report_table_changes(
@@ -114,24 +188,36 @@ pub(crate) fn report_table_changes(
     num_updates: usize,
     num_deletes: usize,
 ) -> Result<Vec<u64>, CacheError> {
-    // Nothing to do if there are no changes - these are unsigned so they only way the
-    // sum can equal zero is if all three are zero.
     if num_inserts + num_updates + num_deletes == 0 {
         return Ok(vec![]);
     }
-    // Increase the number of records by the number of inserts minus the number of deletes
-    // Deletes might be larger than inserts so we need signed integers.
-    increment(
-        &approx_num_records_key(table),
-        num_inserts as i64 - num_deletes as i64,
-    )?;
-    // ...and bump the seq no by the total number of operations
-    let delta = (num_inserts + num_updates + num_deletes) as i64;
-    assert!(delta > 0);
-    let new_last_seq_no = increment(&table_seq_no_key(table), delta)?;
-    let values: Vec<u64> = (0..delta)
-        .map(|offset: i64| (new_last_seq_no - offset) as u64)
-        .collect();
-    assert_eq!(values.len(), delta as usize);
-    Ok(values)
+
+    let delta = (num_inserts + num_updates + num_deletes) as u64;
+    let mut backend = CACHE_BACKEND.lock().unwrap();
+    match &mut *backend {
+        CacheBackend::Redis { .. } => {
+            drop(backend);
+            increment_redis(
+                &approx_num_records_key(table),
+                num_inserts as i64 - num_deletes as i64,
+            )?;
+            let new_last_seq_no = increment_redis(&table_seq_no_key(table), delta as i64)?;
+            let values: Vec<u64> = (0..delta)
+                .map(|offset| (new_last_seq_no as u64).saturating_sub(offset))
+                .collect();
+            Ok(values)
+        }
+        CacheBackend::Native { tables } => {
+            let state = tables
+                .entry(table.clone())
+                .or_insert_with(NativeTableState::new);
+            let new_approx =
+                state.approx_num_records as i64 + num_inserts as i64 - num_deletes as i64;
+            state.approx_num_records = new_approx.max(0) as u64;
+            state.next_seq_no += delta;
+            let new_last_seq_no = state.next_seq_no;
+            let values: Vec<u64> = (0..delta).map(|offset| new_last_seq_no - offset).collect();
+            Ok(values)
+        }
+    }
 }

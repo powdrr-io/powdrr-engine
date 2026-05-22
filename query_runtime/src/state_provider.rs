@@ -3,14 +3,12 @@ use crate::data_contract::{
     CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, OrgSettings, SpeedboatCommit,
     TableDescription, TableMetadataCheckpoint,
 };
-use crate::distributed_cache::set_redis_address;
+use crate::distributed_cache::set_cache_mode;
 use crate::dynamodb_state_provider::DynamoDbStateProvider;
 use crate::ephemeral_state_provider::EphemeralStateProvider;
 use crate::leaderless_state_provider::LeaderlessStateProvider;
 use crate::peers::{PeerClient, PeerProvider};
-use crate::test_api::{
-    CacheMode, CompactionMode, PeerModeType, StateMode, StorageMode, TestProcessingMode,
-};
+use crate::test_api::{CompactionMode, PeerModeType, StateMode, StorageMode, TestProcessingMode};
 use crate::{
     data_access, distributed_cache, peers::CheckpointDescriptor, pipeline::PipelineDefinition,
 };
@@ -193,14 +191,7 @@ impl StateProviderActor {
     async fn handle_message(&mut self, msg: StateProviderActorMessage) -> () {
         match msg {
             StateProviderActorMessage::SetMode { respond_to, mode } => {
-                match &mode.cache_mode {
-                    CacheMode::Redis(address) => {
-                        set_redis_address(address);
-                    }
-                    CacheMode::Native => {
-                        panic!("Native cache mode is not supported");
-                    }
-                }
+                set_cache_mode(&mode.cache_mode);
                 match &mode.state_mode {
                     StateMode::Testing => {
                         self.state_provider =
