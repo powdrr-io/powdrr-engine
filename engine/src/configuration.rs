@@ -1,8 +1,8 @@
 use powdrr_query_runtime::peers::get_docker_peer_ips;
 use powdrr_query_runtime::state_provider::STATE_PROVIDER;
 use powdrr_query_runtime::test_api::{
-    CacheMode, CompactionMode, IndexingMode, PeerMode, PeerModeType, PrefetchMode, StateMode,
-    StorageMode, TestProcessingMode,
+    ApiMode, CacheMode, CompactionMode, IndexingMode, PeerMode, PeerModeType, PrefetchMode,
+    StateMode, StorageMode, TestProcessingMode,
 };
 
 #[derive(Debug, Clone)]
@@ -36,24 +36,64 @@ pub(crate) fn get_operating_mode(_command_line_args: &Vec<String>) -> OperatingM
     let redis_port = std::env::var("REDIS_FRONTEND_PORT")
         .ok()
         .map(|port| port.parse::<u32>().unwrap());
+    let api_mode = match std::env::var("API_MODE") {
+        Ok(mode) => match mode.to_lowercase().as_str() {
+            "readwrite" => ApiMode::ReadWrite,
+            "readonly" => ApiMode::ReadOnly,
+            other => panic!("Invalid API_MODE specified: {}", other),
+        },
+        Err(_) => ApiMode::ReadWrite,
+    };
 
     match mode.as_str() {
-        "default" => OperatingMode {
-            peer_detection: PeerDetectionMode::SelfOnly,
-            testing_enabled: true,
-            port,
-            mongo_port,
-            redis_port,
-            state_mode: None,
-        },
-        "docker" => OperatingMode {
-            peer_detection: PeerDetectionMode::Docker,
-            testing_enabled: true,
-            port,
-            mongo_port,
-            redis_port,
-            state_mode: None,
-        },
+        "default" => {
+            let state_mode = match api_mode {
+                ApiMode::ReadWrite => None,
+                ApiMode::ReadOnly => Some(TestProcessingMode {
+                    state_mode: StateMode::Ephemeral,
+                    storage_mode: StorageMode::default(),
+                    cache_mode: CacheMode::Redis(None),
+                    api_mode,
+                    peer_mode: PeerMode::SelfOnly,
+                    indexing_mode: IndexingMode::Sync,
+                    compaction_mode: CompactionMode::Async(None),
+                    prefetch_mode: PrefetchMode::Disabled,
+                }),
+            };
+
+            OperatingMode {
+                peer_detection: PeerDetectionMode::SelfOnly,
+                testing_enabled: !api_mode.is_read_only(),
+                port,
+                mongo_port,
+                redis_port,
+                state_mode,
+            }
+        }
+        "docker" => {
+            let state_mode = match api_mode {
+                ApiMode::ReadWrite => None,
+                ApiMode::ReadOnly => Some(TestProcessingMode {
+                    state_mode: StateMode::Ephemeral,
+                    storage_mode: StorageMode::default(),
+                    cache_mode: CacheMode::Redis(None),
+                    api_mode,
+                    peer_mode: PeerMode::SelfOnly,
+                    indexing_mode: IndexingMode::Sync,
+                    compaction_mode: CompactionMode::Async(None),
+                    prefetch_mode: PrefetchMode::Disabled,
+                }),
+            };
+
+            OperatingMode {
+                peer_detection: PeerDetectionMode::Docker,
+                testing_enabled: !api_mode.is_read_only(),
+                port,
+                mongo_port,
+                redis_port,
+                state_mode,
+            }
+        }
         "leaderless" => OperatingMode {
             peer_detection: PeerDetectionMode::SelfOnly,
             testing_enabled: false,
@@ -71,6 +111,7 @@ pub(crate) fn get_operating_mode(_command_line_args: &Vec<String>) -> OperatingM
                 },
                 storage_mode: StorageMode::default(),
                 cache_mode: CacheMode::Native,
+                api_mode,
                 peer_mode: PeerMode::SelfOnly,
                 indexing_mode: IndexingMode::Sync,
                 compaction_mode: CompactionMode::Async(None),

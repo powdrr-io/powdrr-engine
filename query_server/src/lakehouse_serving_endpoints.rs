@@ -71,6 +71,14 @@ pub fn get_serving_config(state: State) -> Pin<Box<HandlerFuture>> {
 
 pub fn put_serving_config(mut state: State) -> Pin<Box<HandlerFuture>> {
     async move {
+        if STATE_PROVIDER.is_read_only().await {
+            let response = json_response(
+                &state,
+                StatusCode::FORBIDDEN,
+                &json_error("Serving config writes are disabled in Powdrr read-only mode"),
+            );
+            return Ok((state, response));
+        }
         let path = NamePathExtractor::borrow_from(&state).name.clone();
         let body = match parse_json_body::<ServingTableConfig>(&mut state).await {
             Ok(body) => body,

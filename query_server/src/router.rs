@@ -757,8 +757,8 @@ pub(crate) mod tests {
     };
     use powdrr_query_runtime::state_provider::STATE_PROVIDER;
     use powdrr_query_runtime::test_api::{
-        CacheMode, CompactionMode, IndexingMode, PeerMode, PeerModeType, PrefetchMode, StateMode,
-        StorageMode, TestProcessingMode,
+        ApiMode, CacheMode, CompactionMode, IndexingMode, PeerMode, PeerModeType, PrefetchMode,
+        StateMode, StorageMode, TestProcessingMode,
     };
     use serde_json::{Value, json};
     use std::sync::Arc;
@@ -767,9 +767,10 @@ pub(crate) mod tests {
     pub(crate) static TEST_SERVER: LazyLock<TestServer> =
         LazyLock::new(|| TestServer::with_timeout(router(true), 1000).unwrap());
 
-    fn set_testing_and_processing_mode_with_indexing(
+    fn set_testing_and_processing_mode_with_indexing_and_api_mode(
         test_server: &TestServer,
         indexing_mode: IndexingMode,
+        api_mode: ApiMode,
     ) {
         crate::mongodb_protocol::reset_mongodb_cursor_state_for_tests();
         test_server
@@ -780,6 +781,7 @@ pub(crate) mod tests {
                     state_mode: StateMode::Testing,
                     storage_mode: StorageMode::default(),
                     cache_mode: CacheMode::Redis(None),
+                    api_mode,
                     peer_mode: PeerMode::SelfOnly,
                     indexing_mode,
                     compaction_mode: CompactionMode::Disabled,
@@ -792,8 +794,69 @@ pub(crate) mod tests {
             .unwrap();
     }
 
+    fn set_testing_and_processing_mode_with_indexing(
+        test_server: &TestServer,
+        indexing_mode: IndexingMode,
+    ) {
+        set_testing_and_processing_mode_with_indexing_and_api_mode(
+            test_server,
+            indexing_mode,
+            ApiMode::ReadWrite,
+        );
+    }
+
     fn set_testing_and_processing_mode(test_server: &TestServer) {
         set_testing_and_processing_mode_with_indexing(test_server, IndexingMode::Disabled);
+    }
+
+    #[test]
+    fn test_es_write_routes_return_cluster_block_in_readonly_mode() {
+        let test_server = &*TEST_SERVER;
+        set_testing_and_processing_mode_with_indexing_and_api_mode(
+            test_server,
+            IndexingMode::Disabled,
+            ApiMode::ReadOnly,
+        );
+
+        let response = test_server
+            .client()
+            .put("http://localhost/logs", "{}", mime::APPLICATION_JSON)
+            .perform()
+            .unwrap();
+
+        assert_eq!(response.status(), 403);
+        let body: Value = serde_json::from_str(&response.read_utf8_body().unwrap()).unwrap();
+        assert_eq!(body["error"]["type"], "cluster_block_exception");
+        assert!(
+            body["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("read-only mode")
+        );
+    }
+
+    #[test]
+    fn test_support_config_writes_fail_in_readonly_mode() {
+        let test_server = &*TEST_SERVER;
+        set_testing_and_processing_mode_with_indexing_and_api_mode(
+            test_server,
+            IndexingMode::Disabled,
+            ApiMode::ReadOnly,
+        );
+
+        let response = test_server
+            .client()
+            .put(
+                "http://localhost/logs/_serve/config",
+                r#"{"patterns":[]}"#,
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+
+        assert_eq!(response.status(), 403);
+        let body: Value = serde_json::from_str(&response.read_utf8_body().unwrap()).unwrap();
+        assert!(body["error"].as_str().unwrap().contains("read-only mode"));
     }
 
     fn process_pending_work(test_server: &TestServer) {
@@ -1069,6 +1132,7 @@ pub(crate) mod tests {
                     state_mode: StateMode::Testing,
                     storage_mode: StorageMode::default(),
                     cache_mode: CacheMode::Redis(None),
+                    api_mode: ApiMode::ReadWrite,
                     peer_mode: PeerMode::SelfOnly,
                     indexing_mode: IndexingMode::Disabled,
                     compaction_mode: CompactionMode::Disabled,
@@ -2105,6 +2169,7 @@ pub(crate) mod tests {
                     state_mode: StateMode::Testing,
                     storage_mode: StorageMode::default(),
                     cache_mode: CacheMode::Redis(None),
+                    api_mode: ApiMode::ReadWrite,
                     peer_mode: PeerMode::SelfOnly,
                     indexing_mode: IndexingMode::Sync,
                     compaction_mode: CompactionMode::Disabled,
@@ -2197,6 +2262,7 @@ pub(crate) mod tests {
                     state_mode: StateMode::Testing,
                     storage_mode: StorageMode::default(),
                     cache_mode: CacheMode::Redis(None),
+                    api_mode: ApiMode::ReadWrite,
                     peer_mode: PeerMode::SelfOnly,
                     indexing_mode: IndexingMode::Sync,
                     compaction_mode: CompactionMode::Disabled,

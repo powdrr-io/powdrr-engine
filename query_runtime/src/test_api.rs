@@ -1,6 +1,6 @@
 pub use powdrr_control_plane::test_api::{
-    CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode, StorageMode,
-    TestProcessingMode,
+    ApiMode, CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode,
+    StorageMode, TestProcessingMode,
 };
 
 use std::{future::Future, time::Duration};
