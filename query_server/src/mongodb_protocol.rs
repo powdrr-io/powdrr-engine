@@ -38,6 +38,7 @@ const MONGO_BAD_VALUE_CODE: i32 = 2;
 const MONGO_CURSOR_NOT_FOUND_CODE: i32 = 43;
 const MONGO_NAMESPACE_NOT_FOUND_CODE: i32 = 26;
 const MONGO_INTERNAL_ERROR_CODE: i32 = 1;
+const MONGO_UNAUTHORIZED_CODE: i32 = 13;
 const MONGO_CURSOR_TIMEOUT_MS: i64 = 10 * 60 * 1000;
 static MONGO_CURSOR_IDS: AtomicI64 = AtomicI64::new(1);
 static MONGO_CURSORS: LazyLock<Mutex<HashMap<i64, MongoCursorState>>> =
@@ -141,6 +142,15 @@ impl MongoCommandError {
         }
     }
 
+    fn read_only(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: MONGO_UNAUTHORIZED_CODE,
+            code_name: "Unauthorized",
+            message: message.into(),
+        }
+    }
+
     fn from_protocol_error(error: MongoProtocolError) -> Self {
         Self::bad_value(error.to_string())
     }
@@ -209,6 +219,15 @@ pub fn get_mongodb_config(state: State) -> Pin<Box<HandlerFuture>> {
 
 pub fn put_mongodb_config(mut state: State) -> Pin<Box<HandlerFuture>> {
     async move {
+        if STATE_PROVIDER.is_read_only().await {
+            let response = json_error_response(
+                &state,
+                MongoCommandError::read_only(
+                    "Mongo config writes are disabled in Powdrr read-only mode",
+                ),
+            );
+            return Ok((state, response));
+        }
         let path = NamePathExtractor::borrow_from(&state).name.clone();
         let body = match parse_json_body::<MongoDbTableConfig>(&mut state).await {
             Ok(body) => body,

@@ -926,8 +926,8 @@ mod tests {
     };
     use crate::schema_massager::PowdrrSchema;
     use crate::test_api::{
-        CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode, StorageMode,
-        TestProcessingMode,
+        ApiMode, CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode,
+        StorageMode, TestProcessingMode,
     };
     use idgenerator::{IdGeneratorOptions, IdInstance};
     use std::collections::{BTreeMap, HashMap};
@@ -950,6 +950,7 @@ mod tests {
             state_mode: StateMode::Ephemeral,
             storage_mode: StorageMode::default(),
             cache_mode: CacheMode::Redis(None),
+            api_mode: ApiMode::ReadWrite,
             peer_mode: PeerMode::SelfOnly,
             indexing_mode: IndexingMode::Disabled,
             compaction_mode,

@@ -149,8 +149,9 @@ same maturity level.
 | Surface | Current shape | Notes |
 |---|---|---|
 | Native serving API | `PUT /:table/_serve/config`, `POST /:table/_serve` | This is the long-term protocol-neutral serving path. |
-| Elasticsearch-compatible HTTP API | Root `/`, index lifecycle, `_bulk`, `_search`, aliases, templates, selected aggregations | Compatibility is tracked as a subset, not full Elasticsearch parity. See `docs/es-compatibility-matrix.md`. |
-| DynamoDB-compatible HTTP API | Root `POST /` with `X-Amz-Target: DynamoDB_20120810.*` plus per-table config | Designed for configured tables on top of the shared serving path. |
+| Elasticsearch-compatible HTTP API | Root `/`, index lifecycle, `_bulk`, `_search`, aliases, templates, selected aggregations | Compatibility is tracked as a subset, not full Elasticsearch parity. See `docs/protocol-compatibility-contract.md` and `docs/es-compatibility-matrix.md`. |
+| DynamoDB-compatible HTTP API | Root `POST /` with `X-Amz-Target: DynamoDB_20120810.*` plus per-table config | Designed for configured tables on top of the shared serving path. See `docs/protocol-compatibility-contract.md` and `docs/dynamodb-compatibility-matrix.md`. |
+| Redis-compatible RESP API | `REDIS_FRONTEND_PORT` plus per-table config | Read-oriented subset with explicit `READONLY` behavior for known write commands in read-only mode. See `docs/protocol-compatibility-contract.md`. |
 | Mongo-shaped read API | `POST /:table/_mongo/find`, `POST /_mongo/:database/_command` | Read-only subset over HTTP. This is **not** full Mongo wire-protocol compatibility yet. |
 | Control-plane API | `powdrr-io-service` under `/api/v1` | Used for table creation, checkpoint publication, aliases, templates, pipelines, and org management. |
 
@@ -160,6 +161,12 @@ Two important caveats:
   identity.
 - The Mongo work is intentionally an HTTP bridge today. Off-the-shelf MongoDB
   drivers speaking the Mongo wire protocol are a later step.
+
+Compatibility is explicit, not implied. Powdrr only claims the Elasticsearch,
+DynamoDB, and Redis subsets documented in
+`docs/protocol-compatibility-contract.md`, and unsupported or read-disabled
+requests are expected to fail with checked errors rather than succeed as
+partial approximations.
 
 ## Getting Started
 
@@ -419,6 +426,10 @@ Powdrr would not exist in its current form without that work upstream.
 - `docs/redis-dependency-removal-plan.md`
   The plan for removing Redis from the mutation path and moving the remaining
   shared state behind a service-owned coordination boundary.
+
+- `docs/protocol-compatibility-contract.md`
+  The top-level contract for the supported Elasticsearch, DynamoDB, and Redis
+  surfaces, including read-only mode and verified client coverage.
 
 - `docs/lakehouse-serving-roadmap.md`
   The repo-specific roadmap from the current hybrid stack toward a shared

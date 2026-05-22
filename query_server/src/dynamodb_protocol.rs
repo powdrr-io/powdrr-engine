@@ -111,6 +111,17 @@ impl DynamoDbError {
             message,
         )
     }
+
+    fn read_only(operation: &str) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "ValidationException",
+            format!(
+                "{} is disabled while Powdrr is running in read-only mode",
+                operation
+            ),
+        )
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -671,6 +682,11 @@ pub fn get_dynamodb_config(state: State) -> Pin<Box<HandlerFuture>> {
 
 pub fn put_dynamodb_config(mut state: State) -> Pin<Box<HandlerFuture>> {
     async move {
+        if STATE_PROVIDER.is_read_only().await {
+            let response =
+                dynamodb_error_response(&state, DynamoDbError::read_only("DynamoDB config writes"));
+            return Ok((state, response));
+        }
         let path = NamePathExtractor::borrow_from(&state).name.clone();
         let body = match parse_json_body::<DynamoDbTableConfig>(&mut state).await {
             Ok(body) => body,
@@ -760,6 +776,9 @@ pub fn dynamodb_api(mut state: State) -> Pin<Box<HandlerFuture>> {
         let result = async {
             let _meta = authenticate_request(&headers, &body_bytes).await?;
             let target = parse_target(&headers)?;
+            if STATE_PROVIDER.is_read_only().await && dynamodb_target_is_write(&target) {
+                return Err(DynamoDbError::read_only(&target));
+            }
             let payload = if body_bytes.is_empty() {
                 Value::Object(Map::new())
             } else {
@@ -803,6 +822,13 @@ pub fn dynamodb_api(mut state: State) -> Pin<Box<HandlerFuture>> {
         }
     }
     .boxed()
+}
+
+fn dynamodb_target_is_write(target: &str) -> bool {
+    matches!(
+        target,
+        "PutItem" | "UpdateItem" | "DeleteItem" | "BatchWriteItem"
+    )
 }
 
 async fn handle_list_tables(payload: Value) -> Result<Value, DynamoDbError> {
@@ -5051,8 +5077,8 @@ mod tests {
     use powdrr_query_runtime::serving_dataset::read_parquet_documents;
     use powdrr_query_runtime::state_provider::STATE_PROVIDER;
     use powdrr_query_runtime::test_api::{
-        CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode, StorageMode,
-        TestProcessingMode,
+        ApiMode, CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode,
+        StorageMode, TestProcessingMode,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -5288,6 +5314,7 @@ mod tests {
             state_mode: StateMode::Testing,
             storage_mode: StorageMode::default(),
             cache_mode: CacheMode::Redis(None),
+            api_mode: ApiMode::ReadWrite,
             peer_mode: PeerMode::SelfOnly,
             indexing_mode: IndexingMode::Disabled,
             compaction_mode: CompactionMode::Disabled,
@@ -5557,6 +5584,44 @@ mod tests {
         )
         .unwrap();
         assert!(missing_item_body.get("Item").is_none());
+    }
+
+    #[test]
+    fn test_dynamodb_write_operations_fail_in_readonly_mode() {
+        let test_server = TestServer::with_timeout(crate::router::router(true), 1000).unwrap();
+        let mode = TestProcessingMode {
+            state_mode: StateMode::Testing,
+            storage_mode: StorageMode::default(),
+            cache_mode: CacheMode::Redis(None),
+            api_mode: ApiMode::ReadOnly,
+            peer_mode: PeerMode::SelfOnly,
+            indexing_mode: IndexingMode::Disabled,
+            compaction_mode: CompactionMode::Disabled,
+            prefetch_mode: PrefetchMode::Disabled,
+        };
+        let mode_response = test_server
+            .client()
+            .put(
+                "http://localhost/_test/v1/_testing_and_processing_mode",
+                serde_json::to_string(&mode).unwrap(),
+                mime::APPLICATION_JSON,
+            )
+            .perform()
+            .unwrap();
+        assert_eq!(mode_response.status(), 200);
+
+        let put_response = perform_dynamodb_request(&test_server, "PutItem", json!({}));
+        assert_eq!(put_response.status(), 400);
+        let put_body =
+            serde_json::from_str::<serde_json::Value>(&put_response.read_utf8_body().unwrap())
+                .unwrap();
+        assert_eq!(put_body["__type"], "ValidationException");
+        assert!(
+            put_body["message"]
+                .as_str()
+                .unwrap()
+                .contains("read-only mode")
+        );
     }
 
     #[test]

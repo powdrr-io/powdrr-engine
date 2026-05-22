@@ -9,7 +9,7 @@ use crate::ephemeral_state_provider::EphemeralStateProvider;
 use crate::leaderless_state_provider::LeaderlessStateProvider;
 use crate::peers::{PeerClient, PeerProvider};
 use crate::test_api::{
-    CacheMode, CompactionMode, PeerModeType, StateMode, StorageMode, TestProcessingMode,
+    ApiMode, CacheMode, CompactionMode, PeerModeType, StateMode, StorageMode, TestProcessingMode,
 };
 use crate::{
     data_access, distributed_cache, peers::CheckpointDescriptor, pipeline::PipelineDefinition,
@@ -25,9 +25,16 @@ enum StateProviderActorMessage {
         respond_to: oneshot::Sender<()>,
         mode: TestProcessingMode,
     },
+    SetApiMode {
+        respond_to: oneshot::Sender<()>,
+        api_mode: ApiMode,
+    },
     SetPeerMode {
         respond_to: oneshot::Sender<()>,
         mode: PeerModeType,
+    },
+    GetApiMode {
+        respond_to: oneshot::Sender<ApiMode>,
     },
     CreatePipeline {
         respond_to: oneshot::Sender<Result<bool, ServiceApiError>>,
@@ -170,6 +177,7 @@ struct StateProviderActor {
     receiver: mpsc::Receiver<StateProviderActorMessage>,
     #[allow(dead_code)]
     compaction_mode: CompactionMode,
+    mode: TestProcessingMode,
 }
 
 macro_rules! handle_message_impl {
@@ -187,6 +195,7 @@ impl StateProviderActor {
             peer_provider: PeerProvider::new(PeerModeType::SelfOnly),
             receiver,
             compaction_mode: CompactionMode::Disabled,
+            mode: TestProcessingMode::default(),
         }
     }
 
@@ -234,6 +243,7 @@ impl StateProviderActor {
                         s3_endpoint,
                     } => data_access::set_s3_endpoint(rest_endpoint, s3_endpoint).await,
                 }
+                self.mode = mode.clone();
 
                 self.peer_provider
                     .set_mode(crate::test_api::peer_mode_to_type(&mode.peer_mode));
@@ -243,11 +253,25 @@ impl StateProviderActor {
                 self.peer_provider.set_mode(mode);
                 respond_to.send(()).unwrap();
             }
+            StateProviderActorMessage::SetApiMode {
+                respond_to,
+                api_mode,
+            } => {
+                self.mode.api_mode = api_mode;
+                respond_to.send(()).unwrap();
+            }
+            StateProviderActorMessage::GetApiMode { respond_to } => {
+                respond_to.send(self.mode.api_mode).unwrap();
+            }
             StateProviderActorMessage::CreatePipeline {
                 respond_to,
                 name,
                 pipeline,
             } => {
+                if self.mode.is_read_only() {
+                    let _ = respond_to.send(Err(read_only_service_error("create_pipeline")));
+                    return;
+                }
                 handle_message_impl!(self, respond_to, create_pipeline(&name, &pipeline));
             }
             StateProviderActorMessage::DescribePipeline { respond_to, name } => {
@@ -258,6 +282,10 @@ impl StateProviderActor {
                 name,
                 policy,
             } => {
+                if self.mode.is_read_only() {
+                    let _ = respond_to.send(Err(read_only_service_error("create_lifetime_policy")));
+                    return;
+                }
                 handle_message_impl!(self, respond_to, create_lifetime_policy(&name, &policy));
             }
             StateProviderActorMessage::DescribeLifetimePolicy { respond_to, name } => {
@@ -267,6 +295,10 @@ impl StateProviderActor {
                 respond_to,
                 create_table,
             } => {
+                if self.mode.is_read_only() {
+                    let _ = respond_to.send(Err(read_only_service_error("create_table")));
+                    return;
+                }
                 match distributed_cache::create_table(&create_table.name) {
                     Ok(_) => (),
                     Err(e) => panic!("Unable to create table = {}", e),
@@ -277,12 +309,20 @@ impl StateProviderActor {
                 respond_to,
                 settings,
             } => {
+                if self.mode.is_read_only() {
+                    let _ = respond_to.send(Err(read_only_service_error("create_org")));
+                    return;
+                }
                 handle_message_impl!(self, respond_to, create_org(&settings));
             }
             StateProviderActorMessage::UpsertTableMetadata {
                 respond_to,
                 create_table,
             } => {
+                if self.mode.is_read_only() {
+                    let _ = respond_to.send(Err(read_only_service_error("upsert_table_metadata")));
+                    return;
+                }
                 match distributed_cache::create_table(&create_table.name) {
                     Ok(_) => (),
                     Err(e) => panic!("Unable to create table = {}", e),
@@ -306,6 +346,10 @@ impl StateProviderActor {
                 table_name,
                 alias,
             } => {
+                if self.mode.is_read_only() {
+                    let _ = respond_to.send(Err(read_only_service_error("add_alias")));
+                    return;
+                }
                 handle_message_impl!(self, respond_to, add_alias(&table_name, &alias));
             }
             StateProviderActorMessage::RemoveAlias {
@@ -313,6 +357,10 @@ impl StateProviderActor {
                 table_name,
                 alias,
             } => {
+                if self.mode.is_read_only() {
+                    let _ = respond_to.send(Err(read_only_service_error("remove_alias")));
+                    return;
+                }
                 handle_message_impl!(self, respond_to, remove_alias(&table_name, &alias));
             }
             StateProviderActorMessage::CreateTableTemplate {
@@ -320,6 +368,10 @@ impl StateProviderActor {
                 name,
                 template,
             } => {
+                if self.mode.is_read_only() {
+                    let _ = respond_to.send(Err(read_only_service_error("create_table_template")));
+                    return;
+                }
                 handle_message_impl!(self, respond_to, create_table_template(&name, &template));
             }
             StateProviderActorMessage::DescribeTableTemplate { respond_to, name } => {
@@ -336,6 +388,10 @@ impl StateProviderActor {
                 table_name,
                 iceberg_commit,
             } => {
+                if self.mode.is_read_only() {
+                    let _ = respond_to.send(Err(read_only_service_error("iceberg_commit")));
+                    return;
+                }
                 handle_message_impl!(
                     self,
                     respond_to,
@@ -346,6 +402,10 @@ impl StateProviderActor {
                 respond_to,
                 speedboat_commit,
             } => {
+                if self.mode.is_read_only() {
+                    let _ = respond_to.send(Err(read_only_service_error("speedboat_commit")));
+                    return;
+                }
                 handle_message_impl!(self, respond_to, speedboat_commit(&speedboat_commit));
             }
             StateProviderActorMessage::ExtensionCommit {
@@ -353,6 +413,10 @@ impl StateProviderActor {
                 table_name,
                 extension_commit,
             } => {
+                if self.mode.is_read_only() {
+                    let _ = respond_to.send(Err(read_only_service_error("extension_commit")));
+                    return;
+                }
                 handle_message_impl!(
                     self,
                     respond_to,
@@ -364,6 +428,10 @@ impl StateProviderActor {
                 table_name,
                 compaction_commit,
             } => {
+                if self.mode.is_read_only() {
+                    let _ = respond_to.send(Err(read_only_service_error("compaction_commit")));
+                    return;
+                }
                 handle_message_impl!(
                     self,
                     respond_to,
@@ -374,6 +442,10 @@ impl StateProviderActor {
                 respond_to,
                 cleanup_commit,
             } => {
+                if self.mode.is_read_only() {
+                    let _ = respond_to.send(Err(read_only_service_error("cleanup_commit")));
+                    return;
+                }
                 handle_message_impl!(self, respond_to, cleanup_commit(&cleanup_commit));
             }
             StateProviderActorMessage::GetLatestCommittedCheckpoint {
@@ -459,6 +531,13 @@ async fn run_state_provider_actor_message_pump(mut actor: StateProviderActor) {
     while let Some(msg) = actor.receiver.recv().await {
         actor.handle_message(msg).await;
     }
+}
+
+fn read_only_service_error(operation: &str) -> ServiceApiError {
+    ServiceApiError::new(format!(
+        "Powdrr read-only mode does not support {}",
+        operation
+    ))
 }
 
 enum StateProvider {
@@ -749,8 +828,20 @@ impl StateProviderHandle {
         send_message!(self, SetMode, mode = mode.clone());
     }
 
+    pub async fn set_api_mode(&self, api_mode: ApiMode) -> () {
+        send_message!(self, SetApiMode, api_mode = api_mode);
+    }
+
     pub async fn set_peer_mode(&self, mode: &PeerModeType) -> () {
         send_message!(self, SetPeerMode, mode = mode.clone());
+    }
+
+    pub async fn api_mode(&self) -> ApiMode {
+        send_message!(self, GetApiMode)
+    }
+
+    pub async fn is_read_only(&self) -> bool {
+        self.api_mode().await.is_read_only()
     }
 
     pub async fn create_pipeline(
@@ -1144,8 +1235,8 @@ mod tests {
     use crate::peers::CheckpointDescriptor;
     use crate::schema_massager::PowdrrSchema;
     use crate::test_api::{
-        CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode, StorageMode,
-        TestProcessingMode,
+        ApiMode, CacheMode, CompactionMode, IndexingMode, PeerMode, PrefetchMode, StateMode,
+        StorageMode, TestProcessingMode,
     };
     use idgenerator::{IdGeneratorOptions, IdInstance};
     use std::collections::HashMap;
@@ -1165,6 +1256,7 @@ mod tests {
             state_mode: StateMode::Ephemeral,
             storage_mode: StorageMode::default(),
             cache_mode: CacheMode::Redis(None),
+            api_mode: ApiMode::ReadWrite,
             peer_mode: PeerMode::SelfOnly,
             indexing_mode: IndexingMode::Disabled,
             compaction_mode: CompactionMode::Disabled,

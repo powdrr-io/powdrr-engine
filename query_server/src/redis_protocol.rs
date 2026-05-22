@@ -89,6 +89,14 @@ impl RedisCommandError {
         Self::validation(format!("unsupported Redis command {}", command))
     }
 
+    fn read_only() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            prefix: "READONLY",
+            message: "This Powdrr Redis frontend is running in read-only mode".to_string(),
+        }
+    }
+
     pub(crate) fn resp_message(&self) -> String {
         format!("{} {}", self.prefix, self.message)
     }
@@ -129,6 +137,10 @@ pub fn get_redis_config(state: State) -> Pin<Box<HandlerFuture>> {
 
 pub fn put_redis_config(mut state: State) -> Pin<Box<HandlerFuture>> {
     async move {
+        if STATE_PROVIDER.is_read_only().await {
+            let response = json_error_response(&state, RedisCommandError::read_only());
+            return Ok((state, response));
+        }
         let path = NamePathExtractor::borrow_from(&state).name.clone();
         let body = match parse_json_body::<RedisTableConfig>(&mut state).await {
             Ok(body) => body,
@@ -207,6 +219,10 @@ pub(crate) async fn execute_redis_command(
         .to_ascii_uppercase();
     let rest = &args[1..];
 
+    if STATE_PROVIDER.is_read_only().await && is_known_redis_write_command(&command) {
+        return Err(RedisCommandError::read_only());
+    }
+
     match command.as_str() {
         "PING" => execute_ping(rest),
         "ECHO" => execute_echo(rest),
@@ -221,6 +237,40 @@ pub(crate) async fn execute_redis_command(
         "EXISTS" => execute_exists(*selected_db, rest).await,
         _ => Err(RedisCommandError::unsupported(&command)),
     }
+}
+
+fn is_known_redis_write_command(command: &str) -> bool {
+    matches!(
+        command,
+        "APPEND"
+            | "DECR"
+            | "DECRBY"
+            | "DEL"
+            | "EXPIRE"
+            | "FLUSHALL"
+            | "FLUSHDB"
+            | "GETSET"
+            | "HDEL"
+            | "HINCRBY"
+            | "HMSET"
+            | "HSET"
+            | "INCR"
+            | "INCRBY"
+            | "LPOP"
+            | "LPUSH"
+            | "MSET"
+            | "PERSIST"
+            | "PSETEX"
+            | "RPOP"
+            | "RPUSH"
+            | "SADD"
+            | "SET"
+            | "SETEX"
+            | "SETNX"
+            | "UNLINK"
+            | "XADD"
+            | "ZADD"
+    )
 }
 
 fn execute_ping(args: &[String]) -> Result<RedisCommandResult, RedisCommandError> {
