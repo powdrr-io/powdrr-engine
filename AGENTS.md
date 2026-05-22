@@ -25,7 +25,7 @@ Repo-wide instructions for agent work in this checkout of `powdrr-engine`.
 - Keep `git status --porcelain` empty in the root checkout.
 - If the root checkout is dirty, stop and ask the user whether to commit, stash, discard, or move the work before starting a new implementation task.
 - Do not park feature branches, ad hoc experiments, or generated outputs in the root checkout.
-- Shared repo-owned caches such as `.cargo-target/` may live at the repo root, but they must stay ignored and must not become part of an implementation diff.
+- Shared repo-owned caches such as `.cargo-build/` may live at the repo root, and worktree-local `target/` directories may exist under linked worktrees, but both must stay ignored and must not become part of an implementation diff.
 
 ## Worktree Policy
 - Create one isolated worktree per change.
@@ -39,7 +39,7 @@ Repo-wide instructions for agent work in this checkout of `powdrr-engine`.
 1. Explore from the root checkout if needed, but do not edit there.
 2. Verify the root checkout is clean and on `main`.
 3. Create a task worktree from `origin/main`.
-4. Run Cargo commands from the worktree through `scripts/cargo-worktree.sh` so linked worktrees share the repo-level `.cargo-target/` cache shards.
+4. Run Cargo commands from the worktree through `scripts/cargo-worktree.sh` so linked worktrees keep final outputs in worktree-local `target/` directories while sharing the repo-level `.cargo-build/` intermediate cache.
 5. Do all edits, tests, commits, and generated tracked outputs inside that worktree only.
 6. Validate the touched surface before calling the change ready.
 7. Report exactly which checks passed, failed, or were not run.
@@ -72,7 +72,7 @@ scripts/cargo-worktree.sh check -p <crate>
 
 ## Validation Expectations
 - Run targeted checks while iterating.
-- Prefer `scripts/cargo-worktree.sh check -p <crate>` or `scripts/cargo-worktree.sh test -p <crate>` over whole-workspace commands during the edit loop so Cargo can use a package-specific shard instead of the workspace shard.
+- Prefer `scripts/cargo-worktree.sh check -p <crate>` or `scripts/cargo-worktree.sh test -p <crate>` over whole-workspace commands during the edit loop so Cargo rebuild scope stays focused on the touched surface.
 - Run formatting before handoff: `cargo fmt --all`.
 - Run the most relevant crate-level or workspace-level tests for the touched code.
 - The heavy `powdrr-query-server` compatibility suites are opt-in behind `--features integration-tests`; only run them when you touch those surfaces.
