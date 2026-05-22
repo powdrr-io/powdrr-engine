@@ -1,6 +1,8 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
@@ -9,6 +11,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use futures::stream::{self, StreamExt};
 use http::StatusCode;
 use idgenerator::IdInstance;
+use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot};
@@ -57,7 +60,9 @@ const ACCESS_ARTIFACT_KIND_SNAPSHOT_KEY_LOOKUP: &str = "snapshot-key-lookup";
 const ACCESS_ARTIFACT_KIND_SNAPSHOT_KEY_RANGE_LOOKUP: &str = "snapshot-key-range-lookup";
 const ACCESS_ARTIFACT_KIND_SORT_ORDER: &str = "sort-order";
 const SNAPSHOT_EXACT_LOOKUP_EXTENSION_SUFFIX: &str = "snapshot_exact_lookup";
+const SNAPSHOT_EXACT_LOOKUP_MMAP_EXTENSION_SUFFIX: &str = "snapshot_exact_lookup_mmap";
 const SNAPSHOT_LOOKUP_EXTENSION_SUFFIX: &str = "snapshot_lookup";
+const SNAPSHOT_LOOKUP_MMAP_EXTENSION_SUFFIX: &str = "snapshot_lookup_mmap";
 const DEFAULT_FAST_PATH_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_FAST_PATH_MAX_FILES: usize = 32;
 const DEFAULT_FAST_PATH_MAX_ROW_GROUPS: usize = 128;
@@ -66,11 +71,15 @@ const DEFAULT_SLOW_PATH_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_SLOW_PATH_MAX_FILES: usize = 128;
 const DEFAULT_SLOW_PATH_MAX_ROW_GROUPS: usize = 512;
 const DEFAULT_SLOW_PATH_MAX_DELETE_FILES: usize = 64;
+const SNAPSHOT_LOOKUP_MMAP_V1_MAGIC: &[u8; 8] = b"PSLKM001";
+const SNAPSHOT_LOOKUP_MMAP_V2_MAGIC: &[u8; 8] = b"PSLKM002";
+const SNAPSHOT_LOOKUP_MMAP_HEADER_BYTES: usize = 16;
+const SNAPSHOT_LOOKUP_MMAP_ENTRY_BYTES: usize = 16;
 
 static EXACT_PRUNING_SUMMARY_CACHE: LazyLock<Mutex<HashMap<String, ExactPruningSummary>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static SNAPSHOT_EXACT_LOOKUP_CACHE: LazyLock<
-    Mutex<HashMap<String, Arc<HashMap<String, SnapshotExactLookupEntry>>>>,
+    Mutex<HashMap<String, Arc<SnapshotExactLookupCache>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 static SNAPSHOT_LOOKUP_CACHE: LazyLock<Mutex<HashMap<String, Arc<SnapshotLookupCache>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -300,7 +309,7 @@ struct ServingExecutionResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ExactLookupPredicate {
     field: String,
-    values: Vec<String>,
+    values: Vec<SnapshotLookupKey>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -319,15 +328,30 @@ enum SnapshotLookupPlan {
     },
     KeyRange {
         eq_field: String,
-        eq_value: String,
+        eq_value: SnapshotLookupKey,
         order_field: String,
         descending: bool,
         range: Option<RangeLookupPredicate>,
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SnapshotLookupArtifact {
+    Mmap(String),
+    Parquet(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SnapshotExactLookupArtifact {
+    Mmap(String),
+    Parquet(String),
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct SnapshotRowRef(usize);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct SnapshotLookupKey(Box<[u8]>);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SnapshotOrderedIndexKey {
@@ -340,6 +364,26 @@ struct SnapshotLookupRow {
     values: Map<String, Value>,
 }
 
+#[derive(Debug)]
+enum SnapshotLookupRowStore {
+    InMemory(Arc<Vec<Arc<SnapshotLookupRow>>>),
+    Mmap(Arc<MmapSnapshotLookupRows>),
+}
+
+#[derive(Debug)]
+struct MmapSnapshotLookupRows {
+    mmap: Mmap,
+    row_count: usize,
+    data_offset: usize,
+    encoding: SnapshotLookupMmapEncoding,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapshotLookupMmapEncoding {
+    JsonRowsV1,
+    FieldTableV2,
+}
+
 #[derive(Clone, Debug)]
 struct SnapshotLookupWorkerHandle {
     sender: mpsc::UnboundedSender<SnapshotLookupWorkerRequest>,
@@ -349,12 +393,12 @@ struct SnapshotLookupWorkerHandle {
 enum SnapshotLookupWorkerRequest {
     ExactField {
         field: String,
-        values: Vec<String>,
+        values: Vec<SnapshotLookupKey>,
         respond_to: oneshot::Sender<Result<Vec<SnapshotRowRef>, String>>,
     },
     KeyRange {
         eq_field: String,
-        eq_value: String,
+        eq_value: SnapshotLookupKey,
         order_field: String,
         descending: bool,
         range: Option<RangeLookupPredicate>,
@@ -365,24 +409,175 @@ enum SnapshotLookupWorkerRequest {
 
 #[derive(Debug)]
 struct SnapshotLookupWorkerState {
-    rows: Arc<Vec<Arc<SnapshotLookupRow>>>,
-    exact_indexes: HashMap<String, HashMap<String, Vec<SnapshotRowRef>>>,
-    ordered_indexes: HashMap<SnapshotOrderedIndexKey, HashMap<String, Vec<SnapshotRowRef>>>,
+    row_store: Arc<SnapshotLookupRowStore>,
+    exact_indexes: HashMap<String, HashMap<SnapshotLookupKey, Vec<SnapshotRowRef>>>,
+    ordered_indexes:
+        HashMap<SnapshotOrderedIndexKey, HashMap<SnapshotLookupKey, Vec<SnapshotRowRef>>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SnapshotLookupCache {
-    rows: Arc<Vec<Arc<SnapshotLookupRow>>>,
+    row_store: Arc<SnapshotLookupRowStore>,
+    row_count: usize,
     estimated_bytes: u64,
     shard_count: usize,
     workers: Vec<SnapshotLookupWorkerHandle>,
+}
+
+impl SnapshotLookupRowStore {
+    fn row_count(&self) -> usize {
+        match self {
+            SnapshotLookupRowStore::InMemory(rows) => rows.len(),
+            SnapshotLookupRowStore::Mmap(rows) => rows.row_count,
+        }
+    }
+
+    fn row_value(&self, row_ref: SnapshotRowRef) -> Result<Value, String> {
+        match self {
+            SnapshotLookupRowStore::InMemory(rows) => rows
+                .get(row_ref.0)
+                .map(|row| Value::Object(row.values.clone()))
+                .ok_or_else(|| format!("Snapshot row {} was out of bounds", row_ref.0)),
+            SnapshotLookupRowStore::Mmap(rows) => rows.row_value(row_ref),
+        }
+    }
+
+    fn row_field_value(
+        &self,
+        row_ref: SnapshotRowRef,
+        field: &str,
+    ) -> Result<Option<Value>, String> {
+        match self {
+            SnapshotLookupRowStore::InMemory(rows) => Ok(rows
+                .get(row_ref.0)
+                .and_then(|row| row.values.get(field))
+                .cloned()),
+            SnapshotLookupRowStore::Mmap(rows) => rows.row_field_value(row_ref, field),
+        }
+    }
+
+    fn projected_row_value(
+        &self,
+        row_ref: SnapshotRowRef,
+        select_fields: Option<&[String]>,
+    ) -> Result<Value, String> {
+        let Some(select_fields) = select_fields else {
+            return self.row_value(row_ref);
+        };
+
+        let mut projected = Map::with_capacity(select_fields.len());
+        let mut source_value: Option<Value> = None;
+        for field in select_fields {
+            if let Some(value) = self.row_field_value(row_ref, field)? {
+                projected.insert(field.clone(), value);
+                continue;
+            }
+            if source_value.is_none() {
+                source_value = self.row_field_value(row_ref, "_source")?;
+            }
+            if let Some(Value::Object(source)) = source_value.as_ref() {
+                if let Some(value) = source.get(field) {
+                    projected.insert(field.clone(), value.clone());
+                }
+            }
+        }
+        Ok(Value::Object(projected))
+    }
+}
+
+impl MmapSnapshotLookupRows {
+    fn open(local_path: &Path) -> Result<Self, String> {
+        let file = File::open(local_path).map_err(|error| error.to_string())?;
+        let mmap = unsafe { Mmap::map(&file) }.map_err(|error| error.to_string())?;
+        if mmap.len() < SNAPSHOT_LOOKUP_MMAP_HEADER_BYTES {
+            return Err("Snapshot lookup mmap artifact was truncated".to_string());
+        }
+        let encoding = if &mmap[..SNAPSHOT_LOOKUP_MMAP_V1_MAGIC.len()]
+            == SNAPSHOT_LOOKUP_MMAP_V1_MAGIC
+        {
+            SnapshotLookupMmapEncoding::JsonRowsV1
+        } else if &mmap[..SNAPSHOT_LOOKUP_MMAP_V2_MAGIC.len()] == SNAPSHOT_LOOKUP_MMAP_V2_MAGIC {
+            SnapshotLookupMmapEncoding::FieldTableV2
+        } else {
+            return Err("Snapshot lookup mmap artifact had an unexpected header".to_string());
+        };
+        let row_count = read_snapshot_lookup_mmap_u64(&mmap[8..16])? as usize;
+        let data_offset = SNAPSHOT_LOOKUP_MMAP_HEADER_BYTES
+            .checked_add(
+                row_count
+                    .checked_mul(SNAPSHOT_LOOKUP_MMAP_ENTRY_BYTES)
+                    .ok_or_else(|| "Snapshot lookup mmap artifact overflowed".to_string())?,
+            )
+            .ok_or_else(|| "Snapshot lookup mmap artifact overflowed".to_string())?;
+        if data_offset > mmap.len() {
+            return Err("Snapshot lookup mmap artifact index was out of bounds".to_string());
+        }
+        Ok(Self {
+            mmap,
+            row_count,
+            data_offset,
+            encoding,
+        })
+    }
+
+    fn row_slice(&self, row_ref: SnapshotRowRef) -> Result<&[u8], String> {
+        if row_ref.0 >= self.row_count {
+            return Err(format!("Snapshot row {} was out of bounds", row_ref.0));
+        }
+        let entry_offset =
+            SNAPSHOT_LOOKUP_MMAP_HEADER_BYTES + row_ref.0 * SNAPSHOT_LOOKUP_MMAP_ENTRY_BYTES;
+        let relative_offset =
+            read_snapshot_lookup_mmap_u64(&self.mmap[entry_offset..entry_offset + 8])? as usize;
+        let row_len =
+            read_snapshot_lookup_mmap_u64(&self.mmap[entry_offset + 8..entry_offset + 16])?
+                as usize;
+        let row_start = self
+            .data_offset
+            .checked_add(relative_offset)
+            .ok_or_else(|| "Snapshot lookup mmap row offset overflowed".to_string())?;
+        let row_end = row_start
+            .checked_add(row_len)
+            .ok_or_else(|| "Snapshot lookup mmap row length overflowed".to_string())?;
+        if row_end > self.mmap.len() {
+            return Err("Snapshot lookup mmap row was out of bounds".to_string());
+        }
+        Ok(&self.mmap[row_start..row_end])
+    }
+
+    fn row_value(&self, row_ref: SnapshotRowRef) -> Result<Value, String> {
+        match self.encoding {
+            SnapshotLookupMmapEncoding::JsonRowsV1 => {
+                serde_json::from_slice(self.row_slice(row_ref)?).map_err(|error| error.to_string())
+            }
+            SnapshotLookupMmapEncoding::FieldTableV2 => Ok(Value::Object(
+                parse_snapshot_lookup_binary_row_to_map(self.row_slice(row_ref)?)?,
+            )),
+        }
+    }
+
+    fn row_field_value(
+        &self,
+        row_ref: SnapshotRowRef,
+        field: &str,
+    ) -> Result<Option<Value>, String> {
+        match self.encoding {
+            SnapshotLookupMmapEncoding::JsonRowsV1 => Ok(self
+                .row_value(row_ref)?
+                .as_object()
+                .and_then(|row| row.get(field))
+                .cloned()),
+            SnapshotLookupMmapEncoding::FieldTableV2 => {
+                parse_snapshot_lookup_binary_row_field(self.row_slice(row_ref)?, field)
+            }
+        }
+    }
 }
 
 impl SnapshotLookupWorkerHandle {
     async fn exact_field_rows(
         &self,
         field: &str,
-        values: Vec<String>,
+        values: Vec<SnapshotLookupKey>,
     ) -> Result<Vec<SnapshotRowRef>, String> {
         let (respond_to, receive_from_worker) = oneshot::channel();
         self.sender
@@ -400,7 +595,7 @@ impl SnapshotLookupWorkerHandle {
     async fn key_range_rows(
         &self,
         eq_field: &str,
-        eq_value: &str,
+        eq_value: &SnapshotLookupKey,
         order_field: &str,
         descending: bool,
         range: Option<RangeLookupPredicate>,
@@ -410,7 +605,7 @@ impl SnapshotLookupWorkerHandle {
         self.sender
             .send(SnapshotLookupWorkerRequest::KeyRange {
                 eq_field: eq_field.to_string(),
-                eq_value: eq_value.to_string(),
+                eq_value: eq_value.clone(),
                 order_field: order_field.to_string(),
                 descending,
                 range,
@@ -424,13 +619,17 @@ impl SnapshotLookupWorkerHandle {
     }
 }
 
-#[derive(Clone, Debug)]
-struct SnapshotExactLookupEntry {
-    id: String,
-    id_seq_no: Option<String>,
+#[derive(Clone, Copy, Debug)]
+struct SnapshotExactLookupIndexEntry {
+    row_ref: SnapshotRowRef,
     seq_no: i64,
     version: i64,
-    source: Value,
+}
+
+#[derive(Debug)]
+struct SnapshotExactLookupCache {
+    row_store: Arc<SnapshotLookupRowStore>,
+    entries_by_id: HashMap<SnapshotLookupKey, SnapshotExactLookupIndexEntry>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -862,14 +1061,8 @@ pub async fn execute_serving_query(
 
     let mut execution = execute_plan(
         &checkpoint_cache_key(&context.checkpoint),
-        snapshot_exact_lookup_artifact_location(
-            &context.checkpoint.checkpoint_id,
-            &context.extension_files,
-        ),
-        snapshot_lookup_artifact_location(
-            &context.checkpoint.checkpoint_id,
-            &context.extension_files,
-        ),
+        snapshot_exact_lookup_artifact(&context.checkpoint.checkpoint_id, &context.extension_files),
+        snapshot_lookup_artifact(&context.checkpoint.checkpoint_id, &context.extension_files),
         &plan.selected_files,
         &context.speedboat_files,
         &context.delete_files,
@@ -1145,8 +1338,8 @@ fn plan_request(
 
 async fn execute_plan(
     checkpoint_key: &str,
-    snapshot_exact_lookup_artifact: Option<String>,
-    snapshot_lookup_artifact: Option<String>,
+    snapshot_exact_lookup_artifact: Option<SnapshotExactLookupArtifact>,
+    snapshot_lookup_artifact: Option<SnapshotLookupArtifact>,
     files: &[FileDescriptor],
     speedboat_files: &[FileDescriptor],
     delete_files: &[String],
@@ -1162,8 +1355,8 @@ async fn execute_plan(
     }
     if let Some(result) = maybe_execute_snapshot_lookup(
         checkpoint_key,
-        snapshot_exact_lookup_artifact.as_deref(),
-        snapshot_lookup_artifact.as_deref(),
+        snapshot_exact_lookup_artifact.as_ref(),
+        snapshot_lookup_artifact.as_ref(),
         files,
         speedboat_files,
         delete_files,
@@ -1327,11 +1520,14 @@ pub async fn execute_checkpoint_point_lookup_rows(
     let extension_files = flatten_extension_files(checkpoint);
     let checkpoint_key = checkpoint_cache_key(&checkpoint.get_descriptor());
     let limit = request.normalized_limit(DEFAULT_LIMIT, MAX_LIMIT);
+    let snapshot_exact_lookup_artifact =
+        snapshot_exact_lookup_artifact(&checkpoint.checkpoint_id, &extension_files);
+    let snapshot_lookup_artifact =
+        snapshot_lookup_artifact(&checkpoint.checkpoint_id, &extension_files);
     if let Some(result) = maybe_execute_snapshot_lookup(
         &checkpoint_key,
-        snapshot_exact_lookup_artifact_location(&checkpoint.checkpoint_id, &extension_files)
-            .as_deref(),
-        snapshot_lookup_artifact_location(&checkpoint.checkpoint_id, &extension_files).as_deref(),
+        snapshot_exact_lookup_artifact.as_ref(),
+        snapshot_lookup_artifact.as_ref(),
         &files,
         &speedboat_files,
         &delete_files,
@@ -1371,9 +1567,9 @@ pub async fn execute_checkpoint_exact_lookup_batch_rows(
     let extension_files = flatten_extension_files(checkpoint);
     let checkpoint_key = checkpoint_cache_key(&checkpoint.get_descriptor());
     let snapshot_exact_lookup_artifact =
-        snapshot_exact_lookup_artifact_location(&checkpoint.checkpoint_id, &extension_files);
+        snapshot_exact_lookup_artifact(&checkpoint.checkpoint_id, &extension_files);
     let snapshot_lookup_artifact =
-        snapshot_lookup_artifact_location(&checkpoint.checkpoint_id, &extension_files);
+        snapshot_lookup_artifact(&checkpoint.checkpoint_id, &extension_files);
 
     if files.is_empty() || !speedboat_files.is_empty() {
         return Ok(None);
@@ -1381,7 +1577,7 @@ pub async fn execute_checkpoint_exact_lookup_batch_rows(
 
     let cache = get_or_build_snapshot_lookup_cache(
         &checkpoint_key,
-        snapshot_lookup_artifact.as_deref(),
+        snapshot_lookup_artifact.as_ref(),
         &files,
         &delete_files,
     )
@@ -1391,7 +1587,7 @@ pub async fn execute_checkpoint_exact_lookup_batch_rows(
         let limit = request.normalized_limit(DEFAULT_LIMIT, MAX_LIMIT);
         if let Some(rows) = maybe_execute_snapshot_exact_lookup_artifact(
             &checkpoint_key,
-            snapshot_exact_lookup_artifact.as_deref(),
+            snapshot_exact_lookup_artifact.as_ref(),
             request,
             limit,
         )
@@ -1459,19 +1655,20 @@ pub(crate) async fn warm_checkpoint_point_lookup_caches(
 
     let started_at = Instant::now();
     let snapshot_lookup_artifact =
-        snapshot_lookup_artifact_location(&checkpoint.checkpoint_id, &extension_files);
+        snapshot_lookup_artifact(&checkpoint.checkpoint_id, &extension_files);
     let cache = get_or_build_snapshot_lookup_cache(
         &checkpoint_key,
-        snapshot_lookup_artifact.as_deref(),
+        snapshot_lookup_artifact.as_ref(),
         &files,
         &delete_files,
     )
     .await?;
     let exact_id_entries = if let Some(snapshot_exact_lookup_artifact) =
-        snapshot_exact_lookup_artifact_location(&checkpoint.checkpoint_id, &extension_files)
+        snapshot_exact_lookup_artifact(&checkpoint.checkpoint_id, &extension_files)
     {
         get_or_build_snapshot_exact_lookup_cache(&checkpoint_key, &snapshot_exact_lookup_artifact)
             .await?
+            .entries_by_id
             .len()
     } else {
         0
@@ -1479,7 +1676,7 @@ pub(crate) async fn warm_checkpoint_point_lookup_caches(
     let _elapsed = started_at.elapsed();
 
     Ok(ServingPointLookupWarmupStats {
-        rows: cache.rows.len(),
+        rows: cache.row_count,
         estimated_bytes: cache.estimated_bytes,
         shard_count: cache.shard_count,
         exact_id_entries,
@@ -1535,6 +1732,33 @@ fn snapshot_lookup_artifact_location(
         .map(|extension| extension.location.clone())
 }
 
+fn snapshot_lookup_mmap_artifact_location(
+    checkpoint_id: &str,
+    extension_files: &HashMap<String, Vec<ExtensionFile>>,
+) -> Option<String> {
+    let checkpoint_key = checkpoint_extension_metadata_key(checkpoint_id);
+    extension_files
+        .get(&checkpoint_key)
+        .and_then(|extension_files| {
+            extension_files
+                .iter()
+                .find(|extension| extension.suffix == SNAPSHOT_LOOKUP_MMAP_EXTENSION_SUFFIX)
+        })
+        .map(|extension| extension.location.clone())
+}
+
+fn snapshot_lookup_artifact(
+    checkpoint_id: &str,
+    extension_files: &HashMap<String, Vec<ExtensionFile>>,
+) -> Option<SnapshotLookupArtifact> {
+    snapshot_lookup_mmap_artifact_location(checkpoint_id, extension_files)
+        .map(SnapshotLookupArtifact::Mmap)
+        .or_else(|| {
+            snapshot_lookup_artifact_location(checkpoint_id, extension_files)
+                .map(SnapshotLookupArtifact::Parquet)
+        })
+}
+
 fn snapshot_exact_lookup_artifact_location(
     checkpoint_id: &str,
     extension_files: &HashMap<String, Vec<ExtensionFile>>,
@@ -1550,10 +1774,37 @@ fn snapshot_exact_lookup_artifact_location(
         .map(|extension| extension.location.clone())
 }
 
+fn snapshot_exact_lookup_mmap_artifact_location(
+    checkpoint_id: &str,
+    extension_files: &HashMap<String, Vec<ExtensionFile>>,
+) -> Option<String> {
+    let checkpoint_key = checkpoint_extension_metadata_key(checkpoint_id);
+    extension_files
+        .get(&checkpoint_key)
+        .and_then(|extension_files| {
+            extension_files
+                .iter()
+                .find(|extension| extension.suffix == SNAPSHOT_EXACT_LOOKUP_MMAP_EXTENSION_SUFFIX)
+        })
+        .map(|extension| extension.location.clone())
+}
+
+fn snapshot_exact_lookup_artifact(
+    checkpoint_id: &str,
+    extension_files: &HashMap<String, Vec<ExtensionFile>>,
+) -> Option<SnapshotExactLookupArtifact> {
+    snapshot_exact_lookup_mmap_artifact_location(checkpoint_id, extension_files)
+        .map(SnapshotExactLookupArtifact::Mmap)
+        .or_else(|| {
+            snapshot_exact_lookup_artifact_location(checkpoint_id, extension_files)
+                .map(SnapshotExactLookupArtifact::Parquet)
+        })
+}
+
 async fn maybe_execute_snapshot_lookup(
     checkpoint_key: &str,
-    snapshot_exact_lookup_artifact: Option<&str>,
-    snapshot_lookup_artifact: Option<&str>,
+    snapshot_exact_lookup_artifact: Option<&SnapshotExactLookupArtifact>,
+    snapshot_lookup_artifact: Option<&SnapshotLookupArtifact>,
     files: &[FileDescriptor],
     speedboat_files: &[FileDescriptor],
     delete_files: &[String],
@@ -1596,9 +1847,9 @@ async fn maybe_execute_snapshot_lookup(
         delete_files,
     )
     .await?;
-    let (rows, artifact_used) = match plan {
+    let (row_refs, artifact_used) = match plan {
         SnapshotLookupPlan::Exact { predicates } => (
-            execute_snapshot_exact_lookup(&cache, &predicates, limit).await?,
+            execute_snapshot_exact_lookup_row_refs(&cache, &predicates, limit).await?,
             ACCESS_ARTIFACT_KIND_SNAPSHOT_KEY_LOOKUP.to_string(),
         ),
         SnapshotLookupPlan::KeyRange {
@@ -1608,7 +1859,7 @@ async fn maybe_execute_snapshot_lookup(
             descending,
             range,
         } => (
-            execute_snapshot_key_range_lookup(
+            execute_snapshot_key_range_lookup_row_refs(
                 &cache,
                 &eq_field,
                 &eq_value,
@@ -1621,7 +1872,10 @@ async fn maybe_execute_snapshot_lookup(
             ACCESS_ARTIFACT_KIND_SNAPSHOT_KEY_RANGE_LOOKUP.to_string(),
         ),
     };
-    let rows = project_rows_for_select(rows, request);
+    let rows = row_refs
+        .into_iter()
+        .map(|row_ref| snapshot_row_to_projected_value(&cache, row_ref, request))
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Some(ServingExecutionResult {
         rows,
@@ -1631,7 +1885,7 @@ async fn maybe_execute_snapshot_lookup(
     }))
 }
 
-fn exact_id_lookup_values(request: &ReadPlan) -> Option<Vec<String>> {
+fn exact_id_lookup_values(request: &ReadPlan) -> Option<Vec<SnapshotLookupKey>> {
     let predicates = exact_lookup_predicates(request)?;
     if predicates.len() != 1 || predicates[0].field != "_id" {
         return None;
@@ -1641,7 +1895,7 @@ fn exact_id_lookup_values(request: &ReadPlan) -> Option<Vec<String>> {
 
 async fn maybe_execute_snapshot_exact_lookup_artifact(
     checkpoint_key: &str,
-    snapshot_exact_lookup_artifact: Option<&str>,
+    snapshot_exact_lookup_artifact: Option<&SnapshotExactLookupArtifact>,
     request: &ReadPlan,
     limit: usize,
 ) -> Result<Option<Vec<Value>>, String> {
@@ -1659,11 +1913,11 @@ async fn maybe_execute_snapshot_exact_lookup_artifact(
             .await?;
     let mut rows = Vec::with_capacity(limit.min(doc_ids.len()));
     for doc_id in doc_ids {
-        if let Some(entry) = cache.get(&doc_id) {
-            rows.push(project_row_for_select(
-                snapshot_exact_lookup_entry_to_value(entry),
-                request,
-            ));
+        if let Some(entry) = cache.entries_by_id.get(&doc_id) {
+            rows.push(cache.row_store.projected_row_value(
+                entry.row_ref,
+                normalized_select(request.select.clone()).as_deref(),
+            )?);
         }
         if rows.len() >= limit {
             break;
@@ -1674,8 +1928,8 @@ async fn maybe_execute_snapshot_exact_lookup_artifact(
 
 async fn get_or_build_snapshot_exact_lookup_cache(
     checkpoint_key: &str,
-    snapshot_exact_lookup_artifact: &str,
-) -> Result<Arc<HashMap<String, SnapshotExactLookupEntry>>, String> {
+    snapshot_exact_lookup_artifact: &SnapshotExactLookupArtifact,
+) -> Result<Arc<SnapshotExactLookupCache>, String> {
     if let Some(cache) = SNAPSHOT_EXACT_LOOKUP_CACHE
         .lock()
         .unwrap()
@@ -1694,141 +1948,118 @@ async fn get_or_build_snapshot_exact_lookup_cache(
 }
 
 async fn build_snapshot_exact_lookup_cache(
-    snapshot_exact_lookup_artifact: &str,
-) -> Result<HashMap<String, SnapshotExactLookupEntry>, String> {
-    let batches = load_snapshot_lookup_artifact_batches(snapshot_exact_lookup_artifact).await?;
-    let mut best_by_id = HashMap::new();
+    snapshot_exact_lookup_artifact: &SnapshotExactLookupArtifact,
+) -> Result<SnapshotExactLookupCache, String> {
+    match snapshot_exact_lookup_artifact {
+        SnapshotExactLookupArtifact::Mmap(snapshot_exact_lookup_artifact) => {
+            build_mmap_snapshot_exact_lookup_cache(snapshot_exact_lookup_artifact).await
+        }
+        SnapshotExactLookupArtifact::Parquet(snapshot_exact_lookup_artifact) => {
+            let batches =
+                load_snapshot_lookup_artifact_batches(snapshot_exact_lookup_artifact).await?;
+            build_in_memory_snapshot_exact_lookup_cache(batches)
+        }
+    }
+}
+
+fn build_in_memory_snapshot_exact_lookup_cache(
+    batches: Vec<RecordBatch>,
+) -> Result<SnapshotExactLookupCache, String> {
+    let mut rows = vec![];
     for batch in batches.iter() {
         for row_index in 0..batch.num_rows() {
-            let Some(candidate) = snapshot_exact_lookup_entry_from_batch(batch, row_index)? else {
-                continue;
-            };
-            if let Some(existing) = best_by_id.get(&candidate.id) {
-                if !exact_lookup_entry_is_better(&candidate, existing) {
-                    continue;
-                }
-            }
-            best_by_id.insert(candidate.id.clone(), candidate);
+            let row = snapshot_exact_lookup_row_from_batch(batch, row_index)?;
+            rows.push(Arc::new(row));
         }
+    }
+    let rows = Arc::new(rows);
+    let row_store = Arc::new(SnapshotLookupRowStore::InMemory(rows));
+    let entries_by_id = build_snapshot_exact_lookup_index_from_store(row_store.as_ref())?;
+    Ok(SnapshotExactLookupCache {
+        row_store,
+        entries_by_id,
+    })
+}
+
+async fn build_mmap_snapshot_exact_lookup_cache(
+    snapshot_exact_lookup_artifact: &str,
+) -> Result<SnapshotExactLookupCache, String> {
+    let local_path =
+        data_access::materialize_local_file(&snapshot_exact_lookup_artifact.to_string())
+            .await
+            .map_err(|error| error.to_string())?;
+    let mmap_rows = Arc::new(MmapSnapshotLookupRows::open(local_path.as_path())?);
+    let row_store = Arc::new(SnapshotLookupRowStore::Mmap(mmap_rows));
+    let entries_by_id = build_snapshot_exact_lookup_index_from_store(row_store.as_ref())?;
+    Ok(SnapshotExactLookupCache {
+        row_store,
+        entries_by_id,
+    })
+}
+
+fn build_snapshot_exact_lookup_index_from_store(
+    row_store: &SnapshotLookupRowStore,
+) -> Result<HashMap<SnapshotLookupKey, SnapshotExactLookupIndexEntry>, String> {
+    let mut best_by_id = HashMap::new();
+    for row_index in 0..row_store.row_count() {
+        let row_ref = SnapshotRowRef(row_index);
+        let Some((id, seq_no, version)) =
+            snapshot_exact_lookup_metadata_from_row_store(row_store, row_ref)?
+        else {
+            continue;
+        };
+        let candidate = SnapshotExactLookupIndexEntry {
+            row_ref,
+            seq_no,
+            version,
+        };
+        if let Some(existing) = best_by_id.get(&id) {
+            if !exact_lookup_index_entry_is_better(&candidate, existing) {
+                continue;
+            }
+        }
+        best_by_id.insert(id, candidate);
     }
     Ok(best_by_id)
 }
 
-fn snapshot_exact_lookup_entry_from_batch(
-    batch: &RecordBatch,
-    row_index: usize,
-) -> Result<Option<SnapshotExactLookupEntry>, String> {
-    let field_index = |field_name: &str| {
-        batch
-            .schema()
-            .index_of(field_name)
-            .map_err(|error| error.to_string())
-    };
-
-    let id_index = match field_index("_id") {
-        Ok(index) => index,
-        Err(_) => return Ok(None),
-    };
-    let id_array = batch.column(id_index);
-    if id_array.is_null(row_index) {
-        return Ok(None);
-    }
-    let id_value =
-        array_value_to_json(id_array.as_ref(), row_index).map_err(|error| error.message.clone())?;
-    let Some(id) = normalize_exact_lookup_value(&id_value) else {
+fn snapshot_exact_lookup_metadata_from_row_store(
+    row_store: &SnapshotLookupRowStore,
+    row_ref: SnapshotRowRef,
+) -> Result<Option<(SnapshotLookupKey, i64, i64)>, String> {
+    let Some(id) = row_store.row_field_value(row_ref, "_id")? else {
         return Ok(None);
     };
-
-    let id_seq_no = match field_index("_id_seq_no") {
-        Ok(index) => {
-            let array = batch.column(index);
-            if array.is_null(row_index) {
-                None
-            } else {
-                let value = array_value_to_json(array.as_ref(), row_index)
-                    .map_err(|error| error.message.clone())?;
-                normalize_exact_lookup_value(&value)
-            }
-        }
-        Err(_) => None,
+    let Some(id) = encode_exact_lookup_key(&id) else {
+        return Ok(None);
     };
-
-    let seq_no = read_batch_i64_field(batch, "_seq_no", row_index)?;
-    let version = read_batch_i64_field(batch, "_version", row_index)?;
-    let source = read_snapshot_exact_lookup_source(batch, row_index)?;
-
-    Ok(Some(SnapshotExactLookupEntry {
-        id,
-        id_seq_no,
-        seq_no,
-        version,
-        source,
-    }))
+    let seq_no = row_store
+        .row_field_value(row_ref, "_seq_no")?
+        .as_ref()
+        .and_then(snapshot_exact_lookup_i64)
+        .unwrap_or_default();
+    let version = row_store
+        .row_field_value(row_ref, "_version")?
+        .as_ref()
+        .and_then(snapshot_exact_lookup_i64)
+        .unwrap_or_default();
+    Ok(Some((id, seq_no, version)))
 }
 
-fn read_batch_i64_field(
-    batch: &RecordBatch,
-    field_name: &str,
-    row_index: usize,
-) -> Result<i64, String> {
-    let field_index = batch
-        .schema()
-        .index_of(field_name)
-        .map_err(|error| error.to_string())?;
-    let array = batch.column(field_index);
-    if array.is_null(row_index) {
-        return Ok(0);
-    }
-    let value =
-        array_value_to_json(array.as_ref(), row_index).map_err(|error| error.message.clone())?;
-    Ok(value
+fn snapshot_exact_lookup_i64(value: &Value) -> Option<i64> {
+    value
         .as_i64()
         .or_else(|| value.as_u64().map(|value| value as i64))
-        .unwrap_or_default())
 }
 
-fn read_snapshot_exact_lookup_source(
-    batch: &RecordBatch,
-    row_index: usize,
-) -> Result<Value, String> {
-    let field_index = batch
-        .schema()
-        .index_of("_source")
-        .map_err(|error| error.to_string())?;
-    let array = batch.column(field_index);
-    if array.is_null(row_index) {
-        return Ok(Value::Null);
-    }
-    let value =
-        array_value_to_json(array.as_ref(), row_index).map_err(|error| error.message.clone())?;
-    Ok(match value {
-        Value::String(text) => serde_json::from_str(&text).unwrap_or(Value::String(text)),
-        other => other,
-    })
-}
-
-fn exact_lookup_entry_is_better(
-    candidate: &SnapshotExactLookupEntry,
-    existing: &SnapshotExactLookupEntry,
+fn exact_lookup_index_entry_is_better(
+    candidate: &SnapshotExactLookupIndexEntry,
+    existing: &SnapshotExactLookupIndexEntry,
 ) -> bool {
     if candidate.seq_no != existing.seq_no {
         return candidate.seq_no > existing.seq_no;
     }
     candidate.version > existing.version
-}
-
-fn snapshot_exact_lookup_entry_to_value(entry: &SnapshotExactLookupEntry) -> Value {
-    let mut row = Map::new();
-    row.insert("_id".to_string(), Value::String(entry.id.clone()));
-    if let Some(id_seq_no) = entry.id_seq_no.as_ref() {
-        row.insert("_id_seq_no".to_string(), Value::String(id_seq_no.clone()));
-    } else {
-        row.insert("_id_seq_no".to_string(), Value::Null);
-    }
-    row.insert("_seq_no".to_string(), Value::from(entry.seq_no));
-    row.insert("_version".to_string(), Value::from(entry.version));
-    row.insert("_source".to_string(), entry.source.clone());
-    Value::Object(row)
 }
 
 fn project_rows_for_select(rows: Vec<Value>, request: &ReadPlan) -> Vec<Value> {
@@ -1874,7 +2105,7 @@ fn snapshot_lookup_plan(request: &ReadPlan) -> Option<SnapshotLookupPlan> {
     }
 
     let mut eq_field: Option<String> = None;
-    let mut eq_value: Option<String> = None;
+    let mut eq_value: Option<SnapshotLookupKey> = None;
     let mut range: Option<RangeLookupPredicate> = None;
 
     for filter in request.filters.iter() {
@@ -1889,12 +2120,12 @@ fn snapshot_lookup_plan(request: &ReadPlan) -> Option<SnapshotLookupPlan> {
                     return None;
                 }
                 let value = if let Some(value) = filter.eq.as_ref() {
-                    normalize_exact_lookup_value(value)?
+                    encode_exact_lookup_key(value)?
                 } else if let Some(values) = filter.in_values.as_ref() {
                     if values.len() != 1 {
                         return None;
                     }
-                    normalize_exact_lookup_value(values.first()?)?
+                    encode_exact_lookup_key(values.first()?)?
                 } else {
                     return None;
                 };
@@ -1947,7 +2178,7 @@ fn snapshot_lookup_plan(request: &ReadPlan) -> Option<SnapshotLookupPlan> {
 
 async fn get_or_build_snapshot_lookup_cache(
     checkpoint_key: &str,
-    snapshot_lookup_artifact: Option<&str>,
+    snapshot_lookup_artifact: Option<&SnapshotLookupArtifact>,
     files: &[FileDescriptor],
     delete_files: &[String],
 ) -> Result<Arc<SnapshotLookupCache>, String> {
@@ -1969,7 +2200,7 @@ async fn get_or_build_snapshot_lookup_cache(
         .clone())
 }
 
-fn snapshot_lookup_shard_for_key(key: &str, shard_count: usize) -> usize {
+fn snapshot_lookup_shard_for_lookup_key(key: &SnapshotLookupKey, shard_count: usize) -> usize {
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
     (hasher.finish() as usize) % shard_count.max(1)
@@ -2007,27 +2238,245 @@ fn snapshot_lookup_row_from_batch(
     Ok(SnapshotLookupRow { values })
 }
 
+fn snapshot_exact_lookup_row_from_batch(
+    batch: &RecordBatch,
+    row_index: usize,
+) -> Result<SnapshotLookupRow, String> {
+    let mut row = snapshot_lookup_row_from_batch(batch, row_index)?;
+    if let Some(Value::String(text)) = row.values.get_mut("_source") {
+        let source_text = text.clone();
+        row.values.insert(
+            "_source".to_string(),
+            serde_json::from_str(&source_text).unwrap_or(Value::String(source_text)),
+        );
+    }
+    Ok(row)
+}
+
+fn read_snapshot_lookup_mmap_u64(bytes: &[u8]) -> Result<u64, String> {
+    let value: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| "Snapshot lookup mmap artifact had an invalid integer".to_string())?;
+    Ok(u64::from_le_bytes(value))
+}
+
+fn append_snapshot_lookup_mmap_u64(buffer: &mut Vec<u8>, value: u64) {
+    buffer.extend_from_slice(&value.to_le_bytes());
+}
+
+fn append_snapshot_lookup_mmap_u32(buffer: &mut Vec<u8>, value: u32) {
+    buffer.extend_from_slice(&value.to_le_bytes());
+}
+
+fn read_snapshot_lookup_mmap_u32(bytes: &[u8]) -> Result<u32, String> {
+    let value: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| "Snapshot lookup mmap artifact had an invalid integer".to_string())?;
+    Ok(u32::from_le_bytes(value))
+}
+
+fn encode_snapshot_lookup_binary_row(row: &SnapshotLookupRow) -> Result<Vec<u8>, String> {
+    let field_count: u32 = row
+        .values
+        .len()
+        .try_into()
+        .map_err(|_| "Snapshot lookup mmap row had too many fields".to_string())?;
+    let mut buffer = Vec::new();
+    append_snapshot_lookup_mmap_u32(&mut buffer, field_count);
+    for (field_name, value) in row.values.iter() {
+        let field_bytes = field_name.as_bytes();
+        let field_len: u32 = field_bytes
+            .len()
+            .try_into()
+            .map_err(|_| "Snapshot lookup mmap field name was too large".to_string())?;
+        let value_bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+        let value_len: u32 = value_bytes
+            .len()
+            .try_into()
+            .map_err(|_| "Snapshot lookup mmap field value was too large".to_string())?;
+        append_snapshot_lookup_mmap_u32(&mut buffer, field_len);
+        buffer.extend_from_slice(field_bytes);
+        append_snapshot_lookup_mmap_u32(&mut buffer, value_len);
+        buffer.extend_from_slice(&value_bytes);
+    }
+    Ok(buffer)
+}
+
+fn parse_snapshot_lookup_binary_row_to_map(bytes: &[u8]) -> Result<Map<String, Value>, String> {
+    let field_count = read_snapshot_lookup_mmap_u32(
+        bytes
+            .get(0..4)
+            .ok_or_else(|| "Snapshot lookup mmap row header was truncated".to_string())?,
+    )? as usize;
+    let mut offset = 4usize;
+    let mut row = Map::with_capacity(field_count);
+    for _ in 0..field_count {
+        let field_name_len = read_snapshot_lookup_mmap_u32(
+            bytes
+                .get(offset..offset + 4)
+                .ok_or_else(|| "Snapshot lookup mmap row field name was truncated".to_string())?,
+        )? as usize;
+        offset += 4;
+        let field_name = std::str::from_utf8(
+            bytes
+                .get(offset..offset + field_name_len)
+                .ok_or_else(|| "Snapshot lookup mmap row field name was truncated".to_string())?,
+        )
+        .map_err(|error| error.to_string())?
+        .to_string();
+        offset += field_name_len;
+        let value_len = read_snapshot_lookup_mmap_u32(
+            bytes
+                .get(offset..offset + 4)
+                .ok_or_else(|| "Snapshot lookup mmap row field value was truncated".to_string())?,
+        )? as usize;
+        offset += 4;
+        let value_bytes = bytes
+            .get(offset..offset + value_len)
+            .ok_or_else(|| "Snapshot lookup mmap row field value was truncated".to_string())?;
+        offset += value_len;
+        let value = serde_json::from_slice(value_bytes).map_err(|error| error.to_string())?;
+        row.insert(field_name, value);
+    }
+    Ok(row)
+}
+
+fn parse_snapshot_lookup_binary_row_field(
+    bytes: &[u8],
+    target_field: &str,
+) -> Result<Option<Value>, String> {
+    let field_count = read_snapshot_lookup_mmap_u32(
+        bytes
+            .get(0..4)
+            .ok_or_else(|| "Snapshot lookup mmap row header was truncated".to_string())?,
+    )? as usize;
+    let mut offset = 4usize;
+    for _ in 0..field_count {
+        let field_name_len = read_snapshot_lookup_mmap_u32(
+            bytes
+                .get(offset..offset + 4)
+                .ok_or_else(|| "Snapshot lookup mmap row field name was truncated".to_string())?,
+        )? as usize;
+        offset += 4;
+        let field_name_bytes = bytes
+            .get(offset..offset + field_name_len)
+            .ok_or_else(|| "Snapshot lookup mmap row field name was truncated".to_string())?;
+        offset += field_name_len;
+        let value_len = read_snapshot_lookup_mmap_u32(
+            bytes
+                .get(offset..offset + 4)
+                .ok_or_else(|| "Snapshot lookup mmap row field value was truncated".to_string())?,
+        )? as usize;
+        offset += 4;
+        let value_bytes = bytes
+            .get(offset..offset + value_len)
+            .ok_or_else(|| "Snapshot lookup mmap row field value was truncated".to_string())?;
+        offset += value_len;
+        if field_name_bytes == target_field.as_bytes() {
+            return serde_json::from_slice(value_bytes)
+                .map(Some)
+                .map_err(|error| error.to_string());
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) fn record_batches_to_snapshot_lookup_mmap_bytes(
+    batches: &[RecordBatch],
+) -> Result<Vec<u8>, String> {
+    record_batches_to_snapshot_lookup_mmap_bytes_with_row_builder(
+        batches,
+        snapshot_lookup_row_from_batch,
+    )
+}
+
+pub(crate) fn record_batches_to_snapshot_exact_lookup_mmap_bytes(
+    batches: &[RecordBatch],
+) -> Result<Vec<u8>, String> {
+    record_batches_to_snapshot_lookup_mmap_bytes_with_row_builder(
+        batches,
+        snapshot_exact_lookup_row_from_batch,
+    )
+}
+
+fn record_batches_to_snapshot_lookup_mmap_bytes_with_row_builder(
+    batches: &[RecordBatch],
+    row_builder: fn(&RecordBatch, usize) -> Result<SnapshotLookupRow, String>,
+) -> Result<Vec<u8>, String> {
+    let mut row_bytes = vec![];
+    let mut row_count = 0usize;
+    let mut total_row_bytes = 0usize;
+    for batch in batches {
+        for row_index in 0..batch.num_rows() {
+            let row = row_builder(batch, row_index)?;
+            let encoded = encode_snapshot_lookup_binary_row(&row)?;
+            total_row_bytes = total_row_bytes
+                .checked_add(encoded.len())
+                .ok_or_else(|| "Snapshot lookup mmap artifact overflowed".to_string())?;
+            row_bytes.push(encoded);
+            row_count += 1;
+        }
+    }
+
+    let index_bytes = row_count
+        .checked_mul(SNAPSHOT_LOOKUP_MMAP_ENTRY_BYTES)
+        .ok_or_else(|| "Snapshot lookup mmap artifact overflowed".to_string())?;
+    let total_capacity = SNAPSHOT_LOOKUP_MMAP_HEADER_BYTES
+        .checked_add(index_bytes)
+        .and_then(|value| value.checked_add(total_row_bytes))
+        .ok_or_else(|| "Snapshot lookup mmap artifact overflowed".to_string())?;
+    let mut buffer = Vec::with_capacity(total_capacity);
+    buffer.extend_from_slice(SNAPSHOT_LOOKUP_MMAP_V2_MAGIC);
+    append_snapshot_lookup_mmap_u64(&mut buffer, row_count as u64);
+
+    let mut current_offset = 0usize;
+    for row in row_bytes.iter() {
+        append_snapshot_lookup_mmap_u64(&mut buffer, current_offset as u64);
+        append_snapshot_lookup_mmap_u64(&mut buffer, row.len() as u64);
+        current_offset = current_offset
+            .checked_add(row.len())
+            .ok_or_else(|| "Snapshot lookup mmap artifact overflowed".to_string())?;
+    }
+    for row in row_bytes {
+        buffer.extend_from_slice(&row);
+    }
+    Ok(buffer)
+}
+
 async fn build_snapshot_lookup_cache(
-    snapshot_lookup_artifact: Option<&str>,
+    snapshot_lookup_artifact: Option<&SnapshotLookupArtifact>,
     files: &[FileDescriptor],
     delete_files: &[String],
 ) -> Result<SnapshotLookupCache, String> {
-    let batches = if let Some(snapshot_lookup_artifact) = snapshot_lookup_artifact {
-        load_snapshot_lookup_artifact_batches(snapshot_lookup_artifact).await?
-    } else {
-        let sql = snapshot_lookup_full_scan_sql(!delete_files.is_empty());
-        execute_query_plan_batches(QueryExecutionPlan {
-            sql: QuerySqlTemplate::Built(sql),
-            files: iceberg_query_inputs(files.to_vec()),
-            delete_files: delete_files.to_vec(),
-            use_deletes_table: !delete_files.is_empty(),
-            extension_suffixes: None,
-            use_cpu_threadpool: true,
-        })
-        .await
-        .map_err(|error| error.to_string())?
-    };
+    match snapshot_lookup_artifact {
+        Some(SnapshotLookupArtifact::Mmap(snapshot_lookup_artifact)) => {
+            build_mmap_snapshot_lookup_cache(snapshot_lookup_artifact).await
+        }
+        Some(SnapshotLookupArtifact::Parquet(snapshot_lookup_artifact)) => {
+            build_in_memory_snapshot_lookup_cache(
+                load_snapshot_lookup_artifact_batches(snapshot_lookup_artifact).await?,
+            )
+        }
+        None => {
+            let sql = snapshot_lookup_full_scan_sql(!delete_files.is_empty());
+            let batches = execute_query_plan_batches(QueryExecutionPlan {
+                sql: QuerySqlTemplate::Built(sql),
+                files: iceberg_query_inputs(files.to_vec()),
+                delete_files: delete_files.to_vec(),
+                use_deletes_table: !delete_files.is_empty(),
+                extension_suffixes: None,
+                use_cpu_threadpool: true,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            build_in_memory_snapshot_lookup_cache(batches)
+        }
+    }
+}
 
+fn build_in_memory_snapshot_lookup_cache(
+    batches: Vec<RecordBatch>,
+) -> Result<SnapshotLookupCache, String> {
     let mut rows = vec![];
     let mut estimated_bytes = 0u64;
     for batch in batches.iter() {
@@ -2039,53 +2488,120 @@ async fn build_snapshot_lookup_cache(
         }
     }
     let rows = Arc::new(rows);
-    let workers = spawn_snapshot_lookup_workers(rows.clone());
+    let row_store = Arc::new(SnapshotLookupRowStore::InMemory(rows.clone()));
+    let workers = spawn_snapshot_lookup_workers(
+        row_store.clone(),
+        build_snapshot_lookup_exact_index_shards_from_rows(rows.as_ref()),
+    );
 
     Ok(SnapshotLookupCache {
-        rows,
+        row_store,
+        row_count: rows.len(),
         estimated_bytes,
         shard_count: SNAPSHOT_LOOKUP_SHARD_COUNT,
         workers,
     })
 }
 
-fn spawn_snapshot_lookup_workers(
-    rows: Arc<Vec<Arc<SnapshotLookupRow>>>,
-) -> Vec<SnapshotLookupWorkerHandle> {
-    let mut exact_index_shards: Vec<HashMap<String, HashMap<String, Vec<SnapshotRowRef>>>> = (0
-        ..SNAPSHOT_LOOKUP_SHARD_COUNT)
+async fn build_mmap_snapshot_lookup_cache(
+    snapshot_lookup_artifact: &str,
+) -> Result<SnapshotLookupCache, String> {
+    let local_path = data_access::materialize_local_file(&snapshot_lookup_artifact.to_string())
+        .await
+        .map_err(|error| error.to_string())?;
+    let mmap_rows = Arc::new(MmapSnapshotLookupRows::open(local_path.as_path())?);
+    let row_count = mmap_rows.row_count;
+    let estimated_bytes = mmap_rows.mmap.len() as u64;
+    let row_store = Arc::new(SnapshotLookupRowStore::Mmap(mmap_rows));
+    let workers = spawn_snapshot_lookup_workers(
+        row_store.clone(),
+        build_snapshot_lookup_exact_index_shards_from_store(row_store.as_ref())?,
+    );
+
+    Ok(SnapshotLookupCache {
+        row_store,
+        row_count,
+        estimated_bytes,
+        shard_count: SNAPSHOT_LOOKUP_SHARD_COUNT,
+        workers,
+    })
+}
+
+fn build_snapshot_lookup_exact_index_shards_from_rows(
+    rows: &[Arc<SnapshotLookupRow>],
+) -> Vec<HashMap<String, HashMap<SnapshotLookupKey, Vec<SnapshotRowRef>>>> {
+    let mut exact_index_shards: Vec<
+        HashMap<String, HashMap<SnapshotLookupKey, Vec<SnapshotRowRef>>>,
+    > = (0..SNAPSHOT_LOOKUP_SHARD_COUNT)
         .map(|_| HashMap::new())
         .collect();
     for (row_index, row) in rows.iter().enumerate() {
         for (field, value) in row.values.iter() {
-            let Some(normalized) = normalize_exact_lookup_value(value) else {
+            let Some(encoded) = encode_exact_lookup_key(value) else {
                 continue;
             };
             let shard_index =
-                snapshot_lookup_shard_for_key(&normalized, SNAPSHOT_LOOKUP_SHARD_COUNT);
+                snapshot_lookup_shard_for_lookup_key(&encoded, SNAPSHOT_LOOKUP_SHARD_COUNT);
             exact_index_shards[shard_index]
                 .entry(field.clone())
                 .or_default()
-                .entry(normalized)
+                .entry(encoded)
                 .or_default()
                 .push(SnapshotRowRef(row_index));
         }
     }
 
     exact_index_shards
+}
+
+fn build_snapshot_lookup_exact_index_shards_from_store(
+    row_store: &SnapshotLookupRowStore,
+) -> Result<Vec<HashMap<String, HashMap<SnapshotLookupKey, Vec<SnapshotRowRef>>>>, String> {
+    let mut exact_index_shards: Vec<
+        HashMap<String, HashMap<SnapshotLookupKey, Vec<SnapshotRowRef>>>,
+    > = (0..SNAPSHOT_LOOKUP_SHARD_COUNT)
+        .map(|_| HashMap::new())
+        .collect();
+    for row_index in 0..row_store.row_count() {
+        let row_ref = SnapshotRowRef(row_index);
+        let Value::Object(values) = row_store.row_value(row_ref)? else {
+            continue;
+        };
+        for (field, value) in values.iter() {
+            let Some(encoded) = encode_exact_lookup_key(value) else {
+                continue;
+            };
+            let shard_index =
+                snapshot_lookup_shard_for_lookup_key(&encoded, SNAPSHOT_LOOKUP_SHARD_COUNT);
+            exact_index_shards[shard_index]
+                .entry(field.clone())
+                .or_default()
+                .entry(encoded)
+                .or_default()
+                .push(row_ref);
+        }
+    }
+    Ok(exact_index_shards)
+}
+
+fn spawn_snapshot_lookup_workers(
+    row_store: Arc<SnapshotLookupRowStore>,
+    exact_index_shards: Vec<HashMap<String, HashMap<SnapshotLookupKey, Vec<SnapshotRowRef>>>>,
+) -> Vec<SnapshotLookupWorkerHandle> {
+    exact_index_shards
         .into_iter()
-        .map(|exact_indexes| spawn_snapshot_lookup_worker(rows.clone(), exact_indexes))
+        .map(|exact_indexes| spawn_snapshot_lookup_worker(row_store.clone(), exact_indexes))
         .collect()
 }
 
 fn spawn_snapshot_lookup_worker(
-    rows: Arc<Vec<Arc<SnapshotLookupRow>>>,
-    exact_indexes: HashMap<String, HashMap<String, Vec<SnapshotRowRef>>>,
+    row_store: Arc<SnapshotLookupRowStore>,
+    exact_indexes: HashMap<String, HashMap<SnapshotLookupKey, Vec<SnapshotRowRef>>>,
 ) -> SnapshotLookupWorkerHandle {
     let (sender, mut receiver) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let mut state = SnapshotLookupWorkerState {
-            rows,
+            row_store,
             exact_indexes,
             ordered_indexes: HashMap::new(),
         };
@@ -2128,7 +2644,7 @@ fn spawn_snapshot_lookup_worker(
 fn snapshot_worker_exact_field_rows(
     state: &SnapshotLookupWorkerState,
     field: &str,
-    values: &[String],
+    values: &[SnapshotLookupKey],
 ) -> Vec<SnapshotRowRef> {
     let Some(index) = state.exact_indexes.get(field) else {
         return vec![];
@@ -2145,7 +2661,7 @@ fn snapshot_worker_exact_field_rows(
 fn snapshot_worker_key_range_rows(
     state: &mut SnapshotLookupWorkerState,
     eq_field: &str,
-    eq_value: &str,
+    eq_value: &SnapshotLookupKey,
     order_field: &str,
     descending: bool,
     range: Option<&RangeLookupPredicate>,
@@ -2161,11 +2677,11 @@ fn snapshot_worker_key_range_rows(
             for (lookup_value, row_refs) in exact_index.iter() {
                 let mut ordered_refs = row_refs.clone();
                 ordered_refs.sort_by(|left, right| {
-                    compare_row_values(
-                        snapshot_row_field_value_in_rows(state.rows.as_ref(), *left, order_field),
-                        snapshot_row_field_value_in_rows(state.rows.as_ref(), *right, order_field),
-                        false,
-                    )
+                    let left_value =
+                        snapshot_row_field_value(state.row_store.as_ref(), *left, order_field);
+                    let right_value =
+                        snapshot_row_field_value(state.row_store.as_ref(), *right, order_field);
+                    compare_row_values(left_value.as_ref(), right_value.as_ref(), false)
                 });
                 ordered_index.insert(lookup_value.clone(), ordered_refs);
             }
@@ -2189,7 +2705,7 @@ fn snapshot_worker_key_range_rows(
     };
     for row_ref in row_iter {
         if let Some(range_filter) = range {
-            if !snapshot_row_matches_range_in_rows(state.rows.as_ref(), *row_ref, range_filter)? {
+            if !snapshot_row_matches_range(state.row_store.as_ref(), *row_ref, range_filter)? {
                 continue;
             }
         }
@@ -2233,12 +2749,24 @@ async fn execute_snapshot_exact_lookup(
     predicates: &[ExactLookupPredicate],
     limit: usize,
 ) -> Result<Vec<Value>, String> {
+    let row_refs = execute_snapshot_exact_lookup_row_refs(cache, predicates, limit).await?;
+    row_refs
+        .into_iter()
+        .map(|row_ref| snapshot_row_to_value(cache, row_ref))
+        .collect()
+}
+
+async fn execute_snapshot_exact_lookup_row_refs(
+    cache: &SnapshotLookupCache,
+    predicates: &[ExactLookupPredicate],
+    limit: usize,
+) -> Result<Vec<SnapshotRowRef>, String> {
     let mut matching_rows: Option<HashSet<SnapshotRowRef>> = None;
     for predicate in predicates.iter() {
         let mut predicate_rows = HashSet::new();
-        let mut shard_values: HashMap<usize, Vec<String>> = HashMap::new();
+        let mut shard_values: HashMap<usize, Vec<SnapshotLookupKey>> = HashMap::new();
         for value in predicate.values.iter() {
-            let shard_index = snapshot_lookup_shard_for_key(value, cache.shard_count);
+            let shard_index = snapshot_lookup_shard_for_lookup_key(value, cache.shard_count);
             shard_values
                 .entry(shard_index)
                 .or_default()
@@ -2267,23 +2795,44 @@ async fn execute_snapshot_exact_lookup(
         .into_iter()
         .collect::<Vec<_>>();
     row_refs.sort();
-    row_refs
-        .into_iter()
-        .take(limit)
-        .map(|row_ref| snapshot_row_to_value(cache, row_ref))
-        .collect()
+    Ok(row_refs.into_iter().take(limit).collect())
 }
 
 async fn execute_snapshot_key_range_lookup(
     cache: &SnapshotLookupCache,
     eq_field: &str,
-    eq_value: &str,
+    eq_value: &SnapshotLookupKey,
     order_field: &str,
     descending: bool,
     range: Option<&RangeLookupPredicate>,
     limit: usize,
 ) -> Result<Vec<Value>, String> {
-    let shard_index = snapshot_lookup_shard_for_key(eq_value, cache.shard_count);
+    let row_refs = execute_snapshot_key_range_lookup_row_refs(
+        cache,
+        eq_field,
+        eq_value,
+        order_field,
+        descending,
+        range,
+        limit,
+    )
+    .await?;
+    row_refs
+        .into_iter()
+        .map(|row_ref| snapshot_row_to_value(cache, row_ref))
+        .collect()
+}
+
+async fn execute_snapshot_key_range_lookup_row_refs(
+    cache: &SnapshotLookupCache,
+    eq_field: &str,
+    eq_value: &SnapshotLookupKey,
+    order_field: &str,
+    descending: bool,
+    range: Option<&RangeLookupPredicate>,
+    limit: usize,
+) -> Result<Vec<SnapshotRowRef>, String> {
+    let shard_index = snapshot_lookup_shard_for_lookup_key(eq_value, cache.shard_count);
     let row_refs = cache.workers[shard_index]
         .key_range_rows(
             eq_field,
@@ -2294,62 +2843,67 @@ async fn execute_snapshot_key_range_lookup(
             limit,
         )
         .await?;
-    row_refs
-        .into_iter()
-        .map(|row_ref| snapshot_row_to_value(cache, row_ref))
-        .collect()
+    Ok(row_refs)
 }
 
-fn snapshot_row_matches_range_in_rows(
-    rows: &[Arc<SnapshotLookupRow>],
+fn snapshot_row_matches_range(
+    row_store: &SnapshotLookupRowStore,
     row_ref: SnapshotRowRef,
     range: &RangeLookupPredicate,
 ) -> Result<bool, String> {
-    let Some(value) = snapshot_row_field_value_in_rows(rows, row_ref, &range.field) else {
+    let Some(value) = snapshot_row_field_value(row_store, row_ref, &range.field) else {
         return Ok(false);
     };
     if value.is_null() {
         return Ok(false);
     }
     if let Some(bound) = range.gt.as_ref() {
-        if compare_values(value, bound) != Ordering::Greater {
+        if compare_values(&value, bound) != Ordering::Greater {
             return Ok(false);
         }
     }
     if let Some(bound) = range.gte.as_ref() {
-        if compare_values(value, bound) == Ordering::Less {
+        if compare_values(&value, bound) == Ordering::Less {
             return Ok(false);
         }
     }
     if let Some(bound) = range.lt.as_ref() {
-        if compare_values(value, bound) != Ordering::Less {
+        if compare_values(&value, bound) != Ordering::Less {
             return Ok(false);
         }
     }
     if let Some(bound) = range.lte.as_ref() {
-        if compare_values(value, bound) == Ordering::Greater {
+        if compare_values(&value, bound) == Ordering::Greater {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
-fn snapshot_row_field_value_in_rows<'a>(
-    rows: &'a [Arc<SnapshotLookupRow>],
+fn snapshot_row_field_value(
+    row_store: &SnapshotLookupRowStore,
     row_ref: SnapshotRowRef,
     field: &str,
-) -> Option<&'a Value> {
-    rows.get(row_ref.0).and_then(|row| row.values.get(field))
+) -> Option<Value> {
+    row_store.row_field_value(row_ref, field).ok().flatten()
 }
 
 fn snapshot_row_to_value(
     cache: &SnapshotLookupCache,
     row_ref: SnapshotRowRef,
 ) -> Result<Value, String> {
-    let Some(row) = cache.rows.get(row_ref.0) else {
-        return Err("Snapshot lookup cache row is missing".to_string());
-    };
-    Ok(Value::Object(row.values.clone()))
+    cache.row_store.row_value(row_ref)
+}
+
+fn snapshot_row_to_projected_value(
+    cache: &SnapshotLookupCache,
+    row_ref: SnapshotRowRef,
+    request: &ReadPlan,
+) -> Result<Value, String> {
+    let select_fields = normalized_select(request.select.clone());
+    cache
+        .row_store
+        .projected_row_value(row_ref, select_fields.as_deref())
 }
 
 async fn maybe_execute_exact_lookup(
@@ -2487,14 +3041,14 @@ fn exact_lookup_predicates(request: &ReadPlan) -> Option<Vec<ExactLookupPredicat
         }
 
         let values = if let Some(value) = filter.eq.as_ref() {
-            vec![normalize_exact_lookup_value(value)?]
+            vec![encode_exact_lookup_key(value)?]
         } else if let Some(values) = filter.in_values.as_ref() {
             if values.is_empty() || values.len() > MAX_IN_VALUES {
                 return None;
             }
             let mut normalized = values
                 .iter()
-                .map(normalize_exact_lookup_value)
+                .map(encode_exact_lookup_key)
                 .collect::<Option<Vec<_>>>()?;
             normalized.sort();
             normalized.dedup();
@@ -2529,6 +3083,23 @@ fn normalize_exact_lookup_value(value: &Value) -> Option<String> {
     }
 }
 
+fn encode_exact_lookup_key(value: &Value) -> Option<SnapshotLookupKey> {
+    let (prefix, text) = match value {
+        Value::String(text) => (b's', text.clone()),
+        Value::Number(number) => (b'n', number.to_string()),
+        Value::Bool(boolean) => (b'b', boolean.to_string()),
+        _ => return None,
+    };
+    let mut encoded = Vec::with_capacity(1 + text.len());
+    encoded.push(prefix);
+    encoded.extend_from_slice(text.as_bytes());
+    Some(SnapshotLookupKey(encoded.into_boxed_slice()))
+}
+
+fn exact_lookup_key_sql_text(value: &SnapshotLookupKey) -> Option<&str> {
+    std::str::from_utf8(value.0.get(1..)?).ok()
+}
+
 fn exact_index_extension_file(extension_files: &[ExtensionFile]) -> Option<&ExtensionFile> {
     extension_files
         .iter()
@@ -2548,22 +3119,24 @@ async fn load_exact_lookup_doc_ids(
             .map_err(|error| error.to_string())?;
         let predicate_sql = predicates
             .iter()
-            .map(|predicate| {
+            .map(|predicate| -> Result<String, String> {
                 let escaped_field = sql_escape_text(&predicate.field);
                 let values_sql = predicate
                     .values
                     .iter()
-                    .map(|value| {
-                        format!(
+                    .map(|value| -> Result<String, String> {
+                        let value = exact_lookup_key_sql_text(value)
+                            .ok_or_else(|| "Exact lookup key was not valid utf-8".to_string())?;
+                        Ok(format!(
                             "(field_name = '{}' AND field_value = '{}')",
                             escaped_field,
                             sql_escape_text(value)
-                        )
+                        ))
                     })
-                    .collect::<Vec<_>>();
-                format!("({})", values_sql.join(" OR "))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(format!("({})", values_sql.join(" OR ")))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let sql = format!(
             "SELECT doc_id FROM {local_name} WHERE {} GROUP BY doc_id HAVING COUNT(*) = {} LIMIT {}",
             predicate_sql.join(" OR "),
@@ -5276,6 +5849,9 @@ mod tests {
     use crate::serving_plan::{
         ServingPredicate, ServingQueryClassification, ServingRequestPlan, ServingSort,
     };
+    use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
@@ -5417,12 +5993,155 @@ mod tests {
                 })
                 .collect(),
         );
+        let row_store = Arc::new(super::SnapshotLookupRowStore::InMemory(rows.clone()));
         super::SnapshotLookupCache {
-            rows: rows.clone(),
+            row_store: row_store.clone(),
+            row_count: rows.len(),
             estimated_bytes,
             shard_count: super::SNAPSHOT_LOOKUP_SHARD_COUNT,
-            workers: super::spawn_snapshot_lookup_workers(rows),
+            workers: super::spawn_snapshot_lookup_workers(
+                row_store,
+                super::build_snapshot_lookup_exact_index_shards_from_rows(rows.as_ref()),
+            ),
         }
+    }
+
+    fn snapshot_lookup_record_batch(rows: &[serde_json::Value]) -> RecordBatch {
+        let tenants = rows
+            .iter()
+            .map(|row| {
+                row.get("tenant")
+                    .and_then(|value| value.as_str())
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        let timestamps = rows
+            .iter()
+            .map(|row| row.get("ts").and_then(|value| value.as_i64()).unwrap())
+            .collect::<Vec<_>>();
+        let event_ids = rows
+            .iter()
+            .map(|row| {
+                row.get("event_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("tenant", DataType::Utf8, false),
+                Field::new("ts", DataType::Int64, false),
+                Field::new("event_id", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(tenants)) as ArrayRef,
+                Arc::new(Int64Array::from(timestamps)) as ArrayRef,
+                Arc::new(StringArray::from(event_ids)) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn snapshot_lookup_mmap_cache(
+        rows: Vec<serde_json::Value>,
+    ) -> super::SnapshotLookupCache {
+        let batch = snapshot_lookup_record_batch(&rows);
+        let bytes = super::record_batches_to_snapshot_lookup_mmap_bytes(&vec![batch]).unwrap();
+        let local_path = std::env::temp_dir().join(format!(
+            "powdrr-snapshot-lookup-test-{}.bin",
+            idgenerator::IdInstance::next_id()
+        ));
+        std::fs::write(&local_path, &bytes).unwrap();
+        let mmap_rows =
+            Arc::new(super::MmapSnapshotLookupRows::open(local_path.as_path()).unwrap());
+        let row_count = mmap_rows.row_count;
+        let row_store = Arc::new(super::SnapshotLookupRowStore::Mmap(mmap_rows));
+        super::SnapshotLookupCache {
+            row_store: row_store.clone(),
+            row_count,
+            estimated_bytes: bytes.len() as u64,
+            shard_count: super::SNAPSHOT_LOOKUP_SHARD_COUNT,
+            workers: super::spawn_snapshot_lookup_workers(
+                row_store.clone(),
+                super::build_snapshot_lookup_exact_index_shards_from_store(row_store.as_ref())
+                    .unwrap(),
+            ),
+        }
+    }
+
+    fn snapshot_exact_lookup_record_batch(rows: &[serde_json::Value]) -> RecordBatch {
+        let ids = rows
+            .iter()
+            .map(|row| {
+                row.get("_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        let id_seq_nos = rows
+            .iter()
+            .map(|row| {
+                row.get("_id_seq_no")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string())
+            })
+            .collect::<Vec<_>>();
+        let seq_nos = rows
+            .iter()
+            .map(|row| row.get("_seq_no").and_then(|value| value.as_i64()).unwrap())
+            .collect::<Vec<_>>();
+        let versions = rows
+            .iter()
+            .map(|row| {
+                row.get("_version")
+                    .and_then(|value| value.as_i64())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let sources = rows
+            .iter()
+            .map(|row| row.get("_source").unwrap().to_string())
+            .collect::<Vec<_>>();
+
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("_id", DataType::Utf8, false),
+                Field::new("_id_seq_no", DataType::Utf8, true),
+                Field::new("_seq_no", DataType::Int64, false),
+                Field::new("_version", DataType::Int64, false),
+                Field::new("_source", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(ids)) as ArrayRef,
+                Arc::new(StringArray::from(id_seq_nos)) as ArrayRef,
+                Arc::new(Int64Array::from(seq_nos)) as ArrayRef,
+                Arc::new(Int64Array::from(versions)) as ArrayRef,
+                Arc::new(StringArray::from(sources)) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn snapshot_exact_lookup_mmap_cache(
+        rows: Vec<serde_json::Value>,
+    ) -> super::SnapshotExactLookupCache {
+        let batch = snapshot_exact_lookup_record_batch(&rows);
+        let bytes =
+            super::record_batches_to_snapshot_exact_lookup_mmap_bytes(&vec![batch]).unwrap();
+        let local_path = std::env::temp_dir().join(format!(
+            "powdrr-snapshot-exact-lookup-test-{}.bin",
+            idgenerator::IdInstance::next_id()
+        ));
+        std::fs::write(&local_path, &bytes).unwrap();
+        super::build_snapshot_exact_lookup_cache(&super::SnapshotExactLookupArtifact::Mmap(
+            format!("file://{}", local_path.display()),
+        ))
+        .await
+        .unwrap()
     }
 
     fn aggregate_spec() -> ServingAggregateSpec {
@@ -6833,11 +7552,11 @@ mod tests {
             &vec![
                 super::ExactLookupPredicate {
                     field: "tenant".to_string(),
-                    values: vec!["acme".to_string()],
+                    values: vec![super::encode_exact_lookup_key(&json!("acme")).unwrap()],
                 },
                 super::ExactLookupPredicate {
                     field: "ts".to_string(),
-                    values: vec!["20".to_string()],
+                    values: vec![super::encode_exact_lookup_key(&json!(20)).unwrap()],
                 },
             ],
             10,
@@ -6864,7 +7583,7 @@ mod tests {
         let rows = super::execute_snapshot_key_range_lookup(
             &cache,
             "tenant",
-            "acme",
+            &super::encode_exact_lookup_key(&json!("acme")).unwrap(),
             "ts",
             true,
             Some(&super::RangeLookupPredicate {
@@ -6885,6 +7604,166 @@ mod tests {
                 json!({ "tenant": "acme", "ts": 30, "event_id": "evt-30" }),
                 json!({ "tenant": "acme", "ts": 20, "event_id": "evt-20" }),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_lookup_mmap_artifact_round_trips_rows() {
+        let rows = vec![
+            json!({ "tenant": "acme", "ts": 10, "event_id": "evt-10" }),
+            json!({ "tenant": "acme", "ts": 20, "event_id": "evt-20" }),
+        ];
+        let batch = snapshot_lookup_record_batch(&rows);
+        let bytes = super::record_batches_to_snapshot_lookup_mmap_bytes(&vec![batch]).unwrap();
+        let local_path = std::env::temp_dir().join(format!(
+            "powdrr-snapshot-lookup-roundtrip-{}.bin",
+            idgenerator::IdInstance::next_id()
+        ));
+        std::fs::write(&local_path, &bytes).unwrap();
+
+        let mmap_rows = super::MmapSnapshotLookupRows::open(local_path.as_path()).unwrap();
+        assert_eq!(mmap_rows.row_count, 2);
+        assert_eq!(
+            mmap_rows.row_value(super::SnapshotRowRef(1)).unwrap(),
+            json!({ "tenant": "acme", "ts": 20, "event_id": "evt-20" })
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_exact_lookup_mmap_artifact_round_trips_source_object() {
+        let rows = vec![json!({
+            "_id": "doc-1",
+            "_id_seq_no": "doc-1#1",
+            "_seq_no": 7,
+            "_version": 3,
+            "_source": { "tenant": "acme", "score": 20 }
+        })];
+        let batch = snapshot_exact_lookup_record_batch(&rows);
+        let bytes =
+            super::record_batches_to_snapshot_exact_lookup_mmap_bytes(&vec![batch]).unwrap();
+        let local_path = std::env::temp_dir().join(format!(
+            "powdrr-snapshot-exact-lookup-roundtrip-{}.bin",
+            idgenerator::IdInstance::next_id()
+        ));
+        std::fs::write(&local_path, &bytes).unwrap();
+
+        let mmap_rows = super::MmapSnapshotLookupRows::open(local_path.as_path()).unwrap();
+        assert_eq!(
+            mmap_rows.row_value(super::SnapshotRowRef(0)).unwrap(),
+            json!({
+                "_id": "doc-1",
+                "_id_seq_no": "doc-1#1",
+                "_seq_no": 7,
+                "_version": 3,
+                "_source": { "tenant": "acme", "score": 20 }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_exact_lookup_mmap_cache_prefers_latest_seq_no() {
+        let cache = snapshot_exact_lookup_mmap_cache(vec![
+            json!({
+                "_id": "doc-1",
+                "_id_seq_no": "doc-1#1",
+                "_seq_no": 1,
+                "_version": 1,
+                "_source": { "tenant": "acme", "score": 10 }
+            }),
+            json!({
+                "_id": "doc-1",
+                "_id_seq_no": "doc-1#2",
+                "_seq_no": 2,
+                "_version": 2,
+                "_source": { "tenant": "acme", "score": 20 }
+            }),
+        ])
+        .await;
+
+        let entry = cache
+            .entries_by_id
+            .get(&super::encode_exact_lookup_key(&json!("doc-1")).unwrap())
+            .expect("doc id should be indexed");
+        assert_eq!(
+            cache.row_store.row_value(entry.row_ref).unwrap(),
+            json!({
+                "_id": "doc-1",
+                "_id_seq_no": "doc-1#2",
+                "_seq_no": 2,
+                "_version": 2,
+                "_source": { "tenant": "acme", "score": 20 }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_snapshot_exact_lookup_uses_mmap_backed_cache() {
+        let cache = snapshot_lookup_mmap_cache(vec![
+            json!({ "tenant": "acme", "ts": 10, "event_id": "evt-10" }),
+            json!({ "tenant": "acme", "ts": 20, "event_id": "evt-20" }),
+            json!({ "tenant": "omega", "ts": 20, "event_id": "evt-omega-20" }),
+        ])
+        .await;
+
+        let rows = super::execute_snapshot_exact_lookup(
+            &cache,
+            &vec![
+                super::ExactLookupPredicate {
+                    field: "tenant".to_string(),
+                    values: vec![super::encode_exact_lookup_key(&json!("acme")).unwrap()],
+                },
+                super::ExactLookupPredicate {
+                    field: "ts".to_string(),
+                    values: vec![super::encode_exact_lookup_key(&json!(20)).unwrap()],
+                },
+            ],
+            10,
+        )
+        .await
+        .expect("exact lookup should succeed");
+
+        assert_eq!(
+            rows,
+            vec![json!({ "tenant": "acme", "ts": 20, "event_id": "evt-20" })]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_snapshot_exact_lookup_distinguishes_string_and_numeric_keys() {
+        let cache = snapshot_lookup_cache(vec![
+            json!({ "tenant": "acme", "bucket": "20", "event_id": "evt-string" }),
+            json!({ "tenant": "acme", "bucket": 20, "event_id": "evt-number" }),
+        ])
+        .await;
+
+        let string_rows = super::execute_snapshot_exact_lookup(
+            &cache,
+            &vec![super::ExactLookupPredicate {
+                field: "bucket".to_string(),
+                values: vec![super::encode_exact_lookup_key(&json!("20")).unwrap()],
+            }],
+            10,
+        )
+        .await
+        .expect("string exact lookup should succeed");
+        assert_eq!(
+            string_rows,
+            vec![json!({ "tenant": "acme", "bucket": "20", "event_id": "evt-string" })]
+        );
+
+        let number_rows = super::execute_snapshot_exact_lookup(
+            &cache,
+            &vec![super::ExactLookupPredicate {
+                field: "bucket".to_string(),
+                values: vec![super::encode_exact_lookup_key(&json!(20)).unwrap()],
+            }],
+            10,
+        )
+        .await
+        .expect("numeric exact lookup should succeed");
+        assert_eq!(
+            number_rows,
+            vec![json!({ "tenant": "acme", "bucket": 20, "event_id": "evt-number" })]
         );
     }
 

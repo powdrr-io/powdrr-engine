@@ -3,6 +3,7 @@ mod elastic_search_cluster_info;
 pub mod elastic_search_endpoints;
 pub mod elastic_search_http_types;
 pub mod elastic_search_lifetime_policy;
+mod exact_lookup;
 pub mod lakehouse_serving_endpoints;
 pub mod mongodb_protocol;
 pub mod mongodb_wire_protocol;

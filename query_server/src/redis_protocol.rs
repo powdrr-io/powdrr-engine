@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::elastic_search_http_types::NamePathExtractor;
+use crate::exact_lookup::{
+    ActiveCheckpointLookupError, execute_active_checkpoint_exact_lookup_batch_rows,
+    load_active_checkpoint as load_shared_active_checkpoint,
+};
 use powdrr_query_lib::data_contract::{
     CreateTable, RedisTableConfig, TableDescription, TableMetadataCheckpoint,
 };
@@ -19,7 +23,6 @@ use powdrr_query_lib::serving_plan::{
     ServingPredicate, ServingQueryClassification, ServingRequestPlan,
 };
 use powdrr_query_runtime::lakehouse_serving::{ServingQueryError, execute_serving_query};
-use powdrr_query_runtime::peers::CheckpointDescriptor;
 use powdrr_query_runtime::state_provider::{STATE_PROVIDER, ServiceApiError};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -387,7 +390,9 @@ async fn execute_get(
     };
 
     let binding = load_redis_database_binding(selected_db).await?;
-    let value = fetch_redis_value(&binding, key).await?;
+    let keys = vec![key.to_string()];
+    let values = fetch_redis_values(&binding, &keys).await?;
+    let value = values.into_iter().next().unwrap_or(None);
     Ok(RedisCommandResult {
         response: value
             .map(RespValue::BulkString)
@@ -407,15 +412,15 @@ async fn execute_mget(
     }
 
     let binding = load_redis_database_binding(selected_db).await?;
-    let mut values = Vec::with_capacity(args.len());
-    for key in args {
-        let value = fetch_redis_value(&binding, key).await?;
-        values.push(
+    let values = fetch_redis_values(&binding, args).await?;
+    let values = values
+        .into_iter()
+        .map(|value| {
             value
                 .map(RespValue::BulkString)
-                .unwrap_or(RespValue::NullBulkString),
-        );
-    }
+                .unwrap_or(RespValue::NullBulkString)
+        })
+        .collect();
 
     Ok(RedisCommandResult {
         response: RespValue::Array(values),
@@ -434,12 +439,11 @@ async fn execute_exists(
     }
 
     let binding = load_redis_database_binding(selected_db).await?;
-    let mut count = 0i64;
-    for key in args {
-        if fetch_redis_value(&binding, key).await?.is_some() {
-            count += 1;
-        }
-    }
+    let count = fetch_redis_values(&binding, args)
+        .await?
+        .into_iter()
+        .filter(|value| value.is_some())
+        .count() as i64;
 
     Ok(RedisCommandResult {
         response: RespValue::Integer(count),
@@ -447,57 +451,99 @@ async fn execute_exists(
     })
 }
 
-async fn fetch_redis_value(
-    binding: &RedisTableBinding,
-    key: &str,
-) -> Result<Option<Vec<u8>>, RedisCommandError> {
-    let response = execute_serving_query(
-        &binding.table_name,
-        ServingRequestPlan {
-            select: Some(vec![binding.config.value_field.clone()]),
-            filters: vec![ServingPredicate {
-                field: binding.config.key_field.clone(),
-                eq: Some(json!(key)),
-                in_values: None,
-                gt: None,
-                gte: None,
-                lt: None,
-                lte: None,
-            }],
-            aggregate: None,
-            order_by: vec![],
-            limit: Some(2),
-            allow_slow_path: false,
-            explain: false,
-        },
-    )
-    .await
-    .map_err(convert_serving_error)?;
+fn redis_lookup_request(binding: &RedisTableBinding, key: &str) -> ServingRequestPlan {
+    ServingRequestPlan {
+        select: Some(vec![binding.config.value_field.clone()]),
+        filters: vec![ServingPredicate {
+            field: binding.config.key_field.clone(),
+            eq: Some(json!(key)),
+            in_values: None,
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: None,
+        }],
+        aggregate: None,
+        order_by: vec![],
+        limit: Some(2),
+        allow_slow_path: false,
+        explain: false,
+    }
+}
 
-    if response.classification != ServingQueryClassification::FastPath {
-        return Err(RedisCommandError::validation(
-            response
-                .reason
-                .unwrap_or_else(|| "Query did not qualify for the serving fast path".to_string()),
-        ));
+async fn fetch_redis_values(
+    binding: &RedisTableBinding,
+    keys: &[String],
+) -> Result<Vec<Option<Vec<u8>>>, RedisCommandError> {
+    let requests = keys
+        .iter()
+        .map(|key| redis_lookup_request(binding, key))
+        .collect::<Vec<_>>();
+
+    if let Some(row_sets) =
+        execute_fast_path_point_lookup_batch_rows(&binding.table_name, &requests).await?
+    {
+        let mut values = Vec::with_capacity(row_sets.len());
+        for (key, rows) in keys.iter().zip(row_sets.into_iter()) {
+            values.push(redis_value_from_rows(
+                &binding.table_name,
+                &binding.config.value_field,
+                key,
+                rows,
+            )?);
+        }
+        return Ok(values);
     }
 
-    if response.rows.len() > 1 {
+    let mut values = Vec::with_capacity(requests.len());
+    for (key, request) in keys.iter().zip(requests.into_iter()) {
+        let response = execute_serving_query(&binding.table_name, request)
+            .await
+            .map_err(convert_serving_error)?;
+        if response.classification != ServingQueryClassification::FastPath {
+            return Err(RedisCommandError::validation(
+                response.reason.unwrap_or_else(|| {
+                    "Query did not qualify for the serving fast path".to_string()
+                }),
+            ));
+        }
+        values.push(redis_value_from_rows(
+            &binding.table_name,
+            &binding.config.value_field,
+            key,
+            response.rows,
+        )?);
+    }
+    Ok(values)
+}
+
+fn redis_value_from_rows(
+    table_name: &str,
+    value_field: &str,
+    key: &str,
+    rows: Vec<Value>,
+) -> Result<Option<Vec<u8>>, RedisCommandError> {
+    if rows.len() > 1 {
         return Err(RedisCommandError::internal(format!(
             "Redis key {} matched multiple rows in table {}",
-            key, binding.table_name
+            key, table_name
         )));
     }
-
-    let row = match response.rows.into_iter().next() {
+    let row = match rows.into_iter().next() {
         Some(row) => row,
         None => return Ok(None),
     };
-    let value = row
-        .get(&binding.config.value_field)
-        .cloned()
-        .unwrap_or(Value::Null);
+    let value = row.get(value_field).cloned().unwrap_or(Value::Null);
     Ok(redis_value_bytes(&value))
+}
+
+async fn execute_fast_path_point_lookup_batch_rows(
+    table_name: &str,
+    requests: &[ServingRequestPlan],
+) -> Result<Option<Vec<Vec<Value>>>, RedisCommandError> {
+    execute_active_checkpoint_exact_lookup_batch_rows(table_name, requests)
+        .await
+        .map_err(convert_active_checkpoint_lookup_error)
 }
 
 fn redis_value_bytes(value: &Value) -> Option<Vec<u8>> {
@@ -593,30 +639,16 @@ async fn load_table_description(table_name: &str) -> Result<TableDescription, Re
 }
 
 async fn load_table_schema(table_name: &str) -> Result<PowdrrSchema, RedisCommandError> {
-    let checkpoint_id = STATE_PROVIDER
-        .get_published_active_servable_checkpoint(&table_name.to_string())
-        .await
-        .map_err(service_error)?
-        .ok_or_else(|| {
-            RedisCommandError::namespace_not_found(format!(
-                "No checkpoint was available for table {}",
-                table_name
-            ))
-        })?;
-    let checkpoint = STATE_PROVIDER
-        .get_checkpoint(CheckpointDescriptor::new(
-            table_name.to_string(),
-            checkpoint_id,
-        ))
-        .await
-        .map_err(service_error)?
-        .ok_or_else(|| {
-            RedisCommandError::namespace_not_found(format!(
-                "Checkpoint metadata was not found for table {}",
-                table_name
-            ))
-        })?;
+    let checkpoint = load_active_checkpoint(table_name).await?;
     schema_from_checkpoint(&checkpoint)
+}
+
+async fn load_active_checkpoint(
+    table_name: &str,
+) -> Result<TableMetadataCheckpoint, RedisCommandError> {
+    load_shared_active_checkpoint(table_name)
+        .await
+        .map_err(convert_active_checkpoint_lookup_error)
 }
 
 fn schema_from_checkpoint(
@@ -681,6 +713,15 @@ fn convert_serving_error(error: ServingQueryError) -> RedisCommandError {
             RedisCommandError::validation(error.message)
         }
         _ => RedisCommandError::internal(error.message),
+    }
+}
+
+fn convert_active_checkpoint_lookup_error(error: ActiveCheckpointLookupError) -> RedisCommandError {
+    match error {
+        ActiveCheckpointLookupError::NotFound(message) => {
+            RedisCommandError::namespace_not_found(message)
+        }
+        ActiveCheckpointLookupError::Internal(message) => RedisCommandError::internal(message),
     }
 }
 

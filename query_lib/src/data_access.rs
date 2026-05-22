@@ -1276,6 +1276,10 @@ enum CacheTrackerActorMessage {
         file_path: String,
         payload: Vec<u8>,
     },
+    MaterializeLocalFile {
+        respond_to: oneshot::Sender<Result<PathBuf, DataFusionError>>,
+        file_path: String,
+    },
     DropIcebergTable {
         respond_to: oneshot::Sender<Result<(), iceberg::Error>>,
         namespace: String,
@@ -1698,6 +1702,14 @@ impl CacheTrackerActor {
                 };
                 respond_to.send(retval).expect("Failed to send response");
             }
+            CacheTrackerActorMessage::MaterializeLocalFile {
+                respond_to,
+                file_path,
+            } => {
+                respond_to
+                    .send(materialize_local_file_direct(&self.s3_file_store, &file_path).await)
+                    .expect("Failed to send response");
+            }
             CacheTrackerActorMessage::DropIcebergTable {
                 respond_to,
                 namespace,
@@ -2075,6 +2087,17 @@ impl LRUCacheHandle {
 
         let _ = self.sender.send(msg).await;
         // TODO: deal with errors
+        recv.await.expect("Actor task has been killed")
+    }
+
+    async fn materialize_local_file(&self, file_path: &String) -> Result<PathBuf, DataFusionError> {
+        let (send, recv) = oneshot::channel();
+        let msg = CacheTrackerActorMessage::MaterializeLocalFile {
+            respond_to: send,
+            file_path: file_path.clone(),
+        };
+
+        let _ = self.sender.send(msg).await;
         recv.await.expect("Actor task has been killed")
     }
 
@@ -2456,6 +2479,64 @@ async fn read_file_bytes_direct(
     }
 }
 
+fn materialized_file_cache_root() -> PathBuf {
+    std::env::temp_dir()
+        .join("powdrr-engine")
+        .join("materialized-artifacts")
+}
+
+fn materialized_file_cache_path(file_path: &str) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    file_path.hash(&mut hasher);
+    let extension = Path::new(normalize_local_file_path(file_path))
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .filter(|ext| !ext.is_empty())
+        .unwrap_or("bin");
+    materialized_file_cache_root().join(format!("{:016x}.{}", hasher.finish(), extension))
+}
+
+async fn materialize_local_file_direct(
+    s3_file_store: &Arc<AmazonS3>,
+    file_path: &String,
+) -> Result<PathBuf, DataFusionError> {
+    if !file_path.starts_with("s3://") {
+        return Path::new(normalize_local_file_path(file_path))
+            .canonicalize()
+            .map_err(DataFusionError::IoError);
+    }
+
+    let cache_root = materialized_file_cache_root();
+    std::fs::create_dir_all(&cache_root).map_err(DataFusionError::IoError)?;
+
+    let target_path = materialized_file_cache_path(file_path);
+    if target_path.exists() {
+        return Ok(target_path);
+    }
+
+    let file_bytes = read_file_bytes_direct(s3_file_store, file_path).await?;
+    let tmp_path = cache_root.join(format!(
+        "{}.tmp-{}",
+        target_path
+            .file_name()
+            .and_then(|file_name| file_name.to_str())
+            .unwrap_or("artifact"),
+        IdInstance::next_id()
+    ));
+    std::fs::write(&tmp_path, &file_bytes).map_err(DataFusionError::IoError)?;
+    match std::fs::rename(&tmp_path, &target_path) {
+        Ok(_) => Ok(target_path),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&tmp_path);
+            Ok(target_path)
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(DataFusionError::IoError(error))
+        }
+    }
+}
+
 async fn load_arrow_as_memtable(
     data_fusion_context: &SessionContext,
     s3_file_store: &Arc<AmazonS3>,
@@ -2536,6 +2617,10 @@ pub async fn load_files_as_table(
     LRU_CACHE_HANDLE
         .create_multi_table(new_local_name, file_paths, schema)
         .await
+}
+
+pub async fn materialize_local_file(file_path: &String) -> Result<PathBuf, DataFusionError> {
+    LRU_CACHE_HANDLE.materialize_local_file(file_path).await
 }
 
 #[allow(dead_code)]
