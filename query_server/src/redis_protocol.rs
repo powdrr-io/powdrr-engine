@@ -1,4 +1,8 @@
-use std::pin::Pin;
+use std::{
+    collections::{HashMap, HashSet},
+    pin::Pin,
+    sync::{LazyLock, Mutex},
+};
 
 use futures_util::future::FutureExt;
 use gotham::handler::HandlerFuture;
@@ -59,6 +63,17 @@ struct RedisTableBinding {
     table_name: String,
     config: RedisTableConfig,
 }
+
+#[derive(Clone, Debug)]
+struct ResolvedRedisDatabaseBinding {
+    binding: RedisTableBinding,
+    active_checkpoint_id: String,
+    known_fields: HashSet<String>,
+    all_fields: Vec<String>,
+}
+
+static REDIS_DATABASE_BINDING_CACHE: LazyLock<Mutex<HashMap<u32, ResolvedRedisDatabaseBinding>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 impl RedisCommandError {
     fn validation(message: impl Into<String>) -> Self {
@@ -186,6 +201,7 @@ pub fn put_redis_config(mut state: State) -> Pin<Box<HandlerFuture>> {
                 .upsert_table_metadata(&request)
                 .await
                 .map_err(service_error)?;
+            clear_redis_database_binding_cache();
 
             Ok::<_, RedisCommandError>(RedisConfigResponse {
                 acknowledged: true,
@@ -495,8 +511,7 @@ async fn execute_hget(
     };
 
     let binding = load_redis_database_binding(selected_db).await?;
-    let schema = load_table_schema(&binding.table_name).await?;
-    let select = select_known_fields(&schema, &[field.to_string()]);
+    let select = select_known_fields(&binding.known_fields, &[field.to_string()]);
     let row = fetch_redis_row(&binding, key, &select).await?;
     Ok(RedisCommandResult {
         response: redis_field_bytes(row.as_ref(), field)
@@ -522,8 +537,7 @@ async fn execute_hmget(
     }
 
     let binding = load_redis_database_binding(selected_db).await?;
-    let schema = load_table_schema(&binding.table_name).await?;
-    let select = select_known_fields(&schema, fields);
+    let select = select_known_fields(&binding.known_fields, fields);
     let row = fetch_redis_row(&binding, key, &select).await?;
     let values = fields
         .iter()
@@ -551,12 +565,7 @@ async fn execute_hgetall(
     };
 
     let binding = load_redis_database_binding(selected_db).await?;
-    let schema = load_table_schema(&binding.table_name).await?;
-    let fields = schema
-        .fields()
-        .iter()
-        .map(|field| field.name.clone())
-        .collect::<Vec<_>>();
+    let fields = binding.all_fields.clone();
     let row = fetch_redis_row(&binding, key, &fields).await?;
 
     let Some(row) = row.as_ref() else {
@@ -593,8 +602,7 @@ async fn execute_hexists(
     };
 
     let binding = load_redis_database_binding(selected_db).await?;
-    let schema = load_table_schema(&binding.table_name).await?;
-    let select = select_known_fields(&schema, &[field.to_string()]);
+    let select = select_known_fields(&binding.known_fields, &[field.to_string()]);
     let row = fetch_redis_row(&binding, key, &select).await?;
     let exists = redis_field_bytes(row.as_ref(), field).is_some();
 
@@ -649,7 +657,7 @@ fn redis_lookup_request(key_field: &str, key: &str, select: Vec<String>) -> Serv
 }
 
 async fn fetch_redis_values(
-    binding: &RedisTableBinding,
+    binding: &ResolvedRedisDatabaseBinding,
     keys: &[String],
     value_field: &str,
 ) -> Result<Vec<Option<Vec<u8>>>, RedisCommandError> {
@@ -659,14 +667,14 @@ async fn fetch_redis_values(
         .zip(rows.into_iter())
         .map(|rows| {
             let (key, rows) = rows;
-            redis_row_from_rows(&binding.table_name, key, rows)
+            redis_row_from_rows(&binding.binding.table_name, key, rows)
                 .map(|row| redis_field_bytes(row.as_ref(), value_field))
         })
         .collect()
 }
 
 async fn fetch_redis_row(
-    binding: &RedisTableBinding,
+    binding: &ResolvedRedisDatabaseBinding,
     key: &str,
     select: &[String],
 ) -> Result<Option<Value>, RedisCommandError> {
@@ -675,31 +683,31 @@ async fn fetch_redis_row(
     }
     let rows = fetch_redis_rows(binding, &[key.to_string()], select).await?;
     redis_row_from_rows(
-        &binding.table_name,
+        &binding.binding.table_name,
         key,
         rows.into_iter().next().unwrap_or_default(),
     )
 }
 
 async fn fetch_redis_rows(
-    binding: &RedisTableBinding,
+    binding: &ResolvedRedisDatabaseBinding,
     keys: &[String],
     select: &[String],
 ) -> Result<Vec<Vec<Value>>, RedisCommandError> {
     let requests = keys
         .iter()
-        .map(|key| redis_lookup_request(&binding.config.key_field, key, select.to_vec()))
+        .map(|key| redis_lookup_request(&binding.binding.config.key_field, key, select.to_vec()))
         .collect::<Vec<_>>();
 
     if let Some(row_sets) =
-        execute_fast_path_point_lookup_batch_rows(&binding.table_name, &requests).await?
+        execute_fast_path_point_lookup_batch_rows(&binding.binding.table_name, &requests).await?
     {
         return Ok(row_sets);
     }
 
     let mut values = Vec::with_capacity(requests.len());
     for request in requests {
-        let response = execute_serving_query(&binding.table_name, request)
+        let response = execute_serving_query(&binding.binding.table_name, request)
             .await
             .map_err(convert_serving_error)?;
         if response.classification != ServingQueryClassification::FastPath {
@@ -758,9 +766,9 @@ fn parse_database(database: &str) -> Result<u32, RedisCommandError> {
 }
 
 fn configured_redis_value_field<'a>(
-    binding: &'a RedisTableBinding,
+    binding: &'a ResolvedRedisDatabaseBinding,
 ) -> Result<&'a str, RedisCommandError> {
-    binding.config.value_field.as_deref().ok_or_else(|| {
+    binding.binding.config.value_field.as_deref().ok_or_else(|| {
         RedisCommandError::validation(
             "Redis value_field must be configured to use GET, MGET, or EXISTS; use HGET, HMGET, HGETALL, or HEXISTS for multi-column row access",
         )
@@ -777,13 +785,16 @@ fn unique_fields(fields: &[String]) -> Vec<String> {
     unique
 }
 
-fn select_known_fields(schema: &PowdrrSchema, fields: &[String]) -> Vec<String> {
-    let schema_map = schema.to_map();
+fn select_known_fields(known_fields: &HashSet<String>, fields: &[String]) -> Vec<String> {
     let unique = unique_fields(fields);
     unique
         .into_iter()
-        .filter(|field| schema_map.contains_key(field))
+        .filter(|field| known_fields.contains(field))
         .collect()
+}
+
+fn clear_redis_database_binding_cache() {
+    REDIS_DATABASE_BINDING_CACHE.lock().unwrap().clear();
 }
 
 async fn list_redis_bindings() -> Result<Vec<RedisTableBinding>, RedisCommandError> {
@@ -812,24 +823,85 @@ async fn list_redis_bindings() -> Result<Vec<RedisTableBinding>, RedisCommandErr
 
 async fn load_redis_database_binding(
     database: u32,
-) -> Result<RedisTableBinding, RedisCommandError> {
+) -> Result<ResolvedRedisDatabaseBinding, RedisCommandError> {
+    let cached = {
+        REDIS_DATABASE_BINDING_CACHE
+            .lock()
+            .unwrap()
+            .get(&database)
+            .cloned()
+    };
+    if let Some(cached) = cached {
+        if let Ok(checkpoint) = load_active_checkpoint(&cached.binding.table_name).await {
+            if checkpoint.checkpoint_id == cached.active_checkpoint_id {
+                return Ok(cached);
+            }
+            let resolved = resolved_redis_database_binding_from_checkpoint(
+                cached.binding.clone(),
+                &checkpoint,
+            )?;
+            REDIS_DATABASE_BINDING_CACHE
+                .lock()
+                .unwrap()
+                .insert(database, resolved.clone());
+            return Ok(resolved);
+        }
+    }
+
+    refresh_redis_database_binding(database).await
+}
+
+async fn refresh_redis_database_binding(
+    database: u32,
+) -> Result<ResolvedRedisDatabaseBinding, RedisCommandError> {
     let matches = list_redis_bindings()
         .await?
         .into_iter()
         .filter(|binding| binding.config.enabled && binding.config.database == database)
         .collect::<Vec<_>>();
 
-    match matches.len() {
-        0 => Err(RedisCommandError::namespace_not_found(format!(
-            "Redis database {} is not configured",
-            database
-        ))),
-        1 => Ok(matches.into_iter().next().unwrap()),
-        _ => Err(RedisCommandError::internal(format!(
-            "Multiple Powdrr tables are exposed as Redis database {}",
-            database
-        ))),
-    }
+    let binding = match matches.len() {
+        0 => {
+            return Err(RedisCommandError::namespace_not_found(format!(
+                "Redis database {} is not configured",
+                database
+            )));
+        }
+        1 => matches.into_iter().next().unwrap(),
+        _ => {
+            return Err(RedisCommandError::internal(format!(
+                "Multiple Powdrr tables are exposed as Redis database {}",
+                database
+            )));
+        }
+    };
+
+    let checkpoint = load_active_checkpoint(&binding.table_name).await?;
+    let resolved = resolved_redis_database_binding_from_checkpoint(binding, &checkpoint)?;
+    REDIS_DATABASE_BINDING_CACHE
+        .lock()
+        .unwrap()
+        .insert(database, resolved.clone());
+    Ok(resolved)
+}
+
+fn resolved_redis_database_binding_from_checkpoint(
+    binding: RedisTableBinding,
+    checkpoint: &TableMetadataCheckpoint,
+) -> Result<ResolvedRedisDatabaseBinding, RedisCommandError> {
+    let schema = schema_from_checkpoint(checkpoint)?;
+    let all_fields = schema
+        .fields()
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<Vec<_>>();
+    let known_fields = all_fields.iter().cloned().collect::<HashSet<_>>();
+    Ok(ResolvedRedisDatabaseBinding {
+        binding,
+        active_checkpoint_id: checkpoint.checkpoint_id.clone(),
+        known_fields,
+        all_fields,
+    })
 }
 
 async fn validate_redis_database_uniqueness(
