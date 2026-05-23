@@ -680,6 +680,8 @@ pub struct CreateTable {
     #[serde(default)]
     pub serving: Option<ServingTableConfig>,
     #[serde(default)]
+    pub support: Option<SupportTableConfig>,
+    #[serde(default)]
     pub dynamodb: Option<DynamoDbTableConfig>,
     #[serde(default)]
     pub mongodb: Option<MongoDbTableConfig>,
@@ -694,6 +696,8 @@ pub struct TableDescription {
     #[serde(default)]
     pub serving: Option<ServingTableConfig>,
     #[serde(default)]
+    pub support: Option<SupportTableConfig>,
+    #[serde(default)]
     pub dynamodb: Option<DynamoDbTableConfig>,
     #[serde(default)]
     pub mongodb: Option<MongoDbTableConfig>,
@@ -707,6 +711,7 @@ impl TableDescription {
             name: create_table.name.clone(),
             tags: create_table.tags.clone(),
             serving: create_table.serving.clone(),
+            support: create_table.support.clone(),
             dynamodb: create_table.dynamodb.clone(),
             mongodb: create_table.mongodb.clone(),
             redis: create_table.redis.clone(),
@@ -754,6 +759,42 @@ pub struct ServingPattern {
     pub projection: Option<Vec<String>>,
     #[serde(default)]
     pub aggregate: Option<ServingAggregateSpec>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SupportKeySchemaConfig {
+    pub primary_key: String,
+    #[serde(default)]
+    pub range_key: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SupportElasticSearchTableConfig {}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SupportDynamoDbTableConfig {
+    #[serde(default)]
+    pub local_secondary_indexes: Vec<DynamoDbLocalSecondaryIndexConfig>,
+    #[serde(default)]
+    pub global_secondary_indexes: Vec<DynamoDbGlobalSecondaryIndexConfig>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SupportRedisTableConfig {
+    #[serde(default)]
+    pub database: u32,
+    pub value_field: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SupportTableConfig {
+    pub key_schema: SupportKeySchemaConfig,
+    #[serde(default)]
+    pub elasticsearch: Option<SupportElasticSearchTableConfig>,
+    #[serde(default)]
+    pub dynamodb: Option<SupportDynamoDbTableConfig>,
+    #[serde(default)]
+    pub redis: Option<SupportRedisTableConfig>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

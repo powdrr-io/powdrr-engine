@@ -5,7 +5,7 @@ use crate::data_contract::{
 };
 use crate::elastic_search_commands::LookupById;
 use crate::elastic_search_common::{
-    CommandContext, ElasticSearchResponse, MIME_ES_JSON, load_command_raw_result,
+    load_command_raw_result, CommandContext, ElasticSearchResponse, MIME_ES_JSON,
 };
 use crate::elastic_search_parser::UpdateBody;
 use crate::elastic_search_responses::{
@@ -14,13 +14,13 @@ use crate::elastic_search_responses::{
 use crate::elastic_search_storage_schema::{
     FullRecord, RecordDelete, RecordInput, SpeedboatCommitBuilder,
 };
-use crate::search_runtime::{SerdeValueResult, df_to_serde_value};
+use crate::search_runtime::{df_to_serde_value, SerdeValueResult};
 use crate::speedboat_buffer::{SpeedboatBufferError, WriteBuffer};
-use crate::state_provider::{STATE_PROVIDER, ServiceApiError};
+use crate::state_provider::{ServiceApiError, STATE_PROVIDER};
 use crate::util::{describe_table_log_error_then_none, log_err, log_service_err};
 use futures::FutureExt;
-use http::StatusCode;
 use http::header::LOCATION;
+use http::StatusCode;
 use idgenerator::*;
 use mime;
 use serde::{Deserialize, Serialize};
@@ -63,6 +63,7 @@ fn create_table_request(
     name: String,
     tags: HashMap<String, String>,
     serving: Option<crate::data_contract::ServingTableConfig>,
+    support: Option<crate::data_contract::SupportTableConfig>,
     dynamodb: Option<crate::data_contract::DynamoDbTableConfig>,
     mongodb: Option<crate::data_contract::MongoDbTableConfig>,
     redis: Option<crate::data_contract::RedisTableConfig>,
@@ -71,6 +72,7 @@ fn create_table_request(
         "name": name,
         "tags": tags,
         "serving": serving,
+        "support": support,
         "dynamodb": dynamodb,
         "mongodb": mongodb,
         "redis": redis,
@@ -184,6 +186,7 @@ pub async fn create_index(table: &String, body: &String) -> Result<CreateIndexRe
             None,
             None,
             None,
+            None,
         ))
         .await
         .map_err(|e| IngestError::from_service_api_error(e))?;
@@ -245,6 +248,7 @@ where
             table_description.name,
             tags,
             table_description.serving,
+            table_description.support,
             table_description.dynamodb,
             table_description.mongodb,
             table_description.redis,
@@ -1557,7 +1561,7 @@ pub static INGEST_HANDLE: std::sync::LazyLock<IngestHandle> =
 mod tests {
     use crate::data_contract::{CreateIndexTemplateBody, PropertyInfo};
     use crate::elastic_search_ingest::{
-        IngestCommand, WriteBuffer, next_speedboat_segment, speedboat_orphan_marker_path,
+        next_speedboat_segment, speedboat_orphan_marker_path, IngestCommand, WriteBuffer,
     };
     use serde_json::json;
     use std::{collections::HashMap, fs};

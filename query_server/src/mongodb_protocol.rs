@@ -2,8 +2,8 @@ use std::{
     collections::{BTreeSet, HashMap},
     pin::Pin,
     sync::{
-        LazyLock, Mutex,
         atomic::{AtomicI64, Ordering},
+        LazyLock, Mutex,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -11,28 +11,28 @@ use std::{
 use futures_util::future::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{Body, body};
+use gotham::hyper::{body, Body};
 use gotham::mime;
 use gotham::prelude::StaticResponseExtender;
 use gotham::state::{FromState, State, StateData};
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 use crate::elastic_search_http_types::NamePathExtractor;
-use powdrr_query_lib::data_contract::{
+use powdrr_control_plane::data_contract::{
     CreateTable, MongoDbTableConfig, TableDescription, TableMetadataCheckpoint,
 };
 use powdrr_query_lib::schema_massager::{PowdrrDataType, PowdrrSchema};
 use powdrr_query_lib::serving_plan::ServingQueryClassification;
 use powdrr_query_runtime::lakehouse_serving::{
-    ServingQueryError, ServingQueryResponse, execute_serving_query,
+    execute_serving_query, ServingQueryError, ServingQueryResponse,
 };
 use powdrr_query_runtime::peers::CheckpointDescriptor;
 use powdrr_query_runtime::serving_protocol::{
-    MongoFindCommand, MongoProtocolError, from_mongodb_find,
+    from_mongodb_find, MongoFindCommand, MongoProtocolError,
 };
-use powdrr_query_runtime::state_provider::{STATE_PROVIDER, ServiceApiError};
+use powdrr_query_runtime::state_provider::{ServiceApiError, STATE_PROVIDER};
 
 const MONGO_BAD_VALUE_CODE: i32 = 2;
 const MONGO_CURSOR_NOT_FOUND_CODE: i32 = 43;
@@ -249,6 +249,9 @@ pub fn put_mongodb_config(mut state: State) -> Pin<Box<HandlerFuture>> {
             let serving = existing
                 .as_ref()
                 .and_then(|description| description.serving.clone());
+            let support = existing
+                .as_ref()
+                .and_then(|description| description.support.clone());
             let dynamodb = existing
                 .as_ref()
                 .and_then(|description| description.dynamodb.clone());
@@ -264,6 +267,7 @@ pub fn put_mongodb_config(mut state: State) -> Pin<Box<HandlerFuture>> {
                 "name": path.clone(),
                 "tags": tags,
                 "serving": serving,
+                "support": support,
                 "dynamodb": dynamodb,
                 "mongodb": body.clone(),
                 "redis": redis,

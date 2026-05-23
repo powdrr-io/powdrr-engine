@@ -18,20 +18,20 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::data_access::{self, execute_sql_async};
 use crate::data_contract::{
-    ExtensionFile, FileDescriptor, IcebergAccessArtifact, IcebergFileStats, IcebergPartitionField,
-    IcebergRowGroupStats, IcebergSortField, ServingAggregateMeasure, ServingAggregateSpec,
-    ServingPattern, ServingTableConfig, TableDescription, TableMetadataCheckpoint,
-    checkpoint_extension_metadata_key,
+    checkpoint_extension_metadata_key, ExtensionFile, FileDescriptor, IcebergAccessArtifact,
+    IcebergFileStats, IcebergPartitionField, IcebergRowGroupStats, IcebergSortField,
+    ServingAggregateMeasure, ServingAggregateSpec, ServingPattern, ServingTableConfig,
+    TableDescription, TableMetadataCheckpoint,
 };
 use crate::peers::CheckpointDescriptor;
 use crate::prefetch::warm_iceberg_checkpoints;
 use crate::query_execution::{
-    QueryExecutionPlan, QueryInputFile, QuerySqlTemplate, QueryStorageKind,
-    execute_query_plan_batches, group_query_input_files_by_schema,
+    execute_query_plan_batches, group_query_input_files_by_schema, QueryExecutionPlan,
+    QueryInputFile, QuerySqlTemplate, QueryStorageKind,
 };
 use crate::query_path::{
-    QueryPredicate, column_is_all_null, compare_scalar_values, file_may_match_predicates,
-    group_files_by_schema, row_group_may_match_predicates,
+    column_is_all_null, compare_scalar_values, file_may_match_predicates, group_files_by_schema,
+    row_group_may_match_predicates, QueryPredicate,
 };
 use crate::read_plan::{ReadPlan, ReadPredicate};
 use crate::schema_massager::{PowdrrDataType, PowdrrSchema};
@@ -5817,14 +5817,15 @@ impl ServingQueryError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCESS_ARTIFACT_KIND_EXACT_PRUNING, ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS,
-        DEFAULT_FAST_PATH_MAX_DELETE_FILES, DEFAULT_SLOW_PATH_MAX_BYTES, ExactPruningFieldSummary,
-        ServingExecutionContext, aggregate_measure_plans, append_secondary_pattern_artifacts,
-        build_serving_layout_advice, build_serving_warmup_plan, build_sql, exact_artifact_fields,
+        aggregate_measure_plans, append_secondary_pattern_artifacts, build_serving_layout_advice,
+        build_serving_warmup_plan, build_sql, exact_artifact_fields,
         exact_pruning_summary_may_match_request, file_group_table_name, finalize_aggregate_rows,
         group_files_by_schema, merge_partial_aggregate_rows, ordered_file_groups_for_top_k,
         plan_request, prune_candidate_files, remaining_groups_cannot_beat_kth_row,
         request_matches_pattern, secondary_pattern_artifact_name, select_serving_warmup_files,
+        ExactPruningFieldSummary, ServingExecutionContext, ACCESS_ARTIFACT_KIND_EXACT_PRUNING,
+        ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS, DEFAULT_FAST_PATH_MAX_DELETE_FILES,
+        DEFAULT_SLOW_PATH_MAX_BYTES,
     };
     use crate::data_access::{
         prime_parquet_row_group_stats_cache_for_test, reset_serving_metadata_caches_for_test,
@@ -5902,6 +5903,7 @@ mod tests {
                 name: "events".to_string(),
                 tags: HashMap::new(),
                 serving: Some(serving),
+                support: None,
                 dynamodb: None,
                 mongodb: None,
                 redis: None,
@@ -6657,6 +6659,7 @@ mod tests {
                 name: "events".to_string(),
                 tags: HashMap::new(),
                 serving: Some(ServingTableConfig::default()),
+                support: None,
                 dynamodb: None,
                 mongodb: None,
                 redis: None,
@@ -6713,11 +6716,10 @@ mod tests {
         let plan = plan_request(&context, &read_request).unwrap();
 
         assert_eq!(plan.classification, ServingQueryClassification::Rejected);
-        assert!(
-            plan.reason
-                .as_ref()
-                .is_some_and(|reason| reason.contains("exceeds serving budget"))
-        );
+        assert!(plan
+            .reason
+            .as_ref()
+            .is_some_and(|reason| reason.contains("exceeds serving budget")));
     }
 
     #[test]
@@ -6748,11 +6750,10 @@ mod tests {
         let plan = plan_request(&context, &read_request).unwrap();
 
         assert_eq!(plan.classification, ServingQueryClassification::Rejected);
-        assert!(
-            plan.reason
-                .as_ref()
-                .is_some_and(|reason| reason.contains("aggregate serving pattern"))
-        );
+        assert!(plan
+            .reason
+            .as_ref()
+            .is_some_and(|reason| reason.contains("aggregate serving pattern")));
     }
 
     #[test]
@@ -6875,11 +6876,9 @@ mod tests {
             }],
         );
 
-        assert!(
-            access_artifacts.iter().any(|artifact| {
-                artifact.name == secondary_pattern_artifact_name("tenant_recent")
-            })
-        );
+        assert!(access_artifacts
+            .iter()
+            .any(|artifact| { artifact.name == secondary_pattern_artifact_name("tenant_recent") }));
     }
 
     #[test]
@@ -6933,11 +6932,10 @@ mod tests {
         let plan = plan_request(&context, &read_request).unwrap();
 
         assert_eq!(plan.classification, ServingQueryClassification::SlowPath);
-        assert!(
-            plan.reason
-                .as_ref()
-                .is_some_and(|reason| reason.contains("delete files"))
-        );
+        assert!(plan
+            .reason
+            .as_ref()
+            .is_some_and(|reason| reason.contains("delete files")));
     }
 
     #[test]
@@ -7004,12 +7002,10 @@ mod tests {
 
         assert_eq!(advice.patterns.len(), 1);
         assert!(!advice.issues.is_empty());
-        assert!(
-            advice.patterns[0]
-                .recommendation
-                .as_ref()
-                .is_some_and(|recommendation| recommendation.contains("Cluster or partition"))
-        );
+        assert!(advice.patterns[0]
+            .recommendation
+            .as_ref()
+            .is_some_and(|recommendation| recommendation.contains("Cluster or partition")));
     }
 
     #[test]

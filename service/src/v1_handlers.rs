@@ -1,20 +1,20 @@
 use crate::response::GenericResponse;
 use crate::router::NamePathExtractor;
-use crate::service_impl_provider::{SERVICE_IMPL, ServiceImplError};
+use crate::service_impl_provider::{ServiceImplError, SERVICE_IMPL};
 use futures_util::future::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::hyper::Method;
 use gotham::hyper::Uri;
-use gotham::hyper::{Body, body};
+use gotham::hyper::{body, Body};
 use gotham::hyper::{HeaderMap, StatusCode};
 use gotham::mime;
 use gotham::state::FromState;
 use gotham::state::State;
 use powdrr_service_lib::data_contract::CreateIndexTemplateBody;
 use powdrr_service_lib::data_contract::{
-    ACCESS_KEY_HEADER_KEY, AddAlias, CleanupCommit, CompactionCommit, CreateTable, ExtensionCommit,
-    GetLatestCheckpoint, IcebergCommit, OrgInfo, OrgSettings, SECRET_KEY_HEADER_KEY,
-    SpeedboatCommit,
+    AddAlias, CleanupCommit, CompactionCommit, CreateTable, ExtensionCommit, GetLatestCheckpoint,
+    IcebergCommit, OrgInfo, OrgSettings, SpeedboatCommit, ACCESS_KEY_HEADER_KEY,
+    SECRET_KEY_HEADER_KEY,
 };
 use powdrr_service_lib::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use powdrr_service_lib::metadata_store::{ServingNodeActivationAck, ServingNodeLease};
@@ -529,8 +529,8 @@ mod tests {
     use gotham::mime;
     use gotham::test::TestServer;
     use powdrr_service_lib::data_contract::{
-        ACCESS_KEY_HEADER_KEY, AddAlias, CreateTable, SECRET_KEY_HEADER_KEY, ServiceMode,
-        TEST_ACCESS_KEY, TEST_SECRET_KEY, TableDescription,
+        AddAlias, CreateTable, ServiceMode, TableDescription, ACCESS_KEY_HEADER_KEY,
+        SECRET_KEY_HEADER_KEY, TEST_ACCESS_KEY, TEST_SECRET_KEY,
     };
     use std::sync::LazyLock;
 
@@ -557,6 +557,7 @@ mod tests {
             name: "the_name".to_string(),
             tags: Default::default(),
             serving: None,
+            support: None,
             dynamodb: None,
             mongodb: None,
             redis: None,

@@ -4,7 +4,7 @@ use std::pin::Pin;
 use futures::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{Body, body};
+use gotham::hyper::{body, Body};
 use gotham::mime;
 use gotham::state::{FromState, State};
 use http::StatusCode;
@@ -13,12 +13,12 @@ use serde_json::Value;
 
 use crate::elastic_search_http_types::NamePathExtractor;
 
-use powdrr_query_lib::data_contract::{CreateTable, ServingTableConfig};
+use powdrr_control_plane::data_contract::{CreateTable, ServingTableConfig};
 use powdrr_query_lib::serving_plan::ServingQueryClassification;
 use powdrr_query_lib::serving_plan::ServingRequestPlan;
 use powdrr_query_runtime::lakehouse_serving::{
-    ServingCacheManagerRequestBody, ServingConfigResponse, execute_serving_cache_manager_request,
-    execute_serving_layout_advice, execute_serving_query,
+    execute_serving_cache_manager_request, execute_serving_layout_advice, execute_serving_query,
+    ServingCacheManagerRequestBody, ServingConfigResponse,
 };
 use powdrr_query_runtime::state_provider::STATE_PROVIDER;
 
@@ -89,28 +89,31 @@ pub fn put_serving_config(mut state: State) -> Pin<Box<HandlerFuture>> {
             }
         };
 
-        let (tags, dynamodb, mongodb, redis) = match STATE_PROVIDER.describe_table(&path).await {
-            Ok(Some(description)) => (
-                description.tags,
-                description.dynamodb,
-                description.mongodb,
-                description.redis,
-            ),
-            Ok(None) => (HashMap::new(), None, None, None),
-            Err(error) => {
-                let response = json_response(
-                    &state,
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &json_error(&error.to_string()),
-                );
-                return Ok((state, response));
-            }
-        };
+        let (tags, support, dynamodb, mongodb, redis) =
+            match STATE_PROVIDER.describe_table(&path).await {
+                Ok(Some(description)) => (
+                    description.tags,
+                    description.support,
+                    description.dynamodb,
+                    description.mongodb,
+                    description.redis,
+                ),
+                Ok(None) => (HashMap::new(), None, None, None, None),
+                Err(error) => {
+                    let response = json_response(
+                        &state,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json_error(&error.to_string()),
+                    );
+                    return Ok((state, response));
+                }
+            };
 
         let request = serde_json::from_value::<CreateTable>(serde_json::json!({
             "name": path.clone(),
             "tags": tags,
             "serving": body.clone(),
+            "support": support,
             "dynamodb": dynamodb,
             "mongodb": mongodb,
             "redis": redis,

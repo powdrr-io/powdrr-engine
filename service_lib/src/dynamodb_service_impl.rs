@@ -23,8 +23,8 @@ use crate::state_provider::ServiceApiError;
 use crate::test_api::{StateMode, TestProcessingMode};
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_dynamodb::Client;
-use modyne::TestTableExt;
 use modyne::model::TransactWrite;
+use modyne::TestTableExt;
 use std::collections::{HashMap, HashSet};
 
 const LEASE_LENGTH_MS: i64 = 60 * 1000; // 1 minute
@@ -847,6 +847,7 @@ impl DynamoDBServiceImpl {
                 name: metadata.table_name.clone(),
                 tags: Default::default(),
                 serving: None,
+                support: None,
                 dynamodb: None,
                 mongodb: None,
                 redis: None,
@@ -918,6 +919,7 @@ impl DynamoDBServiceImpl {
                 &TableBody {
                     tags: create_table.tags.clone(),
                     serving: create_table.serving.clone(),
+                    support: create_table.support.clone(),
                     dynamodb: create_table.dynamodb.clone(),
                     mongodb: create_table.mongodb.clone(),
                     redis: create_table.redis.clone(),
@@ -948,6 +950,7 @@ impl DynamoDBServiceImpl {
                     name: name.clone(),
                     tags: x.tags.clone(),
                     serving: x.serving.clone(),
+                    support: x.support.clone(),
                     dynamodb: x.dynamodb.clone(),
                     mongodb: x.mongodb.clone(),
                     redis: x.redis.clone(),
@@ -974,6 +977,7 @@ impl DynamoDBServiceImpl {
                                 name: table_name.clone(),
                                 tags: x.tags.clone(),
                                 serving: x.serving.clone(),
+                                support: x.support.clone(),
                                 dynamodb: x.dynamodb.clone(),
                                 mongodb: x.mongodb.clone(),
                                 redis: x.redis.clone(),
@@ -2254,6 +2258,7 @@ mod tests {
                     name: table_name.clone(),
                     tags: HashMap::new(),
                     serving: None,
+                    support: None,
                     dynamodb: None,
                     mongodb: None,
                     redis: None,
@@ -2303,11 +2308,9 @@ mod tests {
             None
         );
 
-        assert!(
-            MetadataStore::advance_published_checkpoints(&mut state)
-                .await
-                .unwrap()
-        );
+        assert!(MetadataStore::advance_published_checkpoints(&mut state)
+            .await
+            .unwrap());
         assert_eq!(
             MetadataStore::get_latest_target_checkpoint(&mut state, &org_info, &table_name, None)
                 .await
@@ -2352,6 +2355,7 @@ mod tests {
                     name: table_name.clone(),
                     tags: HashMap::new(),
                     serving: None,
+                    support: None,
                     dynamodb: None,
                     mongodb: None,
                     redis: None,
@@ -2372,13 +2376,11 @@ mod tests {
         let first_work_items = state.get_compaction_work_items(&org_info).await.unwrap();
         assert_eq!(first_work_items.len(), 1);
         assert!(state.tables_with_pending_compaction.contains(&table_name));
-        assert!(
-            state
-                .not_compacted_checkpoint_ids
-                .get(&table_name)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(state
+            .not_compacted_checkpoint_ids
+            .get(&table_name)
+            .unwrap()
+            .is_empty());
 
         state
             .speedboat_commit(
@@ -2393,13 +2395,11 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-        assert!(
-            state
-                .get_compaction_work_items(&org_info)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(state
+            .get_compaction_work_items(&org_info)
+            .await
+            .unwrap()
+            .is_empty());
         assert_eq!(
             state.not_compacted_checkpoint_ids.get(&table_name).unwrap(),
             &vec![second_checkpoint.clone()]
@@ -2441,12 +2441,10 @@ mod tests {
             second_work_items[0].1.checkpoints_to_delete,
             vec![second_checkpoint, third_checkpoint]
         );
-        assert!(
-            state
-                .not_compacted_checkpoint_ids
-                .get(&table_name)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(state
+            .not_compacted_checkpoint_ids
+            .get(&table_name)
+            .unwrap()
+            .is_empty());
     }
 }

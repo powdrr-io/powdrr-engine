@@ -21,8 +21,8 @@ use crate::state_provider::ServiceApiError;
 use crate::test_api::{StateMode, TestProcessingMode};
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_dynamodb::Client;
-use modyne::TestTableExt;
 use modyne::model::TransactWrite;
+use modyne::TestTableExt;
 use powdrr_control_plane::ilm_policy::ILMPolicyDefinition;
 use std::collections::{HashMap, HashSet};
 
@@ -36,6 +36,7 @@ fn create_table_request(
     name: String,
     tags: HashMap<String, String>,
     serving: Option<crate::data_contract::ServingTableConfig>,
+    support: Option<crate::data_contract::SupportTableConfig>,
     dynamodb: Option<crate::data_contract::DynamoDbTableConfig>,
     mongodb: Option<crate::data_contract::MongoDbTableConfig>,
     redis: Option<crate::data_contract::RedisTableConfig>,
@@ -44,6 +45,7 @@ fn create_table_request(
         "name": name,
         "tags": tags,
         "serving": serving,
+        "support": support,
         "dynamodb": dynamodb,
         "mongodb": mongodb,
         "redis": redis,
@@ -55,6 +57,7 @@ fn table_description_from_parts(
     name: String,
     tags: HashMap<String, String>,
     serving: Option<crate::data_contract::ServingTableConfig>,
+    support: Option<crate::data_contract::SupportTableConfig>,
     dynamodb: Option<crate::data_contract::DynamoDbTableConfig>,
     mongodb: Option<crate::data_contract::MongoDbTableConfig>,
     redis: Option<crate::data_contract::RedisTableConfig>,
@@ -63,6 +66,7 @@ fn table_description_from_parts(
         "name": name,
         "tags": tags,
         "serving": serving,
+        "support": support,
         "dynamodb": dynamodb,
         "mongodb": mongodb,
         "redis": redis,
@@ -370,6 +374,7 @@ impl DynamoDBServiceImpl {
                 None,
                 None,
                 None,
+                None,
             ),
         )
         .await?;
@@ -449,6 +454,7 @@ impl DynamoDBServiceImpl {
                 &TableBody {
                     tags: create_table.tags.clone(),
                     serving: create_table.serving.clone(),
+                    support: create_table.support.clone(),
                     dynamodb: create_table.dynamodb.clone(),
                     mongodb: create_table.mongodb.clone(),
                     redis: create_table.redis.clone(),
@@ -470,6 +476,7 @@ impl DynamoDBServiceImpl {
                 &TableBody {
                     tags: create_table.tags.clone(),
                     serving: create_table.serving.clone(),
+                    support: create_table.support.clone(),
                     dynamodb: create_table.dynamodb.clone(),
                     mongodb: create_table.mongodb.clone(),
                     redis: create_table.redis.clone(),
@@ -493,6 +500,7 @@ impl DynamoDBServiceImpl {
                         name.clone(),
                         x.tags.clone(),
                         x.serving.clone(),
+                        x.support.clone(),
                         x.dynamodb.clone(),
                         x.mongodb.clone(),
                         x.redis.clone(),
@@ -521,6 +529,7 @@ impl DynamoDBServiceImpl {
                                     table_name.clone(),
                                     x.tags.clone(),
                                     x.serving.clone(),
+                                    x.support.clone(),
                                     x.dynamodb.clone(),
                                     x.mongodb.clone(),
                                     x.redis.clone(),
@@ -1626,7 +1635,15 @@ mod tests {
         service_impl
             .create_table(
                 &org_info,
-                &create_table_request(table_name.clone(), HashMap::new(), None, None, None, None),
+                &create_table_request(
+                    table_name.clone(),
+                    HashMap::new(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
             )
             .await
             .unwrap();
@@ -1701,7 +1718,15 @@ mod tests {
         service_impl
             .create_table(
                 &org_info,
-                &create_table_request(table_name.clone(), HashMap::new(), None, None, None, None),
+                &create_table_request(
+                    table_name.clone(),
+                    HashMap::new(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
             )
             .await
             .unwrap();

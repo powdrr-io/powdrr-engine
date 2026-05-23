@@ -17,7 +17,7 @@ use crate::metadata_store::{
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
 use crate::read_only_coordination::{
-    ArtifactClass, ArtifactReadinessAck, required_artifact_classes,
+    required_artifact_classes, ArtifactClass, ArtifactReadinessAck,
 };
 use crate::schema_massager::PowdrrSchema;
 use crate::state_provider::ServiceApiError;
@@ -673,6 +673,7 @@ impl EphemeralServiceImpl {
                     name: metadata.table_name.clone(),
                     tags: Default::default(),
                     serving: None,
+                    support: None,
                     dynamodb: None,
                     mongodb: None,
                     redis: None,
@@ -2064,6 +2065,7 @@ mod tests {
                     name: table_name.clone(),
                     tags: HashMap::new(),
                     serving: None,
+                    support: None,
                     dynamodb: None,
                     mongodb: None,
                     redis: None,
@@ -2113,11 +2115,9 @@ mod tests {
             None
         );
 
-        assert!(
-            MetadataStore::advance_published_checkpoints(&mut state)
-                .await
-                .unwrap()
-        );
+        assert!(MetadataStore::advance_published_checkpoints(&mut state)
+            .await
+            .unwrap());
         assert_eq!(
             MetadataStore::get_latest_target_checkpoint(&mut state, &org_info, &table_name, None)
                 .await
@@ -2166,11 +2166,9 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            !MetadataStore::advance_published_checkpoints(&mut state)
-                .await
-                .unwrap()
-        );
+        assert!(!MetadataStore::advance_published_checkpoints(&mut state)
+            .await
+            .unwrap());
         assert_eq!(
             MetadataStore::get_published_active_checkpoint(
                 &mut state,
@@ -2192,11 +2190,9 @@ mod tests {
         )
         .await;
 
-        assert!(
-            MetadataStore::advance_published_checkpoints(&mut state)
-                .await
-                .unwrap()
-        );
+        assert!(MetadataStore::advance_published_checkpoints(&mut state)
+            .await
+            .unwrap());
         assert_eq!(
             MetadataStore::get_published_active_checkpoint(
                 &mut state,
@@ -2223,6 +2219,7 @@ mod tests {
                     name: table_name.clone(),
                     tags: HashMap::new(),
                     serving: None,
+                    support: None,
                     dynamodb: None,
                     mongodb: None,
                     redis: None,
