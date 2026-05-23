@@ -8,6 +8,7 @@ use serde_json::Value;
 use powdrr_query_lib::data_contract::TableMetadataCheckpoint;
 use powdrr_query_lib::serving_plan::{ServingPredicate, ServingRequestPlan};
 use powdrr_query_runtime::lakehouse_serving::{
+    ProjectedFieldBytesRow, execute_checkpoint_exact_lookup_batch_projected_field_bytes,
     execute_checkpoint_exact_lookup_batch_rows, execute_checkpoint_exact_lookup_rows,
 };
 use powdrr_query_runtime::peers::CheckpointDescriptor;
@@ -36,6 +37,17 @@ pub(crate) async fn execute_active_checkpoint_exact_lookup_batch_rows(
     let checkpoint = load_active_checkpoint(table_name).await?;
     let read_plans = requests.iter().map(ReadPlan::from).collect::<Vec<_>>();
     execute_checkpoint_exact_lookup_batch_rows(checkpoint.as_ref(), &read_plans)
+        .await
+        .map_err(ActiveCheckpointLookupError::Internal)
+}
+
+pub(crate) async fn execute_active_checkpoint_exact_lookup_batch_projected_field_bytes(
+    table_name: &str,
+    requests: &[ServingRequestPlan],
+) -> Result<Option<Vec<Vec<ProjectedFieldBytesRow>>>, ActiveCheckpointLookupError> {
+    let checkpoint = load_active_checkpoint(table_name).await?;
+    let read_plans = requests.iter().map(ReadPlan::from).collect::<Vec<_>>();
+    execute_checkpoint_exact_lookup_batch_projected_field_bytes(checkpoint.as_ref(), &read_plans)
         .await
         .map_err(ActiveCheckpointLookupError::Internal)
 }

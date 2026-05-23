@@ -114,16 +114,35 @@ async fn run_redis_wire_compat_test() {
     configure_redis(&http_server.base_url, &table_name, database).await;
 
     let client = redis::Client::open(redis_server.url.clone()).unwrap();
-    let (ping, alpha, missing, values, exists_count, city, features, all_fields, hexists_city, hexists_missing) =
-        tokio::task::spawn_blocking(move || -> (String, Option<String>, Option<String>, Vec<Option<String>>, i64, Option<String>, Vec<Option<String>>, HashMap<String, String>, i64, i64) {
+    let (
+        ping,
+        alpha,
+        missing,
+        values,
+        duplicate_values,
+        exists_count,
+        duplicate_exists_count,
+        city,
+        features,
+        all_fields,
+        hexists_city,
+        hexists_missing,
+    ) =
+        tokio::task::spawn_blocking(move || -> (String, Option<String>, Option<String>, Vec<Option<String>>, Vec<Option<String>>, i64, i64, Option<String>, Vec<Option<String>>, HashMap<String, String>, i64, i64) {
             let mut connection = client.get_connection().unwrap();
             let ping: String = redis::cmd("PING").query(&mut connection).unwrap();
             let alpha: Option<String> = connection.get("alpha").unwrap();
             let missing: Option<String> = connection.get("missing").unwrap();
             let values: Vec<Option<String>> =
                 connection.get(&["alpha", "missing", "bravo"]).unwrap();
+            let duplicate_values: Vec<Option<String>> =
+                connection.get(&["alpha", "alpha", "charlie"]).unwrap();
             let exists_count: i64 = redis::cmd("EXISTS")
                 .arg(&["alpha", "missing", "bravo"])
+                .query(&mut connection)
+                .unwrap();
+            let duplicate_exists_count: i64 = redis::cmd("EXISTS")
+                .arg(&["alpha", "alpha", "missing"])
                 .query(&mut connection)
                 .unwrap();
             let city: Option<String> = redis::cmd("HGET")
@@ -155,7 +174,9 @@ async fn run_redis_wire_compat_test() {
                 alpha,
                 missing,
                 values,
+                duplicate_values,
                 exists_count,
+                duplicate_exists_count,
                 city,
                 features,
                 all_fields,
@@ -173,7 +194,16 @@ async fn run_redis_wire_compat_test() {
         values,
         vec![Some("first".to_string()), None, Some("second".to_string())]
     );
+    assert_eq!(
+        duplicate_values,
+        vec![
+            Some("first".to_string()),
+            Some("first".to_string()),
+            Some("third".to_string())
+        ]
+    );
     assert_eq!(exists_count, 2);
+    assert_eq!(duplicate_exists_count, 2);
     assert_eq!(city, Some("honolulu".to_string()));
     assert_eq!(
         features,
