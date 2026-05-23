@@ -104,10 +104,6 @@ pub(crate) fn get_operating_mode(_command_line_args: &Vec<String>) -> OperatingM
                 state_mode: StateMode::Leaderless {
                     server_address: std::env::var("SERVICE_BASE_URL")
                         .expect("SERVICE_BASE_URL must be set for MODE=leaderless"),
-                    access_key: std::env::var("SERVICE_ACCESS_KEY")
-                        .expect("SERVICE_ACCESS_KEY must be set for MODE=leaderless"),
-                    secret_key: std::env::var("SERVICE_SECRET_KEY")
-                        .expect("SERVICE_SECRET_KEY must be set for MODE=leaderless"),
                 },
                 storage_mode: StorageMode::default(),
                 cache_mode: CacheMode::Native,

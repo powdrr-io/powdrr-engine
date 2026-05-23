@@ -416,7 +416,6 @@ These methods should return explicit read-only errors:
 
 - `create_table`
 - `upsert_table_metadata`
-- `create_org`
 - `add_alias`
 - `remove_alias`
 - `create_table_template`

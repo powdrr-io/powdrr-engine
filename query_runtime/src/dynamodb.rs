@@ -1,7 +1,7 @@
 use crate::data_contract::{
     CleanupWorkItem, CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody,
-    ExtensionCommit, ExtensionWorkItem, FileSetPayload, IcebergCommit, OrgInfo, OrgSettings,
-    SpeedboatCommit, TableMetadataCheckpoint,
+    ExtensionCommit, ExtensionWorkItem, FileSetPayload, IcebergCommit, SpeedboatCommit,
+    TableMetadataCheckpoint,
 };
 use crate::peers::CheckpointDescriptor;
 use crate::pipeline::PipelineDefinition;
@@ -10,8 +10,8 @@ use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use idgenerator::IdInstance;
 use modyne::expr::Filter;
 use modyne::{
-    Aggregate, Entity, EntityExt, Error, Item, ProjectionExt, QueryInput, QueryInputExt, Table,
-    expr, keys, model::TransactWrite, projections, read_projection,
+    expr, keys, model::TransactWrite, projections, read_projection, Aggregate, Entity, EntityExt,
+    Error, Item, ProjectionExt, QueryInput, QueryInputExt, Table,
 };
 use powdrr_control_plane::ilm_policy::ILMPolicyDefinition;
 use std::collections::HashMap;
@@ -573,6 +573,8 @@ pub struct TableBody {
     #[serde(default)]
     pub serving: Option<crate::data_contract::ServingTableConfig>,
     #[serde(default)]
+    pub support: Option<crate::data_contract::SupportTableConfig>,
+    #[serde(default)]
     pub dynamodb: Option<crate::data_contract::DynamoDbTableConfig>,
     #[serde(default)]
     pub mongodb: Option<crate::data_contract::MongoDbTableConfig>,
@@ -586,6 +588,7 @@ impl TableBody {
         Self {
             tags: HashMap::new(),
             serving: None,
+            support: None,
             dynamodb: None,
             mongodb: None,
             redis: None,
@@ -625,7 +628,6 @@ powdrr_named_entity!(table_template, CreateIndexTemplateBody);
 powdrr_named_entity!(pipeline, PipelineDefinition);
 powdrr_named_entity!(lifetime_policy, ILMPolicyDefinition);
 powdrr_named_entity!(latest, EntityVersionInfo);
-powdrr_named_entity!(org_settings, OrgSettings);
 
 // Note: only things where a given key can only ever have one value are cacheable
 powdrr_named_cached_entity!(compaction, CompactionCommit);
@@ -636,7 +638,6 @@ powdrr_named_cached_entity!(extension_commit, ExtensionCommit);
 powdrr_named_cached_entity!(compaction_work_item, CompactionWorkItem);
 powdrr_named_cached_entity!(extension_work_item, ExtensionWorkItem);
 powdrr_named_cached_entity!(cleanup_work_item, CleanupWorkItem);
-powdrr_named_cached_entity!(org_creds, OrgInfo);
 
 powdrr_tracker!(extension_work_item_lease);
 powdrr_tracker!(compaction_work_item_lease);
@@ -1142,11 +1143,9 @@ impl DynamoDbConnector {
             cloned_checkpoint_to_replace.checkpoint_id = IdInstance::next_id().to_string();
             cloned_checkpoint_to_replace
                 .apply_compaction_for_replacement(compaction_commit, &commit.metadata);
-            assert!(
-                cloned_checkpoint_to_replace
-                    .original_checkpoint_id
-                    .is_none()
-            );
+            assert!(cloned_checkpoint_to_replace
+                .original_checkpoint_id
+                .is_none());
             cloned_checkpoint_to_replace.original_checkpoint_id =
                 Some(compaction_commit.checkpoint_id_to_replace.clone());
 
@@ -1287,6 +1286,7 @@ mod tests {
                 &TableBody {
                     tags: HashMap::from([("foo".to_string(), "bar".to_string())]),
                     serving: None,
+                    support: None,
                     dynamodb: None,
                     mongodb: None,
                     redis: None,

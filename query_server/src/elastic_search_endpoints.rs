@@ -10,13 +10,13 @@ use gotham::helpers::http::response::create_empty_response;
 use gotham::{
     handler::HandlerFuture,
     helpers::http::response::create_response,
-    hyper::{Body, body},
+    hyper::{body, Body},
     mime,
     state::{FromState, State},
 };
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 use crate::elastic_search_cluster_info;
 use crate::elastic_search_http_types::{
@@ -24,12 +24,12 @@ use crate::elastic_search_http_types::{
     QueryStringSearchExtractor,
 };
 use crate::exact_lookup::{
-    ActiveCheckpointLookupError, execute_active_checkpoint_projected_exact_id_lookup_rows,
+    execute_active_checkpoint_projected_exact_id_lookup_rows, ActiveCheckpointLookupError,
 };
 use powdrr_query_lib::data_contract::{AliasInfo, CreateIndexBody, PropertyInfo, TableDescription};
 use powdrr_query_lib::elastic_search_api_types::QueryStringSearch;
 use powdrr_query_runtime::elastic_search_common::{
-    CommandContext, ElasticSearchResponse, MIME_ES_JSON, execute_command,
+    execute_command, CommandContext, ElasticSearchResponse, MIME_ES_JSON,
 };
 use powdrr_query_runtime::elastic_search_ingest;
 use powdrr_query_runtime::elastic_search_parser;
@@ -38,7 +38,7 @@ use powdrr_query_runtime::elastic_search_responses::{
     ErrorDetails, QueryResultShards, QueryResults, SingleDocCreateFailedResult,
 };
 use powdrr_query_runtime::search_executor;
-use powdrr_query_runtime::state_provider::{STATE_PROVIDER, ServiceApiError};
+use powdrr_query_runtime::state_provider::{ServiceApiError, STATE_PROVIDER};
 use powdrr_query_runtime::util::{log_service_err, log_service_err_response};
 
 pub use crate::elastic_search_http_types::{

@@ -42,6 +42,7 @@ range design plans. Start here instead of guessing which document is current.
 - [redis-dependency-removal-plan.md](./redis-dependency-removal-plan.md)
 - [mongodb-client-api-plan.md](./mongodb-client-api-plan.md)
 - [cross-protocol-serving-optimization-plan.md](./cross-protocol-serving-optimization-plan.md)
+- [guaranteed-feature-computation-platform.md](./guaranteed-feature-computation-platform.md)
 
 These are important, but many of them describe target architecture or staged
 plans rather than the exact structure of the current `main` branch. Check

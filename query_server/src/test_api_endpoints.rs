@@ -4,7 +4,7 @@ use futures::FutureExt;
 use gotham::{
     handler::HandlerFuture,
     helpers::http::response::create_response,
-    hyper::{Body, StatusCode, body},
+    hyper::{body, Body, StatusCode},
     mime,
     prelude::FromState,
     state::State,
@@ -16,8 +16,8 @@ use powdrr_query_lib::data_contract::TableMetadataCheckpoint;
 use powdrr_query_runtime::elastic_search_index;
 use powdrr_query_runtime::state_provider::STATE_PROVIDER;
 use powdrr_query_runtime::test_api::{
-    TestProcessingMode, do_available_compaction_work, do_available_extension_work, do_next_cleanup,
-    spawn_processing_mode_workers,
+    do_available_compaction_work, do_available_extension_work, do_next_cleanup,
+    spawn_processing_mode_workers, TestProcessingMode,
 };
 
 #[derive(Serialize, Deserialize)]

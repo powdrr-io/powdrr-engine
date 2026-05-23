@@ -21,7 +21,7 @@ use crate::exact_lookup::{
     execute_active_checkpoint_exact_lookup_batch_rows,
     load_active_checkpoint as load_shared_active_checkpoint,
 };
-use powdrr_query_lib::data_contract::{
+use powdrr_control_plane::data_contract::{
     CreateTable, RedisTableConfig, TableDescription, TableMetadataCheckpoint,
 };
 use powdrr_query_lib::schema_massager::PowdrrSchema;
@@ -183,6 +183,9 @@ pub fn put_redis_config(mut state: State) -> Pin<Box<HandlerFuture>> {
             let serving = existing
                 .as_ref()
                 .and_then(|description| description.serving.clone());
+            let support = existing
+                .as_ref()
+                .and_then(|description| description.support.clone());
             let dynamodb = existing
                 .as_ref()
                 .and_then(|description| description.dynamodb.clone());
@@ -198,6 +201,7 @@ pub fn put_redis_config(mut state: State) -> Pin<Box<HandlerFuture>> {
                 name: path.clone(),
                 tags,
                 serving,
+                support,
                 dynamodb,
                 mongodb,
                 redis: Some(body.clone()),
