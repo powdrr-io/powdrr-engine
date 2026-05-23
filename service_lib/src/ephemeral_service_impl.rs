@@ -1165,6 +1165,14 @@ impl EphemeralServiceImpl {
         Ok(true)
     }
 
+    pub async fn upsert_table_metadata(
+        &mut self,
+        org_info: &OrgInfo,
+        create_table: &CreateTable,
+    ) -> Result<bool, ServiceApiError> {
+        self.create_table(org_info, create_table).await
+    }
+
     pub async fn describe_table(
         &mut self,
         _org_info: &OrgInfo,

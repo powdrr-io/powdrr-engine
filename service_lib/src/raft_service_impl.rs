@@ -17,8 +17,6 @@ use crate::read_only_coordination::ArtifactReadinessAck;
 use crate::state_provider::ServiceApiError;
 use crate::test_api::TestProcessingMode;
 use async_trait::async_trait;
-use openraft::Config;
-use openraft::Raft;
 use openraft::error::InstallSnapshotError;
 use openraft::error::NetworkError;
 use openraft::error::RPCError;
@@ -35,17 +33,19 @@ use openraft::raft::InstallSnapshotResponse;
 use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
 use openraft::storage::Adaptor;
+use openraft::Config;
+use openraft::Raft;
 use openraft_memstore::ClientRequest;
 use openraft_memstore::MemNodeId;
 use openraft_memstore::MemStore;
 use openraft_memstore::TypeConfig;
 use reqwest::Client;
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::Mutex;
 
 const SERVICE_STATE_KEY: &str = "__powdrr_service_state__";
@@ -402,6 +402,15 @@ impl RaftServiceImpl {
         create_table: &CreateTable,
     ) -> Result<bool, ServiceApiError> {
         raft_write_state!(self, |state| state.create_table(org_info, create_table))
+    }
+
+    pub async fn upsert_table_metadata(
+        &self,
+        org_info: &OrgInfo,
+        create_table: &CreateTable,
+    ) -> Result<bool, ServiceApiError> {
+        raft_write_state!(self, |state| state
+            .upsert_table_metadata(org_info, create_table))
     }
 
     pub async fn describe_table(

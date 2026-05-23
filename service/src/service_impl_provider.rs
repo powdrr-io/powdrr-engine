@@ -120,6 +120,11 @@ enum ServiceImplProviderActorMessage {
         org_info: OrgInfo,
         create_table: CreateTable,
     },
+    UpsertTableMetadata {
+        respond_to: oneshot::Sender<Result<bool, ServiceImplError>>,
+        org_info: OrgInfo,
+        create_table: CreateTable,
+    },
     DescribeTable {
         respond_to: oneshot::Sender<Result<Option<TableDescription>, ServiceImplError>>,
         org_info: OrgInfo,
@@ -393,6 +398,17 @@ impl ServiceImplProviderActor {
                 create_table,
             } => {
                 handle_message_impl!(self, respond_to, create_table(&org_info, &create_table));
+            }
+            ServiceImplProviderActorMessage::UpsertTableMetadata {
+                respond_to,
+                org_info,
+                create_table,
+            } => {
+                handle_message_impl!(
+                    self,
+                    respond_to,
+                    upsert_table_metadata(&org_info, &create_table)
+                );
             }
             ServiceImplProviderActorMessage::DescribeTable {
                 respond_to,
@@ -692,6 +708,14 @@ impl ServiceImpl {
         create_table: &CreateTable,
     ) -> Result<bool, ServiceImplError> {
         state_provider_func_impl!(self, create_table(org_info, create_table))
+    }
+
+    pub async fn upsert_table_metadata(
+        &mut self,
+        org_info: &OrgInfo,
+        create_table: &CreateTable,
+    ) -> Result<bool, ServiceImplError> {
+        state_provider_func_impl!(self, upsert_table_metadata(org_info, create_table))
     }
 
     pub async fn describe_table(
@@ -1158,6 +1182,19 @@ impl ServiceImplHandle {
         send_message!(
             self,
             CreateTable,
+            org_info = org_info.clone(),
+            create_table = create_table.clone()
+        )
+    }
+
+    pub async fn upsert_table_metadata(
+        &self,
+        org_info: &OrgInfo,
+        create_table: &CreateTable,
+    ) -> Result<bool, ServiceImplError> {
+        send_message!(
+            self,
+            UpsertTableMetadata,
             org_info = org_info.clone(),
             create_table = create_table.clone()
         )

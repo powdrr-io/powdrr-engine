@@ -936,6 +936,34 @@ impl DynamoDBServiceImpl {
         Ok(created)
     }
 
+    pub async fn upsert_table_metadata(
+        &mut self,
+        org_info: &OrgInfo,
+        create_table: &CreateTable,
+    ) -> Result<bool, ServiceApiError> {
+        let updated = self
+            .connector
+            .upsert_table_helper(
+                &org_info.org_id.to_string(),
+                &create_table.name,
+                &TableBody {
+                    tags: create_table.tags.clone(),
+                    serving: create_table.serving.clone(),
+                    support: create_table.support.clone(),
+                    dynamodb: create_table.dynamodb.clone(),
+                    mongodb: create_table.mongodb.clone(),
+                    redis: create_table.redis.clone(),
+                },
+            )
+            .await
+            .map_err(from_modyne)?;
+        self.not_compacted_checkpoint_ids
+            .entry(create_table.name.clone())
+            .or_default();
+
+        Ok(updated)
+    }
+
     pub async fn describe_table(
         &mut self,
         org_info: &OrgInfo,

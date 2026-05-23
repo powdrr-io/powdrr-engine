@@ -10,7 +10,6 @@ use crate::elastic_search_http_types::QueryStringFieldCaps;
 use crate::elastic_search_http_types::QueryStringSearchExtractor;
 use crate::mongodb_protocol;
 use crate::redis_protocol;
-use crate::support_protocol;
 use crate::test_api_endpoints::test_v1_add_checkpoint;
 use crate::test_api_endpoints::test_v1_advance_checkpoints;
 use crate::test_api_endpoints::test_v1_create_index;
@@ -497,10 +496,6 @@ pub fn router(include_test_apis: bool) -> Router {
             .with_path_extractor::<NamePathExtractor>()
             .to(redis_protocol::get_redis_config);
         route
-            .get("/:name/_support/config")
-            .with_path_extractor::<NamePathExtractor>()
-            .to(support_protocol::get_support_config);
-        route
             .put("/:name/_serve/config")
             .with_path_extractor::<NamePathExtractor>()
             .to(lakehouse_serving_endpoints::put_serving_config);
@@ -516,10 +511,6 @@ pub fn router(include_test_apis: bool) -> Router {
             .put("/:name/_redis/config")
             .with_path_extractor::<NamePathExtractor>()
             .to(redis_protocol::put_redis_config);
-        route
-            .put("/:name/_support/config")
-            .with_path_extractor::<NamePathExtractor>()
-            .to(support_protocol::put_support_config);
         route
             .post("/_mongo/:database/_command")
             .with_path_extractor::<mongodb_protocol::MongoDatabasePathExtractor>()
@@ -864,27 +855,6 @@ pub(crate) mod tests {
         assert_eq!(response.status(), 403);
         let body: Value = serde_json::from_str(&response.read_utf8_body().unwrap()).unwrap();
         assert!(body["error"].as_str().unwrap().contains("read-only mode"));
-
-        let support_response = test_server
-            .client()
-            .put(
-                "http://localhost/logs/_support/config",
-                r#"{
-                  "key_schema": { "primary_key": "tenant" },
-                  "redis": { "database": 7, "value_field": "message" }
-                }"#,
-                mime::APPLICATION_JSON,
-            )
-            .perform()
-            .unwrap();
-
-        assert_eq!(support_response.status(), 400);
-        let support_body: Value =
-            serde_json::from_str(&support_response.read_utf8_body().unwrap()).unwrap();
-        assert!(support_body["error"]
-            .as_str()
-            .unwrap()
-            .contains("read-only mode"));
     }
 
     fn process_pending_work(test_server: &TestServer) {
@@ -974,28 +944,6 @@ pub(crate) mod tests {
         writer.close().unwrap();
     }
 
-    fn write_support_test_parquet(path: &Path) {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("tenant", DataType::Utf8, false),
-            Field::new("event_id", DataType::Utf8, false),
-            Field::new("payload", DataType::Utf8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec!["tenant-a", "tenant-a", "tenant-b"])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["evt-1", "evt-2", "evt-3"])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["first", "second", "third"])) as ArrayRef,
-            ],
-        )
-        .unwrap();
-
-        let file = fs::File::create(path).unwrap();
-        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-    }
-
     fn write_serving_delete_test_parquet(path: &Path) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("_id_seq_no", DataType::Utf8, false),
@@ -1071,78 +1019,6 @@ pub(crate) mod tests {
                 "http://localhost/_test/v1/_add_checkpoint",
                 serde_json::to_string(&checkpoint).unwrap(),
                 mime::APPLICATION_JSON,
-            )
-            .perform()
-            .unwrap();
-
-        temp_dir
-    }
-
-    fn add_support_parquet_checkpoint(test_server: &TestServer, table_name: &str) -> TempDir {
-        let schema = PowdrrSchema::from(&vec![
-            PowdrrField {
-                name: "tenant".to_string(),
-                data_type: PowdrrDataType::String,
-            },
-            PowdrrField {
-                name: "event_id".to_string(),
-                data_type: PowdrrDataType::String,
-            },
-            PowdrrField {
-                name: "payload".to_string(),
-                data_type: PowdrrDataType::String,
-            },
-        ]);
-        let temp_dir = TempDir::new().unwrap();
-        let parquet_path = temp_dir.path().join(format!("{}.parquet", table_name));
-        write_support_test_parquet(&parquet_path);
-        let checkpoint = TableMetadataCheckpoint {
-            table_name: table_name.to_string(),
-            original_checkpoint_id: None,
-            checkpoint_id: format!("{}_checkpoint_0", table_name),
-            iceberg_metadata: Some(IcebergMetadata {
-                table_schema: schema.clone(),
-                snapshot_id: Some(format!("{}_snapshot_0", table_name)),
-                files: FileSetPayload::single(
-                    format!("file://{}", parquet_path.display()),
-                    fs::metadata(&parquet_path).unwrap().len(),
-                    schema.clone(),
-                ),
-                partition_spec: vec![],
-                sort_order: vec![],
-                column_names: vec![],
-                column_stats: vec![],
-                access_artifacts: vec![],
-                file_stats: vec![IcebergFileStats {
-                    file_path: format!("file://{}", parquet_path.display()),
-                    record_count: Some(3),
-                    columns: vec![],
-                    partition_values: vec![],
-                    row_groups: vec![],
-                }],
-            }),
-            speedboat_metadata: None,
-            deletes_metadata: None,
-            extension_metadata: HashMap::new(),
-            schema,
-        };
-
-        test_server
-            .client()
-            .post(
-                "http://localhost/_test/v1/_add_checkpoint",
-                serde_json::to_string(&checkpoint).unwrap(),
-                mime::APPLICATION_JSON,
-            )
-            .perform()
-            .unwrap();
-
-        test_server
-            .client()
-            .put(
-                "http://localhost/_test/v1/_advance_checkpoints",
-                "",
-                mime::TEXT_PLAIN,
             )
             .perform()
             .unwrap();
@@ -1384,159 +1260,6 @@ pub(crate) mod tests {
             "title_top_n"
         );
         assert_eq!(response_obj["rows"].as_array().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn test_support_config_derives_dynamodb_and_serving_configs() {
-        let test_server = &*TEST_SERVER;
-        set_testing_and_processing_mode(test_server);
-
-        let table_name = unique_test_index_name("support_config_dynamo");
-        let _temp_dir = add_support_parquet_checkpoint(test_server, &table_name);
-
-        let response = test_server
-            .client()
-            .put(
-                &format!("http://localhost/{}/_support/config", table_name),
-                r#"{
-                  "key_schema": {
-                    "primary_key": "tenant",
-                    "range_key": "event_id"
-                  },
-                  "elasticsearch": {},
-                  "dynamodb": {
-                    "global_secondary_indexes": [
-                      { "name": "by_event", "partition_key": "event_id" }
-                    ]
-                  }
-                }"#,
-                mime::APPLICATION_JSON,
-            )
-            .perform()
-            .unwrap();
-
-        assert_eq!(response.status(), 200);
-        let response_obj: Value =
-            serde_json::from_str(&response.read_utf8_body().unwrap()).unwrap();
-        assert_eq!(
-            response_obj["support"]["key_schema"]["primary_key"],
-            "tenant"
-        );
-        assert_eq!(response_obj["dynamodb"]["partition_key"], "tenant");
-        assert_eq!(response_obj["dynamodb"]["sort_key"], "event_id");
-        assert_eq!(
-            response_obj["dynamodb"]["global_secondary_indexes"][0]["name"],
-            "by_event"
-        );
-        let pattern_names = response_obj["serving"]["patterns"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|pattern| pattern["name"].as_str().unwrap().to_string())
-            .collect::<Vec<_>>();
-        assert!(pattern_names.contains(&"_support_es_get_item".to_string()));
-        assert!(pattern_names.contains(&"_support_es_range_query_asc".to_string()));
-        assert!(pattern_names.contains(&"_dynamodb_get_item".to_string()));
-
-        let get_dynamodb_response = test_server
-            .client()
-            .get(&format!("http://localhost/{}/_dynamodb/config", table_name))
-            .perform()
-            .unwrap();
-        assert_eq!(get_dynamodb_response.status(), 200);
-        let get_dynamodb_obj: Value =
-            serde_json::from_str(&get_dynamodb_response.read_utf8_body().unwrap()).unwrap();
-        assert_eq!(get_dynamodb_obj["dynamodb"]["partition_key"], "tenant");
-        assert_eq!(get_dynamodb_obj["dynamodb"]["sort_key"], "event_id");
-
-        let get_support_response = test_server
-            .client()
-            .get(&format!("http://localhost/{}/_support/config", table_name))
-            .perform()
-            .unwrap();
-        assert_eq!(get_support_response.status(), 200);
-        let get_support_obj: Value =
-            serde_json::from_str(&get_support_response.read_utf8_body().unwrap()).unwrap();
-        assert!(get_support_obj["support"]["elasticsearch"].is_object());
-        assert!(get_support_obj["support"]["redis"].is_null());
-    }
-
-    #[test]
-    fn test_support_config_derives_redis_and_rejects_range_keys() {
-        let test_server = &*TEST_SERVER;
-        set_testing_and_processing_mode(test_server);
-
-        let redis_table = unique_test_index_name("support_config_redis");
-        let _redis_temp_dir = add_support_parquet_checkpoint(test_server, &redis_table);
-
-        let redis_response = test_server
-            .client()
-            .put(
-                &format!("http://localhost/{}/_support/config", redis_table),
-                r#"{
-                  "key_schema": {
-                    "primary_key": "tenant"
-                  },
-                  "redis": {
-                    "database": 23,
-                    "value_field": "payload"
-                  }
-                }"#,
-                mime::APPLICATION_JSON,
-            )
-            .perform()
-            .unwrap();
-
-        assert_eq!(redis_response.status(), 200);
-        let redis_obj: Value =
-            serde_json::from_str(&redis_response.read_utf8_body().unwrap()).unwrap();
-        assert_eq!(redis_obj["redis"]["database"], 23);
-        assert_eq!(redis_obj["redis"]["key_field"], "tenant");
-        assert_eq!(redis_obj["redis"]["value_field"], "payload");
-        let redis_patterns = redis_obj["serving"]["patterns"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|pattern| pattern["name"].as_str().unwrap().to_string())
-            .collect::<Vec<_>>();
-        assert!(redis_patterns.contains(&"_support_redis_get".to_string()));
-
-        let get_redis_response = test_server
-            .client()
-            .get(&format!("http://localhost/{}/_redis/config", redis_table))
-            .perform()
-            .unwrap();
-        assert_eq!(get_redis_response.status(), 200);
-
-        let invalid_table = unique_test_index_name("support_config_redis_invalid");
-        let _invalid_temp_dir = add_support_parquet_checkpoint(test_server, &invalid_table);
-
-        let invalid_response = test_server
-            .client()
-            .put(
-                &format!("http://localhost/{}/_support/config", invalid_table),
-                r#"{
-                  "key_schema": {
-                    "primary_key": "tenant",
-                    "range_key": "event_id"
-                  },
-                  "redis": {
-                    "database": 24,
-                    "value_field": "payload"
-                  }
-                }"#,
-                mime::APPLICATION_JSON,
-            )
-            .perform()
-            .unwrap();
-
-        assert_eq!(invalid_response.status(), 400);
-        let invalid_obj: Value =
-            serde_json::from_str(&invalid_response.read_utf8_body().unwrap()).unwrap();
-        assert!(invalid_obj["error"]
-            .as_str()
-            .unwrap()
-            .contains("does not support range_key"));
     }
 
     #[test]

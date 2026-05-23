@@ -1,72 +1,82 @@
 # Iceberg Support Surface Config
 
-Powdrr now has a table-level support config for declaring how an Iceberg table
-should be exposed through the shared compatibility surfaces.
+Powdrr now supports a service-owned bootstrap config for declaring how Iceberg
+tables should be exposed through the shared compatibility surfaces.
 
-The goal is to stop treating each frontend as an isolated one-off mapping.
-Instead, a table can declare:
+The goal is to stop treating each frontend as an isolated one-off mapping and
+to avoid mutating that mapping through a public HTTP config API. Instead, the
+service loads one YAML file at startup, then writes the derived table metadata
+into the metadata plane before serving requests.
 
-- whether it should be exposed through compatibility surfaces at all
-- which field acts as the primary key
-- whether there is a range key
-- how that key schema should drive DynamoDB, Redis, and exact/range
-  Elasticsearch-style serving
+## Startup Contract
 
-## Route
+Set:
 
-The config lives behind:
+- `SUPPORT_SURFACES_CONFIG_PATH=/path/to/support-surfaces.yaml`
 
-- `GET /:table/_support/config`
-- `PUT /:table/_support/config`
+on `powdrr-io-service`.
 
-`PUT` stores the declared support contract and derives the existing
-surface-specific table metadata from it.
+At startup, the service:
 
-## Request Shape
+1. parses the YAML file
+2. ensures the configured org exists
+3. derives serving, DynamoDB, and Redis metadata from each table's support
+   mapping
+4. upserts that metadata into the service state
 
-```json
-{
-  "key_schema": {
-    "primary_key": "customer_id",
-    "range_key": "event_ts"
-  },
-  "elasticsearch": {},
-  "dynamodb": {
-    "local_secondary_indexes": [
-      {
-        "name": "by_status",
-        "sort_key": "status"
-      }
-    ],
-    "global_secondary_indexes": [
-      {
-        "name": "by_region",
-        "partition_key": "region",
-        "sort_key": "event_ts"
-      }
-    ]
-  },
-  "redis": null
-}
-```
+There is intentionally no public `/_support/config` route in this design.
 
-For a Redis-oriented table:
+## YAML Shape
 
-```json
-{
-  "key_schema": {
-    "primary_key": "session_id"
-  },
-  "redis": {
-    "database": 3,
-    "value_field": "payload_json"
-  }
-}
+```yaml
+org:
+  org_id: default
+  license_type: Free
+  creds:
+    - access_key_id: access
+      secret_access_key: secret
+
+tables:
+  - name: events
+    tags:
+      team: serving
+    support:
+      key_schema:
+        primary_key: tenant
+        range_key: event_id
+      elasticsearch: {}
+      dynamodb:
+        global_secondary_indexes:
+          - name: by_event
+            partition_key: event_id
+
+  - name: sessions
+    support:
+      key_schema:
+        primary_key: session_id
+      redis:
+        database: 3
+        value_field: payload_json
 ```
 
 ## What Powdrr Derives
 
-### Shared Serving Patterns
+Each table entry writes a normal `CreateTable`-style metadata record containing:
+
+- `support`
+  The original declarative support mapping.
+- `serving`
+  Derived exact/range serving patterns.
+- `dynamodb`
+  Derived DynamoDB key and secondary-index mapping.
+- `redis`
+  Derived Redis key/value mapping.
+
+Existing `mongodb` config is preserved if it already exists in metadata. Any
+manual serving patterns that do not belong to the support-derived or
+DynamoDB-derived families are also preserved.
+
+## Shared Serving Patterns
 
 The support config derives serving patterns from the declared key schema so the
 compatibility surfaces all land on the same exact/range-serving path.
@@ -84,97 +94,86 @@ With a primary key and range key:
 - `range_query_asc`
 - `range_query_desc`
 
-These patterns are written into the table's serving config with internal
-support-specific names so Powdrr can distinguish them from manually-authored
-patterns.
+These are stored with internal support-prefixed names so Powdrr can distinguish
+them from manually-authored patterns.
 
-### DynamoDB Config
+## DynamoDB Mapping
 
-If `dynamodb` is present, Powdrr derives:
+If `support.dynamodb` is present, Powdrr derives:
 
 - `partition_key` from `key_schema.primary_key`
 - `sort_key` from `key_schema.range_key`
-- local/global secondary indexes from the provided `dynamodb` block
+- local/global secondary indexes from `support.dynamodb`
 
-The support config does not duplicate the key names inside the DynamoDB block.
-There is one shared key schema for the table, and DynamoDB inherits it.
+The DynamoDB block does not repeat the primary key names. There is one shared
+key schema for the table, and DynamoDB inherits it.
 
-### Redis Config
+## Redis Mapping
 
-If `redis` is present, Powdrr derives:
+If `support.redis` is present, Powdrr derives:
 
 - `enabled = true`
-- `database` from `redis.database`
+- `database` from `support.redis.database`
 - `key_field` from `key_schema.primary_key`
-- `value_field` from `redis.value_field`
+- `value_field` from `support.redis.value_field`
 
-Redis support is intentionally narrower than DynamoDB support today:
+Current Redis limits:
 
 - no range key
 - one configured table per Redis database number
 
-### Elasticsearch-Style Support
+## Elasticsearch-Style Mapping
 
-The `elasticsearch` block currently means:
+The `support.elasticsearch` block currently means:
 
-- derive exact/range serving patterns suitable for key-oriented Elasticsearch
-  compatibility paths
+- derive exact/range serving patterns suitable for key-oriented
+  Elasticsearch-compatible serving
 
 It does **not** currently mean:
 
 - automatic text indexing sidecars
-- automatic `_search` full-text mapping
-- alias or template provisioning
+- automatic `_search` full-text provisioning
+- alias or template lifecycle management
 
-This slice is about exact/range key exposure, not the full search contract.
+This slice is about key-oriented exposure, not the full search contract.
 
 ## Validation Rules
 
-`PUT /:table/_support/config` fails fast when the contract does not match the
-table shape.
+The startup loader currently enforces structural config rules:
 
-Current enforced rules:
-
+- `org.org_id` must be non-empty
+- `org.creds` must contain at least one credential
 - `primary_key` must be present and non-empty
 - `range_key`, when set, must be non-empty and different from `primary_key`
 - at least one support surface must be enabled:
   `elasticsearch`, `dynamodb`, or `redis`
-- `primary_key`, `range_key`, and `redis.value_field` must exist in the table
-  schema
 - Redis support rejects `range_key`
-- Redis database numbers must be unique across configured tables
+- `support.redis.value_field` must be non-empty
 - DynamoDB index names must be unique across local and global secondary indexes
-- DynamoDB key fields must use scalar types Powdrr maps cleanly to DynamoDB
-  keys today: `String`, `Integer`, or `Float`
 
-## Schema Source
+## What Is Not Validated Yet
 
-Powdrr validates the support config against the table schema from the active
-checkpoint. That means:
+The bootstrap loader does **not** currently validate the support mapping
+against the live checkpoint schema at service startup.
 
-- the table must already exist
-- the table must already have a usable active checkpoint
-- that checkpoint must carry either Iceberg schema metadata, speedboat file
-  schemas, or the merged checkpoint schema
+That means:
 
-If there is no usable active checkpoint schema yet, support config writes fail
-with a checked error instead of guessing.
+- it does not check whether `primary_key`, `range_key`, or
+  `redis.value_field` exist in the current Iceberg schema
+- it does not check whether DynamoDB key fields map to scalar types that the
+  runtime will accept later
+
+Those are still real constraints, but they are not enforced by the service
+bootstrap file yet. This is the main gap between the earlier API-driven
+prototype and the file-driven design.
 
 ## Current Scope And Limits
 
-This support config is the preferred unified declaration for exposing Iceberg
-tables through the compatibility surfaces, but a few limits still matter:
-
+- the support mapping is owned by service bootstrap, not a public config API
 - legacy per-surface config routes still exist:
   `/_serve/config`, `/_dynamodb/config`, `/_redis/config`, `/_mongo/config`
-- those legacy routes are preserved for now and can still be edited directly
+- those legacy routes can still be edited directly, but the YAML file is now
+  the preferred source of truth for table exposure
 - Mongo is not yet included in the unified support config
 - Elasticsearch here means key-oriented serving patterns, not full search
   lifecycle automation
-
-So the practical contract is:
-
-- use `/_support/config` when you want one declared source of truth for table
-  exposure and key mapping
-- use the older per-surface routes only when you intentionally want to manage a
-  frontend mapping by hand

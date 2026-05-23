@@ -5,13 +5,13 @@ use crate::v1_handlers;
 use futures_util::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{Body, StatusCode, body};
+use gotham::hyper::{body, Body, StatusCode};
 use gotham::mime;
 use gotham::pipeline::{new_pipeline, single_pipeline};
 use gotham::prelude::{
     DefineSingleRoute, DrawRoutes, FromState, StateData, StaticResponseExtender,
 };
-use gotham::router::{Router, build_router};
+use gotham::router::{build_router, Router};
 use gotham::state::State;
 use powdrr_service_lib::data_contract::ServiceMode;
 use serde::Deserialize;

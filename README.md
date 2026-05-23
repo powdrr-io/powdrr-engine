@@ -240,11 +240,11 @@ requests are expected to fail with checked errors rather than succeed as
 partial approximations.
 
 For tables that should be exposed consistently across the compatibility
-surfaces, use `PUT /:table/_support/config` as the unified Iceberg-to-surface
-mapping contract. That route lets you declare the table's primary/range key
-shape once, then derive the serving, DynamoDB, and Redis mappings from it. The
-full contract is documented in
-`docs/iceberg-support-surface-config.md`.
+surfaces, configure `powdrr-io-service` with
+`SUPPORT_SURFACES_CONFIG_PATH=/path/to/support-surfaces.yaml`. That bootstrap
+file lets you declare the table's primary/range key shape once, then derive
+the serving, DynamoDB, and Redis mappings from it. The full contract is
+documented in `docs/iceberg-support-surface-config.md`.
 
 ## Getting Started
 
@@ -608,8 +608,9 @@ Powdrr would not exist in its current form without that work upstream.
   surfaces, including read-only mode and verified client coverage.
 
 - `docs/iceberg-support-surface-config.md`
-  The table-level contract for exposing Iceberg tables through the shared
-  serving, DynamoDB, Redis, and exact/range Elasticsearch-compatible paths.
+  The service-owned YAML contract for exposing Iceberg tables through the
+  shared serving, DynamoDB, Redis, and exact/range Elasticsearch-compatible
+  paths.
 
 - `docs/lakehouse-serving-roadmap.md`
   The repo-specific roadmap from the current hybrid stack toward a shared

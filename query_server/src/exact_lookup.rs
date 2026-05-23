@@ -12,7 +12,7 @@ use powdrr_query_runtime::lakehouse_serving::{
 };
 use powdrr_query_runtime::peers::CheckpointDescriptor;
 use powdrr_query_runtime::read_plan::ReadPlan;
-use powdrr_query_runtime::state_provider::{STATE_PROVIDER, ServiceApiError};
+use powdrr_query_runtime::state_provider::{ServiceApiError, STATE_PROVIDER};
 
 #[derive(Clone)]
 struct CachedActiveCheckpoint {

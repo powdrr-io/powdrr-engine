@@ -10,5 +10,4 @@ pub mod mongodb_wire_protocol;
 pub mod redis_protocol;
 pub mod redis_wire_protocol;
 pub mod router;
-pub mod support_protocol;
 mod test_api_endpoints;
