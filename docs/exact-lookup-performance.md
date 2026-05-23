@@ -3,6 +3,11 @@
 This note records the latest exact-lookup benchmark numbers for the mmap-backed
 snapshot lookup path.
 
+Exact lookup is a first-class product contract for Powdrr, not just a local
+optimization experiment. These measurements matter because exact lookup is the
+first serving class where the repo is trying to feel like a real operational
+database surface over coherent Iceberg snapshots.
+
 The purpose of these measurements is narrow:
 
 - show what the current Redis-style key/value fast path looks like

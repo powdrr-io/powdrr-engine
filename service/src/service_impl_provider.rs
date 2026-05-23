@@ -275,7 +275,7 @@ impl ServiceImplProviderActor {
     fn new(receiver: mpsc::Receiver<ServiceImplProviderActorMessage>) -> Self {
         ServiceImplProviderActor {
             service_impl: ServiceImpl::Ephemeral(EphemeralServiceImpl::new(
-                TestProcessingMode::default(),
+                TestProcessingMode::ephemeral_default(),
             )),
             receiver,
         }
@@ -312,7 +312,7 @@ impl ServiceImplProviderActor {
                 respond_to.send(Ok(())).unwrap();
             }
             ServiceImplProviderActorMessage::ConfigureRaft { respond_to, config } => {
-                let raft = RaftServiceImpl::new(config, TestProcessingMode::default())
+                let raft = RaftServiceImpl::new(config, TestProcessingMode::ephemeral_default())
                     .await
                     .map_err(ServiceImplError::from);
                 match raft {

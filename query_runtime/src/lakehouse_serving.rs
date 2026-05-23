@@ -361,7 +361,19 @@ struct SnapshotOrderedIndexKey {
 
 #[derive(Clone, Debug, Default)]
 struct SnapshotLookupRow {
-    values: Map<String, Value>,
+    encoded: Box<[u8]>,
+}
+
+impl SnapshotLookupRow {
+    fn from_values(values: Map<String, Value>) -> Result<Self, String> {
+        Ok(Self {
+            encoded: encode_snapshot_lookup_binary_fields(&values)?.into_boxed_slice(),
+        })
+    }
+
+    fn encoded_bytes(&self) -> &[u8] {
+        &self.encoded
+    }
 }
 
 #[derive(Debug)]
@@ -436,7 +448,9 @@ impl SnapshotLookupRowStore {
         match self {
             SnapshotLookupRowStore::InMemory(rows) => rows
                 .get(row_ref.0)
-                .map(|row| Value::Object(row.values.clone()))
+                .map(|row| parse_snapshot_lookup_binary_row_to_map(row.encoded_bytes()))
+                .transpose()?
+                .map(Value::Object)
                 .ok_or_else(|| format!("Snapshot row {} was out of bounds", row_ref.0)),
             SnapshotLookupRowStore::Mmap(rows) => rows.row_value(row_ref),
         }
@@ -448,10 +462,11 @@ impl SnapshotLookupRowStore {
         field: &str,
     ) -> Result<Option<Value>, String> {
         match self {
-            SnapshotLookupRowStore::InMemory(rows) => Ok(rows
+            SnapshotLookupRowStore::InMemory(rows) => rows
                 .get(row_ref.0)
-                .and_then(|row| row.values.get(field))
-                .cloned()),
+                .map(|row| parse_snapshot_lookup_binary_row_field(row.encoded_bytes(), field))
+                .transpose()?
+                .ok_or_else(|| format!("Snapshot row {} was out of bounds", row_ref.0)),
             SnapshotLookupRowStore::Mmap(rows) => rows.row_field_value(row_ref, field),
         }
     }
@@ -2198,10 +2213,10 @@ fn estimate_snapshot_lookup_value_bytes(value: &Value) -> u64 {
     }
 }
 
-fn snapshot_lookup_row_from_batch(
+fn snapshot_lookup_row_values_from_batch(
     batch: &RecordBatch,
     row_index: usize,
-) -> Result<SnapshotLookupRow, String> {
+) -> Result<Map<String, Value>, String> {
     let mut values = Map::with_capacity(batch.num_columns());
     for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
         values.insert(
@@ -2210,22 +2225,29 @@ fn snapshot_lookup_row_from_batch(
                 .map_err(|error| error.message.clone())?,
         );
     }
-    Ok(SnapshotLookupRow { values })
+    Ok(values)
+}
+
+fn snapshot_lookup_row_from_batch(
+    batch: &RecordBatch,
+    row_index: usize,
+) -> Result<SnapshotLookupRow, String> {
+    SnapshotLookupRow::from_values(snapshot_lookup_row_values_from_batch(batch, row_index)?)
 }
 
 fn snapshot_exact_lookup_row_from_batch(
     batch: &RecordBatch,
     row_index: usize,
 ) -> Result<SnapshotLookupRow, String> {
-    let mut row = snapshot_lookup_row_from_batch(batch, row_index)?;
-    if let Some(Value::String(text)) = row.values.get_mut("_source") {
+    let mut values = snapshot_lookup_row_values_from_batch(batch, row_index)?;
+    if let Some(Value::String(text)) = values.get_mut("_source") {
         let source_text = text.clone();
-        row.values.insert(
+        values.insert(
             "_source".to_string(),
             serde_json::from_str(&source_text).unwrap_or(Value::String(source_text)),
         );
     }
-    Ok(row)
+    SnapshotLookupRow::from_values(values)
 }
 
 fn read_snapshot_lookup_mmap_u64(bytes: &[u8]) -> Result<u64, String> {
@@ -2250,15 +2272,14 @@ fn read_snapshot_lookup_mmap_u32(bytes: &[u8]) -> Result<u32, String> {
     Ok(u32::from_le_bytes(value))
 }
 
-fn encode_snapshot_lookup_binary_row(row: &SnapshotLookupRow) -> Result<Vec<u8>, String> {
-    let field_count: u32 = row
-        .values
+fn encode_snapshot_lookup_binary_fields(values: &Map<String, Value>) -> Result<Vec<u8>, String> {
+    let field_count: u32 = values
         .len()
         .try_into()
         .map_err(|_| "Snapshot lookup mmap row had too many fields".to_string())?;
     let mut buffer = Vec::new();
     append_snapshot_lookup_mmap_u32(&mut buffer, field_count);
-    for (field_name, value) in row.values.iter() {
+    for (field_name, value) in values.iter() {
         let field_bytes = field_name.as_bytes();
         let field_len: u32 = field_bytes
             .len()
@@ -2278,41 +2299,12 @@ fn encode_snapshot_lookup_binary_row(row: &SnapshotLookupRow) -> Result<Vec<u8>,
 }
 
 fn parse_snapshot_lookup_binary_row_to_map(bytes: &[u8]) -> Result<Map<String, Value>, String> {
-    let field_count = read_snapshot_lookup_mmap_u32(
-        bytes
-            .get(0..4)
-            .ok_or_else(|| "Snapshot lookup mmap row header was truncated".to_string())?,
-    )? as usize;
-    let mut offset = 4usize;
-    let mut row = Map::with_capacity(field_count);
-    for _ in 0..field_count {
-        let field_name_len = read_snapshot_lookup_mmap_u32(
-            bytes
-                .get(offset..offset + 4)
-                .ok_or_else(|| "Snapshot lookup mmap row field name was truncated".to_string())?,
-        )? as usize;
-        offset += 4;
-        let field_name = std::str::from_utf8(
-            bytes
-                .get(offset..offset + field_name_len)
-                .ok_or_else(|| "Snapshot lookup mmap row field name was truncated".to_string())?,
-        )
-        .map_err(|error| error.to_string())?
-        .to_string();
-        offset += field_name_len;
-        let value_len = read_snapshot_lookup_mmap_u32(
-            bytes
-                .get(offset..offset + 4)
-                .ok_or_else(|| "Snapshot lookup mmap row field value was truncated".to_string())?,
-        )? as usize;
-        offset += 4;
-        let value_bytes = bytes
-            .get(offset..offset + value_len)
-            .ok_or_else(|| "Snapshot lookup mmap row field value was truncated".to_string())?;
-        offset += value_len;
+    let mut row = Map::new();
+    visit_snapshot_lookup_binary_fields(bytes, |field_name, value_bytes| {
         let value = serde_json::from_slice(value_bytes).map_err(|error| error.to_string())?;
-        row.insert(field_name, value);
-    }
+        row.insert(field_name.to_string(), value);
+        Ok(())
+    })?;
     Ok(row)
 }
 
@@ -2320,6 +2312,20 @@ fn parse_snapshot_lookup_binary_row_field(
     bytes: &[u8],
     target_field: &str,
 ) -> Result<Option<Value>, String> {
+    let mut value = None;
+    visit_snapshot_lookup_binary_fields(bytes, |field_name, value_bytes| {
+        if field_name == target_field {
+            value = Some(serde_json::from_slice(value_bytes).map_err(|error| error.to_string())?);
+        }
+        Ok(())
+    })?;
+    Ok(value)
+}
+
+fn visit_snapshot_lookup_binary_fields<F>(bytes: &[u8], mut visitor: F) -> Result<(), String>
+where
+    F: FnMut(&str, &[u8]) -> Result<(), String>,
+{
     let field_count = read_snapshot_lookup_mmap_u32(
         bytes
             .get(0..4)
@@ -2347,13 +2353,54 @@ fn parse_snapshot_lookup_binary_row_field(
             .get(offset..offset + value_len)
             .ok_or_else(|| "Snapshot lookup mmap row field value was truncated".to_string())?;
         offset += value_len;
-        if field_name_bytes == target_field.as_bytes() {
-            return serde_json::from_slice(value_bytes)
-                .map(Some)
-                .map_err(|error| error.to_string());
-        }
+        let field_name =
+            std::str::from_utf8(field_name_bytes).map_err(|error| error.to_string())?;
+        visitor(field_name, value_bytes)?;
     }
-    Ok(None)
+    Ok(())
+}
+
+fn visit_snapshot_lookup_row_fields<F>(
+    row_store: &SnapshotLookupRowStore,
+    row_ref: SnapshotRowRef,
+    mut visitor: F,
+) -> Result<(), String>
+where
+    F: FnMut(&str, Value) -> Result<(), String>,
+{
+    match row_store {
+        SnapshotLookupRowStore::InMemory(rows) => {
+            let row = rows
+                .get(row_ref.0)
+                .ok_or_else(|| format!("Snapshot row {} was out of bounds", row_ref.0))?;
+            visit_snapshot_lookup_binary_fields(row.encoded_bytes(), |field_name, value_bytes| {
+                visitor(
+                    field_name,
+                    serde_json::from_slice(value_bytes).map_err(|error| error.to_string())?,
+                )
+            })
+        }
+        SnapshotLookupRowStore::Mmap(rows) => match rows.encoding {
+            SnapshotLookupMmapEncoding::JsonRowsV1 => {
+                let Value::Object(values) = rows.row_value(row_ref)? else {
+                    return Ok(());
+                };
+                for (field_name, value) in values {
+                    visitor(&field_name, value)?;
+                }
+                Ok(())
+            }
+            SnapshotLookupMmapEncoding::FieldTableV2 => visit_snapshot_lookup_binary_fields(
+                rows.row_slice(row_ref)?,
+                |field_name, value_bytes| {
+                    visitor(
+                        field_name,
+                        serde_json::from_slice(value_bytes).map_err(|error| error.to_string())?,
+                    )
+                },
+            ),
+        },
+    }
 }
 
 pub(crate) fn record_batches_to_snapshot_lookup_mmap_bytes(
@@ -2384,11 +2431,10 @@ fn record_batches_to_snapshot_lookup_mmap_bytes_with_row_builder(
     for batch in batches {
         for row_index in 0..batch.num_rows() {
             let row = row_builder(batch, row_index)?;
-            let encoded = encode_snapshot_lookup_binary_row(&row)?;
             total_row_bytes = total_row_bytes
-                .checked_add(encoded.len())
+                .checked_add(row.encoded_bytes().len())
                 .ok_or_else(|| "Snapshot lookup mmap artifact overflowed".to_string())?;
-            row_bytes.push(encoded);
+            row_bytes.push(row.encoded_bytes().to_vec());
             row_count += 1;
         }
     }
@@ -2457,21 +2503,21 @@ fn build_in_memory_snapshot_lookup_cache(
     for batch in batches.iter() {
         for row_index in 0..batch.num_rows() {
             let row = snapshot_lookup_row_from_batch(batch, row_index)?;
-            estimated_bytes +=
-                estimate_snapshot_lookup_value_bytes(&Value::Object(row.values.clone()));
+            estimated_bytes += row.encoded_bytes().len() as u64;
             rows.push(Arc::new(row));
         }
     }
     let rows = Arc::new(rows);
-    let row_store = Arc::new(SnapshotLookupRowStore::InMemory(rows.clone()));
+    let row_count = rows.len();
+    let row_store = Arc::new(SnapshotLookupRowStore::InMemory(rows));
     let workers = spawn_snapshot_lookup_workers(
         row_store.clone(),
-        build_snapshot_lookup_exact_index_shards_from_rows(rows.as_ref()),
+        build_snapshot_lookup_exact_index_shards_from_store(row_store.as_ref())?,
     );
 
     Ok(SnapshotLookupCache {
         row_store,
-        row_count: rows.len(),
+        row_count,
         estimated_bytes,
         shard_count: SNAPSHOT_LOOKUP_SHARD_COUNT,
         workers,
@@ -2502,33 +2548,6 @@ async fn build_mmap_snapshot_lookup_cache(
     })
 }
 
-fn build_snapshot_lookup_exact_index_shards_from_rows(
-    rows: &[Arc<SnapshotLookupRow>],
-) -> Vec<HashMap<String, HashMap<SnapshotLookupKey, Vec<SnapshotRowRef>>>> {
-    let mut exact_index_shards: Vec<
-        HashMap<String, HashMap<SnapshotLookupKey, Vec<SnapshotRowRef>>>,
-    > = (0..SNAPSHOT_LOOKUP_SHARD_COUNT)
-        .map(|_| HashMap::new())
-        .collect();
-    for (row_index, row) in rows.iter().enumerate() {
-        for (field, value) in row.values.iter() {
-            let Some(encoded) = encode_exact_lookup_key(value) else {
-                continue;
-            };
-            let shard_index =
-                snapshot_lookup_shard_for_lookup_key(&encoded, SNAPSHOT_LOOKUP_SHARD_COUNT);
-            exact_index_shards[shard_index]
-                .entry(field.clone())
-                .or_default()
-                .entry(encoded)
-                .or_default()
-                .push(SnapshotRowRef(row_index));
-        }
-    }
-
-    exact_index_shards
-}
-
 fn build_snapshot_lookup_exact_index_shards_from_store(
     row_store: &SnapshotLookupRowStore,
 ) -> Result<Vec<HashMap<String, HashMap<SnapshotLookupKey, Vec<SnapshotRowRef>>>>, String> {
@@ -2539,22 +2558,20 @@ fn build_snapshot_lookup_exact_index_shards_from_store(
         .collect();
     for row_index in 0..row_store.row_count() {
         let row_ref = SnapshotRowRef(row_index);
-        let Value::Object(values) = row_store.row_value(row_ref)? else {
-            continue;
-        };
-        for (field, value) in values.iter() {
-            let Some(encoded) = encode_exact_lookup_key(value) else {
-                continue;
+        visit_snapshot_lookup_row_fields(row_store, row_ref, |field, value| {
+            let Some(encoded) = encode_exact_lookup_key(&value) else {
+                return Ok(());
             };
             let shard_index =
                 snapshot_lookup_shard_for_lookup_key(&encoded, SNAPSHOT_LOOKUP_SHARD_COUNT);
             exact_index_shards[shard_index]
-                .entry(field.clone())
+                .entry(field.to_string())
                 .or_default()
                 .entry(encoded)
                 .or_default()
                 .push(row_ref);
-        }
+            Ok(())
+        })?;
     }
     Ok(exact_index_shards)
 }
@@ -5980,9 +5997,10 @@ mod tests {
         let rows: Arc<Vec<Arc<super::SnapshotLookupRow>>> = Arc::new(
             rows.into_iter()
                 .map(|row| {
-                    Arc::new(super::SnapshotLookupRow {
-                        values: row.as_object().unwrap().clone(),
-                    })
+                    Arc::new(
+                        super::SnapshotLookupRow::from_values(row.as_object().unwrap().clone())
+                            .unwrap(),
+                    )
                 })
                 .collect(),
         );
@@ -5993,8 +6011,9 @@ mod tests {
             estimated_bytes,
             shard_count: super::SNAPSHOT_LOOKUP_SHARD_COUNT,
             workers: super::spawn_snapshot_lookup_workers(
-                row_store,
-                super::build_snapshot_lookup_exact_index_shards_from_rows(rows.as_ref()),
+                row_store.clone(),
+                super::build_snapshot_lookup_exact_index_shards_from_store(row_store.as_ref())
+                    .unwrap(),
             ),
         }
     }
@@ -6135,6 +6154,13 @@ mod tests {
         ))
         .await
         .unwrap()
+    }
+
+    fn snapshot_exact_lookup_in_memory_cache(
+        rows: Vec<serde_json::Value>,
+    ) -> super::SnapshotExactLookupCache {
+        let batch = snapshot_exact_lookup_record_batch(&rows);
+        super::build_in_memory_snapshot_exact_lookup_cache(vec![batch]).unwrap()
     }
 
     fn aggregate_spec() -> ServingAggregateSpec {
@@ -7678,6 +7704,44 @@ mod tests {
                 "_id_seq_no": "doc-1#2",
                 "_seq_no": 2,
                 "_version": 2,
+                "_source": { "tenant": "acme", "score": 20 }
+            })
+        );
+    }
+
+    #[test]
+    fn test_snapshot_exact_lookup_in_memory_cache_prefers_latest_seq_no_and_projects_source() {
+        let cache = snapshot_exact_lookup_in_memory_cache(vec![
+            json!({
+                "_id": "doc-1",
+                "_id_seq_no": "doc-1#1",
+                "_seq_no": 1,
+                "_version": 1,
+                "_source": { "tenant": "acme", "score": 10 }
+            }),
+            json!({
+                "_id": "doc-1",
+                "_id_seq_no": "doc-1#2",
+                "_seq_no": 2,
+                "_version": 2,
+                "_source": { "tenant": "acme", "score": 20 }
+            }),
+        ]);
+
+        let entry = cache
+            .entries_by_id
+            .get(&super::encode_exact_lookup_key(&json!("doc-1")).unwrap())
+            .expect("doc id should be indexed");
+        assert_eq!(
+            cache
+                .row_store
+                .projected_row_value(
+                    entry.row_ref,
+                    Some(&["_id".to_string(), "_source".to_string()])
+                )
+                .unwrap(),
+            json!({
+                "_id": "doc-1",
                 "_source": { "tenant": "acme", "score": 20 }
             })
         );
