@@ -228,7 +228,7 @@ impl StateProviderActor {
                         let provider = DynamoDbStateProvider::test(mode.clone()).await;
                         self.state_provider = StateProvider::DynamoDb(provider);
                     }
-                    StateMode::Leaderless { server_address } => {
+                    StateMode::Leaderless { server_address, .. } => {
                         self.state_provider = StateProvider::Leaderless(
                             LeaderlessStateProvider::new(mode.clone(), server_address.clone()),
                         )

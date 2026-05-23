@@ -1,7 +1,7 @@
 use crate::data_contract::{CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody};
 use crate::data_contract::{
-    CompactionCommit, CompactionWorkItem, CreateTable, DEFAULT_METADATA_NAMESPACE, ExtensionCommit,
-    ExtensionWorkItem, IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint,
+    CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem,
+    IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint,
 };
 use crate::dynamodb_service_impl::DynamoDBServiceImpl;
 use crate::ephemeral_fetch_tracker::EphemeralFetchTracker;
@@ -10,6 +10,8 @@ use crate::pipeline::PipelineDefinition;
 use crate::state_provider::ServiceApiError;
 use crate::test_api::TestProcessingMode;
 use powdrr_control_plane::ilm_policy::ILMPolicyDefinition;
+
+const DEFAULT_METADATA_NAMESPACE: &str = "__powdrr__";
 
 pub struct DynamoDbStateProvider {
     pub service_impl: DynamoDBServiceImpl,

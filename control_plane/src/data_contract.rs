@@ -1173,8 +1173,8 @@ impl ServiceMode {
 
 pub const DEFAULT_METADATA_NAMESPACE: &str = "__powdrr__";
 
-pub const TEST_ACCESS_KEY: &str = "access_key";
-pub const TEST_SECRET_KEY: &str = "secret_key";
+pub const TEST_ACCESS_KEY: &str = "test";
+pub const TEST_SECRET_KEY: &str = "test";
 
 #[cfg(test)]
 mod tests {

@@ -1,7 +1,7 @@
 use crate::data_contract::{
     CleanupCommit, CleanupWorkItem, CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody,
-    CreateTable, DEFAULT_METADATA_NAMESPACE, ExtensionCommit, ExtensionWorkItem, IcebergCommit,
-    SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription, TableMetadataCheckpoint,
+    CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit,
+    SpeedboatCommitTableInfo, TableDescription, TableMetadataCheckpoint,
 };
 use crate::dynamodb::{
     DynamoDbConnector, EntityVersionInfo, PowdrrNamedCleanupWorkItemCache,
@@ -26,6 +26,7 @@ use modyne::model::TransactWrite;
 use powdrr_control_plane::ilm_policy::ILMPolicyDefinition;
 use std::collections::{HashMap, HashSet};
 
+const DEFAULT_METADATA_NAMESPACE: &str = "__powdrr__";
 const LEASE_LENGTH_MS: i64 = 60 * 1000; // 1 minute
 
 fn from_modyne(e: modyne::Error) -> ServiceApiError {
