@@ -2,7 +2,7 @@ use crate::service_impl_provider::SERVICE_IMPL;
 use futures_util::future::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{Body, StatusCode, body};
+use gotham::hyper::{body, Body, StatusCode};
 use gotham::mime;
 use gotham::state::FromState;
 use gotham::state::State;

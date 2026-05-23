@@ -114,6 +114,10 @@ enum ServiceImplProviderActorMessage {
         respond_to: oneshot::Sender<Result<bool, ServiceImplError>>,
         create_table: CreateTable,
     },
+    UpsertTableMetadata {
+        respond_to: oneshot::Sender<Result<bool, ServiceImplError>>,
+        create_table: CreateTable,
+    },
     DescribeTable {
         respond_to: oneshot::Sender<Result<Option<TableDescription>, ServiceImplError>>,
         name: String,
@@ -323,7 +327,16 @@ impl ServiceImplProviderActor {
             } => {
                 handle_message_impl!(self, respond_to, create_table(&create_table));
             }
-            ServiceImplProviderActorMessage::DescribeTable { respond_to, name } => {
+            ServiceImplProviderActorMessage::UpsertTableMetadata {
+                respond_to,
+                create_table,
+            } => {
+                handle_message_impl!(self, respond_to, upsert_table_metadata(&create_table));
+            }
+            ServiceImplProviderActorMessage::DescribeTable {
+                respond_to,
+                name,
+            } => {
                 handle_message_impl!(self, respond_to, describe_table(&name));
             }
             ServiceImplProviderActorMessage::AddAlias {
@@ -541,6 +554,13 @@ impl ServiceImpl {
         create_table: &CreateTable,
     ) -> Result<bool, ServiceImplError> {
         state_provider_func_impl!(self, create_table(create_table))
+    }
+
+    pub async fn upsert_table_metadata(
+        &mut self,
+        create_table: &CreateTable,
+    ) -> Result<bool, ServiceImplError> {
+        state_provider_func_impl!(self, upsert_table_metadata(create_table))
     }
 
     pub async fn describe_table(
@@ -944,6 +964,13 @@ impl ServiceImplHandle {
 
     pub async fn create_table(&self, create_table: &CreateTable) -> Result<bool, ServiceImplError> {
         send_message!(self, CreateTable, create_table = create_table.clone())
+    }
+
+    pub async fn upsert_table_metadata(
+        &self,
+        create_table: &CreateTable,
+    ) -> Result<bool, ServiceImplError> {
+        send_message!(self, UpsertTableMetadata, create_table = create_table.clone())
     }
 
     pub async fn describe_table(

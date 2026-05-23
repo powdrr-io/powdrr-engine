@@ -5,13 +5,13 @@ use powdrr_service_lib::data_contract::{ServiceImplType, ServiceMode};
 use powdrr_service_lib::raft_service_impl::RaftServiceConfig;
 use std::collections::BTreeMap;
 use std::env;
-use std::time::Duration;
 
 mod checkpoint_updater;
 mod raft_handlers;
 mod response;
 mod router;
 mod service_impl_provider;
+mod support_surface_config;
 mod v1_handlers;
 
 use crate::service_impl_provider::SERVICE_IMPL;
@@ -92,12 +92,7 @@ async fn configure_service_impl_from_env(port: &String) {
                 peers: parse_raft_peers(port),
             };
             SERVICE_IMPL.configure_raft(config).await.unwrap();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                if let Err(error) = SERVICE_IMPL.bootstrap_raft_if_needed().await {
-                    tracing::error!("Raft bootstrap failed: {}", error);
-                }
-            });
+            SERVICE_IMPL.bootstrap_raft_if_needed().await.unwrap();
         }
         other => panic!("Unsupported SERVICE_METADATA_MODE: {}", other),
     }
@@ -117,10 +112,16 @@ async fn main() -> () {
         None => {
             let port = "7784".to_string();
             configure_service_impl_from_env(&port).await;
+            support_surface_config::apply_support_surface_config_from_env()
+                .await
+                .unwrap_or_else(|error| panic!("Failed to apply support surfaces config: {error}"));
             run_server(&port).await;
         }
         Some(val) => {
             configure_service_impl_from_env(val).await;
+            support_surface_config::apply_support_surface_config_from_env()
+                .await
+                .unwrap_or_else(|error| panic!("Failed to apply support surfaces config: {error}"));
             run_server(val).await;
         }
     }

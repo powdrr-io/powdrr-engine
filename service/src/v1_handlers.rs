@@ -1,11 +1,11 @@
 use crate::response::GenericResponse;
 use crate::router::NamePathExtractor;
-use crate::service_impl_provider::{SERVICE_IMPL, ServiceImplError};
+use crate::service_impl_provider::{ServiceImplError, SERVICE_IMPL};
 use futures_util::future::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::hyper::Method;
 use gotham::hyper::Uri;
-use gotham::hyper::{Body, body};
+use gotham::hyper::{body, Body};
 use gotham::hyper::{HeaderMap, StatusCode};
 use gotham::mime;
 use gotham::state::FromState;
@@ -435,6 +435,7 @@ mod tests {
             name: "the_name".to_string(),
             tags: Default::default(),
             serving: None,
+            support: None,
             dynamodb: None,
             mongodb: None,
             redis: None,

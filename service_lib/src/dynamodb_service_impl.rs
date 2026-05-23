@@ -23,8 +23,8 @@ use crate::state_provider::ServiceApiError;
 use crate::test_api::{StateMode, TestProcessingMode};
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_dynamodb::Client;
-use modyne::TestTableExt;
 use modyne::model::TransactWrite;
+use modyne::TestTableExt;
 use std::collections::{HashMap, HashSet};
 
 const LEASE_LENGTH_MS: i64 = 60 * 1000; // 1 minute
@@ -845,6 +845,7 @@ impl DynamoDBServiceImpl {
             name: metadata.table_name.clone(),
             tags: Default::default(),
             serving: None,
+            support: None,
             dynamodb: None,
             mongodb: None,
             redis: None,
@@ -910,6 +911,7 @@ impl DynamoDBServiceImpl {
                 &TableBody {
                     tags: create_table.tags.clone(),
                     serving: create_table.serving.clone(),
+                    support: create_table.support.clone(),
                     dynamodb: create_table.dynamodb.clone(),
                     mongodb: create_table.mongodb.clone(),
                     redis: create_table.redis.clone(),
@@ -926,6 +928,33 @@ impl DynamoDBServiceImpl {
         Ok(created)
     }
 
+    pub async fn upsert_table_metadata(
+        &mut self,
+        create_table: &CreateTable,
+    ) -> Result<bool, ServiceApiError> {
+        let updated = self
+            .connector
+            .upsert_table_helper(
+                &DEFAULT_METADATA_NAMESPACE.to_string(),
+                &create_table.name,
+                &TableBody {
+                    tags: create_table.tags.clone(),
+                    serving: create_table.serving.clone(),
+                    support: create_table.support.clone(),
+                    dynamodb: create_table.dynamodb.clone(),
+                    mongodb: create_table.mongodb.clone(),
+                    redis: create_table.redis.clone(),
+                },
+            )
+            .await
+            .map_err(from_modyne)?;
+        self.not_compacted_checkpoint_ids
+            .entry(create_table.name.clone())
+            .or_default();
+
+        Ok(updated)
+    }
+
     pub async fn describe_table(
         &mut self,
         name: &String,
@@ -939,6 +968,7 @@ impl DynamoDBServiceImpl {
                     name: name.clone(),
                     tags: x.tags.clone(),
                     serving: x.serving.clone(),
+                    support: x.support.clone(),
                     dynamodb: x.dynamodb.clone(),
                     mongodb: x.mongodb.clone(),
                     redis: x.redis.clone(),
@@ -965,6 +995,7 @@ impl DynamoDBServiceImpl {
                                 name: table_name.clone(),
                                 tags: x.tags.clone(),
                                 serving: x.serving.clone(),
+                                support: x.support.clone(),
                                 dynamodb: x.dynamodb.clone(),
                                 mongodb: x.mongodb.clone(),
                                 redis: x.redis.clone(),
@@ -2168,6 +2199,109 @@ mod tests {
     use crate::test_api::{CompactionMode, TestProcessingMode};
     use std::collections::HashMap;
 
+    fn iceberg_metadata(file_path: &str, snapshot_id: &str) -> IcebergMetadata {
+        let schema = PowdrrSchema::minimal();
+        IcebergMetadata {
+            table_schema: schema.clone(),
+            snapshot_id: Some(snapshot_id.to_string()),
+            files: FileSetPayload::single(file_path.to_string(), 128, schema),
+            partition_spec: vec![],
+            sort_order: vec![],
+            column_names: vec![],
+            column_stats: vec![],
+            access_artifacts: vec![],
+            file_stats: vec![],
+        }
+    }
+
+    fn speedboat_commit(table_name: &str, file_path: &str) -> SpeedboatCommit {
+        SpeedboatCommit {
+            type_files: vec![SpeedboatCommitTableInfo {
+                commit_type: "commit".to_string(),
+                table_name: table_name.to_string(),
+                segments: vec![],
+                files: vec![file_path.to_string()],
+                sizes: vec![64],
+                schema: Some(PowdrrSchema::minimal()),
+            }],
+            compaction: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_target_and_active_frontiers_diverge_until_activation() {
+        let mut state = DynamoDBServiceImpl::test(TestProcessingMode::default()).await;
+        let table_name = "dynamodb-frontier-table".to_string();
+
+        state
+            .create_table(&CreateTable {
+                name: table_name.clone(),
+                tags: HashMap::new(),
+                serving: None,
+                support: None,
+                dynamodb: None,
+                mongodb: None,
+                redis: None,
+            })
+            .await
+            .unwrap();
+
+        state
+            .iceberg_commit(
+                &table_name,
+                &IcebergCommit {
+                    metadata: iceberg_metadata("s3://warehouse/table/data-0001.parquet", "1"),
+                    deletes_table_info: None,
+                    compactions: vec![],
+                },
+            )
+            .await
+            .unwrap();
+
+        let committed_checkpoint =
+            MetadataStore::get_latest_committed_checkpoint(&mut state, &table_name, None)
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            MetadataStore::get_latest_target_checkpoint(&mut state, &table_name, None)
+                .await
+                .unwrap(),
+            Some(committed_checkpoint.clone())
+        );
+        assert_eq!(
+            MetadataStore::get_published_active_checkpoint(&mut state, &table_name, None)
+            .await
+            .unwrap(),
+            None
+        );
+
+        assert!(MetadataStore::advance_published_checkpoints(&mut state)
+            .await
+            .unwrap());
+        assert_eq!(
+            MetadataStore::get_latest_target_checkpoint(&mut state, &table_name, None)
+                .await
+                .unwrap(),
+            Some(committed_checkpoint.clone())
+        );
+        assert_eq!(
+            MetadataStore::get_published_active_checkpoint(&mut state, &table_name, None)
+            .await
+            .unwrap(),
+            None
+        );
+
+        let cutover_state = MetadataStore::get_checkpoint_cutover_state(&mut state, &table_name, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            cutover_state.target_checkpoint_id,
+            Some(committed_checkpoint)
+        );
+        assert_eq!(cutover_state.active_checkpoint_id, None);
+    }
     #[tokio::test]
     async fn tracks_intermediate_checkpoints_while_compaction_is_pending() {
         let mut mode = TestProcessingMode::default();
@@ -2180,6 +2314,7 @@ mod tests {
                 name: table_name.clone(),
                 tags: HashMap::new(),
                 serving: None,
+                support: None,
                 dynamodb: None,
                 mongodb: None,
                 redis: None,
@@ -2199,13 +2334,11 @@ mod tests {
         let first_work_items = state.get_compaction_work_items().await.unwrap();
         assert_eq!(first_work_items.len(), 1);
         assert!(state.tables_with_pending_compaction.contains(&table_name));
-        assert!(
-            state
-                .not_compacted_checkpoint_ids
-                .get(&table_name)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(state
+            .not_compacted_checkpoint_ids
+            .get(&table_name)
+            .unwrap()
+            .is_empty());
 
         state
             .speedboat_commit(&speedboat_commit(
@@ -2262,12 +2395,10 @@ mod tests {
             second_work_items[0].1.checkpoints_to_delete,
             vec![second_checkpoint, third_checkpoint]
         );
-        assert!(
-            state
-                .not_compacted_checkpoint_ids
-                .get(&table_name)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(state
+            .not_compacted_checkpoint_ids
+            .get(&table_name)
+            .unwrap()
+            .is_empty());
     }
 }

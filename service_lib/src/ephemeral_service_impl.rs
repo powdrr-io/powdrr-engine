@@ -661,6 +661,7 @@ impl EphemeralServiceImpl {
                     name: metadata.table_name.clone(),
                     tags: Default::default(),
                     serving: None,
+                    support: None,
                     dynamodb: None,
                     mongodb: None,
                     redis: None,
@@ -1152,6 +1153,13 @@ impl EphemeralServiceImpl {
             }
         }
         Ok(true)
+    }
+
+    pub async fn upsert_table_metadata(
+        &mut self,
+        create_table: &CreateTable,
+    ) -> Result<bool, ServiceApiError> {
+        self.create_table(create_table).await
     }
 
     pub async fn describe_table(
@@ -1915,6 +1923,7 @@ mod tests {
                 name: table_name.clone(),
                 tags: HashMap::new(),
                 serving: None,
+                support: None,
                 dynamodb: None,
                 mongodb: None,
                 redis: None,

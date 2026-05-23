@@ -11,38 +11,38 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::parquet::arrow::ArrowWriter;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{Body, body};
+use gotham::hyper::{body, Body};
 use gotham::mime;
 use gotham::state::{FromState, State};
 use hmac::{Hmac, Mac};
 use http::{HeaderMap, StatusCode};
 use idgenerator::IdInstance;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::elastic_search_http_types::NamePathExtractor;
 use crate::exact_lookup::{
-    ActiveCheckpointLookupError, execute_active_checkpoint_exact_lookup_batch_rows,
-    load_active_checkpoint as load_shared_active_checkpoint,
+    execute_active_checkpoint_exact_lookup_batch_rows,
+    load_active_checkpoint as load_shared_active_checkpoint, ActiveCheckpointLookupError,
 };
 use futures_util::future::FutureExt;
-use powdrr_query_lib::data_access::{self, execute_sql_async, load_files_as_table};
-use powdrr_query_lib::data_contract::{
+use powdrr_control_plane::data_contract::{
     CreateTable, DynamoDbGlobalSecondaryIndexConfig, DynamoDbLocalSecondaryIndexConfig,
     DynamoDbTableConfig, FileDescriptor, FileSetPayload, IcebergMetadata, ServingPattern,
     ServingTableConfig, TableDescription, TableMetadataCheckpoint,
 };
-use powdrr_query_lib::schema_massager::{PowdrrDataType, PowdrrSchema, extract_powdrr_schema};
+use powdrr_query_lib::data_access::{self, execute_sql_async, load_files_as_table};
+use powdrr_query_lib::schema_massager::{extract_powdrr_schema, PowdrrDataType, PowdrrSchema};
 use powdrr_query_lib::serving_plan::{
     ServingPredicate, ServingQueryClassification, ServingRequestPlan, ServingSort,
 };
 use powdrr_query_runtime::lakehouse_serving::{
-    ServingQueryError, ServingQueryResponse, execute_serving_query,
+    execute_serving_query, ServingQueryError, ServingQueryResponse,
 };
 use powdrr_query_runtime::peers::CheckpointDescriptor;
 use powdrr_query_runtime::search_runtime::batches_to_serde_value;
-use powdrr_query_runtime::state_provider::{STATE_PROVIDER, ServiceApiError};
+use powdrr_query_runtime::state_provider::{ServiceApiError, STATE_PROVIDER};
 
 const DYNAMODB_TARGET_PREFIX: &str = "DynamoDB_20120810.";
 const DYNAMODB_CONFIG_PATTERN_PREFIX: &str = "_dynamodb_";
@@ -712,6 +712,9 @@ pub fn put_dynamodb_config(mut state: State) -> Pin<Box<HandlerFuture>> {
             let existing_serving = existing
                 .as_ref()
                 .and_then(|description| description.serving.clone());
+            let existing_support = existing
+                .as_ref()
+                .and_then(|description| description.support.clone());
             let existing_mongodb = existing
                 .as_ref()
                 .and_then(|description| description.mongodb.clone());
@@ -722,6 +725,7 @@ pub fn put_dynamodb_config(mut state: State) -> Pin<Box<HandlerFuture>> {
                 "name": path.clone(),
                 "tags": tags,
                 "serving": merge_dynamodb_serving_patterns(existing_serving, &body),
+                "support": existing_support,
                 "dynamodb": body.clone(),
                 "mongodb": existing_mongodb,
                 "redis": existing_redis,
@@ -2818,7 +2822,7 @@ fn dynamodb_key_type(
     }
 }
 
-fn merge_dynamodb_serving_patterns(
+pub(crate) fn merge_dynamodb_serving_patterns(
     existing: Option<ServingTableConfig>,
     config: &DynamoDbTableConfig,
 ) -> ServingTableConfig {
@@ -5615,12 +5619,10 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&put_response.read_utf8_body().unwrap())
                 .unwrap();
         assert_eq!(put_body["__type"], "ValidationException");
-        assert!(
-            put_body["message"]
-                .as_str()
-                .unwrap()
-                .contains("read-only mode")
-        );
+        assert!(put_body["message"]
+            .as_str()
+            .unwrap()
+            .contains("read-only mode"));
     }
 
     #[test]
@@ -5748,13 +5750,11 @@ mod tests {
             &list_tables_response.read_utf8_body().unwrap(),
         )
         .unwrap();
-        assert!(
-            list_tables_body["TableNames"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value == &json!(table_name))
-        );
+        assert!(list_tables_body["TableNames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == &json!(table_name)));
 
         let list_tables_unknown_field_response =
             perform_dynamodb_request(&test_server, "ListTables", json!({ "UnknownField": true }));

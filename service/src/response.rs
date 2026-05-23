@@ -1,6 +1,6 @@
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::StatusCode;
 use gotham::hyper::header::HeaderName;
+use gotham::hyper::StatusCode;
 use gotham::mime::Mime;
 use gotham::state::State;
 

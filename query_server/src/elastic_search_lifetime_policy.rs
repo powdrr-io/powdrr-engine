@@ -2,7 +2,7 @@ use crate::elastic_search_http_types::NamePathExtractor;
 use futures_util::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{Body, body};
+use gotham::hyper::{body, Body};
 use gotham::mime;
 use gotham::prelude::FromState;
 use gotham::state::State;

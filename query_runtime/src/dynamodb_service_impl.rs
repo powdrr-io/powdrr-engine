@@ -21,8 +21,8 @@ use crate::state_provider::ServiceApiError;
 use crate::test_api::{StateMode, TestProcessingMode};
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_dynamodb::Client;
-use modyne::TestTableExt;
 use modyne::model::TransactWrite;
+use modyne::TestTableExt;
 use powdrr_control_plane::ilm_policy::ILMPolicyDefinition;
 use std::collections::{HashMap, HashSet};
 
@@ -37,6 +37,7 @@ fn create_table_request(
     name: String,
     tags: HashMap<String, String>,
     serving: Option<crate::data_contract::ServingTableConfig>,
+    support: Option<crate::data_contract::SupportTableConfig>,
     dynamodb: Option<crate::data_contract::DynamoDbTableConfig>,
     mongodb: Option<crate::data_contract::MongoDbTableConfig>,
     redis: Option<crate::data_contract::RedisTableConfig>,
@@ -45,6 +46,7 @@ fn create_table_request(
         "name": name,
         "tags": tags,
         "serving": serving,
+        "support": support,
         "dynamodb": dynamodb,
         "mongodb": mongodb,
         "redis": redis,
@@ -56,6 +58,7 @@ fn table_description_from_parts(
     name: String,
     tags: HashMap<String, String>,
     serving: Option<crate::data_contract::ServingTableConfig>,
+    support: Option<crate::data_contract::SupportTableConfig>,
     dynamodb: Option<crate::data_contract::DynamoDbTableConfig>,
     mongodb: Option<crate::data_contract::MongoDbTableConfig>,
     redis: Option<crate::data_contract::RedisTableConfig>,
@@ -64,6 +67,7 @@ fn table_description_from_parts(
         "name": name,
         "tags": tags,
         "serving": serving,
+        "support": support,
         "dynamodb": dynamodb,
         "mongodb": mongodb,
         "redis": redis,
@@ -366,6 +370,7 @@ impl DynamoDBServiceImpl {
             None,
             None,
             None,
+            None,
         ))
         .await?;
         if metadata.speedboat_metadata.is_some() {
@@ -439,6 +444,7 @@ impl DynamoDBServiceImpl {
                 &TableBody {
                     tags: create_table.tags.clone(),
                     serving: create_table.serving.clone(),
+                    support: create_table.support.clone(),
                     dynamodb: create_table.dynamodb.clone(),
                     mongodb: create_table.mongodb.clone(),
                     redis: create_table.redis.clone(),
@@ -459,6 +465,7 @@ impl DynamoDBServiceImpl {
                 &TableBody {
                     tags: create_table.tags.clone(),
                     serving: create_table.serving.clone(),
+                    support: create_table.support.clone(),
                     dynamodb: create_table.dynamodb.clone(),
                     mongodb: create_table.mongodb.clone(),
                     redis: create_table.redis.clone(),
@@ -481,6 +488,7 @@ impl DynamoDBServiceImpl {
                         name.clone(),
                         x.tags.clone(),
                         x.serving.clone(),
+                        x.support.clone(),
                         x.dynamodb.clone(),
                         x.mongodb.clone(),
                         x.redis.clone(),
@@ -509,6 +517,7 @@ impl DynamoDBServiceImpl {
                                     table_name.clone(),
                                     x.tags.clone(),
                                     x.serving.clone(),
+                                    x.support.clone(),
                                     x.dynamodb.clone(),
                                     x.mongodb.clone(),
                                     x.redis.clone(),
@@ -1491,6 +1500,94 @@ mod tests {
     use crate::schema_massager::PowdrrSchema;
     use std::collections::HashMap;
 
+    fn iceberg_metadata(file_path: &String, snapshot_id: &str) -> IcebergMetadata {
+        let schema = PowdrrSchema::minimal();
+        IcebergMetadata {
+            table_schema: schema.clone(),
+            snapshot_id: Some(snapshot_id.to_string()),
+            files: FileSetPayload::single(file_path.clone(), 128, schema),
+            partition_spec: vec![],
+            sort_order: vec![],
+            column_names: vec![],
+            column_stats: vec![],
+            access_artifacts: vec![],
+            file_stats: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_store_committed_and_published_frontiers_diverge_until_advanced() {
+        let mut service_impl = DynamoDBServiceImpl::test(TestProcessingMode::default()).await;
+        let table_name = "dynamodb_frontier_table".to_string();
+        let file_path = "s3://warehouse/table/data-0001.parquet".to_string();
+
+        service_impl
+            .create_table(&create_table_request(
+                table_name.clone(),
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+
+        service_impl
+            .iceberg_commit(
+                &table_name,
+                &IcebergCommit {
+                    metadata: iceberg_metadata(&file_path, "1"),
+                    deletes_table_info: None,
+                    compactions: vec![],
+                },
+            )
+            .await
+            .unwrap();
+
+        let committed_checkpoint = MetadataStore::get_latest_committed_checkpoint(
+            &mut service_impl,
+            &table_name,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            MetadataStore::get_published_checkpoint_record(
+                &mut service_impl,
+                &PublishedCheckpointSelector::active(table_name.clone(), None),
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        let target_record = MetadataStore::get_published_checkpoint_record(
+            &mut service_impl,
+            &PublishedCheckpointSelector::target(table_name.clone(), None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(target_record.checkpoint_id, committed_checkpoint);
+
+        assert!(
+            MetadataStore::advance_published_checkpoints(&mut service_impl)
+                .await
+                .unwrap()
+        );
+
+        let published_record = MetadataStore::get_published_checkpoint_record(
+            &mut service_impl,
+            &PublishedCheckpointSelector::active(table_name.clone(), None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(published_record.checkpoint_id, committed_checkpoint);
+    }
     #[tokio::test]
     async fn iceberg_extension_checkpoints_publish_after_extension_commit() {
         let mut service_impl = DynamoDBServiceImpl::test(TestProcessingMode::default()).await;
@@ -1501,6 +1598,7 @@ mod tests {
             .create_table(&create_table_request(
                 table_name.clone(),
                 HashMap::new(),
+                None,
                 None,
                 None,
                 None,

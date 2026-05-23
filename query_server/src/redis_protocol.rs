@@ -7,27 +7,27 @@ use std::{
 use futures_util::future::FutureExt;
 use gotham::handler::HandlerFuture;
 use gotham::helpers::http::response::create_response;
-use gotham::hyper::{Body, body};
+use gotham::hyper::{body, Body};
 use gotham::mime;
 use gotham::state::{FromState, State};
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::elastic_search_http_types::NamePathExtractor;
 use crate::exact_lookup::{
-    ActiveCheckpointLookupError, execute_active_checkpoint_exact_lookup_batch_rows,
-    load_active_checkpoint as load_shared_active_checkpoint,
+    execute_active_checkpoint_exact_lookup_batch_rows,
+    load_active_checkpoint as load_shared_active_checkpoint, ActiveCheckpointLookupError,
 };
-use powdrr_query_lib::data_contract::{
+use powdrr_control_plane::data_contract::{
     CreateTable, RedisTableConfig, TableDescription, TableMetadataCheckpoint,
 };
 use powdrr_query_lib::schema_massager::PowdrrSchema;
 use powdrr_query_lib::serving_plan::{
     ServingPredicate, ServingQueryClassification, ServingRequestPlan,
 };
-use powdrr_query_runtime::lakehouse_serving::{ServingQueryError, execute_serving_query};
-use powdrr_query_runtime::state_provider::{STATE_PROVIDER, ServiceApiError};
+use powdrr_query_runtime::lakehouse_serving::{execute_serving_query, ServingQueryError};
+use powdrr_query_runtime::state_provider::{ServiceApiError, STATE_PROVIDER};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct RedisConfigResponse {
@@ -177,6 +177,9 @@ pub fn put_redis_config(mut state: State) -> Pin<Box<HandlerFuture>> {
             let serving = existing
                 .as_ref()
                 .and_then(|description| description.serving.clone());
+            let support = existing
+                .as_ref()
+                .and_then(|description| description.support.clone());
             let dynamodb = existing
                 .as_ref()
                 .and_then(|description| description.dynamodb.clone());
@@ -192,6 +195,7 @@ pub fn put_redis_config(mut state: State) -> Pin<Box<HandlerFuture>> {
                 name: path.clone(),
                 tags,
                 serving,
+                support,
                 dynamodb,
                 mongodb,
                 redis: Some(body.clone()),
