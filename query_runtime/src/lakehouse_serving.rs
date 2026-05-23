@@ -84,6 +84,8 @@ static SNAPSHOT_EXACT_LOOKUP_CACHE: LazyLock<
 static SNAPSHOT_LOOKUP_CACHE: LazyLock<Mutex<HashMap<String, Arc<SnapshotLookupCache>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+pub type ProjectedFieldBytesRow = HashMap<String, Option<Vec<u8>>>;
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ServingQueryResponse {
     pub table: String,
@@ -471,6 +473,28 @@ impl SnapshotLookupRowStore {
         }
     }
 
+    fn projected_top_level_field_bytes(
+        &self,
+        row_ref: SnapshotRowRef,
+        select_fields: &[String],
+    ) -> Result<ProjectedFieldBytesRow, String> {
+        match self {
+            SnapshotLookupRowStore::InMemory(rows) => rows
+                .get(row_ref.0)
+                .map(|row| {
+                    parse_snapshot_lookup_binary_row_selected_field_bytes(
+                        row.encoded_bytes(),
+                        select_fields,
+                    )
+                })
+                .transpose()?
+                .ok_or_else(|| format!("Snapshot row {} was out of bounds", row_ref.0)),
+            SnapshotLookupRowStore::Mmap(rows) => {
+                rows.projected_top_level_field_bytes(row_ref, select_fields)
+            }
+        }
+    }
+
     fn projected_row_value(
         &self,
         row_ref: SnapshotRowRef,
@@ -583,6 +607,44 @@ impl MmapSnapshotLookupRows {
                 .cloned()),
             SnapshotLookupMmapEncoding::FieldTableV2 => {
                 parse_snapshot_lookup_binary_row_field(self.row_slice(row_ref)?, field)
+            }
+        }
+    }
+
+    fn projected_top_level_field_bytes(
+        &self,
+        row_ref: SnapshotRowRef,
+        select_fields: &[String],
+    ) -> Result<ProjectedFieldBytesRow, String> {
+        match self.encoding {
+            SnapshotLookupMmapEncoding::JsonRowsV1 => {
+                let Value::Object(values) = self.row_value(row_ref)? else {
+                    return Err("Snapshot lookup row was not an object".to_string());
+                };
+                let mut projected = ProjectedFieldBytesRow::with_capacity(select_fields.len());
+                let source_value = values.get("_source").and_then(Value::as_object);
+                for field in select_fields {
+                    if let Some(value) = values.get(field) {
+                        projected.insert(
+                            field.clone(),
+                            snapshot_lookup_value_to_projected_bytes(value),
+                        );
+                        continue;
+                    }
+                    if let Some(value) = source_value.and_then(|source| source.get(field)) {
+                        projected.insert(
+                            field.clone(),
+                            snapshot_lookup_value_to_projected_bytes(value),
+                        );
+                    }
+                }
+                Ok(projected)
+            }
+            SnapshotLookupMmapEncoding::FieldTableV2 => {
+                parse_snapshot_lookup_binary_row_selected_field_bytes(
+                    self.row_slice(row_ref)?,
+                    select_fields,
+                )
             }
         }
     }
@@ -1647,6 +1709,95 @@ pub async fn execute_checkpoint_exact_lookup_batch_rows(
     Ok(Some(results))
 }
 
+pub async fn execute_checkpoint_exact_lookup_batch_projected_field_bytes(
+    checkpoint: &TableMetadataCheckpoint,
+    requests: &[ReadPlan],
+) -> Result<Option<Vec<Vec<ProjectedFieldBytesRow>>>, String> {
+    if requests.is_empty() {
+        return Ok(Some(vec![]));
+    }
+
+    let files = checkpoint
+        .iceberg_metadata
+        .as_ref()
+        .map(|metadata| metadata.files.as_file_tuples())
+        .unwrap_or_default();
+    let speedboat_files = checkpoint
+        .speedboat_metadata
+        .as_ref()
+        .map(|metadata| metadata.files.as_file_tuples())
+        .unwrap_or_default();
+    let delete_files = checkpoint
+        .deletes_metadata
+        .as_ref()
+        .map(|metadata| metadata.files.clone())
+        .unwrap_or_default();
+    let extension_files = flatten_extension_files(checkpoint);
+    let checkpoint_key = checkpoint_cache_key(&checkpoint.get_descriptor());
+    let snapshot_exact_lookup_artifact =
+        snapshot_exact_lookup_artifact(&checkpoint.checkpoint_id, &extension_files);
+    let snapshot_lookup_artifact =
+        snapshot_lookup_artifact(&checkpoint.checkpoint_id, &extension_files);
+
+    if files.is_empty() || !speedboat_files.is_empty() {
+        return Ok(None);
+    }
+
+    let cache = get_or_build_snapshot_lookup_cache(
+        &checkpoint_key,
+        snapshot_lookup_artifact.as_ref(),
+        &files,
+        &delete_files,
+    )
+    .await?;
+    let mut results = Vec::with_capacity(requests.len());
+    for request in requests {
+        let limit = request.normalized_limit(DEFAULT_LIMIT, MAX_LIMIT);
+        if let Some(rows) = maybe_execute_snapshot_exact_lookup_artifact_projected_field_bytes(
+            &checkpoint_key,
+            snapshot_exact_lookup_artifact.as_ref(),
+            request,
+            limit,
+        )
+        .await?
+        {
+            results.push(rows);
+            continue;
+        }
+
+        let Some(plan) = snapshot_lookup_plan(request) else {
+            return Ok(None);
+        };
+        let row_refs = match plan {
+            SnapshotLookupPlan::Exact { predicates } => {
+                execute_snapshot_exact_lookup_row_refs(&cache, &predicates, limit).await?
+            }
+            SnapshotLookupPlan::KeyRange {
+                eq_field,
+                eq_value,
+                order_field,
+                descending,
+                range,
+            } => {
+                execute_snapshot_key_range_lookup_row_refs(
+                    &cache,
+                    &eq_field,
+                    &eq_value,
+                    &order_field,
+                    descending,
+                    range.as_ref(),
+                    limit,
+                )
+                .await?
+            }
+        };
+        results.push(snapshot_row_refs_to_projected_field_bytes(
+            &cache, row_refs, request,
+        )?);
+    }
+    Ok(Some(results))
+}
+
 pub(crate) async fn warm_checkpoint_point_lookup_caches(
     checkpoint: &TableMetadataCheckpoint,
 ) -> Result<ServingPointLookupWarmupStats, String> {
@@ -1935,6 +2086,43 @@ async fn maybe_execute_snapshot_exact_lookup_artifact(
                 cache
                     .row_store
                     .projected_row_value(entry.row_ref, select_fields.as_deref())?,
+            );
+        }
+        if rows.len() >= limit {
+            break;
+        }
+    }
+    Ok(Some(rows))
+}
+
+async fn maybe_execute_snapshot_exact_lookup_artifact_projected_field_bytes(
+    checkpoint_key: &str,
+    snapshot_exact_lookup_artifact: Option<&SnapshotExactLookupArtifact>,
+    request: &ReadPlan,
+    limit: usize,
+) -> Result<Option<Vec<ProjectedFieldBytesRow>>, String> {
+    let Some(snapshot_exact_lookup_artifact) = snapshot_exact_lookup_artifact else {
+        return Ok(None);
+    };
+    let Some(doc_ids) = exact_id_lookup_values(request) else {
+        return Ok(None);
+    };
+    let Some(select_fields) = normalized_select(request.select.clone()) else {
+        return Ok(None);
+    };
+    if doc_ids.is_empty() {
+        return Ok(Some(vec![]));
+    }
+    let cache =
+        get_or_build_snapshot_exact_lookup_cache(checkpoint_key, snapshot_exact_lookup_artifact)
+            .await?;
+    let mut rows = Vec::with_capacity(limit.min(doc_ids.len()));
+    for doc_id in doc_ids {
+        if let Some(entry) = cache.entries_by_id.get(&doc_id) {
+            rows.push(
+                cache
+                    .row_store
+                    .projected_top_level_field_bytes(entry.row_ref, &select_fields)?,
             );
         }
         if rows.len() >= limit {
@@ -2320,6 +2508,79 @@ fn parse_snapshot_lookup_binary_row_field(
         Ok(())
     })?;
     Ok(value)
+}
+
+fn parse_snapshot_lookup_binary_row_selected_field_bytes(
+    bytes: &[u8],
+    target_fields: &[String],
+) -> Result<ProjectedFieldBytesRow, String> {
+    let wanted = target_fields.iter().cloned().collect::<HashSet<_>>();
+    let mut projected = ProjectedFieldBytesRow::with_capacity(wanted.len());
+    let mut missing = wanted.clone();
+    let mut source_bytes = None;
+    visit_snapshot_lookup_binary_fields(bytes, |field_name, value_bytes| {
+        if field_name == "_source" {
+            source_bytes = Some(value_bytes.to_vec());
+        }
+        if wanted.contains(field_name) {
+            projected.insert(
+                field_name.to_string(),
+                snapshot_lookup_json_bytes_to_projected_bytes(value_bytes)?,
+            );
+            missing.remove(field_name);
+        }
+        Ok(())
+    })?;
+    if !missing.is_empty() {
+        merge_projected_source_field_bytes(&mut projected, &missing, source_bytes.as_deref())?;
+    }
+    Ok(projected)
+}
+
+fn merge_projected_source_field_bytes(
+    projected: &mut ProjectedFieldBytesRow,
+    missing_fields: &HashSet<String>,
+    source_bytes: Option<&[u8]>,
+) -> Result<(), String> {
+    let Some(source_bytes) = source_bytes else {
+        return Ok(());
+    };
+    let Value::Object(source) =
+        serde_json::from_slice::<Value>(source_bytes).map_err(|error| error.to_string())?
+    else {
+        return Ok(());
+    };
+    for field in missing_fields {
+        if let Some(value) = source.get(field) {
+            projected.insert(
+                field.clone(),
+                snapshot_lookup_value_to_projected_bytes(value),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_lookup_json_bytes_to_projected_bytes(
+    value_bytes: &[u8],
+) -> Result<Option<Vec<u8>>, String> {
+    if value_bytes == b"null" {
+        return Ok(None);
+    }
+    if value_bytes.first() == Some(&b'"') {
+        let text =
+            serde_json::from_slice::<String>(value_bytes).map_err(|error| error.to_string())?;
+        return Ok(Some(text.into_bytes()));
+    }
+    Ok(Some(value_bytes.to_vec()))
+}
+
+fn snapshot_lookup_value_to_projected_bytes(value: &Value) -> Option<Vec<u8>> {
+    match value {
+        Value::Null => None,
+        Value::String(text) => Some(text.clone().into_bytes()),
+        _ => serde_json::to_vec(value).ok(),
+    }
 }
 
 fn visit_snapshot_lookup_binary_fields<F>(bytes: &[u8], mut visitor: F) -> Result<(), String>
@@ -2910,6 +3171,24 @@ fn snapshot_row_refs_to_projected_values(
             cache
                 .row_store
                 .projected_row_value(row_ref, select_fields.as_deref())
+        })
+        .collect()
+}
+
+fn snapshot_row_refs_to_projected_field_bytes(
+    cache: &SnapshotLookupCache,
+    row_refs: Vec<SnapshotRowRef>,
+    request: &ReadPlan,
+) -> Result<Vec<ProjectedFieldBytesRow>, String> {
+    let Some(select_fields) = normalized_select(request.select.clone()) else {
+        return Err("Projected field bytes require explicit select fields".to_string());
+    };
+    row_refs
+        .into_iter()
+        .map(|row_ref| {
+            cache
+                .row_store
+                .projected_top_level_field_bytes(row_ref, &select_fields)
         })
         .collect()
 }
@@ -7749,6 +8028,113 @@ mod tests {
                 "_source": { "tenant": "acme", "score": 20 }
             })
         );
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_lookup_in_memory_cache_projects_top_level_field_bytes() {
+        let cache = snapshot_lookup_cache(vec![json!({
+            "tenant": "acme",
+            "ts": 20,
+            "event_id": "evt-1"
+        })])
+        .await;
+
+        let projected = cache
+            .row_store
+            .projected_top_level_field_bytes(
+                super::SnapshotRowRef(0),
+                &[
+                    "tenant".to_string(),
+                    "ts".to_string(),
+                    "missing".to_string(),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(projected.get("tenant"), Some(&Some(b"acme".to_vec())));
+        assert_eq!(projected.get("ts"), Some(&Some(b"20".to_vec())));
+        assert_eq!(projected.get("missing"), None);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_lookup_mmap_cache_projects_top_level_field_bytes() {
+        let cache = snapshot_lookup_mmap_cache(vec![json!({
+            "tenant": "acme",
+            "ts": 20,
+            "event_id": "evt-1"
+        })])
+        .await;
+
+        let projected = cache
+            .row_store
+            .projected_top_level_field_bytes(
+                super::SnapshotRowRef(0),
+                &[
+                    "tenant".to_string(),
+                    "ts".to_string(),
+                    "missing".to_string(),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(projected.get("tenant"), Some(&Some(b"acme".to_vec())));
+        assert_eq!(projected.get("ts"), Some(&Some(b"20".to_vec())));
+        assert_eq!(projected.get("missing"), None);
+    }
+
+    #[test]
+    fn test_snapshot_exact_lookup_in_memory_cache_projects_selected_field_bytes_from_source() {
+        let cache = snapshot_exact_lookup_in_memory_cache(vec![json!({
+            "_id": "doc-1",
+            "_id_seq_no": "doc-1#1",
+            "_seq_no": 7,
+            "_version": 3,
+            "_source": { "tenant": "acme", "score": 20 }
+        })]);
+
+        let projected = cache
+            .row_store
+            .projected_top_level_field_bytes(
+                super::SnapshotRowRef(0),
+                &[
+                    "tenant".to_string(),
+                    "score".to_string(),
+                    "missing".to_string(),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(projected.get("tenant"), Some(&Some(b"acme".to_vec())));
+        assert_eq!(projected.get("score"), Some(&Some(b"20".to_vec())));
+        assert_eq!(projected.get("missing"), None);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_exact_lookup_mmap_cache_projects_selected_field_bytes_from_source() {
+        let cache = snapshot_exact_lookup_mmap_cache(vec![json!({
+            "_id": "doc-1",
+            "_id_seq_no": "doc-1#1",
+            "_seq_no": 7,
+            "_version": 3,
+            "_source": { "tenant": "acme", "score": 20 }
+        })])
+        .await;
+
+        let projected = cache
+            .row_store
+            .projected_top_level_field_bytes(
+                super::SnapshotRowRef(0),
+                &[
+                    "tenant".to_string(),
+                    "score".to_string(),
+                    "missing".to_string(),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(projected.get("tenant"), Some(&Some(b"acme".to_vec())));
+        assert_eq!(projected.get("score"), Some(&Some(b"20".to_vec())));
+        assert_eq!(projected.get("missing"), None);
     }
 
     #[tokio::test]

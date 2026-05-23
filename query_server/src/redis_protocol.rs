@@ -16,7 +16,9 @@ use serde_json::{Value, json};
 
 use crate::elastic_search_http_types::NamePathExtractor;
 use crate::exact_lookup::{
-    ActiveCheckpointLookupError, execute_active_checkpoint_exact_lookup_batch_rows,
+    ActiveCheckpointLookupError,
+    execute_active_checkpoint_exact_lookup_batch_projected_field_bytes,
+    execute_active_checkpoint_exact_lookup_batch_rows,
     load_active_checkpoint as load_shared_active_checkpoint,
 };
 use powdrr_query_lib::data_contract::{
@@ -26,7 +28,9 @@ use powdrr_query_lib::schema_massager::PowdrrSchema;
 use powdrr_query_lib::serving_plan::{
     ServingPredicate, ServingQueryClassification, ServingRequestPlan,
 };
-use powdrr_query_runtime::lakehouse_serving::{ServingQueryError, execute_serving_query};
+use powdrr_query_runtime::lakehouse_serving::{
+    ProjectedFieldBytesRow, ServingQueryError, execute_serving_query,
+};
 use powdrr_query_runtime::state_provider::{STATE_PROVIDER, ServiceApiError};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -74,6 +78,8 @@ struct ResolvedRedisDatabaseBinding {
 
 static REDIS_DATABASE_BINDING_CACHE: LazyLock<Mutex<HashMap<u32, ResolvedRedisDatabaseBinding>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+type RedisProjectedFieldRow = ProjectedFieldBytesRow;
 
 impl RedisCommandError {
     fn validation(message: impl Into<String>) -> Self {
@@ -512,6 +518,19 @@ async fn execute_hget(
 
     let binding = load_redis_database_binding(selected_db).await?;
     let select = select_known_fields(&binding.known_fields, &[field.to_string()]);
+    if let Some(rows) = fetch_redis_rows_field_bytes(&binding, &[key.to_string()], &select).await? {
+        let row = redis_projected_row_from_rows(
+            &binding.binding.table_name,
+            key,
+            rows.into_iter().next().unwrap_or_default(),
+        )?;
+        return Ok(RedisCommandResult {
+            response: redis_projected_field_bytes(row.as_ref(), field)
+                .map(RespValue::BulkString)
+                .unwrap_or(RespValue::NullBulkString),
+            close_connection: false,
+        });
+    }
     let row = fetch_redis_row(&binding, key, &select).await?;
     Ok(RedisCommandResult {
         response: redis_field_bytes(row.as_ref(), field)
@@ -538,6 +557,26 @@ async fn execute_hmget(
 
     let binding = load_redis_database_binding(selected_db).await?;
     let select = select_known_fields(&binding.known_fields, fields);
+    if let Some(rows) = fetch_redis_rows_field_bytes(&binding, &[key.to_string()], &select).await? {
+        let row = redis_projected_row_from_rows(
+            &binding.binding.table_name,
+            key,
+            rows.into_iter().next().unwrap_or_default(),
+        )?;
+        let values = fields
+            .iter()
+            .map(|field| {
+                redis_projected_field_bytes(row.as_ref(), field)
+                    .map(RespValue::BulkString)
+                    .unwrap_or(RespValue::NullBulkString)
+            })
+            .collect();
+
+        return Ok(RedisCommandResult {
+            response: RespValue::Array(values),
+            close_connection: false,
+        });
+    }
     let row = fetch_redis_row(&binding, key, &select).await?;
     let values = fields
         .iter()
@@ -566,6 +605,34 @@ async fn execute_hgetall(
 
     let binding = load_redis_database_binding(selected_db).await?;
     let fields = binding.all_fields.clone();
+    if let Some(rows) = fetch_redis_rows_field_bytes(&binding, &[key.to_string()], &fields).await? {
+        let row = redis_projected_row_from_rows(
+            &binding.binding.table_name,
+            key,
+            rows.into_iter().next().unwrap_or_default(),
+        )?;
+        let Some(row) = row.as_ref() else {
+            return Ok(RedisCommandResult {
+                response: RespValue::Array(vec![]),
+                close_connection: false,
+            });
+        };
+
+        let mut response = Vec::with_capacity(fields.len() * 2);
+        for field in fields {
+            response.push(RespValue::BulkString(field.clone().into_bytes()));
+            response.push(
+                redis_projected_field_bytes(Some(row), &field)
+                    .map(RespValue::BulkString)
+                    .unwrap_or(RespValue::NullBulkString),
+            );
+        }
+
+        return Ok(RedisCommandResult {
+            response: RespValue::Array(response),
+            close_connection: false,
+        });
+    }
     let row = fetch_redis_row(&binding, key, &fields).await?;
 
     let Some(row) = row.as_ref() else {
@@ -603,6 +670,18 @@ async fn execute_hexists(
 
     let binding = load_redis_database_binding(selected_db).await?;
     let select = select_known_fields(&binding.known_fields, &[field.to_string()]);
+    if let Some(rows) = fetch_redis_rows_field_bytes(&binding, &[key.to_string()], &select).await? {
+        let row = redis_projected_row_from_rows(
+            &binding.binding.table_name,
+            key,
+            rows.into_iter().next().unwrap_or_default(),
+        )?;
+        let exists = redis_projected_field_bytes(row.as_ref(), field).is_some();
+        return Ok(RedisCommandResult {
+            response: RespValue::Integer(if exists { 1 } else { 0 }),
+            close_connection: false,
+        });
+    }
     let row = fetch_redis_row(&binding, key, &select).await?;
     let exists = redis_field_bytes(row.as_ref(), field).is_some();
 
@@ -662,6 +741,17 @@ async fn fetch_redis_values(
     value_field: &str,
 ) -> Result<Vec<Option<Vec<u8>>>, RedisCommandError> {
     let select = vec![value_field.to_string()];
+    if let Some(rows) = fetch_redis_rows_field_bytes(binding, keys, &select).await? {
+        return keys
+            .iter()
+            .zip(rows.into_iter())
+            .map(|rows| {
+                let (key, rows) = rows;
+                redis_projected_row_from_rows(&binding.binding.table_name, key, rows)
+                    .map(|row| redis_projected_field_bytes(row.as_ref(), value_field))
+            })
+            .collect();
+    }
     let rows = fetch_redis_rows(binding, keys, &select).await?;
     keys.iter()
         .zip(rows.into_iter())
@@ -671,6 +761,31 @@ async fn fetch_redis_values(
                 .map(|row| redis_field_bytes(row.as_ref(), value_field))
         })
         .collect()
+}
+
+async fn fetch_redis_rows_field_bytes(
+    binding: &ResolvedRedisDatabaseBinding,
+    keys: &[String],
+    select: &[String],
+) -> Result<Option<Vec<Vec<RedisProjectedFieldRow>>>, RedisCommandError> {
+    if select.is_empty() {
+        return Ok(Some(
+            std::iter::repeat_with(Vec::new).take(keys.len()).collect(),
+        ));
+    }
+
+    let (lookup_keys, key_positions) = dedupe_lookup_keys(keys);
+    let requests = lookup_keys
+        .iter()
+        .map(|key| redis_lookup_request(&binding.binding.config.key_field, key, select.to_vec()))
+        .collect::<Vec<_>>();
+
+    Ok(execute_fast_path_point_lookup_batch_projected_field_bytes(
+        &binding.binding.table_name,
+        &requests,
+    )
+    .await?
+    .map(|row_sets| expand_lookup_row_sets(row_sets, &key_positions)))
 }
 
 async fn fetch_redis_row(
@@ -694,7 +809,8 @@ async fn fetch_redis_rows(
     keys: &[String],
     select: &[String],
 ) -> Result<Vec<Vec<Value>>, RedisCommandError> {
-    let requests = keys
+    let (lookup_keys, key_positions) = dedupe_lookup_keys(keys);
+    let requests = lookup_keys
         .iter()
         .map(|key| redis_lookup_request(&binding.binding.config.key_field, key, select.to_vec()))
         .collect::<Vec<_>>();
@@ -702,7 +818,7 @@ async fn fetch_redis_rows(
     if let Some(row_sets) =
         execute_fast_path_point_lookup_batch_rows(&binding.binding.table_name, &requests).await?
     {
-        return Ok(row_sets);
+        return Ok(expand_lookup_row_sets(row_sets, &key_positions));
     }
 
     let mut values = Vec::with_capacity(requests.len());
@@ -719,7 +835,7 @@ async fn fetch_redis_rows(
         }
         values.push(response.rows);
     }
-    Ok(values)
+    Ok(expand_lookup_row_sets(values, &key_positions))
 }
 
 fn redis_row_from_rows(
@@ -742,11 +858,41 @@ fn redis_field_bytes(row: Option<&Value>, field: &str) -> Option<Vec<u8>> {
     redis_value_bytes(value)
 }
 
+fn redis_projected_row_from_rows(
+    table_name: &str,
+    key: &str,
+    rows: Vec<RedisProjectedFieldRow>,
+) -> Result<Option<RedisProjectedFieldRow>, RedisCommandError> {
+    if rows.len() > 1 {
+        return Err(RedisCommandError::internal(format!(
+            "Redis key {} matched multiple rows in table {}",
+            key, table_name
+        )));
+    }
+    Ok(rows.into_iter().next())
+}
+
+fn redis_projected_field_bytes(
+    row: Option<&RedisProjectedFieldRow>,
+    field: &str,
+) -> Option<Vec<u8>> {
+    row.and_then(|row| row.get(field)).cloned().flatten()
+}
+
 async fn execute_fast_path_point_lookup_batch_rows(
     table_name: &str,
     requests: &[ServingRequestPlan],
 ) -> Result<Option<Vec<Vec<Value>>>, RedisCommandError> {
     execute_active_checkpoint_exact_lookup_batch_rows(table_name, requests)
+        .await
+        .map_err(convert_active_checkpoint_lookup_error)
+}
+
+async fn execute_fast_path_point_lookup_batch_projected_field_bytes(
+    table_name: &str,
+    requests: &[ServingRequestPlan],
+) -> Result<Option<Vec<Vec<RedisProjectedFieldRow>>>, RedisCommandError> {
+    execute_active_checkpoint_exact_lookup_batch_projected_field_bytes(table_name, requests)
         .await
         .map_err(convert_active_checkpoint_lookup_error)
 }
@@ -783,6 +929,31 @@ fn unique_fields(fields: &[String]) -> Vec<String> {
         }
     }
     unique
+}
+
+fn dedupe_lookup_keys(keys: &[String]) -> (Vec<String>, Vec<usize>) {
+    let mut positions_by_key = HashMap::new();
+    let mut unique_keys = Vec::new();
+    let mut key_positions = Vec::with_capacity(keys.len());
+    for key in keys {
+        let index = if let Some(index) = positions_by_key.get(key) {
+            *index
+        } else {
+            let index = unique_keys.len();
+            unique_keys.push(key.clone());
+            positions_by_key.insert(key.clone(), index);
+            index
+        };
+        key_positions.push(index);
+    }
+    (unique_keys, key_positions)
+}
+
+fn expand_lookup_row_sets<T: Clone>(row_sets: Vec<Vec<T>>, key_positions: &[usize]) -> Vec<Vec<T>> {
+    key_positions
+        .iter()
+        .map(|index| row_sets.get(*index).cloned().unwrap_or_default())
+        .collect()
 }
 
 fn select_known_fields(known_fields: &HashSet<String>, fields: &[String]) -> Vec<String> {
