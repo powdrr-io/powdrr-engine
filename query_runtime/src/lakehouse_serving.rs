@@ -86,6 +86,41 @@ static SNAPSHOT_LOOKUP_CACHE: LazyLock<Mutex<HashMap<String, Arc<SnapshotLookupC
 
 pub type ProjectedFieldBytesRow = HashMap<String, Option<Vec<u8>>>;
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServingFileSource {
+    Iceberg,
+    Speedboat,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServingFileDecisionKind {
+    SelectedWithoutFileStats,
+    PrunedByPartitionSpec,
+    SelectedWithFileStats,
+    PrunedByFileStats,
+    SelectedWithRowGroupStats,
+    PrunedByRowGroupStats,
+    SelectedSpeedboat,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ServingFileDecision {
+    pub file_path: String,
+    pub source: ServingFileSource,
+    pub selected: bool,
+    pub decision: ServingFileDecisionKind,
+    #[serde(default)]
+    pub estimated_bytes: u64,
+    #[serde(default)]
+    pub row_groups_considered: usize,
+    #[serde(default)]
+    pub row_groups_selected: usize,
+    #[serde(default)]
+    pub artifacts_used: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ServingQueryResponse {
     pub table: String,
@@ -129,6 +164,8 @@ pub struct ServingQueryResponse {
     pub bulk_cache: data_access::ServingBulkCacheStats,
     #[serde(default)]
     pub sql: Option<String>,
+    #[serde(default)]
+    pub file_decisions: Vec<ServingFileDecision>,
     #[serde(default)]
     pub rows: Vec<Value>,
 }
@@ -280,6 +317,7 @@ struct ServingPlan {
     bloom_filter_row_groups_selected: usize,
     artifacts_considered: Vec<String>,
     artifacts_used: Vec<String>,
+    file_decisions: Vec<ServingFileDecision>,
 }
 
 #[derive(Clone, Debug)]
@@ -796,6 +834,7 @@ struct PrunedFileSelection {
     metadata_row_groups_cached: usize,
     page_index_row_groups_selected: usize,
     bloom_filter_row_groups_selected: usize,
+    file_decisions: Vec<ServingFileDecision>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1037,6 +1076,51 @@ fn build_serving_layout_advice(context: &ServingExecutionContext) -> ServingLayo
     }
 }
 
+fn build_serving_query_response(
+    table: String,
+    snapshot_id: Option<String>,
+    plan: &ServingPlan,
+    bulk_cache: data_access::ServingBulkCacheStats,
+    rows: Vec<Value>,
+    files_selected: usize,
+    estimated_bytes: u64,
+    reason: Option<String>,
+    artifacts_used: Vec<String>,
+    include_file_decisions: bool,
+) -> ServingQueryResponse {
+    ServingQueryResponse {
+        table,
+        classification: plan.classification.clone(),
+        matched_pattern: plan.matched_pattern.clone(),
+        snapshot_id,
+        reason,
+        files_considered: plan.files_considered,
+        files_selected,
+        row_groups_considered: plan.row_groups_considered,
+        row_groups_selected: plan.row_groups_selected,
+        delete_files_considered: plan.delete_files_considered,
+        estimated_bytes,
+        partition_fields_available: plan.partition_fields_available,
+        sort_fields_available: plan.sort_fields_available,
+        declared_sort_order_match: plan.declared_sort_order_match,
+        metadata_snapshot_cached: plan.metadata_snapshot_cached,
+        metadata_files_cached: plan.metadata_files_cached,
+        metadata_row_groups_cached: plan.metadata_row_groups_cached,
+        page_index_row_groups_selected: plan.page_index_row_groups_selected,
+        bloom_filter_row_groups_selected: plan.bloom_filter_row_groups_selected,
+        artifacts_considered: plan.artifacts_considered.clone(),
+        artifacts_used,
+        bulk_cache,
+        sql: Some(plan.sql.clone()),
+        file_decisions: if include_file_decisions {
+            plan.file_decisions.clone()
+        } else {
+            vec![]
+        },
+        rows,
+    }
+}
+
 pub async fn execute_serving_query(
     table_name: &str,
     request: ServingRequestPlan,
@@ -1048,92 +1132,48 @@ pub async fn execute_serving_query(
 
     let plan = plan_request(&context, &read_plan)?;
     if read_plan.explain {
-        return Ok(ServingQueryResponse {
-            table: context.description.name,
-            classification: plan.classification,
-            matched_pattern: plan.matched_pattern,
-            snapshot_id: context.snapshot_id,
-            reason: plan.reason,
-            files_considered: plan.files_considered,
-            files_selected: plan.files_selected,
-            row_groups_considered: plan.row_groups_considered,
-            row_groups_selected: plan.row_groups_selected,
-            delete_files_considered: plan.delete_files_considered,
-            estimated_bytes: plan.estimated_bytes,
-            partition_fields_available: plan.partition_fields_available,
-            sort_fields_available: plan.sort_fields_available,
-            declared_sort_order_match: plan.declared_sort_order_match,
-            metadata_snapshot_cached: plan.metadata_snapshot_cached,
-            metadata_files_cached: plan.metadata_files_cached,
-            metadata_row_groups_cached: plan.metadata_row_groups_cached,
-            page_index_row_groups_selected: plan.page_index_row_groups_selected,
-            bloom_filter_row_groups_selected: plan.bloom_filter_row_groups_selected,
-            artifacts_considered: plan.artifacts_considered,
-            artifacts_used: plan.artifacts_used,
+        return Ok(build_serving_query_response(
+            context.description.name,
+            context.snapshot_id,
+            &plan,
             bulk_cache,
-            sql: Some(plan.sql),
-            rows: vec![],
-        });
+            vec![],
+            plan.files_selected,
+            plan.estimated_bytes,
+            plan.reason.clone(),
+            plan.artifacts_used.clone(),
+            true,
+        ));
     }
 
     if plan.classification == ServingQueryClassification::Rejected {
-        return Ok(ServingQueryResponse {
-            table: context.description.name,
-            classification: plan.classification,
-            matched_pattern: plan.matched_pattern,
-            snapshot_id: context.snapshot_id,
-            reason: plan.reason,
-            files_considered: plan.files_considered,
-            files_selected: plan.files_selected,
-            row_groups_considered: plan.row_groups_considered,
-            row_groups_selected: plan.row_groups_selected,
-            delete_files_considered: plan.delete_files_considered,
-            estimated_bytes: plan.estimated_bytes,
-            partition_fields_available: plan.partition_fields_available,
-            sort_fields_available: plan.sort_fields_available,
-            declared_sort_order_match: plan.declared_sort_order_match,
-            metadata_snapshot_cached: plan.metadata_snapshot_cached,
-            metadata_files_cached: plan.metadata_files_cached,
-            metadata_row_groups_cached: plan.metadata_row_groups_cached,
-            page_index_row_groups_selected: plan.page_index_row_groups_selected,
-            bloom_filter_row_groups_selected: plan.bloom_filter_row_groups_selected,
-            artifacts_considered: plan.artifacts_considered,
-            artifacts_used: plan.artifacts_used,
+        return Ok(build_serving_query_response(
+            context.description.name,
+            context.snapshot_id,
+            &plan,
             bulk_cache,
-            sql: Some(plan.sql),
-            rows: vec![],
-        });
+            vec![],
+            plan.files_selected,
+            plan.estimated_bytes,
+            plan.reason.clone(),
+            plan.artifacts_used.clone(),
+            true,
+        ));
     }
 
     if plan.classification == ServingQueryClassification::SlowPath && !read_plan.allow_slow_path {
-        return Ok(ServingQueryResponse {
-            table: context.description.name,
-            classification: plan.classification,
-            matched_pattern: plan.matched_pattern,
-            snapshot_id: context.snapshot_id,
-            reason: Some(
-                "Query requires slow path. Set allow_slow_path=true to execute it".to_string(),
-            ),
-            files_considered: plan.files_considered,
-            files_selected: plan.files_selected,
-            row_groups_considered: plan.row_groups_considered,
-            row_groups_selected: plan.row_groups_selected,
-            delete_files_considered: plan.delete_files_considered,
-            estimated_bytes: plan.estimated_bytes,
-            partition_fields_available: plan.partition_fields_available,
-            sort_fields_available: plan.sort_fields_available,
-            declared_sort_order_match: plan.declared_sort_order_match,
-            metadata_snapshot_cached: plan.metadata_snapshot_cached,
-            metadata_files_cached: plan.metadata_files_cached,
-            metadata_row_groups_cached: plan.metadata_row_groups_cached,
-            page_index_row_groups_selected: plan.page_index_row_groups_selected,
-            bloom_filter_row_groups_selected: plan.bloom_filter_row_groups_selected,
-            artifacts_considered: plan.artifacts_considered,
-            artifacts_used: plan.artifacts_used,
+        return Ok(build_serving_query_response(
+            context.description.name,
+            context.snapshot_id,
+            &plan,
             bulk_cache,
-            sql: Some(plan.sql),
-            rows: vec![],
-        });
+            vec![],
+            plan.files_selected,
+            plan.estimated_bytes,
+            Some("Query requires slow path. Set allow_slow_path=true to execute it".to_string()),
+            plan.artifacts_used.clone(),
+            true,
+        ));
     }
 
     let mut execution = execute_plan(
@@ -1160,32 +1200,18 @@ pub async fn execute_serving_query(
         push_unique_string(&mut artifacts_used, artifact);
     }
 
-    Ok(ServingQueryResponse {
-        table: context.description.name,
-        classification: plan.classification,
-        matched_pattern: plan.matched_pattern,
-        snapshot_id: context.snapshot_id,
-        reason: plan.reason,
-        files_considered: plan.files_considered,
-        files_selected: execution.files_selected,
-        row_groups_considered: plan.row_groups_considered,
-        row_groups_selected: plan.row_groups_selected,
-        delete_files_considered: plan.delete_files_considered,
-        estimated_bytes: execution.estimated_bytes,
-        partition_fields_available: plan.partition_fields_available,
-        sort_fields_available: plan.sort_fields_available,
-        declared_sort_order_match: plan.declared_sort_order_match,
-        metadata_snapshot_cached: plan.metadata_snapshot_cached,
-        metadata_files_cached: plan.metadata_files_cached,
-        metadata_row_groups_cached: plan.metadata_row_groups_cached,
-        page_index_row_groups_selected: plan.page_index_row_groups_selected,
-        bloom_filter_row_groups_selected: plan.bloom_filter_row_groups_selected,
-        artifacts_considered: plan.artifacts_considered,
-        artifacts_used,
+    Ok(build_serving_query_response(
+        context.description.name,
+        context.snapshot_id,
+        &plan,
         bulk_cache,
-        sql: Some(plan.sql),
-        rows: execution.rows,
-    })
+        execution.rows,
+        execution.files_selected,
+        execution.estimated_bytes,
+        plan.reason.clone(),
+        artifacts_used,
+        false,
+    ))
 }
 
 async fn load_serving_context(
@@ -1359,11 +1385,14 @@ fn plan_request(
             bloom_filter_row_groups_selected: 0,
             artifacts_considered,
             artifacts_used: vec![],
+            file_decisions: vec![],
         });
     }
 
     let pruned = prune_candidate_files(&context.files, &context.file_stats, request);
     let mut artifacts_used = pruned.artifacts_used.clone();
+    let mut file_decisions = pruned.file_decisions.clone();
+    file_decisions.extend(speedboat_file_decisions(&context.speedboat_files));
     if declared_sort_order_match {
         for artifact in artifacts_considered
             .iter()
@@ -1410,6 +1439,7 @@ fn plan_request(
         bloom_filter_row_groups_selected: pruned.bloom_filter_row_groups_selected,
         artifacts_considered,
         artifacts_used,
+        file_decisions,
     })
 }
 
@@ -5605,25 +5635,74 @@ fn prune_candidate_files(
     let mut pruned = PrunedFileSelection::default();
 
     for file in files.iter().cloned() {
+        let mut file_artifacts_used = vec![];
+        let file_path = file.file_path.clone();
+        let file_size = file.size;
         let Some(stats) = file_stats.get(&file.file_path) else {
             pruned.estimated_bytes += file.size;
             pruned.files_selected += 1;
             record_metadata_cache_coverage(&mut pruned, &file.file_path);
             pruned.selected_files.push(file);
+            pruned.file_decisions.push(ServingFileDecision {
+                file_path,
+                source: ServingFileSource::Iceberg,
+                selected: true,
+                decision: ServingFileDecisionKind::SelectedWithoutFileStats,
+                estimated_bytes: file_size,
+                row_groups_considered: 0,
+                row_groups_selected: 0,
+                artifacts_used: file_artifacts_used,
+            });
             continue;
         };
 
-        if !partition_values_may_match_request(stats, request, &mut pruned) {
+        if !partition_values_may_match_request(
+            stats,
+            request,
+            &mut pruned,
+            &mut file_artifacts_used,
+        ) {
+            pruned.file_decisions.push(ServingFileDecision {
+                file_path,
+                source: ServingFileSource::Iceberg,
+                selected: false,
+                decision: ServingFileDecisionKind::PrunedByPartitionSpec,
+                estimated_bytes: 0,
+                row_groups_considered: 0,
+                row_groups_selected: 0,
+                artifacts_used: file_artifacts_used,
+            });
             continue;
         }
 
         if stats.row_groups.is_empty() {
-            record_file_stats_artifact_usage(&mut pruned, stats, request);
+            record_file_stats_artifact_usage(&mut pruned, stats, request, &mut file_artifacts_used);
             if file_may_match_request(stats, request) {
                 pruned.estimated_bytes += file.size;
                 pruned.files_selected += 1;
                 record_metadata_cache_coverage(&mut pruned, &file.file_path);
                 pruned.selected_files.push(file);
+                pruned.file_decisions.push(ServingFileDecision {
+                    file_path,
+                    source: ServingFileSource::Iceberg,
+                    selected: true,
+                    decision: ServingFileDecisionKind::SelectedWithFileStats,
+                    estimated_bytes: file_size,
+                    row_groups_considered: 0,
+                    row_groups_selected: 0,
+                    artifacts_used: file_artifacts_used,
+                });
+            } else {
+                pruned.file_decisions.push(ServingFileDecision {
+                    file_path,
+                    source: ServingFileSource::Iceberg,
+                    selected: false,
+                    decision: ServingFileDecisionKind::PrunedByFileStats,
+                    estimated_bytes: 0,
+                    row_groups_considered: 0,
+                    row_groups_selected: 0,
+                    artifacts_used: file_artifacts_used,
+                });
             }
             continue;
         }
@@ -5635,28 +5714,86 @@ fn prune_candidate_files(
             .filter(|row_group| row_group_may_match_request(row_group, request))
             .collect::<Vec<_>>();
         if matching_row_groups.is_empty() {
+            if !request.filters.is_empty() {
+                record_artifact_usage(
+                    &mut pruned,
+                    &mut file_artifacts_used,
+                    ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS,
+                );
+            }
+            pruned.file_decisions.push(ServingFileDecision {
+                file_path,
+                source: ServingFileSource::Iceberg,
+                selected: false,
+                decision: ServingFileDecisionKind::PrunedByRowGroupStats,
+                estimated_bytes: 0,
+                row_groups_considered: stats.row_groups.len(),
+                row_groups_selected: 0,
+                artifacts_used: file_artifacts_used,
+            });
             continue;
         }
 
         if !request.filters.is_empty() {
-            record_artifact_usage(&mut pruned, ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS);
+            record_artifact_usage(
+                &mut pruned,
+                &mut file_artifacts_used,
+                ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS,
+            );
         }
-        pruned.files_selected += 1;
-        pruned.row_groups_selected += matching_row_groups.len();
-        pruned.estimated_bytes += matching_row_groups
+        let estimated_bytes = matching_row_groups
             .iter()
             .map(|row_group| row_group.compressed_bytes)
             .sum::<u64>();
-        record_page_pruning_coverage(&mut pruned, &matching_row_groups, request);
+        pruned.files_selected += 1;
+        pruned.row_groups_selected += matching_row_groups.len();
+        pruned.estimated_bytes += estimated_bytes;
+        record_page_pruning_coverage(
+            &mut pruned,
+            &matching_row_groups,
+            request,
+            &mut file_artifacts_used,
+        );
         record_metadata_cache_coverage(&mut pruned, &file.file_path);
         pruned.selected_files.push(file);
+        pruned.file_decisions.push(ServingFileDecision {
+            file_path,
+            source: ServingFileSource::Iceberg,
+            selected: true,
+            decision: ServingFileDecisionKind::SelectedWithRowGroupStats,
+            estimated_bytes,
+            row_groups_considered: stats.row_groups.len(),
+            row_groups_selected: matching_row_groups.len(),
+            artifacts_used: file_artifacts_used,
+        });
     }
 
     pruned
 }
 
-fn record_artifact_usage(pruned: &mut PrunedFileSelection, artifact_name: &str) {
+fn speedboat_file_decisions(files: &[FileDescriptor]) -> Vec<ServingFileDecision> {
+    files
+        .iter()
+        .map(|file| ServingFileDecision {
+            file_path: file.file_path.clone(),
+            source: ServingFileSource::Speedboat,
+            selected: true,
+            decision: ServingFileDecisionKind::SelectedSpeedboat,
+            estimated_bytes: file.size,
+            row_groups_considered: 0,
+            row_groups_selected: 0,
+            artifacts_used: vec![],
+        })
+        .collect()
+}
+
+fn record_artifact_usage(
+    pruned: &mut PrunedFileSelection,
+    file_artifacts_used: &mut Vec<String>,
+    artifact_name: &str,
+) {
     push_unique_string(&mut pruned.artifacts_used, artifact_name.to_string());
+    push_unique_string(file_artifacts_used, artifact_name.to_string());
 }
 
 fn record_metadata_cache_coverage(pruned: &mut PrunedFileSelection, file_path: &str) {
@@ -5669,6 +5806,7 @@ fn record_file_stats_artifact_usage(
     pruned: &mut PrunedFileSelection,
     file_stats: &IcebergFileStats,
     request: &ReadPlan,
+    file_artifacts_used: &mut Vec<String>,
 ) {
     if request.filters.is_empty() {
         return;
@@ -5679,7 +5817,7 @@ fn record_file_stats_artifact_usage(
             .iter()
             .any(|column| column.field_name == predicate.field)
     }) {
-        record_artifact_usage(pruned, ACCESS_ARTIFACT_KIND_FILE_STATS);
+        record_artifact_usage(pruned, file_artifacts_used, ACCESS_ARTIFACT_KIND_FILE_STATS);
     }
 }
 
@@ -5687,24 +5825,31 @@ fn record_page_pruning_coverage(
     pruned: &mut PrunedFileSelection,
     matching_row_groups: &[&IcebergRowGroupStats],
     request: &ReadPlan,
+    file_artifacts_used: &mut Vec<String>,
 ) {
     if request.filters.is_empty() {
         return;
     }
 
-    pruned.page_index_row_groups_selected += matching_row_groups
+    let page_index_matches = matching_row_groups
         .iter()
         .filter(|row_group| row_group.page_index_present)
         .count();
-    if pruned.page_index_row_groups_selected > 0 {
-        record_artifact_usage(pruned, ACCESS_ARTIFACT_KIND_PAGE_INDEX);
+    pruned.page_index_row_groups_selected += page_index_matches;
+    if page_index_matches > 0 {
+        record_artifact_usage(pruned, file_artifacts_used, ACCESS_ARTIFACT_KIND_PAGE_INDEX);
     }
-    pruned.bloom_filter_row_groups_selected += matching_row_groups
+    let bloom_filter_matches = matching_row_groups
         .iter()
         .filter(|row_group| row_group.bloom_filter_present)
         .count();
-    if pruned.bloom_filter_row_groups_selected > 0 {
-        record_artifact_usage(pruned, ACCESS_ARTIFACT_KIND_BLOOM_FILTER);
+    pruned.bloom_filter_row_groups_selected += bloom_filter_matches;
+    if bloom_filter_matches > 0 {
+        record_artifact_usage(
+            pruned,
+            file_artifacts_used,
+            ACCESS_ARTIFACT_KIND_BLOOM_FILTER,
+        );
     }
 }
 
@@ -5712,6 +5857,7 @@ fn partition_values_may_match_request(
     file_stats: &IcebergFileStats,
     request: &ReadPlan,
     pruned: &mut PrunedFileSelection,
+    file_artifacts_used: &mut Vec<String>,
 ) -> bool {
     for predicate in request.filters.iter() {
         let Some((may_match, artifact_name)) =
@@ -5719,7 +5865,7 @@ fn partition_values_may_match_request(
         else {
             continue;
         };
-        record_artifact_usage(pruned, &artifact_name);
+        record_artifact_usage(pruned, file_artifacts_used, &artifact_name);
         if !may_match {
             return false;
         }
@@ -6119,9 +6265,10 @@ mod tests {
         group_files_by_schema, merge_partial_aggregate_rows, ordered_file_groups_for_top_k,
         plan_request, prune_candidate_files, remaining_groups_cannot_beat_kth_row,
         request_matches_pattern, secondary_pattern_artifact_name, select_serving_warmup_files,
-        ExactPruningFieldSummary, ServingExecutionContext, ACCESS_ARTIFACT_KIND_EXACT_PRUNING,
-        ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS, DEFAULT_FAST_PATH_MAX_DELETE_FILES,
-        DEFAULT_SLOW_PATH_MAX_BYTES,
+        ExactPruningFieldSummary, ServingExecutionContext, ServingFileDecision,
+        ServingFileDecisionKind, ServingFileSource, ACCESS_ARTIFACT_KIND_EXACT_PRUNING,
+        ACCESS_ARTIFACT_KIND_FILE_STATS, ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS,
+        DEFAULT_FAST_PATH_MAX_DELETE_FILES, DEFAULT_SLOW_PATH_MAX_BYTES,
     };
     use crate::data_access::{
         prime_parquet_row_group_stats_cache_for_test, reset_serving_metadata_caches_for_test,
@@ -6684,6 +6831,31 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["file://first.parquet"]
         );
+        assert_eq!(
+            plan.file_decisions,
+            vec![
+                ServingFileDecision {
+                    file_path: "file://first.parquet".to_string(),
+                    source: ServingFileSource::Iceberg,
+                    selected: true,
+                    decision: ServingFileDecisionKind::SelectedWithFileStats,
+                    estimated_bytes: 100,
+                    row_groups_considered: 0,
+                    row_groups_selected: 0,
+                    artifacts_used: vec![ACCESS_ARTIFACT_KIND_FILE_STATS.to_string()],
+                },
+                ServingFileDecision {
+                    file_path: "file://second.parquet".to_string(),
+                    source: ServingFileSource::Iceberg,
+                    selected: false,
+                    decision: ServingFileDecisionKind::PrunedByFileStats,
+                    estimated_bytes: 0,
+                    row_groups_considered: 0,
+                    row_groups_selected: 0,
+                    artifacts_used: vec![ACCESS_ARTIFACT_KIND_FILE_STATS.to_string()],
+                },
+            ]
+        );
     }
 
     #[test]
@@ -6790,6 +6962,112 @@ mod tests {
                 .map(|file| file.file_path.as_str())
                 .collect::<Vec<_>>(),
             vec!["file://second.parquet"]
+        );
+        assert_eq!(
+            plan.file_decisions,
+            vec![
+                ServingFileDecision {
+                    file_path: "file://first.parquet".to_string(),
+                    source: ServingFileSource::Iceberg,
+                    selected: false,
+                    decision: ServingFileDecisionKind::PrunedByRowGroupStats,
+                    estimated_bytes: 0,
+                    row_groups_considered: 2,
+                    row_groups_selected: 0,
+                    artifacts_used: vec![ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS.to_string()],
+                },
+                ServingFileDecision {
+                    file_path: "file://second.parquet".to_string(),
+                    source: ServingFileSource::Iceberg,
+                    selected: true,
+                    decision: ServingFileDecisionKind::SelectedWithRowGroupStats,
+                    estimated_bytes: 40,
+                    row_groups_considered: 1,
+                    row_groups_selected: 1,
+                    artifacts_used: vec![ACCESS_ARTIFACT_KIND_ROW_GROUP_STATS.to_string()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_plan_request_includes_speedboat_file_decisions() {
+        let mut context = test_context(
+            ServingTableConfig {
+                patterns: vec![ServingPattern {
+                    name: "tenant_lookup".to_string(),
+                    eq_fields: vec!["tenant".to_string()],
+                    range_field: None,
+                    order_field: None,
+                    descending: false,
+                    max_limit: Some(25),
+                    projection: None,
+                    aggregate: None,
+                }],
+            },
+            vec![
+                file_stats(
+                    "file://first.parquet",
+                    Some(10),
+                    vec![column_stats(
+                        "tenant",
+                        Some(0),
+                        Some(json!("acme")),
+                        Some(json!("acme")),
+                    )],
+                ),
+                file_stats(
+                    "file://second.parquet",
+                    Some(10),
+                    vec![column_stats(
+                        "tenant",
+                        Some(0),
+                        Some(json!("omega")),
+                        Some(json!("omega")),
+                    )],
+                ),
+            ],
+        );
+        context.speedboat_files = vec![FileDescriptor {
+            file_path: "file://legacy.arrow".to_string(),
+            schema: context.schema.clone(),
+            size: 50,
+        }];
+        let request = ServingRequestPlan {
+            select: None,
+            filters: vec![ServingPredicate {
+                field: "tenant".to_string(),
+                eq: Some(json!("acme")),
+                in_values: None,
+                gt: None,
+                gte: None,
+                lt: None,
+                lte: None,
+            }],
+            aggregate: None,
+            order_by: vec![],
+            limit: Some(10),
+            allow_slow_path: false,
+            explain: false,
+        };
+
+        let read_request = ReadPlan::from(&request);
+        let plan = plan_request(&context, &read_request).unwrap();
+
+        assert_eq!(plan.files_considered, 3);
+        assert_eq!(plan.files_selected, 2);
+        assert_eq!(
+            plan.file_decisions.last(),
+            Some(&ServingFileDecision {
+                file_path: "file://legacy.arrow".to_string(),
+                source: ServingFileSource::Speedboat,
+                selected: true,
+                decision: ServingFileDecisionKind::SelectedSpeedboat,
+                estimated_bytes: 50,
+                row_groups_considered: 0,
+                row_groups_selected: 0,
+                artifacts_used: vec![],
+            })
         );
     }
 
