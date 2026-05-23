@@ -1,4 +1,3 @@
-use crate::data_contract::OrgInfo;
 use crate::metadata_store::{
     CheckpointCutoverState, CutoverEpoch, MetadataStore, PublishedCheckpointSelector,
     ServingNodeActivationAck, ServingNodeLease,
@@ -85,47 +84,40 @@ fn readiness_satisfies_target(
 pub trait ReadOnlyCoordinationStore {
     async fn get_published_active_checkpoint(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Option<String>, ServiceApiError>;
 
     async fn get_latest_target_checkpoint(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Option<String>, ServiceApiError>;
 
     async fn get_checkpoint_cutover_state(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<CheckpointCutoverState, ServiceApiError>;
 
     async fn heartbeat_serving_node(
         &mut self,
-        org_info: &OrgInfo,
         lease: &ServingNodeLease,
     ) -> Result<(), ServiceApiError>;
 
     async fn record_serving_node_activation(
         &mut self,
-        org_info: &OrgInfo,
         ack: &ServingNodeActivationAck,
     ) -> Result<(), ServiceApiError>;
 
     async fn list_serving_node_activations(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Vec<ServingNodeActivationAck>, ServiceApiError>;
 
     async fn record_artifact_readiness(
         &mut self,
-        _org_info: &OrgInfo,
         _ack: &ArtifactReadinessAck,
     ) -> Result<(), ServiceApiError> {
         Ok(())
@@ -133,7 +125,6 @@ pub trait ReadOnlyCoordinationStore {
 
     async fn list_artifact_readiness(
         &mut self,
-        _org_info: &OrgInfo,
         _table_name: &String,
         _extension: Option<String>,
     ) -> Result<Vec<ArtifactReadinessAck>, ServiceApiError> {
@@ -142,16 +133,13 @@ pub trait ReadOnlyCoordinationStore {
 
     async fn get_read_only_coordination_state(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<ReadOnlyCheckpointCoordinationState, ServiceApiError> {
         let cutover_state = self
-            .get_checkpoint_cutover_state(org_info, table_name, extension.clone())
+            .get_checkpoint_cutover_state(table_name, extension.clone())
             .await?;
-        let readiness_acks = self
-            .list_artifact_readiness(org_info, table_name, extension)
-            .await?;
+        let readiness_acks = self.list_artifact_readiness(table_name, extension).await?;
         let phase = if cutover_state.active_checkpoint_id.is_some()
             && cutover_state.active_checkpoint_id == cutover_state.target_checkpoint_id
         {
@@ -183,34 +171,29 @@ where
 {
     async fn get_published_active_checkpoint(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
-        MetadataStore::get_published_active_checkpoint(self, org_info, table_name, extension).await
+        MetadataStore::get_published_active_checkpoint(self, table_name, extension).await
     }
 
     async fn get_latest_target_checkpoint(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
-        MetadataStore::get_latest_committed_checkpoint(self, org_info, table_name, extension).await
+        MetadataStore::get_latest_committed_checkpoint(self, table_name, extension).await
     }
 
     async fn get_checkpoint_cutover_state(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<CheckpointCutoverState, ServiceApiError> {
         let mut cutover_state =
-            MetadataStore::get_checkpoint_cutover_state(self, org_info, table_name, extension)
-                .await?;
+            MetadataStore::get_checkpoint_cutover_state(self, table_name, extension).await?;
         cutover_state.target_checkpoint_id = MetadataStore::get_latest_committed_checkpoint(
             self,
-            org_info,
             table_name,
             cutover_state.selector.extension.clone(),
         )
@@ -220,43 +203,38 @@ where
 
     async fn heartbeat_serving_node(
         &mut self,
-        org_info: &OrgInfo,
         lease: &ServingNodeLease,
     ) -> Result<(), ServiceApiError> {
-        MetadataStore::heartbeat_serving_node(self, org_info, lease).await
+        MetadataStore::heartbeat_serving_node(self, lease).await
     }
 
     async fn record_serving_node_activation(
         &mut self,
-        org_info: &OrgInfo,
         ack: &ServingNodeActivationAck,
     ) -> Result<(), ServiceApiError> {
-        MetadataStore::record_serving_node_activation(self, org_info, ack).await
+        MetadataStore::record_serving_node_activation(self, ack).await
     }
 
     async fn list_serving_node_activations(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Vec<ServingNodeActivationAck>, ServiceApiError> {
-        MetadataStore::list_serving_node_activations(self, org_info, table_name, extension).await
+        MetadataStore::list_serving_node_activations(self, table_name, extension).await
     }
 
     async fn record_artifact_readiness(
         &mut self,
-        org_info: &OrgInfo,
         ack: &ArtifactReadinessAck,
     ) -> Result<(), ServiceApiError> {
-        MetadataStore::record_artifact_readiness(self, org_info, ack).await
+        MetadataStore::record_artifact_readiness(self, ack).await
     }
 
     async fn list_artifact_readiness(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Vec<ArtifactReadinessAck>, ServiceApiError> {
-        MetadataStore::list_artifact_readiness(self, org_info, table_name, extension).await
+        MetadataStore::list_artifact_readiness(self, table_name, extension).await
     }
 }

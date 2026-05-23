@@ -3,11 +3,7 @@ pub enum StateMode {
     Testing,
     Ephemeral,
     TestingDynamoDb(Option<String>),
-    Leaderless {
-        server_address: String,
-        access_key: String,
-        secret_key: String,
-    },
+    Leaderless { server_address: String },
 }
 
 impl StateMode {

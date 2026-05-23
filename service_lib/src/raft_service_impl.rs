@@ -1,7 +1,7 @@
 use crate::data_contract::{
     CleanupCommit, CleanupWorkItem, CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody,
-    CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, OrgInfo, OrgSettings,
-    SpeedboatCommit, TableDescription, TableMetadataCheckpoint,
+    CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit,
+    TableDescription, TableMetadataCheckpoint,
 };
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::ephemeral_service_impl::{EphemeralServiceImpl, EphemeralServiceSnapshot};
@@ -386,282 +386,237 @@ impl RaftServiceImpl {
 
     pub async fn add_checkpoint(
         &self,
-        org_info: &OrgInfo,
         checkpoint: &TableMetadataCheckpoint,
     ) -> Result<(), ServiceApiError> {
-        raft_write_state!(self, |state| state.add_checkpoint(org_info, checkpoint))
+        raft_write_state!(self, |state| state.add_checkpoint(checkpoint))
     }
 
     pub async fn get_all_iceberg_tables(&self) -> Result<Vec<String>, ServiceApiError> {
         raft_read_state!(self, |state| state.get_all_iceberg_tables())
     }
 
-    pub async fn create_table(
-        &self,
-        org_info: &OrgInfo,
-        create_table: &CreateTable,
-    ) -> Result<bool, ServiceApiError> {
-        raft_write_state!(self, |state| state.create_table(org_info, create_table))
+    pub async fn create_table(&self, create_table: &CreateTable) -> Result<bool, ServiceApiError> {
+        raft_write_state!(self, |state| state.create_table(create_table))
     }
 
     pub async fn describe_table(
         &self,
-        org_info: &OrgInfo,
         name: &String,
     ) -> Result<Option<TableDescription>, ServiceApiError> {
-        raft_read_state!(self, |state| state.describe_table(org_info, name))
+        raft_read_state!(self, |state| state.describe_table(name))
     }
 
     pub async fn add_alias(
         &self,
-        org_info: &OrgInfo,
         table_name: &String,
         alias: &String,
     ) -> Result<bool, ServiceApiError> {
-        raft_write_state!(self, |state| state.add_alias(org_info, table_name, alias))
+        raft_write_state!(self, |state| state.add_alias(table_name, alias))
     }
 
     pub async fn remove_alias(
         &self,
-        org_info: &OrgInfo,
         table_name: &String,
         alias: &String,
     ) -> Result<bool, ServiceApiError> {
-        raft_write_state!(self, |state| state
-            .remove_alias(org_info, table_name, alias))
+        raft_write_state!(self, |state| state.remove_alias(table_name, alias))
     }
 
     pub async fn create_table_template(
         &self,
-        org_info: &OrgInfo,
         name: &String,
         template: &CreateIndexTemplateBody,
     ) -> Result<bool, ServiceApiError> {
-        raft_write_state!(self, |state| state
-            .create_table_template(org_info, name, template))
+        raft_write_state!(self, |state| state.create_table_template(name, template))
     }
 
     pub async fn describe_table_template(
         &self,
-        org_info: &OrgInfo,
         name: &String,
     ) -> Result<Option<CreateIndexTemplateBody>, ServiceApiError> {
-        raft_read_state!(self, |state| state.describe_table_template(org_info, name))
+        raft_read_state!(self, |state| state.describe_table_template(name))
     }
 
     pub async fn create_pipeline(
         &self,
-        org_info: &OrgInfo,
         name: &String,
         pipeline: &PipelineDefinition,
     ) -> Result<bool, ServiceApiError> {
-        raft_write_state!(self, |state| state
-            .create_pipeline(org_info, name, pipeline))
+        raft_write_state!(self, |state| state.create_pipeline(name, pipeline))
     }
 
     pub async fn describe_pipeline(
         &self,
-        org_info: &OrgInfo,
         name: &String,
     ) -> Result<Option<PipelineDefinition>, ServiceApiError> {
-        raft_read_state!(self, |state| state.describe_pipeline(org_info, name))
+        raft_read_state!(self, |state| state.describe_pipeline(name))
     }
 
     pub async fn create_lifetime_policy(
         &self,
-        org_info: &OrgInfo,
         name: &String,
         policy: &ILMPolicyDefinition,
     ) -> Result<bool, ServiceApiError> {
-        raft_write_state!(self, |state| state
-            .create_lifetime_policy(org_info, name, policy))
+        raft_write_state!(self, |state| state.create_lifetime_policy(name, policy))
     }
 
     pub async fn describe_lifetime_policy(
         &self,
-        org_info: &OrgInfo,
         name: &String,
     ) -> Result<Option<ILMPolicyDefinition>, ServiceApiError> {
-        raft_read_state!(self, |state| state.describe_lifetime_policy(org_info, name))
+        raft_read_state!(self, |state| state.describe_lifetime_policy(name))
     }
 
     pub async fn speedboat_commit(
         &self,
-        org_info: &OrgInfo,
         commit: &SpeedboatCommit,
     ) -> Result<bool, ServiceApiError> {
-        raft_write_state!(self, |state| state.speedboat_commit(org_info, commit))
+        raft_write_state!(self, |state| state.speedboat_commit(commit))
     }
 
     pub async fn iceberg_commit(
         &self,
-        org_info: &OrgInfo,
         table_name: &String,
         commit: &IcebergCommit,
     ) -> Result<bool, ServiceApiError> {
-        raft_write_state!(self, |state| state
-            .iceberg_commit(org_info, table_name, commit))
+        raft_write_state!(self, |state| state.iceberg_commit(table_name, commit))
     }
 
     pub async fn extension_commit(
         &self,
-        org_info: &OrgInfo,
         table_name: &String,
         commit: &ExtensionCommit,
     ) -> Result<bool, ServiceApiError> {
-        raft_write_state!(self, |state| state
-            .extension_commit(org_info, table_name, commit))
+        raft_write_state!(self, |state| state.extension_commit(table_name, commit))
     }
 
     pub async fn compaction_commit(
         &self,
-        org_info: &OrgInfo,
         table_name: &String,
         commit: &CompactionCommit,
     ) -> Result<bool, ServiceApiError> {
-        raft_write_state!(self, |state| state
-            .compaction_commit(org_info, table_name, commit))
+        raft_write_state!(self, |state| state.compaction_commit(table_name, commit))
     }
 
-    pub async fn cleanup_commit(
-        &self,
-        org_info: &OrgInfo,
-        commit: &CleanupCommit,
-    ) -> Result<bool, ServiceApiError> {
-        raft_write_state!(self, |state| state.cleanup_commit(org_info, commit))
+    pub async fn cleanup_commit(&self, commit: &CleanupCommit) -> Result<bool, ServiceApiError> {
+        raft_write_state!(self, |state| state.cleanup_commit(commit))
     }
 
     pub async fn get_latest_committed_checkpoint(
         &self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
         raft_read_state!(
             self,
             |state| MetadataStore::get_latest_committed_checkpoint(
-                &mut state, org_info, table_name, extension
+                &mut state, table_name, extension
             )
         )
     }
 
     pub async fn get_published_active_checkpoint(
         &self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
         raft_read_state!(
             self,
             |state| MetadataStore::get_published_active_checkpoint(
-                &mut state, org_info, table_name, extension
+                &mut state, table_name, extension
             )
         )
     }
 
     pub async fn get_checkpoint(
         &self,
-        org_info: &OrgInfo,
         checkpoint: &CheckpointDescriptor,
     ) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
-        raft_read_state!(self, |state| state.get_checkpoint(org_info, checkpoint))
+        raft_read_state!(self, |state| state.get_checkpoint(checkpoint))
     }
 
     pub async fn get_latest_target_checkpoint(
         &self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
         raft_read_state!(self, |state| MetadataStore::get_latest_target_checkpoint(
-            &mut state, org_info, table_name, extension
+            &mut state, table_name, extension
         ))
     }
 
     pub async fn get_checkpoint_cutover_state(
         &self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<CheckpointCutoverState, ServiceApiError> {
         raft_read_state!(self, |state| MetadataStore::get_checkpoint_cutover_state(
-            &mut state, org_info, table_name, extension
+            &mut state, table_name, extension
         ))
     }
 
     pub async fn heartbeat_serving_node(
         &self,
-        org_info: &OrgInfo,
         lease: &ServingNodeLease,
     ) -> Result<(), ServiceApiError> {
         raft_write_state!(self, |state| MetadataStore::heartbeat_serving_node(
-            &mut state, org_info, lease
+            &mut state, lease
         ))
     }
 
     pub async fn record_serving_node_activation(
         &self,
-        org_info: &OrgInfo,
         ack: &ServingNodeActivationAck,
     ) -> Result<(), ServiceApiError> {
         raft_write_state!(self, |state| MetadataStore::record_serving_node_activation(
-            &mut state, org_info, ack
+            &mut state, ack
         ))
     }
 
     pub async fn list_serving_node_activations(
         &self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Vec<ServingNodeActivationAck>, ServiceApiError> {
         raft_read_state!(self, |state| MetadataStore::list_serving_node_activations(
-            &mut state, org_info, table_name, extension
+            &mut state, table_name, extension
         ))
     }
 
     pub async fn record_artifact_readiness(
         &self,
-        org_info: &OrgInfo,
         ack: &ArtifactReadinessAck,
     ) -> Result<(), ServiceApiError> {
         raft_write_state!(self, |state| MetadataStore::record_artifact_readiness(
-            &mut state, org_info, ack
+            &mut state, ack
         ))
     }
 
     pub async fn list_artifact_readiness(
         &self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Vec<ArtifactReadinessAck>, ServiceApiError> {
         raft_read_state!(self, |state| MetadataStore::list_artifact_readiness(
-            &mut state, org_info, table_name, extension
+            &mut state, table_name, extension
         ))
     }
 
     pub async fn get_extension_work_items(
         &self,
-        org_info: &OrgInfo,
         extension_type: &String,
     ) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {
-        raft_write_state!(self, |state| state
-            .get_extension_work_items(org_info, extension_type))
+        raft_write_state!(self, |state| state.get_extension_work_items(extension_type))
     }
 
     pub async fn get_compaction_work_items(
         &self,
-        org_info: &OrgInfo,
     ) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
-        raft_write_state!(self, |state| state.get_compaction_work_items(org_info))
+        raft_write_state!(self, |state| state.get_compaction_work_items())
     }
 
-    pub async fn get_cleanup_work_items(
-        &self,
-        org_info: &OrgInfo,
-    ) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
-        raft_write_state!(self, |state| state.get_cleanup_work_items(org_info))
+    pub async fn get_cleanup_work_items(&self) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
+        raft_write_state!(self, |state| state.get_cleanup_work_items())
     }
 
     pub async fn update_all_checkpoints(&self) -> Result<bool, ServiceApiError> {
@@ -671,18 +626,6 @@ impl RaftServiceImpl {
         raft_write_state!(self, |state| MetadataStore::update_all_checkpoints(
             &mut state
         ))
-    }
-
-    pub async fn create_org(&self, settings: &OrgSettings) -> Result<(), ServiceApiError> {
-        raft_write_state!(self, |state| state.create_org(settings))
-    }
-
-    pub async fn lookup_org(
-        &self,
-        access_key: &String,
-        secret_key: &String,
-    ) -> Result<Option<OrgInfo>, ServiceApiError> {
-        raft_read_state!(self, |state| state.lookup_org(access_key, secret_key))
     }
 }
 
@@ -699,34 +642,31 @@ impl MetadataStore for RaftServiceImpl {
 
     async fn get_latest_committed_checkpoint(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
         raft_read_state!(
             self,
             |state| MetadataStore::get_latest_committed_checkpoint(
-                &mut state, org_info, table_name, extension
+                &mut state, table_name, extension
             )
         )
     }
 
     async fn get_published_checkpoint_record(
         &mut self,
-        org_info: &OrgInfo,
         selector: &PublishedCheckpointSelector,
     ) -> Result<Option<PublishedCheckpointRecord>, ServiceApiError> {
         raft_read_state!(self, |state| {
-            MetadataStore::get_published_checkpoint_record(&mut state, org_info, selector)
+            MetadataStore::get_published_checkpoint_record(&mut state, selector)
         })
     }
 
     async fn get_checkpoint_metadata(
         &mut self,
-        org_info: &OrgInfo,
         checkpoint: &CheckpointDescriptor,
     ) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
-        self.get_checkpoint(org_info, checkpoint).await
+        self.get_checkpoint(checkpoint).await
     }
 
     async fn plan_checkpoint_cutover(
@@ -740,75 +680,66 @@ impl MetadataStore for RaftServiceImpl {
 
     async fn get_checkpoint_cutover_state(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<CheckpointCutoverState, ServiceApiError> {
         raft_read_state!(self, |state| {
-            MetadataStore::get_checkpoint_cutover_state(&mut state, org_info, table_name, extension)
+            MetadataStore::get_checkpoint_cutover_state(&mut state, table_name, extension)
         })
     }
 
     async fn heartbeat_serving_node(
         &mut self,
-        org_info: &OrgInfo,
         lease: &ServingNodeLease,
     ) -> Result<(), ServiceApiError> {
         raft_write_state!(self, |state| {
-            MetadataStore::heartbeat_serving_node(&mut state, org_info, lease)
+            MetadataStore::heartbeat_serving_node(&mut state, lease)
         })
     }
 
     async fn record_serving_node_activation(
         &mut self,
-        org_info: &OrgInfo,
         ack: &ServingNodeActivationAck,
     ) -> Result<(), ServiceApiError> {
         raft_write_state!(self, |state| {
-            MetadataStore::record_serving_node_activation(&mut state, org_info, ack)
+            MetadataStore::record_serving_node_activation(&mut state, ack)
         })
     }
 
     async fn list_serving_node_activations(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Vec<ServingNodeActivationAck>, ServiceApiError> {
         raft_read_state!(self, |state| {
-            MetadataStore::list_serving_node_activations(
-                &mut state, org_info, table_name, extension,
-            )
+            MetadataStore::list_serving_node_activations(&mut state, table_name, extension)
         })
     }
 
     async fn record_artifact_readiness(
         &mut self,
-        org_info: &OrgInfo,
         ack: &ArtifactReadinessAck,
     ) -> Result<(), ServiceApiError> {
         raft_write_state!(self, |state| {
-            MetadataStore::record_artifact_readiness(&mut state, org_info, ack)
+            MetadataStore::record_artifact_readiness(&mut state, ack)
         })
     }
 
     async fn list_artifact_readiness(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Vec<ArtifactReadinessAck>, ServiceApiError> {
         raft_read_state!(self, |state| {
-            MetadataStore::list_artifact_readiness(&mut state, org_info, table_name, extension)
+            MetadataStore::list_artifact_readiness(&mut state, table_name, extension)
         })
     }
     async fn claim_extension_work_items(
         &mut self,
-        org_info: &OrgInfo,
         extension_type: &String,
     ) -> Result<Vec<ClaimedExtensionWorkItem>, ServiceApiError> {
         Ok(self
-            .get_extension_work_items(org_info, extension_type)
+            .get_extension_work_items(extension_type)
             .await?
             .into_iter()
             .map(|work_item| ClaimedExtensionWorkItem {
@@ -820,10 +751,9 @@ impl MetadataStore for RaftServiceImpl {
 
     async fn claim_compaction_work_items(
         &mut self,
-        org_info: &OrgInfo,
     ) -> Result<Vec<ClaimedCompactionWorkItem>, ServiceApiError> {
         Ok(self
-            .get_compaction_work_items(org_info)
+            .get_compaction_work_items()
             .await?
             .into_iter()
             .map(|(table_name, work_item)| ClaimedCompactionWorkItem {
@@ -836,10 +766,9 @@ impl MetadataStore for RaftServiceImpl {
 
     async fn claim_cleanup_work_items(
         &mut self,
-        org_info: &OrgInfo,
     ) -> Result<Vec<ClaimedCleanupWorkItem>, ServiceApiError> {
         Ok(self
-            .get_cleanup_work_items(org_info)
+            .get_cleanup_work_items()
             .await?
             .into_iter()
             .map(|work_item| ClaimedCleanupWorkItem {
@@ -961,7 +890,7 @@ mod tests {
     use super::{RaftServiceConfig, RaftServiceImpl, TestNodeRegistry};
     use crate::data_contract::{
         CompactionCommit, ExtensionCommit, ExtensionFile, FileSetPayload, IcebergCommit,
-        IcebergMetadata, LicenseType, OrgInfo, SpeedboatCommit, SpeedboatCommitTableInfo,
+        IcebergMetadata, SpeedboatCommit, SpeedboatCommitTableInfo,
     };
     use crate::ephemeral_service_impl::EphemeralServiceImpl;
     use crate::metadata_store::{
@@ -1002,1010 +931,6 @@ mod tests {
         }
     }
 
-    fn org_info() -> OrgInfo {
-        OrgInfo {
-            org_id: "org-1".to_string(),
-            license_type: LicenseType::Pro,
-        }
-    }
-
-    fn speedboat_commit_for(table_name: &str, file_path: &str) -> SpeedboatCommit {
-        SpeedboatCommit {
-            type_files: vec![SpeedboatCommitTableInfo {
-                commit_type: "commit".to_string(),
-                table_name: table_name.to_string(),
-                segments: vec![],
-                files: vec![file_path.to_string()],
-                sizes: vec![1],
-                schema: Some(PowdrrSchema::minimal()),
-            }],
-            compaction: None,
-        }
-    }
-
-    fn iceberg_commit_for(
-        file_path: &str,
-        snapshot_id: &str,
-        compactions: Vec<String>,
-    ) -> IcebergCommit {
-        let schema = PowdrrSchema::minimal();
-        IcebergCommit {
-            metadata: IcebergMetadata {
-                table_schema: schema.clone(),
-                snapshot_id: Some(snapshot_id.to_string()),
-                files: FileSetPayload::single(file_path.to_string(), 1, schema),
-                partition_spec: vec![],
-                sort_order: vec![],
-                column_names: vec![],
-                column_stats: vec![],
-                access_artifacts: vec![],
-                file_stats: vec![],
-            },
-            deletes_table_info: None,
-            compactions,
-        }
-    }
-
-    fn extension_commit_for(id: &str, file_path: &str, location: &str) -> ExtensionCommit {
-        ExtensionCommit {
-            id: id.to_string(),
-            extension: "es".to_string(),
-            files: HashMap::from([(
-                file_path.to_string(),
-                vec![ExtensionFile {
-                    suffix: "search_index".to_string(),
-                    location: location.to_string(),
-                }],
-            )]),
-        }
-    }
-
-    fn serving_lease(node_id: &str) -> ServingNodeLease {
-        ServingNodeLease {
-            node_id: node_id.to_string(),
-            membership_epoch: CutoverEpoch::default(),
-            observed_at_ms: chrono::Utc::now().timestamp_millis(),
-        }
-    }
-
-    fn stale_serving_lease(node_id: &str) -> ServingNodeLease {
-        ServingNodeLease {
-            node_id: node_id.to_string(),
-            membership_epoch: CutoverEpoch::default(),
-            observed_at_ms: chrono::Utc::now().timestamp_millis() - (2 * 60 * 1000),
-        }
-    }
-
-    async fn record_readiness(
-        raft: &RaftServiceImpl,
-        table_name: &String,
-        extension: Option<String>,
-        epoch: CutoverEpoch,
-        checkpoint_id: &String,
-    ) {
-        let artifact_classes = match extension.as_deref() {
-            None => vec![
-                ArtifactClass::SnapshotLookupMmap,
-                ArtifactClass::SnapshotExactLookupMmap,
-            ],
-            Some("es") => vec![ArtifactClass::SearchProjection],
-            Some(extension) => vec![ArtifactClass::Custom(extension.to_string())],
-        };
-
-        for artifact_class in artifact_classes {
-            raft.record_artifact_readiness(
-                &org_info(),
-                &ArtifactReadinessAck {
-                    selector: crate::metadata_store::PublishedCheckpointSelector::target(
-                        table_name.clone(),
-                        extension.clone(),
-                    ),
-                    checkpoint_id: checkpoint_id.clone(),
-                    epoch,
-                    artifact_class,
-                    producer_id: "warm-cache".to_string(),
-                    ready_at_ms: chrono::Utc::now().timestamp_millis(),
-                },
-            )
-            .await
-            .unwrap();
-        }
-    }
-
-    async fn single_node_raft(cluster_name: &str, mode: TestProcessingMode) -> RaftServiceImpl {
-        let raft = RaftServiceImpl::new(
-            RaftServiceConfig {
-                cluster_name: cluster_name.to_string(),
-                node_id: 1,
-                advertise_address: "127.0.0.1:17784".to_string(),
-                bootstrap: true,
-                peers: BTreeMap::from([(1, "127.0.0.1:17784".to_string())]),
-            },
-            mode,
-        )
-        .await
-        .unwrap();
-        raft.bootstrap_cluster_if_needed().await.unwrap();
-        for _ in 0..50 {
-            if raft.is_local_leader().await {
-                return raft;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!("single-node raft cluster never elected a leader");
-    }
-
-    async fn wait_for_leader(nodes: &[Arc<RaftServiceImpl>]) -> Arc<RaftServiceImpl> {
-        for _ in 0..200 {
-            for node in nodes {
-                if node.is_local_leader().await {
-                    return node.clone();
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!("raft cluster never elected a leader");
-    }
-
-    async fn multi_node_raft(
-        cluster_name: &str,
-        mode: TestProcessingMode,
-        node_count: u64,
-    ) -> (Vec<Arc<RaftServiceImpl>>, TestNodeRegistry) {
-        let registry: TestNodeRegistry = Arc::new(Mutex::new(BTreeMap::new()));
-        let peers: BTreeMap<u64, String> = (1..=node_count)
-            .map(|node_id| (node_id, format!("test://{cluster_name}/{node_id}")))
-            .collect();
-        let mut nodes = vec![];
-        for node_id in 1..=node_count {
-            let raft = Arc::new(
-                RaftServiceImpl::new_with_test_network(
-                    RaftServiceConfig {
-                        cluster_name: cluster_name.to_string(),
-                        node_id,
-                        advertise_address: format!("test://{cluster_name}/{node_id}"),
-                        bootstrap: node_id == 1,
-                        peers: peers.clone(),
-                    },
-                    mode.clone(),
-                    registry.clone(),
-                )
-                .await
-                .unwrap(),
-            );
-            registry.lock().await.insert(node_id, raft.clone());
-            nodes.push(raft);
-        }
-
-        nodes[0].bootstrap_cluster_if_needed().await.unwrap();
-        let _ = wait_for_leader(&nodes).await;
-        (nodes, registry)
-    }
-
-    async fn locally_replicated_active_checkpoint(
-        node: &Arc<RaftServiceImpl>,
-        table_name: &String,
-    ) -> Option<String> {
-        let snapshot = node.read_snapshot_state().await.unwrap();
-        let mut state = EphemeralServiceImpl::from_snapshot(node.mode.clone(), snapshot);
-        MetadataStore::get_published_active_checkpoint(&mut state, &org_info(), table_name, None)
-            .await
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn raft_publication_queue_publishes_base_and_extension_frontiers() {
-        initialize_ids();
-
-        let raft = single_node_raft(
-            "raft-publication-queue",
-            raft_test_mode(CompactionMode::Disabled),
-        )
-        .await;
-        let org_info = org_info();
-        let table_name = "servable_logs".to_string();
-        let file_path = "s3://bucket/logs/first.parquet";
-
-        raft.speedboat_commit(&org_info, &speedboat_commit_for(&table_name, file_path))
-            .await
-            .unwrap();
-
-        let committed_base_checkpoint = raft
-            .get_latest_committed_checkpoint(&org_info, &table_name, None)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            raft.get_latest_target_checkpoint(&org_info, &table_name, None)
-                .await
-                .unwrap(),
-            Some(committed_base_checkpoint.clone())
-        );
-        assert_eq!(
-            raft.get_published_active_checkpoint(&org_info, &table_name, None)
-                .await
-                .unwrap(),
-            None
-        );
-
-        let extension_work_items = raft
-            .get_extension_work_items(&org_info, &"es".to_string())
-            .await
-            .unwrap();
-        assert_eq!(extension_work_items.len(), 1);
-        assert_eq!(
-            raft.get_extension_work_items(&org_info, &"es".to_string())
-                .await
-                .unwrap()
-                .len(),
-            0
-        );
-
-        assert!(raft.update_all_checkpoints().await.unwrap());
-        let target_base_checkpoint = raft
-            .get_latest_target_checkpoint(&org_info, &table_name, None)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            raft.get_latest_committed_checkpoint(&org_info, &table_name, None)
-                .await
-                .unwrap(),
-            Some(target_base_checkpoint.clone())
-        );
-        assert_eq!(
-            raft.get_published_active_checkpoint(&org_info, &table_name, None)
-                .await
-                .unwrap(),
-            None
-        );
-        let base_cutover_state = raft
-            .get_checkpoint_cutover_state(&org_info, &table_name, None)
-            .await
-            .unwrap();
-        raft.heartbeat_serving_node(&org_info, &serving_lease("warm-cache"))
-            .await
-            .unwrap();
-        record_readiness(
-            &raft,
-            &table_name,
-            None,
-            base_cutover_state.epoch,
-            &target_base_checkpoint,
-        )
-        .await;
-        raft.record_serving_node_activation(
-            &org_info,
-            &ServingNodeActivationAck {
-                selector: base_cutover_state.selector,
-                node_id: "warm-cache".to_string(),
-                epoch: base_cutover_state.epoch,
-                checkpoint_id: target_base_checkpoint.clone(),
-                activated_at_ms: 1,
-            },
-        )
-        .await
-        .unwrap();
-        assert!(raft.update_all_checkpoints().await.unwrap());
-        assert_eq!(
-            raft.get_latest_committed_checkpoint(&org_info, &table_name, None)
-                .await
-                .unwrap(),
-            Some(target_base_checkpoint.clone())
-        );
-        assert_eq!(
-            raft.get_published_active_checkpoint(&org_info, &table_name, None)
-                .await
-                .unwrap(),
-            Some(target_base_checkpoint.clone())
-        );
-        assert_eq!(
-            raft.get_latest_committed_checkpoint(&org_info, &table_name, Some("es".to_string()))
-                .await
-                .unwrap(),
-            None
-        );
-
-        raft.extension_commit(
-            &org_info,
-            &table_name,
-            &extension_commit_for(
-                "ext-1",
-                file_path,
-                "s3://bucket/logs/first.parquet.search_index",
-            ),
-        )
-        .await
-        .unwrap();
-
-        let committed_extension_checkpoint = raft
-            .get_latest_committed_checkpoint(&org_info, &table_name, Some("es".to_string()))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            raft.get_latest_target_checkpoint(&org_info, &table_name, Some("es".to_string()))
-                .await
-                .unwrap(),
-            Some(committed_extension_checkpoint.clone())
-        );
-        assert_eq!(
-            raft.get_published_active_checkpoint(&org_info, &table_name, Some("es".to_string()))
-                .await
-                .unwrap(),
-            None
-        );
-
-        assert!(raft.update_all_checkpoints().await.unwrap());
-        let target_extension_checkpoint = raft
-            .get_latest_target_checkpoint(&org_info, &table_name, Some("es".to_string()))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            raft.get_latest_committed_checkpoint(&org_info, &table_name, Some("es".to_string()))
-                .await
-                .unwrap(),
-            Some(target_extension_checkpoint.clone())
-        );
-        assert_eq!(
-            raft.get_published_active_checkpoint(&org_info, &table_name, Some("es".to_string()))
-                .await
-                .unwrap(),
-            None
-        );
-        let extension_cutover_state = raft
-            .get_checkpoint_cutover_state(&org_info, &table_name, Some("es".to_string()))
-            .await
-            .unwrap();
-        raft.heartbeat_serving_node(&org_info, &serving_lease("warm-cache"))
-            .await
-            .unwrap();
-        record_readiness(
-            &raft,
-            &table_name,
-            Some("es".to_string()),
-            extension_cutover_state.epoch,
-            &target_extension_checkpoint,
-        )
-        .await;
-        raft.record_serving_node_activation(
-            &org_info,
-            &ServingNodeActivationAck {
-                selector: extension_cutover_state.selector.clone(),
-                node_id: "warm-cache".to_string(),
-                epoch: extension_cutover_state.epoch,
-                checkpoint_id: target_extension_checkpoint.clone(),
-                activated_at_ms: 2,
-            },
-        )
-        .await
-        .unwrap();
-        let recorded_activations = raft
-            .list_serving_node_activations(&org_info, &table_name, Some("es".to_string()))
-            .await
-            .unwrap();
-        assert_eq!(recorded_activations.len(), 1);
-        let promoted_extension = raft.update_all_checkpoints().await.unwrap();
-        let active_extension_checkpoint = raft
-            .get_published_active_checkpoint(&org_info, &table_name, Some("es".to_string()))
-            .await
-            .unwrap();
-        assert!(
-            promoted_extension
-                || active_extension_checkpoint == Some(target_extension_checkpoint.clone()),
-            "promoted_extension={promoted_extension}, active_extension_checkpoint={active_extension_checkpoint:?}, cutover_state={:?}, recorded_activations={recorded_activations:?}",
-            extension_cutover_state,
-        );
-        assert_eq!(
-            active_extension_checkpoint,
-            Some(target_extension_checkpoint)
-        );
-    }
-
-    #[tokio::test]
-    async fn raft_active_checkpoint_waits_for_all_live_serving_nodes() {
-        initialize_ids();
-
-        let raft = single_node_raft(
-            "raft-live-node-cutover",
-            raft_test_mode(CompactionMode::Disabled),
-        )
-        .await;
-        let org_info = org_info();
-        let table_name = "strict_cutover_logs".to_string();
-        let file_path = "s3://bucket/logs/strict-cutover.parquet";
-
-        raft.speedboat_commit(&org_info, &speedboat_commit_for(&table_name, file_path))
-            .await
-            .unwrap();
-        assert!(raft.update_all_checkpoints().await.unwrap());
-
-        let target_checkpoint = raft
-            .get_latest_target_checkpoint(&org_info, &table_name, None)
-            .await
-            .unwrap()
-            .unwrap();
-        let cutover_state = raft
-            .get_checkpoint_cutover_state(&org_info, &table_name, None)
-            .await
-            .unwrap();
-        record_readiness(
-            &raft,
-            &table_name,
-            None,
-            cutover_state.epoch,
-            &target_checkpoint,
-        )
-        .await;
-
-        raft.heartbeat_serving_node(&org_info, &serving_lease("node-a"))
-            .await
-            .unwrap();
-        raft.heartbeat_serving_node(&org_info, &serving_lease("node-b"))
-            .await
-            .unwrap();
-
-        raft.record_serving_node_activation(
-            &org_info,
-            &ServingNodeActivationAck {
-                selector: cutover_state.selector.clone(),
-                node_id: "node-a".to_string(),
-                epoch: cutover_state.epoch,
-                checkpoint_id: target_checkpoint.clone(),
-                activated_at_ms: 1,
-            },
-        )
-        .await
-        .unwrap();
-
-        assert!(!raft.update_all_checkpoints().await.unwrap());
-        assert_eq!(
-            raft.get_published_active_checkpoint(&org_info, &table_name, None)
-                .await
-                .unwrap(),
-            None
-        );
-
-        raft.record_serving_node_activation(
-            &org_info,
-            &ServingNodeActivationAck {
-                selector: cutover_state.selector,
-                node_id: "node-b".to_string(),
-                epoch: cutover_state.epoch,
-                checkpoint_id: target_checkpoint.clone(),
-                activated_at_ms: 2,
-            },
-        )
-        .await
-        .unwrap();
-
-        assert!(raft.update_all_checkpoints().await.unwrap());
-        assert_eq!(
-            raft.get_published_active_checkpoint(&org_info, &table_name, None)
-                .await
-                .unwrap(),
-            Some(target_checkpoint)
-        );
-    }
-
-    #[tokio::test]
-    async fn raft_cutover_ignores_nodes_that_join_after_membership_is_captured() {
-        initialize_ids();
-
-        let raft = single_node_raft(
-            "raft-fixed-membership-late-joiner",
-            raft_test_mode(CompactionMode::Disabled),
-        )
-        .await;
-        let org_info = org_info();
-        let table_name = "late_joiner_logs".to_string();
-        let file_path = "s3://bucket/logs/late-joiner.parquet";
-
-        raft.heartbeat_serving_node(&org_info, &serving_lease("node-a"))
-            .await
-            .unwrap();
-        raft.speedboat_commit(&org_info, &speedboat_commit_for(&table_name, file_path))
-            .await
-            .unwrap();
-        assert!(raft.update_all_checkpoints().await.unwrap());
-
-        let target_checkpoint = raft
-            .get_latest_target_checkpoint(&org_info, &table_name, None)
-            .await
-            .unwrap()
-            .unwrap();
-        let cutover_state = raft
-            .get_checkpoint_cutover_state(&org_info, &table_name, None)
-            .await
-            .unwrap();
-
-        raft.heartbeat_serving_node(&org_info, &serving_lease("node-b"))
-            .await
-            .unwrap();
-        record_readiness(
-            &raft,
-            &table_name,
-            None,
-            cutover_state.epoch,
-            &target_checkpoint,
-        )
-        .await;
-        raft.record_serving_node_activation(
-            &org_info,
-            &ServingNodeActivationAck {
-                selector: cutover_state.selector,
-                node_id: "node-a".to_string(),
-                epoch: cutover_state.epoch,
-                checkpoint_id: target_checkpoint.clone(),
-                activated_at_ms: 1,
-            },
-        )
-        .await
-        .unwrap();
-
-        assert!(raft.update_all_checkpoints().await.unwrap());
-        assert_eq!(
-            raft.get_published_active_checkpoint(&org_info, &table_name, None)
-                .await
-                .unwrap(),
-            Some(target_checkpoint)
-        );
-    }
-
-    #[tokio::test]
-    async fn raft_cutover_backfills_membership_when_target_arrives_before_live_nodes() {
-        initialize_ids();
-
-        let raft = single_node_raft(
-            "raft-fixed-membership-backfill",
-            raft_test_mode(CompactionMode::Disabled),
-        )
-        .await;
-        let org_info = org_info();
-        let table_name = "backfill_logs".to_string();
-        let file_path = "s3://bucket/logs/backfill.parquet";
-
-        raft.speedboat_commit(&org_info, &speedboat_commit_for(&table_name, file_path))
-            .await
-            .unwrap();
-        assert!(raft.update_all_checkpoints().await.unwrap());
-
-        let target_checkpoint = raft
-            .get_latest_target_checkpoint(&org_info, &table_name, None)
-            .await
-            .unwrap()
-            .unwrap();
-        let cutover_state = raft
-            .get_checkpoint_cutover_state(&org_info, &table_name, None)
-            .await
-            .unwrap();
-
-        raft.heartbeat_serving_node(&org_info, &serving_lease("node-a"))
-            .await
-            .unwrap();
-        record_readiness(
-            &raft,
-            &table_name,
-            None,
-            cutover_state.epoch,
-            &target_checkpoint,
-        )
-        .await;
-        raft.record_serving_node_activation(
-            &org_info,
-            &ServingNodeActivationAck {
-                selector: cutover_state.selector,
-                node_id: "node-a".to_string(),
-                epoch: cutover_state.epoch,
-                checkpoint_id: target_checkpoint.clone(),
-                activated_at_ms: 1,
-            },
-        )
-        .await
-        .unwrap();
-
-        assert!(raft.update_all_checkpoints().await.unwrap());
-        assert_eq!(
-            raft.get_published_active_checkpoint(&org_info, &table_name, None)
-                .await
-                .unwrap(),
-            Some(target_checkpoint)
-        );
-    }
-
-    #[tokio::test]
-    async fn raft_cutover_reconfigures_when_a_required_node_expires() {
-        initialize_ids();
-
-        let raft = single_node_raft(
-            "raft-membership-reconfiguration",
-            raft_test_mode(CompactionMode::Disabled),
-        )
-        .await;
-        let org_info = org_info();
-        let table_name = "membership_reconfiguration_logs".to_string();
-        let file_path = "s3://bucket/logs/reconfigure.parquet";
-
-        raft.heartbeat_serving_node(&org_info, &serving_lease("node-a"))
-            .await
-            .unwrap();
-        raft.heartbeat_serving_node(&org_info, &serving_lease("node-b"))
-            .await
-            .unwrap();
-        raft.speedboat_commit(&org_info, &speedboat_commit_for(&table_name, file_path))
-            .await
-            .unwrap();
-        assert!(raft.update_all_checkpoints().await.unwrap());
-
-        let target_checkpoint = raft
-            .get_latest_target_checkpoint(&org_info, &table_name, None)
-            .await
-            .unwrap()
-            .unwrap();
-        let original_cutover_state = raft
-            .get_checkpoint_cutover_state(&org_info, &table_name, None)
-            .await
-            .unwrap();
-        record_readiness(
-            &raft,
-            &table_name,
-            None,
-            original_cutover_state.epoch,
-            &target_checkpoint,
-        )
-        .await;
-
-        raft.record_serving_node_activation(
-            &org_info,
-            &ServingNodeActivationAck {
-                selector: original_cutover_state.selector.clone(),
-                node_id: "node-a".to_string(),
-                epoch: original_cutover_state.epoch,
-                checkpoint_id: target_checkpoint.clone(),
-                activated_at_ms: 1,
-            },
-        )
-        .await
-        .unwrap();
-        raft.heartbeat_serving_node(&org_info, &stale_serving_lease("node-b"))
-            .await
-            .unwrap();
-
-        assert!(!raft.update_all_checkpoints().await.unwrap());
-        let reconfigured_cutover_state = raft
-            .get_checkpoint_cutover_state(&org_info, &table_name, None)
-            .await
-            .unwrap();
-        assert!(reconfigured_cutover_state.epoch > original_cutover_state.epoch);
-        assert_eq!(
-            raft.get_published_active_checkpoint(&org_info, &table_name, None)
-                .await
-                .unwrap(),
-            None
-        );
-
-        raft.record_serving_node_activation(
-            &org_info,
-            &ServingNodeActivationAck {
-                selector: reconfigured_cutover_state.selector,
-                node_id: "node-a".to_string(),
-                epoch: reconfigured_cutover_state.epoch,
-                checkpoint_id: target_checkpoint.clone(),
-                activated_at_ms: 2,
-            },
-        )
-        .await
-        .unwrap();
-
-        assert!(raft.update_all_checkpoints().await.unwrap());
-        assert_eq!(
-            raft.get_published_active_checkpoint(&org_info, &table_name, None)
-                .await
-                .unwrap(),
-            Some(target_checkpoint)
-        );
-    }
-
-    #[tokio::test]
-    async fn raft_claimed_work_is_reissued_after_lease_expiry() {
-        initialize_ids();
-
-        let raft = single_node_raft(
-            "raft-reclaimable-work",
-            raft_test_mode(CompactionMode::Async(Some(1))),
-        )
-        .await;
-        let org_info = org_info();
-        let table_name = "reclaimable_work_logs".to_string();
-        let file_path = "s3://bucket/logs/reclaimable.parquet";
-
-        raft.speedboat_commit(&org_info, &speedboat_commit_for(&table_name, file_path))
-            .await
-            .unwrap();
-
-        let extension_work_item = raft
-            .get_extension_work_items(&org_info, &"es".to_string())
-            .await
-            .unwrap()
-            .pop()
-            .unwrap();
-        assert_eq!(
-            raft.get_extension_work_items(&org_info, &"es".to_string())
-                .await
-                .unwrap()
-                .len(),
-            0
-        );
-        tokio::time::sleep(Duration::from_millis(WORK_CLAIM_RETRY_WAIT_MS)).await;
-        let retried_extension_work_item = raft
-            .get_extension_work_items(&org_info, &"es".to_string())
-            .await
-            .unwrap()
-            .pop()
-            .unwrap();
-        assert_eq!(retried_extension_work_item.id, extension_work_item.id);
-
-        let (_claimed_table_name, compaction_work_item) = raft
-            .get_compaction_work_items(&org_info)
-            .await
-            .unwrap()
-            .pop()
-            .unwrap();
-        assert_eq!(
-            raft.get_compaction_work_items(&org_info)
-                .await
-                .unwrap()
-                .len(),
-            0
-        );
-        tokio::time::sleep(Duration::from_millis(WORK_CLAIM_RETRY_WAIT_MS)).await;
-        let retried_compaction_work_item = raft
-            .get_compaction_work_items(&org_info)
-            .await
-            .unwrap()
-            .pop()
-            .unwrap()
-            .1;
-        assert_eq!(retried_compaction_work_item.id, compaction_work_item.id);
-
-        raft.compaction_commit(
-            &org_info,
-            &table_name,
-            &CompactionCommit {
-                removed_speedboat_files: compaction_work_item.speedboat_files.file_paths.clone(),
-                removed_delete_files: compaction_work_item.delete_files.clone(),
-                parquet_file_name: "s3://bucket/logs/reclaimable-compacted.parquet".to_string(),
-                compaction_id: compaction_work_item.id.clone(),
-                checkpoint_id_to_replace: compaction_work_item.checkpoint_id_to_replace.clone(),
-                checkpoints_to_delete: compaction_work_item.checkpoints_to_delete.clone(),
-            },
-        )
-        .await
-        .unwrap();
-        raft.iceberg_commit(
-            &org_info,
-            &table_name,
-            &iceberg_commit_for(
-                "s3://bucket/logs/reclaimable-compacted.parquet",
-                "snapshot-reclaim",
-                vec![compaction_work_item.id.clone()],
-            ),
-        )
-        .await
-        .unwrap();
-
-        let cleanup_work_item = raft
-            .get_cleanup_work_items(&org_info)
-            .await
-            .unwrap()
-            .pop()
-            .unwrap();
-        assert_eq!(
-            raft.get_cleanup_work_items(&org_info).await.unwrap().len(),
-            0
-        );
-        tokio::time::sleep(Duration::from_millis(WORK_CLAIM_RETRY_WAIT_MS)).await;
-        let retried_cleanup_work_item = raft
-            .get_cleanup_work_items(&org_info)
-            .await
-            .unwrap()
-            .pop()
-            .unwrap();
-        assert_eq!(retried_cleanup_work_item.id, cleanup_work_item.id);
-    }
-
-    #[tokio::test]
-    async fn raft_cleanup_waits_for_active_checkpoint_cutover() {
-        initialize_ids();
-
-        let raft = single_node_raft(
-            "raft-cleanup-pinning",
-            raft_test_mode(CompactionMode::Async(Some(1))),
-        )
-        .await;
-        let org_info = org_info();
-        let table_name = "cleanup_pinning_logs".to_string();
-        let file_path = "s3://bucket/logs/pinning.parquet";
-
-        raft.heartbeat_serving_node(&org_info, &serving_lease("warm-cache"))
-            .await
-            .unwrap();
-        raft.speedboat_commit(&org_info, &speedboat_commit_for(&table_name, file_path))
-            .await
-            .unwrap();
-        assert!(raft.update_all_checkpoints().await.unwrap());
-
-        let initial_target_checkpoint = raft
-            .get_latest_target_checkpoint(&org_info, &table_name, None)
-            .await
-            .unwrap()
-            .unwrap();
-        let initial_cutover_state = raft
-            .get_checkpoint_cutover_state(&org_info, &table_name, None)
-            .await
-            .unwrap();
-        record_readiness(
-            &raft,
-            &table_name,
-            None,
-            initial_cutover_state.epoch,
-            &initial_target_checkpoint,
-        )
-        .await;
-        raft.record_serving_node_activation(
-            &org_info,
-            &ServingNodeActivationAck {
-                selector: initial_cutover_state.selector,
-                node_id: "warm-cache".to_string(),
-                epoch: initial_cutover_state.epoch,
-                checkpoint_id: initial_target_checkpoint,
-                activated_at_ms: 1,
-            },
-        )
-        .await
-        .unwrap();
-        assert!(raft.update_all_checkpoints().await.unwrap());
-
-        let (_claimed_table_name, compaction_work_item) = raft
-            .get_compaction_work_items(&org_info)
-            .await
-            .unwrap()
-            .pop()
-            .unwrap();
-        raft.compaction_commit(
-            &org_info,
-            &table_name,
-            &CompactionCommit {
-                removed_speedboat_files: compaction_work_item.speedboat_files.file_paths.clone(),
-                removed_delete_files: compaction_work_item.delete_files.clone(),
-                parquet_file_name: "s3://bucket/logs/pinning-compacted.parquet".to_string(),
-                compaction_id: compaction_work_item.id.clone(),
-                checkpoint_id_to_replace: compaction_work_item.checkpoint_id_to_replace.clone(),
-                checkpoints_to_delete: compaction_work_item.checkpoints_to_delete.clone(),
-            },
-        )
-        .await
-        .unwrap();
-        raft.iceberg_commit(
-            &org_info,
-            &table_name,
-            &iceberg_commit_for(
-                "s3://bucket/logs/pinning-compacted.parquet",
-                "snapshot-pinning",
-                vec![compaction_work_item.id.clone()],
-            ),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            raft.get_cleanup_work_items(&org_info).await.unwrap().len(),
-            0
-        );
-
-        assert!(raft.update_all_checkpoints().await.unwrap());
-        let next_target_checkpoint = raft
-            .get_latest_target_checkpoint(&org_info, &table_name, None)
-            .await
-            .unwrap()
-            .unwrap();
-        let next_cutover_state = raft
-            .get_checkpoint_cutover_state(&org_info, &table_name, None)
-            .await
-            .unwrap();
-        record_readiness(
-            &raft,
-            &table_name,
-            None,
-            next_cutover_state.epoch,
-            &next_target_checkpoint,
-        )
-        .await;
-        raft.record_serving_node_activation(
-            &org_info,
-            &ServingNodeActivationAck {
-                selector: next_cutover_state.selector,
-                node_id: "warm-cache".to_string(),
-                epoch: next_cutover_state.epoch,
-                checkpoint_id: next_target_checkpoint,
-                activated_at_ms: 2,
-            },
-        )
-        .await
-        .unwrap();
-        assert!(raft.update_all_checkpoints().await.unwrap());
-
-        assert_eq!(
-            raft.get_cleanup_work_items(&org_info).await.unwrap().len(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn raft_work_claims_update_replicated_snapshot_state() {
-        initialize_ids();
-
-        let raft = single_node_raft(
-            "raft-work-claims",
-            raft_test_mode(CompactionMode::Async(Some(1))),
-        )
-        .await;
-        let org_info = org_info();
-        let table_name = "compaction_logs".to_string();
-        let file_path = "s3://bucket/logs/first.parquet";
-
-        raft.speedboat_commit(&org_info, &speedboat_commit_for(&table_name, file_path))
-            .await
-            .unwrap();
-
-        let compaction_work_items = raft.get_compaction_work_items(&org_info).await.unwrap();
-        assert_eq!(compaction_work_items.len(), 1);
-        assert_eq!(
-            raft.get_compaction_work_items(&org_info)
-                .await
-                .unwrap()
-                .len(),
-            0
-        );
-
-        let (_claimed_table_name, compaction_work_item) = compaction_work_items[0].clone();
-        let compaction_id = compaction_work_item.id.clone();
-        raft.compaction_commit(
-            &org_info,
-            &table_name,
-            &CompactionCommit {
-                removed_speedboat_files: compaction_work_item.speedboat_files.file_paths.clone(),
-                removed_delete_files: compaction_work_item.delete_files.clone(),
-                parquet_file_name: "s3://bucket/logs/compacted.parquet".to_string(),
-                compaction_id: compaction_id.clone(),
-                checkpoint_id_to_replace: compaction_work_item.checkpoint_id_to_replace.clone(),
-                checkpoints_to_delete: compaction_work_item.checkpoints_to_delete.clone(),
-            },
-        )
-        .await
-        .unwrap();
-
-        raft.iceberg_commit(
-            &org_info,
-            &table_name,
-            &iceberg_commit_for(
-                "s3://bucket/logs/compacted.parquet",
-                "snapshot-1",
-                vec![compaction_id],
-            ),
-        )
-        .await
-        .unwrap();
-
-        let cleanup_work_items = raft.get_cleanup_work_items(&org_info).await.unwrap();
-        assert_eq!(cleanup_work_items.len(), 1);
-        assert_eq!(
-            raft.get_cleanup_work_items(&org_info).await.unwrap().len(),
-            0
-        );
-    }
-
     #[tokio::test]
     async fn raft_cluster_failover_preserves_committed_state() {
         initialize_ids();
@@ -2016,30 +941,26 @@ mod tests {
             3,
         )
         .await;
-        let org_info = org_info();
         let table_name = "cluster_failover_logs".to_string();
         let first_file_path = "s3://bucket/logs/cluster-first.parquet";
 
         let leader = wait_for_leader(&nodes).await;
         leader
-            .speedboat_commit(
-                &org_info,
-                &speedboat_commit_for(&table_name, first_file_path),
-            )
+            .speedboat_commit(&speedboat_commit_for(&table_name, first_file_path))
             .await
             .unwrap();
         assert!(leader.update_all_checkpoints().await.unwrap());
         let first_target_checkpoint = leader
-            .get_latest_target_checkpoint(&org_info, &table_name, None)
+            .get_latest_target_checkpoint(&table_name, None)
             .await
             .unwrap()
             .unwrap();
         let first_cutover_state = leader
-            .get_checkpoint_cutover_state(&org_info, &table_name, None)
+            .get_checkpoint_cutover_state(&table_name, None)
             .await
             .unwrap();
         leader
-            .heartbeat_serving_node(&org_info, &serving_lease("warm-cache"))
+            .heartbeat_serving_node(&serving_lease("warm-cache"))
             .await
             .unwrap();
         record_readiness(
@@ -2051,16 +972,13 @@ mod tests {
         )
         .await;
         leader
-            .record_serving_node_activation(
-                &org_info,
-                &ServingNodeActivationAck {
-                    selector: first_cutover_state.selector,
-                    node_id: "warm-cache".to_string(),
-                    epoch: first_cutover_state.epoch,
-                    checkpoint_id: first_target_checkpoint.clone(),
-                    activated_at_ms: 1,
-                },
-            )
+            .record_serving_node_activation(&ServingNodeActivationAck {
+                selector: first_cutover_state.selector,
+                node_id: "warm-cache".to_string(),
+                epoch: first_cutover_state.epoch,
+                checkpoint_id: first_target_checkpoint.clone(),
+                activated_at_ms: 1,
+            })
             .await
             .unwrap();
         assert!(leader.update_all_checkpoints().await.unwrap());
@@ -2095,31 +1013,31 @@ mod tests {
         assert_ne!(new_leader.config.node_id, leader_id);
         assert_eq!(
             new_leader
-                .get_latest_committed_checkpoint(&org_info, &table_name, None)
+                .get_latest_committed_checkpoint(&table_name, None)
                 .await
                 .unwrap(),
             Some(first_target_checkpoint)
         );
 
         new_leader
-            .speedboat_commit(
-                &org_info,
-                &speedboat_commit_for(&table_name, "s3://bucket/logs/cluster-second.parquet"),
-            )
+            .speedboat_commit(&speedboat_commit_for(
+                &table_name,
+                "s3://bucket/logs/cluster-second.parquet",
+            ))
             .await
             .unwrap();
         assert!(new_leader.update_all_checkpoints().await.unwrap());
         let second_target_checkpoint = new_leader
-            .get_latest_target_checkpoint(&org_info, &table_name, None)
+            .get_latest_target_checkpoint(&table_name, None)
             .await
             .unwrap()
             .unwrap();
         let second_cutover_state = new_leader
-            .get_checkpoint_cutover_state(&org_info, &table_name, None)
+            .get_checkpoint_cutover_state(&table_name, None)
             .await
             .unwrap();
         new_leader
-            .heartbeat_serving_node(&org_info, &serving_lease("warm-cache"))
+            .heartbeat_serving_node(&serving_lease("warm-cache"))
             .await
             .unwrap();
         record_readiness(
@@ -2131,16 +1049,13 @@ mod tests {
         )
         .await;
         new_leader
-            .record_serving_node_activation(
-                &org_info,
-                &ServingNodeActivationAck {
-                    selector: second_cutover_state.selector,
-                    node_id: "warm-cache".to_string(),
-                    epoch: second_cutover_state.epoch,
-                    checkpoint_id: second_target_checkpoint.clone(),
-                    activated_at_ms: 2,
-                },
-            )
+            .record_serving_node_activation(&ServingNodeActivationAck {
+                selector: second_cutover_state.selector,
+                node_id: "warm-cache".to_string(),
+                epoch: second_cutover_state.epoch,
+                checkpoint_id: second_target_checkpoint.clone(),
+                activated_at_ms: 2,
+            })
             .await
             .unwrap();
         assert!(new_leader.update_all_checkpoints().await.unwrap());
