@@ -343,7 +343,7 @@ fn derive_support_redis_config(
         enabled: true,
         database: config.database,
         key_field: key_schema.primary_key.clone(),
-        value_field: config.value_field.clone(),
+        value_field: Some(config.value_field.clone()),
     }
 }
 
@@ -538,10 +538,15 @@ fn validate_derived_redis_config(
             config.key_field
         )));
     }
-    if !schema_map.contains_key(&config.value_field) {
+    let value_field = config.value_field.as_ref().ok_or_else(|| {
+        SupportConfigError::validation(
+            "Derived Redis config is missing value_field for unified support mapping",
+        )
+    })?;
+    if !schema_map.contains_key(value_field) {
         return Err(SupportConfigError::validation(format!(
             "Unknown Redis value field {}",
-            config.value_field
+            value_field
         )));
     }
     Ok(())
