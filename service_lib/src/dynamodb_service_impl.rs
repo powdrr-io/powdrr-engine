@@ -1,13 +1,13 @@
 use crate::data_contract::{
     CleanupCommit, CleanupWorkItem, CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody,
-    CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, OrgInfo, OrgSettings,
+    CreateTable, DEFAULT_METADATA_NAMESPACE, ExtensionCommit, ExtensionWorkItem, IcebergCommit,
     SpeedboatCommit, SpeedboatCommitTableInfo, TableDescription, TableMetadataCheckpoint,
 };
 use crate::dynamodb::{
     DynamoDbConnector, EntityVersionInfo, PowdrrNamedCleanupWorkItemCache,
     PowdrrNamedCompactionCommitCache, PowdrrNamedCompactionWorkItemCache,
     PowdrrNamedExtensionCommitCache, PowdrrNamedExtensionWorkItemCache,
-    PowdrrNamedIcebergCommitCache, PowdrrNamedOrgInfoCache, PowdrrNamedSpeedboatCommitCache,
+    PowdrrNamedIcebergCommitCache, PowdrrNamedSpeedboatCommitCache,
     PowdrrNamedTableMetadataCheckpointCache, TableBody,
 };
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
@@ -47,7 +47,6 @@ pub struct DynamoDBServiceImpl {
     extension_cache: PowdrrNamedExtensionCommitCache,
     extension_work_item_cache: PowdrrNamedExtensionWorkItemCache,
     compaction_work_item_cache: PowdrrNamedCompactionWorkItemCache,
-    org_cache: PowdrrNamedOrgInfoCache,
 }
 
 static MANAGEMENT_ORG_ID: &'static str = "MANAGEMENT_ORG";
@@ -104,7 +103,6 @@ impl DynamoDBServiceImpl {
             extension_cache: PowdrrNamedExtensionCommitCache::new(),
             extension_work_item_cache: PowdrrNamedExtensionWorkItemCache::new(),
             compaction_work_item_cache: PowdrrNamedCompactionWorkItemCache::new(),
-            org_cache: PowdrrNamedOrgInfoCache::new(),
         }
     }
 
@@ -617,23 +615,26 @@ impl DynamoDBServiceImpl {
 
     async fn cleanup_work_item_is_ready(
         &mut self,
-        org_info: &OrgInfo,
         work_item: &CleanupWorkItem,
     ) -> Result<bool, ServiceApiError> {
         let files_to_delete: HashSet<String> = work_item.files_to_delete.iter().cloned().collect();
 
         for extension in [None, Some("es".to_string())] {
             let Some(checkpoint_id) = self
-                .get_active_checkpoint_id(&org_info.org_id, &work_item.table_name, &extension)
+                .get_active_checkpoint_id(
+                    &DEFAULT_METADATA_NAMESPACE.to_string(),
+                    &work_item.table_name,
+                    &extension,
+                )
                 .await?
             else {
                 continue;
             };
             let Some(checkpoint) = self
-                .get_checkpoint(
-                    org_info,
-                    &CheckpointDescriptor::new(work_item.table_name.clone(), checkpoint_id),
-                )
+                .get_checkpoint(&CheckpointDescriptor::new(
+                    work_item.table_name.clone(),
+                    checkpoint_id,
+                ))
                 .await?
             else {
                 continue;
@@ -838,54 +839,46 @@ impl DynamoDBServiceImpl {
 
     pub async fn add_checkpoint(
         &mut self,
-        org_info: &OrgInfo,
         metadata: &TableMetadataCheckpoint,
     ) -> Result<(), ServiceApiError> {
-        self.create_table(
-            org_info,
-            &CreateTable {
-                name: metadata.table_name.clone(),
-                tags: Default::default(),
-                serving: None,
-                support: None,
-                dynamodb: None,
-                mongodb: None,
-                redis: None,
-            },
-        )
+        self.create_table(&CreateTable {
+            name: metadata.table_name.clone(),
+            tags: Default::default(),
+            serving: None,
+            support: None,
+            dynamodb: None,
+            mongodb: None,
+            redis: None,
+        })
         .await?;
         if metadata.speedboat_metadata.is_some() {
-            self.speedboat_commit(
-                org_info,
-                &SpeedboatCommit {
-                    type_files: vec![SpeedboatCommitTableInfo {
-                        commit_type: "commit".to_string(),
-                        table_name: metadata.table_name.clone(),
-                        segments: vec![],
-                        files: metadata
-                            .speedboat_metadata
-                            .as_ref()
-                            .unwrap()
-                            .files
-                            .file_paths
-                            .clone(),
-                        sizes: metadata
-                            .speedboat_metadata
-                            .as_ref()
-                            .unwrap()
-                            .files
-                            .sizes
-                            .clone(),
-                        schema: Some(metadata.schema.clone()),
-                    }],
-                    compaction: None,
-                },
-            )
+            self.speedboat_commit(&SpeedboatCommit {
+                type_files: vec![SpeedboatCommitTableInfo {
+                    commit_type: "commit".to_string(),
+                    table_name: metadata.table_name.clone(),
+                    segments: vec![],
+                    files: metadata
+                        .speedboat_metadata
+                        .as_ref()
+                        .unwrap()
+                        .files
+                        .file_paths
+                        .clone(),
+                    sizes: metadata
+                        .speedboat_metadata
+                        .as_ref()
+                        .unwrap()
+                        .files
+                        .sizes
+                        .clone(),
+                    schema: Some(metadata.schema.clone()),
+                }],
+                compaction: None,
+            })
             .await?;
         }
         if metadata.iceberg_metadata.is_some() {
             self.iceberg_commit(
-                org_info,
                 &metadata.table_name,
                 &IcebergCommit {
                     metadata: metadata.iceberg_metadata.as_ref().unwrap().clone(),
@@ -908,13 +901,12 @@ impl DynamoDBServiceImpl {
 
     pub async fn create_table(
         &mut self,
-        org_info: &OrgInfo,
         create_table: &CreateTable,
     ) -> Result<bool, ServiceApiError> {
         let created = self
             .connector
             .create_table_helper(
-                &org_info.org_id.to_string(),
+                &DEFAULT_METADATA_NAMESPACE.to_string(),
                 &create_table.name,
                 &TableBody {
                     tags: create_table.tags.clone(),
@@ -938,13 +930,12 @@ impl DynamoDBServiceImpl {
 
     pub async fn upsert_table_metadata(
         &mut self,
-        org_info: &OrgInfo,
         create_table: &CreateTable,
     ) -> Result<bool, ServiceApiError> {
         let updated = self
             .connector
             .upsert_table_helper(
-                &org_info.org_id.to_string(),
+                &DEFAULT_METADATA_NAMESPACE.to_string(),
                 &create_table.name,
                 &TableBody {
                     tags: create_table.tags.clone(),
@@ -966,12 +957,11 @@ impl DynamoDBServiceImpl {
 
     pub async fn describe_table(
         &mut self,
-        org_info: &OrgInfo,
         name: &String,
     ) -> Result<Option<TableDescription>, ServiceApiError> {
         let result = self
             .connector
-            .describe_powdrr_table(&org_info.org_id.to_string(), name)
+            .describe_powdrr_table(&DEFAULT_METADATA_NAMESPACE.to_string(), name)
             .await
             .map(|x| {
                 x.map(|x| TableDescription {
@@ -991,14 +981,14 @@ impl DynamoDBServiceImpl {
             None => {
                 match self
                     .connector
-                    .describe_alias(&org_info.org_id.to_string(), name)
+                    .describe_alias(&DEFAULT_METADATA_NAMESPACE.to_string(), name)
                     .await
                     .map_err(from_modyne)?
                 {
                     None => Ok(None),
                     Some(table_name) => self
                         .connector
-                        .describe_powdrr_table(&org_info.org_id.to_string(), &table_name)
+                        .describe_powdrr_table(&DEFAULT_METADATA_NAMESPACE.to_string(), &table_name)
                         .await
                         .map(|x| {
                             x.map(|x| TableDescription {
@@ -1019,100 +1009,91 @@ impl DynamoDBServiceImpl {
 
     pub async fn add_alias(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         alias: &String,
     ) -> Result<bool, ServiceApiError> {
         self.connector
-            .create_alias(&org_info.org_id.to_string(), alias, table_name)
+            .create_alias(&DEFAULT_METADATA_NAMESPACE.to_string(), alias, table_name)
             .await
             .map_err(from_modyne)
     }
 
     pub async fn remove_alias(
         &mut self,
-        org_info: &OrgInfo,
         _table_name: &String,
         alias: &String,
     ) -> Result<bool, ServiceApiError> {
         self.connector
-            .delete_alias(&org_info.org_id.to_string(), alias)
+            .delete_alias(&DEFAULT_METADATA_NAMESPACE.to_string(), alias)
             .await
             .map_err(from_modyne)
     }
 
     pub async fn create_table_template(
         &mut self,
-        org_info: &OrgInfo,
         name: &String,
         template: &CreateIndexTemplateBody,
     ) -> Result<bool, ServiceApiError> {
         self.connector
-            .create_table_template(&org_info.org_id.to_string(), name, template)
+            .create_table_template(&DEFAULT_METADATA_NAMESPACE.to_string(), name, template)
             .await
             .map_err(from_modyne)
     }
 
     pub async fn describe_table_template(
         &mut self,
-        org_info: &OrgInfo,
         name: &String,
     ) -> Result<Option<CreateIndexTemplateBody>, ServiceApiError> {
         self.connector
-            .describe_table_template(&org_info.org_id.clone(), name)
+            .describe_table_template(&DEFAULT_METADATA_NAMESPACE.to_string(), name)
             .await
             .map_err(from_modyne)
     }
 
     pub async fn create_pipeline(
         &mut self,
-        org_info: &OrgInfo,
         name: &String,
         pipeline: &PipelineDefinition,
     ) -> Result<bool, ServiceApiError> {
         self.connector
-            .create_pipeline(&org_info.org_id.clone(), name, pipeline)
+            .create_pipeline(&DEFAULT_METADATA_NAMESPACE.to_string(), name, pipeline)
             .await
             .map_err(from_modyne)
     }
 
     pub async fn describe_pipeline(
         &mut self,
-        org_info: &OrgInfo,
         name: &String,
     ) -> Result<Option<PipelineDefinition>, ServiceApiError> {
         self.connector
-            .describe_pipeline(&org_info.org_id.clone(), name)
+            .describe_pipeline(&DEFAULT_METADATA_NAMESPACE.to_string(), name)
             .await
             .map_err(from_modyne)
     }
 
     pub async fn create_lifetime_policy(
         &mut self,
-        org_info: &OrgInfo,
         name: &String,
         policy: &ILMPolicyDefinition,
     ) -> Result<bool, ServiceApiError> {
         self.connector
-            .create_lifetime_policy(&org_info.org_id.clone(), name, policy)
+            .create_lifetime_policy(&DEFAULT_METADATA_NAMESPACE.to_string(), name, policy)
             .await
             .map_err(from_modyne)
     }
 
     pub async fn describe_lifetime_policy(
         &mut self,
-        org_info: &OrgInfo,
         name: &String,
     ) -> Result<Option<ILMPolicyDefinition>, ServiceApiError> {
         self.connector
-            .describe_lifetime_policy(&org_info.org_id.clone(), name)
+            .describe_lifetime_policy(&DEFAULT_METADATA_NAMESPACE.to_string(), name)
             .await
             .map_err(from_modyne)
     }
 
     pub async fn speedboat_commit(
         &mut self,
-        org_info: &OrgInfo,
         commit: &SpeedboatCommit,
     ) -> Result<bool, ServiceApiError> {
         let tables: HashSet<String> = commit
@@ -1128,7 +1109,7 @@ impl DynamoDBServiceImpl {
         let retval = self
             .connector
             .commit_speedboat(
-                &org_info.org_id.clone(),
+                &DEFAULT_METADATA_NAMESPACE.to_string(),
                 &commit.type_files[0].table_name,
                 commit,
             )
@@ -1137,10 +1118,7 @@ impl DynamoDBServiceImpl {
         if retval {
             MetadataStore::queue_checkpoint_publication(
                 self,
-                &CheckpointUpdateRequest::new(
-                    org_info.org_id.clone(),
-                    commit.type_files[0].table_name.clone(),
-                ),
+                &CheckpointUpdateRequest::new(commit.type_files[0].table_name.clone()),
             )
             .await?;
         }
@@ -1202,13 +1180,16 @@ impl DynamoDBServiceImpl {
 
     pub async fn iceberg_commit(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         iceberg_commit: &IcebergCommit,
     ) -> Result<bool, ServiceApiError> {
         let retval = self
             .connector
-            .commit_iceberg(&org_info.org_id.clone(), table_name, iceberg_commit)
+            .commit_iceberg(
+                &DEFAULT_METADATA_NAMESPACE.to_string(),
+                table_name,
+                iceberg_commit,
+            )
             .await
             .map_err(from_modyne)?;
         if retval {
@@ -1217,7 +1198,7 @@ impl DynamoDBServiceImpl {
             }
             MetadataStore::queue_checkpoint_publication(
                 self,
-                &CheckpointUpdateRequest::new(org_info.org_id.clone(), table_name.clone()),
+                &CheckpointUpdateRequest::new(table_name.clone()),
             )
             .await?;
         }
@@ -1226,19 +1207,22 @@ impl DynamoDBServiceImpl {
 
     pub async fn extension_commit(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         commit: &ExtensionCommit,
     ) -> Result<bool, ServiceApiError> {
         let retval = self
             .connector
-            .commit_extension_work_item_completed(&org_info.org_id, table_name, &commit)
+            .commit_extension_work_item_completed(
+                &DEFAULT_METADATA_NAMESPACE.to_string(),
+                table_name,
+                &commit,
+            )
             .await
             .map_err(from_modyne)?;
         if retval {
             MetadataStore::queue_checkpoint_publication(
                 self,
-                &CheckpointUpdateRequest::new(org_info.org_id.clone(), table_name.clone()),
+                &CheckpointUpdateRequest::new(table_name.clone()),
             )
             .await?;
         }
@@ -1247,7 +1231,6 @@ impl DynamoDBServiceImpl {
 
     pub async fn compaction_commit(
         &mut self,
-        org_info: &OrgInfo,
         _table_name: &String,
         commit: &CompactionCommit,
     ) -> Result<bool, ServiceApiError> {
@@ -1257,7 +1240,7 @@ impl DynamoDBServiceImpl {
         self.connector
             .create_compaction(
                 &mut self.compactions_cache,
-                &org_info.org_id,
+                &DEFAULT_METADATA_NAMESPACE.to_string(),
                 &commit.compaction_id,
                 commit,
             )
@@ -1267,13 +1250,12 @@ impl DynamoDBServiceImpl {
 
     pub async fn cleanup_commit(
         &mut self,
-        org_info: &OrgInfo,
         commit: &CleanupCommit,
     ) -> Result<bool, ServiceApiError> {
         let mut transaction = TransactWrite::new();
         transaction = DynamoDbConnector::mark_done_cleanup_work_item_lease_inner(
             transaction,
-            &org_info.org_id,
+            &DEFAULT_METADATA_NAMESPACE.to_string(),
             &commit.table_name,
             &commit.id,
             None,
@@ -1286,12 +1268,15 @@ impl DynamoDBServiceImpl {
 
     pub async fn get_latest_committed_checkpoint(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         extensions: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
         let checkpoint_id = self
-            .get_target_checkpoint_id(&org_info.org_id, table_name, &extensions)
+            .get_target_checkpoint_id(
+                &DEFAULT_METADATA_NAMESPACE.to_string(),
+                table_name,
+                &extensions,
+            )
             .await?;
         if let Some(checkpoint_id) = checkpoint_id.as_ref() {
             tracing::info!(
@@ -1305,12 +1290,15 @@ impl DynamoDBServiceImpl {
 
     pub async fn get_published_active_checkpoint(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         extensions: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
         let checkpoint_id = self
-            .get_active_checkpoint_id(&org_info.org_id, table_name, &extensions)
+            .get_active_checkpoint_id(
+                &DEFAULT_METADATA_NAMESPACE.to_string(),
+                table_name,
+                &extensions,
+            )
             .await?;
         if let Some(checkpoint_id) = checkpoint_id.as_ref() {
             tracing::info!(
@@ -1324,7 +1312,6 @@ impl DynamoDBServiceImpl {
 
     pub async fn get_checkpoint(
         &mut self,
-        org_info: &OrgInfo,
         checkpoint: &CheckpointDescriptor,
     ) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
         tracing::info!("Getting checkpoint for {}", checkpoint.full_name());
@@ -1332,7 +1319,7 @@ impl DynamoDBServiceImpl {
             .connector
             .describe_checkpoint(
                 &mut self.checkpoints_cache,
-                &org_info.org_id,
+                &DEFAULT_METADATA_NAMESPACE.to_string(),
                 &checkpoint.full_name(),
             )
             .await
@@ -1352,12 +1339,15 @@ impl DynamoDBServiceImpl {
 
     pub async fn get_extension_work_items(
         &mut self,
-        org_info: &OrgInfo,
         extension_type: &String,
     ) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {
         let all_tables = self
             .connector
-            .fetch_entities(&org_info.org_id, &"powdrr_table".to_string(), None)
+            .fetch_entities(
+                &DEFAULT_METADATA_NAMESPACE.to_string(),
+                &"powdrr_table".to_string(),
+                None,
+            )
             .await
             .map_err(from_modyne)?;
         let mut work_items = vec![];
@@ -1367,7 +1357,7 @@ impl DynamoDBServiceImpl {
                 &Self::latest_extension_work_item_key(&table_entity.entity_id, extension_type);
             let latest_entity_info = self
                 .connector
-                .describe_latest(&org_info.org_id, latest_es_key)
+                .describe_latest(&DEFAULT_METADATA_NAMESPACE.to_string(), latest_es_key)
                 .await
                 .map_err(from_modyne)?;
             match latest_entity_info {
@@ -1376,7 +1366,7 @@ impl DynamoDBServiceImpl {
                         let lease = self
                             .connector
                             .valid_leases_extension_work_item_lease(
-                                &org_info.org_id,
+                                &DEFAULT_METADATA_NAMESPACE.to_string(),
                                 &latest_entity_info.entity_id,
                                 None,
                                 Some(LEASE_LENGTH_MS),
@@ -1388,7 +1378,7 @@ impl DynamoDBServiceImpl {
                                 .connector
                                 .describe_extension_work_item(
                                     &mut self.extension_work_item_cache,
-                                    &org_info.org_id,
+                                    &DEFAULT_METADATA_NAMESPACE.to_string(),
                                     &latest_entity_info.entity_id,
                                 )
                                 .await
@@ -1426,11 +1416,14 @@ impl DynamoDBServiceImpl {
 
     pub async fn get_compaction_work_items(
         &mut self,
-        org_info: &OrgInfo,
     ) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
         let all_tables = self
             .connector
-            .fetch_entities(&org_info.org_id, &"powdrr_table".to_string(), None)
+            .fetch_entities(
+                &DEFAULT_METADATA_NAMESPACE.to_string(),
+                &"powdrr_table".to_string(),
+                None,
+            )
             .await
             .map_err(from_modyne)?;
         let mut work_items = vec![];
@@ -1439,7 +1432,7 @@ impl DynamoDBServiceImpl {
             let latest_entity_info = self
                 .connector
                 .describe_latest(
-                    &org_info.org_id,
+                    &DEFAULT_METADATA_NAMESPACE.to_string(),
                     &Self::latest_compaction_work_item_key(&table_entity.entity_id),
                 )
                 .await
@@ -1450,7 +1443,7 @@ impl DynamoDBServiceImpl {
                         let leases = self
                             .connector
                             .valid_leases_compaction_work_item_lease(
-                                &org_info.org_id,
+                                &DEFAULT_METADATA_NAMESPACE.to_string(),
                                 &latest_entity_info.entity_id,
                                 None,
                                 Some(LEASE_LENGTH_MS),
@@ -1462,7 +1455,7 @@ impl DynamoDBServiceImpl {
                                 .connector
                                 .describe_compaction_work_item(
                                     &mut self.compaction_work_item_cache,
-                                    &org_info.org_id,
+                                    &DEFAULT_METADATA_NAMESPACE.to_string(),
                                     &latest_entity_info.entity_id,
                                 )
                                 .await
@@ -1501,11 +1494,14 @@ impl DynamoDBServiceImpl {
 
     pub async fn get_cleanup_work_items(
         &mut self,
-        org_info: &OrgInfo,
     ) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
         let all_tables = self
             .connector
-            .fetch_entities(&org_info.org_id, &"powdrr_table".to_string(), None)
+            .fetch_entities(
+                &DEFAULT_METADATA_NAMESPACE.to_string(),
+                &"powdrr_table".to_string(),
+                None,
+            )
             .await
             .map_err(from_modyne)?;
         let mut work_items = vec![];
@@ -1514,7 +1510,7 @@ impl DynamoDBServiceImpl {
             let available_infos = self
                 .connector
                 .oldest_available_cleanup_work_item_lease(
-                    &org_info.org_id,
+                    &DEFAULT_METADATA_NAMESPACE.to_string(),
                     &table_entity.entity_id,
                     None,
                     Some(LEASE_LENGTH_MS),
@@ -1526,17 +1522,14 @@ impl DynamoDBServiceImpl {
                     .connector
                     .describe_cleanup_work_item(
                         &mut PowdrrNamedCleanupWorkItemCache::new(),
-                        &org_info.org_id,
+                        &DEFAULT_METADATA_NAMESPACE.to_string(),
                         &available_info.name,
                     )
                     .await
                     .map_err(from_modyne)?;
                 assert!(work_item.is_some());
                 let work_item = work_item.unwrap();
-                if !self
-                    .cleanup_work_item_is_ready(org_info, &work_item)
-                    .await?
-                {
+                if !self.cleanup_work_item_is_ready(&work_item).await? {
                     continue;
                 }
                 work_items.push(work_item);
@@ -1929,53 +1922,6 @@ impl DynamoDBServiceImpl {
 
         Ok(work_done)
     }
-
-    fn org_info_key(access_key_id: &String, secret_access_key: &String) -> String {
-        format!("{}:{}", access_key_id, secret_access_key)
-    }
-
-    pub async fn create_org(&mut self, settings: &OrgSettings) -> Result<(), ServiceApiError> {
-        // Org settings are stored as-is.
-        // An OrgInfo is created using the credentials as a key for fast lookups.
-        let mut transaction = TransactWrite::new();
-        transaction = self.connector.private_create_org_settings_core(
-            transaction,
-            &MANAGEMENT_ORG_ID.to_string(),
-            &settings.org_id,
-            settings,
-        );
-        for creds in settings.creds.iter() {
-            transaction = self.connector.cached_create_org_creds_core(
-                transaction,
-                &mut self.org_cache,
-                &MANAGEMENT_ORG_ID.to_string(),
-                &Self::org_info_key(&creds.access_key_id, &creds.secret_access_key),
-                &settings.to_org_info(),
-            );
-        }
-        let result = self
-            .connector
-            .commit_conditional_transaction(transaction)
-            .await
-            .map_err(from_modyne)?;
-        assert!(result);
-        Ok(())
-    }
-
-    pub async fn lookup_org(
-        &mut self,
-        access_key_id: &String,
-        secret_access_key: &String,
-    ) -> Result<Option<OrgInfo>, ServiceApiError> {
-        self.connector
-            .describe_org_creds(
-                &mut self.org_cache,
-                &MANAGEMENT_ORG_ID.to_string(),
-                &Self::org_info_key(access_key_id, secret_access_key),
-            )
-            .await
-            .map_err(from_modyne)
-    }
 }
 
 #[async_trait::async_trait]
@@ -1985,7 +1931,10 @@ impl MetadataStore for DynamoDBServiceImpl {
         request: &CheckpointUpdateRequest,
     ) -> Result<(), ServiceApiError> {
         let management_org_id = MANAGEMENT_ORG_ID.to_string();
-        let key = Self::checkpoint_publication_request_key(&request.org_id, &request.table_name);
+        let key = Self::checkpoint_publication_request_key(
+            &DEFAULT_METADATA_NAMESPACE.to_string(),
+            &request.table_name,
+        );
 
         match self
             .connector
@@ -2019,23 +1968,20 @@ impl MetadataStore for DynamoDBServiceImpl {
 
     async fn get_latest_committed_checkpoint(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
-        DynamoDBServiceImpl::get_latest_committed_checkpoint(self, org_info, table_name, extension)
-            .await
+        DynamoDBServiceImpl::get_latest_committed_checkpoint(self, table_name, extension).await
     }
 
     async fn get_published_checkpoint_record(
         &mut self,
-        org_info: &OrgInfo,
         selector: &PublishedCheckpointSelector,
     ) -> Result<Option<PublishedCheckpointRecord>, ServiceApiError> {
         let checkpoint_id = match selector.role {
             PublishedCheckpointRole::Active => {
                 self.get_active_checkpoint_id(
-                    &org_info.org_id,
+                    &DEFAULT_METADATA_NAMESPACE.to_string(),
                     &selector.table_name,
                     &selector.extension,
                 )
@@ -2043,7 +1989,7 @@ impl MetadataStore for DynamoDBServiceImpl {
             }
             PublishedCheckpointRole::Target => {
                 self.get_target_checkpoint_id(
-                    &org_info.org_id,
+                    &DEFAULT_METADATA_NAMESPACE.to_string(),
                     &selector.table_name,
                     &selector.extension,
                 )
@@ -2060,19 +2006,30 @@ impl MetadataStore for DynamoDBServiceImpl {
 
     async fn get_checkpoint_cutover_state(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<CheckpointCutoverState, ServiceApiError> {
         let active_checkpoint_id = self
-            .get_active_checkpoint_id(&org_info.org_id, table_name, &extension)
+            .get_active_checkpoint_id(
+                &DEFAULT_METADATA_NAMESPACE.to_string(),
+                table_name,
+                &extension,
+            )
             .await?;
         let target_checkpoint_id = self
-            .get_target_checkpoint_id(&org_info.org_id, table_name, &extension)
+            .get_target_checkpoint_id(
+                &DEFAULT_METADATA_NAMESPACE.to_string(),
+                table_name,
+                &extension,
+            )
             .await?
             .or_else(|| active_checkpoint_id.clone());
         let membership_view = self
-            .get_cutover_membership_view(&org_info.org_id, table_name, &extension)
+            .get_cutover_membership_view(
+                &DEFAULT_METADATA_NAMESPACE.to_string(),
+                table_name,
+                &extension,
+            )
             .await?;
         Ok(CheckpointCutoverState {
             selector: PublishedCheckpointSelector::target(table_name.clone(), extension.clone()),
@@ -2081,8 +2038,12 @@ impl MetadataStore for DynamoDBServiceImpl {
                 .filter(|view| Some(view.target_checkpoint_id.clone()) == target_checkpoint_id)
                 .map(|view| view.epoch)
                 .unwrap_or(
-                    self.get_cutover_epoch(&org_info.org_id, table_name, &extension)
-                        .await?,
+                    self.get_cutover_epoch(
+                        &DEFAULT_METADATA_NAMESPACE.to_string(),
+                        table_name,
+                        &extension,
+                    )
+                    .await?,
                 ),
             active_checkpoint_id,
             target_checkpoint_id,
@@ -2091,18 +2052,17 @@ impl MetadataStore for DynamoDBServiceImpl {
 
     async fn heartbeat_serving_node(
         &mut self,
-        org_info: &OrgInfo,
         lease: &ServingNodeLease,
     ) -> Result<(), ServiceApiError> {
         let lease_name = Self::lease_key(&lease.node_id);
         let _ = self
             .connector
-            .delete_serving_node_lease(&org_info.org_id, &lease_name)
+            .delete_serving_node_lease(&DEFAULT_METADATA_NAMESPACE.to_string(), &lease_name)
             .await
             .map_err(from_modyne)?;
         let _ = self
             .connector
-            .create_serving_node_lease(&org_info.org_id, &lease_name, lease)
+            .create_serving_node_lease(&DEFAULT_METADATA_NAMESPACE.to_string(), &lease_name, lease)
             .await
             .map_err(from_modyne)?;
         Ok(())
@@ -2110,7 +2070,6 @@ impl MetadataStore for DynamoDBServiceImpl {
 
     async fn record_serving_node_activation(
         &mut self,
-        org_info: &OrgInfo,
         ack: &ServingNodeActivationAck,
     ) -> Result<(), ServiceApiError> {
         let activation_name = Self::activation_key(
@@ -2120,12 +2079,19 @@ impl MetadataStore for DynamoDBServiceImpl {
         );
         let _ = self
             .connector
-            .delete_serving_node_activation(&org_info.org_id, &activation_name)
+            .delete_serving_node_activation(
+                &DEFAULT_METADATA_NAMESPACE.to_string(),
+                &activation_name,
+            )
             .await
             .map_err(from_modyne)?;
         let _ = self
             .connector
-            .create_serving_node_activation(&org_info.org_id, &activation_name, ack)
+            .create_serving_node_activation(
+                &DEFAULT_METADATA_NAMESPACE.to_string(),
+                &activation_name,
+                ack,
+            )
             .await
             .map_err(from_modyne)?;
         Ok(())
@@ -2133,7 +2099,6 @@ impl MetadataStore for DynamoDBServiceImpl {
 
     async fn list_serving_node_activations(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Vec<ServingNodeActivationAck>, ServiceApiError> {
@@ -2141,7 +2106,7 @@ impl MetadataStore for DynamoDBServiceImpl {
         let activations = self
             .connector
             .fetch_entities(
-                &org_info.org_id,
+                &DEFAULT_METADATA_NAMESPACE.to_string(),
                 &"serving_node_activation".to_string(),
                 None,
             )
@@ -2154,7 +2119,10 @@ impl MetadataStore for DynamoDBServiceImpl {
             }
             if let Some(ack) = self
                 .connector
-                .describe_serving_node_activation(&org_info.org_id, &activation.entity_id)
+                .describe_serving_node_activation(
+                    &DEFAULT_METADATA_NAMESPACE.to_string(),
+                    &activation.entity_id,
+                )
                 .await
                 .map_err(from_modyne)?
             {
@@ -2166,19 +2134,17 @@ impl MetadataStore for DynamoDBServiceImpl {
 
     async fn get_checkpoint_metadata(
         &mut self,
-        org_info: &OrgInfo,
         checkpoint: &CheckpointDescriptor,
     ) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
-        DynamoDBServiceImpl::get_checkpoint(self, org_info, checkpoint).await
+        DynamoDBServiceImpl::get_checkpoint(self, checkpoint).await
     }
 
     async fn claim_extension_work_items(
         &mut self,
-        org_info: &OrgInfo,
         extension_type: &String,
     ) -> Result<Vec<ClaimedExtensionWorkItem>, ServiceApiError> {
         Ok(
-            DynamoDBServiceImpl::get_extension_work_items(self, org_info, extension_type)
+            DynamoDBServiceImpl::get_extension_work_items(self, extension_type)
                 .await?
                 .into_iter()
                 .map(|work_item| ClaimedExtensionWorkItem {
@@ -2191,26 +2157,22 @@ impl MetadataStore for DynamoDBServiceImpl {
 
     async fn claim_compaction_work_items(
         &mut self,
-        org_info: &OrgInfo,
     ) -> Result<Vec<ClaimedCompactionWorkItem>, ServiceApiError> {
-        Ok(
-            DynamoDBServiceImpl::get_compaction_work_items(self, org_info)
-                .await?
-                .into_iter()
-                .map(|(table_name, work_item)| ClaimedCompactionWorkItem {
-                    claim: MetadataClaimKind::Leased,
-                    table_name,
-                    work_item,
-                })
-                .collect(),
-        )
+        Ok(DynamoDBServiceImpl::get_compaction_work_items(self)
+            .await?
+            .into_iter()
+            .map(|(table_name, work_item)| ClaimedCompactionWorkItem {
+                claim: MetadataClaimKind::Leased,
+                table_name,
+                work_item,
+            })
+            .collect())
     }
 
     async fn claim_cleanup_work_items(
         &mut self,
-        org_info: &OrgInfo,
     ) -> Result<Vec<ClaimedCleanupWorkItem>, ServiceApiError> {
-        Ok(DynamoDBServiceImpl::get_cleanup_work_items(self, org_info)
+        Ok(DynamoDBServiceImpl::get_cleanup_work_items(self)
             .await?
             .into_iter()
             .map(|work_item| ClaimedCleanupWorkItem {
@@ -2229,20 +2191,13 @@ impl MetadataStore for DynamoDBServiceImpl {
 mod tests {
     use super::DynamoDBServiceImpl;
     use crate::data_contract::{
-        CreateTable, FileSetPayload, IcebergCommit, IcebergMetadata, LicenseType, OrgInfo,
-        SpeedboatCommit, SpeedboatCommitTableInfo,
+        CreateTable, FileSetPayload, IcebergCommit, IcebergMetadata, SpeedboatCommit,
+        SpeedboatCommitTableInfo,
     };
     use crate::metadata_store::MetadataStore;
     use crate::schema_massager::PowdrrSchema;
     use crate::test_api::{CompactionMode, TestProcessingMode};
     use std::collections::HashMap;
-
-    fn org_info() -> OrgInfo {
-        OrgInfo {
-            org_id: "fake_org_id".to_string(),
-            license_type: LicenseType::Free,
-        }
-    }
 
     fn iceberg_metadata(file_path: &str, snapshot_id: &str) -> IcebergMetadata {
         let schema = PowdrrSchema::minimal();
@@ -2276,28 +2231,23 @@ mod tests {
     #[tokio::test]
     async fn committed_target_and_active_frontiers_diverge_until_activation() {
         let mut state = DynamoDBServiceImpl::test(TestProcessingMode::default()).await;
-        let org_info = org_info();
         let table_name = "dynamodb-frontier-table".to_string();
 
         state
-            .create_table(
-                &org_info,
-                &CreateTable {
-                    name: table_name.clone(),
-                    tags: HashMap::new(),
-                    serving: None,
-                    support: None,
-                    dynamodb: None,
-                    mongodb: None,
-                    redis: None,
-                },
-            )
+            .create_table(&CreateTable {
+                name: table_name.clone(),
+                tags: HashMap::new(),
+                serving: None,
+                support: None,
+                dynamodb: None,
+                mongodb: None,
+                redis: None,
+            })
             .await
             .unwrap();
 
         state
             .iceberg_commit(
-                &org_info,
                 &table_name,
                 &IcebergCommit {
                     metadata: iceberg_metadata("s3://warehouse/table/data-0001.parquet", "1"),
@@ -2308,29 +2258,20 @@ mod tests {
             .await
             .unwrap();
 
-        let committed_checkpoint = MetadataStore::get_latest_committed_checkpoint(
-            &mut state,
-            &org_info,
-            &table_name,
-            None,
-        )
+        let committed_checkpoint =
+            MetadataStore::get_latest_committed_checkpoint(&mut state, &table_name, None)
         .await
         .unwrap()
         .unwrap();
 
         assert_eq!(
-            MetadataStore::get_latest_target_checkpoint(&mut state, &org_info, &table_name, None)
+            MetadataStore::get_latest_target_checkpoint(&mut state, &table_name, None)
                 .await
                 .unwrap(),
             Some(committed_checkpoint.clone())
         );
         assert_eq!(
-            MetadataStore::get_published_active_checkpoint(
-                &mut state,
-                &org_info,
-                &table_name,
-                None,
-            )
+            MetadataStore::get_published_active_checkpoint(&mut state, &table_name, None)
             .await
             .unwrap(),
             None
@@ -2340,68 +2281,57 @@ mod tests {
             .await
             .unwrap());
         assert_eq!(
-            MetadataStore::get_latest_target_checkpoint(&mut state, &org_info, &table_name, None)
+            MetadataStore::get_latest_target_checkpoint(&mut state, &table_name, None)
                 .await
                 .unwrap(),
             Some(committed_checkpoint.clone())
         );
         assert_eq!(
-            MetadataStore::get_published_active_checkpoint(
-                &mut state,
-                &org_info,
-                &table_name,
-                None,
-            )
+            MetadataStore::get_published_active_checkpoint(&mut state, &table_name, None)
             .await
             .unwrap(),
             None
         );
 
-        let cutover_state =
-            MetadataStore::get_checkpoint_cutover_state(&mut state, &org_info, &table_name, None)
-                .await
-                .unwrap();
+        let cutover_state = MetadataStore::get_checkpoint_cutover_state(&mut state, &table_name, None)
+            .await
+            .unwrap();
         assert_eq!(
             cutover_state.target_checkpoint_id,
             Some(committed_checkpoint)
         );
         assert_eq!(cutover_state.active_checkpoint_id, None);
     }
-
     #[tokio::test]
     async fn tracks_intermediate_checkpoints_while_compaction_is_pending() {
         let mut mode = TestProcessingMode::default();
         mode.compaction_mode = CompactionMode::Async(Some(1));
         let mut state = DynamoDBServiceImpl::test(mode).await;
-        let org_info = org_info();
         let table_name = "dynamodb-compaction-tracking-table".to_string();
 
         state
-            .create_table(
-                &org_info,
-                &CreateTable {
-                    name: table_name.clone(),
-                    tags: HashMap::new(),
-                    serving: None,
-                    support: None,
-                    dynamodb: None,
-                    mongodb: None,
-                    redis: None,
-                },
-            )
+            .create_table(&CreateTable {
+                name: table_name.clone(),
+                tags: HashMap::new(),
+                serving: None,
+                support: None,
+                dynamodb: None,
+                mongodb: None,
+                redis: None,
+            })
             .await
             .unwrap();
 
         state
-            .speedboat_commit(
-                &org_info,
-                &speedboat_commit(&table_name, "s3://warehouse/table/speedboat-0001.arrow"),
-            )
+            .speedboat_commit(&speedboat_commit(
+                &table_name,
+                "s3://warehouse/table/speedboat-0001.arrow",
+            ))
             .await
             .unwrap();
         assert!(state.update_all_checkpoints().await.unwrap());
 
-        let first_work_items = state.get_compaction_work_items(&org_info).await.unwrap();
+        let first_work_items = state.get_compaction_work_items().await.unwrap();
         assert_eq!(first_work_items.len(), 1);
         assert!(state.tables_with_pending_compaction.contains(&table_name));
         assert!(state
@@ -2411,38 +2341,34 @@ mod tests {
             .is_empty());
 
         state
-            .speedboat_commit(
-                &org_info,
-                &speedboat_commit(&table_name, "s3://warehouse/table/speedboat-0002.arrow"),
-            )
+            .speedboat_commit(&speedboat_commit(
+                &table_name,
+                "s3://warehouse/table/speedboat-0002.arrow",
+            ))
             .await
             .unwrap();
         assert!(state.update_all_checkpoints().await.unwrap());
         let second_checkpoint =
-            MetadataStore::get_latest_target_checkpoint(&mut state, &org_info, &table_name, None)
+            MetadataStore::get_latest_target_checkpoint(&mut state, &table_name, None)
                 .await
                 .unwrap()
                 .unwrap();
-        assert!(state
-            .get_compaction_work_items(&org_info)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(state.get_compaction_work_items().await.unwrap().is_empty());
         assert_eq!(
             state.not_compacted_checkpoint_ids.get(&table_name).unwrap(),
             &vec![second_checkpoint.clone()]
         );
 
         state
-            .speedboat_commit(
-                &org_info,
-                &speedboat_commit(&table_name, "s3://warehouse/table/speedboat-0003.arrow"),
-            )
+            .speedboat_commit(&speedboat_commit(
+                &table_name,
+                "s3://warehouse/table/speedboat-0003.arrow",
+            ))
             .await
             .unwrap();
         assert!(state.update_all_checkpoints().await.unwrap());
         let third_checkpoint =
-            MetadataStore::get_latest_target_checkpoint(&mut state, &org_info, &table_name, None)
+            MetadataStore::get_latest_target_checkpoint(&mut state, &table_name, None)
                 .await
                 .unwrap()
                 .unwrap();
@@ -2455,15 +2381,15 @@ mod tests {
         state.tables_with_pending_compaction.remove(&table_name);
 
         state
-            .speedboat_commit(
-                &org_info,
-                &speedboat_commit(&table_name, "s3://warehouse/table/speedboat-0004.arrow"),
-            )
+            .speedboat_commit(&speedboat_commit(
+                &table_name,
+                "s3://warehouse/table/speedboat-0004.arrow",
+            ))
             .await
             .unwrap();
         assert!(state.update_all_checkpoints().await.unwrap());
 
-        let second_work_items = state.get_compaction_work_items(&org_info).await.unwrap();
+        let second_work_items = state.get_compaction_work_items().await.unwrap();
         assert_eq!(second_work_items.len(), 1);
         assert_eq!(
             second_work_items[0].1.checkpoints_to_delete,

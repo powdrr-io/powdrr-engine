@@ -1,7 +1,7 @@
 use crate::data_contract::{
     CleanupWorkItem, CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody,
-    ExtensionCommit, ExtensionWorkItem, FileSetPayload, IcebergCommit, OrgInfo, OrgSettings,
-    SpeedboatCommit, TableMetadataCheckpoint,
+    ExtensionCommit, ExtensionWorkItem, FileSetPayload, IcebergCommit, SpeedboatCommit,
+    TableMetadataCheckpoint,
 };
 use crate::elastic_search_lifetime_policy::ILMPolicyDefinition;
 use crate::metadata_store::{CutoverMembershipView, ServingNodeActivationAck, ServingNodeLease};
@@ -632,8 +632,6 @@ powdrr_named_entity!(cutover_membership_view, CutoverMembershipView);
 powdrr_named_entity!(serving_node_lease, ServingNodeLease);
 powdrr_named_entity!(serving_node_activation, ServingNodeActivationAck);
 powdrr_named_entity!(latest, EntityVersionInfo);
-powdrr_named_entity!(org_settings, OrgSettings);
-
 // Note: only things where a given key can only ever have one value are cacheable
 powdrr_named_cached_entity!(compaction, CompactionCommit);
 powdrr_named_cached_entity!(checkpoint, TableMetadataCheckpoint);
@@ -643,7 +641,6 @@ powdrr_named_cached_entity!(extension_commit, ExtensionCommit);
 powdrr_named_cached_entity!(compaction_work_item, CompactionWorkItem);
 powdrr_named_cached_entity!(extension_work_item, ExtensionWorkItem);
 powdrr_named_cached_entity!(cleanup_work_item, CleanupWorkItem);
-powdrr_named_cached_entity!(org_creds, OrgInfo);
 
 powdrr_tracker!(extension_work_item_lease);
 powdrr_tracker!(compaction_work_item_lease);

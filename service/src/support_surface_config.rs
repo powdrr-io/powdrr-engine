@@ -3,9 +3,9 @@ use std::fs;
 use std::path::Path;
 
 use powdrr_service_lib::data_contract::{
-    CreateTable, DynamoDbTableConfig, OrgSettings, RedisTableConfig, ServingPattern,
-    ServingTableConfig, SupportDynamoDbTableConfig, SupportKeySchemaConfig,
-    SupportRedisTableConfig, SupportTableConfig, TableDescription,
+    CreateTable, DynamoDbTableConfig, RedisTableConfig, ServingPattern, ServingTableConfig,
+    SupportDynamoDbTableConfig, SupportKeySchemaConfig, SupportRedisTableConfig,
+    SupportTableConfig, TableDescription,
 };
 
 use crate::service_impl_provider::{ServiceImplError, SERVICE_IMPL};
@@ -17,7 +17,6 @@ const DYNAMODB_CONFIG_PATTERN_PREFIX: &str = "_dynamodb_";
 
 #[derive(serde::Deserialize, Debug, Clone)]
 pub(crate) struct SupportSurfaceBootstrapConfig {
-    pub(crate) org: OrgSettings,
     #[serde(default)]
     pub(crate) tables: Vec<SupportSurfaceBootstrapTable>,
 }
@@ -49,57 +48,13 @@ fn load_support_surface_config(path: &Path) -> Result<SupportSurfaceBootstrapCon
 async fn apply_support_surface_config(
     config: SupportSurfaceBootstrapConfig,
 ) -> Result<(), ServiceImplError> {
-    validate_org_settings(&config.org)?;
-    ensure_org_exists(&config.org).await?;
-
-    let org_info = config.org.to_org_info();
     for table in config.tables.iter() {
-        let existing = SERVICE_IMPL.describe_table(&org_info, &table.name).await?;
+        let existing = SERVICE_IMPL.describe_table(&table.name).await?;
         let create_table = build_create_table_request(existing.as_ref(), table)?;
-        SERVICE_IMPL
-            .upsert_table_metadata(&org_info, &create_table)
-            .await?;
+        SERVICE_IMPL.upsert_table_metadata(&create_table).await?;
     }
 
     Ok(())
-}
-
-fn validate_org_settings(settings: &OrgSettings) -> Result<(), ServiceImplError> {
-    if settings.org_id.trim().is_empty() {
-        return Err(ServiceImplError::new(
-            "Support surfaces config org_id must be a non-empty string".to_string(),
-        ));
-    }
-    if settings.creds.is_empty() {
-        return Err(ServiceImplError::new(
-            "Support surfaces config org must declare at least one credential".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-async fn ensure_org_exists(settings: &OrgSettings) -> Result<(), ServiceImplError> {
-    let first_creds = settings.creds.first().ok_or_else(|| {
-        ServiceImplError::new(
-            "Support surfaces config org must declare at least one credential".to_string(),
-        )
-    })?;
-
-    match SERVICE_IMPL
-        .lookup_org(&first_creds.access_key_id, &first_creds.secret_access_key)
-        .await?
-    {
-        Some(existing) => {
-            if existing.org_id != settings.org_id {
-                return Err(ServiceImplError::new(format!(
-                    "Support surfaces config credentials already map to org {} instead of {}",
-                    existing.org_id, settings.org_id
-                )));
-            }
-            Ok(())
-        }
-        None => SERVICE_IMPL.create_org(settings).await,
-    }
 }
 
 fn build_create_table_request(
@@ -464,12 +419,6 @@ mod tests {
         std::fs::write(
             file.path(),
             r#"
-org:
-  org_id: default
-  license_type: Free
-  creds:
-    - access_key_id: access
-      secret_access_key: secret
 tables:
   - name: sessions
     support:
@@ -483,7 +432,6 @@ tables:
         .unwrap();
 
         let config = load_support_surface_config(file.path()).unwrap();
-        assert_eq!(config.org.org_id, "default");
         assert_eq!(config.tables.len(), 1);
         assert_eq!(config.tables[0].name, "sessions");
         assert_eq!(

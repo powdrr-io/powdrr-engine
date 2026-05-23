@@ -1,7 +1,7 @@
 use crate::data_contract::{
     CleanupCommit, CleanupWorkItem, CompactionCommit, CompactionWorkItem, CreateIndexTemplateBody,
-    CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, OrgSettings, SpeedboatCommit,
-    TableDescription, TableMetadataCheckpoint,
+    CreateTable, ExtensionCommit, ExtensionWorkItem, IcebergCommit, SpeedboatCommit,
+    TEST_ACCESS_KEY, TEST_SECRET_KEY, TableDescription, TableMetadataCheckpoint,
 };
 use crate::distributed_cache::set_cache_mode;
 use crate::dynamodb_state_provider::DynamoDbStateProvider;
@@ -19,6 +19,22 @@ pub use powdrr_control_plane::service_api_error::ServiceApiError;
 use tokio::sync::{mpsc, oneshot};
 
 const DEFAULT_SERVABLE_EXTENSION: &str = "es";
+
+fn deployment_access_key_id() -> String {
+    std::env::var("POWDRR_ACCESS_KEY").unwrap_or_else(|_| TEST_ACCESS_KEY.to_string())
+}
+
+fn deployment_secret_access_key() -> String {
+    std::env::var("POWDRR_SECRET_KEY").unwrap_or_else(|_| TEST_SECRET_KEY.to_string())
+}
+
+fn lookup_deployment_secret_access_key(access_key_id: &str) -> Option<String> {
+    if access_key_id == deployment_access_key_id() {
+        Some(deployment_secret_access_key())
+    } else {
+        None
+    }
+}
 
 enum StateProviderActorMessage {
     SetMode {
@@ -57,10 +73,6 @@ enum StateProviderActorMessage {
     CreateTable {
         respond_to: oneshot::Sender<Result<bool, ServiceApiError>>,
         create_table: CreateTable,
-    },
-    CreateOrg {
-        respond_to: oneshot::Sender<Result<(), ServiceApiError>>,
-        settings: OrgSettings,
     },
     UpsertTableMetadata {
         respond_to: oneshot::Sender<Result<bool, ServiceApiError>>,
@@ -216,18 +228,10 @@ impl StateProviderActor {
                         let provider = DynamoDbStateProvider::test(mode.clone()).await;
                         self.state_provider = StateProvider::DynamoDb(provider);
                     }
-                    StateMode::Leaderless {
-                        server_address,
-                        access_key,
-                        secret_key,
-                    } => {
-                        self.state_provider =
-                            StateProvider::Leaderless(LeaderlessStateProvider::new(
-                                mode.clone(),
-                                server_address.clone(),
-                                access_key.clone(),
-                                secret_key.clone(),
-                            ))
+                    StateMode::Leaderless { server_address, .. } => {
+                        self.state_provider = StateProvider::Leaderless(
+                            LeaderlessStateProvider::new(mode.clone(), server_address.clone()),
+                        )
                     }
                 }
                 match &mode.storage_mode {
@@ -298,16 +302,6 @@ impl StateProviderActor {
                 };
                 handle_message_impl!(self, respond_to, create_table(&create_table));
             }
-            StateProviderActorMessage::CreateOrg {
-                respond_to,
-                settings,
-            } => {
-                if self.mode.is_read_only() {
-                    let _ = respond_to.send(Err(read_only_service_error("create_org")));
-                    return;
-                }
-                handle_message_impl!(self, respond_to, create_org(&settings));
-            }
             StateProviderActorMessage::UpsertTableMetadata {
                 respond_to,
                 create_table,
@@ -329,7 +323,9 @@ impl StateProviderActor {
                 respond_to,
                 access_key_id,
             } => {
-                handle_message_impl!(self, respond_to, lookup_secret_access_key(&access_key_id));
+                respond_to
+                    .send(Ok(lookup_deployment_secret_access_key(&access_key_id)))
+                    .unwrap();
             }
             StateProviderActorMessage::GetAllIcebergTables { respond_to } => {
                 handle_message_impl!(self, respond_to, get_all_iceberg_tables());
@@ -583,10 +579,6 @@ impl StateProvider {
         state_provider_func_impl!(self, create_table(create_table))
     }
 
-    pub async fn create_org(&mut self, settings: &OrgSettings) -> Result<(), ServiceApiError> {
-        state_provider_func_impl!(self, create_org(settings))
-    }
-
     #[allow(dead_code)]
     pub async fn upsert_table_metadata(
         &mut self,
@@ -600,13 +592,6 @@ impl StateProvider {
         name: &String,
     ) -> Result<Option<TableDescription>, ServiceApiError> {
         state_provider_func_impl!(self, describe_table(name))
-    }
-
-    pub async fn lookup_secret_access_key(
-        &mut self,
-        access_key_id: &String,
-    ) -> Result<Option<String>, ServiceApiError> {
-        state_provider_func_impl!(self, lookup_secret_access_key(access_key_id))
     }
 
     pub async fn add_alias(
@@ -879,10 +864,6 @@ impl StateProviderHandle {
 
     pub async fn create_table(&self, create_table: &CreateTable) -> Result<bool, ServiceApiError> {
         send_message!(self, CreateTable, create_table = create_table.clone())
-    }
-
-    pub async fn create_org(&self, settings: &OrgSettings) -> Result<(), ServiceApiError> {
-        send_message!(self, CreateOrg, settings = settings.clone())
     }
 
     pub async fn upsert_table_metadata(

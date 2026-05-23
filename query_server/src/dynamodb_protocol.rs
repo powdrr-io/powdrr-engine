@@ -5074,8 +5074,7 @@ mod tests {
     use gotham::mime;
     use gotham::test::TestServer;
     use powdrr_query_lib::data_contract::{
-        DynamoDbTableConfig, FileSetPayload, IcebergMetadata, LicenseType, OrgCreds, OrgSettings,
-        TableMetadataCheckpoint,
+        DynamoDbTableConfig, FileSetPayload, IcebergMetadata, TableMetadataCheckpoint,
     };
     use powdrr_query_lib::schema_massager::extract_powdrr_schema;
     use powdrr_query_runtime::serving_dataset::read_parquet_documents;
@@ -5813,27 +5812,14 @@ mod tests {
     }
 
     async fn ensure_test_org_registered() {
-        if STATE_PROVIDER
-            .lookup_secret_access_key(&"test".to_string())
-            .await
-            .unwrap()
-            .as_deref()
-            == Some("test")
-        {
-            return;
-        }
-        STATE_PROVIDER
-            .create_org(&OrgSettings {
-                org_id: "dynamodb_test_org".to_string(),
-                license_type: LicenseType::Free,
-                creds: vec![OrgCreds {
-                    access_key_id: "test".to_string(),
-                    secret_access_key: "test".to_string(),
-                    nickname: Some("dynamodb-test".to_string()),
-                }],
-            })
-            .await
-            .unwrap();
+        assert_eq!(
+            STATE_PROVIDER
+                .lookup_secret_access_key(&"test".to_string())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("test")
+        );
     }
 
     fn write_smoke_parquet(path: &std::path::Path) {

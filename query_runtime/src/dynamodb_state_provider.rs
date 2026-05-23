@@ -1,6 +1,4 @@
-use crate::data_contract::{
-    CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody, LicenseType, OrgInfo, OrgSettings,
-};
+use crate::data_contract::{CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody};
 use crate::data_contract::{
     CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit, ExtensionWorkItem,
     IcebergCommit, SpeedboatCommit, TableDescription, TableMetadataCheckpoint,
@@ -13,10 +11,11 @@ use crate::state_provider::ServiceApiError;
 use crate::test_api::TestProcessingMode;
 use powdrr_control_plane::ilm_policy::ILMPolicyDefinition;
 
+const DEFAULT_METADATA_NAMESPACE: &str = "__powdrr__";
+
 pub struct DynamoDbStateProvider {
     pub service_impl: DynamoDBServiceImpl,
     pub fetch_tracker: EphemeralFetchTracker,
-    pub fake_org_info: OrgInfo,
 }
 
 impl DynamoDbStateProvider {
@@ -25,10 +24,6 @@ impl DynamoDbStateProvider {
         DynamoDbStateProvider {
             service_impl: DynamoDBServiceImpl::new(mode.clone()),
             fetch_tracker: EphemeralFetchTracker::new(mode),
-            fake_org_info: OrgInfo {
-                org_id: "fake_org_id".to_string(),
-                license_type: LicenseType::Free,
-            },
         }
     }
 
@@ -36,18 +31,11 @@ impl DynamoDbStateProvider {
         DynamoDbStateProvider {
             service_impl: DynamoDBServiceImpl::test(mode.clone()).await,
             fetch_tracker: EphemeralFetchTracker::new(mode),
-            fake_org_info: OrgInfo {
-                org_id: "fake_org_id".to_string(),
-                license_type: LicenseType::Free,
-            },
         }
     }
 
     pub(crate) async fn add_checkpoint(&mut self, checkpoint: &TableMetadataCheckpoint) -> () {
-        self.service_impl
-            .add_checkpoint(&self.fake_org_info, checkpoint)
-            .await
-            .unwrap();
+        self.service_impl.add_checkpoint(checkpoint).await.unwrap();
     }
 
     #[allow(dead_code)]
@@ -56,7 +44,7 @@ impl DynamoDbStateProvider {
             .service_impl
             .connector
             .fetch_entities(
-                &self.fake_org_info.org_id,
+                &DEFAULT_METADATA_NAMESPACE.to_string(),
                 &"powdrr_table".to_string(),
                 None,
             )
@@ -73,38 +61,21 @@ impl DynamoDbStateProvider {
         &mut self,
         create_table: &CreateTable,
     ) -> Result<bool, ServiceApiError> {
-        self.service_impl
-            .create_table(&self.fake_org_info, create_table)
-            .await
+        self.service_impl.create_table(create_table).await
     }
 
     pub async fn upsert_table_metadata(
         &mut self,
         create_table: &CreateTable,
     ) -> Result<bool, ServiceApiError> {
-        self.service_impl
-            .upsert_table_metadata(&self.fake_org_info, create_table)
-            .await
-    }
-
-    pub async fn create_org(&mut self, settings: &OrgSettings) -> Result<(), ServiceApiError> {
-        self.service_impl.create_org(settings).await
-    }
-
-    pub async fn lookup_secret_access_key(
-        &mut self,
-        access_key: &String,
-    ) -> Result<Option<String>, ServiceApiError> {
-        self.service_impl.lookup_secret_access_key(access_key).await
+        self.service_impl.upsert_table_metadata(create_table).await
     }
 
     pub async fn describe_table(
         &mut self,
         name: &String,
     ) -> Result<Option<TableDescription>, ServiceApiError> {
-        self.service_impl
-            .describe_table(&self.fake_org_info, name)
-            .await
+        self.service_impl.describe_table(name).await
     }
 
     pub async fn add_alias(
@@ -112,9 +83,7 @@ impl DynamoDbStateProvider {
         table_name: &String,
         alias: &String,
     ) -> Result<bool, ServiceApiError> {
-        self.service_impl
-            .add_alias(&self.fake_org_info, table_name, alias)
-            .await
+        self.service_impl.add_alias(table_name, alias).await
     }
 
     pub async fn remove_alias(
@@ -122,9 +91,7 @@ impl DynamoDbStateProvider {
         _table_name: &String,
         alias: &String,
     ) -> Result<bool, ServiceApiError> {
-        self.service_impl
-            .remove_alias(&self.fake_org_info, _table_name, alias)
-            .await
+        self.service_impl.remove_alias(_table_name, alias).await
     }
 
     pub async fn create_table_template(
@@ -133,7 +100,7 @@ impl DynamoDbStateProvider {
         template: &CreateIndexTemplateBody,
     ) -> Result<bool, ServiceApiError> {
         self.service_impl
-            .create_table_template(&self.fake_org_info, name, template)
+            .create_table_template(name, template)
             .await
     }
 
@@ -141,9 +108,7 @@ impl DynamoDbStateProvider {
         &mut self,
         name: &String,
     ) -> Result<Option<CreateIndexTemplateBody>, ServiceApiError> {
-        self.service_impl
-            .describe_table_template(&self.fake_org_info, name)
-            .await
+        self.service_impl.describe_table_template(name).await
     }
 
     pub async fn create_pipeline(
@@ -151,18 +116,14 @@ impl DynamoDbStateProvider {
         name: &String,
         pipeline: &PipelineDefinition,
     ) -> Result<bool, ServiceApiError> {
-        self.service_impl
-            .create_pipeline(&self.fake_org_info, name, pipeline)
-            .await
+        self.service_impl.create_pipeline(name, pipeline).await
     }
 
     pub async fn describe_pipeline(
         &mut self,
         name: &String,
     ) -> Result<Option<PipelineDefinition>, ServiceApiError> {
-        self.service_impl
-            .describe_pipeline(&self.fake_org_info, name)
-            .await
+        self.service_impl.describe_pipeline(name).await
     }
 
     pub async fn create_lifetime_policy(
@@ -170,29 +131,21 @@ impl DynamoDbStateProvider {
         name: &String,
         policy: &ILMPolicyDefinition,
     ) -> Result<bool, ServiceApiError> {
-        self.service_impl
-            .create_lifetime_policy(&self.fake_org_info, name, policy)
-            .await
+        self.service_impl.create_lifetime_policy(name, policy).await
     }
 
     pub async fn describe_lifetime_policy(
         &mut self,
         name: &String,
     ) -> Result<Option<ILMPolicyDefinition>, ServiceApiError> {
-        self.service_impl
-            .describe_lifetime_policy(&self.fake_org_info, name)
-            .await
+        self.service_impl.describe_lifetime_policy(name).await
     }
 
     pub async fn speedboat_commit(
         &mut self,
         commit: &SpeedboatCommit,
     ) -> Result<bool, ServiceApiError> {
-        match self
-            .service_impl
-            .speedboat_commit(&self.fake_org_info, commit)
-            .await
-        {
+        match self.service_impl.speedboat_commit(commit).await {
             Ok(val) => {
                 if val {
                     for table_info in commit.type_files.iter() {
@@ -223,7 +176,7 @@ impl DynamoDbStateProvider {
     ) -> Result<bool, ServiceApiError> {
         match self
             .service_impl
-            .iceberg_commit(&self.fake_org_info, table_name, iceberg_commit)
+            .iceberg_commit(table_name, iceberg_commit)
             .await
         {
             Ok(val) => {
@@ -246,11 +199,7 @@ impl DynamoDbStateProvider {
         table_name: &String,
         commit: &ExtensionCommit,
     ) -> Result<bool, ServiceApiError> {
-        match self
-            .service_impl
-            .extension_commit(&self.fake_org_info, table_name, commit)
-            .await
-        {
+        match self.service_impl.extension_commit(table_name, commit).await {
             Ok(val) => {
                 if val {
                     let checkpoint_id = self
@@ -277,7 +226,7 @@ impl DynamoDbStateProvider {
     ) -> Result<bool, ServiceApiError> {
         match self
             .service_impl
-            .compaction_commit(&self.fake_org_info, table_name, commit)
+            .compaction_commit(table_name, commit)
             .await
         {
             Ok(val) => {
@@ -299,9 +248,7 @@ impl DynamoDbStateProvider {
         &mut self,
         commit: &CleanupCommit,
     ) -> Result<bool, ServiceApiError> {
-        self.service_impl
-            .cleanup_commit(&self.fake_org_info, commit)
-            .await
+        self.service_impl.cleanup_commit(commit).await
     }
 
     pub async fn get_latest_committed_checkpoint(
@@ -310,7 +257,7 @@ impl DynamoDbStateProvider {
         extensions: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
         self.service_impl
-            .get_latest_committed_checkpoint(&self.fake_org_info, table_name, extensions)
+            .get_latest_committed_checkpoint(table_name, extensions)
             .await
     }
 
@@ -320,7 +267,7 @@ impl DynamoDbStateProvider {
         extensions: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
         self.service_impl
-            .get_published_active_checkpoint(&self.fake_org_info, table_name, extensions)
+            .get_published_active_checkpoint(table_name, extensions)
             .await
     }
 
@@ -328,9 +275,7 @@ impl DynamoDbStateProvider {
         &mut self,
         snapshot: &CheckpointDescriptor,
     ) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
-        self.service_impl
-            .get_checkpoint(&self.fake_org_info, snapshot)
-            .await
+        self.service_impl.get_checkpoint(snapshot).await
     }
 
     pub async fn get_extension_work_items(
@@ -338,24 +283,20 @@ impl DynamoDbStateProvider {
         extension_type: &String,
     ) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {
         self.service_impl
-            .get_extension_work_items(&self.fake_org_info, extension_type)
+            .get_extension_work_items(extension_type)
             .await
     }
 
     pub async fn get_compaction_work_items(
         &mut self,
     ) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
-        self.service_impl
-            .get_compaction_work_items(&self.fake_org_info)
-            .await
+        self.service_impl.get_compaction_work_items().await
     }
 
     pub async fn get_cleanup_work_items(
         &mut self,
     ) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
-        self.service_impl
-            .get_cleanup_work_items(&self.fake_org_info)
-            .await
+        self.service_impl.get_cleanup_work_items().await
     }
 
     pub(crate) async fn get_latest_target_checkpoint(
@@ -364,7 +305,7 @@ impl DynamoDbStateProvider {
         extension: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
         self.service_impl
-            .get_latest_committed_checkpoint(&self.fake_org_info, table_name, extension)
+            .get_latest_committed_checkpoint(table_name, extension)
             .await
     }
 

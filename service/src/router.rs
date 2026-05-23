@@ -125,11 +125,6 @@ pub fn router(include_test_apis: bool) -> Router {
                     .to(v1_handlers::get_cleanup_work_items);
             })
         });
-        route.scope("/management", |route| {
-            route.scope("/v1", |route| {
-                route.post("/create_org").to(v1_handlers::create_org);
-            })
-        });
         route.scope("/_raft", |route| {
             route.scope("/v1", |route| {
                 route.post("/append").to(raft_handlers::append_entries);
