@@ -22,7 +22,7 @@ use futures_util::future;
 use gotham::bind_server;
 use powdrr_query_lib::data_contract::{
     DynamoDbGlobalSecondaryIndexConfig, DynamoDbLocalSecondaryIndexConfig, DynamoDbTableConfig,
-    FileSetPayload, IcebergMetadata, LicenseType, OrgCreds, OrgSettings, TableMetadataCheckpoint,
+    FileSetPayload, IcebergMetadata, TableMetadataCheckpoint,
 };
 use powdrr_query_runtime::serving_dataset::read_parquet_documents;
 use powdrr_query_runtime::state_provider::STATE_PROVIDER;
@@ -1185,28 +1185,14 @@ async fn configure_powdrr_testing_mode(base_url: &str) {
 }
 
 async fn register_powdrr_test_org() {
-    let access_key = "test".to_string();
-    if STATE_PROVIDER
-        .lookup_secret_access_key(&access_key)
-        .await
-        .unwrap()
-        .as_deref()
-        == Some("test")
-    {
-        return;
-    }
-    STATE_PROVIDER
-        .create_org(&OrgSettings {
-            org_id: "dynamodb_test_org".to_string(),
-            license_type: LicenseType::Free,
-            creds: vec![OrgCreds {
-                access_key_id: access_key,
-                secret_access_key: "test".to_string(),
-                nickname: Some("dynamodb-test".to_string()),
-            }],
-        })
-        .await
-        .unwrap();
+    assert_eq!(
+        STATE_PROVIDER
+            .lookup_secret_access_key(&"test".to_string())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("test")
+    );
 }
 
 async fn checkpoint_from_parquet(table_name: &str, parquet_path: &Path) -> TableMetadataCheckpoint {

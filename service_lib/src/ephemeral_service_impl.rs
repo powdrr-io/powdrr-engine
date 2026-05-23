@@ -1,5 +1,6 @@
 use crate::data_contract::{
-    CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody, IcebergMetadata, OrgInfo, OrgSettings,
+    CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody, DEFAULT_METADATA_NAMESPACE,
+    IcebergMetadata,
 };
 use crate::data_contract::{
     CompactionCommit, CompactionWorkItem, CreateTable, DeletesMetadata, ExtensionCommit,
@@ -88,8 +89,6 @@ pub struct EphemeralServiceSnapshot {
     checkpoints: HashMap<String, TableMetadataCheckpoint>,
     checkpoints_needing_extension_work: HashMap<String, Vec<String>>,
     recent_file_extension_metadata: HashMap<String, Vec<ExtensionFile>>,
-    org_settings_by_id: HashMap<String, OrgSettings>,
-    org_lookup: HashMap<String, OrgInfo>,
 }
 
 pub struct EphemeralServiceImpl {
@@ -116,8 +115,6 @@ pub struct EphemeralServiceImpl {
     checkpoints: HashMap<String, TableMetadataCheckpoint>,
     checkpoints_needing_extension_work: HashMap<String, Vec<String>>,
     recent_file_extension_metadata: HashMap<String, Vec<ExtensionFile>>,
-    org_settings_by_id: HashMap<String, OrgSettings>,
-    org_lookup: HashMap<String, OrgInfo>,
 }
 
 impl EphemeralServiceImpl {
@@ -155,8 +152,6 @@ impl EphemeralServiceImpl {
             checkpoints: snapshot.checkpoints,
             checkpoints_needing_extension_work: snapshot.checkpoints_needing_extension_work,
             recent_file_extension_metadata: snapshot.recent_file_extension_metadata,
-            org_settings_by_id: snapshot.org_settings_by_id,
-            org_lookup: snapshot.org_lookup,
         }
     }
 
@@ -183,13 +178,7 @@ impl EphemeralServiceImpl {
             checkpoints: self.checkpoints.clone(),
             checkpoints_needing_extension_work: self.checkpoints_needing_extension_work.clone(),
             recent_file_extension_metadata: self.recent_file_extension_metadata.clone(),
-            org_settings_by_id: self.org_settings_by_id.clone(),
-            org_lookup: self.org_lookup.clone(),
         }
-    }
-
-    fn org_info_key(access_key_id: &String, secret_access_key: &String) -> String {
-        format!("{}:{}", access_key_id, secret_access_key)
     }
 
     fn role_key(role: PublishedCheckpointRole) -> &'static str {
@@ -662,7 +651,6 @@ impl EphemeralServiceImpl {
 
     pub async fn add_checkpoint(
         &mut self,
-        org_info: &OrgInfo,
         metadata: &TableMetadataCheckpoint,
     ) -> Result<(), ServiceApiError> {
         // To make testing a little easier, we'll just magic up a table as necessary
@@ -712,7 +700,10 @@ impl EphemeralServiceImpl {
                     .map_or(&FileSetPayload::new(), |m| &m.files),
             )
         }
-        self.queue_publication_request(&org_info.org_id, &metadata.table_name);
+        self.queue_publication_request(
+            &DEFAULT_METADATA_NAMESPACE.to_string(),
+            &metadata.table_name,
+        );
         Ok(())
     }
 
@@ -1142,7 +1133,6 @@ impl EphemeralServiceImpl {
 
     pub async fn create_table(
         &mut self,
-        _org_info: &OrgInfo,
         create_table: &CreateTable,
     ) -> Result<bool, ServiceApiError> {
         match self.tables.get(&create_table.name) {
@@ -1166,7 +1156,6 @@ impl EphemeralServiceImpl {
 
     pub async fn describe_table(
         &mut self,
-        _org_info: &OrgInfo,
         name: &String,
     ) -> Result<Option<TableDescription>, ServiceApiError> {
         let final_name = self.table_aliases.get(name).unwrap_or_else(|| name);
@@ -1178,7 +1167,6 @@ impl EphemeralServiceImpl {
 
     pub async fn add_alias(
         &mut self,
-        _org_info: &OrgInfo,
         table_name: &String,
         alias: &String,
     ) -> Result<bool, ServiceApiError> {
@@ -1189,7 +1177,6 @@ impl EphemeralServiceImpl {
 
     pub async fn remove_alias(
         &mut self,
-        _org_info: &OrgInfo,
         _table_name: &String,
         alias: &String,
     ) -> Result<bool, ServiceApiError> {
@@ -1200,7 +1187,6 @@ impl EphemeralServiceImpl {
 
     pub async fn create_table_template(
         &mut self,
-        _org_info: &OrgInfo,
         name: &String,
         template: &CreateIndexTemplateBody,
     ) -> Result<bool, ServiceApiError> {
@@ -1219,7 +1205,6 @@ impl EphemeralServiceImpl {
 
     pub async fn describe_table_template(
         &mut self,
-        _org_info: &OrgInfo,
         name: &String,
     ) -> Result<Option<CreateIndexTemplateBody>, ServiceApiError> {
         match self.table_templates.get(name) {
@@ -1230,7 +1215,6 @@ impl EphemeralServiceImpl {
 
     pub async fn create_pipeline(
         &mut self,
-        _org_info: &OrgInfo,
         name: &String,
         pipeline: &PipelineDefinition,
     ) -> Result<bool, ServiceApiError> {
@@ -1245,7 +1229,6 @@ impl EphemeralServiceImpl {
 
     pub async fn describe_pipeline(
         &mut self,
-        _org_info: &OrgInfo,
         name: &String,
     ) -> Result<Option<PipelineDefinition>, ServiceApiError> {
         match self.pipelines.get(name) {
@@ -1256,7 +1239,6 @@ impl EphemeralServiceImpl {
 
     pub async fn create_lifetime_policy(
         &mut self,
-        _org_info: &OrgInfo,
         name: &String,
         policy: &ILMPolicyDefinition,
     ) -> Result<bool, ServiceApiError> {
@@ -1271,7 +1253,6 @@ impl EphemeralServiceImpl {
 
     pub async fn describe_lifetime_policy(
         &mut self,
-        _org_info: &OrgInfo,
         name: &String,
     ) -> Result<Option<ILMPolicyDefinition>, ServiceApiError> {
         match self.lifetime_policies.get(name) {
@@ -1282,7 +1263,6 @@ impl EphemeralServiceImpl {
 
     pub async fn speedboat_commit(
         &mut self,
-        org_info: &OrgInfo,
         commit: &SpeedboatCommit,
     ) -> Result<bool, ServiceApiError> {
         let mut touched_tables = vec![];
@@ -1305,14 +1285,13 @@ impl EphemeralServiceImpl {
             }
         }
         for table_name in touched_tables.iter() {
-            self.queue_publication_request(&org_info.org_id, table_name);
+            self.queue_publication_request(&DEFAULT_METADATA_NAMESPACE.to_string(), table_name);
         }
         Ok(true)
     }
 
     pub async fn iceberg_commit(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         iceberg_commit: &IcebergCommit,
     ) -> Result<bool, ServiceApiError> {
@@ -1383,13 +1362,12 @@ impl EphemeralServiceImpl {
             });
         }
 
-        self.queue_publication_request(&org_info.org_id, table_name);
+        self.queue_publication_request(&DEFAULT_METADATA_NAMESPACE.to_string(), table_name);
         Ok(true)
     }
 
     pub async fn extension_commit(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         commit: &ExtensionCommit,
     ) -> Result<bool, ServiceApiError> {
@@ -1424,13 +1402,12 @@ impl EphemeralServiceImpl {
                 self.set_latest_committed_checkpoint(table_name, Some("es".to_string()), max_id);
             }
         };
-        self.queue_publication_request(&org_info.org_id, table_name);
+        self.queue_publication_request(&DEFAULT_METADATA_NAMESPACE.to_string(), table_name);
         Ok(true)
     }
 
     pub async fn compaction_commit(
         &mut self,
-        _org_info: &OrgInfo,
         table_name: &String,
         commit: &CompactionCommit,
     ) -> Result<bool, ServiceApiError> {
@@ -1445,7 +1422,6 @@ impl EphemeralServiceImpl {
 
     pub async fn cleanup_commit(
         &mut self,
-        _org_info: &OrgInfo,
         commit: &CleanupCommit,
     ) -> Result<bool, ServiceApiError> {
         self.cleanup_work_items
@@ -1455,7 +1431,6 @@ impl EphemeralServiceImpl {
 
     pub async fn get_latest_committed_checkpoint(
         &mut self,
-        _org_info: &OrgInfo,
         table_name: &String,
         extensions: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
@@ -1464,7 +1439,6 @@ impl EphemeralServiceImpl {
 
     pub async fn get_published_active_checkpoint(
         &mut self,
-        _org_info: &OrgInfo,
         table_name: &String,
         extensions: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
@@ -1477,7 +1451,6 @@ impl EphemeralServiceImpl {
 
     pub async fn get_checkpoint(
         &mut self,
-        _org_info: &OrgInfo,
         snapshot: &CheckpointDescriptor,
     ) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
         match self.get_checkpoint_sync(&snapshot.table_name, &snapshot.checkpoint_id) {
@@ -1488,7 +1461,6 @@ impl EphemeralServiceImpl {
 
     pub async fn get_extension_work_items(
         &mut self,
-        _org_info: &OrgInfo,
         extension_type: &String,
     ) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {
         if extension_type == "es" {
@@ -1516,7 +1488,6 @@ impl EphemeralServiceImpl {
 
     pub async fn get_compaction_work_items(
         &mut self,
-        _org_info: &OrgInfo,
     ) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
         let mut work_items = vec![];
         for (table_name, compaction_tracker) in self.compaction_work_items.iter_mut() {
@@ -1531,7 +1502,6 @@ impl EphemeralServiceImpl {
 
     pub async fn get_cleanup_work_items(
         &mut self,
-        _org_info: &OrgInfo,
     ) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
         let mut work_items = vec![];
         let ready_indexes: Vec<usize> = self
@@ -1555,7 +1525,7 @@ impl EphemeralServiceImpl {
     }
 
     fn queue_publication_request(&mut self, org_id: &String, table_name: &String) {
-        let request = CheckpointUpdateRequest::new(org_id.clone(), table_name.clone());
+        let request = CheckpointUpdateRequest::new(table_name.clone());
         self.checkpoint_publication_requests.insert(
             Self::checkpoint_publication_request_key(org_id, table_name),
             request,
@@ -1697,37 +1667,15 @@ impl EphemeralServiceImpl {
 
             if !self.checkpoint_publication_still_pending(&request.table_name) {
                 self.checkpoint_publication_requests.remove(
-                    &Self::checkpoint_publication_request_key(&request.org_id, &request.table_name),
+                    &Self::checkpoint_publication_request_key(
+                        &DEFAULT_METADATA_NAMESPACE.to_string(),
+                        &request.table_name,
+                    ),
                 );
             }
         }
 
         Ok(work_done)
-    }
-
-    pub async fn create_org(&mut self, _settings: &OrgSettings) -> Result<(), ServiceApiError> {
-        let settings = _settings.clone();
-        let org_info = settings.to_org_info();
-        self.org_settings_by_id
-            .insert(settings.org_id.clone(), settings.clone());
-        for creds in settings.creds.iter() {
-            self.org_lookup.insert(
-                Self::org_info_key(&creds.access_key_id, &creds.secret_access_key),
-                org_info.clone(),
-            );
-        }
-        Ok(())
-    }
-
-    pub async fn lookup_org(
-        &mut self,
-        access_key: &String,
-        secret_key: &String,
-    ) -> Result<Option<OrgInfo>, ServiceApiError> {
-        Ok(self
-            .org_lookup
-            .get(&Self::org_info_key(access_key, secret_key))
-            .cloned())
     }
 }
 
@@ -1737,23 +1685,23 @@ impl MetadataStore for EphemeralServiceImpl {
         &mut self,
         request: &CheckpointUpdateRequest,
     ) -> Result<(), ServiceApiError> {
-        self.queue_publication_request(&request.org_id, &request.table_name);
+        self.queue_publication_request(
+            &DEFAULT_METADATA_NAMESPACE.to_string(),
+            &request.table_name,
+        );
         Ok(())
     }
 
     async fn get_latest_committed_checkpoint(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
-        EphemeralServiceImpl::get_latest_committed_checkpoint(self, org_info, table_name, extension)
-            .await
+        EphemeralServiceImpl::get_latest_committed_checkpoint(self, table_name, extension).await
     }
 
     async fn get_published_checkpoint_record(
         &mut self,
-        _org_info: &OrgInfo,
         selector: &PublishedCheckpointSelector,
     ) -> Result<Option<PublishedCheckpointRecord>, ServiceApiError> {
         Ok(self
@@ -1791,7 +1739,6 @@ impl MetadataStore for EphemeralServiceImpl {
 
     async fn get_checkpoint_cutover_state(
         &mut self,
-        _org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<CheckpointCutoverState, ServiceApiError> {
@@ -1833,7 +1780,6 @@ impl MetadataStore for EphemeralServiceImpl {
 
     async fn heartbeat_serving_node(
         &mut self,
-        _org_info: &OrgInfo,
         lease: &ServingNodeLease,
     ) -> Result<(), ServiceApiError> {
         self.prune_expired_serving_node_leases();
@@ -1844,7 +1790,6 @@ impl MetadataStore for EphemeralServiceImpl {
 
     async fn record_serving_node_activation(
         &mut self,
-        _org_info: &OrgInfo,
         ack: &ServingNodeActivationAck,
     ) -> Result<(), ServiceApiError> {
         let key = Self::selector_group_key(&ack.selector.table_name, &ack.selector.extension);
@@ -1857,7 +1802,6 @@ impl MetadataStore for EphemeralServiceImpl {
 
     async fn list_serving_node_activations(
         &mut self,
-        _org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Vec<ServingNodeActivationAck>, ServiceApiError> {
@@ -1870,7 +1814,6 @@ impl MetadataStore for EphemeralServiceImpl {
 
     async fn record_artifact_readiness(
         &mut self,
-        _org_info: &OrgInfo,
         ack: &ArtifactReadinessAck,
     ) -> Result<(), ServiceApiError> {
         let key = Self::selector_group_key(&ack.selector.table_name, &ack.selector.extension);
@@ -1883,7 +1826,6 @@ impl MetadataStore for EphemeralServiceImpl {
 
     async fn list_artifact_readiness(
         &mut self,
-        _org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Vec<ArtifactReadinessAck>, ServiceApiError> {
@@ -1896,19 +1838,17 @@ impl MetadataStore for EphemeralServiceImpl {
 
     async fn get_checkpoint_metadata(
         &mut self,
-        org_info: &OrgInfo,
         checkpoint: &CheckpointDescriptor,
     ) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
-        EphemeralServiceImpl::get_checkpoint(self, org_info, checkpoint).await
+        EphemeralServiceImpl::get_checkpoint(self, checkpoint).await
     }
 
     async fn claim_extension_work_items(
         &mut self,
-        org_info: &OrgInfo,
         extension_type: &String,
     ) -> Result<Vec<ClaimedExtensionWorkItem>, ServiceApiError> {
         Ok(
-            EphemeralServiceImpl::get_extension_work_items(self, org_info, extension_type)
+            EphemeralServiceImpl::get_extension_work_items(self, extension_type)
                 .await?
                 .into_iter()
                 .map(|work_item| ClaimedExtensionWorkItem {
@@ -1921,26 +1861,22 @@ impl MetadataStore for EphemeralServiceImpl {
 
     async fn claim_compaction_work_items(
         &mut self,
-        org_info: &OrgInfo,
     ) -> Result<Vec<ClaimedCompactionWorkItem>, ServiceApiError> {
-        Ok(
-            EphemeralServiceImpl::get_compaction_work_items(self, org_info)
-                .await?
-                .into_iter()
-                .map(|(table_name, work_item)| ClaimedCompactionWorkItem {
-                    claim: MetadataClaimKind::Leased,
-                    table_name,
-                    work_item,
-                })
-                .collect(),
-        )
+        Ok(EphemeralServiceImpl::get_compaction_work_items(self)
+            .await?
+            .into_iter()
+            .map(|(table_name, work_item)| ClaimedCompactionWorkItem {
+                claim: MetadataClaimKind::Leased,
+                table_name,
+                work_item,
+            })
+            .collect())
     }
 
     async fn claim_cleanup_work_items(
         &mut self,
-        org_info: &OrgInfo,
     ) -> Result<Vec<ClaimedCleanupWorkItem>, ServiceApiError> {
-        Ok(EphemeralServiceImpl::get_cleanup_work_items(self, org_info)
+        Ok(EphemeralServiceImpl::get_cleanup_work_items(self)
             .await?
             .into_iter()
             .map(|work_item| ClaimedCleanupWorkItem {
@@ -1958,10 +1894,7 @@ impl MetadataStore for EphemeralServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::EphemeralServiceImpl;
-    use crate::data_contract::{
-        CreateTable, FileSetPayload, IcebergCommit, IcebergMetadata, LicenseType, OrgCreds,
-        OrgInfo, OrgSettings,
-    };
+    use crate::data_contract::{CreateTable, FileSetPayload, IcebergCommit, IcebergMetadata};
     use crate::metadata_store::{
         CutoverEpoch, MetadataStore, ServingNodeActivationAck, ServingNodeLease,
     };
@@ -1972,268 +1905,25 @@ mod tests {
     use crate::test_api::TestProcessingMode;
     use std::collections::HashMap;
 
-    fn org_info() -> OrgInfo {
-        OrgInfo {
-            org_id: "org-1".to_string(),
-            license_type: LicenseType::Pro,
-        }
-    }
-
-    fn iceberg_metadata(file_path: &str, snapshot_id: &str) -> IcebergMetadata {
-        let schema = PowdrrSchema::minimal();
-        IcebergMetadata {
-            table_schema: schema.clone(),
-            snapshot_id: Some(snapshot_id.to_string()),
-            files: FileSetPayload::single(file_path.to_string(), 128, schema),
-            partition_spec: vec![],
-            sort_order: vec![],
-            column_names: vec![],
-            column_stats: vec![],
-            access_artifacts: vec![],
-            file_stats: vec![],
-        }
-    }
-
-    async fn record_default_readiness(
-        state: &mut EphemeralServiceImpl,
-        org_info: &OrgInfo,
-        table_name: &String,
-        epoch: CutoverEpoch,
-        checkpoint_id: &String,
-    ) {
-        for artifact_class in [
-            ArtifactClass::SnapshotLookupMmap,
-            ArtifactClass::SnapshotExactLookupMmap,
-        ] {
-            MetadataStore::record_artifact_readiness(
-                state,
-                org_info,
-                &ArtifactReadinessAck {
-                    selector: crate::metadata_store::PublishedCheckpointSelector::target(
-                        table_name.clone(),
-                        None,
-                    ),
-                    checkpoint_id: checkpoint_id.clone(),
-                    epoch,
-                    artifact_class,
-                    producer_id: "warm-cache".to_string(),
-                    ready_at_ms: chrono::Utc::now().timestamp_millis(),
-                },
-            )
-            .await
-            .unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn org_lookup_survives_snapshot_round_trip() {
-        let mut state = EphemeralServiceImpl::new(TestProcessingMode::default());
-        let settings = OrgSettings {
-            org_id: "org-1".to_string(),
-            license_type: LicenseType::Pro,
-            creds: vec![OrgCreds {
-                access_key_id: "access".to_string(),
-                secret_access_key: "secret".to_string(),
-                nickname: Some("primary".to_string()),
-            }],
-        };
-
-        state.create_org(&settings).await.unwrap();
-        let snapshot = state.snapshot_state();
-        let mut restored =
-            EphemeralServiceImpl::from_snapshot(TestProcessingMode::default(), snapshot);
-
-        let org = restored
-            .lookup_org(&"access".to_string(), &"secret".to_string())
-            .await
-            .unwrap();
-
-        assert_eq!(org.unwrap().org_id, "org-1".to_string());
-    }
-
-    #[tokio::test]
-    async fn committed_target_and_active_frontiers_diverge_until_activation() {
-        let mut state = EphemeralServiceImpl::new(TestProcessingMode::default());
-        let org_info = org_info();
-        let table_name = "ephemeral-frontier-table".to_string();
-
-        state
-            .create_table(
-                &org_info,
-                &CreateTable {
-                    name: table_name.clone(),
-                    tags: HashMap::new(),
-                    serving: None,
-                    dynamodb: None,
-                    mongodb: None,
-                    redis: None,
-                },
-            )
-            .await
-            .unwrap();
-
-        state
-            .iceberg_commit(
-                &org_info,
-                &table_name,
-                &IcebergCommit {
-                    metadata: iceberg_metadata("s3://warehouse/table/data-0001.parquet", "1"),
-                    deletes_table_info: None,
-                    compactions: vec![],
-                },
-            )
-            .await
-            .unwrap();
-
-        let committed_checkpoint = MetadataStore::get_latest_committed_checkpoint(
-            &mut state,
-            &org_info,
-            &table_name,
-            None,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(
-            MetadataStore::get_latest_target_checkpoint(&mut state, &org_info, &table_name, None)
-                .await
-                .unwrap(),
-            Some(committed_checkpoint.clone())
-        );
-        assert_eq!(
-            MetadataStore::get_published_active_checkpoint(
-                &mut state,
-                &org_info,
-                &table_name,
-                None,
-            )
-            .await
-            .unwrap(),
-            None
-        );
-
-        assert!(
-            MetadataStore::advance_published_checkpoints(&mut state)
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            MetadataStore::get_latest_target_checkpoint(&mut state, &org_info, &table_name, None)
-                .await
-                .unwrap(),
-            Some(committed_checkpoint.clone())
-        );
-        assert_eq!(
-            MetadataStore::get_published_active_checkpoint(
-                &mut state,
-                &org_info,
-                &table_name,
-                None,
-            )
-            .await
-            .unwrap(),
-            None
-        );
-
-        let cutover_state =
-            MetadataStore::get_checkpoint_cutover_state(&mut state, &org_info, &table_name, None)
-                .await
-                .unwrap();
-        let observed_at_ms = chrono::Utc::now().timestamp_millis();
-        MetadataStore::heartbeat_serving_node(
-            &mut state,
-            &org_info,
-            &ServingNodeLease {
-                node_id: "warm-cache".to_string(),
-                membership_epoch: cutover_state.epoch,
-                observed_at_ms,
-            },
-        )
-        .await
-        .unwrap();
-        MetadataStore::record_serving_node_activation(
-            &mut state,
-            &org_info,
-            &ServingNodeActivationAck {
-                selector: cutover_state.selector,
-                node_id: "warm-cache".to_string(),
-                epoch: cutover_state.epoch,
-                checkpoint_id: committed_checkpoint.clone(),
-                activated_at_ms: observed_at_ms + 1,
-            },
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            !MetadataStore::advance_published_checkpoints(&mut state)
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            MetadataStore::get_published_active_checkpoint(
-                &mut state,
-                &org_info,
-                &table_name,
-                None,
-            )
-            .await
-            .unwrap(),
-            None
-        );
-
-        record_default_readiness(
-            &mut state,
-            &org_info,
-            &table_name,
-            cutover_state.epoch,
-            &committed_checkpoint,
-        )
-        .await;
-
-        assert!(
-            MetadataStore::advance_published_checkpoints(&mut state)
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            MetadataStore::get_published_active_checkpoint(
-                &mut state,
-                &org_info,
-                &table_name,
-                None,
-            )
-            .await
-            .unwrap(),
-            Some(committed_checkpoint)
-        );
-    }
-
     #[tokio::test]
     async fn read_only_cutover_state_uses_latest_committed_target_and_ephemeral_active() {
         let mut state = EphemeralServiceImpl::new(TestProcessingMode::default());
-        let org_info = org_info();
         let table_name = "read-only-cutover-table".to_string();
 
         state
-            .create_table(
-                &org_info,
-                &CreateTable {
-                    name: table_name.clone(),
-                    tags: HashMap::new(),
-                    serving: None,
-                    dynamodb: None,
-                    mongodb: None,
-                    redis: None,
-                },
-            )
+            .create_table(&CreateTable {
+                name: table_name.clone(),
+                tags: HashMap::new(),
+                serving: None,
+                dynamodb: None,
+                mongodb: None,
+                redis: None,
+            })
             .await
             .unwrap();
 
         state
             .iceberg_commit(
-                &org_info,
                 &table_name,
                 &IcebergCommit {
                     metadata: iceberg_metadata("s3://warehouse/table/data-0001.parquet", "1"),
@@ -2244,28 +1934,19 @@ mod tests {
             .await
             .unwrap();
 
-        let checkpoint_one = MetadataStore::get_latest_committed_checkpoint(
-            &mut state,
-            &org_info,
-            &table_name,
-            None,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let checkpoint_one =
+            MetadataStore::get_latest_committed_checkpoint(&mut state, &table_name, None)
+                .await
+                .unwrap()
+                .unwrap();
 
-        let initial_cutover = ReadOnlyCoordinationStore::get_checkpoint_cutover_state(
-            &mut state,
-            &org_info,
-            &table_name,
-            None,
-        )
-        .await
-        .unwrap();
+        let initial_cutover =
+            ReadOnlyCoordinationStore::get_checkpoint_cutover_state(&mut state, &table_name, None)
+                .await
+                .unwrap();
         let initial_coordination_state =
             ReadOnlyCoordinationStore::get_read_only_coordination_state(
                 &mut state,
-                &org_info,
                 &table_name,
                 None,
             )
@@ -2284,7 +1965,6 @@ mod tests {
         let observed_at_ms = chrono::Utc::now().timestamp_millis();
         MetadataStore::heartbeat_serving_node(
             &mut state,
-            &org_info,
             &ServingNodeLease {
                 node_id: "warm-cache".to_string(),
                 membership_epoch: initial_cutover.epoch,
@@ -2295,7 +1975,6 @@ mod tests {
         .unwrap();
         MetadataStore::record_serving_node_activation(
             &mut state,
-            &org_info,
             &ServingNodeActivationAck {
                 selector: initial_cutover.selector,
                 node_id: "warm-cache".to_string(),
@@ -2308,7 +1987,6 @@ mod tests {
         .unwrap();
         let awaiting_readiness = ReadOnlyCoordinationStore::get_read_only_coordination_state(
             &mut state,
-            &org_info,
             &table_name,
             None,
         )
@@ -2320,7 +1998,6 @@ mod tests {
         );
         record_default_readiness(
             &mut state,
-            &org_info,
             &table_name,
             initial_cutover.epoch,
             &checkpoint_one,
@@ -2328,7 +2005,6 @@ mod tests {
         .await;
         let awaiting_activation = ReadOnlyCoordinationStore::get_read_only_coordination_state(
             &mut state,
-            &org_info,
             &table_name,
             None,
         )
@@ -2344,7 +2020,6 @@ mod tests {
 
         state
             .iceberg_commit(
-                &org_info,
                 &table_name,
                 &IcebergCommit {
                     metadata: iceberg_metadata("s3://warehouse/table/data-0002.parquet", "2"),
@@ -2355,23 +2030,15 @@ mod tests {
             .await
             .unwrap();
 
-        let checkpoint_two = MetadataStore::get_latest_committed_checkpoint(
-            &mut state,
-            &org_info,
-            &table_name,
-            None,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let next_cutover = ReadOnlyCoordinationStore::get_checkpoint_cutover_state(
-            &mut state,
-            &org_info,
-            &table_name,
-            None,
-        )
-        .await
-        .unwrap();
+        let checkpoint_two =
+            MetadataStore::get_latest_committed_checkpoint(&mut state, &table_name, None)
+                .await
+                .unwrap()
+                .unwrap();
+        let next_cutover =
+            ReadOnlyCoordinationStore::get_checkpoint_cutover_state(&mut state, &table_name, None)
+                .await
+                .unwrap();
 
         assert_eq!(next_cutover.active_checkpoint_id, Some(checkpoint_one));
         assert_eq!(next_cutover.target_checkpoint_id, Some(checkpoint_two));

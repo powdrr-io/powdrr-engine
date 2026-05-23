@@ -1,5 +1,5 @@
 use crate::data_contract::{
-    CleanupWorkItem, CompactionWorkItem, ExtensionWorkItem, OrgInfo, TableMetadataCheckpoint,
+    CleanupWorkItem, CompactionWorkItem, ExtensionWorkItem, TableMetadataCheckpoint,
 };
 use crate::peers::CheckpointDescriptor;
 use crate::state_provider::ServiceApiError;
@@ -86,20 +86,17 @@ pub struct ServingNodeActivationAck {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointCutoverRequest {
-    pub org_id: String,
     pub selector: PublishedCheckpointSelector,
     pub target_checkpoint_id: String,
 }
 
 impl CheckpointCutoverRequest {
     pub fn new(
-        org_id: String,
         table_name: String,
         extension: Option<String>,
         target_checkpoint_id: String,
     ) -> Self {
         Self {
-            org_id,
             selector: PublishedCheckpointSelector::target(table_name, extension),
             target_checkpoint_id,
         }
@@ -108,13 +105,12 @@ impl CheckpointCutoverRequest {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct CheckpointUpdateRequest {
-    pub org_id: String,
     pub table_name: String,
 }
 
 impl CheckpointUpdateRequest {
-    pub fn new(org_id: String, table_name: String) -> Self {
-        Self { org_id, table_name }
+    pub fn new(table_name: String) -> Self {
+        Self { table_name }
     }
 }
 
@@ -152,30 +148,25 @@ pub trait MetadataStore {
 
     async fn get_published_checkpoint_record(
         &mut self,
-        org_info: &OrgInfo,
         selector: &PublishedCheckpointSelector,
     ) -> Result<Option<PublishedCheckpointRecord>, ServiceApiError>;
 
     async fn get_checkpoint_metadata(
         &mut self,
-        org_info: &OrgInfo,
         checkpoint: &CheckpointDescriptor,
     ) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError>;
 
     async fn claim_extension_work_items(
         &mut self,
-        org_info: &OrgInfo,
         extension_type: &String,
     ) -> Result<Vec<ClaimedExtensionWorkItem>, ServiceApiError>;
 
     async fn claim_compaction_work_items(
         &mut self,
-        org_info: &OrgInfo,
     ) -> Result<Vec<ClaimedCompactionWorkItem>, ServiceApiError>;
 
     async fn claim_cleanup_work_items(
         &mut self,
-        org_info: &OrgInfo,
     ) -> Result<Vec<ClaimedCleanupWorkItem>, ServiceApiError>;
 
     async fn advance_published_checkpoints(&mut self) -> Result<bool, ServiceApiError>;
@@ -185,7 +176,6 @@ pub trait MetadataStore {
         request: &CheckpointCutoverRequest,
     ) -> Result<(), ServiceApiError> {
         self.queue_checkpoint_publication(&CheckpointUpdateRequest::new(
-            request.org_id.clone(),
             request.selector.table_name.clone(),
         ))
         .await
@@ -193,7 +183,6 @@ pub trait MetadataStore {
 
     async fn get_checkpoint_cutover_state(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<CheckpointCutoverState, ServiceApiError> {
@@ -201,11 +190,11 @@ pub trait MetadataStore {
             PublishedCheckpointSelector::active(table_name.clone(), extension.clone());
         let target_selector = PublishedCheckpointSelector::target(table_name.clone(), extension);
         let active_checkpoint_id = self
-            .get_published_checkpoint_record(org_info, &active_selector)
+            .get_published_checkpoint_record(&active_selector)
             .await?
             .map(|record| record.checkpoint_id);
         let target_checkpoint_id = self
-            .get_published_checkpoint_record(org_info, &target_selector)
+            .get_published_checkpoint_record(&target_selector)
             .await?
             .map(|record| record.checkpoint_id)
             .or_else(|| active_checkpoint_id.clone());
@@ -219,7 +208,6 @@ pub trait MetadataStore {
 
     async fn heartbeat_serving_node(
         &mut self,
-        _org_info: &OrgInfo,
         _lease: &ServingNodeLease,
     ) -> Result<(), ServiceApiError> {
         Ok(())
@@ -227,7 +215,6 @@ pub trait MetadataStore {
 
     async fn record_serving_node_activation(
         &mut self,
-        _org_info: &OrgInfo,
         _ack: &ServingNodeActivationAck,
     ) -> Result<(), ServiceApiError> {
         Ok(())
@@ -235,7 +222,6 @@ pub trait MetadataStore {
 
     async fn list_serving_node_activations(
         &mut self,
-        _org_info: &OrgInfo,
         _table_name: &String,
         _extension: Option<String>,
     ) -> Result<Vec<ServingNodeActivationAck>, ServiceApiError> {
@@ -244,45 +230,41 @@ pub trait MetadataStore {
 
     async fn get_latest_committed_checkpoint(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
         let selector = PublishedCheckpointSelector::active(table_name.clone(), extension);
         Ok(self
-            .get_published_checkpoint_record(org_info, &selector)
+            .get_published_checkpoint_record(&selector)
             .await?
             .map(|record| record.checkpoint_id))
     }
 
     async fn get_latest_target_checkpoint(
         &mut self,
-        org_info: &OrgInfo,
         table_name: &String,
         extension: Option<String>,
     ) -> Result<Option<String>, ServiceApiError> {
         let selector = PublishedCheckpointSelector::target(table_name.clone(), extension);
         Ok(self
-            .get_published_checkpoint_record(org_info, &selector)
+            .get_published_checkpoint_record(&selector)
             .await?
             .map(|record| record.checkpoint_id))
     }
 
     async fn get_checkpoint(
         &mut self,
-        org_info: &OrgInfo,
         checkpoint: &CheckpointDescriptor,
     ) -> Result<Option<TableMetadataCheckpoint>, ServiceApiError> {
-        self.get_checkpoint_metadata(org_info, checkpoint).await
+        self.get_checkpoint_metadata(checkpoint).await
     }
 
     async fn get_extension_work_items(
         &mut self,
-        org_info: &OrgInfo,
         extension_type: &String,
     ) -> Result<Vec<ExtensionWorkItem>, ServiceApiError> {
         Ok(self
-            .claim_extension_work_items(org_info, extension_type)
+            .claim_extension_work_items(extension_type)
             .await?
             .into_iter()
             .map(|claimed| claimed.work_item)
@@ -291,22 +273,18 @@ pub trait MetadataStore {
 
     async fn get_compaction_work_items(
         &mut self,
-        org_info: &OrgInfo,
     ) -> Result<Vec<(String, CompactionWorkItem)>, ServiceApiError> {
         Ok(self
-            .claim_compaction_work_items(org_info)
+            .claim_compaction_work_items()
             .await?
             .into_iter()
             .map(|claimed| (claimed.table_name, claimed.work_item))
             .collect())
     }
 
-    async fn get_cleanup_work_items(
-        &mut self,
-        org_info: &OrgInfo,
-    ) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
+    async fn get_cleanup_work_items(&mut self) -> Result<Vec<CleanupWorkItem>, ServiceApiError> {
         Ok(self
-            .claim_cleanup_work_items(org_info)
+            .claim_cleanup_work_items()
             .await?
             .into_iter()
             .map(|claimed| claimed.work_item)

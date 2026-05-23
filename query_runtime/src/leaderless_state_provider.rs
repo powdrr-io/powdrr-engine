@@ -1,12 +1,9 @@
 use crate::data_contract::{
-    ACCESS_KEY_HEADER_KEY, CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody, OrgSettings,
-    SECRET_KEY_HEADER_KEY,
-};
-use crate::data_contract::{
     AddAlias, CompactionCommit, CompactionWorkItem, CreateTable, ExtensionCommit,
     ExtensionWorkItem, GetLatestCheckpoint, IcebergCommit, SpeedboatCommit, TableDescription,
     TableMetadataCheckpoint,
 };
+use crate::data_contract::{CleanupCommit, CleanupWorkItem, CreateIndexTemplateBody};
 use crate::ephemeral_fetch_tracker::EphemeralFetchTracker;
 use crate::metadata_store::{
     CheckpointCutoverState, CutoverEpoch, ServingNodeActivationAck, ServingNodeLease,
@@ -42,8 +39,6 @@ struct ArtifactReadinessAck {
 pub struct LeaderlessStateProvider {
     base_address: String,
     client: Client,
-    access_key: String,
-    secret_key: String,
     fetch_tracker: EphemeralFetchTracker,
     serving_node_id: String,
 }
@@ -77,17 +72,10 @@ impl LeaderlessStateProvider {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn new(
-        mode: TestProcessingMode,
-        address: String,
-        access_key: String,
-        secret_key: String,
-    ) -> Self {
+    pub(crate) fn new(mode: TestProcessingMode, address: String) -> Self {
         LeaderlessStateProvider {
             base_address: address,
             client: Client::new(),
-            access_key,
-            secret_key,
             fetch_tracker: EphemeralFetchTracker::new(mode),
             serving_node_id: Self::default_serving_node_id(),
         }
@@ -98,17 +86,11 @@ impl LeaderlessStateProvider {
     }
 
     fn get(&self, url: String) -> RequestBuilder {
-        self.client
-            .get(url)
-            .header(ACCESS_KEY_HEADER_KEY, self.access_key.clone())
-            .header(SECRET_KEY_HEADER_KEY, self.secret_key.clone())
+        self.client.get(url)
     }
 
     fn post(&self, url: String) -> RequestBuilder {
-        self.client
-            .post(url)
-            .header(ACCESS_KEY_HEADER_KEY, self.access_key.clone())
-            .header(SECRET_KEY_HEADER_KEY, self.secret_key.clone())
+        self.client.post(url)
     }
 
     async fn handle_response_body<T>(
@@ -221,31 +203,6 @@ impl LeaderlessStateProvider {
         create_table: &CreateTable,
     ) -> Result<bool, ServiceApiError> {
         self.create_table(create_table).await
-    }
-
-    pub(crate) async fn create_org(
-        &mut self,
-        settings: &OrgSettings,
-    ) -> Result<(), ServiceApiError> {
-        Self::handle_response(
-            self.client
-                .post(format!("{}/api/v1/create_org", self.base_address))
-                .body(serde_json::to_string(settings).unwrap())
-                .send()
-                .await,
-        )
-        .await
-    }
-
-    pub(crate) async fn lookup_secret_access_key(
-        &mut self,
-        access_key: &String,
-    ) -> Result<Option<String>, ServiceApiError> {
-        if access_key == &self.access_key {
-            Ok(Some(self.secret_key.clone()))
-        } else {
-            Ok(None)
-        }
     }
 
     pub(crate) async fn describe_table(
